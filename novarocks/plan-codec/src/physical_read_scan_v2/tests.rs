@@ -24,10 +24,20 @@ use crate::physical_properties_v2::PhysicalPropertyProjectionLimits;
 use crate::physical_provider_binding_v2::{
     ProviderBindingProjectionLimits, decode_provider_bindings, encode_provider_bindings,
 };
+use crate::physical_public_source_schema_v2::{
+    SourceSchemaFactsSource, decode_public_source_schemas_pure_in,
+    encode_public_source_schemas_pure_in,
+};
 use crate::physical_schema_v2::{SchemaSource, prepare_schemas_decode, prepare_schemas_encode};
-use crate::physical_type_v2::{TypeProjectionLimits, decode_type_table, encode_type_table_sources};
+use crate::physical_type_v2::{
+    BorrowedFieldTypeRoot, TypeProjectionLimits, decode_type_table,
+    encode_borrowed_type_table_associated_sources_pure_in,
+};
 use arrow::datatypes::{DataType, Field, Schema};
-use novarocks_type_contract::{CompilePhase, PureCompileControl};
+use novarocks_type_contract::{
+    CompilePhase, FunctionValueType, PureCompileControl, ValueField, ValueKind, ValueLayout,
+    ValueTypeRef, ValueTypeStorageLifetime,
+};
 use std::{collections::HashMap, sync::Mutex};
 const SOURCE: usize = 64 << 20;
 const NAMESPACE_SOURCE: usize = 1 << 20;
@@ -121,6 +131,89 @@ fn schema_limits() -> NodeProjectionLimits {
         },
     }
 }
+fn source_attributes(original: &HashMap<String, String>) -> (HashMap<String, String>, usize) {
+    // The fixture author creates this table in one explicit reserve. Its
+    // source work proof includes actual copied String backing, not a floor.
+    let table = novarocks_type_contract::owned_resources::hashmap::fresh_table_layout::<
+        String,
+        String,
+    >(original.len())
+    .unwrap();
+    let mut output = HashMap::with_capacity(original.len());
+    let mut invoice = table.request_bytes_upper_bound;
+    for (key, value) in original {
+        let key = key.clone();
+        let value = value.clone();
+        invoice += key.capacity() + value.capacity();
+        output.insert(key, value);
+    }
+    (output, invoice)
+}
+fn typed_public(
+    source: c::ConnectorReadStaticFacts<c::ScanColumnId>,
+    metadata: Option<c::ConnectorReadMetadataKind>,
+    original: Schema,
+    bindings: Vec<FunctionValueType>,
+) -> c::ConnectorReadPublicFacts {
+    let pure = ValueTypeStorageLifetime::pure();
+    let fields = original
+        .fields()
+        .iter()
+        .map(|field| {
+            Arc::new(Field::new(
+                field.name(),
+                field.data_type().clone(),
+                field.is_nullable(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let execution = c::ConnectorReadExecutionSchema::try_new(
+        Arc::new(Schema::new(fields.clone())),
+        bindings.into_boxed_slice(),
+        pure.clone(),
+    )
+    .unwrap();
+    let shape = c::ConnectorSourceSchemaShape::try_new(Arc::new(Schema::new(fields)), pure.clone())
+        .unwrap();
+    let mut facts = Vec::new();
+    for (ordinal, field) in original.fields().iter().enumerate() {
+        let (attributes, invoice) = source_attributes(field.metadata());
+        facts.push(
+            c::ConnectorSourceFieldFacts::try_new_observed(
+                vec![ordinal as u32].into(),
+                None,
+                None,
+                attributes,
+                &[],
+                pure.clone(),
+                invoice,
+                |_| Ok::<_, c::ConnectorError>(()),
+                |_| Ok(()),
+            )
+            .unwrap(),
+        );
+    }
+    let (attributes, invoice) = source_attributes(original.metadata());
+    let source_facts = c::ConnectorSourceSchemaFacts::try_new_observed_with_source_invoice(
+        shape,
+        attributes,
+        facts.into_boxed_slice(),
+        pure.clone(),
+        invoice,
+        |_| Ok::<_, c::ConnectorError>(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    c::ConnectorReadPublicFacts::try_new_typed_with_control(
+        source,
+        metadata,
+        &execution,
+        &source_facts,
+        &Control::default(),
+    )
+    .unwrap()
+}
+
 fn read(count: usize, metadata: bool, residual: bool) -> c::FrozenConnectorRead {
     let provider = c::ConnectorProviderId::parse("iceberg").unwrap();
     let instance = c::ConnectorInstanceId::try_from_canonical("lake").unwrap();
@@ -257,13 +350,14 @@ fn read(count: usize, metadata: bool, residual: bool) -> c::FrozenConnectorRead 
             "雪".repeat(if metadata { 4096 } else { 1 }),
         )]),
     );
-    let public = c::ConnectorReadPublicFacts::try_new(
+    let public = typed_public(
         source,
         metadata.then(|| c::ConnectorReadMetadataKind::try_new("snapshots").unwrap()),
         schema,
-        vec![ValueLogicalType::Physical; count],
-    )
-    .unwrap();
+        (0..count)
+            .map(|i| FunctionValueType::new(DataType::Int64, i % 2 == 0))
+            .collect(),
+    );
     c::FrozenConnectorRead::try_new(scan, public).unwrap()
 }
 fn with_encoded<T>(
@@ -284,30 +378,78 @@ fn with_encoded<T>(
         encode_provider_bindings(&providers, NAMESPACE_SOURCE, provider_limits(), control).unwrap();
     let payloads =
         encode_connector_payloads(&inputs, NAMESPACE_SOURCE, payload_limits(), control).unwrap();
-    let roots = read
-        .public_facts()
+    let public = read.public_facts();
+    let execution = public.execution_schema().unwrap();
+    let source_facts = public.source_schema_facts().unwrap();
+    let roots = execution
+        .bindings()
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| (i as u32, ty))
+        .collect::<Vec<_>>();
+    let count = roots.len() as u32;
+    let field_ids = (0..count).collect::<Vec<_>>();
+    let shape_field_ids = (count..count * 2).collect::<Vec<_>>();
+    let mut fields = execution
         .schema()
         .fields()
         .iter()
         .enumerate()
-        .map(|(i, f)| (i as u32, f.clone()))
+        .map(|(i, field)| BorrowedFieldTypeRoot {
+            id: i as u32,
+            field,
+            value_type_id: Some(i as u32),
+        })
         .collect::<Vec<_>>();
-    let field_ids = (0..roots.len() as u32).collect::<Vec<_>>();
-    let types = encode_type_table_sources(&[], &roots, type_limits(), control).unwrap();
-    let sources = [SchemaSource {
-        id: u32::MAX,
-        source: read.public_facts().schema(),
-        field_ids: &field_ids,
-    }];
+    fields.extend(
+        source_facts
+            .shape()
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, field)| BorrowedFieldTypeRoot {
+                id: count + i as u32,
+                field,
+                value_type_id: None,
+            }),
+    );
+    let mut type_work = CompileCheckpoints::try_new(control, CompilePhase::Encode).unwrap();
+    let types = encode_borrowed_type_table_associated_sources_pure_in(
+        &roots,
+        &fields,
+        type_limits(),
+        &mut type_work,
+    )
+    .unwrap();
+    type_work.finish().unwrap();
+    let sources = [
+        SchemaSource {
+            id: u32::MAX,
+            source: execution.schema(),
+            field_ids: &field_ids,
+        },
+        SchemaSource {
+            id: u32::MAX - 1,
+            source: source_facts.shape().schema(),
+            field_ids: &shape_field_ids,
+        },
+    ];
     let schemas =
         prepare_schemas_encode(&sources, &types, NAMESPACE_SOURCE, schema_limits(), control)
             .unwrap()
             .emit()
             .unwrap();
+    let source_schemas = [SourceSchemaFactsSource {
+        id: 17,
+        source_shape_schema_id: u32::MAX - 1,
+        facts: source_facts,
+    }];
     run(ReadScanEncodeContext {
         bindings: &bindings,
         payloads: &payloads,
         schemas: &schemas,
+        source_schemas: &source_schemas,
     })
 }
 #[derive(Clone)]
@@ -318,6 +460,7 @@ struct Raw {
     payloads: Vec<w::ConnectorPayloadDefinition>,
     schemas: Vec<w::SchemaDefinition>,
     types: novarocks_proto_models::physical_type_v2::TypeTable,
+    source_schemas: Vec<w::PublicSourceSchemaFactsDefinition>,
 }
 fn raw(read: &c::FrozenConnectorRead) -> Raw {
     let c = Control::default();
@@ -335,6 +478,7 @@ fn raw(read: &c::FrozenConnectorRead) -> Raw {
                 node: NodeId::new(u32::MAX),
                 read,
                 schema_id: u32::MAX,
+                source_schema_id: 17,
                 expression_ids: &ids,
             }],
             context,
@@ -344,6 +488,8 @@ fn raw(read: &c::FrozenConnectorRead) -> Raw {
             &mut work,
         )
         .unwrap();
+        let source_schemas =
+            encode_public_source_schemas_pure_in(context.source_schemas, &mut work).unwrap();
         work.finish().unwrap();
         Raw {
             scans: s,
@@ -352,6 +498,7 @@ fn raw(read: &c::FrozenConnectorRead) -> Raw {
             payloads: context.payloads.as_wire().to_vec(),
             schemas: context.schemas.as_wire().to_vec(),
             types: context.schemas.types().as_wire().clone(),
+            source_schemas,
         }
     })
 }
@@ -386,6 +533,7 @@ fn encode_run(
                 node: NodeId::new(u32::MAX),
                 read,
                 schema_id: u32::MAX,
+                source_schema_id: 17,
                 expression_ids: ids,
             }],
             context,
@@ -429,6 +577,16 @@ fn decode_run(
     .unwrap()
     .emit()
     .unwrap();
+    let mut source_work = CompileCheckpoints::try_new(original, CompilePhase::Decode).unwrap();
+    let source_schemas = decode_public_source_schemas_pure_in(
+        &raw.source_schemas,
+        &schemas,
+        NAMESPACE_SOURCE,
+        schema_limits(),
+        &mut source_work,
+    )
+    .unwrap();
+    source_work.finish().unwrap();
     c.arm(stop);
     let out = (|| {
         let mut work =
@@ -440,6 +598,7 @@ fn decode_run(
                 bindings: &bindings,
                 payloads: &payloads,
                 schemas: &schemas,
+                source_schemas: Some(&source_schemas),
             },
             SOURCE,
             l,
@@ -538,8 +697,8 @@ fn complete_data_and_metadata_scans_have_independent_sparse_wire_oracles() {
             cv::ValueTypeKind::BigInt as i32
         );
         let p = scan.public_facts.as_ref().unwrap();
-        assert_eq!(p.schema_id, Some(u32::MAX));
-        assert_eq!(p.logical_types, [1, 1]);
+        assert_eq!(p.execution_schema_id, Some(u32::MAX));
+        assert_eq!(p.source_schema_id, Some(17));
         assert_eq!(p.metadata_kind.as_deref(), metadata.then_some("snapshots"));
         let source = p.source.as_ref().unwrap();
         assert_eq!(source.input_version, [1, 2, 3]);
@@ -581,11 +740,23 @@ fn complete_data_and_metadata_scans_have_independent_sparse_wire_oracles() {
         assert_eq!(facts.scan_count, 1);
         assert!(facts.allocation_requests_upper_bound > 10);
         assert_eq!(
-            out[0].1.public_facts().schema().metadata()["source"].len(),
+            out[0]
+                .1
+                .public_facts()
+                .source_schema_facts()
+                .unwrap()
+                .schema_attributes()["source"]
+                .len(),
             if metadata { 12288 } else { 3 }
         );
         assert_eq!(
-            out[0].1.public_facts().schema().fields()[1].metadata()["ordinal"],
+            out[0]
+                .1
+                .public_facts()
+                .source_schema_facts()
+                .unwrap()
+                .field_facts()[1]
+                .attributes()["ordinal"],
             "1"
         );
     }
@@ -637,13 +808,35 @@ fn residual_field_variable_value_and_typed_null_use_the_original_algebra() {
         DataType::Struct(vec![Arc::new(Field::new("member", DataType::Int64, true))].into()),
         true,
     )]);
-    let public = c::ConnectorReadPublicFacts::try_new(
+    let member = FunctionValueType::new(DataType::Int64, true);
+    let value = ValueTypeRef::try_new(
+        ValueKind::Struct(
+            vec![ValueField::new(
+                "member",
+                member.value_type().clone(),
+                ValueTypeStorageLifetime::pure(),
+            )]
+            .into(),
+        ),
+        true,
+        ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    let binding = FunctionValueType::try_from_value(
+        value,
+        ValueLayout::try_new(
+            schema.field(0).data_type(),
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let public = typed_public(
         original.public_facts().source().clone(),
         None,
         schema,
-        vec![ValueLogicalType::Physical],
-    )
-    .unwrap();
+        vec![binding],
+    );
     let read = c::FrozenConnectorRead::try_new(scan, public).unwrap();
     let c = Control::default();
     let ids = [u32::MAX, 0, 7, 9, 17];
@@ -656,6 +849,7 @@ fn residual_field_variable_value_and_typed_null_use_the_original_algebra() {
                 node: NodeId::new(0),
                 read: &read,
                 schema_id: u32::MAX,
+                source_schema_id: 17,
                 expression_ids: &ids,
             }],
             context,
@@ -665,6 +859,8 @@ fn residual_field_variable_value_and_typed_null_use_the_original_algebra() {
             &mut work,
         )
         .unwrap();
+        let source_schemas =
+            encode_public_source_schemas_pure_in(context.source_schemas, &mut work).unwrap();
         work.finish().unwrap();
         Raw {
             scans,
@@ -673,6 +869,7 @@ fn residual_field_variable_value_and_typed_null_use_the_original_algebra() {
             payloads: context.payloads.as_wire().to_vec(),
             schemas: context.schemas.as_wire().to_vec(),
             types: context.schemas.types().as_wire().clone(),
+            source_schemas,
         }
     });
     assert_eq!(
@@ -751,8 +948,10 @@ fn mandatory_presence_order_and_original_constructor_laws_fail_closed() {
         .public_facts
         .as_mut()
         .unwrap()
-        .logical_types
-        .clear();
+        .execution_schema_id = None;
+    cases.push(x);
+    let mut x = raw.clone();
+    x.scans[0].public_facts.as_mut().unwrap().source_schema_id = None;
     cases.push(x);
     let mut x = raw.clone();
     x.scans[0].recipe.as_mut().unwrap().provider_binding_id = Some(7);
@@ -810,6 +1009,7 @@ fn exact_source_and_control_loans_are_not_equal_metadata_authority() {
                 node: NodeId::new(0),
                 read: &b,
                 schema_id: u32::MAX,
+                source_schema_id: 17,
                 expression_ids: &[0, 1, 2],
             }],
             context,
@@ -829,6 +1029,7 @@ fn exact_source_and_control_loans_are_not_equal_metadata_authority() {
                 node: NodeId::new(0),
                 read: &a,
                 schema_id: u32::MAX,
+                source_schema_id: 17,
                 expression_ids: &[0, 1, 2],
             }],
             context,
@@ -1008,6 +1209,7 @@ fn actual_seven_axis_invoices_refuse_underbounds_without_publication() {
                             node: NodeId::new(0),
                             read: &read,
                             schema_id: u32::MAX,
+                            source_schema_id: 17,
                             expression_ids: &[0, 1, 2]
                         }],
                         context,
@@ -1052,5 +1254,105 @@ fn wide_real_assignments_and_columns_preserve_order_and_actual_sampled_controls(
             assert!(matches!(out,Err(E::Control(c))if c==cause));
             assert_eq!(actual, &trace[..=at]);
         }
+    }
+}
+
+#[test]
+fn read_public_schema_presence_has_no_pure_legacy_route_or_logical_label_parser() {
+    use prost::Message;
+    let raw = raw(&read(2, true, true));
+    let mut absent = raw.clone();
+    let public = absent.scans[0].public_facts.as_mut().unwrap();
+    public.execution_schema_id = None;
+    public.source_schema_id = None;
+    assert!(matches!(
+        decode_run(&absent, limits(), None).0,
+        Err(E::InvalidShape("read execution schema ID absent"))
+    ));
+    // Independent retired tags: uint32 schema_id(3), packed root labels(4).
+    // Prost discards unknown/reserved fields. They cannot supply either real
+    // modern reference, even when every other original source fact is present.
+    for retired in [
+        &[0x18, 0xff, 0xff, 0xff, 0xff, 0x0f][..],
+        &[0x22, 0x05, 0xff, 0xff, 0xff, 0xff, 0x07][..],
+    ] {
+        let mut bytes = absent.scans[0]
+            .public_facts
+            .as_ref()
+            .unwrap()
+            .encode_to_vec();
+        bytes.extend_from_slice(retired);
+        let decoded = w::ConnectorReadPublicFacts::decode(bytes.as_slice()).unwrap();
+        assert!(decoded.execution_schema_id.is_none());
+        assert!(decoded.source_schema_id.is_none());
+        let mut legacy = absent.clone();
+        legacy.scans[0].public_facts = Some(decoded);
+        assert!(matches!(
+            decode_run(&legacy, limits(), None).0,
+            Err(E::InvalidShape("read execution schema ID absent"))
+        ));
+    }
+    let mut only_execution = raw.clone();
+    only_execution.scans[0]
+        .public_facts
+        .as_mut()
+        .unwrap()
+        .source_schema_id = None;
+    assert!(matches!(
+        decode_run(&only_execution, limits(), None).0,
+        Err(E::InvalidShape("read source schema facts ID absent"))
+    ));
+    let mut only_source = raw;
+    only_source.scans[0]
+        .public_facts
+        .as_mut()
+        .unwrap()
+        .execution_schema_id = None;
+    assert!(matches!(
+        decode_run(&only_source, limits(), None).0,
+        Err(E::InvalidShape("read execution schema ID absent"))
+    ));
+}
+
+#[test]
+fn read_public_execution_and_source_namespaces_accept_zero_ids_without_changing_facts() {
+    for metadata in [false, true] {
+        let original = read(2, metadata, true);
+        let mut raw = raw(&original);
+        raw.schemas
+            .iter_mut()
+            .find(|schema| schema.id == u32::MAX)
+            .unwrap()
+            .id = 0;
+        raw.source_schemas
+            .iter_mut()
+            .find(|source| source.id == Some(17))
+            .unwrap()
+            .id = Some(0);
+        let public = raw.scans[0].public_facts.as_mut().unwrap();
+        public.execution_schema_id = Some(0);
+        public.source_schema_id = Some(0);
+        let (decoded, _) = decode_run(&raw, limits(), None);
+        let (out, facts) = decoded.unwrap();
+        assert_eq!(out[0], (NodeId::new(u32::MAX), original));
+        assert_eq!(facts.scan_count, 1);
+        let public = out[0].1.public_facts();
+        assert!(
+            public
+                .execution_schema()
+                .unwrap()
+                .schema()
+                .metadata()
+                .capacity()
+                == 0
+        );
+        assert_eq!(
+            public.source_schema_facts().unwrap().field_facts()[1].attributes()["ordinal"],
+            "1"
+        );
+        assert_eq!(
+            public.source_schema_facts().unwrap().schema_attributes()["source"].len(),
+            if metadata { 12288 } else { 3 }
+        );
     }
 }

@@ -150,16 +150,20 @@ pub(super) fn adapt_plan_output_with_qualifier(
         .iter()
         .zip(target_output_columns.iter())
     {
-        if source.value_type.data_type != target.value_type.data_type {
+        if source.value_type.data_type() != target.value_type.data_type() {
             return Err(format!(
                 "output type mismatch while adapting subquery/CTE column '{}': child={:?}, target={:?}",
-                target.name, source.value_type.data_type, target.value_type.data_type
+                target.name,
+                source.value_type.data_type(),
+                target.value_type.data_type()
             ));
         }
-        if source.value_type.nullable && !target.value_type.nullable {
+        if source.value_type.nullable() && !target.value_type.nullable() {
             return Err(format!(
                 "output nullability mismatch while adapting subquery/CTE column '{}': child={}, target={}",
-                target.name, source.value_type.nullable, target.value_type.nullable
+                target.name,
+                source.value_type.nullable(),
+                target.value_type.nullable()
             ));
         }
         items.push(ProjectItem {
@@ -169,10 +173,9 @@ pub(super) fn adapt_plan_output_with_qualifier(
                     qualifier: None,
                     column: source.name.clone(),
                 },
-                value_type: novarocks_type_contract::FunctionValueType {
-                    nullable: target.value_type.nullable,
-                    ..source.value_type.clone()
-                },
+                value_type: (source.value_type.clone())
+                    .with_nullable(target.value_type.nullable())
+                    .expect("valid value root nullability transform"),
             },
             output_name: target.name.clone(),
             output_column_id: target.column_id,
@@ -192,8 +195,8 @@ pub(super) fn adapt_plan_output_with_qualifier(
 fn output_column_metadata_equal(left: &OutputColumn, right: &OutputColumn) -> bool {
     left.column_id == right.column_id
         && left.name == right.name
-        && left.value_type.data_type == right.value_type.data_type
-        && left.value_type.nullable == right.value_type.nullable
+        && left.value_type.data_type() == right.value_type.data_type()
+        && left.value_type.nullable() == right.value_type.nullable()
         && left.is_internal == right.is_internal
 }
 
@@ -230,7 +233,10 @@ fn join_output_columns(
 
 fn make_nullable(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
     for column in &mut columns {
-        column.value_type.nullable = true;
+        column.value_type = column
+            .value_type
+            .with_nullable(true)
+            .expect("validated root NULL contract");
     }
     columns
 }

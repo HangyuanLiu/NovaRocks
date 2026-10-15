@@ -117,12 +117,23 @@ fn whole_invocation_probe(step: usize, later_root_error: bool) {
     let tracker = MemTracker::new_root("original function-major BY probe");
     tracker.install_limit_once(64 * 1024 * 1024).unwrap();
     operator.set_mem_tracker(tracker.clone());
+    operator.set_construction_factory(
+        super::super::aggregate_fixture::runtime_construction_factory(
+            tracker.clone(),
+            Arc::new(RuntimeErrorState::default()),
+        ),
+    );
+    operator.prepare().unwrap();
     let processor = operator.as_processor_mut().unwrap();
     let state = RuntimeState::default();
-    let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
     let mut earlier = None;
     for start in (0..4).step_by(step) {
-        if let Err(cause) = processor.push_chunk(&state, chunk.slice(start, step.min(4 - start))) {
+        let input = Chunk::try_new_with_chunk_schema(
+            batch.slice(start, step.min(4 - start)),
+            chunk_schema.clone(),
+        )
+        .unwrap();
+        if let Err(cause) = processor.push_chunk(&state, input) {
             earlier = Some(cause);
             break;
         }

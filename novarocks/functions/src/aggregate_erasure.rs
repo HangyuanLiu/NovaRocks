@@ -103,6 +103,17 @@ impl PreparedAggregateHandle {
     pub fn contract(&self) -> &Arc<AggregateCallContract> {
         self.inner.contract()
     }
+    /// Exact installed adapter identity. Equal contracts or rewrapping the same
+    /// typed kernel do not establish the state column's installed owner.
+    pub fn same_installed_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+    pub fn argument_encoding(
+        &self,
+        ordinal: usize,
+    ) -> Result<crate::AggregateArgumentEncoding<'_>, KernelFailure> {
+        self.inner.argument_encoding(ordinal)
+    }
     pub fn state_layout(&self) -> Layout {
         self.inner.layout()
     }
@@ -377,7 +388,7 @@ impl AggregateEvaluationBatchInvocation<'_> {
     }
 }
 
-trait BatchExecution {
+pub(crate) trait BatchExecution {
     fn retained_preparation_bytes(&self) -> usize;
     fn run(&mut self, control: &dyn KernelEvaluationControl) -> Result<(), EvaluationFailure>;
     fn rows_processed(&self) -> usize;
@@ -401,13 +412,17 @@ impl PreparedAggregateLocalStages {
         &self.final_stage
     }
 }
-trait ErasedAggregateOps: Send + Sync + fmt::Debug {
+pub(crate) trait ErasedAggregateOps: Send + Sync + fmt::Debug {
     fn clone_local_phase(
         &self,
         contract: Arc<AggregateCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<PreparedAggregateHandle, KernelFailure>;
     fn contract(&self) -> &Arc<AggregateCallContract>;
+    fn argument_encoding(
+        &self,
+        ordinal: usize,
+    ) -> Result<crate::AggregateArgumentEncoding<'_>, KernelFailure>;
     fn layout(&self) -> Layout;
     fn policy(&self) -> AggregateStateMemoryPolicy;
     fn has_invocation_data(&self) -> bool;
@@ -526,6 +541,15 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
     fn contract(&self) -> &Arc<AggregateCallContract> {
         &self.contract
     }
+    fn argument_encoding(
+        &self,
+        ordinal: usize,
+    ) -> Result<crate::AggregateArgumentEncoding<'_>, KernelFailure> {
+        self.validate_metadata()?;
+        let fact = self.kernel.argument_encoding(ordinal);
+        fact.validate_scope(self.contract.as_ref(), ordinal)?;
+        Ok(fact.bind_installed(self))
+    }
     fn layout(&self) -> Layout {
         self.layout
     }
@@ -573,7 +597,8 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
         control: &dyn KernelEvaluationControl,
     ) -> Result<Box<dyn BatchExecution + 'frame>, EvaluationFailure> {
         self.validate_metadata()?;
-        let invocation = AggregateUpdateInvocation::try_new_evaluation(
+        let invocation = AggregateUpdateInvocation::try_new_evaluation_for_installed(
+            self,
             self.kernel.as_ref(),
             input,
             mapping,

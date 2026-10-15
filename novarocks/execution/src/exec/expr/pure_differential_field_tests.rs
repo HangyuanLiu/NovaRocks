@@ -22,10 +22,12 @@ use arrow::array::{Float64Array, NullArray, StringArray};
 fn pure_differential_field_one_actual_variadic_overload_all_registered_carriers() {
     for mut ty in profiles() {
         for nullable in [true, false] {
-            if ty.data_type == DataType::Null && !nullable {
+            if *ty.data_type() == DataType::Null && !nullable {
                 continue;
             }
-            ty.nullable = nullable;
+            ty = ty
+                .with_nullable(nullable)
+                .expect("valid test root nullability");
             let a = generated(&ty, 257);
             for a in [a.clone(), a.slice(1, 7), a.slice(0, 0)] {
                 for arity in [2, 3, 5] {
@@ -118,7 +120,7 @@ fn pure_differential_field_actual_sql_null_coercion_and_generic_nominal_tags() {
         let DiffArgument::Column { values, .. } = arg else {
             unreachable!()
         };
-        let actual = arrow::compute::cast(values.as_ref(), &ty.data_type).unwrap();
+        let actual = arrow::compute::cast(values.as_ref(), &ty.data_type()).unwrap();
         spec = spec.typed_column(ty.clone(), actual);
     }
     assert_scalar_matches_v1(spec);

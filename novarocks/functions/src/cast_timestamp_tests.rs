@@ -142,7 +142,8 @@ fn policy() -> ConstantPolicy {
     }
 }
 fn pool(input: &ArrayRef, nullable: bool) -> ConstantPool {
-    let source = FunctionValueType::new(input.data_type().clone(), nullable);
+    let source =
+        FunctionValueType::from_legacy_declared_projection(input.data_type().clone(), nullable);
     let field = Arc::new(
         Field::new("original-timestamp", input.data_type().clone(), nullable)
             .with_metadata([("source-note".into(), "retain-exact-pool".into())].into()),
@@ -358,8 +359,8 @@ fn timestamp_nullability_and_effects_follow_exact_five_null_pairs_and_one_error_
                         );
                         assert_eq!(
                             carrier_cast_can_produce_null(
-                                &ty(from, false).data_type,
-                                &ty(to, false).data_type,
+                                &ty(from, false).data_type(),
+                                &ty(to, false).data_type(),
                                 allow
                             ),
                             null_pair
@@ -413,8 +414,8 @@ fn timestamp_nullability_and_effects_follow_exact_five_null_pairs_and_one_error_
         assert_eq!(
             PreparedCastRecipe::try_new(
                 CastOperation::Carrier,
-                &FunctionValueType::new(source, true),
-                &FunctionValueType::new(target, true),
+                &FunctionValueType::from_legacy_declared_projection(source, true),
+                &FunctionValueType::from_legacy_declared_projection(target, true),
                 DecimalOverflowPolicy::OutputNull,
                 false,
                 &CompileControl::default()
@@ -492,7 +493,7 @@ fn timestamp_constant_real_ordinal_scalar_slice_and_compact_addresses_stay_indep
         let selection = Selection::try_sparse(4, &rows).unwrap();
         let compact = SelectedValues::try_new(
             selection,
-            &recipe.source_type().data_type,
+            recipe.source_type().data_type(),
             array(unit, vec![Some(51), Some(52)]),
             Box::default(),
         )
@@ -605,7 +606,7 @@ fn timestamp_class_source_domain_addresses_and_required_journal_are_checked_befo
     ));
     let required = SelectedValues::try_new(
         Selection::all(2),
-        &ty(TimeUnit::Microsecond, true).data_type,
+        &ty(TimeUnit::Microsecond, true).data_type(),
         array(TimeUnit::Microsecond, vec![None, None]),
         vec![RowDataError::new(1, "required child failed")].into_boxed_slice(),
     )

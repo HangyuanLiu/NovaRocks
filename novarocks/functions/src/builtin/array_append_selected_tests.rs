@@ -75,7 +75,7 @@ impl PureCompileControl for Compile {
 }
 
 fn source(a: &ArrayRef) -> FunctionValueType {
-    FunctionValueType::new(a.data_type().clone(), true)
+    FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true)
 }
 fn list(values: ArrayRef, offsets: Vec<i32>) -> ArrayRef {
     Arc::new(ListArray::new(
@@ -293,7 +293,7 @@ fn array_append_every_actual_compile_callback_preserves_three_causes_and_named_r
         vec![FunctionValueType::new(DataType::Int32, true); 2],
     ] {
         let good = Compile::default();
-        let success = types[0].data_type == *a.data_type();
+        let success = *types[0].data_type() == *a.data_type();
         assert_eq!(prepared(&types, &good).is_ok(), success);
         let trace = good.trace.lock().unwrap().clone();
         assert!(!trace.is_empty());

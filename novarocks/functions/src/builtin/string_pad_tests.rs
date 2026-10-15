@@ -100,7 +100,7 @@ fn output(result: &SelectedValues<'_>) -> Vec<Option<String>> {
         .collect()
 }
 fn pool(array: ArrayRef) -> ConstantPool {
-    let ty = FunctionValueType::new(array.data_type().clone(), true);
+    let ty = FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true);
     ConstantPool::try_new(
         Arc::new(
             ty.try_to_field("original")
@@ -358,7 +358,7 @@ fn string_pad_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_s
         for source in [
             FunctionValueType::new(DataType::LargeUtf8, true),
             FunctionValueType::new(DataType::Binary, true),
-            FunctionValueType::new(
+            FunctionValueType::from_legacy_declared_projection(
                 DataType::List(Arc::new(arrow_schema::Field::new(
                     "item",
                     DataType::Int64,
@@ -389,7 +389,7 @@ fn string_pad_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_s
 fn string_pad_compile_success_and_ordinary_tail_preserve_all_callback_causes() {
     for ty in [source(true), FunctionValueType::new(DataType::Binary, true)] {
         let good = CompileControl::default();
-        let success = ty.data_type == DataType::Utf8;
+        let success = ty.data_type() == &DataType::Utf8;
         assert_eq!(
             prepared_for_test_with_control(
                 "lpad",
@@ -484,7 +484,9 @@ fn string_pad_two_actual_profiles_preserve_independent_unicode_cycle_oracles() {
             ] {
                 let mut types = sources();
                 for (i, ty) in types.iter_mut().enumerate() {
-                    ty.nullable = mask & (1 << i) != 0;
+                    *ty = ty
+                        .with_nullable(mask & (1 << i) != 0)
+                        .expect("valid function nullability declaration");
                 }
                 let prepared = prepared_for_test_with_policy(name, &types, policy).unwrap();
                 assert_eq!(prepared.contract().result_type(), &source(true));
@@ -673,7 +675,9 @@ fn string_pad_strict_null_and_inactive_payload_skip_work_but_do_not_mask_bad_met
         );
         for position in 0..3 {
             let mut types = sources();
-            types[position].nullable = false;
+            types[position] = types[position]
+                .with_nullable(false)
+                .expect("valid function nullability declaration");
             let prepared =
                 prepared_for_test_with_policy(name, &types, DecimalOverflowPolicy::OutputNull)
                     .unwrap();

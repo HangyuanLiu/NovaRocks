@@ -2040,8 +2040,8 @@ mod join_demotion_tests {
         assert_eq!(phys.eq_conditions.len(), 1);
         let left_key = mat(&memo, phys.eq_conditions[0].left);
         let right_key = mat(&memo, phys.eq_conditions[0].right);
-        assert_eq!(left_key.value_type.data_type, DataType::Int64);
-        assert_eq!(right_key.value_type.data_type, DataType::Int32);
+        assert_eq!(left_key.value_type.data_type().clone(), DataType::Int64);
+        assert_eq!(right_key.value_type.data_type().clone(), DataType::Int32);
         assert!(
             matches!(left_key.kind, ExprKind::ColumnRef { .. }),
             "optimizer hash key should keep raw column refs so distribution can enforce both sides"
@@ -2417,7 +2417,7 @@ mod two_phase_agg_tests {
         AggregateCall {
             name: "count".into(),
             distinct,
-            result_type: DataType::Int64,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             output_column_id: ColumnId::new_for_test(3),
             source: crate::binding::AggregateArgumentSource::uncertified(
                 vec![col(arg)],
@@ -2622,7 +2622,10 @@ mod two_phase_agg_tests {
                 vec![AggregateCall {
                     name: "count".into(),
                     distinct: true,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                     output_column_id: ColumnId::new_for_test(6),
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![col("id")],

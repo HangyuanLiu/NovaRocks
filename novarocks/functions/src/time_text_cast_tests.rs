@@ -60,7 +60,7 @@ impl KernelEvaluationControl for Control {
 fn recipe(dtype: DataType, allow: bool) -> PreparedCastRecipe {
     PreparedCastRecipe::try_new(
         CastOperation::Carrier,
-        &FunctionValueType::new(dtype, true),
+        &FunctionValueType::from_legacy_declared_projection(dtype, true),
         &FunctionValueType::new(DataType::Time64(TimeUnit::Microsecond), true),
         DecimalOverflowPolicy::ReportError,
         allow,
@@ -154,7 +154,7 @@ fn text_time_kernel_original_parser_full_domain_keeps_distinct_carriers_and_type
         assert!(
             PreparedCastRecipe::try_new(
                 CastOperation::Carrier,
-                &FunctionValueType::new(dtype, false),
+                &FunctionValueType::from_legacy_declared_projection(dtype, false),
                 &target,
                 DecimalOverflowPolicy::OutputNull,
                 false,
@@ -243,7 +243,7 @@ fn text_time_kernel_exact_compact_and_nonzero_pool_ordinals_keep_original_row_ad
             ),
             Err(KernelFailure::InvalidProgram(_))
         ));
-        let ty = FunctionValueType::new(dtype, true);
+        let ty = FunctionValueType::from_legacy_declared_projection(dtype, true);
         let pool = ConstantPool::try_new(
             Arc::new(ty.try_to_field("actual-time-text").unwrap()),
             ty,

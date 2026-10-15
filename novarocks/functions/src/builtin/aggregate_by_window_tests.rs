@@ -579,6 +579,11 @@ fn by_window_tracked_actual_full_generic_scalar_builder_and_nested_metadata() {
     ];
     for (ty, original) in cases {
         let values = scalar::build_scalar_array(&ty, original, &mut ScalarWork::new(None)).unwrap();
+        let values = crate::test_value_ingress::array_for_binding(
+            &values,
+            &FunctionValueType::from_legacy_declared_projection(ty.clone(), true),
+        )
+        .unwrap();
         let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "z"]));
         let args = [
             EvaluatedArgument::Column(&values),
@@ -590,7 +595,11 @@ fn by_window_tracked_actual_full_generic_scalar_builder_and_nested_metadata() {
             WindowRowRange { start: 0, end: 2 },
         ];
         for name in ["max_by", "min_by"] {
-            let prepared = prepared(name, FunctionValueType::new(ty.clone(), true), text_type());
+            let prepared = prepared(
+                name,
+                FunctionValueType::from_legacy_declared_projection(ty.clone(), true),
+                text_type(),
+            );
             let input = input(prepared.contract(), &args, &peers, &frames);
             let host = Arc::new(WindowHost::default());
             let mut partition = begin(
@@ -605,7 +614,7 @@ fn by_window_tracked_actual_full_generic_scalar_builder_and_nested_metadata() {
                 .unwrap();
             let (_, output, errors) = output.into_parts();
             assert!(errors.is_empty());
-            assert_eq!(output.data_type(), &ty);
+            assert_eq!(output.data_type(), values.data_type());
             assert_eq!(
                 scalar::scalar_from_array(&output, 0, &mut ScalarWork::new(None))
                     .unwrap()
@@ -640,7 +649,7 @@ fn by_window_tracked_actual_empty_struct_unwinds_original_builder_and_releases_r
             let ty = DataType::Struct(arrow_schema::Fields::empty());
             let prepared = prepared(
                 name,
-                FunctionValueType::new(ty, true),
+                FunctionValueType::from_legacy_declared_projection(ty, true),
                 FunctionValueType::new(DataType::Int32, true),
             );
             let nulls = null_winner.then(|| arrow_buffer::NullBuffer::new_null(2));

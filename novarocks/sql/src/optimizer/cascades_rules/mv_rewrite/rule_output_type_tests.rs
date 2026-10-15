@@ -58,8 +58,8 @@ fn output_type_rollup_fixture(
         "exact_output_mv",
         &["a", "materialized_aggregate"],
     );
-    target_table.columns[1].data_type = mv_value.value_type.data_type.clone();
-    target_table.columns[1].nullable = mv_value.value_type.nullable;
+    target_table.columns[1].data_type = mv_value.value_type.data_type().clone();
+    target_table.columns[1].nullable = mv_value.value_type.nullable();
     let candidate = MvRewriteCandidate {
         mv_name: "exact_output_mv".into(),
         mv,
@@ -113,7 +113,7 @@ fn count_rollup_internal_sum_uses_selected_nullable_type_and_exact_visible_count
     ] {
         let (mut memo, expr, candidate, published) = output_type_rollup_fixture(true, policy);
         assert!(
-            !published.value_type.nullable,
+            !published.value_type.nullable(),
             "actual COUNT author is nonnullable"
         );
         let alts = MvRewriteRule::new(vec![candidate])
@@ -143,7 +143,7 @@ fn count_rollup_internal_sum_uses_selected_nullable_type_and_exact_visible_count
             panic!("COALESCE must be scalar")
         };
         assert_eq!(memo.scalars.value_type(item.expr), coalesce_result);
-        assert!(!memo.scalars.value_type(args[1]).nullable);
+        assert!(!memo.scalars.value_type(args[1]).nullable());
 
         let Operator::LogicalAggregate(inner) =
             &memo.groups[alts[0].children[0]].logical_exprs[0].op
@@ -156,7 +156,7 @@ fn count_rollup_internal_sum_uses_selected_nullable_type_and_exact_visible_count
             panic!("SUM must be scalar")
         };
         assert!(
-            sum_result.nullable,
+            sum_result.nullable(),
             "SUM can return successful NULL on no rows"
         );
         assert_eq!(
@@ -243,11 +243,11 @@ fn rollup_refuses_target_storage_and_query_published_type_drift() {
     let Operator::LogicalAggregate(aggregate) = &mut expr.op else {
         panic!("aggregate fixture")
     };
-    aggregate.output_columns[0].value_type.nullable = false;
+    aggregate.output_columns[0].value_type = aggregate.output_columns[0].value_type.with_nullable(false).unwrap();
     assert!(
         aggregate.output_layout.aggregate_columns[0]
             .value_type
-            .nullable
+            .nullable()
     );
     assert!(
         MvRewriteRule::new(vec![candidate])

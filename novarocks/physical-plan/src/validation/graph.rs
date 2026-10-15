@@ -699,8 +699,10 @@ pub(crate) fn validate_edge(
                 // the sender never writes -- it is declared by the statement's
                 // column layout, not by the value that happens to fill it. It
                 // may not declare the reverse.
-                if !source_value.ty.same_value_domain(&destination_value.ty)
-                    || (source_value.ty.nullable && !destination_value.ty.nullable)
+                if !super::value_bindings_match_ignoring_root_nullability(
+                    &source_value.ty,
+                    &destination_value.ty,
+                ) || (source_value.ty.nullable() && !destination_value.ty.nullable())
                 {
                     errors.push(ValidationError::new(
                         &path,
@@ -1279,8 +1281,8 @@ pub(crate) fn validate_result_port_fields(
                 || column.name != name
                 || !novarocks_type_contract::result_render_type::render_field_matches_storage(
                     &column.field,
-                    &field.ty.data_type,
-                    field.ty.nullable,
+                    &field.ty.data_type(),
+                    field.ty.nullable(),
                 )
             {
                 errors.push(ValidationError::new(
@@ -1294,8 +1296,8 @@ pub(crate) fn validate_result_port_fields(
         && let novarocks_result_contract::FrozenRootOutput::ScalarValue(schema) = contract.output()
     {
         match result.fields.as_ref() {
-            [field] if result.scalar_schema.as_ref().is_some_and(|frozen| frozen.field() == schema.field()) && field.domain.matches_scalar(&schema.field().value_type) && novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
-                schema.field(), &field.ty.data_type, field.ty.nullable
+            [field] if result.scalar_schema.as_ref().is_some_and(|frozen| frozen.field() == schema.field()) && field.domain.matches_scalar(&schema.field().value_type) && novarocks_type_contract::result_scalar_type::scalar_field_matches_binding(
+                schema.field(), field.ty.typed_binding()
             ) => {}
             _ => errors.push(ValidationError::new(
                 "result_port.scalar_schema", "scalar schema differs from the sole ordered root occurrence"
@@ -1306,10 +1308,9 @@ pub(crate) fn validate_result_port_fields(
         let consistent = match result.fields.as_ref() {
             [field] => {
                 field.domain.matches_scalar(&schema.field().value_type)
-                    && novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
+                    && novarocks_type_contract::result_scalar_type::scalar_field_matches_binding(
                         schema.field(),
-                        &field.ty.data_type,
-                        field.ty.nullable,
+                        field.ty.typed_binding(),
                     )
             }
             _ => false,
@@ -1334,7 +1335,7 @@ pub(crate) fn validate_result_port_fields(
                 format!("result value differs at ordinal {ordinal}"),
             ));
         }
-        if !field.domain.matches_storage(&field.ty.data_type) {
+        if !field.domain.matches_storage(&field.ty.data_type()) {
             errors.push(ValidationError::new(
                 "result_port.fields",
                 format!("result logical domain differs from storage at ordinal {ordinal}"),
@@ -1418,6 +1419,107 @@ pub(crate) fn validate_cross_fragment_value_origins(
                 },
                 _ => {}
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scalar_binding_tests {
+    use super::*;
+    use crate::{FragmentBuilder, PipelineDopDomain, ResultField, ResultPort, ResultValueDomain};
+    use novarocks_result_contract::{ScalarField, ScalarSchema, ScalarValueType};
+    use novarocks_type_contract::{
+        FunctionValueType, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        ValueTypeStorageLifetime as Hold,
+    };
+    use std::sync::Arc;
+
+    fn list(json: bool) -> FunctionValueType {
+        let item = ValueTypeRef::try_new(
+            if json {
+                ValueKind::Nominal(ValueLogicalType::Json)
+            } else {
+                ValueKind::String
+            },
+            true,
+            Hold::pure(),
+        )
+        .unwrap();
+        let root = ValueTypeRef::try_new(ValueKind::List(item), false, Hold::pure()).unwrap();
+        let layout = arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
+            "item",
+            arrow_schema::DataType::Utf8,
+            true,
+        )));
+        FunctionValueType::try_from_value(
+            root,
+            ValueLayout::try_new(&layout, Hold::pure()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn actual_result_port_rejects_nested_json_text_drift_on_the_same_value_layout() {
+        let expected = list(true);
+        for json in [false, true] {
+            let actual = list(json);
+            assert_eq!(expected.data_type(), actual.data_type());
+            assert!(!expected.value_type().shares_storage(actual.value_type()));
+            let id = FragmentId::new(0);
+            let root = NodeId::new(1);
+            let mut builder = FragmentBuilder::new(id);
+            let value = builder
+                .add_value(
+                    actual.clone(),
+                    ValueOrigin::NodeOutput {
+                        node: root,
+                        output_ordinal: 0,
+                    },
+                )
+                .unwrap();
+            builder
+                .add_values(root, Box::default(), Box::from([value]))
+                .unwrap();
+            let fragment = builder
+                .finish_definition(
+                    root,
+                    FragmentSink::Result,
+                    PipelineDopDomain {
+                        min: 1,
+                        max: 1,
+                        requires_power_of_two: false,
+                    },
+                )
+                .unwrap();
+            let result = ResultPort {
+                fragment: id,
+                output: fragment.nodes()[&root].output.clone(),
+                fields: Box::from([ResultField {
+                    domain: ResultValueDomain::Plain,
+                    name: "nested".into(),
+                    alias: None,
+                    value,
+                    ty: actual,
+                }]),
+                scalar_schema: Some(
+                    ScalarSchema::try_new(ScalarField {
+                        nullable: false,
+                        value_type: ScalarValueType::List(Box::new(ScalarField {
+                            nullable: true,
+                            value_type: ScalarValueType::Json,
+                        })),
+                    })
+                    .unwrap(),
+                ),
+            };
+            let mut errors = ValidationContext::new();
+            validate_result_port_fields(&fragment, &result, &mut errors);
+            assert_eq!(
+                errors.is_empty(),
+                json,
+                "actual result publication checks complete child semantics: {:?}",
+                errors.errors
+            );
         }
     }
 }

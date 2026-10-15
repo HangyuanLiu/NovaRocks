@@ -97,13 +97,44 @@ pub(super) struct CreationFailure {
 /// winner's: the frontend freezes exactly one body per identity, so a request
 /// naming an identity asks for the entity that identity already names.
 pub(super) struct CreationCell {
-    decision: Mutex<CreationDecision>,
+    decision: Arc<Mutex<CreationDecision>>,
     accepted_status: Mutex<Option<Arc<TaskStatusOwner>>>,
 }
 
 struct CreationDecision {
     failure: Option<CreationFailure>,
     stop: Option<PreparationStop>,
+}
+
+/// Read-only observation of the creation winner's actual stop decision.
+/// This retains no registry, task input, query context or status publication.
+#[derive(Clone)]
+pub struct TaskPreparationStopView {
+    decision: Arc<Mutex<CreationDecision>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskPreparationStopCause {
+    Cancelled,
+    LeaseExpired,
+}
+impl TaskPreparationStopView {
+    pub fn stop_cause(&self) -> Option<TaskPreparationStopCause> {
+        match self.decision.lock().expect("creation cell lock").stop {
+            None => None,
+            Some(PreparationStop::Abort(AbortCause::LeaseExpired)) => {
+                Some(TaskPreparationStopCause::LeaseExpired)
+            }
+            Some(PreparationStop::Cancel(_) | PreparationStop::Abort(_)) => {
+                Some(TaskPreparationStopCause::Cancelled)
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn unstopped_for_test() -> Self {
+        CreationCell::new().preparation_stop_view()
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -113,13 +144,19 @@ pub(super) enum PreparationStop {
 }
 
 impl CreationCell {
-    pub(super) const fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
-            decision: Mutex::new(CreationDecision {
+            decision: Arc::new(Mutex::new(CreationDecision {
                 failure: None,
                 stop: None,
-            }),
+            })),
             accepted_status: Mutex::new(None),
+        }
+    }
+
+    pub(super) fn preparation_stop_view(&self) -> TaskPreparationStopView {
+        TaskPreparationStopView {
+            decision: Arc::clone(&self.decision),
         }
     }
 
@@ -171,6 +208,49 @@ impl CreationCell {
 
     pub(super) fn stop(&self) -> Option<PreparationStop> {
         self.decision.lock().expect("creation cell lock").stop
+    }
+}
+
+#[cfg(test)]
+mod preparation_stop_view_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_preparation_view_observes_original_cancel_and_abort_precedence() {
+        let cell = CreationCell::new();
+        let view = cell.preparation_stop_view();
+        assert_eq!(view.stop_cause(), None);
+        assert!(cell.request_stop(PreparationStop::Cancel(
+            CancelReason::UpstreamNoLongerNeeded
+        )));
+        assert_eq!(view.stop_cause(), Some(TaskPreparationStopCause::Cancelled));
+        assert!(cell.request_stop(PreparationStop::Abort(AbortCause::LeaseExpired)));
+        assert_eq!(
+            view.stop_cause(),
+            Some(TaskPreparationStopCause::LeaseExpired)
+        );
+        drop(cell);
+        assert_eq!(
+            view.stop_cause(),
+            Some(TaskPreparationStopCause::LeaseExpired)
+        );
+    }
+
+    #[test]
+    fn claimed_failure_remains_primary_and_does_not_publish_a_stop() {
+        let cell = CreationCell::new();
+        let view = cell.preparation_stop_view();
+        cell.claim_failure(CreationFailure {
+            outcome: OperationOutcome::InvalidStateOrRequest,
+            detail: "original preparation failure".to_string(),
+            category: TaskFailureCategory::Execution,
+        });
+        assert!(!cell.request_stop(PreparationStop::Abort(AbortCause::LeaseExpired)));
+        assert_eq!(view.stop_cause(), None);
+        assert_eq!(
+            cell.failure().unwrap().detail,
+            "original preparation failure"
+        );
     }
 }
 

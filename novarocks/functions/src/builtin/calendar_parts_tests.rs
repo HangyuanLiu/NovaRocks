@@ -374,7 +374,9 @@ fn calendar_parts_all_profiles_preserve_iso_leap_midnight_nullable_and_policy_or
                     DecimalOverflowPolicy::ReportError,
                 ] {
                     let mut source = source.clone();
-                    source.nullable = nullable;
+                    source = source
+                        .with_nullable(nullable)
+                        .expect("valid function nullability declaration");
                     let array = if nullable {
                         arrays[profile].clone()
                     } else {
@@ -565,7 +567,7 @@ fn calendar_parts_original_slices_compact_scalar_and_cv_ordinals_retain_source_b
         let scalar = array.slice(1, 1);
         let compact = SelectedValues::try_new(
             selection,
-            &source.data_type,
+            source.data_type(),
             array.slice(0, 2),
             Box::default(),
         )
@@ -762,7 +764,7 @@ fn calendar_parts_every_actual_compile_callback_preserves_three_causes_success_a
         FunctionValueType::new(DataType::Int64, true),
     ] {
         let good = CompileControl::default();
-        let success = source.data_type == DataType::Utf8;
+        let success = source.data_type() == &DataType::Utf8;
         assert_eq!(
             prepared_for_test_with_control(
                 "year",

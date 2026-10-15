@@ -77,17 +77,19 @@ impl Owner {
     fn new() -> Self {
         let arguments =
             [DataType::Int64, DataType::Int32].map(|data_type| FunctionArgument::Value {
-                value_type: FunctionValueType::new(data_type, false),
+                value_type: FunctionValueType::from_legacy_declared_projection(data_type, false),
                 constant: None,
             });
         Self {
             id: FunctionId::try_new("fixture/aggregate-window/sum-v1").unwrap(),
             selected: Arc::new(FunctionBindingSelection {
                 overload: FunctionOverloadId::try_new("fixture/aggregate-window/int64-v1").unwrap(),
-                argument_types: arguments
-                    .iter()
-                    .map(FunctionArgument::argument_type)
-                    .collect(),
+                argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                    arguments
+                        .iter()
+                        .map(FunctionArgument::argument_type)
+                        .collect::<Box<[_]>>(),
+                ),
                 result_type: FunctionResultType::Scalar(FunctionValueType::new(
                     DataType::Int64,
                     false,

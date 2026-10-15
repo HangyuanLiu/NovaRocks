@@ -401,7 +401,9 @@ fn branch_fixture(is_case: bool) -> (Fragment, PhysicalRootUses) {
                 overload: FunctionOverloadId::try_new("fixture/control-codec/boolean-branch")
                     .unwrap(),
                 kind: FunctionKind::Scalar,
-                argument_types: vec![FunctionArgumentType::Value(ty.clone()); 3].into_boxed_slice(),
+                argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    vec![FunctionArgumentType::Value(ty.clone()); 3].into_boxed_slice(),
+                ),
                 result_type: ty.clone(),
 
                 legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {

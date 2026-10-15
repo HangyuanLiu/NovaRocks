@@ -120,11 +120,11 @@ fn split_owner_one_actual_exact_signature_and_strict_eager_effects() {
             ]
         );
         assert_eq!(
-            prepared.contract().result_type().data_type,
+            prepared.contract().result_type().data_type().clone(),
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
         );
         assert_eq!(
-            prepared.contract().result_type().logical_type,
+            prepared.contract().result_type().logical_type(),
             ValueLogicalType::Physical
         );
         assert_eq!(
@@ -154,7 +154,7 @@ fn split_owner_public_arity_and_non_utf8_profiles_are_not_guessed() {
             prepared_for_test(
                 "split",
                 &[
-                    FunctionValueType::new(ty, true),
+                    FunctionValueType::from_legacy_declared_projection(ty, true),
                     FunctionValueType::new(DataType::Utf8, true)
                 ]
             )

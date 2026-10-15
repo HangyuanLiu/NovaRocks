@@ -1577,15 +1577,22 @@ mod tests {
         let (_executor, _warehouse, provider) = exact_provider_with_empty_table();
         let adapter = IcebergDataMutationAdapter::try_new(Arc::clone(&provider)).expect("adapter");
         let metadata = provider
-            .load_table(ConnectorTableRequest {
-                table: ConnectorTableIdentity {
-                    instance_id: provider.descriptor().instance_id.clone(),
-                    namespace: Arc::from("db"),
-                    table: Arc::from("t"),
+            .load_table(
+                ConnectorTableRequest {
+                    table: ConnectorTableIdentity {
+                        instance_id: provider.descriptor().instance_id.clone(),
+                        namespace: Arc::from("db"),
+                        table: Arc::from("t"),
+                    },
+                    resolution: ConnectorTableResolution::StrictBaseTable,
+                    context: table_context(),
                 },
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                context: table_context(),
-            })
+                &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    &mut |_| Ok(()),
+                    &mut |_| Ok(()),
+                ),
+            )
             .expect("load table");
         let operation_id = ConnectorMutationOperationId::new();
         let planning = ConnectorDataMutationPlanningRequest::try_new(
@@ -1636,15 +1643,22 @@ mod tests {
         directory: &std::path::Path,
     ) -> ConnectorDataMutationPlan {
         let metadata = provider
-            .load_table(ConnectorTableRequest {
-                table: ConnectorTableIdentity {
-                    instance_id: provider.descriptor().instance_id.clone(),
-                    namespace: Arc::from("db"),
-                    table: Arc::from("t"),
+            .load_table(
+                ConnectorTableRequest {
+                    table: ConnectorTableIdentity {
+                        instance_id: provider.descriptor().instance_id.clone(),
+                        namespace: Arc::from("db"),
+                        table: Arc::from("t"),
+                    },
+                    resolution: ConnectorTableResolution::StrictBaseTable,
+                    context: table_context(),
                 },
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                context: table_context(),
-            })
+                &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    &mut |_| Ok(()),
+                    &mut |_| Ok(()),
+                ),
+            )
             .unwrap();
         adapter
             .plan_mutation(
@@ -2251,15 +2265,22 @@ mod tests {
         let (_executor, _warehouse, provider) = exact_provider_with_empty_table();
         let adapter = IcebergDataMutationAdapter::try_new(Arc::clone(&provider)).expect("adapter");
         let metadata = provider
-            .load_table(ConnectorTableRequest {
-                table: ConnectorTableIdentity {
-                    instance_id: provider.descriptor().instance_id.clone(),
-                    namespace: Arc::from("db"),
-                    table: Arc::from("t"),
+            .load_table(
+                ConnectorTableRequest {
+                    table: ConnectorTableIdentity {
+                        instance_id: provider.descriptor().instance_id.clone(),
+                        namespace: Arc::from("db"),
+                        table: Arc::from("t"),
+                    },
+                    resolution: ConnectorTableResolution::StrictBaseTable,
+                    context: table_context(),
                 },
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                context: table_context(),
-            })
+                &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    &mut |_| Ok(()),
+                    &mut |_| Ok(()),
+                ),
+            )
             .expect("table");
         let mut request = ConnectorDataMutationPlanningRequest::try_new(
             ConnectorMutationOperationId::new(),

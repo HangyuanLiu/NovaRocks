@@ -172,7 +172,7 @@ impl WindowKernelPartition for NtilePartition<'_> {
                 work.flush()?;
                 SelectedValues::try_new_observed::<KernelFailure>(
                     selection,
-                    &self.prepared.contract.result_type().data_type,
+                    self.prepared.contract.result_type().data_type(),
                     array,
                     Box::default(),
                     || work.step(),

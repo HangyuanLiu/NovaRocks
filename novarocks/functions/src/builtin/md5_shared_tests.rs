@@ -95,7 +95,9 @@ fn md5_family_actual_instances_keep_seven_causes_at_every_checkpoint_without_rep
         };
         let sources = arrays
             .iter()
-            .map(|array| FunctionValueType::new(array.data_type().clone(), true))
+            .map(|array| {
+                FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true)
+            })
             .collect::<Vec<_>>();
         let prepared = prepared(name, &sources);
         let rows = [0, 1, 2, 3];

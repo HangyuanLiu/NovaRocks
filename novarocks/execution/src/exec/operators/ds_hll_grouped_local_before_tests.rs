@@ -165,13 +165,13 @@ fn grouped_input(program: &LocalProgram, length: usize, nullable: bool) -> Chunk
 }
 fn estimates(output: &Chunk) -> BTreeMap<Option<i32>, i64> {
     let keys = output
-        .batch
+        .record_batch()
         .column(0)
         .as_any()
         .downcast_ref::<Int32Array>()
         .unwrap();
     let values = output
-        .batch
+        .record_batch()
         .column(1)
         .as_any()
         .downcast_ref::<Int64Array>()
@@ -199,13 +199,16 @@ fn two_partials(
     [
         run(
             &partial,
-            &[Chunk::new_like(source.batch.slice(0, split), source)],
+            &[Chunk::new_like(
+                source.record_batch().slice(0, split),
+                source,
+            )],
             tracker.clone(),
         ),
         run(
             &partial,
             &[Chunk::new_like(
-                source.batch.slice(split, source.len() - split),
+                source.record_batch().slice(split, source.len() - split),
                 source,
             )],
             tracker.clone(),
@@ -232,7 +235,7 @@ fn ds_hll_grouped_local_before_real_factories_native_100k() {
         let parts = two_partials(&program, &grouped_input(&program, 100_000, false), &tracker);
         for (driver, part) in parts.iter().enumerate() {
             let payloads = part
-                .batch
+                .record_batch()
                 .column(1)
                 .as_any()
                 .downcast_ref::<BinaryArray>()

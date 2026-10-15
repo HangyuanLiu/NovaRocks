@@ -27,7 +27,10 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::runtime::fragment::ExecutionResult;
+use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionFactory};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use novarocks_local_program::StaticLayout;
+use std::alloc::Layout;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,6 +59,59 @@ use novarocks_types::value::bitmap;
 const MAX_TABLE_FUNCTION_OUTPUT_ROWS: usize =
     novarocks_functions::generate_series_core::MAX_TABLE_FUNCTION_OUTPUT_ROWS;
 
+#[derive(Clone)]
+enum TableFunctionSchemaSource {
+    Legacy(ChunkSchemaRef),
+    Typed {
+        input: StaticLayout,
+        output: StaticLayout,
+    },
+}
+struct GeneratedColumns {
+    columns: Vec<ArrayRef>,
+    rows: usize,
+}
+
+/// Actual constructor sites in the unchanged payload algorithm. The typed
+/// caller assigns temporary scratch and retained wrapper responsibilities.
+enum TableFunctionConstructionStep<'a> {
+    Scratch(Layout),
+    OuterMap(usize),
+    PrimitiveIndex,
+    EndOperation,
+    Work(usize),
+    Take {
+        source: &'a dyn Array,
+        indices: &'a UInt32Array,
+    },
+    Mutable {
+        list: &'a ListArray,
+        counts: &'a [usize],
+        rows: usize,
+    },
+    Flat {
+        result: usize,
+        has_nulls: bool,
+    },
+    Null {
+        result: usize,
+        rows: usize,
+    },
+    Empty(usize),
+    EmptyOuter(SlotId),
+}
+struct TableFunctionConstruction<'a, E> {
+    observe: Option<&'a mut dyn FnMut(TableFunctionConstructionStep<'_>) -> Result<(), E>>,
+}
+impl<E> TableFunctionConstruction<'_, E> {
+    fn step(&mut self, step: TableFunctionConstructionStep<'_>) -> Result<(), E> {
+        match self.observe.as_mut() {
+            Some(observe) => observe(step),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Factory for table-function processors that expand each input row to variable output rows.
 pub struct TableFunctionProcessorFactory {
     name: String,
@@ -67,7 +123,7 @@ pub struct TableFunctionProcessorFactory {
     is_left_join: bool,
     param_types: Vec<DataType>,
     ret_types: Vec<DataType>,
-    output_chunk_schema: ChunkSchemaRef,
+    schema_source: TableFunctionSchemaSource,
     output_slot_sources: Vec<TableFunctionOutputSlot>,
 }
 
@@ -101,9 +157,49 @@ impl TableFunctionProcessorFactory {
             is_left_join,
             param_types,
             ret_types,
-            output_chunk_schema,
+            schema_source: TableFunctionSchemaSource::Legacy(output_chunk_schema),
             output_slot_sources,
         }
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The original table function facts and complete input/output templates stay distinct."
+    )]
+    pub(crate) fn new_typed(
+        node_id: i32,
+        function_name: String,
+        param_slots: Vec<SlotId>,
+        outer_slots: Vec<SlotId>,
+        fn_result_slots: Vec<SlotId>,
+        fn_result_required: bool,
+        is_left_join: bool,
+        param_types: Vec<DataType>,
+        ret_types: Vec<DataType>,
+        input: StaticLayout,
+        output: StaticLayout,
+        output_slot_sources: Vec<TableFunctionOutputSlot>,
+    ) -> Result<Self, String> {
+        if !input.is_typed() || !output.is_typed() {
+            return Err("native table function requires complete input/output declarations".into());
+        }
+        let name = if node_id >= 0 {
+            format!("TableFunction (id={node_id})")
+        } else {
+            "TableFunction".into()
+        };
+        Ok(Self {
+            name,
+            function_name,
+            param_slots,
+            outer_slots,
+            fn_result_slots,
+            fn_result_required,
+            is_left_join,
+            param_types,
+            ret_types,
+            schema_source: TableFunctionSchemaSource::Typed { input, output },
+            output_slot_sources,
+        })
     }
 }
 
@@ -123,7 +219,12 @@ impl OperatorFactory for TableFunctionProcessorFactory {
             is_left_join: self.is_left_join,
             param_types: self.param_types.clone(),
             ret_types: self.ret_types.clone(),
-            output_chunk_schema: Arc::clone(&self.output_chunk_schema),
+            schema_source: self.schema_source.clone(),
+            output_chunk_schema: match &self.schema_source {
+                TableFunctionSchemaSource::Legacy(schema) => Some(schema.clone()),
+                TableFunctionSchemaSource::Typed { .. } => None,
+            },
+            construction: None,
             output_slot_sources: self.output_slot_sources.clone(),
             output_chunk: None,
             output_offset: 0,
@@ -144,7 +245,9 @@ struct TableFunctionProcessorOperator {
     is_left_join: bool,
     param_types: Vec<DataType>,
     ret_types: Vec<DataType>,
-    output_chunk_schema: ChunkSchemaRef,
+    schema_source: TableFunctionSchemaSource,
+    output_chunk_schema: Option<ChunkSchemaRef>,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
     output_slot_sources: Vec<TableFunctionOutputSlot>,
     output_chunk: Option<Chunk>,
     output_offset: usize,
@@ -154,6 +257,26 @@ struct TableFunctionProcessorOperator {
 }
 
 impl Operator for TableFunctionProcessorOperator {
+    fn creates_typed_storage(&self) -> bool {
+        matches!(self.schema_source, TableFunctionSchemaSource::Typed { .. })
+    }
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.construction = Some(factory);
+    }
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        if let TableFunctionSchemaSource::Typed { output, .. } = &self.schema_source {
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?;
+            let owner = factory.begin_compiled_layout_construction(output)?;
+            self.validate_typed_declarations(owner.as_ref())?;
+            self.output_chunk_schema = Some(factory.create_compiled_chunk_schema(output)?);
+        }
+        self.validate_config()?;
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -197,13 +320,29 @@ impl ProcessorOperator for TableFunctionProcessorOperator {
         }
         self.validate_config()?;
         if chunk.is_empty() {
+            if self.creates_typed_storage() {
+                let output = self
+                    .output_chunk_schema
+                    .as_ref()
+                    .ok_or(ConstructionFailure::MissingOwner)?;
+                let owner = self
+                    .construction
+                    .as_ref()
+                    .ok_or(ConstructionFailure::MissingOwner)?
+                    .begin_typed_construction(output)?;
+                self.validate_typed_input(&chunk, owner.as_ref())?;
+            }
             self.emit_empty_once = true;
             self.output_chunk = None;
             self.output_offset = 0;
             return Ok(());
         }
 
-        let output = self.build_output_chunk(&chunk)?;
+        let output = if matches!(self.schema_source, TableFunctionSchemaSource::Typed { .. }) {
+            self.build_output_chunk_typed(&chunk)?
+        } else {
+            self.build_output_chunk(&chunk)?
+        };
         if output.is_empty() {
             self.emit_empty_once = true;
             self.output_chunk = None;
@@ -224,7 +363,11 @@ impl ProcessorOperator for TableFunctionProcessorOperator {
             if self.finishing && self.output_chunk.is_none() {
                 self.finished = true;
             }
-            return Ok(Some(self.empty_output_chunk()?));
+            return Ok(Some(if self.creates_typed_storage() {
+                self.empty_output_chunk_typed()?
+            } else {
+                self.empty_output_chunk()?
+            }));
         }
 
         let Some(output) = self.output_chunk.as_ref() else {
@@ -235,7 +378,21 @@ impl ProcessorOperator for TableFunctionProcessorOperator {
             return Ok(None);
         }
         let take_len = state.chunk_size().min(total - self.output_offset);
-        let slice = output.slice(self.output_offset, take_len);
+        let slice = if matches!(self.schema_source, TableFunctionSchemaSource::Typed { .. }) {
+            let owner = self
+                .construction
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?
+                .begin_input_construction(output)?;
+            output.slice_typed_observed::<ConstructionFailure, _>(
+                self.output_offset,
+                take_len,
+                owner.storage_lifetime(),
+                |step| owner.observe(0, &[], step),
+            )?
+        } else {
+            output.slice(self.output_offset, take_len)
+        };
         self.output_offset += take_len;
         if self.output_offset >= total {
             self.output_chunk = None;
@@ -257,6 +414,29 @@ impl ProcessorOperator for TableFunctionProcessorOperator {
 }
 
 impl TableFunctionProcessorOperator {
+    fn schema(&self) -> Result<&ChunkSchemaRef, String> {
+        self.output_chunk_schema
+            .as_ref()
+            .ok_or_else(|| "table function schema was not prepared".into())
+    }
+    fn build_output_chunk(&self, chunk: &Chunk) -> Result<Chunk, String> {
+        let generated = self.build_output_columns::<String>(
+            chunk,
+            &mut |count| Ok(Vec::with_capacity(count)),
+            &mut TableFunctionConstruction { observe: None },
+        )?;
+        Chunk::try_new_with_columns(self.schema()?.clone(), generated.columns)
+            .map_err(|cause| format!("table function build batch failed: {cause}"))
+    }
+    fn empty_output_chunk(&self) -> Result<Chunk, String> {
+        let generated = self.empty_output_columns::<String>(
+            &mut |count| Ok(Vec::with_capacity(count)),
+            &mut TableFunctionConstruction { observe: None },
+        )?;
+        Chunk::try_new_with_columns(self.schema()?.clone(), generated.columns)
+            .map_err(|cause| format!("table function build empty batch failed: {cause}"))
+    }
+
     fn validate_config(&self) -> Result<(), String> {
         if self.param_slots.len() != self.param_types.len() {
             return Err(format!(
@@ -272,31 +452,47 @@ impl TableFunctionProcessorOperator {
                 self.ret_types.len()
             ));
         }
-        if self.output_slot_sources.len() != self.output_chunk_schema.slot_ids().len() {
+        if self.output_slot_sources.len() != self.schema()?.slot_ids().len() {
             return Err(format!(
                 "table function output mapping mismatch: slots={} sources={}",
-                self.output_chunk_schema.slot_ids().len(),
+                self.schema()?.slot_ids().len(),
                 self.output_slot_sources.len()
             ));
         }
         Ok(())
     }
 
-    fn build_output_chunk(&self, chunk: &Chunk) -> Result<Chunk, String> {
-        let func = self.function_name.to_ascii_lowercase();
-        match func.as_str() {
-            "unnest" => self.build_output_chunk_unnest(chunk),
-            "unnest_bitmap" => self.build_output_chunk_unnest_bitmap(chunk),
-            "subdivide_bitmap" => self.build_output_chunk_subdivide_bitmap(chunk),
-            "generate_series" => self.build_output_chunk_generate_series(chunk),
-            _ => Err(format!(
-                "unsupported table function: {}",
-                self.function_name
-            )),
+    fn build_output_columns<E: From<String>>(
+        &self,
+        chunk: &Chunk,
+        vector: &mut impl FnMut(usize) -> Result<Vec<ArrayRef>, E>,
+        construction: &mut TableFunctionConstruction<'_, E>,
+    ) -> Result<GeneratedColumns, E> {
+        // The original case-insensitive dispatch borrows the frozen label;
+        // no temporary lowercase String is needed by the actual operator.
+        if self.function_name.eq_ignore_ascii_case("unnest") {
+            self.build_output_columns_unnest(chunk, vector, construction)
+        } else if self.function_name.eq_ignore_ascii_case("unnest_bitmap") {
+            self.build_output_columns_unnest_bitmap(chunk, vector, construction)
+        } else if self.function_name.eq_ignore_ascii_case("subdivide_bitmap") {
+            self.build_output_columns_subdivide_bitmap(chunk, vector, construction)
+        } else if self.function_name.eq_ignore_ascii_case("generate_series") {
+            self.build_output_columns_generate_series(chunk, vector, construction)
+        } else {
+            Err(format!("unsupported table function: {}", self.function_name).into())
         }
     }
 
-    fn build_output_chunk_unnest(&self, chunk: &Chunk) -> Result<Chunk, String> {
+    fn build_output_columns_unnest<E: From<String>>(
+        &self,
+        chunk: &Chunk,
+        vector: &mut impl FnMut(usize) -> Result<Vec<ArrayRef>, E>,
+        construction: &mut TableFunctionConstruction<'_, E>,
+    ) -> Result<GeneratedColumns, E> {
+        construction.step(TableFunctionConstructionStep::Scratch(
+            Layout::array::<ArrayRef>(self.param_slots.len())
+                .map_err(|_| "table function source reference extent overflow".to_string())?,
+        ))?;
         let mut list_cols = Vec::with_capacity(self.param_slots.len());
         for (idx, slot) in self.param_slots.iter().enumerate() {
             let col = chunk.column_by_slot_id(*slot)?;
@@ -304,10 +500,15 @@ impl TableFunctionProcessorOperator {
                 return Err(format!(
                     "table function unnest param {idx} expects ListArray, got {:?}",
                     col.data_type()
-                ));
+                )
+                .into());
             }
             list_cols.push(col);
         }
+        construction.step(TableFunctionConstructionStep::Scratch(
+            Layout::array::<&ListArray>(list_cols.len())
+                .map_err(|_| "table function source reference extent overflow".to_string())?,
+        ))?;
         let list_args: Vec<&ListArray> = list_cols
             .iter()
             .map(|col| {
@@ -324,38 +525,61 @@ impl TableFunctionProcessorOperator {
         };
         let total_output_rows: usize = row_counts.iter().sum();
         if total_output_rows > u32::MAX as usize {
-            return Err("table function output too large".to_string());
+            return Err("table function output too large".to_string().into());
         }
         if total_output_rows == 0 {
-            return self.empty_output_chunk();
+            return self.empty_output_columns(vector, construction);
         }
 
         let row_indices = build_row_indices(&row_counts)?;
 
-        let outer_columns = self.build_outer_columns(chunk, &row_indices)?;
+        let outer_columns = self.build_outer_columns(chunk, &row_indices, construction)?;
         let result_columns = if self.fn_result_required {
             if list_args.len() == 1 {
+                construction.step(TableFunctionConstructionStep::Scratch(
+                    Layout::array::<ArrayRef>(1).map_err(|_| {
+                        "table function result reference extent overflow".to_string()
+                    })?,
+                ))?;
                 vec![self.build_result_column_single(
                     list_args[0],
                     &row_counts,
                     total_output_rows,
+                    construction,
                 )?]
             } else {
-                self.build_result_columns_multi(&list_args, &row_counts, total_output_rows)?
+                self.build_result_columns_multi(
+                    &list_args,
+                    &row_counts,
+                    total_output_rows,
+                    construction,
+                )?
             }
         } else {
             Vec::new()
         };
 
-        self.assemble_output_chunk(outer_columns, result_columns)
+        self.assemble_output_columns(
+            outer_columns,
+            result_columns,
+            total_output_rows,
+            vector,
+            construction,
+        )
     }
 
-    fn build_output_chunk_unnest_bitmap(&self, chunk: &Chunk) -> Result<Chunk, String> {
+    fn build_output_columns_unnest_bitmap<E: From<String>>(
+        &self,
+        chunk: &Chunk,
+        vector: &mut impl FnMut(usize) -> Result<Vec<ArrayRef>, E>,
+        construction: &mut TableFunctionConstruction<'_, E>,
+    ) -> Result<GeneratedColumns, E> {
         if self.param_slots.len() != 1 {
             return Err(format!(
                 "table function unnest_bitmap expects 1 arg, got {}",
                 self.param_slots.len()
-            ));
+            )
+            .into());
         }
         let bitmap_col = chunk.column_by_slot_id(self.param_slots[0])?;
         let bitmap_arr = bitmap_col
@@ -404,21 +628,30 @@ impl TableFunctionProcessorOperator {
 
         let total_output_rows: usize = row_counts.iter().sum();
         if total_output_rows > u32::MAX as usize {
-            return Err("table function output too large".to_string());
+            return Err("table function output too large".to_string().into());
         }
         if total_output_rows == 0 {
-            return self.empty_output_chunk();
+            return self.empty_output_columns(vector, construction);
         }
 
         let row_indices = build_row_indices(&row_counts)?;
-        let outer_columns = self.build_outer_columns(chunk, &row_indices)?;
+        let outer_columns = self.build_outer_columns(chunk, &row_indices, construction)?;
         let result_columns = if self.fn_result_required {
             if !matches!(self.ret_types.first(), Some(DataType::Int64)) {
                 return Err(format!(
                     "table function unnest_bitmap return type expects BIGINT, got {:?}",
                     self.ret_types.first()
-                ));
+                )
+                .into());
             }
+            construction.step(TableFunctionConstructionStep::Scratch(
+                Layout::array::<ArrayRef>(1)
+                    .map_err(|_| "table function result reference extent overflow".to_string())?,
+            ))?;
+            construction.step(TableFunctionConstructionStep::Flat {
+                result: 0,
+                has_nulls: self.is_left_join,
+            })?;
             let mut builder = Int64Builder::new();
             for (row, count) in row_counts.iter().enumerate() {
                 if *count == 0 {
@@ -441,15 +674,27 @@ impl TableFunctionProcessorOperator {
         } else {
             Vec::new()
         };
-        self.assemble_output_chunk(outer_columns, result_columns)
+        self.assemble_output_columns(
+            outer_columns,
+            result_columns,
+            total_output_rows,
+            vector,
+            construction,
+        )
     }
 
-    fn build_output_chunk_subdivide_bitmap(&self, chunk: &Chunk) -> Result<Chunk, String> {
+    fn build_output_columns_subdivide_bitmap<E: From<String>>(
+        &self,
+        chunk: &Chunk,
+        vector: &mut impl FnMut(usize) -> Result<Vec<ArrayRef>, E>,
+        construction: &mut TableFunctionConstruction<'_, E>,
+    ) -> Result<GeneratedColumns, E> {
         if self.param_slots.len() != 2 {
             return Err(format!(
                 "table function subdivide_bitmap expects 2 args, got {}",
                 self.param_slots.len()
-            ));
+            )
+            .into());
         }
         let bitmap_col = chunk.column_by_slot_id(self.param_slots[0])?;
         let size_col = chunk.column_by_slot_id(self.param_slots[1])?;
@@ -502,21 +747,30 @@ impl TableFunctionProcessorOperator {
 
         let total_output_rows: usize = row_counts.iter().sum();
         if total_output_rows > u32::MAX as usize {
-            return Err("table function output too large".to_string());
+            return Err("table function output too large".to_string().into());
         }
         if total_output_rows == 0 {
-            return self.empty_output_chunk();
+            return self.empty_output_columns(vector, construction);
         }
 
         let row_indices = build_row_indices(&row_counts)?;
-        let outer_columns = self.build_outer_columns(chunk, &row_indices)?;
+        let outer_columns = self.build_outer_columns(chunk, &row_indices, construction)?;
         let result_columns = if self.fn_result_required {
             if !matches!(self.ret_types.first(), Some(DataType::Binary)) {
                 return Err(format!(
                     "table function subdivide_bitmap return type expects Binary, got {:?}",
                     self.ret_types.first()
-                ));
+                )
+                .into());
             }
+            construction.step(TableFunctionConstructionStep::Scratch(
+                Layout::array::<ArrayRef>(1)
+                    .map_err(|_| "table function result reference extent overflow".to_string())?,
+            ))?;
+            construction.step(TableFunctionConstructionStep::Flat {
+                result: 0,
+                has_nulls: self.is_left_join,
+            })?;
             let mut builder = BinaryBuilder::new();
             for (row, count) in row_counts.iter().enumerate() {
                 if *count == 0 {
@@ -539,15 +793,27 @@ impl TableFunctionProcessorOperator {
         } else {
             Vec::new()
         };
-        self.assemble_output_chunk(outer_columns, result_columns)
+        self.assemble_output_columns(
+            outer_columns,
+            result_columns,
+            total_output_rows,
+            vector,
+            construction,
+        )
     }
 
-    fn build_output_chunk_generate_series(&self, chunk: &Chunk) -> Result<Chunk, String> {
+    fn build_output_columns_generate_series<E: From<String>>(
+        &self,
+        chunk: &Chunk,
+        vector: &mut impl FnMut(usize) -> Result<Vec<ArrayRef>, E>,
+        construction: &mut TableFunctionConstruction<'_, E>,
+    ) -> Result<GeneratedColumns, E> {
         if !(self.param_slots.len() == 2 || self.param_slots.len() == 3) {
             return Err(format!(
                 "table function generate_series expects 2 or 3 args, got {}",
                 self.param_slots.len()
-            ));
+            )
+            .into());
         }
         let start_col = chunk.column_by_slot_id(self.param_slots[0])?;
         let end_col = chunk.column_by_slot_id(self.param_slots[1])?;
@@ -557,33 +823,72 @@ impl TableFunctionProcessorOperator {
             None
         };
 
-        let expansion = novarocks_functions::generate_series_core::expand(
+        let expansion = novarocks_functions::generate_series_core::expand_observed(
             &start_col,
             &end_col,
             step_col.as_ref(),
             chunk.len(),
             self.is_left_join,
-        )?;
+            &mut |event| {
+                construction.step(TableFunctionConstructionStep::Work(match event {
+                novarocks_functions::generate_series_core::SeriesObservation::Step => 1,
+                novarocks_functions::generate_series_core::SeriesObservation::OpaqueBoundary => 0,
+            }))
+            },
+        )
+        .map_err(|failure| match failure {
+            novarocks_functions::generate_series_core::SeriesFailure::Data(message) => {
+                E::from(message)
+            }
+            novarocks_functions::generate_series_core::SeriesFailure::Control(cause) => cause,
+        })?;
         if expansion.total_rows == 0 {
-            return self.empty_output_chunk();
+            return self.empty_output_columns(vector, construction);
         }
         let row_indices = build_row_indices(&expansion.row_counts)?;
-        let outer_columns = self.build_outer_columns(chunk, &row_indices)?;
+        let outer_columns = self.build_outer_columns(chunk, &row_indices, construction)?;
         let result_columns = if self.fn_result_required {
-            vec![self.generate_series_result_column(expansion.values)?]
+            construction.step(TableFunctionConstructionStep::Scratch(
+                Layout::array::<ArrayRef>(1)
+                    .map_err(|_| "table function result reference extent overflow".to_string())?,
+            ))?;
+            if self.ret_types.first().is_some() {
+                construction.step(TableFunctionConstructionStep::Flat {
+                    result: 0,
+                    has_nulls: expansion.values.iter().any(Option::is_none),
+                })?;
+            }
+            vec![novarocks_functions::generate_series_core::result_column_observed(
+                expansion.values, &self.ret_types,
+                &mut |event| construction.step(TableFunctionConstructionStep::Work(match event {
+                    novarocks_functions::generate_series_core::SeriesObservation::Step => 1,
+                    novarocks_functions::generate_series_core::SeriesObservation::OpaqueBoundary => 0,
+                })),
+            ).map_err(|failure| match failure {
+                novarocks_functions::generate_series_core::SeriesFailure::Data(message) => E::from(message),
+                novarocks_functions::generate_series_core::SeriesFailure::Control(cause) => cause,
+            })?]
         } else {
             Vec::new()
         };
-        self.assemble_output_chunk(outer_columns, result_columns)
+        self.assemble_output_columns(
+            outer_columns,
+            result_columns,
+            expansion.total_rows,
+            vector,
+            construction,
+        )
     }
 
-    fn assemble_output_chunk(
+    fn assemble_output_columns<E: From<String>>(
         &self,
         outer_columns: HashMap<SlotId, ArrayRef>,
         result_columns: Vec<ArrayRef>,
-    ) -> Result<Chunk, String> {
-        let mut output_columns: Vec<ArrayRef> =
-            Vec::with_capacity(self.output_chunk_schema.slot_ids().len());
+        rows: usize,
+        vector: &mut impl FnMut(usize) -> Result<Vec<ArrayRef>, E>,
+        _construction: &mut TableFunctionConstruction<'_, E>,
+    ) -> Result<GeneratedColumns, E> {
+        let mut output_columns = vector(self.schema()?.slot_ids().len())?;
         for source in &self.output_slot_sources {
             match source {
                 TableFunctionOutputSlot::Outer { slot } => {
@@ -601,21 +906,24 @@ impl TableFunctionProcessorOperator {
             }
         }
 
-        // Chunk alignment derives carrier/nullability facts from the exact
-        // output field owners. Rebuilding equal Fields here loses provenance.
-        Chunk::try_new_with_columns(Arc::clone(&self.output_chunk_schema), output_columns)
-            .map_err(|e| format!("table function build batch failed: {e}"))
+        Ok(GeneratedColumns {
+            columns: output_columns,
+            rows,
+        })
     }
 
-    fn empty_output_chunk(&self) -> Result<Chunk, String> {
-        let columns = self
-            .output_chunk_schema
-            .slots()
-            .iter()
-            .map(|slot| new_empty_array(slot.data_type()))
-            .collect();
-        Chunk::try_new_with_columns(Arc::clone(&self.output_chunk_schema), columns)
-            .map_err(|e| format!("table function build empty batch failed: {e}"))
+    fn empty_output_columns<E: From<String>>(
+        &self,
+        vector: &mut impl FnMut(usize) -> Result<Vec<ArrayRef>, E>,
+        construction: &mut TableFunctionConstruction<'_, E>,
+    ) -> Result<GeneratedColumns, E> {
+        let schema = self.schema()?;
+        let mut columns = vector(schema.slots().len())?;
+        for (ordinal, slot) in schema.slots().iter().enumerate() {
+            construction.step(TableFunctionConstructionStep::Empty(ordinal))?;
+            columns.push(new_empty_array(slot.data_type()));
+        }
+        Ok(GeneratedColumns { columns, rows: 0 })
     }
 
     fn int_like_arg_to_i128(
@@ -696,40 +1004,61 @@ impl TableFunctionProcessorOperator {
         Ok(counts)
     }
 
-    fn build_outer_columns(
+    fn build_outer_columns<E: From<String>>(
         &self,
         chunk: &Chunk,
         row_indices: &[u32],
-    ) -> Result<HashMap<SlotId, ArrayRef>, String> {
+        construction: &mut TableFunctionConstruction<'_, E>,
+    ) -> Result<HashMap<SlotId, ArrayRef>, E> {
+        construction.step(TableFunctionConstructionStep::OuterMap(
+            self.outer_slots.len(),
+        ))?;
         let mut out = HashMap::with_capacity(self.outer_slots.len());
         let idx_array = if row_indices.is_empty() {
             None
         } else {
+            construction.step(TableFunctionConstructionStep::PrimitiveIndex)?;
             Some(UInt32Array::from(row_indices.to_vec()))
         };
         for slot in &self.outer_slots {
             let col = chunk.column_by_slot_id(*slot)?;
             let out_col = match idx_array.as_ref() {
-                Some(idx) => take(col.as_ref(), idx, None).map_err(|e| e.to_string())?,
-                None => new_empty_array(col.data_type()),
+                Some(idx) => {
+                    construction.step(TableFunctionConstructionStep::Take {
+                        source: col.as_ref(),
+                        indices: idx,
+                    })?;
+                    let output = take(col.as_ref(), idx, None).map_err(|e| e.to_string())?;
+                    construction.step(TableFunctionConstructionStep::EndOperation)?;
+                    output
+                }
+                None => {
+                    construction.step(TableFunctionConstructionStep::EmptyOuter(*slot))?;
+                    new_empty_array(col.data_type())
+                }
             };
             out.insert(*slot, out_col);
         }
         Ok(out)
     }
 
-    fn build_result_column_single(
+    fn build_result_column_single<E: From<String>>(
         &self,
         list: &ListArray,
         row_counts: &[usize],
         total_output_rows: usize,
-    ) -> Result<ArrayRef, String> {
+        construction: &mut TableFunctionConstruction<'_, E>,
+    ) -> Result<ArrayRef, E> {
         let values = list.values();
         let expected = self
             .ret_types
             .first()
             .ok_or_else(|| "table function missing return type".to_string())?;
         if matches!(expected, DataType::Null) {
+            construction.step(TableFunctionConstructionStep::Null {
+                result: 0,
+                rows: total_output_rows,
+            })?;
             return Ok(Arc::new(NullArray::new(total_output_rows)) as ArrayRef);
         }
         if values.data_type() != expected {
@@ -737,8 +1066,19 @@ impl TableFunctionProcessorOperator {
                 "table function unnest result type mismatch: expected {:?}, got {:?}",
                 expected,
                 values.data_type()
-            ));
+            )
+            .into());
         }
+        construction.step(TableFunctionConstructionStep::Mutable {
+            list,
+            counts: row_counts,
+            rows: total_output_rows,
+        })?;
+        construction.step(TableFunctionConstructionStep::Scratch(
+            Layout::array::<&arrow_data::ArrayData>(1).map_err(|_| {
+                "table function source packet reference extent overflow".to_string()
+            })?,
+        ))?;
         let data_storage = [values.to_data()];
         let data_refs: Vec<&arrow_data::ArrayData> = data_storage.iter().collect();
         let mut mutable = MutableArrayData::new(data_refs, true, total_output_rows);
@@ -755,7 +1095,9 @@ impl TableFunctionProcessorOperator {
             let start = offsets[row];
             let end = offsets[row + 1];
             if end < start {
-                return Err("table function unnest list offsets are invalid".to_string());
+                return Err("table function unnest list offsets are invalid"
+                    .to_string()
+                    .into());
             }
             let len = (end - start) as usize;
             if len == 0 && self.is_left_join {
@@ -769,15 +1111,22 @@ impl TableFunctionProcessorOperator {
                 mutable.extend_nulls(*count - len);
             }
         }
-        Ok(make_array(mutable.freeze()))
+        let output = make_array(mutable.freeze());
+        construction.step(TableFunctionConstructionStep::EndOperation)?;
+        Ok(output)
     }
 
-    fn build_result_columns_multi(
+    fn build_result_columns_multi<E: From<String>>(
         &self,
         lists: &[&ListArray],
         row_counts: &[usize],
         total_output_rows: usize,
-    ) -> Result<Vec<ArrayRef>, String> {
+        construction: &mut TableFunctionConstruction<'_, E>,
+    ) -> Result<Vec<ArrayRef>, E> {
+        construction.step(TableFunctionConstructionStep::Scratch(
+            Layout::array::<ArrayRef>(lists.len())
+                .map_err(|_| "table function result reference extent overflow".to_string())?,
+        ))?;
         let mut out = Vec::with_capacity(lists.len());
         for (col_idx, list) in lists.iter().enumerate() {
             let values = list.values();
@@ -786,6 +1135,10 @@ impl TableFunctionProcessorOperator {
                 .get(col_idx)
                 .ok_or_else(|| "table function missing return type".to_string())?;
             if matches!(expected, DataType::Null) {
+                construction.step(TableFunctionConstructionStep::Null {
+                    result: col_idx,
+                    rows: total_output_rows,
+                })?;
                 out.push(Arc::new(NullArray::new(total_output_rows)) as ArrayRef);
                 continue;
             }
@@ -794,8 +1147,19 @@ impl TableFunctionProcessorOperator {
                     "table function unnest result type mismatch: expected {:?}, got {:?}",
                     expected,
                     values.data_type()
-                ));
+                )
+                .into());
             }
+            construction.step(TableFunctionConstructionStep::Mutable {
+                list,
+                counts: row_counts,
+                rows: total_output_rows,
+            })?;
+            construction.step(TableFunctionConstructionStep::Scratch(
+                Layout::array::<&arrow_data::ArrayData>(1).map_err(|_| {
+                    "table function source packet reference extent overflow".to_string()
+                })?,
+            ))?;
             let data_storage = [values.to_data()];
             let data_refs: Vec<&arrow_data::ArrayData> = data_storage.iter().collect();
             let mut mutable = MutableArrayData::new(data_refs, true, total_output_rows);
@@ -812,7 +1176,9 @@ impl TableFunctionProcessorOperator {
                 let start = offsets[row];
                 let end = offsets[row + 1];
                 if end < start {
-                    return Err("table function unnest list offsets are invalid".to_string());
+                    return Err("table function unnest list offsets are invalid"
+                        .to_string()
+                        .into());
                 }
                 let len = (end - start) as usize;
                 if len == 0 && self.is_left_join && *count == 1 {
@@ -827,6 +1193,7 @@ impl TableFunctionProcessorOperator {
                 }
             }
             out.push(make_array(mutable.freeze()));
+            construction.step(TableFunctionConstructionStep::EndOperation)?;
         }
         Ok(out)
     }
@@ -905,3 +1272,13 @@ mod generate_series_original_baseline_tests;
 #[cfg(test)]
 #[path = "generate_series_shared_differential_tests.rs"]
 mod generate_series_shared_differential_tests;
+
+#[path = "typed_table_function.rs"]
+mod typed_table_function;
+
+#[cfg(test)]
+#[path = "typed_table_function_tests.rs"]
+mod typed_table_function_tests;
+
+#[path = "typed_table_function_construction.rs"]
+mod typed_table_function_construction;

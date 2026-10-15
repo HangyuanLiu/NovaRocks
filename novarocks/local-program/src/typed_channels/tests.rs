@@ -406,9 +406,9 @@ fn left_outer_table_projection_widens_only_projected_results_without_changing_fu
         .unwrap();
     });
     let mut channels = table_channels();
-    channels[1].1.nullable = true;
+    channels[1].1 = channels[1].1.with_nullable(true).unwrap();
     let typed = ProgramTypedChannels::try_new(source, channels, &Control::default()).unwrap();
-    assert!(typed.channel_type(output(1)).unwrap().nullable);
+    assert!(typed.channel_type(output(1)).unwrap().nullable());
     assert!(
         !typed
             .channel_type(ProgramChannelSite::TableResult {
@@ -416,7 +416,7 @@ fn left_outer_table_projection_widens_only_projected_results_without_changing_fu
                 result: 0
             })
             .unwrap()
-            .nullable
+            .nullable()
     );
 }
 
@@ -501,12 +501,12 @@ fn explicit_json_root_identity_is_required_without_inferring_it_from_plain_utf8(
         ProgramTypedChannels::try_new(source, vec![(output(0), json)], &Control::default())
             .unwrap();
     assert_eq!(
-        checked.channel_type(output(0)).unwrap().logical_type,
+        checked.channel_type(output(0)).unwrap().logical_type(),
         ValueLogicalType::Json
     );
 }
 #[test]
-fn nested_nullability_dictionary_identity_and_annotation_metadata_are_exact_channel_carriers() {
+fn nested_nullability_is_semantic_but_dictionary_ids_and_source_attributes_are_not() {
     #[allow(deprecated)]
     let nested = |id, nullable, annotation: &str| {
         DataType::Struct(
@@ -534,21 +534,26 @@ fn nested_nullability_dictionary_identity_and_annotation_metadata_are_exact_chan
         &Control::default(),
     )
     .unwrap();
-    for changed in [
-        nested(2, true, "first"),
-        nested(1, false, "first"),
-        nested(1, true, "changed"),
-    ] {
-        assert_eq!(
-            ProgramTypedChannels::try_new(
-                source.clone(),
-                vec![(output(0), FunctionValueType::new(changed, true))],
-                &Control::default()
-            )
-            .unwrap_err(),
-            ProgramChannelTypeError::TypeMismatch
-        );
+    for changed in [nested(2, true, "first"), nested(1, true, "changed")] {
+        ProgramTypedChannels::try_new(
+            source.clone(),
+            vec![(output(0), FunctionValueType::new(changed, true))],
+            &Control::default(),
+        )
+        .unwrap();
     }
+    assert_eq!(
+        ProgramTypedChannels::try_new(
+            source,
+            vec![(
+                output(0),
+                FunctionValueType::new(nested(1, false, "first"), true)
+            )],
+            &Control::default(),
+        )
+        .unwrap_err(),
+        ProgramChannelTypeError::TypeMismatch
+    );
 }
 struct OwnerControl;
 impl PureCompileControl for OwnerControl {
@@ -802,14 +807,14 @@ fn actual_join_side_and_scope_layouts_keep_separate_explicit_logical_domains() {
         checked
             .slot_type(ProgramNodeId::new(2), Role::JoinLeft, SlotId::new(1))
             .unwrap()
-            .logical_type,
+            .logical_type(),
         ValueLogicalType::Json
     );
     assert_eq!(
         checked
             .slot_type(ProgramNodeId::new(2), Role::JoinRight, SlotId::new(2))
             .unwrap()
-            .logical_type,
+            .logical_type(),
         ValueLogicalType::Physical
     );
     let mut missing = channels.clone();
@@ -1098,6 +1103,18 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
     };
     functions[0].inputs = vec![ProgramExprId::new(0), ProgramExprId::new(1)];
     functions[0].resolved = owner.signature();
+    // The adapted call has an independently declared order channel. Publish
+    // the actual ordered owner's complete selection, replacing the original
+    // one-argument fixture owner together with the revised signature.
+    functions[0].frozen = Some(Arc::new(
+        crate::FrozenAggregateSelection::try_new(
+            owner.declaration.function_id().clone(),
+            owner.selected.clone(),
+            1,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+    ));
     functions[0].order = StaticAggregateOrder {
         is_asc_order: vec![false],
         nulls_first: vec![false],
@@ -1172,8 +1189,8 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
             .order_argument_types()
             .next()
             .unwrap()
-            .data_type,
-        DataType::Int32
+            .data_type(),
+        &DataType::Int32
     );
     #[repr(C, align(64))]
     struct Storage([std::mem::MaybeUninit<u8>; 128]);
@@ -1217,4 +1234,156 @@ fn independent_order_tail_has_its_actual_complete_type_and_is_materialized_as_a_
         .unwrap_err(),
         ProgramChannelTypeError::TypeMismatch
     );
+}
+
+// The supplied owner is lifetime-only. Its observer records actual public
+// requests and locked opaque operation bounds, without manufacturing a grant.
+struct CreationHold(Arc<std::sync::atomic::AtomicUsize>);
+impl novarocks_type_contract::ValueTypeStorageHold for CreationHold {}
+impl Drop for CreationHold {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CreationEvent {
+    Layout(usize, usize),
+    Opaque(usize),
+}
+#[derive(Debug, Eq, PartialEq)]
+struct CallerRefusal {
+    operation: usize,
+    original: u64,
+}
+fn creation_storage(drops: &Arc<std::sync::atomic::AtomicUsize>) -> ValueTypeStorageLifetime {
+    ValueTypeStorageLifetime::held(Arc::new(CreationHold(drops.clone())))
+}
+
+#[test]
+fn created_channel_maps_and_independent_type_clones_retain_only_their_actual_owners() {
+    use novarocks_type_contract::{ValueKind, ValueLayout, ValueTypeRef};
+    let original_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let new_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let source_storage = creation_storage(&original_drops);
+    let ty = FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(
+            ValueKind::Scalar(DataType::Int64),
+            false,
+            source_storage.clone(),
+        )
+        .unwrap(),
+        ValueLayout::try_new(&DataType::Int64, source_storage.clone()).unwrap(),
+    )
+    .unwrap();
+    let source = writer();
+    let channels = writer_channels()
+        .into_iter()
+        .map(|(site, _)| (site, ty.clone()))
+        .collect::<Vec<_>>();
+    let expected =
+        ProgramTypedChannels::try_new(source.clone(), channels.clone(), &Control::default())
+            .unwrap();
+    let mut request = |_: std::alloc::Layout| -> Result<(), CallerRefusal> { Ok(()) };
+    let mut opaque = |_: usize| -> Result<(), CallerRefusal> { Ok(()) };
+    let mut creation =
+        ValueSchemaCreation::new(creation_storage(&new_drops), &mut request, &mut opaque);
+    let checked = ProgramTypedChannels::try_new_with_creator_in(
+        source,
+        channels,
+        &mut creation,
+        &Control::default(),
+    )
+    .unwrap();
+    assert_eq!(checked.channels(), expected.channels());
+    let independent_type = checked.channel_type(output(0)).unwrap().clone();
+    let late_map = checked.slots.clone();
+    drop(checked);
+    drop(creation);
+    drop(expected);
+    drop(ty);
+    drop(source_storage);
+    assert_eq!(new_drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(late_map);
+    assert_eq!(new_drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(original_drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(independent_type, i64_type(false));
+    drop(independent_type);
+    assert_eq!(original_drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+#[test]
+fn every_channel_quote_preserves_first_caller_payload_and_original_type_failure() {
+    let source = writer();
+    let channels = writer_channels();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let run = |fail_at: Option<usize>| {
+        seen.lock().unwrap().clear();
+        let events = seen.clone();
+        let mut request = move |layout: std::alloc::Layout| {
+            let mut events = events.lock().unwrap();
+            let operation = events.len();
+            events.push(CreationEvent::Layout(layout.size(), layout.align()));
+            if fail_at == Some(operation) {
+                Err(CallerRefusal {
+                    operation,
+                    original: 99,
+                })
+            } else {
+                Ok(())
+            }
+        };
+        let events = seen.clone();
+        let mut opaque = move |bytes| {
+            let mut events = events.lock().unwrap();
+            let operation = events.len();
+            events.push(CreationEvent::Opaque(bytes));
+            if fail_at == Some(operation) {
+                Err(CallerRefusal {
+                    operation,
+                    original: 99,
+                })
+            } else {
+                Ok(())
+            }
+        };
+        let mut creation =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+        ProgramTypedChannels::try_new_with_creator_in(
+            source.clone(),
+            channels.clone(),
+            &mut creation,
+            &Control::default(),
+        )
+    };
+    drop(run(None).unwrap());
+    let original = seen.lock().unwrap().clone();
+    assert_eq!(
+        original
+            .iter()
+            .filter(|e| matches!(e, CreationEvent::Layout(..)))
+            .count(),
+        2
+    );
+    for operation in 0..original.len() {
+        assert!(
+            matches!(run(Some(operation)),Err(ProgramCreationFailure::Creator(CallerRefusal{operation:at,original:99})) if at==operation)
+        );
+        assert_eq!(*seen.lock().unwrap(), original[..=operation]);
+    }
+    let mut wrong = channels;
+    wrong[0].1 = i64_type(true);
+    let mut request = |_| -> Result<(), CallerRefusal> { Ok(()) };
+    let mut opaque = |_| -> Result<(), CallerRefusal> { Ok(()) };
+    let mut creation =
+        ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+    assert!(matches!(
+        ProgramTypedChannels::try_new_with_creator_in(
+            source,
+            wrong,
+            &mut creation,
+            &Control::default()
+        ),
+        Err(ProgramCreationFailure::Owner(
+            ProgramChannelTypeError::TypeMismatch
+        ))
+    ));
 }

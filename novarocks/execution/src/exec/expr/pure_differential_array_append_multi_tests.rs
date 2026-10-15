@@ -88,8 +88,12 @@ fn pure_differential_append_dictionary_same_and_different_full_backing_domains()
         assert_eq!(result.legacy_batch_errors, 0);
     }
 }
+
+// Raw owner/profile and prepared-source replacement passed before retirement
+// of the superseded engine-ingress mismatch witnesses.
 #[test]
-fn pure_differential_append_view_constructor_retains_actual_source_buffer_mapping() {
+fn pure_differential_append_view_constructor_retains_actual_source_buffer_mapping_prepared_plain_views()
+ {
     let child: ArrayRef = Arc::new(StringViewArray::from(
         (0..ROWS)
             .map(|row| {
@@ -112,10 +116,26 @@ fn pure_differential_append_view_constructor_retains_actual_source_buffer_mappin
             })
             .collect::<Vec<_>>(),
     ));
-    let result = assert_scalar_matches_v1(
+    let result = super::assert_scalar_matches_v1_with_plain_views(
         ScalarDiffSpec::new("array_append")
-            .column(list(child))
-            .column(target)
+            .typed_column(
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::List(Arc::new(Field::new(
+                        "item",
+                        arrow::datatypes::DataType::Utf8View,
+                        true,
+                    ))),
+                    true,
+                ),
+                list(child),
+            )
+            .typed_column(
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Utf8View,
+                    true,
+                ),
+                target,
+            )
             .sparse_selections(7, 5382),
     );
     assert_eq!(result.attributed_row_errors, 0);

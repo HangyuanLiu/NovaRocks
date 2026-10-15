@@ -38,8 +38,11 @@ fn profile(name: &str, values: ArrayRef, nullable: bool, seed: u64) {
             .partitions(7, seed),
     );
     assert_eq!(summary.matched_failures, 0);
-    assert_eq!(summary.result_type.data_type, DataType::Int64);
-    assert_eq!(summary.pure_state_type.data_type, DataType::Binary);
+    assert_eq!(summary.result_type.data_type().clone(), DataType::Int64);
+    assert_eq!(
+        summary.pure_state_type.data_type().clone(),
+        DataType::Binary
+    );
     assert_eq!(summary.legacy_intermediate_type, DataType::Binary);
     assert_eq!(summary.null_results, 0);
 }

@@ -80,6 +80,7 @@ fn zero_policy() -> wire::SourceConstantPolicy {
 }
 fn request() -> wire::OriginalCallRequest {
     wire::OriginalCallRequest {
+        request_id: None,
         definition: Some(wire::CallRequestDefinition {
             kind: Some(wire::call_request_definition::Kind::ExpressionDefinitionId(
                 0,

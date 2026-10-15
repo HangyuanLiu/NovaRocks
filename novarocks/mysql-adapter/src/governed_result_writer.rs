@@ -361,7 +361,10 @@ pub(crate) mod streaming_result_tests {
     }
 
     pub(crate) fn string_fields() -> Vec<ResultField> {
-        vec![ResultField::new("value", DataType::Utf8, false, None)]
+        vec![ResultField::new(
+            "value",
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+        )]
     }
 
     pub(crate) fn text_body(value: &str) -> Vec<u8> {

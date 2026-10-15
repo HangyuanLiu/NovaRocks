@@ -1358,7 +1358,7 @@ mod tests {
     use arrow::array::{ArrayRef, Int32Array};
     use arrow::datatypes::{DataType, Field};
     use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-    use novarocks_execution::runtime::exchange::encode_chunks_bounded;
+    use novarocks_execution::runtime::exchange::encode_chunks_bounded_with_creation;
     use novarocks_execution::runtime::fragment::io::ResultAbort;
     use novarocks_types::SlotId;
     use novarocks_types::identity::{
@@ -1602,21 +1602,41 @@ mod tests {
     }
 
     fn test_typed_chunk() -> Chunk {
-        let slot_id = SlotId::new(1);
-        let schema = Arc::new(
-            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
-                slot_id,
-                Field::new("value", DataType::Int32, false),
-                None,
-                None,
-            )])
-            .expect("test chunk schema"),
-        );
-        Chunk::try_new_with_columns(
+        use novarocks_type_contract::{
+            TypedValueBinding, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+        };
+        let pure = ValueTypeStorageLifetime::pure();
+        let binding = TypedValueBinding::try_new(
+            ValueTypeRef::try_new(ValueKind::Scalar(DataType::Int32), false, pure.clone()).unwrap(),
+            ValueLayout::try_new(&DataType::Int32, pure.clone()).unwrap(),
+        )
+        .unwrap();
+        let slot = ChunkSlotSchema::try_new_typed(
+            SlotId::new(1),
+            Arc::new(Field::new("value", DataType::Int32, false)),
+            binding,
+            None,
+            pure.clone(),
+        )
+        .unwrap();
+        let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap());
+        Chunk::try_new_typed_with_columns_observed::<String, _>(
             schema,
             vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+            1,
+            |_| Ok(()),
         )
-        .expect("test chunk")
+        .unwrap()
+    }
+
+    struct ResultEncodingControl;
+    impl novarocks_functions::KernelEvaluationControl for ResultEncodingControl {
+        fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+            Ok(())
+        }
+        fn wait(&self, _: Duration) -> Result<(), novarocks_functions::KernelFailure> {
+            panic!("result encoding does not wait")
+        }
     }
 
     fn test_task_identity(seed: u32) -> TaskIdentity {
@@ -2231,8 +2251,19 @@ mod tests {
             None,
         )
         .expect("open stream");
-        let encoded = encode_chunks_bounded(&[test_typed_chunk()], true, cap.get())
-            .expect("bounded typed encoding");
+        let factory = novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            novarocks_execution::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            novarocks_execution::runtime::mem_tracker::MemTracker::new_root("result buffer encoding fixture"),
+            Arc::new(novarocks_execution::runtime::runtime_state::RuntimeErrorState::default()),
+        ).unwrap();
+        let encoded = encode_chunks_bounded_with_creation(
+            &[test_typed_chunk()],
+            true,
+            cap.get(),
+            factory.as_ref(),
+            &ResultEncodingControl,
+        )
+        .expect("bounded typed encoding");
         assert!(encoded.retained_bytes() > encoded.len());
         let retained_bytes = encoded.retained_bytes();
         let ResultWriteAdmission::Granted(credit) =

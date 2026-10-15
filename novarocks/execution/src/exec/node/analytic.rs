@@ -108,6 +108,7 @@ pub struct WindowFunctionSpec {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WindowAggregateBinding {
+    pub frozen: Option<std::sync::Arc<novarocks_local_program::FrozenAggregateSelection>>,
     pub function_name: String,
     pub resolved: ResolvedAggregateSignature,
 }

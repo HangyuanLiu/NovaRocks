@@ -98,7 +98,7 @@ fn fixture(nullable: bool, sorted: bool) -> ArrayRef {
         ],
         None,
     );
-    Arc::new(MapArray::new(
+    let external: ArrayRef = Arc::new(MapArray::new(
         Arc::new(
             Field::new("entries", entries.data_type().clone(), false)
                 .with_metadata([("entry-fact".into(), "preserved".into())].into()),
@@ -107,10 +107,17 @@ fn fixture(nullable: bool, sorted: bool) -> ArrayRef {
         entries,
         nullable.then(|| NullBuffer::from(vec![true, true, false, true])),
         sorted,
-    ))
+    ));
+    let binding = FunctionValueType::try_with_logical_type(
+        external.data_type().clone(),
+        nullable,
+        novarocks_type_contract::ValueLogicalType::Physical,
+    )
+    .unwrap();
+    crate::test_value_ingress::array_for_binding(&external, &binding).unwrap()
 }
 fn source(a: &ArrayRef, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(a.data_type().clone(), nullable)
+    FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), nullable)
 }
 fn prepared(
     types: &[FunctionValueType],
@@ -304,7 +311,7 @@ fn map_size_every_actual_compile_callback_preserves_three_causes_and_named_refus
         vec![FunctionValueType::new(DataType::Int32, true)],
     ] {
         let good = Compile::default();
-        let success = types[0].data_type == *a.data_type();
+        let success = *types[0].data_type() == *a.data_type();
         assert_eq!(prepared(&types, &good).is_ok(), success);
         let trace = good.trace.lock().unwrap().clone();
         assert!(!trace.is_empty());

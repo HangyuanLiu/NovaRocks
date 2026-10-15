@@ -255,9 +255,14 @@ fn percentile_union_private_full_type_data_null_and_sparse_constant_addresses() 
         let mut state = k
             .create_state_with_allocator(Some(host.clone()), &Control::default())
             .unwrap();
+        let expected_input = crate::test_value_ingress::array_for_binding(
+            &values[0],
+            k.contract.logical_argument_types().next().unwrap(),
+        )
+        .unwrap();
         let expected = core::merge_row(
             &mut digest::PercentileState::default(),
-            &values[0],
+            &expected_input,
             2,
             Diagnostic::UnweightedUpdate,
         )
@@ -313,7 +318,8 @@ fn percentile_union_private_full_type_data_null_and_sparse_constant_addresses() 
     let mut state = k
         .create_state_with_allocator(Some(host.clone()), &Control::default())
         .unwrap();
-    let ty = FunctionValueType::new(values[0].data_type().clone(), true);
+    let ty =
+        FunctionValueType::from_legacy_declared_projection(values[0].data_type().clone(), true);
     let pool = ConstantPool::try_new(
         Arc::new(ty.try_to_field("packed-original").unwrap()),
         ty,
@@ -643,7 +649,7 @@ fn percentile_union_private_compile_three_real_source_causes() {
 }
 
 #[test]
-fn percentile_union_private_original_oversized_field_guard_is_resource() {
+fn percentile_union_private_source_anonymous_names_are_not_execution_parameters() {
     let ty = DataType::List(Arc::new(Field::new(
         "unsupported".repeat(180),
         DataType::UInt32,
@@ -655,22 +661,26 @@ fn percentile_union_private_original_oversized_field_guard_is_resource() {
     assert!(field.name().len() > novarocks_type_contract::MAX_ARROW_FIELD_NAME_BYTES);
     let catalog = super::super::super::catalogue::percentile_union_private_test_catalog();
     let args = [FunctionArgument::Value {
-        value_type: FunctionValueType::new(ty, true),
+        value_type: FunctionValueType::from_legacy_declared_projection(ty, true),
         constant: None,
     }];
-    assert_eq!(
-        catalog
-            .resolve_bound_user(
-                "percentile_union",
-                FunctionKind::Aggregate,
-                FunctionBindingRequest {
-                    arguments: &args,
-                    logical_argument_count: 1,
-                    expected_result_type: None
-                },
-                &Compile
-            )
-            .unwrap_err(),
-        FunctionBindingError::Control(CompileControlError::ResourceExhausted)
-    );
+    let bound = catalog
+        .resolve_bound_user(
+            "percentile_union",
+            FunctionKind::Aggregate,
+            FunctionBindingRequest {
+                arguments: &args,
+                logical_argument_count: 1,
+                expected_result_type: None,
+            },
+            &Compile,
+        )
+        .unwrap();
+    let FunctionArgumentType::Value(selected) = &bound.selected.argument_types[0] else {
+        panic!("value argument")
+    };
+    let DataType::List(item) = selected.data_type() else {
+        panic!("list layout")
+    };
+    assert_eq!(item.name(), "item");
 }

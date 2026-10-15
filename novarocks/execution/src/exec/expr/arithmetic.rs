@@ -1068,8 +1068,8 @@ mod legacy_signed_prepared_oracle_tests {
         )
         .unwrap();
         let schema = Arc::new(Schema::new(vec![
-            Field::new("left", left_type.data_type.clone(), true),
-            Field::new("right", right_type.data_type.clone(), true),
+            Field::new("left", left_type.data_type().clone(), true),
+            Field::new("right", right_type.data_type().clone(), true),
         ]));
         let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
         let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
@@ -1080,8 +1080,14 @@ mod legacy_signed_prepared_oracle_tests {
         let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
         let mut arena = ExprArena::default();
         arena.set_allow_throw_exception(allow);
-        let left = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), left_type.data_type);
-        let right = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), right_type.data_type);
+        let left = arena.push_typed(
+            ExprNode::SlotId(SlotId::new(1)),
+            left_type.data_type().clone(),
+        );
+        let right = arena.push_typed(
+            ExprNode::SlotId(SlotId::new(2)),
+            right_type.data_type().clone(),
+        );
         let kind = match op {
             ArithmeticOperator::Add => ExprNode::Add(left, right, policy),
             ArithmeticOperator::Subtract => ExprNode::Sub(left, right, policy),
@@ -1089,7 +1095,7 @@ mod legacy_signed_prepared_oracle_tests {
             ArithmeticOperator::Divide => ExprNode::Div(left, right, policy),
             ArithmeticOperator::Modulo => ExprNode::Mod(left, right, policy),
         };
-        let id = arena.push_typed(kind, result.data_type);
+        let id = arena.push_typed(kind, result.data_type().clone());
         (arena, id, chunk, recipe)
     }
 
@@ -1190,7 +1196,10 @@ mod legacy_signed_prepared_oracle_tests {
                         false,
                     );
                     let legacy = arena.eval(id, &chunk).unwrap();
-                    assert_eq!(legacy.data_type(), &recipe.result_type().data_type);
+                    assert_eq!(
+                        legacy.data_type().clone(),
+                        recipe.result_type().data_type().clone()
+                    );
                     for row in 0..left.len() {
                         assert_same_row(&legacy, row, prepared_row(&recipe, &left, &right, row));
                     }
@@ -1264,6 +1273,7 @@ mod legacy_signed_prepared_oracle_tests {
         }
     }
 }
+
 #[cfg(test)]
 #[path = "arithmetic_decimal_oracle_tests.rs"]
 mod arithmetic_decimal_oracle_tests;

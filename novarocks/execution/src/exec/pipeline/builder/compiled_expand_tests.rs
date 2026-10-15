@@ -165,7 +165,7 @@ fn compiled_repeat_expands_each_row_per_grouping_set_with_exact_grouping_values(
     // The output is exactly the frozen layout: widened keys, Int64 groupings.
     let layout = program.graph().nodes()[1].output_layout();
     for chunk in &chunks {
-        assert_eq!(chunk.batch.schema(), layout.schema().clone());
+        assert_eq!(chunk.record_batch().schema(), layout.schema().clone());
     }
     let mut rows = int64_rows(&chunks);
     let mut expected = repeat_oracle();
@@ -182,6 +182,62 @@ fn compiled_repeat_factory_refuses_a_node_that_is_not_a_repeat() {
         Err(error) => error,
     };
     assert!(error.contains("is not a Repeat"), "{error}");
+}
+
+#[test]
+fn compiled_repeat_prepare_requires_actual_creator_and_releases_schema_at_last_reference() {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::runtime::fragment::ExecutionFailureCause;
+    use crate::runtime::mem_tracker::MemTracker;
+    let program = repeat_program();
+    let factory = CompiledRepeatProcessorFactory::try_new(&program, ProgramNodeId::new(1)).unwrap();
+    let mut missing = factory.create(1, 0);
+    assert!(matches!(
+        missing.prepare().unwrap_err().cause(),
+        ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
+    ));
+    let tracker = MemTracker::new_root("repeat schema creator");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    let mut operator = factory.create(1, 0);
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        Arc::new(RuntimeErrorState::default()),
+    ));
+    operator.prepare().unwrap();
+    let layout = program.graph().nodes()[0].output_layout();
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        layout.schema().clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1])) as arrow::array::ArrayRef,
+            Arc::new(Int64Array::from(vec![10])),
+            Arc::new(Int64Array::from(vec![100])),
+        ],
+    )
+    .unwrap();
+    let input = Chunk::try_new_with_chunk_schema(
+        batch,
+        crate::exec::chunk::ChunkSchema::from_compiled_layout(layout).unwrap(),
+    )
+    .unwrap();
+    let processor = operator.as_processor_mut().unwrap();
+    let state = crate::runtime::runtime_state::RuntimeState::default();
+    processor.push_chunk(&state, input).unwrap();
+    let output = processor.pull_chunk(&state).unwrap().unwrap();
+    let schema = output.chunk_schema_ref();
+    assert!(
+        schema
+            .slots()
+            .iter()
+            .all(|slot| slot.field_ref().metadata().capacity() == 0)
+    );
+    drop(output);
+    drop(operator);
+    drop(factory);
+    drop(program);
+    assert!(tracker.current() > 0);
+    drop(schema);
+    assert_eq!(tracker.current(), 0);
 }
 
 // ---------------------------------------------------------------- Unpivot
@@ -237,7 +293,7 @@ fn list_pool() -> ConstantPool {
 /// Rows `[{}, {a: x}, {b: y, c: z}]` of a checked non-null Utf8 map pool.
 fn map_pool() -> ConstantPool {
     let ty = FunctionValueType::new(map_type(), false);
-    let DataType::Map(entries, _) = &ty.data_type else {
+    let DataType::Map(entries, _) = &ty.data_type() else {
         unreachable!()
     };
     let DataType::Struct(fields) = entries.data_type() else {
@@ -273,7 +329,7 @@ fn map_pool() -> ConstantPool {
 
 /// `Values(id, v1, v2) -> Unpivot -> Result` with outputs
 /// `(id, value, label, codes, attrs)` and a two-row output budget.
-fn unpivot_program() -> Arc<LocalProgram> {
+pub(crate) fn unpivot_program() -> Arc<LocalProgram> {
     let mut builder = FragmentBuilder::new(FragmentId::new(62));
     let source = NodeId::new(0);
     let unpivot = NodeId::new(1);
@@ -351,12 +407,12 @@ fn unpivot_program() -> Arc<LocalProgram> {
     compile(package(builder, unpivot, constants, 1), 1)
 }
 
-type UnpivotRow = (i64, Option<i64>, String, Vec<i32>, Vec<(String, String)>);
+pub(crate) type UnpivotRow = (i64, Option<i64>, String, Vec<i32>, Vec<(String, String)>);
 
-fn unpivot_rows(chunks: &[Chunk]) -> Vec<UnpivotRow> {
+pub(crate) fn unpivot_rows(chunks: &[Chunk]) -> Vec<UnpivotRow> {
     let mut rows = Vec::new();
     for chunk in chunks {
-        let column = |ordinal: usize| chunk.batch.column(ordinal).clone();
+        let column = |ordinal: usize| chunk.record_batch().column(ordinal).clone();
         let ids = column(0);
         let ids = ids.as_any().downcast_ref::<Int64Array>().unwrap();
         let values = column(1);
@@ -416,7 +472,7 @@ fn compiled_unpivot_expands_every_mapping_within_the_frozen_row_budget() {
     assert!(chunks.iter().all(|chunk| chunk.len() <= 2), "row budget");
     let layout = program.graph().nodes()[1].output_layout();
     for chunk in &chunks {
-        assert_eq!(chunk.batch.schema(), layout.schema().clone());
+        assert_eq!(chunk.record_batch().schema(), layout.schema().clone());
     }
     let mut rows = unpivot_rows(&chunks);
     let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
@@ -545,19 +601,19 @@ fn compiled_change_events_emit_selected_rows_per_event_with_exact_effects() {
     let mut rows = Vec::new();
     for chunk in &chunks {
         let k = chunk
-            .batch
+            .record_batch()
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
         let v = chunk
-            .batch
+            .record_batch()
             .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
         let effect = chunk
-            .batch
+            .record_batch()
             .column(2)
             .as_any()
             .downcast_ref::<Int8Array>()
@@ -594,4 +650,45 @@ fn compiled_change_event_factory_refuses_a_node_that_is_not_an_expansion() {
         Err(error) => error,
     };
     assert!(error.contains("is not a ChangeEventExpand"), "{error}");
+}
+
+#[test]
+fn compiled_change_prepare_refuses_missing_owner_and_first_real_memory_limit() {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::runtime::fragment::ExecutionFailureCause;
+    use crate::runtime::mem_tracker::MemTracker;
+    let program = change_program();
+    let factory = CompiledChangeEventProcessorFactory::try_new(
+        program.clone(),
+        program.graph().root(),
+        Arc::new(RuntimeErrorState::default()),
+    )
+    .unwrap();
+    let mut missing = factory.create(1, 0);
+    assert!(matches!(
+        missing.prepare().unwrap_err().cause(),
+        ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
+    ));
+    let tracker = MemTracker::new_root("change actual schema first refusal");
+    let mut operator = factory.create(1, 0);
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        Arc::new(RuntimeErrorState::default()),
+    ));
+    let baseline = tracker.current();
+    assert!(baseline > 0);
+    tracker.install_limit_once(baseline + 1).unwrap();
+    assert!(matches!(
+        operator.prepare().unwrap_err().cause(),
+        ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
+    ));
+    assert!(matches!(
+        operator.prepare().unwrap_err().cause(),
+        ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::InstanceFailed)
+    ));
+    assert!(operator.is_finished());
+    assert_eq!(tracker.current(), baseline);
+    drop(operator);
+    assert_eq!(tracker.current(), 0);
 }

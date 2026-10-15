@@ -18,7 +18,22 @@
 use super::super::cow_compile_receipt::borrowed_value_footprint::{self as footprint, Failure};
 use super::*;
 use crate::query_execution::internal_result_cpu::INTERNAL_PEAK_BYTES;
+use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+use novarocks_types::schema::SqlType;
 use std::sync::Arc;
+
+fn declared(declaration: &SqlType, carrier: &DataType) -> FunctionValueType {
+    FunctionValueType::try_from_typed_binding(
+        novarocks_types::execution_value_type_from_declaration(
+            declaration,
+            carrier,
+            true,
+            ValueTypeStorageLifetime::pure(),
+        )
+        .expect("explicit COW declaration"),
+    )
+    .expect("complete COW type")
+}
 
 fn map_failure(f: Failure) -> BuildError {
     match f {
@@ -33,7 +48,11 @@ fn preflight(a: &dyn Array, row: usize) -> Result<()> {
         .map(|_| ())
         .map_err(map_failure)
 }
-fn old_cell(column: &ArrayRef, row: usize) -> std::result::Result<String, String> {
+fn old_cell(
+    column: &ArrayRef,
+    row: usize,
+    declaration: &SqlType,
+) -> std::result::Result<String, String> {
     let literal = novarocks_sql::literal::literal_from_batch(column, row)?;
     let text = crate::query_execution::dml::iceberg_writer::literal_to_sql_for_arrow_type(
         &literal,
@@ -44,7 +63,7 @@ fn old_cell(column: &ArrayRef, row: usize) -> std::result::Result<String, String
         data_type: column.data_type().clone(),
         nullable: true,
         write_default: None,
-        logical_type: None,
+        logical_type: Some(declaration.clone()),
     };
     let sql = crate::query_execution::dml::iceberg_writer::target_cast_expr_sql(&text, &field)?;
     let query = novarocks_parser::parse(&format!("SELECT {sql}")).map_err(|e| e.to_string())?;
@@ -59,11 +78,12 @@ fn old_cell(column: &ArrayRef, row: usize) -> std::result::Result<String, String
     };
     Ok(novarocks_parser::printer::print_expr(e))
 }
-fn new_cell(column: &ArrayRef, row: usize) -> Result<String> {
+fn new_cell(column: &ArrayRef, row: usize, declaration: &FunctionValueType) -> Result<String> {
     let e = checked_value(column.as_ref(), row, &preflight, &|| Ok(()))?;
     Ok(novarocks_parser::printer::print_expr(&cast(
         e,
-        column.data_type(),
+        declaration,
+        &|| Ok(()),
     )?))
 }
 
@@ -113,11 +133,37 @@ fn small_values_keep_original_literal_caster_and_parser_intersection() {
         Arc::new(list),
         Arc::new(structure),
     ];
-    for column in columns {
+    let declarations = [
+        SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::BigInt)),
+        SqlType::Boolean,
+        SqlType::TinyInt,
+        SqlType::SmallInt,
+        SqlType::Int,
+        SqlType::BigInt,
+        SqlType::Float,
+        SqlType::Double,
+        SqlType::Decimal {
+            precision: 12,
+            scale: 3,
+        },
+        SqlType::String,
+        SqlType::Binary,
+        SqlType::Variant,
+        SqlType::Date,
+        SqlType::DateTime,
+        SqlType::Array(Box::new(SqlType::BigInt)),
+        SqlType::Struct(vec![
+            ("a`b".into(), SqlType::BigInt),
+            ("text".into(), SqlType::String),
+        ]),
+    ];
+    assert_eq!(columns.len(), declarations.len());
+    for (column, declaration) in columns.into_iter().zip(declarations) {
+        let complete = declared(&declaration, column.data_type());
         for row in 0..column.len() {
             assert_eq!(
-                new_cell(&column, row).unwrap(),
-                old_cell(&column, row).unwrap(),
+                new_cell(&column, row, &complete).unwrap(),
+                old_cell(&column, row, &declaration).unwrap(),
                 "type {:?} row {row}",
                 column.data_type()
             );
@@ -132,13 +178,21 @@ fn unsupported_nonnull_values_stay_unsupported_but_null_first_is_retained() {
         Arc::new(Time64MicrosecondArray::from(vec![Some(1), None])),
         Arc::new(TimestampNanosecondArray::from(vec![Some(1), None])),
     ];
-    for column in columns {
-        assert!(old_cell(&column, 0).is_err());
+    for (column, declaration) in
+        columns
+            .into_iter()
+            .zip([SqlType::String, SqlType::Time, SqlType::DateTimeNs])
+    {
+        let complete = declared(&declaration, column.data_type());
+        assert!(old_cell(&column, 0, &declaration).is_err());
         assert!(matches!(
-            new_cell(&column, 0),
+            new_cell(&column, 0, &complete),
             Err(BuildError::OriginalSemantic(_))
         ));
-        assert_eq!(new_cell(&column, 1).unwrap(), old_cell(&column, 1).unwrap());
+        assert_eq!(
+            new_cell(&column, 1, &complete).unwrap(),
+            old_cell(&column, 1, &declaration).unwrap()
+        );
     }
     for scale in [-1, 0] {
         let value = if scale == 0 { i128::MAX } else { 1 };
@@ -147,16 +201,23 @@ fn unsupported_nonnull_values_stay_unsupported_but_null_first_is_retained() {
                 .with_precision_and_scale(38, scale)
                 .unwrap(),
         );
-        assert!(old_cell(&a, 0).is_err());
-        assert!(new_cell(&a, 0).is_err());
+        let declaration = SqlType::Decimal {
+            precision: 38,
+            scale,
+        };
+        let complete = declared(&declaration, a.data_type());
+        assert!(old_cell(&a, 0, &declaration).is_err());
+        assert!(new_cell(&a, 0, &complete).is_err());
         if scale < 0 {
-            assert!(old_cell(&a, 1).is_err());
-            assert!(new_cell(&a, 1).is_err());
+            assert!(old_cell(&a, 1, &declaration).is_err());
+            assert!(new_cell(&a, 1, &complete).is_err());
         }
     }
     let empty_struct = DataType::Struct(Vec::<arrow::datatypes::Field>::new().into());
     assert!(matches!(
-        type_name(&empty_struct),
+        type_name(&declared(&SqlType::Struct(vec![]), &empty_struct), &|| Ok(
+            ()
+        )),
         Err(BuildError::OriginalSemantic(_))
     ));
     assert!(matches!(
@@ -228,7 +289,14 @@ fn every_generated_nonempty_slot_is_exact_and_empty_values_are_rejected() {
     };
     assert_eq!((s.as_str(), s.len(), s.capacity()), ("616263", 6, 6));
     let mut row = exact_vec(1).unwrap();
-    row.push(cast(bool_value(true), &DataType::Boolean).unwrap());
+    row.push(
+        cast(
+            bool_value(true),
+            &declared(&SqlType::Boolean, &DataType::Boolean),
+            &|| Ok(()),
+        )
+        .unwrap(),
+    );
     let mut rows = exact_vec(1).unwrap();
     rows.push(row);
     let mut aliases = exact_vec(1).unwrap();
@@ -243,108 +311,246 @@ fn every_generated_nonempty_slot_is_exact_and_empty_values_are_rejected() {
     assert!(values(Vec::new(), "x", Vec::new()).is_err());
 }
 
+fn type_owned(ty: &TypeName) -> u64 {
+    // Inspect the actual public AST backing independently of the spelling
+    // projection used to construct it. Inline children are in the argument Vec.
+    let mut bytes = (ty.name.parts.capacity() * std::mem::size_of::<Ident>()) as u64
+        + (ty.arguments.capacity() * std::mem::size_of::<TypeNameArgument>()) as u64
+        + ty.argument_separator_spaces.capacity() as u64;
+    for part in &ty.name.parts {
+        bytes += part.value.capacity() as u64;
+    }
+    for argument in &ty.arguments {
+        bytes += match argument {
+            TypeNameArgument::Type(child) => type_owned(child),
+            TypeNameArgument::Field(field) => {
+                field.name.value.capacity() as u64 + type_owned(&field.data_type)
+            }
+            TypeNameArgument::Literal(Literal {
+                kind: LiteralKind::Number(value),
+                ..
+            }) => value.capacity() as u64,
+            _ => panic!("closed type argument"),
+        };
+    }
+    bytes
+}
+fn cast_sql(value: &FunctionValueType) -> String {
+    novarocks_parser::printer::print_expr(&cast(null(), value, &|| Ok(())).unwrap())
+}
+#[test]
+fn complete_domains_determine_same_carrier_cast_spelling() {
+    let text = declared(&SqlType::String, &DataType::Utf8);
+    let json = declared(&SqlType::Json, &DataType::Utf8);
+    assert_eq!(cast_sql(&text), "CAST(NULL AS STRING)");
+    assert_eq!(cast_sql(&json), "CAST(NULL AS JSON)");
+    let binary = declared(&SqlType::Binary, &DataType::LargeBinary);
+    let variant = declared(&SqlType::Variant, &DataType::LargeBinary);
+    assert_eq!(cast_sql(&binary), "CAST(NULL AS VARBINARY)");
+    assert_eq!(cast_sql(&variant), "CAST(NULL AS VARIANT)");
+    let carrier = DataType::FixedSizeBinary(16);
+    let plain_fixed = declared(&SqlType::Binary, &carrier);
+    assert!(matches!(
+        type_name(&plain_fixed, &|| Ok(())),
+        Err(BuildError::OriginalSemantic(_))
+    ));
+    assert!(matches!(
+        super::super::cow_compile_receipt::type_footprint::exact_type_heap(&plain_fixed),
+        Err(Failure::OriginalSemantic(_))
+    ));
+    assert_eq!(
+        cast_sql(&declared(&SqlType::LargeInt, &carrier)),
+        "CAST(NULL AS LARGEINT)"
+    );
+    // UUID exists in the immutable vocabulary, but has no admitted CAST name.
+    assert!(matches!(
+        type_name(&declared(&SqlType::Uuid, &carrier), &|| Ok(())),
+        Err(BuildError::OriginalSemantic(_))
+    ));
+    let fixed: ArrayRef =
+        Arc::new(FixedSizeBinaryArray::try_from_iter([&[0_u8; 16][..]].into_iter()).unwrap());
+    assert!(matches!(
+        new_cell(&fixed, 0, &declared(&SqlType::LargeInt, &carrier)),
+        Err(BuildError::OriginalSemantic(_))
+    ));
+    let null_fixed = new_null_array(&carrier, 1);
+    assert_eq!(
+        new_cell(&null_fixed, 0, &declared(&SqlType::LargeInt, &carrier)).unwrap(),
+        "CAST(NULL AS LARGEINT)"
+    );
+    assert!(matches!(
+        new_cell(&null_fixed, 0, &plain_fixed),
+        Err(BuildError::OriginalSemantic(_))
+    ));
+}
+#[test]
+fn nested_declared_domains_and_exact_type_heap_share_actual_spelling() {
+    use arrow::datatypes::Field;
+    let leaf = Field::new("format_item", DataType::Utf8, false)
+        .with_metadata([("nrLogicalType".into(), "opaque-source-label".into())].into());
+    let carrier = DataType::Struct(
+        vec![
+            Field::new("j`son", DataType::List(Arc::new(leaf)), true),
+            Field::new("amount", DataType::Decimal128(12, 3), false),
+        ]
+        .into(),
+    );
+    let declaration = SqlType::Struct(vec![
+        ("j`son".into(), SqlType::Array(Box::new(SqlType::Json))),
+        (
+            "amount".into(),
+            SqlType::Decimal {
+                precision: 12,
+                scale: 3,
+            },
+        ),
+    ]);
+    let complete = declared(&declaration, &carrier);
+    let ty = type_name(&complete, &|| Ok(())).unwrap();
+    assert_eq!(
+        super::super::cow_compile_receipt::type_footprint::exact_type_heap(&complete).unwrap(),
+        type_owned(&ty)
+    );
+    let sql = cast_sql(&complete);
+    assert!(sql.contains("ARRAY<JSON>"), "{sql}");
+    assert!(sql.contains("j``son"), "{sql}");
+    let parsed = novarocks_parser::parse(&format!("SELECT {sql}")).unwrap();
+    assert_eq!(parsed.len(), 1);
+    // Both original carrier child promises remain in the borrowed authority;
+    // the SQL TypeName grammar does not contain a child-NULL annotation.
+    let novarocks_type_contract::ValueKind::Struct(fields) = complete.value_type().kind() else {
+        panic!("struct");
+    };
+    assert!(fields[0].value_type().nullable());
+    let novarocks_type_contract::ValueKind::List(item) = fields[0].value_type().kind() else {
+        panic!("list");
+    };
+    assert!(!item.nullable());
+    assert!(!fields[1].value_type().nullable());
+    for (declaration, carrier) in [
+        (SqlType::Json, DataType::Utf8),
+        (SqlType::Variant, DataType::LargeBinary),
+        (
+            SqlType::Decimal {
+                precision: 38,
+                scale: 9,
+            },
+            DataType::Decimal128(38, 9),
+        ),
+    ] {
+        let complete = declared(&declaration, &carrier);
+        assert_eq!(
+            super::super::cow_compile_receipt::type_footprint::exact_type_heap(&complete).unwrap(),
+            type_owned(&type_name(&complete, &|| Ok(())).unwrap())
+        );
+    }
+}
+#[test]
+fn type_construction_preserves_first_original_caller_without_tail() {
+    let complete = declared(&SqlType::Json, &DataType::Utf8);
+    let calls = std::cell::Cell::new(0);
+    let failure = type_name(&complete, &|| {
+        calls.set(calls.get() + 1);
+        Err(BuildError::Control(
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Cancelled,
+                "original COW caller stopped",
+            ),
+        ))
+    })
+    .unwrap_err();
+    let BuildError::Control(original) = failure else {
+        panic!("original caller");
+    };
+    assert_eq!(original.message(), "original COW caller stopped");
+    assert_eq!(calls.get(), 1);
+}
+
 #[test]
 fn authored_variant_fields_keep_exact_cast_identity_and_prospective_heap() {
     use super::super::cow_compile_receipt::type_footprint;
-    use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
-    let physical = arrow::datatypes::Field::new("value", DataType::LargeBinary, true);
-    let variant = FunctionValueType::try_with_logical_type(
-        DataType::LargeBinary,
-        true,
-        ValueLogicalType::Variant,
-    )
-    .unwrap()
-    .try_to_field("value")
-    .unwrap();
-    for (field, expected) in [(physical, "VARBINARY"), (variant, "VARIANT")] {
+    for (declaration, expected) in [
+        (SqlType::Binary, "VARBINARY"),
+        (SqlType::Variant, "VARIANT"),
+    ] {
+        let complete = declared(&declaration, &DataType::LargeBinary);
         let column: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
             Some(&b"\x00\xFF\x27"[..]),
             None,
         ]));
         for row in 0..column.len() {
-            let literal = novarocks_sql::literal::literal_from_batch(&column, row).unwrap();
-            let literal_sql =
-                crate::query_execution::dml::iceberg_writer::literal_to_sql_for_arrow_type(
-                    &literal,
-                    column.data_type(),
-                )
-                .unwrap();
-            let old = crate::query_execution::dml::iceberg_writer::target_cast_expr_sql(
-                &literal_sql,
-                &novarocks_types::schema::ColumnDef::from_value_type(
-                    field.name().clone(),
-                    FunctionValueType::try_from_field(&field).unwrap(),
-                    None,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-            let value = checked_value(column.as_ref(), row, &preflight, &|| Ok(())).unwrap();
-            let new = cast_field(value, &field).unwrap();
-            assert_eq!(novarocks_parser::printer::print_expr(&new), old);
+            let old = old_cell(&column, row, &declaration).unwrap();
+            let new = new_cell(&column, row, &complete).unwrap();
+            assert_eq!(new, old);
             assert!(old.ends_with(&format!(" AS {expected})")));
         }
-        let name = field_type_name(&field).unwrap();
+        let name = type_name(&complete, &|| Ok(())).unwrap();
         assert_eq!(
-            type_footprint::exact_field_type_heap(&field).unwrap(),
-            name.name.parts.capacity() as u64 * std::mem::size_of::<Ident>() as u64
-                + name.name.parts[0].value.capacity() as u64,
+            type_footprint::exact_type_heap(&complete).unwrap(),
+            type_owned(&name)
         );
     }
-    let invalid = arrow::datatypes::Field::new("value", DataType::Int64, true)
-        .with_metadata([("nr_logical_type".into(), "variant".into())].into());
-    assert!(field_type_name(&invalid).is_err());
-    assert!(type_footprint::exact_field_type_heap(&invalid).is_err());
+    // A mismatched declaration/carrier cannot become a signed complete author.
+    assert!(
+        novarocks_types::execution_value_type_from_declaration(
+            &SqlType::Variant,
+            &DataType::Int64,
+            true,
+            ValueTypeStorageLifetime::pure(),
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn declared_cow_field_types_preserve_original_caster_supported_intersection() {
     use super::super::cow_compile_receipt::type_footprint;
-    use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
-    let typed = |carrier, logical| {
-        FunctionValueType::try_with_logical_type(carrier, true, logical)
-            .unwrap()
-            .try_to_field("value")
-            .unwrap()
-    };
-    let fields = [
-        typed(DataType::FixedSizeBinary(16), ValueLogicalType::Physical),
-        typed(DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
-        typed(DataType::Utf8, ValueLogicalType::Json),
-        typed(DataType::Binary, ValueLogicalType::Hll),
-        typed(DataType::Binary, ValueLogicalType::Bitmap),
-        typed(DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
-        typed(DataType::LargeBinary, ValueLogicalType::Object),
-        typed(DataType::Binary, ValueLogicalType::Percentile),
-        arrow::datatypes::Field::new(
-            "value",
-            DataType::List(Arc::new(typed(
+    let cases = [
+        (DataType::FixedSizeBinary(16), SqlType::LargeInt),
+        (DataType::Utf8, SqlType::Json),
+        (DataType::Binary, SqlType::Hll),
+        (DataType::Binary, SqlType::Bitmap),
+        (DataType::FixedSizeBinary(16), SqlType::Uuid),
+        (DataType::LargeBinary, SqlType::Object),
+        (DataType::Binary, SqlType::Percentile),
+        (
+            DataType::List(Arc::new(arrow::datatypes::Field::new(
+                "item",
                 DataType::LargeBinary,
-                ValueLogicalType::Variant,
+                true,
             ))),
-            true,
+            SqlType::Array(Box::new(SqlType::Variant)),
         ),
     ];
-    for field in fields {
-        let old = novarocks_types::schema::ColumnDef::from_value_type(
-            field.name().clone(),
-            FunctionValueType::try_from_field(&field).unwrap(),
-            None,
-        )
-        .map_err(|error| error.to_string())
-        .and_then(|column| {
-            crate::query_execution::dml::iceberg_writer::target_cast_expr_sql("NULL", &column)
-        });
-        let new = cast_field(null(), &field);
+    for (carrier, declaration) in cases {
+        let complete = declared(&declaration, &carrier);
+        let old = crate::query_execution::dml::iceberg_writer::target_cast_expr_sql(
+            "NULL",
+            &novarocks_types::schema::ColumnDef::from_value_type(
+                "value".into(),
+                complete.clone(),
+                None,
+            )
+            .unwrap(),
+        );
+        let new = cast(null(), &complete, &|| Ok(()));
         match (old, new) {
             (Ok(old), Ok(new)) => {
                 assert_eq!(novarocks_parser::printer::print_expr(&new), old);
-                assert!(type_footprint::exact_field_type_heap(&field).is_ok());
+                assert_eq!(
+                    type_footprint::exact_type_heap(&complete).unwrap(),
+                    type_owned(&type_name(&complete, &|| Ok(())).unwrap())
+                );
             }
-            (Err(_), Err(_)) => assert!(type_footprint::exact_field_type_heap(&field).is_err()),
+            (Err(_), Err(_)) => assert!(type_footprint::exact_type_heap(&complete).is_err()),
             (old, new) => {
-                panic!("original/new COW cast support differs for {field:?}: {old:?}, {new:?}")
+                panic!("original/new COW cast support differs for {complete:?}: {old:?}, {new:?}")
             }
         }
     }
+    // Fixed-width Binary has no lossless SQL CAST spelling. Do not restore the
+    // old carrier-only VARBINARY downgrade while merging the upstream test.
+    let fixed = declared(&SqlType::Binary, &DataType::FixedSizeBinary(16));
+    assert!(type_name(&fixed, &|| Ok(())).is_err());
+    assert!(type_footprint::exact_type_heap(&fixed).is_err());
 }

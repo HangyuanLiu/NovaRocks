@@ -139,7 +139,7 @@ fn canonical_conversion_constant_none_intermediate_target_and_following_cast_are
                 .ty,
             final_type
         );
-        if final_type.data_type == DataType::LargeUtf8 {
+        if *final_type.data_type() == DataType::LargeUtf8 {
             let wrapper = fragment.expressions().iter().find_map(|(_, expression)|
                 matches!(&expression.kind, ContractExprKind::Cast { expr, .. } if *expr == source.id)
                     .then_some(expression)).expect("separate same-domain carrier CAST");

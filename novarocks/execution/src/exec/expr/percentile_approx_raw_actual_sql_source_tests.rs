@@ -105,12 +105,12 @@ fn percentile_approx_raw_actual_original_required_sql_full_signature_source() {
                 let FunctionArgumentType::Value(quantile) = &function.argument_types[1] else {
                     panic!("actual quantile")
                 };
-                assert_eq!(payload.data_type, DataType::Binary);
+                assert_eq!(payload.data_type().clone(), DataType::Binary);
                 assert!(
-                    matches!(quantile.data_type, DataType::Decimal128(..)),
+                    matches!(quantile.data_type(), DataType::Decimal128(..)),
                     "exact original SQL decimal literal author"
                 );
-                assert_eq!(node.ty.data_type, DataType::Float64);
+                assert_eq!(node.ty.data_type().clone(), DataType::Float64);
                 assert_eq!(&fragment.expressions().get(args[0]).unwrap().ty, payload);
                 eprintln!(
                     "PERCENTILE_APPROX_RAW original definition={id:?} fullbinding={function:?} request={request:?} payloadSource={:?} quantileSource={:?} output={:?}",

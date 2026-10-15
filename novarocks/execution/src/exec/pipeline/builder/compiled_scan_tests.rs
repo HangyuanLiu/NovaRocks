@@ -88,7 +88,9 @@ fn prepare(
         None,
         None,
         None,
-        None,
+        Some(crate::runtime::mem_tracker::MemTracker::new_root(
+            "compiled scan tests",
+        )),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ));
     let dop = i32::try_from(program.graph().profile().pipeline_dop().get()).unwrap();

@@ -44,11 +44,14 @@ pub(super) fn original_native_profile(
     };
     count == 1
         && selected.aggregate.is_none()
-        && source.logical_type == ValueLogicalType::Physical
-        && source.data_type == DataType::Binary
-        && target.logical_type == ValueLogicalType::Physical
-        && target.data_type == DataType::Utf8
-        && target.nullable
+        && matches!(
+            source.logical_type(),
+            ValueLogicalType::Physical | ValueLogicalType::Bitmap
+        )
+        && source.data_type() == &DataType::Binary
+        && target.logical_type() == ValueLogicalType::Physical
+        && target.data_type() == &DataType::Utf8
+        && target.nullable()
 }
 pub(super) fn validate_profile(
     contract: &ScalarCallContract,
@@ -63,7 +66,7 @@ pub(super) fn validate_profile(
         )
     {
         return Err(invalid(
-            "bitmap_to_string requires its original single Physical Binary profile",
+            "bitmap_to_string requires one Binary value in its declared plain or bitmap domain",
         ));
     }
     observe()
@@ -285,7 +288,7 @@ pub(super) fn evaluate<'a>(
         observed!(control.checkpoint(0))?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &input.contract().result_type().data_type,
+            input.contract().result_type().data_type(),
             values,
             errors.into_boxed_slice(),
             || observed!(rows.step()),

@@ -192,18 +192,18 @@ impl<'a> NumericValue<'a> {
         value_type: &FunctionValueType,
         decimal: bool,
     ) -> Result<Self, KernelFailure> {
-        if value_type.logical_type != ValueLogicalType::Physical
-            || (!decimal && matches!(value_type.data_type, DataType::Decimal128(_, _)))
+        if value_type.logical_type() != ValueLogicalType::Physical
+            || (!decimal && matches!(value_type.data_type(), DataType::Decimal128(_, _)))
         {
             return Err(invalid(
                 "elementary numeric input is not an exact installed profile",
             ));
         }
-        let view = NumericInput::checked(argument.array(), &value_type.data_type)?;
+        let view = NumericInput::checked(argument.array(), value_type.data_type())?;
         Ok(Self {
             argument: ElementaryArgument::Selected(argument),
             view,
-            nullable: Some(value_type.nullable),
+            nullable: Some(value_type.nullable()),
         })
     }
     fn legacy(array: &'a ArrayRef, batch_rows: usize) -> Result<Self, NumericElementaryError> {
@@ -294,7 +294,9 @@ pub(super) fn evaluate_numeric_elementary<'a>(
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     control.checkpoint(0)?;
     let target = input.contract().result_type();
-    if target.logical_type != ValueLogicalType::Physical || target.data_type != DataType::Float64 {
+    if target.logical_type() != ValueLogicalType::Physical
+        || target.data_type() != &DataType::Float64
+    {
         return Err(invalid(
             "elementary numeric requires its exact Physical Float64 result",
         ));
@@ -311,10 +313,10 @@ pub(super) fn evaluate_numeric_elementary<'a>(
         input.contract().selected().argument_types.as_ref(),
         input.arguments(),
     ) {
-        (NumericElementaryOp::E, [], []) if target.nullable => {
+        (NumericElementaryOp::E, [], []) if target.nullable() => {
             ElementaryInput::Constant(std::f64::consts::E)
         }
-        (NumericElementaryOp::Pi, [], []) if target.nullable => {
+        (NumericElementaryOp::Pi, [], []) if target.nullable() => {
             ElementaryInput::Constant(std::f64::consts::PI)
         }
         (
@@ -322,8 +324,8 @@ pub(super) fn evaluate_numeric_elementary<'a>(
             [FunctionArgumentType::Value(source)],
             [argument],
         ) => {
-            if (op == NumericElementaryOp::LogNatural && !target.nullable)
-                || (op == NumericElementaryOp::Sign && target.nullable != source.nullable)
+            if (op == NumericElementaryOp::LogNatural && !target.nullable())
+                || (op == NumericElementaryOp::Sign && target.nullable() != source.nullable())
             {
                 return Err(invalid(
                     "elementary numeric result nullability differs from its exact profile",
@@ -338,7 +340,7 @@ pub(super) fn evaluate_numeric_elementary<'a>(
                 FunctionArgumentType::Value(value),
             ],
             [left, right],
-        ) if target.nullable => ElementaryInput::Binary(
+        ) if target.nullable() => ElementaryInput::Binary(
             NumericValue::checked(*left, base, false)?,
             NumericValue::checked(*right, value, false)?,
         ),
@@ -353,11 +355,11 @@ pub(super) fn evaluate_numeric_elementary<'a>(
         op,
         inputs,
         selection,
-        Some(target.nullable),
+        Some(target.nullable()),
         ElementaryProjection::Float64,
         Some(control),
     )?;
-    SelectedValues::try_new(selection, &target.data_type, values, Box::default())
+    SelectedValues::try_new(selection, target.data_type(), values, Box::default())
         .map_err(|_| internal("elementary numeric compact output violates its selected contract"))
 }
 
@@ -552,7 +554,9 @@ mod tests {
     fn dense(name: &str, arrays: Vec<ArrayRef>, rows: usize) -> ArrayRef {
         let types: Vec<_> = arrays
             .iter()
-            .map(|array| FunctionValueType::new(array.data_type().clone(), true))
+            .map(|array| {
+                FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true)
+            })
             .collect();
         let mut instance = instance(name, &types);
         let arguments: Vec<_> = arrays.iter().map(EvaluatedArgument::Column).collect();
@@ -698,7 +702,7 @@ mod tests {
             -2.0,
         ]));
         let mut instance = instance("sign", &[FunctionValueType::new(DataType::Float64, false)]);
-        assert!(!instance.contract().result_type().nullable);
+        assert!(!instance.contract().result_type().nullable());
         let arguments = [EvaluatedArgument::Column(&array)];
         let output = instance
             .evaluate(Selection::all(8), &arguments, &Control::default())
@@ -724,7 +728,7 @@ mod tests {
     fn e_pi_are_zero_argument_exact_bits_for_dense_and_sparse_outputs() {
         for (name, expected) in [("e", 0x4005bf0a8b145769u64), ("pi", 0x400921fb54442d18)] {
             let mut instance = instance(name, &[]);
-            assert!(instance.contract().result_type().nullable);
+            assert!(instance.contract().result_type().nullable());
             let output = instance
                 .evaluate(Selection::all(3), &[], &Control::default())
                 .unwrap();

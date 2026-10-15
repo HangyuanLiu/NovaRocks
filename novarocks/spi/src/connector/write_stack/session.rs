@@ -95,14 +95,15 @@ impl WriteStatisticsContract {
                     "write statistics aggregate input ordinal is outside the target input",
                 )
             })?;
-            let actual = actual.field();
-            let actual_value_type = novarocks_type_contract::FunctionValueType::try_from_field(
-                actual,
-            )
-            .map_err(|error| {
-                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+            let actual_value_type = actual.execution_type().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "write statistics target field has no complete execution declaration",
+                )
             })?;
-            if declared.name() != actual.name() || declared.value_type() != &actual_value_type {
+            if declared.name() != actual.field().name()
+                || declared.value_type() != actual_value_type
+            {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
                     "write statistics aggregate input does not exactly match the target field",
@@ -318,44 +319,59 @@ pub struct ConnectorWriteTargetPlan {
 /// throughout: the engine passes it to the read side without interpreting it.
 #[derive(Clone, Debug)]
 pub struct ConnectorWriteRewriteSource {
-    source: ConnectorTableHandle,
+    signed: Arc<ConnectorWriteRewriteSourceFacts>,
     frozen_read_source: Option<crate::connector::read_stack::ConnectorFrozenReadSource>,
-    /// Exactly the files this target rewrites. Its commit replaces precisely
-    /// these, so the read that produces its rows is defined by the same set
-    /// rather than by anything re-derived.
+}
+/// Only signed immutable facts are shared. Post-signing read capability stays
+/// wrapper-local, so retaining the original source creates no capability cycle.
+#[derive(Debug)]
+struct ConnectorWriteRewriteSourceFacts {
+    source: ConnectorTableHandle,
     pinned_source: ConnectorPinnedFileSet,
     base_version_digest: [u8; 32],
     scan_schema: SchemaRef,
+    scan_execution_schema: novarocks_connector_contract::ConnectorReadExecutionSchema,
     scan_bindings: Vec<ConnectorRowMutationScanBinding>,
     match_tokens: Vec<ConnectorWriteFieldToken>,
     written_version_token: Option<ConnectorWriteFieldToken>,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
-
 impl ConnectorWriteRewriteSource {
     #[allow(clippy::too_many_arguments)]
-    pub const fn new(
+    pub fn try_new_typed(
         source: ConnectorTableHandle,
         pinned_source: ConnectorPinnedFileSet,
         base_version_digest: [u8; 32],
         scan_schema: SchemaRef,
+        scan_execution_schema: novarocks_connector_contract::ConnectorReadExecutionSchema,
         scan_bindings: Vec<ConnectorRowMutationScanBinding>,
         match_tokens: Vec<ConnectorWriteFieldToken>,
         written_version_token: Option<ConnectorWriteFieldToken>,
-    ) -> Self {
-        Self {
+        creation: &mut crate::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<Self, novarocks_connector_contract::PureProviderCompileError<ConnectorError>> {
+        crate::connector::distributed_rewrite::validate_scan_source_pair(
+            &scan_schema,
+            &scan_execution_schema,
+            creation,
+        )?;
+        let signed = creation.arc(ConnectorWriteRewriteSourceFacts {
             source,
-            frozen_read_source: None,
             pinned_source,
             base_version_digest,
             scan_schema,
+            scan_execution_schema,
             scan_bindings,
             match_tokens,
             written_version_token,
-        }
+            _storage: creation.storage(),
+        })?;
+        Ok(Self {
+            signed,
+            frozen_read_source: None,
+        })
     }
-
-    /// Attach the provider's exact observation after original source signing.
-    /// This does not reinterpret the signed schema, tokens or file set.
+    /// Attach the original source observation after signing. This capability
+    /// is separate from the immutable source facts and never reauthors them.
     pub fn with_frozen_read_source(
         mut self,
         source: crate::connector::read_stack::ConnectorFrozenReadSource,
@@ -363,39 +379,37 @@ impl ConnectorWriteRewriteSource {
         self.frozen_read_source = Some(source);
         self
     }
-
     pub fn frozen_read_source(
         &self,
     ) -> Option<&crate::connector::read_stack::ConnectorFrozenReadSource> {
         self.frozen_read_source.as_ref()
     }
-
-    pub const fn source(&self) -> &ConnectorTableHandle {
-        &self.source
+    pub fn source(&self) -> &ConnectorTableHandle {
+        &self.signed.source
     }
-
-    pub const fn pinned_source(&self) -> &ConnectorPinnedFileSet {
-        &self.pinned_source
+    pub fn pinned_source(&self) -> &ConnectorPinnedFileSet {
+        &self.signed.pinned_source
     }
-
-    pub const fn base_version_digest(&self) -> [u8; 32] {
-        self.base_version_digest
+    pub fn base_version_digest(&self) -> [u8; 32] {
+        self.signed.base_version_digest
     }
-
-    pub const fn scan_schema(&self) -> &SchemaRef {
-        &self.scan_schema
+    /// Original storage format; this loan grants no execution value semantics.
+    pub fn scan_schema(&self) -> &arrow::datatypes::Schema {
+        &self.signed.scan_schema
     }
-
+    pub fn scan_execution_schema(
+        &self,
+    ) -> &novarocks_connector_contract::ConnectorReadExecutionSchema {
+        &self.signed.scan_execution_schema
+    }
     pub fn scan_bindings(&self) -> &[ConnectorRowMutationScanBinding] {
-        &self.scan_bindings
+        &self.signed.scan_bindings
     }
-
     pub fn match_tokens(&self) -> &[ConnectorWriteFieldToken] {
-        &self.match_tokens
+        &self.signed.match_tokens
     }
-
-    pub const fn written_version_token(&self) -> Option<ConnectorWriteFieldToken> {
-        self.written_version_token
+    pub fn written_version_token(&self) -> Option<ConnectorWriteFieldToken> {
+        self.signed.written_version_token
     }
 }
 
@@ -1127,6 +1141,112 @@ pub trait ConnectorWriteControl: Send + Sync {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn rewrite_source_shares_frozen_bindings_and_keeps_independent_complete_value_lifetimes() {
+        use super::*;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use novarocks_connector_contract::ConnectorReadExecutionSchema;
+        use novarocks_type_contract::{
+            FunctionValueType, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+            ValueTypeStorageHold, ValueTypeStorageLifetime,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Creator(Arc<AtomicUsize>);
+        impl ValueTypeStorageHold for Creator {}
+        impl Drop for Creator {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let exits = Arc::new(AtomicUsize::new(0));
+        let storage = ValueTypeStorageLifetime::held(Arc::new(Creator(exits.clone())));
+        let child =
+            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+                .unwrap();
+        let carrier = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let binding = FunctionValueType::try_from_value(
+            ValueTypeRef::try_new(
+                ValueKind::List(child.value_type().clone()),
+                false,
+                storage.clone(),
+            )
+            .unwrap(),
+            ValueLayout::try_new(&carrier, storage.clone()).unwrap(),
+        )
+        .unwrap();
+        let execution = ConnectorReadExecutionSchema::try_new(
+            Arc::new(Schema::new(vec![Field::new("payload", carrier, false)])),
+            vec![binding].into_boxed_slice(),
+            storage.clone(),
+        )
+        .unwrap();
+        // The exact original format uses its own anonymous role name. Its
+        // generic attributes neither replace nor mint the typed declaration.
+        let original = Arc::new(Schema::new(vec![
+            Field::new(
+                "payload",
+                DataType::List(Arc::new(Field::new("element", DataType::Utf8, true))),
+                false,
+            )
+            .with_metadata(std::collections::HashMap::from([(
+                novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_owned(),
+                "unknown-source-attribute".to_owned(),
+            )])),
+        ]));
+        let token = ConnectorWriteFieldToken::from_bytes([1; 32]);
+        let mut request = |_| Ok(());
+        let mut work = |_| Ok(());
+        let mut creation = crate::connector::read_stack::ConnectorReadSchemaCreation::new(
+            storage.clone(),
+            &mut request,
+            &mut work,
+        );
+        let source = ConnectorWriteRewriteSource::try_new_typed(
+            ConnectorTableHandle::try_new(
+                crate::connector::ConnectorInstanceId::parse("rewrite-source-test").unwrap(),
+                bytes::Bytes::from_static(b"source"),
+            )
+            .unwrap(),
+            ConnectorPinnedFileSet::try_new("db", "table", 7, ["source.parquet"]).unwrap(),
+            [7; 32],
+            original,
+            execution,
+            vec![ConnectorRowMutationScanBinding::new(token, 0)],
+            vec![token],
+            None,
+            &mut creation,
+        )
+        .unwrap();
+        let clone = source.clone();
+        assert_eq!(
+            source.scan_bindings().as_ptr(),
+            clone.scan_bindings().as_ptr()
+        );
+        assert_eq!(
+            source.match_tokens().as_ptr(),
+            clone.match_tokens().as_ptr()
+        );
+        let late = clone.scan_execution_schema().binding(0).unwrap().clone();
+        assert_eq!(
+            late.value_type().child_type_at(0).unwrap().domain(),
+            Some(ValueLogicalType::Json)
+        );
+        drop(source);
+        drop(clone);
+        drop(creation);
+        drop(storage);
+        assert_eq!(exits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            late.value_type().child_type_at(0).unwrap().domain(),
+            Some(ValueLogicalType::Json)
+        );
+        drop(late);
+        assert_eq!(exits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn borrowed_writer_fields_keep_all_original_enum_orders() {
         let field = |id: u8| {
             crate::connector::ConnectorWriteFieldBinding::new(
@@ -1247,10 +1367,17 @@ mod tests {
 
     fn input_shape() -> ConnectorWriteInputShape {
         ConnectorWriteInputShape::Data {
-            fields: vec![ConnectorWriteFieldBinding::new(
-                ConnectorWriteFieldToken::from_bytes([1; 32]),
-                arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, true),
-            )],
+            fields: vec![
+                ConnectorWriteFieldBinding::try_new_typed(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, true),
+                    novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    ),
+                )
+                .expect("complete fixture declaration"),
+            ],
         }
     }
 
@@ -1268,13 +1395,32 @@ mod tests {
         .expect("route facts")
     }
 
+    fn cow_bigint_type() -> novarocks_type_contract::FunctionValueType {
+        use novarocks_type_contract::{
+            FunctionValueType, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+        };
+        let storage = ValueTypeStorageLifetime::pure();
+        FunctionValueType::try_from_value(
+            ValueTypeRef::try_new(
+                ValueKind::Scalar(arrow::datatypes::DataType::Int64),
+                true,
+                storage.clone(),
+            )
+            .unwrap(),
+            ValueLayout::try_new(&arrow::datatypes::DataType::Int64, storage).unwrap(),
+        )
+        .unwrap()
+    }
+
     fn cow_contract() -> ConnectorMutationMatchContract {
         let instance = ConnectorInstanceId::parse("session_unit").expect("instance");
-        let identity = ConnectorMutationSourceField::new(
+        let identity = ConnectorMutationSourceField::try_new_typed(
             ConnectorWriteFieldToken::from_bytes([3; 32]),
             arrow::datatypes::Field::new("same", arrow::datatypes::DataType::Int64, true),
             0,
-        );
+            cow_bigint_type(),
+        )
+        .expect("explicit nullable BIGINT identity");
         ConnectorMutationMatchContract::try_new(
             ConnectorProviderBindingKey {
                 instance_id: instance.clone(),
@@ -1285,11 +1431,15 @@ mod tests {
             ConnectorWriteBaseVersion::try_new(bytes::Bytes::from_static(b"base")).expect("base"),
             vec![identity.clone()],
             Vec::new(),
-            vec![ConnectorMutationTargetField::new(
-                ConnectorWriteFieldToken::from_bytes([4; 32]),
-                arrow::datatypes::Field::new("same", arrow::datatypes::DataType::Int64, true),
-                1,
-            )],
+            vec![
+                ConnectorMutationTargetField::try_new_typed(
+                    ConnectorWriteFieldToken::from_bytes([4; 32]),
+                    arrow::datatypes::Field::new("same", arrow::datatypes::DataType::Int64, true),
+                    1,
+                    cow_bigint_type(),
+                )
+                .expect("explicit nullable BIGINT after"),
+            ],
             vec![identity.token()],
             ConnectorMutationEffectField::try_new(
                 ConnectorWriteFieldToken::from_bytes([5; 32]),
@@ -1484,12 +1634,19 @@ mod tests {
         }
     }
 
-    fn statistics_input_shape(field: arrow::datatypes::Field) -> ConnectorWriteInputShape {
+    fn statistics_input_shape(
+        field: arrow::datatypes::Field,
+        value: novarocks_type_contract::FunctionValueType,
+    ) -> ConnectorWriteInputShape {
         ConnectorWriteInputShape::Data {
-            fields: vec![ConnectorWriteFieldBinding::new(
-                ConnectorWriteFieldToken::from_bytes([1; 32]),
-                field,
-            )],
+            fields: vec![
+                ConnectorWriteFieldBinding::try_new_typed(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    field,
+                    value,
+                )
+                .expect("independent statistics declaration"),
+            ],
         }
     }
 
@@ -1510,8 +1667,10 @@ mod tests {
             let semantic = FunctionValueType::try_with_logical_type(carrier.clone(), true, logical)
                 .expect("authored semantic input");
             let physical = FunctionValueType::new(carrier, true);
-            let semantic_input =
-                statistics_input_shape(semantic.try_to_field("v").expect("tagged semantic field"));
+            let semantic_input = statistics_input_shape(
+                semantic.try_to_field("v").expect("semantic source field"),
+                semantic.clone(),
+            );
             let contract = WriteStatisticsContract::try_new(
                 &semantic_input,
                 vec![statistics_requirement(0, "v", semantic.clone(), 1)],
@@ -1519,8 +1678,10 @@ mod tests {
             .expect("exact semantic statistics contract");
             assert_eq!(contract.requirements()[0].input().value_type(), &semantic);
 
-            let physical_input =
-                statistics_input_shape(physical.try_to_field("v").expect("physical field"));
+            let physical_input = statistics_input_shape(
+                physical.try_to_field("v").expect("physical field"),
+                physical.clone(),
+            );
             WriteStatisticsContract::try_new(
                 &physical_input,
                 vec![statistics_requirement(0, "v", physical.clone(), 1)],
@@ -1543,42 +1704,56 @@ mod tests {
     }
 
     #[test]
-    fn statistics_contract_rejects_unknown_and_invalid_field_tags() {
+    fn statistics_contract_does_not_read_source_attributes_as_value_identity() {
         use novarocks_type_contract::{FunctionValueType, NR_LOGICAL_TYPE_KEY};
-
-        for (carrier, tag, expected) in [
-            (
-                arrow::datatypes::DataType::FixedSizeBinary(16),
-                "unknown",
-                "unknown logical type metadata",
-            ),
-            (
-                arrow::datatypes::DataType::LargeBinary,
-                "uuid",
-                "invalid Arrow carrier for Uuid",
-            ),
-            (
-                arrow::datatypes::DataType::FixedSizeBinary(16),
-                "variant",
-                "invalid Arrow carrier for Variant",
-            ),
+        for (carrier, tag) in [
+            (arrow::datatypes::DataType::FixedSizeBinary(16), "unknown"),
+            (arrow::datatypes::DataType::LargeBinary, "uuid"),
+            (arrow::datatypes::DataType::FixedSizeBinary(16), "variant"),
         ] {
             let field = arrow::datatypes::Field::new("v", carrier.clone(), true)
                 .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), tag.to_owned())].into());
-            let input = statistics_input_shape(field);
-            let error = WriteStatisticsContract::try_new(
+            let value = FunctionValueType::new(carrier, true);
+            let input = statistics_input_shape(field, value.clone());
+            let contract = WriteStatisticsContract::try_new(
                 &input,
-                vec![statistics_requirement(
-                    0,
-                    "v",
-                    FunctionValueType::new(carrier, true),
-                    1,
-                )],
+                vec![statistics_requirement(0, "v", value.clone(), 1)],
             )
-            .expect_err("invalid field identity cannot be admitted");
-            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-            assert_eq!(error.message(), expected);
+            .expect("source attributes cannot change an explicit physical declaration");
+            assert_eq!(contract.requirements()[0].input().value_type(), &value);
+            assert_eq!(
+                input.fields()[0].field().metadata()[NR_LOGICAL_TYPE_KEY],
+                tag
+            );
         }
+    }
+
+    #[test]
+    fn statistics_contract_requires_a_complete_target_declaration() {
+        let input = ConnectorWriteInputShape::Data {
+            fields: vec![ConnectorWriteFieldBinding::new(
+                ConnectorWriteFieldToken::from_bytes([1; 32]),
+                arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, true),
+            )],
+        };
+        let error = WriteStatisticsContract::try_new(
+            &input,
+            vec![statistics_requirement(
+                0,
+                "v",
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
+                1,
+            )],
+        )
+        .expect_err("source field alone is not an execution author");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message(),
+            "write statistics target field has no complete execution declaration"
+        );
     }
 
     #[test]

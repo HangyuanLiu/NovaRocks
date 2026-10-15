@@ -381,6 +381,7 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
         .map_err(ExpressionOccurrenceError::function)?;
     work.flush()?;
     let frozen = FrozenPhysicalCall {
+        materialized_writer_input: None,
         site: PhysicalCallSite::Expression(input.use_id),
         context: invocation.context,
         effects: preparation.call_contract().effects().clone(),

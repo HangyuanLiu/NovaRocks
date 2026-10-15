@@ -93,8 +93,8 @@ impl ConnectorWriteTargetBinding {
     ///
     /// This replaces reading `current_schema()` off a concrete provider table:
     /// column shaping, projection and default filling all work from here.
-    pub fn arrow_schema(&self) -> &arrow::datatypes::SchemaRef {
-        &self.metadata.schema
+    pub fn arrow_schema(&self) -> &arrow::datatypes::Schema {
+        self.metadata.schema()
     }
 
     /// SQL-visible columns in the shape row DML must write.
@@ -103,13 +103,13 @@ impl ConnectorWriteTargetBinding {
     /// overrides are all bounded neutral planning facts. Keeping this
     /// projection here avoids loading or decoding a concrete provider table in
     /// statement planning.
-    pub fn dml_target_columns(&self) -> Vec<novarocks_types::schema::ColumnDef> {
+    pub fn dml_target_columns(&self) -> Result<Vec<novarocks_types::schema::ColumnDef>, String> {
         self.metadata
-            .schema
+            .schema()
             .fields()
             .iter()
             .enumerate()
-            .filter_map(|(ordinal, field)| {
+            .filter_map(|(ordinal, _field)| {
                 let fact = self.metadata.planning_facts.column_facts().get(ordinal);
                 if matches!(
                     fact.map(|fact| fact.visibility()),
@@ -120,16 +120,11 @@ impl ConnectorWriteTargetBinding {
                 ) {
                     return None;
                 }
-                Some(novarocks_types::schema::ColumnDef {
-                    name: field.name().to_string(),
-                    data_type: fact
-                        .and_then(|fact| fact.write_target_type())
-                        .cloned()
-                        .unwrap_or_else(|| field.data_type().clone()),
-                    nullable: field.is_nullable(),
-                    write_default: None,
-                    logical_type: None,
-                })
+                Some(crate::connector::application::connector_write_column(
+                    &self.metadata,
+                    ordinal,
+                    None,
+                ))
             })
             .collect()
     }
@@ -261,49 +256,55 @@ pub(crate) fn derive_write_stack_lease(
 /// the signed shape cannot.
 pub(crate) fn write_input_request_for_shape(
     shape: &novarocks_spi::connector::ConnectorWriteInputShape,
-) -> novarocks_spi::connector::ConnectorWriteInputRequest {
+) -> Result<novarocks_spi::connector::ConnectorWriteInputRequest, String> {
     use novarocks_spi::connector::{
         ConnectorWriteFieldRequest, ConnectorWriteInputRequest, ConnectorWriteInputShape,
     };
 
     fn requests(
         fields: &[novarocks_spi::connector::ConnectorWriteFieldBinding],
-    ) -> Vec<ConnectorWriteFieldRequest> {
+    ) -> Result<Vec<ConnectorWriteFieldRequest>, String> {
         fields
             .iter()
-            .map(|field| ConnectorWriteFieldRequest::new(field.field().clone()))
+            .map(|field| {
+                let value = field.execution_type().ok_or_else(|| {
+                    "provider-signed writer field has no complete execution declaration".to_string()
+                })?;
+                ConnectorWriteFieldRequest::try_new_typed(field.field().clone(), value.clone())
+                    .map_err(|error| error.to_string())
+            })
             .collect()
     }
 
-    match shape {
+    Ok(match shape {
         ConnectorWriteInputShape::Data { fields } => ConnectorWriteInputRequest::Data {
-            fields: requests(fields),
+            fields: requests(fields)?,
         },
         ConnectorWriteInputShape::RowLineage {
             data_fields,
             row_identity_fields,
         } => ConnectorWriteInputRequest::RowLineage {
-            data_fields: requests(data_fields),
-            row_identity_fields: requests(row_identity_fields),
+            data_fields: requests(data_fields)?,
+            row_identity_fields: requests(row_identity_fields)?,
         },
         ConnectorWriteInputShape::PositionDelete {
             identity_fields,
             partition_source_fields,
         } => ConnectorWriteInputRequest::PositionDelete {
-            identity_fields: requests(identity_fields),
-            partition_source_fields: requests(partition_source_fields),
+            identity_fields: requests(identity_fields)?,
+            partition_source_fields: requests(partition_source_fields)?,
         },
         ConnectorWriteInputShape::DeletionVector {
             identity_fields,
             partition_source_fields,
         } => ConnectorWriteInputRequest::DeletionVector {
-            identity_fields: requests(identity_fields),
-            partition_source_fields: requests(partition_source_fields),
+            identity_fields: requests(identity_fields)?,
+            partition_source_fields: requests(partition_source_fields)?,
         },
         ConnectorWriteInputShape::EqualityDelete { equality_fields } => {
             ConnectorWriteInputRequest::EqualityDelete {
-                equality_fields: requests(equality_fields),
+                equality_fields: requests(equality_fields)?,
             }
         }
-    }
+    })
 }

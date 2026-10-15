@@ -21,7 +21,7 @@
 //! actual cursor exit. This interface alone advertises no runtime support.
 
 mod encoder;
-pub use encoder::ArrowMysqlTextEncoder;
+pub use encoder::{ArrowMysqlTextEncoder, ValidatedMysqlInput};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderErrorKind {

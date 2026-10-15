@@ -22,11 +22,11 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field};
 
 use crate::fragment_error::NativeFragmentDecodeError;
-use crate::fragment_expression::decode_expr_for_slot_layout;
-use crate::fragment_layout::decode_output_layout;
+use crate::fragment_expression::decode_expr_for_slot_layout_with_types;
+
 use crate::fragment_plan_node::NativeLoweredPlanNode as DecodedNode;
 use crate::fragment_plan_node::{concat_slot_layouts, proto_join_type};
-use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, SlotLayout};
+use novarocks_execution::exec::chunk::SlotLayout;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_execution::exec::node::join::{
     JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
@@ -42,7 +42,7 @@ use novarocks_types::wider_type;
     clippy::too_many_arguments,
     reason = "The frozen native boundary keeps independently validated inputs explicit."
 )]
-pub fn lower_hash_join_node(
+pub(crate) fn lower_hash_join_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
     join: &plan::HashJoinNode,
@@ -51,6 +51,8 @@ pub fn lower_hash_join_node(
     physical_output_path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let mut it = children.into_iter();
     let left = it.next().expect("left");
@@ -71,7 +73,7 @@ pub fn lower_hash_join_node(
         concat_slot_layouts(&left.layout, &right.layout),
     )?;
     let (nullable_left, nullable_right) = hash_join_nullable_sides(join_type);
-    let join_scope_chunk_schema = join_scope_chunk_schema(
+    let join_scope_chunk_schema = type_decoder.join_scope_schema(
         &left.output_schema,
         &right.output_schema,
         nullable_left,
@@ -97,17 +99,19 @@ pub fn lower_hash_join_node(
                 format!("HashJoinNode eq_conditions[{idx}] right missing"),
             )
         })?;
-        let probe_key = decode_expr_for_slot_layout(
+        let probe_key = decode_expr_for_slot_layout_with_types(
             left_expr,
             cond_path.clone().field("left"),
             arena,
             &left.layout,
+            type_decoder,
         )?;
-        let build_key = decode_expr_for_slot_layout(
+        let build_key = decode_expr_for_slot_layout_with_types(
             right_expr,
             cond_path.field("right"),
             arena,
             &right.layout,
+            type_decoder,
         )?;
         if build_is_left {
             probe_keys.push(build_key);
@@ -137,11 +141,12 @@ pub fn lower_hash_join_node(
         .other_condition
         .as_ref()
         .map(|expr| {
-            decode_expr_for_slot_layout(
+            decode_expr_for_slot_layout_with_types(
                 expr,
                 path.clone().field("other_condition"),
                 arena,
                 &join_layout,
+                type_decoder,
             )
         })
         .transpose()?;
@@ -180,6 +185,7 @@ pub fn lower_hash_join_node(
         physical_output_path,
         preserved_layout.as_ref(),
         arena,
+        type_decoder,
     )
 }
 
@@ -194,6 +200,8 @@ fn build_join_output_projection(
     path: FieldPath,
     preserved_layout: Option<&SlotLayout>,
     arena: &mut ExprArena,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let (node_kind, node_id) = identity;
     if output_columns.is_empty() {
@@ -205,7 +213,8 @@ fn build_join_output_projection(
         }
         return Ok(join_node);
     }
-    let output_layout = decode_output_layout(output_columns, path.clone())
+    let output_layout = type_decoder
+        .output_layout(output_columns, path.clone())
         .map_err(NativeFragmentDecodeError::from)?;
     let output_schema = output_layout.chunk_schema();
     if let Some(preserved_layout) = preserved_layout
@@ -242,11 +251,20 @@ fn build_join_output_projection(
                 ),
             ));
         }
-        let expr = arena.push_typed(
-            ExprNode::SlotId(output.slot_id()),
-            source.data_type().clone(),
-        );
-        arena.set_field_schema(expr, source.field_schema().clone());
+        if matches!(
+            type_decoder,
+            crate::fragment_type_decode::NativeTypeDecoder::Strong { .. }
+        ) && !type_decoder.bindings_match(
+            source.typed_binding(),
+            output.typed_binding(),
+            false,
+        )? {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone(),
+                "join projection differs from its complete source binding",
+            ));
+        }
+        let expr = type_decoder.source_slot_expression(source, arena)?;
         exprs.push(expr);
     }
     Ok(DecodedNode {
@@ -266,36 +284,6 @@ fn build_join_output_projection(
         layout,
         output_schema,
     })
-}
-
-fn join_scope_chunk_schema(
-    left: &ChunkSchemaRef,
-    right: &ChunkSchemaRef,
-    nullable_left: bool,
-    nullable_right: bool,
-    path: FieldPath,
-) -> Result<ChunkSchemaRef, NativeFragmentDecodeError> {
-    let slots = left
-        .slots()
-        .iter()
-        .map(|slot| {
-            if nullable_left {
-                slot.with_nullable(true)
-            } else {
-                slot.clone()
-            }
-        })
-        .chain(right.slots().iter().map(|slot| {
-            if nullable_right {
-                slot.with_nullable(true)
-            } else {
-                slot.clone()
-            }
-        }))
-        .collect();
-    ChunkSchema::try_new(slots)
-        .map(Arc::new)
-        .map_err(|error| NativeFragmentDecodeError::inconsistent(path, error))
 }
 
 const fn hash_join_nullable_sides(join_type: JoinType) -> (bool, bool) {

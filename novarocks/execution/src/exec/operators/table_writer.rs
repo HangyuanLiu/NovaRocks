@@ -58,7 +58,8 @@ use crate::exec::expr::agg::SealedExecutionFunctionSet;
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 use crate::exec::node::table_write_relation::{
-    ConnectorCommitFragmentEncoder, WriterMultiplexRelationSchema,
+    ConnectorCommitFragmentEncoder, WriterMultiplexRelationSchema, WriterMultiplexRelationTemplate,
+    WriterRelationPreparation,
 };
 #[cfg(feature = "test-controls")]
 use crate::exec::node::table_write_relation::{
@@ -84,6 +85,13 @@ use crate::runtime::runtime_state::RuntimeState;
 /// 64 MiB native gRPC message limit.
 const MAX_WRITER_MULTIPLEX_ROW_BYTES: usize = 16 * 1024 * 1024;
 
+#[derive(Clone)]
+struct LocalPreparedWriterPartial {
+    calls: novarocks_local_program::PreparedWriterAggregateCalls,
+    input_layout: novarocks_local_program::StaticLayout,
+    output_layout: novarocks_local_program::StaticLayout,
+    error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
+}
 /// The immutable per-node facts every driver copies when it opens its writer.
 struct TableWriterPlan {
     handle: ConnectorWriterHandle,
@@ -94,12 +102,13 @@ struct TableWriterPlan {
     physical_template: TableWriterPhysicalContextTemplate,
     request_context: ConnectorRequestContext,
     fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
-    writer_multiplex_schema: WriterMultiplexRelationSchema,
+    writer_multiplex_schema: WriterRelationPreparation,
     /// Each driver's partial aggregate over its projected pages, emitting one
     /// state row whose auxiliary channels the writer packs as sparse
     /// `AGGREGATE_PARTIAL` rows. A plan-tree writer binds it from the
     /// process function set; a compiled writer from its prepared calls.
     partial_aggregate_factory: Option<Arc<dyn OperatorFactory>>,
+    local_partial_source: Option<LocalPreparedWriterPartial>,
     #[cfg(feature = "test-controls")]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
@@ -107,6 +116,10 @@ struct TableWriterPlan {
 /// How one driver projects an input page onto the exact provider schema its
 /// writer and every embedded aggregate share.
 pub(crate) trait WriterPageProjection: Send {
+    fn prepare(
+        &mut self,
+        factory: Option<&Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    ) -> ExecutionResult<()>;
     fn set_mem_tracker(&mut self, _tracker: Arc<MemTracker>) {}
     fn bind_runtime_state(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         Ok(())
@@ -120,8 +133,14 @@ pub(crate) trait WriterProjectionFactory: Send + Sync {
 }
 
 impl WriterPageProjection for TableWriterInputProjection {
+    fn prepare(
+        &mut self,
+        factory: Option<&Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    ) -> ExecutionResult<()> {
+        self.prepare_created(factory)
+    }
     fn project(&mut self, chunk: &Chunk) -> ExecutionResult<Chunk> {
-        Ok(TableWriterInputProjection::project(self, chunk)?)
+        self.project_created(chunk)
     }
 }
 
@@ -150,10 +169,12 @@ impl TableWriterOperatorFactory {
         target: WriteTargetOrdinal,
         expected_schema: arrow::datatypes::SchemaRef,
         projection: TableWriterInputProjection,
-        writer_multiplex_schema: WriterMultiplexRelationSchema,
-        partial_aggregate_calls: &[crate::exec::node::table_write_aggregate::WriterPartialAggregateCall],
+        writer_multiplex_schema: WriterMultiplexRelationTemplate,
+        prepared_partials: Option<novarocks_local_program::PreparedWriterAggregateCalls>,
+        partial_input_layout: novarocks_local_program::StaticLayout,
+        partial_output_layout: novarocks_local_program::StaticLayout,
+        error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
         binding: &TableWriterRuntimeBinding,
-        function_set: Arc<SealedExecutionFunctionSet>,
     ) -> Result<Self, String> {
         if binding.execution.catalog_handle() != binding.handle.binding().catalog_handle() {
             return Err(
@@ -167,13 +188,12 @@ impl TableWriterOperatorFactory {
                     .to_string(),
             );
         }
-        let partial_aggregate_factory = build_partial_aggregate_factory(
-            node_id,
-            partial_aggregate_calls,
-            &writer_multiplex_schema,
-            function_set,
-        )?
-        .map(|factory| Arc::new(factory) as Arc<dyn OperatorFactory>);
+        let local_partial_source = prepared_partials.map(|calls| LocalPreparedWriterPartial {
+            calls,
+            input_layout: partial_input_layout,
+            output_layout: partial_output_layout,
+            error,
+        });
         let name = if node_id >= 0 {
             format!("TABLE_WRITER (id={node_id})")
         } else {
@@ -190,8 +210,11 @@ impl TableWriterOperatorFactory {
                 physical_template: binding.physical_template,
                 request_context: binding.request_context.clone(),
                 fragment_encoder: Arc::clone(&binding.fragment_encoder),
-                writer_multiplex_schema,
-                partial_aggregate_factory,
+                writer_multiplex_schema: WriterRelationPreparation::compiled(
+                    writer_multiplex_schema,
+                ),
+                partial_aggregate_factory: None,
+                local_partial_source,
                 #[cfg(feature = "test-controls")]
                 aggregate_guard: Arc::clone(&binding.aggregate_guard),
             }),
@@ -207,7 +230,7 @@ impl TableWriterOperatorFactory {
         target: WriteTargetOrdinal,
         expected_schema: arrow::datatypes::SchemaRef,
         projection: Arc<dyn WriterProjectionFactory>,
-        writer_multiplex_schema: WriterMultiplexRelationSchema,
+        writer_multiplex_schema: WriterMultiplexRelationTemplate,
         partial_aggregate_factory: Option<Arc<dyn OperatorFactory>>,
         binding: &TableWriterRuntimeBinding,
     ) -> Result<Self, String> {
@@ -233,8 +256,11 @@ impl TableWriterOperatorFactory {
                 physical_template: binding.physical_template,
                 request_context: binding.request_context.clone(),
                 fragment_encoder: Arc::clone(&binding.fragment_encoder),
-                writer_multiplex_schema,
+                writer_multiplex_schema: WriterRelationPreparation::compiled(
+                    writer_multiplex_schema,
+                ),
                 partial_aggregate_factory,
+                local_partial_source: None,
                 #[cfg(feature = "test-controls")]
                 aggregate_guard: Arc::clone(&binding.aggregate_guard),
             }),
@@ -270,8 +296,11 @@ impl TableWriterOperatorFactory {
                 physical_template: node.physical_template(),
                 request_context: node.request_context().clone(),
                 fragment_encoder: Arc::clone(node.fragment_encoder()),
-                writer_multiplex_schema: node.writer_multiplex_schema().clone(),
+                writer_multiplex_schema: WriterRelationPreparation::Existing(
+                    node.writer_multiplex_schema().clone(),
+                ),
                 partial_aggregate_factory,
+                local_partial_source: None,
                 #[cfg(feature = "test-controls")]
                 aggregate_guard: Arc::clone(node.aggregate_guard()),
             }),
@@ -279,26 +308,62 @@ impl TableWriterOperatorFactory {
     }
 }
 
+/// Explicit construction-plan expansion adapter; local preparation supplies
+/// the actual owner and requires complete frozen selection facts.
 fn build_partial_aggregate_factory(
     node_id: i32,
     calls: &[crate::exec::node::table_write_aggregate::WriterPartialAggregateCall],
     writer_multiplex_schema: &WriterMultiplexRelationSchema,
     function_set: Arc<SealedExecutionFunctionSet>,
 ) -> Result<Option<AggregateProcessorFactory>, String> {
+    build_partial_aggregate_factory_core(
+        node_id,
+        calls,
+        writer_multiplex_schema,
+        function_set,
+        None,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn build_partial_aggregate_factory_core(
+    node_id: i32,
+    calls: &[crate::exec::node::table_write_aggregate::WriterPartialAggregateCall],
+    writer_multiplex_schema: &WriterMultiplexRelationSchema,
+    function_set: Arc<SealedExecutionFunctionSet>,
+    owner: Option<&dyn crate::exec::pipeline::operator::InputConstructionOwner>,
+) -> ExecutionResult<Option<AggregateProcessorFactory>> {
     if calls.is_empty() {
         return Ok(None);
     }
     let mut arena = ExprArena::default();
     let mut functions = Vec::with_capacity(calls.len());
     let mut resolved = Vec::with_capacity(calls.len());
-    let mut output_slots = Vec::with_capacity(calls.len());
+    if let Some(owner) = owner {
+        owner.request(
+            std::alloc::Layout::array::<crate::exec::chunk::ChunkSlotSchema>(calls.len()).map_err(
+                |_| {
+                    crate::exec::pipeline::operator::ConstructionFailure::Control(
+                        novarocks_type_contract::CompileControlError::ResourceExhausted,
+                    )
+                },
+            )?,
+        )?;
+    }
+    let mut output_slots = Vec::new();
+    output_slots.try_reserve_exact(calls.len()).map_err(|_| {
+        crate::exec::pipeline::operator::ConstructionFailure::Control(
+            novarocks_type_contract::CompileControlError::ResourceExhausted,
+        )
+    })?;
     for call in calls {
         if call.resolved.argument_types.len() != 1 {
             return Err(format!(
                 "writer partial aggregate {} requires exactly one planned input type, got {}",
                 call.function_name,
                 call.resolved.argument_types.len()
-            ));
+            )
+            .into());
         }
         let input_type = call
             .resolved
@@ -306,8 +371,32 @@ fn build_partial_aggregate_factory(
             .first()
             .ok_or_else(|| "writer partial aggregate input type is missing".to_string())?
             .clone();
-        let input = arena.push_typed(ExprNode::SlotId(call.input_slot_id), input_type.clone());
+        let input = if owner.is_some() {
+            let frozen = call.frozen.as_ref().ok_or_else(|| {
+                "writer partial aggregate lacks its complete frozen selection".to_owned()
+            })?;
+            let [novarocks_type_contract::FunctionArgumentType::Value(value)] =
+                frozen.selected().argument_types.as_slice()
+            else {
+                return Err(
+                    "writer partial aggregate frozen input is not one complete scalar"
+                        .to_owned()
+                        .into(),
+                );
+            };
+            if value.data_type() != &input_type {
+                return Err(
+                    "writer partial aggregate frozen input differs from its resolved layout"
+                        .to_owned()
+                        .into(),
+                );
+            }
+            arena.push_value_typed(ExprNode::SlotId(call.input_slot_id), value.clone())
+        } else {
+            arena.push_typed(ExprNode::SlotId(call.input_slot_id), input_type.clone())
+        };
         functions.push(AggFunction {
+            frozen: call.frozen.clone(),
             name: call.function_name.to_string(),
             inputs: vec![input],
             input_is_intermediate: false,
@@ -329,17 +418,66 @@ fn build_partial_aggregate_factory(
                     call.intermediate_slot_id
                 )
             })?;
-        if output_slot.data_type() != &call.resolved.intermediate_type {
-            return Err(format!(
-                "writer partial aggregate output slot {} type mismatch: relation={:?}, resolved={:?}",
-                call.intermediate_slot_id,
-                output_slot.data_type(),
-                call.resolved.intermediate_type
-            ));
+        if let Some(owner) = owner {
+            let frozen = call.frozen.as_ref().ok_or_else(|| {
+                "writer partial aggregate lacks its complete frozen selection".to_owned()
+            })?;
+            let selected = frozen.selected().aggregate.as_ref().ok_or_else(|| {
+                "writer partial frozen selection has no aggregate signature".to_owned()
+            })?;
+            let actual = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
+                output_slot.typed_binding().clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            if selected.intermediate_type.data_type() != &call.resolved.intermediate_type
+                || !actual.same_physical_binding_ignoring_root_nullability_observed(
+                    &selected.intermediate_type,
+                    || {
+                        owner.observe(
+                            0,
+                            &[],
+                            crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
+                                units: 1,
+                            },
+                        )
+                    },
+                )?
+            {
+                return Err(format!("writer partial aggregate output slot {} type mismatch: relation={:?}, frozen={:?}",call.intermediate_slot_id,actual,selected.intermediate_type).into());
+            }
+        } else if output_slot.data_type() != &call.resolved.intermediate_type {
+            return Err(format!("writer partial aggregate output slot {} type mismatch: relation={:?}, resolved={:?}",call.intermediate_slot_id,output_slot.data_type(),call.resolved.intermediate_type).into());
         }
         output_slots.push(output_slot);
     }
-    let output_chunk_schema = Arc::new(ChunkSchema::try_new(output_slots)?);
+    let output_chunk_schema = match owner {
+        Some(owner) => {
+            let schema = ChunkSchema::try_new_typed_observed::<
+                crate::exec::pipeline::operator::ConstructionFailure,
+            >(
+                output_slots,
+                owner.storage_lifetime(),
+                |layout| owner.request(layout),
+                |units| {
+                    owner.observe(
+                        0,
+                        &[],
+                        crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
+                            units,
+                        },
+                    )
+                },
+            )?;
+            owner.request(
+                novarocks_type_contract::owned_resources::layout::arc_layout(
+                    std::alloc::Layout::new::<ChunkSchema>(),
+                )
+                .map_err(crate::exec::pipeline::operator::ConstructionFailure::Resource)?,
+            )?;
+            Arc::new(schema)
+        }
+        None => Arc::new(ChunkSchema::try_new(output_slots)?),
+    };
     AggregateProcessorFactory::new_native(
         node_id,
         Arc::new(arena),
@@ -356,6 +494,7 @@ fn build_partial_aggregate_factory(
         None,
     )
     .map(Some)
+    .map_err(Into::into)
 }
 
 impl TableWriterOperatorFactory {
@@ -414,7 +553,9 @@ impl TableWriterOperatorFactory {
             writer,
             target,
             relation: plan.writer_multiplex_schema.clone(),
+            construction: None,
             partial_aggregate,
+            local_partial_source: plan.local_partial_source.clone(),
             #[cfg(feature = "test-controls")]
             aggregate_guard: Arc::clone(&plan.aggregate_guard),
             state: TableWriterState::Open,
@@ -492,8 +633,10 @@ struct TableWriterOperator {
     projection: Box<dyn WriterPageProjection>,
     writer: AsyncWriterOwner<WriterCompletion>,
     target: WriteTargetOrdinal,
-    relation: WriterMultiplexRelationSchema,
+    relation: WriterRelationPreparation,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     partial_aggregate: Option<Box<dyn Operator>>,
+    local_partial_source: Option<LocalPreparedWriterPartial>,
     #[cfg(feature = "test-controls")]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
     state: TableWriterState,
@@ -567,6 +710,23 @@ fn encode_writer_completion(
 }
 
 impl Operator for TableWriterOperator {
+    fn creates_typed_storage(&self) -> bool {
+        self.relation.is_compiled()
+            || self
+                .partial_aggregate
+                .as_ref()
+                .is_some_and(|partial| partial.creates_typed_storage())
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        if let Some(partial) = self.partial_aggregate.as_mut() {
+            partial.set_construction_factory(Arc::clone(&factory));
+        }
+        self.construction = Some(factory);
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -581,9 +741,11 @@ impl Operator for TableWriterOperator {
             .expect("table writer result tracker lock") = Some(result_tracker);
         self.pending_output_tracker =
             Some(MemTracker::new_child("WriterMultiplexOutput", &tracker));
-        if let Some(partial) = self.partial_aggregate.as_mut() {
+        if self.partial_aggregate.is_some() || self.local_partial_source.is_some() {
             let aggregate_tracker = MemTracker::new_child("WriterPartialAggregate", &tracker);
-            partial.set_mem_tracker(Arc::clone(&aggregate_tracker));
+            if let Some(partial) = self.partial_aggregate.as_mut() {
+                partial.set_mem_tracker(aggregate_tracker.clone());
+            }
             self.aggregate_tracker = Some(aggregate_tracker);
         }
     }
@@ -597,6 +759,50 @@ impl Operator for TableWriterOperator {
     }
 
     fn prepare(&mut self) -> ExecutionResult<()> {
+        self.projection.prepare(self.construction.as_ref())?;
+        if let Err(error) = self.relation.prepare(self.construction.as_ref()) {
+            self.state = TableWriterState::Failed;
+            return Err(error);
+        }
+        if let Some(recipe) = self.local_partial_source.as_ref() {
+            let deferred = (|| -> ExecutionResult<Box<dyn Operator>> {
+                let factory = self
+                    .construction
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+                let owner = factory.begin_compiled_layout_construction(&recipe.output_layout)?;
+                let mut partial = super::compiled_writer_statistics::CompiledWriterPartialFactory::create_prepared_in(
+                    recipe.calls.clone(), recipe.input_layout.clone(), recipe.output_layout.clone(),
+                    recipe.error.clone(), owner.as_ref(),
+                )?;
+                partial.set_construction_factory(factory.clone());
+                if let Some(tracker) = self.aggregate_tracker.as_ref() {
+                    partial.set_mem_tracker(tracker.clone());
+                }
+                if let Some(profiles) = self.profiles.as_ref() {
+                    partial.set_profiles(profiles.clone());
+                }
+                if let Some(processor) = partial.as_processor_ref() {
+                    if let Some(observable) = processor.sink_observable() {
+                        forward_observable(&observable, &self.readiness_observable);
+                    }
+                    if let Some(observable) = processor.source_observable() {
+                        forward_observable(&observable, &self.readiness_observable);
+                    }
+                }
+                Ok(partial)
+            })();
+            match deferred {
+                Ok(partial) => {
+                    self.partial_aggregate = Some(partial);
+                    self.local_partial_source = None;
+                }
+                Err(error) => {
+                    self.state = TableWriterState::Failed;
+                    return Err(error);
+                }
+            }
+        }
         if let Some(partial) = self.partial_aggregate.as_mut()
             && let Err(error) = partial.prepare()
         {
@@ -769,11 +975,11 @@ impl ProcessorOperator for TableWriterOperator {
                 .checked_add(rows)
                 .ok_or_else(|| "table writer logical row count overflowed u64".to_string())?;
             let projected = self.projection.project(&chunk)?;
-            let batch = projected.batch.clone();
-            let retained_bytes = record_batch_bytes(&batch);
-            let additional_bytes = record_batch_additional_bytes(&batch, &chunk.batch);
+            let batch = projected.record_batch();
+            let retained_bytes = record_batch_bytes(batch);
+            let additional_bytes = record_batch_additional_bytes(batch, chunk.record_batch());
             let connector_retained_bytes =
-                crate::exec::chunk::record_batch_shared_owner_bytes(&batch, &chunk.batch);
+                crate::exec::chunk::record_batch_shared_owner_bytes(batch, chunk.record_batch());
             let accounting = chunk.take_memory_lease();
             let reservation = self.writer.try_reserve_input(
                 batch.num_rows(),
@@ -782,6 +988,33 @@ impl ProcessorOperator for TableWriterOperator {
                 connector_retained_bytes,
                 additional_bytes,
             )?;
+            // Snapshot only after the original source accounting has moved to
+            // this reservation. Queue custody must not duplicate payload funds.
+            let append = if projected.chunk_schema().is_typed() {
+                let factory = self
+                    .construction
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+                let owner = factory.begin_typed_construction(projected.chunk_schema())?;
+                crate::exec::pipeline::async_writer::WriterAppendBatch::try_new(
+                    projected.batch_projection(),
+                    owner.as_ref(),
+                )?
+            } else {
+                #[cfg(test)]
+                {
+                    crate::exec::pipeline::async_writer::WriterAppendBatch::from_fixture_projection(
+                        projected.batch_projection(),
+                    )
+                }
+                #[cfg(not(test))]
+                return Err(
+                    crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
+                        "writer append requires its complete execution bindings".into(),
+                    )
+                    .into(),
+                );
+            };
             // The writer reservation now owns every retained input charge.
             // Drop the source view before it releases any unshared connector
             // bytes, so accounting never leaves live source buffers ownerless.
@@ -796,7 +1029,7 @@ impl ProcessorOperator for TableWriterOperator {
                     .ok_or_else(|| "writer partial aggregate is not a processor".to_string())?;
                 processor.push_chunk(state, projected)?;
             }
-            reservation.send(batch)?;
+            reservation.send(append)?;
             self.logical_rows = next_rows;
             Ok(())
         })();
@@ -973,6 +1206,8 @@ impl TableWriterOperator {
             return None;
         }
         self.relation
+            .schema()
+            .ok()?
             .contract()
             .auxiliary_channels()
             .iter()
@@ -1023,14 +1258,18 @@ impl TableWriterOperator {
         ];
         columns.extend(
             self.relation
+                .schema()?
                 .contract()
                 .auxiliary_channels()
                 .iter()
                 .map(|channel| new_null_array(channel.data_type(), rows)),
         );
         self.track_output(
-            RecordBatch::try_new(Arc::clone(self.relation.contract().arrow_schema()), columns)
-                .map_err(|error| format!("build table writer prefix output: {error}"))?,
+            RecordBatch::try_new(
+                self.relation.schema()?.chunk_schema().arrow_schema_ref(),
+                columns,
+            )
+            .map_err(|error| format!("build table writer prefix output: {error}"))?,
         )
     }
 
@@ -1114,6 +1353,7 @@ impl TableWriterOperator {
             };
             let candidates = self
                 .relation
+                .schema()?
                 .contract()
                 .auxiliary_channels()
                 .iter()
@@ -1163,8 +1403,15 @@ impl TableWriterOperator {
             self.partial_bytes = self.partial_bytes.saturating_add(best_bytes);
             self.partial_batches = self.partial_batches.saturating_add(1);
             self.partial_channels = self.partial_channels.saturating_add(count);
-            let sparse_rows =
-                usize::from(count < self.relation.contract().auxiliary_channels().len());
+            let sparse_rows = usize::from(
+                count
+                    < self
+                        .relation
+                        .schema()?
+                        .contract()
+                        .auxiliary_channels()
+                        .len(),
+            );
             self.sparse_partial_rows = self.sparse_partial_rows.saturating_add(sparse_rows);
             crate::runtime::table_writer_metrics::observe_partial_output(
                 output.len(),
@@ -1208,6 +1455,7 @@ impl TableWriterOperator {
         ];
         for (index, channel) in self
             .relation
+            .schema()?
             .contract()
             .auxiliary_channels()
             .iter()
@@ -1224,14 +1472,19 @@ impl TableWriterOperator {
             }
         }
         self.track_output(
-            RecordBatch::try_new(Arc::clone(self.relation.contract().arrow_schema()), columns)
-                .map_err(|error| format!("build writer aggregate partial output: {error}"))?,
+            RecordBatch::try_new(
+                self.relation.schema()?.chunk_schema().arrow_schema_ref(),
+                columns,
+            )
+            .map_err(|error| format!("build writer aggregate partial output: {error}"))?,
         )
     }
 
     fn track_output(&self, batch: RecordBatch) -> Result<Chunk, String> {
-        let mut chunk =
-            Chunk::try_new_with_chunk_schema(batch, Arc::clone(self.relation.chunk_schema()))?;
+        let mut chunk = Chunk::try_new_with_chunk_schema(
+            batch,
+            Arc::clone(self.relation.schema()?.chunk_schema()),
+        )?;
         if let Some(tracker) = self.pending_output_tracker.as_ref() {
             chunk.try_transfer_to(tracker)?;
         }
@@ -1244,7 +1497,7 @@ impl TableWriterOperator {
             let mut writer = StreamWriter::try_new(&mut encoded, &chunk.schema())
                 .map_err(|error| format!("table writer output size encoding: {error}"))?;
             writer
-                .write(&chunk.batch)
+                .write(&chunk.record_batch())
                 .map_err(|error| format!("table writer output size encoding: {error}"))?;
             writer
                 .finish()
@@ -2250,9 +2503,12 @@ pub(crate) mod tests {
         let contract = WriterMultiplexSchema::try_new(channels.clone()).expect("multiplex schema");
         let relation = WriterMultiplexRelationSchema::try_new(contract).expect("relation schema");
         let partial = WriterPartialAggregatePlan {
+            prepared: None,
             calls: channels
                 .iter()
                 .map(|channel| WriterPartialAggregateCall {
+                    // Explicit legacy carrier fixture; this is not frozen-binding admission.
+                    frozen: None,
                     input_slot_id: SlotId::new(1),
                     function_name: Arc::from("count"),
                     resolved: resolved.clone(),

@@ -17,7 +17,7 @@
 //! Every actual COUNT logical signature, plus separately named original physical NULL counterexamples.
 use super::aggregate::{AggregateDiffSpec, assert_aggregate_matches_v1};
 use arrow::array::{ArrayRef, DictionaryArray, Int8Array, Int64Array, NullArray, StringArray};
-use arrow::datatypes::Int8Type;
+use arrow::datatypes::{Int8Type, Int32Type};
 use std::sync::Arc;
 #[test]
 fn pure_differential_count_original_star_signature_all_phases_grouped_empty() {
@@ -79,4 +79,33 @@ fn pure_differential_count_original_dictionary_value_null_counterexample() {
             .column(input)
             .partitions(3, 29),
     );
+}
+
+#[test]
+fn pure_differential_count_installed_dictionary_and_plain_logical_nulls_and_slices() {
+    let dictionary: ArrayRef = Arc::new(
+        DictionaryArray::<Int32Type>::try_new(
+            arrow::array::Int32Array::from(vec![Some(0), Some(1), None, Some(1), Some(0)]),
+            Arc::new(StringArray::from(vec![Some("ok"), None])),
+        )
+        .unwrap(),
+    );
+    let plain: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("ok"),
+        None,
+        None,
+        None,
+        Some("ok"),
+    ]));
+    for source in [dictionary, plain] {
+        for values in [source.clone(), source.slice(1, 3), source.slice(2, 0)] {
+            let rows = values.len();
+            assert_aggregate_matches_v1(
+                AggregateDiffSpec::new("count")
+                    .column(values)
+                    .grouped((0..rows).map(|row| row % 2).collect(), 4)
+                    .partitions(3, 29),
+            );
+        }
+    }
 }

@@ -461,9 +461,29 @@ impl ExecutionFunctionSetBuilder {
         }
         let implementation_manifest_digest =
             digest_aggregate_implementation_manifest(&self.aggregate_implementations);
+        let mut executable = BTreeMap::<
+            novarocks_type_contract::FunctionId,
+            BTreeMap<AggregateOverloadIdentity, AggregateImplementationBinding>,
+        >::new();
+        for (key, implementation) in self.aggregate_implementations {
+            let definition = catalog
+                .definition(&key.canonical_name, FunctionKind::Aggregate)
+                .expect("implementation metadata was checked above");
+            let declaration = definition.binding_declaration().ok_or_else(|| {
+                ExecutionFunctionSetError::PrepareAggregate {
+                    canonical_name: key.canonical_name.clone(),
+                    overload: key.overload.clone(),
+                    message: "aggregate executable requires a complete function identity".into(),
+                }
+            })?;
+            executable
+                .entry(declaration.function_id().clone())
+                .or_default()
+                .insert(key.overload, implementation);
+        }
         Ok(SealedExecutionFunctionSet {
             catalog,
-            aggregate_implementations: self.aggregate_implementations,
+            aggregate_implementations: executable,
             implementation_manifest_digest,
         })
     }
@@ -471,7 +491,10 @@ impl ExecutionFunctionSetBuilder {
 
 pub struct SealedExecutionFunctionSet {
     catalog: Arc<EngineFunctionCatalog>,
-    aggregate_implementations: BTreeMap<AggregateImplementationKey, AggregateImplementationBinding>,
+    aggregate_implementations: BTreeMap<
+        novarocks_type_contract::FunctionId,
+        BTreeMap<AggregateOverloadIdentity, AggregateImplementationBinding>,
+    >,
     implementation_manifest_digest: [u8; 32],
 }
 
@@ -486,7 +509,11 @@ impl fmt::Debug for SealedExecutionFunctionSet {
             )
             .field(
                 "aggregate_implementation_count",
-                &self.aggregate_implementations.len(),
+                &self
+                    .aggregate_implementations
+                    .values()
+                    .map(BTreeMap::len)
+                    .sum::<usize>(),
             )
             .finish()
     }
@@ -509,37 +536,92 @@ impl SealedExecutionFunctionSet {
         context: &AggregatePrepareContext<'_>,
     ) -> Result<PreparedAggregateKernel, ExecutionFunctionSetError> {
         let selected = context.selected;
-        let local = self
-            .catalog
-            .resolve_selected_aggregate_update_trusted(
-                canonical_name,
-                &selected.overload,
-                &selected.argument_types,
-            )
-            .map_err(|error| ExecutionFunctionSetError::PrepareAggregate {
-                canonical_name: canonical_name.into(),
+        let definition = if let Some(frozen) = context.frozen {
+            let definition = self
+                .catalog
+                .definition_by_id(frozen.function_id())
+                .ok_or_else(|| ExecutionFunctionSetError::PrepareAggregate {
+                    canonical_name: canonical_name.into(),
+                    overload: selected.overload.clone(),
+                    message: "frozen aggregate function identity is not installed".into(),
+                })?;
+            if definition.kind() != FunctionKind::Aggregate {
+                return Err(ExecutionFunctionSetError::PrepareAggregate {
+                    canonical_name: canonical_name.into(),
+                    overload: selected.overload.clone(),
+                    message: "frozen function identity is not an aggregate".into(),
+                });
+            }
+            let frozen_selection = frozen.selected();
+            let aggregate = frozen_selection
+                .aggregate
+                .as_ref()
+                .expect("checked frozen aggregate owner");
+            let arguments_match=frozen_selection.argument_types.len()==selected.argument_types.len()
+                && frozen_selection.argument_types.iter().zip(selected.argument_types.iter()).all(|(actual,expected)| {
+                    matches!(actual,novarocks_functions::FunctionArgumentType::Value(actual) if actual.data_type()==expected)
+                });
+            let result_matches = matches!(&frozen_selection.result_type,novarocks_functions::FunctionResultType::Scalar(actual) if actual.data_type()==&selected.output_type);
+            if frozen_selection.overload.as_str() != selected.overload.as_str()
+                || !arguments_match
+                || !result_matches
+                || aggregate.intermediate_type.data_type() != &selected.intermediate_type
+                || aggregate.state_format != selected.state_format
+            {
+                return Err(ExecutionFunctionSetError::PrepareAggregate {
+                    canonical_name: definition.canonical_name().into(), overload: selected.overload.clone(),
+                    message: "aggregate physical specialization differs from its complete frozen selection".into(),
+                });
+            }
+            definition
+        } else {
+            // Expansion-only source: its missing complete author cannot gain
+            // semantics from this legacy carrier resolver. Retired with P07.
+            let local = self
+                .catalog
+                .resolve_selected_aggregate_update_trusted(
+                    canonical_name,
+                    &selected.overload,
+                    &selected.argument_types,
+                )
+                .map_err(|error| ExecutionFunctionSetError::PrepareAggregate {
+                    canonical_name: canonical_name.into(),
+                    overload: selected.overload.clone(),
+                    message: error.to_string().into(),
+                })?;
+            if &local != selected {
+                return Err(ExecutionFunctionSetError::ResolvedAggregateDrift {
+                    canonical_name: canonical_name.into(),
+                    planned: Box::new(selected.clone()),
+                    local: Box::new(local),
+                });
+            }
+            self.catalog
+                .definition(canonical_name, FunctionKind::Aggregate)
+                .expect("legacy resolver found its definition")
+        };
+        let declaration = definition.binding_declaration().ok_or_else(|| {
+            ExecutionFunctionSetError::PrepareAggregate {
+                canonical_name: definition.canonical_name().into(),
                 overload: selected.overload.clone(),
-                message: error.to_string().into(),
-            })?;
-        if &local != selected {
-            return Err(ExecutionFunctionSetError::ResolvedAggregateDrift {
-                canonical_name: canonical_name.into(),
-                planned: Box::new(selected.clone()),
-                local: Box::new(local),
-            });
-        }
-        let key = AggregateImplementationKey::try_new(canonical_name, selected.overload.clone())?;
-        let implementation = self.aggregate_implementations.get(&key).ok_or_else(|| {
-            ExecutionFunctionSetError::UnknownAggregateImplementation {
-                canonical_name: key.canonical_name.clone(),
-                overload: key.overload.clone(),
+                message: "aggregate has no complete installed declaration".into(),
             }
         })?;
+        let implementation = self
+            .aggregate_implementations
+            .get(declaration.function_id())
+            .and_then(|overloads| overloads.get(&selected.overload))
+            .ok_or_else(
+                || ExecutionFunctionSetError::UnknownAggregateImplementation {
+                    canonical_name: definition.canonical_name().into(),
+                    overload: selected.overload.clone(),
+                },
+            )?;
         if implementation.expected_state_format != selected.state_format {
             return Err(
                 ExecutionFunctionSetError::AggregateImplementationStateFormatMismatch {
-                    canonical_name: key.canonical_name,
-                    overload: key.overload,
+                    canonical_name: definition.canonical_name().into(),
+                    overload: selected.overload.clone(),
                     metadata: selected.state_format.clone(),
                     implementation: implementation.expected_state_format.clone(),
                 },
@@ -550,8 +632,8 @@ impl SealedExecutionFunctionSet {
             .prepare(context)
             .map(|kernel| PreparedAggregateKernel { kernel })
             .map_err(|message| ExecutionFunctionSetError::PrepareAggregate {
-                canonical_name: key.canonical_name,
-                overload: key.overload,
+                canonical_name: definition.canonical_name().into(),
+                overload: selected.overload.clone(),
                 message: message.into(),
             })
     }
@@ -589,6 +671,7 @@ fn digest_manifest_text(hasher: &mut Sha256, value: &str) {
 /// contract receives only `selected` and `options`; legacy execution details
 /// remain private to the compatibility adapter.
 pub(crate) struct AggregatePrepareContext<'a> {
+    pub(crate) frozen: Option<&'a novarocks_local_program::FrozenAggregateSelection>,
     pub(crate) selected: &'a ResolvedAggregateSignature,
     pub(crate) options: &'a AggregateBindOptions,
     pub(crate) legacy: Option<LegacyAggregateBindContext<'a>>,
@@ -601,6 +684,7 @@ impl<'a> AggregatePrepareContext<'a> {
         options: &'a AggregateBindOptions,
     ) -> Self {
         Self {
+            frozen: None,
             selected,
             options,
             legacy: None,

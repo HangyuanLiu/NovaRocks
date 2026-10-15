@@ -47,17 +47,17 @@ enum DateInput<'a> {
 }
 impl<'a> DateInput<'a> {
     fn checked(source: &FunctionValueType, array: &'a dyn Array) -> Result<Self, KernelFailure> {
-        if source.logical_type != ValueLogicalType::Physical {
+        if source.logical_type() != ValueLogicalType::Physical {
             return Err(invalid(
                 "calendar day number requires its exact Physical source domain",
             ));
         }
-        if array.data_type() != &source.data_type {
+        if array.data_type() != source.data_type() {
             return Err(internal(
                 "calendar day number carrier differs from its exact selected source",
             ));
         }
-        match &source.data_type {
+        match source.data_type() {
             DataType::Date32 => array.as_any().downcast_ref().map(Self::Date),
             DataType::Timestamp(TimeUnit::Microsecond, None) => {
                 array.as_any().downcast_ref().map(Self::Timestamp)
@@ -145,9 +145,9 @@ pub(super) fn evaluate_calendar_day_number<'a>(
             ));
         };
         let target = input.contract().result_type();
-        let exact = target.logical_type == ValueLogicalType::Physical
-            && target.data_type == DataType::Int64
-            && target.nullable;
+        let exact = target.logical_type() == ValueLogicalType::Physical
+            && target.data_type() == &DataType::Int64
+            && target.nullable();
         work.step()?;
         if !exact {
             return Err(invalid(
@@ -178,7 +178,7 @@ pub(super) fn evaluate_calendar_day_number<'a>(
             }
             let null = argument.array().is_null(row);
             work.step()?;
-            if null && !source.nullable {
+            if null && !source.nullable() {
                 return Err(internal(
                     "calendar day number non-null source contains selected SQL NULL",
                 ));
@@ -212,7 +212,7 @@ pub(super) fn evaluate_calendar_day_number<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

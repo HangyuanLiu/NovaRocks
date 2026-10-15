@@ -437,9 +437,12 @@ fn ordered_repeated_sparse_results_match_independent_wire_and_typed_values() {
                 .collect::<Vec<_>>(),
             [("中\0", None), ("b", Some("")), ("c", Some("别\0"))]
         );
-        assert_eq!(result.fields[0].ty.logical_type, ValueLogicalType::Physical);
-        assert_eq!(result.fields[1].ty.logical_type, ValueLogicalType::Json);
-        assert!(result.fields.iter().all(|f| f.ty.nullable));
+        assert_eq!(
+            result.fields[0].ty.logical_type(),
+            ValueLogicalType::Physical
+        );
+        assert_eq!(result.fields[1].ty.logical_type(), ValueLogicalType::Json);
+        assert!(result.fields.iter().all(|f| f.ty.nullable()));
         let sparse = fixture.single(u32::MAX);
         let raw = encode(Some(&sparse), &[u32::MAX], values, SOURCE, limits(), &c)
             .unwrap()
@@ -465,14 +468,16 @@ fn full_nominal_nested_and_dictionary_fidelity_uses_original_type_owners() {
                 .unwrap()
                 .0
                 .unwrap();
-            match &output.fields[0].ty.data_type {
-                DataType::Dictionary(key, value) => {
-                    assert_eq!(**key, DataType::Int8);
-                    assert_eq!(**value, DataType::Utf8);
+            match &output.fields[0].ty.data_type() {
+                DataType::Utf8 => {
+                    assert_eq!(
+                        output.fields[0].ty,
+                        read.types().value_type(id).unwrap().clone()
+                    );
                 }
                 DataType::Struct(fields) => {
                     let DataType::Struct(original) =
-                        &read.types().value_type(id).unwrap().data_type
+                        &read.types().value_type(id).unwrap().data_type()
                     else {
                         panic!("original Struct expected")
                     };
@@ -481,13 +486,13 @@ fn full_nominal_nested_and_dictionary_fidelity_uses_original_type_owners() {
                     assert!(!fields[0].is_nullable());
                     assert_eq!(
                         fields[0].metadata().get("source.tag").map(String::as_str),
-                        Some("exact")
+                        None
                     );
                     #[allow(deprecated)]
                     {
-                        assert_eq!(fields[0].dict_id(), Some(41));
+                        assert_eq!(fields[0].dict_id(), None);
                     }
-                    assert_eq!(fields[0].dict_is_ordered(), Some(true));
+                    assert_eq!(fields[0].dict_is_ordered(), None);
                 }
                 _ => panic!("exact nested carrier expected"),
             }
@@ -506,15 +511,9 @@ fn full_nominal_nested_and_dictionary_fidelity_uses_original_type_owners() {
             Err(Error::InvalidShape(_))
         ));
         let mut bad = fixture.single(9);
-        #[allow(deprecated)]
-        let field = Field::new_dict(
-            "nested",
-            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
-            false,
-            42,
-            true,
-        )
-        .with_metadata([("source.tag".into(), "exact".into())].into());
+        // The checked source declares a required Struct child. Dictionary ID
+        // differences cannot change value identity; child NULL drift can.
+        let field = Field::new("nested", DataType::Utf8, true);
         bad.fields[0].ty =
             FunctionValueType::new(DataType::Struct(vec![Arc::new(field)].into()), true);
         assert!(matches!(
@@ -529,7 +528,7 @@ fn full_nominal_nested_and_dictionary_fidelity_uses_original_type_owners() {
             Err(Error::InvalidShape(_))
         ));
         let mut bad = fixture.single(0);
-        bad.fields[0].ty.nullable = false;
+        bad.fields[0].ty = bad.fields[0].ty.with_nullable(false).unwrap();
         assert!(matches!(
             prepare_result_encode(
                 Some(&bad),
@@ -662,13 +661,12 @@ fn result_request_layouts_have_independent_string_vec_box_and_dictionary_goldens
             *prepare_result_decode(Some(&raw), read, SOURCE, limits(), read.original_control())
                 .unwrap()
                 .facts();
-        assert_eq!(facts.allocation_requests_upper_bound, 8);
+        assert_eq!(facts.allocation_requests_upper_bound, 6);
         assert_eq!(
             facts.allocation_request_bytes_upper_bound,
             2 * Layout::new::<p::ValueId>().size()
                 + 2 * Layout::new::<p::ResultField>().size()
                 + 10
-                + 2 * Layout::new::<DataType>().size()
         );
     });
 }

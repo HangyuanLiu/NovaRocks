@@ -231,7 +231,7 @@ fn kernel(types: &[FunctionValueType], phase: AggregateKernelPhase) -> CountDist
     }
 }
 fn ty(data_type: DataType) -> FunctionValueType {
-    FunctionValueType::new(data_type, false)
+    FunctionValueType::from_legacy_declared_projection(data_type, false)
 }
 fn text(value: &str) -> ArrayRef {
     Arc::new(StringArray::from(vec![value]))

@@ -116,6 +116,8 @@ impl AggregateDiffSpec {
     }
 
     pub(crate) fn typed_column(mut self, value_type: FunctionValueType, values: ArrayRef) -> Self {
+        let values = crate::exec::chunk::normalize_execution_array(&values)
+            .expect("differential source has a valid canonical actual representation");
         self.arguments
             .push(DiffArgument::Column { value_type, values });
         self
@@ -159,7 +161,9 @@ impl AggregateDiffSpec {
     ) -> Self {
         self.original_state = Some(novarocks_type_contract::AggregateStateInterpretation {
             distinct,
-            order_keys: order.into_boxed_slice(),
+            order_keys: novarocks_type_contract::AggregateStateOrderKeys::from_pure_boxed(
+                order.into_boxed_slice(),
+            ),
         });
         self
     }
@@ -491,18 +495,18 @@ fn compare_shape(
                 ));
                 return;
             }
-            if !novarocks_type_contract::arrow_data_types_exact(pure.data_type(), &result_type.data_type)
+            if !novarocks_type_contract::arrow_data_types_exact(pure.data_type(), &result_type.data_type())
                 || !novarocks_type_contract::arrow_data_types_exact(legacy.data_type(), pure.data_type())
             {
                 details.push(format!(
                     "{shape}: result type legacy {:?}, pure {:?}, selected {:?}",
                     legacy.data_type(),
                     pure.data_type(),
-                    result_type.data_type
+                    result_type.data_type()
                 ));
                 return;
             }
-            if !result_type.nullable && (legacy.null_count() > 0 || pure.null_count() > 0) {
+            if !result_type.nullable() && (legacy.null_count() > 0 || pure.null_count() > 0) {
                 details.push(format!(
                     "{shape}: NULL in a non-nullable result (legacy {}, pure {})",
                     legacy.null_count(),
@@ -567,6 +571,34 @@ struct LegacyAggregate {
     channels: Vec<usize>,
 }
 
+/// Pure fixture preparation decodes legal encodings when the exact installed
+/// consumer requires plain input. This does not widen the BE carrier set.
+pub(crate) fn plain_value_array(
+    values: &ArrayRef,
+    value_type: &FunctionValueType,
+) -> Result<ArrayRef, String> {
+    let values = crate::exec::chunk::normalize_execution_array(values)?;
+    if !novarocks_type_contract::value_layout_matches_carrier_observed::<
+        novarocks_type_contract::ValueTypeError,
+    >(
+        value_type.typed_binding().layout(),
+        values.data_type(),
+        |_| Ok(()),
+    )
+    .map_err(|error| error.to_string())?
+    {
+        return Err("differential source differs from its explicitly authored value layout".into());
+    }
+    if values.data_type() == value_type.data_type() {
+        Ok(values)
+    } else {
+        // The borrowed comparison above already ruled out value conversions.
+        // Locked Arrow performs only the remaining encoding removal here.
+        arrow::compute::cast(values.as_ref(), value_type.data_type())
+            .map_err(|error| error.to_string())
+    }
+}
+
 impl LegacyAggregate {
     fn try_new(
         spec: &AggregateDiffSpec,
@@ -579,14 +611,14 @@ impl LegacyAggregate {
         };
         let input_type = match channels.as_slice() {
             [] => None,
-            [single] => Some(spec.arguments[*single].value_type().data_type.clone()),
+            [single] => Some(spec.arguments[*single].value_type().data_type().clone()),
             many => Some(DataType::Struct(Fields::from(
                 many.iter()
                     .enumerate()
                     .map(|(index, channel)| {
                         Field::new(
                             format!("f{index}"),
-                            spec.arguments[*channel].value_type().data_type.clone(),
+                            spec.arguments[*channel].value_type().data_type().clone(),
                             true,
                         )
                     })
@@ -598,6 +630,8 @@ impl LegacyAggregate {
             .flatten();
         let has_input = input_type.is_some();
         let function = |merge: bool| AggFunction {
+            // Explicit legacy carrier fixture; this is not frozen-binding admission.
+            frozen: None,
             name: spec.name.clone(),
             inputs: if has_input || merge {
                 vec![ExprId(0)]
@@ -668,7 +702,10 @@ impl LegacyAggregate {
                     take(value.pool().array().as_ref(), &repeat, None).map_err(|e| e.to_string())?
                 }
             };
-            columns.push(column);
+            columns.push(plain_value_array(
+                &column,
+                spec.arguments[*channel].value_type(),
+            )?);
         }
         Ok(match columns.len() {
             0 => None,
@@ -858,16 +895,49 @@ impl PureAggregate {
         mapping: &[usize],
     ) -> Result<(), novarocks_functions::EvaluationFailure> {
         let contract = Arc::clone(handle.contract());
+        let prepared = spec
+            .arguments
+            .iter()
+            .enumerate()
+            .map(|(ordinal, argument)| {
+                let DiffArgument::Column { value_type, values } = argument else {
+                    return Ok(None);
+                };
+                let accepted = handle
+                    .argument_encoding(ordinal)?
+                    .accepts_root_int32_string_dictionary()
+                    && matches!(values.data_type(), DataType::Dictionary(key, value)
+                        if key.as_ref() == &DataType::Int32
+                            && matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8));
+                if accepted {
+                    Ok(Some(Arc::clone(values)))
+                } else {
+                    plain_value_array(values, value_type)
+                        .map(Some)
+                        .map_err(|message| {
+                            KernelFailure::InvalidProgram(
+                                novarocks_functions::KernelDiagnostic::new(&message),
+                            )
+                        })
+                }
+            })
+            .collect::<Result<Vec<_>, KernelFailure>>()?;
         let arguments = spec
             .arguments
             .iter()
-            .map(DiffArgument::evaluated)
+            .zip(&prepared)
+            .map(|(argument, prepared)| match prepared {
+                Some(values) => EvaluatedArgument::Column(values),
+                None => argument.evaluated(),
+            })
             .collect::<Vec<_>>();
-        let input = SelectedAggregateUpdateInput::try_new(
+        let input = SelectedAggregateUpdateInput::try_new_with_typed_source_lookup(
             &contract,
             selection,
             &arguments[..contract.call().logical_argument_count()],
             &arguments[contract.call().logical_argument_count()..],
+            |ordinal| Ok(spec.arguments[ordinal].value_type()),
+            |ordinal| handle.argument_encoding(ordinal),
             &HarnessControl,
         )?;
         column

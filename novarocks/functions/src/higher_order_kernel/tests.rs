@@ -108,7 +108,9 @@ impl Owner {
                 constant: None,
             },
             FunctionArgument::Lambda {
-                parameter_types: Box::from([i64_type(false), i32_type(false)]),
+                parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                    Box::from([i64_type(false), i32_type(false)]),
+                ),
                 result_type: result,
             },
             FunctionArgument::Value {
@@ -121,10 +123,13 @@ impl Owner {
             selected: Arc::new(FunctionBindingSelection {
                 overload: FunctionOverloadId::try_new("fixture/lambda-body/exact-signature")
                     .unwrap(),
-                argument_types: arguments
-                    .iter()
-                    .map(FunctionArgument::argument_type)
-                    .collect(),
+                argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                    arguments
+                        .iter()
+                        .map(FunctionArgument::argument_type)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
                 result_type: FunctionResultType::Scalar(i64_type(false)),
                 aggregate: None,
             }),
@@ -413,7 +418,7 @@ impl BoundLambdaBodyEvaluator for BodyEvaluator {
             Arc::new(Int32Array::from(vec![0; selection.len()]))
         } else if matches!(self.mode, BodyMode::SuccessNull) {
             Arc::new(Int64Array::from(vec![None; selection.len()]))
-        } else if self.contract.result_type().data_type == DataType::Boolean {
+        } else if self.contract.result_type().data_type() == &DataType::Boolean {
             Arc::new(BooleanArray::from(
                 values
                     .iter()

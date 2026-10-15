@@ -808,7 +808,7 @@ mod tests {
 
     fn chunk_values(chunk: &novarocks_execution::exec::chunk::Chunk) -> Vec<i64> {
         chunk
-            .batch
+            .record_batch()
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -955,12 +955,17 @@ mod tests {
         }
     }
 
+    fn actual_stream_test_factory()
+    -> std::sync::Arc<dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory>
+    {
+        novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(novarocks_execution::exec::pipeline::pipeline::representation_construction_profile().unwrap(),novarocks_execution::runtime::mem_tracker::MemTracker::new_root("typed provider stream fixture creator"),std::sync::Arc::new(novarocks_execution::runtime::runtime_state::RuntimeErrorState::default())).unwrap()
+    }
     fn claim(
         op: &Arc<dyn ScanOp>,
         budget: &ConnectorPollBudget,
     ) -> novarocks_execution::exec::node::scan::ScanOutputStream {
         op.stream_source()
-            .claim(budget.clone(), None)
+            .claim(budget.clone(), None, actual_stream_test_factory())
             .expect("claim the scan's stream")
     }
 
@@ -969,7 +974,11 @@ mod tests {
     fn next_item(
         stream: &mut novarocks_execution::exec::node::scan::ScanOutputStream,
         budget: &ConnectorPollBudget,
-    ) -> Option<Result<novarocks_execution::exec::chunk::Chunk, String>> {
+    ) -> Option<
+        novarocks_execution::runtime::fragment::ExecutionResult<
+            novarocks_execution::exec::chunk::Chunk,
+        >,
+    > {
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         for _ in 0..1_000 {
             budget.refill(64);
@@ -1004,21 +1013,29 @@ mod tests {
             queues,
             NODE,
             vec![SlotId::new(1)],
-            Arc::new(
-                novarocks_execution::exec::chunk::ChunkSchema::try_new(vec![
-                    novarocks_execution::exec::chunk::ChunkSlotSchema::from_field(
-                        SlotId::new(1),
-                        &arrow::datatypes::Field::new(
-                            "value",
-                            arrow::datatypes::DataType::Int64,
-                            true,
-                        ),
-                        None,
-                    )
-                    .expect("frozen test output slot"),
-                ])
-                .expect("frozen test output schema"),
-            ),
+            Arc::new({
+                // This source is explicitly Plain INT64; its Arrow field is
+                // presentation only and cannot author its value domain.
+                let value = novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                );
+                let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+                let slot = novarocks_execution::exec::chunk::ChunkSlotSchema::try_new_typed(
+                    SlotId::new(1),
+                    Arc::new(arrow::datatypes::Field::new(
+                        "value",
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    )),
+                    value.typed_binding().clone(),
+                    None,
+                    storage.clone(),
+                )
+                .expect("complete test output slot");
+                novarocks_execution::exec::chunk::ChunkSchema::try_new_typed(vec![slot], storage)
+                    .expect("complete test output schema")
+            }),
             no_runtime_filter(),
             live_dynamic_filter_factory(),
             #[cfg(feature = "test-controls")]
@@ -1219,9 +1236,11 @@ mod tests {
         let error = next_item(&mut stream, &budget)
             .expect("the saved failure")
             .expect_err("split 3 fails");
-        assert!(error.contains("sequence 3"), "{error}");
+        assert!(error.to_string().contains("sequence 3"), "{error}");
         assert!(
-            error.contains("scripted future preparation failure"),
+            error
+                .to_string()
+                .contains("scripted future preparation failure"),
             "{error}"
         );
         assert!(next_item(&mut stream, &budget).is_none());
@@ -1343,7 +1362,10 @@ mod tests {
             .bind(BoundScanRanges::None)
             .err()
             .expect("a cancelled attempt must not open a provider");
-        assert!(error.contains("cancelled"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("cancelled"),
+            "unexpected error: {error}"
+        );
         assert_eq!(provider.opens.load(Ordering::Acquire), 0);
     }
 
@@ -1408,7 +1430,9 @@ mod tests {
         let op = bind(&source);
         let budget = ConnectorPollBudget::new();
         let stream = claim(&op, &budget);
-        let refused = op.stream_source().claim(budget.clone(), None);
+        let refused = op
+            .stream_source()
+            .claim(budget.clone(), None, actual_stream_test_factory());
         assert!(
             refused.is_err(),
             "a second claim is refused, never a second reader"
@@ -1453,21 +1477,29 @@ mod tests {
             request_with_source(&operations),
             NODE,
             vec![SlotId::new(1)],
-            Arc::new(
-                novarocks_execution::exec::chunk::ChunkSchema::try_new(vec![
-                    novarocks_execution::exec::chunk::ChunkSlotSchema::from_field(
-                        SlotId::new(1),
-                        &arrow::datatypes::Field::new(
-                            "value",
-                            arrow::datatypes::DataType::Int64,
-                            true,
-                        ),
-                        None,
-                    )
-                    .expect("frozen test output slot"),
-                ])
-                .expect("frozen test output schema"),
-            ),
+            Arc::new({
+                // This source is explicitly Plain INT64; its Arrow field is
+                // presentation only and cannot author its value domain.
+                let value = novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                );
+                let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+                let slot = novarocks_execution::exec::chunk::ChunkSlotSchema::try_new_typed(
+                    SlotId::new(1),
+                    Arc::new(arrow::datatypes::Field::new(
+                        "value",
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    )),
+                    value.typed_binding().clone(),
+                    None,
+                    storage.clone(),
+                )
+                .expect("complete test output slot");
+                novarocks_execution::exec::chunk::ChunkSchema::try_new_typed(vec![slot], storage)
+                    .expect("complete test output schema")
+            }),
             #[cfg(feature = "test-controls")]
             None,
             crate::backend_test_support::test_scan_stream_runtime(),

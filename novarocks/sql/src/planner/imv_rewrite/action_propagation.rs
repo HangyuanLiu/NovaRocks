@@ -668,8 +668,15 @@ fn promote_project_union_row_id_output(
             *column_id = row_id_column;
             *column = ImvRowIdColumn::NAME.to_string();
         }
-        item.expr.value_type.data_type = arrow::datatypes::DataType::Int64;
-        item.expr.value_type.nullable = false;
+        item.expr.value_type = novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            false,
+        );
+        item.expr.value_type = item
+            .expr
+            .value_type
+            .with_nullable(false)
+            .expect("validated root NULL contract");
         item.output_column_id = row_id_column;
         item.output_name = ImvRowIdColumn::NAME.to_string();
     }
@@ -728,9 +735,9 @@ fn branch_output_action_column_id(plan: &LogicalPlanNode) -> Option<crate::colum
                     return None;
                 };
                 (*column_id == item.output_column_id
-                    && item.expr.value_type.data_type == arrow::datatypes::DataType::Int8
-                    && !item.expr.value_type.nullable)
-                    .then_some(item.output_column_id)
+                    && *item.expr.value_type.data_type() == arrow::datatypes::DataType::Int8
+                    && !item.expr.value_type.nullable())
+                .then_some(item.output_column_id)
             }),
         LogicalPlanKind::ImvDelta(_) | LogicalPlanKind::ImvVersion(_) => {
             branch_output_action_column_id(plan.unary_input())
@@ -931,8 +938,8 @@ mod tests {
             .iter()
             .find(|c| ImvActionColumn::matches(c))
             .expect("action column must be present");
-        assert_eq!(action.value_type.data_type, DataType::Int8);
-        assert!(!action.value_type.nullable);
+        assert_eq!(action.value_type.data_type().clone(), DataType::Int8);
+        assert!(!action.value_type.nullable());
         assert!(action.is_internal);
         assert_eq!(action.column_id, ColumnId(100));
         assert!(
@@ -1378,8 +1385,8 @@ mod tests {
             ExprKind::ColumnRef { column_id, .. } => assert_eq!(*column_id, ColumnId(100)),
             other => panic!("expected ColumnRef, got {:?}", other),
         }
-        assert_eq!(last.expr.value_type.data_type, DataType::Int8);
-        assert!(!last.expr.value_type.nullable);
+        assert_eq!(last.expr.value_type.data_type().clone(), DataType::Int8);
+        assert!(!last.expr.value_type.nullable());
     }
 
     #[test]

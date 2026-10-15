@@ -448,9 +448,9 @@ fn fingerprint(
             Token::Constant(_) => hasher.write_u8(4),
             Token::ValueType(v) => {
                 hasher.write_u8(3);
-                hasher.write_u8(v.logical_type as u8);
-                hasher.write_u8(u8::from(v.nullable));
-                hasher.write_u64(type_hash(&v.data_type, work)?);
+                hasher.write_u8(v.logical_type() as u8);
+                hasher.write_u8(u8::from(v.nullable()));
+                hasher.write_u64(type_hash(&v.data_type(), work)?);
             }
         }
     }

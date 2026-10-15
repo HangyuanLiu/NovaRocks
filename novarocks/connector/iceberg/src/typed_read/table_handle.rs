@@ -158,6 +158,7 @@ pub struct IcebergTableHandle {
     read_domain: Option<Arc<crate::delete_semantics::ReadDomain>>,
     table_schema_json: Arc<str>,
     scalar_integer_domains: crate::scalar_integer_domain::ScalarIntegerDomains,
+    nominal_declarations: crate::schema_mapping::nominal_declaration::NominalSourceDeclarations,
     spec_id: Option<i32>,
     partition_spec_jsons: BTreeMap<i32, String>,
     format_version: i32,
@@ -301,6 +302,7 @@ impl IcebergTableHandle {
             read_domain,
             table_schema_json: Arc::from(table_schema_json.as_str()),
             scalar_integer_domains: BTreeMap::new(),
+            nominal_declarations: BTreeMap::new(),
             spec_id,
             partition_spec_jsons,
             format_version,
@@ -318,6 +320,24 @@ impl IcebergTableHandle {
 
     pub fn frozen_cow_source(&self) -> Option<&super::cow_source_proof::IcebergCowSourceProof> {
         self.frozen_cow_source.as_ref()
+    }
+
+    pub(crate) fn with_nominal_declarations(
+        mut self,
+        declarations: crate::schema_mapping::nominal_declaration::NominalSourceDeclarations,
+    ) -> Result<Self, ConnectorError> {
+        crate::schema_mapping::nominal_declaration::validate_frozen_schema(
+            &self.parse_table_schema()?,
+            &declarations,
+        )?;
+        self.nominal_declarations = declarations;
+        Ok(self)
+    }
+
+    pub(crate) fn nominal_declarations(
+        &self,
+    ) -> &crate::schema_mapping::nominal_declaration::NominalSourceDeclarations {
+        &self.nominal_declarations
     }
 
     pub(crate) fn with_frozen_cow_source(
@@ -665,6 +685,11 @@ impl IcebergTableHandle {
                 .iter()
                 .map(|(id, domain)| (*id, domain.name().to_string()))
                 .collect(),
+            nominal_declarations: self
+                .nominal_declarations
+                .iter()
+                .map(|(id, domain)| (*id, domain.name().to_string()))
+                .collect(),
             pinned_data_files: self
                 .pinned_data_files
                 .as_ref()
@@ -739,6 +764,19 @@ impl IcebergTableHandle {
                     ))
                 })
                 .collect::<Result<_, novarocks_spi::connector::ConnectorError>>()?,
+        )?
+        .with_nominal_declarations(
+            raw.nominal_declarations
+                .iter()
+                .map(|(id, value)| {
+                    Ok((
+                        *id,
+                        crate::schema_mapping::nominal_declaration::NominalSourceDomain::parse(
+                            value,
+                        )?,
+                    ))
+                })
+                .collect::<Result<_, ConnectorError>>()?,
         )
     }
 }

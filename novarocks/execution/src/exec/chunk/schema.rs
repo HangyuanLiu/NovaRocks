@@ -17,6 +17,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::typed_array_normalization::{
+    ArrayNormalizationStep, execution_field_is_normalized, execution_field_is_normalized_observed,
+    normalize_execution_field_observed,
+};
 use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label};
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
@@ -25,174 +29,98 @@ use novarocks_type_contract::owned_resources::metadata_materialization::{
     MaterializedMetadataMap, MetadataFieldLoan, OriginalFieldMaterialization,
     OriginalMetadataClone, OriginalSharedField, SchemaMetadataMaterializations,
 };
+use novarocks_type_contract::{
+    TypedValueBinding, ValueField, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+    ValueTypeStorageLifetime, ValueUnionField,
+};
 use novarocks_types::SlotId;
 use novarocks_types::arrow_metadata_owner::{
     ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnedSchema, MetadataOwnerLimits,
 };
-use novarocks_types::logical::{LogicalType, logical_type_of_field};
 
-#[derive(Debug, Eq, PartialEq)]
+/// A borrowed view of the unique immutable semantic type authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChunkFieldSchema {
-    logical_type: Option<LogicalType>,
-    children: Vec<ChunkFieldSchema>,
+    value_type: ValueTypeRef,
 }
 
-impl Clone for ChunkFieldSchema {
-    fn clone(&self) -> Self {
-        match self.clone_core(true, &mut |_| Ok::<(), std::convert::Infallible>(())) {
-            Ok(Some(value)) => value,
-            Ok(None) => unreachable!("original semantic clone materializes"),
-            Err(cause) => match cause {},
-        }
-    }
-}
-
-/// Requests of the original immutable semantic-child Vec clone. The same
-/// recursive clone body below owns both this borrowed numerical projection and
-/// materialization. No Field/DataType grammar, metadata map or grant is inferred.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ChunkFieldSchemaCloneRequest {
     pub allocation_requests: usize,
     pub request_bytes: usize,
 }
+
 impl ChunkFieldSchema {
-    fn clone_core<E>(
-        &self,
-        materializes: bool,
-        observe: &mut impl FnMut(usize) -> Result<(), E>,
-    ) -> Result<Option<Self>, E> {
-        // The original derived Vec::clone allocates len elements, then clones
-        // them in source order. Copy of the Option<LogicalType> precedes it.
-        let logical_type = self.logical_type;
-        observe(self.children.len())?;
-        let mut children = materializes.then(|| Vec::with_capacity(self.children.len()));
-        for child in &self.children {
-            if let Some(value) = child.clone_core(materializes, observe)? {
-                children
-                    .as_mut()
-                    .expect("materializing semantic clone")
-                    .push(value);
-            }
-        }
-        Ok(children.map(|children| Self {
-            logical_type,
-            children,
-        }))
+    pub fn from_value_type(value_type: ValueTypeRef) -> Self {
+        Self { value_type }
     }
+
+    pub fn value_type(&self) -> &ValueTypeRef {
+        &self.value_type
+    }
+
+    pub fn kind(&self) -> &ValueKind {
+        self.value_type.kind()
+    }
+
+    /// Explicit external import retained only for the expansion adapter.
+    /// Execution type authors must supply `from_value_type` instead.
+    pub fn from_field(field: &Field) -> Result<Self, String> {
+        ValueTypeRef::try_from_external_field(field, ValueTypeStorageLifetime::pure())
+            .map(Self::from_value_type)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn logical_type(&self) -> Option<ValueLogicalType> {
+        self.value_type.domain()
+    }
+
+    pub fn json_semantic(&self) -> bool {
+        self.logical_type() == Some(ValueLogicalType::Json)
+    }
+
+    pub fn struct_child(&self, index: usize) -> Option<&ValueTypeRef> {
+        match self.kind() {
+            ValueKind::Struct(fields) => fields.get(index).map(|field| field.value_type()),
+            _ => None,
+        }
+    }
+
+    pub fn list_item(&self) -> Option<&ValueTypeRef> {
+        match self.kind() {
+            ValueKind::List(item) | ValueKind::FixedSizeList { item, .. } => Some(item),
+            _ => None,
+        }
+    }
+
+    pub fn map_key(&self) -> Option<&ValueTypeRef> {
+        match self.kind() {
+            ValueKind::Map { key, .. } => Some(key),
+            _ => None,
+        }
+    }
+
+    pub fn map_value(&self) -> Option<&ValueTypeRef> {
+        match self.kind() {
+            ValueKind::Map { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
     pub(crate) fn original_clone_request_observed<E: From<novarocks_type_contract::owned_resources::metadata_materialization::MetadataMaterializationError>>(
         &self,
         observe: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<ChunkFieldSchemaCloneRequest, E>{
-        self.original_clone_allocation_requests_observed(observe, &mut None)
+        observe()?;
+        Ok(ChunkFieldSchemaCloneRequest::default())
     }
 
     pub(crate) fn original_clone_allocation_requests_observed<E: From<novarocks_type_contract::owned_resources::metadata_materialization::MetadataMaterializationError>>(
         &self,
         observe: &mut impl FnMut() -> Result<(), E>,
-        allocations: &mut Option<novarocks_type_contract::owned_resources::metadata_materialization::MetadataAllocationLoan<'_, E>>,
+        _allocations: &mut Option<novarocks_type_contract::owned_resources::metadata_materialization::MetadataAllocationLoan<'_, E>>,
     ) -> Result<ChunkFieldSchemaCloneRequest, E>{
-        use novarocks_type_contract::owned_resources::metadata_materialization::MetadataMaterializationError;
-        let mut request = ChunkFieldSchemaCloneRequest::default();
-        self.clone_core(false, &mut |count| {
-            let layout = std::alloc::Layout::array::<Self>(count)
-                .map_err(|_| E::from(MetadataMaterializationError::Arithmetic))?;
-            if layout.size() != 0 {
-                if let Some(allocations) = allocations.as_deref_mut() {
-                    allocations(layout, 1)?;
-                }
-                request.allocation_requests = request
-                    .allocation_requests
-                    .checked_add(1)
-                    .ok_or_else(|| E::from(MetadataMaterializationError::Arithmetic))?;
-                request.request_bytes = request
-                    .request_bytes
-                    .checked_add(layout.size())
-                    .ok_or_else(|| E::from(MetadataMaterializationError::Arithmetic))?;
-            }
-            observe()
-        })?;
-        Ok(request)
-    }
-    pub(crate) fn new(logical_type: Option<LogicalType>, children: Vec<Self>) -> Self {
-        Self {
-            logical_type,
-            children,
-        }
-    }
-
-    /// Empty metadata used by owner-local test adapters when no source field
-    /// metadata is available on the wire.
-    pub fn empty() -> Self {
-        Self {
-            logical_type: None,
-            children: Vec::new(),
-        }
-    }
-
-    pub fn from_field(field: &Field) -> Result<Self, String> {
-        Ok(Self {
-            logical_type: logical_type_of_field(field),
-            children: Self::children_from_arrow_data_type(field.data_type())?,
-        })
-    }
-
-    fn children_from_arrow_data_type(data_type: &DataType) -> Result<Vec<Self>, String> {
-        match data_type {
-            DataType::Struct(fields) => fields
-                .iter()
-                .map(|child| Self::from_field(child.as_ref()))
-                .collect::<Result<Vec<_>, _>>(),
-            DataType::List(item) | DataType::LargeList(item) => {
-                Ok(vec![Self::from_field(item.as_ref())?])
-            }
-            DataType::Map(entries, _) => {
-                let DataType::Struct(entry_fields) = entries.data_type() else {
-                    return Err(format!(
-                        "map entries is not struct: {:?}",
-                        entries.data_type()
-                    ));
-                };
-                if entry_fields.len() != 2 {
-                    return Err(format!(
-                        "map entries expected 2 struct fields, got {}",
-                        entry_fields.len()
-                    ));
-                }
-                Ok(vec![
-                    Self::from_field(entry_fields[0].as_ref())?,
-                    Self::from_field(entry_fields[1].as_ref())?,
-                ])
-            }
-            _ => Ok(Vec::new()),
-        }
-    }
-
-    pub fn logical_type(&self) -> Option<LogicalType> {
-        self.logical_type
-    }
-
-    pub fn json_semantic(&self) -> bool {
-        self.logical_type == Some(LogicalType::Json)
-    }
-
-    pub fn children(&self) -> &[ChunkFieldSchema] {
-        &self.children
-    }
-
-    pub fn struct_child(&self, idx: usize) -> Option<&ChunkFieldSchema> {
-        self.children.get(idx)
-    }
-
-    pub fn list_item(&self) -> Option<&ChunkFieldSchema> {
-        self.children.first()
-    }
-
-    pub fn map_key(&self) -> Option<&ChunkFieldSchema> {
-        self.children.first()
-    }
-
-    pub fn map_value(&self) -> Option<&ChunkFieldSchema> {
-        self.children.get(1)
+        self.original_clone_request_observed(observe)
     }
 }
 
@@ -201,6 +129,9 @@ pub struct ChunkSlotSchema {
     field: OriginalSharedField,
     metadata_origins: Option<FieldMetadataOrigins>,
     field_schema: ChunkFieldSchema,
+    typed_binding: TypedValueBinding,
+    typed_representation: bool,
+    storage: ValueTypeStorageLifetime,
     unique_id: Option<i32>,
 }
 
@@ -227,6 +158,9 @@ impl Clone for ChunkSlotSchema {
             },
             metadata_origins: self.metadata_origins.clone(),
             field_schema: self.field_schema.clone(),
+            typed_binding: self.typed_binding.clone(),
+            typed_representation: self.typed_representation,
+            storage: self.storage.clone(),
             unique_id: self.unique_id,
         }
     }
@@ -236,13 +170,130 @@ impl PartialEq for ChunkSlotSchema {
     fn eq(&self, other: &Self) -> bool {
         self.slot_id == other.slot_id
             && self.field == other.field
-            && self.field_schema == other.field_schema
+            && self.typed_binding == other.typed_binding
             && self.unique_id == other.unique_id
     }
 }
 impl Eq for ChunkSlotSchema {}
 
 impl ChunkSlotSchema {
+    fn legacy_semantics(
+        field: &Field,
+        supplied: Option<ChunkFieldSchema>,
+    ) -> Result<ChunkFieldSchema, String> {
+        let schema = match supplied {
+            Some(schema) => schema,
+            None => ChunkFieldSchema::from_field(field)?,
+        };
+        legacy_retarget_nullable(schema.value_type(), field.data_type(), field.is_nullable())
+            .map(ChunkFieldSchema::from_value_type)
+    }
+
+    fn bind_carrier(
+        schema: &ChunkFieldSchema,
+        field: &Field,
+        storage: ValueTypeStorageLifetime,
+    ) -> Result<TypedValueBinding, String> {
+        let layout =
+            ValueLayout::try_new(field.data_type(), storage).map_err(|error| error.to_string())?;
+        TypedValueBinding::try_new(schema.value_type().clone(), layout)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Bind explicit semantics to a metadata-free actual field representation.
+    /// The caller owns capacity for this construction and supplies its lifetime.
+    pub fn try_new_typed(
+        slot_id: SlotId,
+        field: FieldRef,
+        binding: TypedValueBinding,
+        unique_id: Option<i32>,
+        storage: ValueTypeStorageLifetime,
+    ) -> Result<Self, String> {
+        Self::try_new_typed_observed(slot_id, field, binding, unique_id, storage, |_| Ok(()))
+    }
+
+    pub fn try_new_typed_observed<E, F>(
+        slot_id: SlotId,
+        field: FieldRef,
+        binding: TypedValueBinding,
+        unique_id: Option<i32>,
+        storage: ValueTypeStorageLifetime,
+        mut observe: F,
+    ) -> Result<Self, E>
+    where
+        E: From<String>,
+        F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
+    {
+        validate_chunk_carrier_encoding_observed(field.data_type(), &mut |carrier| {
+            observe(ArrayNormalizationStep::InspectType(carrier))
+        })?;
+        let field = normalize_execution_field_observed(&field, &mut observe)?;
+        if field.is_nullable() != binding.nullable()
+            || !execution_carrier_matches_layout_observed(
+                binding.data_type(),
+                field.data_type(),
+                &mut |units| observe(ArrayNormalizationStep::InspectConstructionWork { units }),
+            )?
+        {
+            return Err(E::from(
+                "typed chunk field does not match its explicit value binding".into(),
+            ));
+        }
+        Ok(Self {
+            slot_id,
+            field: OriginalSharedField::from_shared(field, None),
+            metadata_origins: None,
+            field_schema: ChunkFieldSchema::from_value_type(binding.value_type().clone()),
+            typed_binding: binding,
+            typed_representation: true,
+            storage,
+            unique_id,
+        })
+    }
+
+    pub fn typed_binding(&self) -> &TypedValueBinding {
+        &self.typed_binding
+    }
+
+    pub fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+        self.storage.clone()
+    }
+
+    pub fn is_typed(&self) -> bool {
+        self.typed_representation
+    }
+
+    /// An explicit root-nullability author operation with new storage supplied.
+    pub fn with_nullable_typed(
+        &self,
+        nullable: bool,
+        storage: ValueTypeStorageLifetime,
+    ) -> Result<Self, String> {
+        if self.nullable() == nullable {
+            return Ok(self.clone());
+        }
+        let binding = self
+            .typed_binding
+            .with_nullable(nullable, storage.clone())
+            .map_err(|error| error.to_string())?;
+        let field = Arc::new(self.field().clone().with_nullable(nullable));
+        Self::try_new_typed(self.slot_id, field, binding, self.unique_id, storage)
+    }
+
+    pub fn with_field_typed(
+        &self,
+        field: FieldRef,
+        storage: ValueTypeStorageLifetime,
+    ) -> Result<Self, String> {
+        Self::try_new_typed(
+            self.slot_id,
+            field,
+            self.typed_binding.clone(),
+            self.unique_id,
+            storage,
+        )
+    }
+
     pub fn new_with_field(
         slot_id: SlotId,
         field: Field,
@@ -273,12 +324,18 @@ impl ChunkSlotSchema {
         field_schema: Option<ChunkFieldSchema>,
         unique_id: Option<i32>,
     ) -> Result<Self, String> {
+        let field_schema = Self::legacy_semantics(field.field(), field_schema)?;
+        let typed_binding = Self::bind_carrier(
+            &field_schema,
+            field.field(),
+            ValueTypeStorageLifetime::pure(),
+        )?;
         Ok(Self {
             slot_id,
-            field_schema: match field_schema {
-                Some(schema) => schema,
-                None => ChunkFieldSchema::from_field(field.field())?,
-            },
+            field_schema,
+            typed_binding,
+            typed_representation: false,
+            storage: ValueTypeStorageLifetime::pure(),
             field: OriginalSharedField::from_original(field),
             metadata_origins: None,
             unique_id,
@@ -292,12 +349,15 @@ impl ChunkSlotSchema {
         field_schema: Option<ChunkFieldSchema>,
         unique_id: Option<i32>,
     ) -> Result<Self, String> {
+        let field_schema = Self::legacy_semantics(&field, field_schema)?;
+        let typed_binding =
+            Self::bind_carrier(&field_schema, &field, ValueTypeStorageLifetime::pure())?;
         Ok(Self {
             slot_id,
-            field_schema: match field_schema {
-                Some(schema) => schema,
-                None => ChunkFieldSchema::from_field(&field)?,
-            },
+            field_schema,
+            typed_binding,
+            typed_representation: false,
+            storage: ValueTypeStorageLifetime::pure(),
             field: OriginalSharedField::from_shared(field, None),
             metadata_origins: None,
             unique_id,
@@ -316,12 +376,15 @@ impl ChunkSlotSchema {
                 "chunk slot metadata receipt does not match the exact field owner".to_string(),
             );
         }
+        let field_schema = Self::legacy_semantics(&field, field_schema)?;
+        let typed_binding =
+            Self::bind_carrier(&field_schema, &field, ValueTypeStorageLifetime::pure())?;
         Ok(Self {
             slot_id,
-            field_schema: match field_schema {
-                Some(schema) => schema,
-                None => ChunkFieldSchema::from_field(&field)?,
-            },
+            field_schema,
+            typed_binding,
+            typed_representation: false,
+            storage: ValueTypeStorageLifetime::pure(),
             field: OriginalSharedField::from_shared(field, None),
             metadata_origins: Some(metadata_origins),
             unique_id,
@@ -345,6 +408,9 @@ impl ChunkSlotSchema {
             && nullable == self.field.field().is_nullable()
         {
             return Ok(self.clone());
+        }
+        if self.is_typed() {
+            return Err("typed slot changes require an explicit replacement binding and construction lifetime".into());
         }
         if let Some(origins) = &self.metadata_origins {
             let original = origins
@@ -441,15 +507,17 @@ impl ChunkSlotSchema {
                 .with_type_and_nullable(self.data_type().clone(), nullable)
                 .unwrap_or_else(|error| panic!("{error}"));
         }
-        Self {
-            slot_id: self.slot_id,
-            field: OriginalSharedField::from_original(
-                self.field.clone_original().with_nullable_original(nullable),
-            ),
-            metadata_origins: None,
-            field_schema: self.field_schema.clone(),
-            unique_id: self.unique_id,
-        }
+        assert!(
+            !self.is_typed(),
+            "typed nullability changes require with_nullable_typed and a creation lifetime"
+        );
+        Self::try_new_owned_field(
+            self.slot_id,
+            self.field.clone_original().with_nullable_original(nullable),
+            Some(self.field_schema.clone()),
+            self.unique_id,
+        )
+        .unwrap_or_else(|error| panic!("{error}"))
     }
 
     pub fn from_field(
@@ -461,12 +529,38 @@ impl ChunkSlotSchema {
     }
 
     pub fn with_field(&self, field: Field) -> Result<Self, String> {
+        if self.is_typed() {
+            if self.field() == &field {
+                return Ok(self.clone());
+            }
+            return Err(
+                "typed field replacement requires with_field_typed and a creation lifetime".into(),
+            );
+        }
         Self::try_new_with_field(
             self.slot_id,
             field,
             Some(self.field_schema.clone()),
             self.unique_id,
         )
+    }
+
+    /// Rename a validated channel while sharing its complete immutable owner.
+    /// Slot identity changes neither value semantics nor encoding facts.
+    pub fn with_slot_id_typed_observed<E: From<String>>(
+        &self,
+        slot_id: SlotId,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
+        observe()?;
+        if !self.is_typed() {
+            return Err(E::from(
+                "typed slot rename requires its complete declaration".into(),
+            ));
+        }
+        let mut slot = self.clone();
+        slot.slot_id = slot_id;
+        Ok(slot)
     }
 
     pub fn with_slot_id(&self, slot_id: SlotId) -> Result<Self, String> {
@@ -484,6 +578,9 @@ impl ChunkSlotSchema {
     }
 
     pub fn with_field_and_slot_id(&self, slot_id: SlotId, field: Field) -> Result<Self, String> {
+        if self.is_typed() {
+            return self.with_field(field)?.with_slot_id(slot_id);
+        }
         Self::try_new_with_field(
             slot_id,
             field,
@@ -530,9 +627,381 @@ pub struct ChunkSchema {
     metadata_materializations: Option<SchemaMetadataMaterializations>,
     field_metadata_origins: Option<FieldMetadataOrigins>,
     schema_metadata_origin: Option<MetadataOwnedSchema>,
+    typed_representation: bool,
+    storage: ValueTypeStorageLifetime,
 }
 
 pub type ChunkSchemaRef = Arc<ChunkSchema>;
+
+impl novarocks_type_contract::ClientInputTypeBindings for ChunkSchema {
+    fn binding_at(&self, ordinal: usize) -> Option<&TypedValueBinding> {
+        self.slots
+            .get(ordinal)
+            .filter(|slot| slot.is_typed())
+            .map(ChunkSlotSchema::typed_binding)
+    }
+
+    fn slot_at(&self, ordinal: usize) -> Option<u32> {
+        self.slot_ids.get(ordinal).map(|slot| slot.0)
+    }
+
+    fn matches_schema(&self, schema: &SchemaRef) -> bool {
+        Arc::ptr_eq(&self.arrow_schema, schema)
+    }
+}
+
+fn request_array<T, E: From<String>>(
+    count: usize,
+    request: &mut impl FnMut(std::alloc::Layout) -> Result<(), E>,
+) -> Result<(), E> {
+    if count == 0 {
+        return Ok(());
+    }
+    request(
+        std::alloc::Layout::array::<T>(count)
+            .map_err(|_| E::from("typed schema array request overflow".into()))?,
+    )
+}
+
+pub(super) fn request_arc_payload<E: From<String>>(
+    payload: std::alloc::Layout,
+    request: &mut impl FnMut(std::alloc::Layout) -> Result<(), E>,
+) -> Result<(), E> {
+    request(
+        novarocks_type_contract::owned_resources::layout::arc_layout(payload)
+            .map_err(|error| E::from(format!("typed schema Arc request: {error:?}")))?,
+    )
+}
+
+/// Retain reused backing without retaining its former whole Chunk or context.
+/// A distinct composite holder is requested before its actual Arc allocation.
+pub(super) fn retain_storage_observed<E: From<String>>(
+    storage: ValueTypeStorageLifetime,
+    original: &ValueTypeStorageLifetime,
+    request: &mut impl FnMut(std::alloc::Layout) -> Result<(), E>,
+) -> Result<ValueTypeStorageLifetime, E> {
+    enum RetentionError<E> {
+        Request(E),
+        Model(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+    }
+    impl<E> From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+        for RetentionError<E>
+    {
+        fn from(
+            error: novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+        ) -> Self {
+            Self::Model(error)
+        }
+    }
+    storage
+        .retaining_observed(original, |layout| {
+            request(layout).map_err(RetentionError::Request)
+        })
+        .map_err(|error| match error {
+            RetentionError::Request(error) => error,
+            RetentionError::Model(error) => {
+                E::from(format!("typed storage retention request: {error:?}"))
+            }
+        })
+}
+
+/// Expansion-only nullability author for the old reconciliation adapter.
+/// Domain and named-field meaning always come from the supplied type authority;
+/// this never imports annotations or supplies missing array semantics.
+fn legacy_retarget_nullable(
+    value: &ValueTypeRef,
+    carrier: &DataType,
+    nullable: bool,
+) -> Result<ValueTypeRef, String> {
+    let carrier = match carrier {
+        DataType::Dictionary(_, values) => {
+            return legacy_retarget_nullable(value, values, nullable);
+        }
+        DataType::RunEndEncoded(_, values) => {
+            return legacy_retarget_nullable(value, values.data_type(), nullable);
+        }
+        carrier => carrier,
+    };
+    let storage = ValueTypeStorageLifetime::pure();
+    let kind = match (value.kind(), carrier) {
+        (
+            ValueKind::List(item),
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::ListView(field)
+            | DataType::LargeListView(field),
+        ) => ValueKind::List(legacy_retarget_nullable(
+            item,
+            field.data_type(),
+            field.is_nullable(),
+        )?),
+        (ValueKind::FixedSizeList { item, length }, DataType::FixedSizeList(field, _)) => {
+            ValueKind::FixedSizeList {
+                item: legacy_retarget_nullable(item, field.data_type(), field.is_nullable())?,
+                length: *length,
+            }
+        }
+        (ValueKind::Struct(fields), DataType::Struct(actual)) if fields.len() == actual.len() => {
+            // Fast borrowed check prevents a new field/name tree on each batch.
+            if value.nullable() == nullable
+                && fields.iter().zip(actual).all(|(field, actual)| {
+                    legacy_nullable_matches(
+                        field.value_type(),
+                        actual.data_type(),
+                        actual.is_nullable(),
+                    )
+                })
+            {
+                return Ok(value.clone());
+            }
+            ValueKind::Struct(
+                fields
+                    .iter()
+                    .zip(actual)
+                    .map(|(field, actual)| {
+                        Ok(ValueField::new(
+                            field.name(),
+                            legacy_retarget_nullable(
+                                field.value_type(),
+                                actual.data_type(),
+                                actual.is_nullable(),
+                            )?,
+                            storage.clone(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+                    .into_boxed_slice(),
+            )
+        }
+        (ValueKind::Map { key, value }, DataType::Map(entries, _)) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err("legacy nullable author Map entries are not a Struct".into());
+            };
+            if fields.len() != 2 {
+                return Err("legacy nullable author Map entries have invalid arity".into());
+            }
+            ValueKind::Map {
+                key: legacy_retarget_nullable(key, fields[0].data_type(), fields[0].is_nullable())?,
+                value: legacy_retarget_nullable(
+                    value,
+                    fields[1].data_type(),
+                    fields[1].is_nullable(),
+                )?,
+            }
+        }
+        (ValueKind::Union(fields), DataType::Union(actual, _)) if fields.len() == actual.len() => {
+            if value.nullable() == nullable
+                && fields
+                    .iter()
+                    .zip(actual.iter())
+                    .all(|(field, (_, actual))| {
+                        legacy_nullable_matches(
+                            field.field.value_type(),
+                            actual.data_type(),
+                            actual.is_nullable(),
+                        )
+                    })
+            {
+                return Ok(value.clone());
+            }
+            ValueKind::Union(
+                fields
+                    .iter()
+                    .zip(actual.iter())
+                    .map(|(field, (_, actual))| {
+                        Ok(ValueUnionField {
+                            type_id: field.type_id,
+                            field: ValueField::new(
+                                field.field.name(),
+                                legacy_retarget_nullable(
+                                    field.field.value_type(),
+                                    actual.data_type(),
+                                    actual.is_nullable(),
+                                )?,
+                                storage.clone(),
+                            ),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+                    .into_boxed_slice(),
+            )
+        }
+        _ => {
+            return if value.nullable() == nullable {
+                Ok(value.clone())
+            } else {
+                value
+                    .with_nullable(nullable, storage)
+                    .map_err(|error| error.to_string())
+            };
+        }
+    };
+    if &kind == value.kind() && nullable == value.nullable() {
+        Ok(value.clone())
+    } else {
+        ValueTypeRef::try_new(kind, nullable, storage).map_err(|error| error.to_string())
+    }
+}
+
+fn legacy_nullable_matches(value: &ValueTypeRef, carrier: &DataType, nullable: bool) -> bool {
+    if value.nullable() != nullable {
+        return false;
+    }
+    match (value.kind(), carrier) {
+        (_, DataType::Dictionary(_, values)) => legacy_nullable_matches(value, values, nullable),
+        (_, DataType::RunEndEncoded(_, values)) => {
+            legacy_nullable_matches(value, values.data_type(), nullable)
+        }
+        (
+            ValueKind::List(item) | ValueKind::FixedSizeList { item, .. },
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::ListView(field)
+            | DataType::LargeListView(field)
+            | DataType::FixedSizeList(field, _),
+        ) => legacy_nullable_matches(item, field.data_type(), field.is_nullable()),
+        (ValueKind::Struct(fields), DataType::Struct(actual)) => {
+            fields.len() == actual.len()
+                && fields.iter().zip(actual).all(|(field, actual)| {
+                    legacy_nullable_matches(
+                        field.value_type(),
+                        actual.data_type(),
+                        actual.is_nullable(),
+                    )
+                })
+        }
+        (ValueKind::Map { key, value }, DataType::Map(entries, _)) => match entries.data_type() {
+            DataType::Struct(fields) if fields.len() == 2 => {
+                legacy_nullable_matches(key, fields[0].data_type(), fields[0].is_nullable())
+                    && legacy_nullable_matches(
+                        value,
+                        fields[1].data_type(),
+                        fields[1].is_nullable(),
+                    )
+            }
+            _ => false,
+        },
+        (ValueKind::Union(fields), DataType::Union(actual, _)) => {
+            fields.len() == actual.len()
+                && fields
+                    .iter()
+                    .zip(actual.iter())
+                    .all(|(field, (_, actual))| {
+                        legacy_nullable_matches(
+                            field.field.value_type(),
+                            actual.data_type(),
+                            actual.is_nullable(),
+                        )
+                    })
+        }
+        _ => true,
+    }
+}
+
+/// Compare the already-authored plain layout to an actual encoding by borrow.
+/// This performs no type import, layout allocation, value decoding or widening.
+pub(crate) fn execution_carrier_matches_layout(expected: &DataType, actual: &DataType) -> bool {
+    execution_carrier_matches_layout_observed::<String>(expected, actual, &mut |_| Ok(()))
+        .unwrap_or(false)
+}
+
+pub(crate) fn execution_carrier_matches_layout_observed<E: From<String>>(
+    expected: &DataType,
+    actual: &DataType,
+    work: &mut impl FnMut(usize) -> Result<(), E>,
+) -> Result<bool, E> {
+    enum MatchError<E> {
+        Caller(E),
+        Source(novarocks_type_contract::ValueTypeError),
+    }
+    impl<E> From<novarocks_type_contract::ValueTypeError> for MatchError<E> {
+        fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+            Self::Source(error)
+        }
+    }
+    novarocks_type_contract::data_type_layout_matches_carrier_observed(expected, actual, |units| {
+        work(units).map_err(MatchError::Caller)
+    })
+    .map_err(|error| match error {
+        MatchError::Caller(error) => error,
+        MatchError::Source(error) => E::from(format!("typed carrier layout validation: {error}")),
+    })
+}
+
+/// The current engine's encoding set is independent of the pure vocabulary.
+fn validate_chunk_carrier_encoding(carrier: &DataType) -> Result<(), String> {
+    validate_chunk_carrier_encoding_observed(carrier, &mut |_| Ok(()))
+}
+pub(crate) fn validate_chunk_carrier_encoding_observed<E: From<String>>(
+    carrier: &DataType,
+    observe: &mut impl FnMut(&DataType) -> Result<(), E>,
+) -> Result<(), E> {
+    validate_chunk_carrier_encoding_at(carrier, 1, &mut 0, observe)
+}
+fn validate_chunk_carrier_encoding_at<E: From<String>>(
+    carrier: &DataType,
+    depth: usize,
+    nodes: &mut usize,
+    observe: &mut impl FnMut(&DataType) -> Result<(), E>,
+) -> Result<(), E> {
+    observe(carrier)?;
+    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+        return Err(E::from(
+            "typed chunk carrier exceeds its nesting profile".into(),
+        ));
+    }
+    *nodes = nodes
+        .checked_add(1)
+        .ok_or_else(|| E::from("typed chunk carrier node count overflow".into()))?;
+    if *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
+        return Err(E::from(
+            "typed chunk carrier exceeds its node profile".into(),
+        ));
+    }
+    match carrier {
+        DataType::Dictionary(keys, values) => {
+            if keys.as_ref() != &DataType::Int32
+                || !matches!(values.as_ref(), DataType::Utf8 | DataType::LargeUtf8)
+            {
+                return Err(E::from(
+                    "typed chunk dictionary encoding requires Int32 keys and Utf8/LargeUtf8 values"
+                        .into(),
+                ));
+            }
+        }
+        DataType::RunEndEncoded(_, _) => {
+            return Err(E::from(
+                "run-end encoding is not supported by the current execution engine".into(),
+            ));
+        }
+        DataType::Utf8View
+        | DataType::BinaryView
+        | DataType::ListView(_)
+        | DataType::LargeListView(_) => {
+            return Err(E::from(
+                "view carriers are not supported by the current execution engine".into(),
+            ));
+        }
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => {
+            validate_chunk_carrier_encoding_at(field.data_type(), depth + 1, nodes, observe)?
+        }
+        DataType::Struct(fields) => {
+            for field in fields {
+                validate_chunk_carrier_encoding_at(field.data_type(), depth + 1, nodes, observe)?;
+            }
+        }
+        DataType::Union(fields, _) => {
+            for (_, field) in fields.iter() {
+                validate_chunk_carrier_encoding_at(field.data_type(), depth + 1, nodes, observe)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 fn check_chunk_data_type(
     expected: &DataType,
@@ -781,9 +1250,194 @@ fn is_dictionary_string_carrier(expected: &DataType, actual: &DataType) -> bool 
 }
 
 impl ChunkSchema {
+    /// Assemble typed occurrences without retaining external format metadata.
+    /// The creating owner covers the Vec/map/schema wrapper construction first.
+    pub fn try_new_typed(
+        slots: Vec<ChunkSlotSchema>,
+        storage: ValueTypeStorageLifetime,
+    ) -> Result<Self, String> {
+        Self::try_new_typed_observed(slots, storage, |_| Ok(()), |_| Ok(()))
+    }
+
+    /// Construct the actual schema scaffolds under the supplied owner's request
+    /// port. The caller has already covered the input slot Vec before creating
+    /// it. Every request describes this constructor's concrete allocation, not
+    /// retained bytes or capacity inferred from a foreign collection.
+    pub fn try_new_typed_observed<E: From<String>>(
+        slots: Vec<ChunkSlotSchema>,
+        storage: ValueTypeStorageLifetime,
+        mut request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
+        mut work: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<Self, E> {
+        work(0)?;
+        for slot in &slots {
+            work(1)?;
+            if !slot.is_typed() {
+                return Err(E::from(
+                    "typed chunk schema contains a legacy imported slot".into(),
+                ));
+            }
+        }
+        let count = slots.len();
+        let table = novarocks_type_contract::owned_resources::hashmap::fresh_table_layout::<
+            SlotId,
+            usize,
+        >(count)
+        .map_err(|error| E::from(format!("typed schema slot index request: {error:?}")))?;
+        if let Some(layout) = table.layout {
+            request(layout)?;
+        }
+        let mut index_by_slot = HashMap::with_capacity(slots.len());
+        request_array::<SlotId, E>(count, &mut request)?;
+        let mut slot_ids = Vec::with_capacity(slots.len());
+        request_array::<FieldRef, E>(count, &mut request)?;
+        let mut fields = Vec::with_capacity(slots.len());
+        for (index, slot) in slots.iter().enumerate() {
+            work(3)?;
+            if index_by_slot.insert(slot.slot_id(), index).is_some() {
+                return Err(E::from(format!(
+                    "duplicate slot id {} in typed chunk schema",
+                    slot.slot_id()
+                )));
+            }
+            slot_ids.push(slot.slot_id());
+            fields.push(Arc::clone(slot.field_ref()));
+        }
+        request_arc_payload(
+            std::alloc::Layout::array::<FieldRef>(count)
+                .map_err(|_| E::from("typed schema FieldRef slice request overflow".into()))?,
+            &mut request,
+        )?;
+        let fields: arrow::datatypes::Fields = fields.into();
+        request_arc_payload(std::alloc::Layout::new::<Schema>(), &mut request)?;
+        Ok(Self {
+            slots,
+            arrow_schema: Arc::new(Schema::new(fields)),
+            slot_ids,
+            index_by_slot,
+            metadata_materializations: None,
+            field_metadata_origins: None,
+            schema_metadata_origin: None,
+            typed_representation: true,
+            storage,
+        })
+    }
+
+    /// Import explicit compiled bindings through the same occurrence author
+    /// used by derived runtime declarations. No legacy importer is attempted.
+    pub fn from_compiled_layout_owned_observed<E: From<String>>(
+        layout: &novarocks_local_program::StaticLayout,
+        storage: ValueTypeStorageLifetime,
+        request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
+        work: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<ChunkSchemaRef, E> {
+        Self::from_compiled_layout_with_bindings_owned_observed(
+            layout,
+            storage,
+            |index| layout.value_binding_at(index),
+            request,
+            work,
+        )
+    }
+
+    /// The actual runtime producer supplies every complete value declaration.
+    /// Names, slot IDs and unique IDs keep their original occurrence role;
+    /// replacement types never come from format annotations or Arrow inference.
+    /// Each newly authored Field and schema scaffold is admitted before creation.
+    pub(crate) fn from_compiled_layout_with_bindings_owned_observed<'a, E: From<String>>(
+        layout: &'a novarocks_local_program::StaticLayout,
+        storage: ValueTypeStorageLifetime,
+        mut binding_at: impl FnMut(usize) -> Option<&'a TypedValueBinding>,
+        mut request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
+        mut work: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<ChunkSchemaRef, E> {
+        work(0)?;
+        if !layout.is_typed()
+            || layout.schema().fields().len() != layout.slots().len()
+            || layout.schema().metadata().capacity() != 0
+        {
+            return Err(E::from(
+                "typed layout does not have a canonical execution schema".into(),
+            ));
+        }
+        for (index, field) in layout.schema().fields().iter().enumerate() {
+            work(2)?;
+            if layout.value_binding_at(index).is_none()
+                || binding_at(index).is_none()
+                || layout.slot_metadata_at(index).is_none()
+                || !execution_field_is_normalized_observed(field, &mut work)?
+            {
+                return Err(E::from(format!(
+                    "typed layout occurrence {index} is not completely bound"
+                )));
+            }
+        }
+        let storage = retain_storage_observed(storage, &layout.storage_lifetime(), &mut request)?;
+        request_array::<ChunkSlotSchema, E>(layout.slots().len(), &mut request)?;
+        let mut slots = Vec::with_capacity(layout.slots().len());
+        for (index, (field, slot)) in layout
+            .schema()
+            .fields()
+            .iter()
+            .zip(layout.slots())
+            .enumerate()
+        {
+            work(3)?;
+            let original = layout.value_binding_at(index).expect("validated binding");
+            let binding = binding_at(index).ok_or_else(|| {
+                E::from(format!(
+                    "derived schema occurrence {index} has no complete binding"
+                ))
+            })?;
+            let field = if std::ptr::eq(original, binding) {
+                Arc::clone(field)
+            } else {
+                // This producer authors a new execution Field. Its name has
+                // fresh backing; normalized type children share the complete
+                // binding's immutable backing, whose owner travels with it.
+                request_array::<u8, E>(field.name().len(), &mut request)?;
+                request_arc_payload(std::alloc::Layout::new::<Field>(), &mut request)?;
+                work(2)?;
+                Arc::new(Field::new(
+                    field.name(),
+                    binding.data_type().clone(),
+                    binding.nullable(),
+                ))
+            };
+            let (_, unique_id) = layout
+                .slot_metadata_at(index)
+                .expect("validated slot declaration");
+            slots.push(ChunkSlotSchema::try_new_typed_observed(
+                *slot,
+                field,
+                binding.clone_observed(|| work(1))?,
+                unique_id,
+                storage.clone(),
+                |step| match step {
+                    ArrayNormalizationStep::InspectConstructionWork { units } => work(units),
+                    _ => work(1),
+                },
+            )?);
+        }
+        let schema = Self::try_new_typed_observed(slots, storage, &mut request, &mut work)?;
+        request_arc_payload(std::alloc::Layout::new::<ChunkSchema>(), &mut request)?;
+        Ok(Arc::new(schema))
+    }
+
+    pub fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+        self.storage.clone()
+    }
+
+    pub fn is_typed(&self) -> bool {
+        self.typed_representation
+    }
+
     pub(crate) fn from_static_layout(
         layout: &novarocks_local_program::StaticLayout,
     ) -> Result<ChunkSchemaRef, String> {
+        if layout.is_typed() {
+            return Self::from_typed_layout(layout);
+        }
         if !layout.has_exact_slot_metadata() {
             return Err("local program layout has no exact slot metadata".to_string());
         }
@@ -828,11 +1482,14 @@ impl ChunkSchema {
         )?))
     }
 
-    /// A compiled layout carries each channel's complete type in its Arrow
-    /// Field; there is no separate legacy slot metadata to thaw or guess.
+    /// Typed compilation supplies the complete immutable binding. The old
+    /// Arrow annotation import remains only in the explicit expansion adapter.
     pub fn from_compiled_layout(
         layout: &novarocks_local_program::StaticLayout,
     ) -> Result<ChunkSchemaRef, String> {
+        if layout.is_typed() {
+            return Self::from_typed_layout(layout);
+        }
         if layout.field_metadata_origins().is_some() {
             return Self::from_layout_with_shared_origins(layout, false);
         }
@@ -869,6 +1526,45 @@ impl ChunkSchema {
                 .metadata_materializations()
                 .map(|source| source.fields()),
         )?))
+    }
+
+    fn from_typed_layout(
+        layout: &novarocks_local_program::StaticLayout,
+    ) -> Result<ChunkSchemaRef, String> {
+        if layout.schema().fields().len() != layout.slots().len()
+            || layout.schema().metadata().capacity() != 0
+        {
+            return Err("typed layout does not have a canonical execution schema".into());
+        }
+        let storage = layout.storage_lifetime();
+        let mut slots = Vec::with_capacity(layout.slots().len());
+        for (index, (field, slot_id)) in layout
+            .schema()
+            .fields()
+            .iter()
+            .zip(layout.slots())
+            .enumerate()
+        {
+            let binding = layout.value_binding_at(index).ok_or_else(|| {
+                format!("typed layout occurrence {index} has no explicit value binding")
+            })?;
+            if !execution_field_is_normalized(field)? {
+                return Err(format!(
+                    "typed layout occurrence {index} has a noncanonical actual field"
+                ));
+            }
+            let (_, unique_id) = layout.slot_metadata_at(index).ok_or_else(|| {
+                format!("typed layout occurrence {index} has no exact slot declaration")
+            })?;
+            slots.push(ChunkSlotSchema::try_new_typed(
+                *slot_id,
+                field.clone(),
+                binding.clone(),
+                unique_id,
+                storage.clone(),
+            )?);
+        }
+        Self::try_new_typed(slots, storage).map(Arc::new)
     }
 
     fn from_layout_with_shared_origins(
@@ -1092,6 +1788,8 @@ impl ChunkSchema {
             metadata_materializations,
             field_metadata_origins,
             schema_metadata_origin,
+            typed_representation: false,
+            storage: ValueTypeStorageLifetime::pure(),
         })
     }
 
@@ -1154,27 +1852,8 @@ impl ChunkSchema {
                 .map_err(|_| RootSchemaBackingError::CapacityExceeded)?;
             inspection.charge(bytes)?;
         }
-        fn logical(
-            schema: &ChunkFieldSchema,
-            depth: usize,
-            inspection: &mut super::root_schema_backing::RootSchemaInspection,
-        ) -> Result<(), RootSchemaBackingError> {
-            inspection.enter_auxiliary_node(depth)?;
-            inspection.charge(
-                schema
-                    .children
-                    .capacity()
-                    .checked_mul(size_of::<ChunkFieldSchema>())
-                    .ok_or(RootSchemaBackingError::CapacityExceeded)?,
-            )?;
-            for child in &schema.children {
-                logical(child, depth + 1, inspection)?;
-            }
-            Ok(())
-        }
-        for slot in &self.slots {
-            logical(&slot.field_schema, 0, inspection)?;
-        }
+        // Immutable semantic nodes carry their own creation storage lifetime.
+        // Per-chunk scaffolds retain handles; they do not recount that backing.
         Ok(())
     }
 
@@ -1278,6 +1957,28 @@ impl ChunkSchema {
     }
 
     pub fn project_by_slots(&self, slot_ids: &[SlotId]) -> Result<Self, String> {
+        if self.is_typed() {
+            return Err("typed schema projection requires a supplied creation lifetime".into());
+        }
+        self.project_by_slots_core(slot_ids, None)
+    }
+
+    pub fn project_by_slots_typed(
+        &self,
+        slot_ids: &[SlotId],
+        storage: ValueTypeStorageLifetime,
+    ) -> Result<Self, String> {
+        if !self.is_typed() {
+            return Err("typed schema projection requires an explicit typed source".into());
+        }
+        self.project_by_slots_core(slot_ids, Some(storage))
+    }
+
+    fn project_by_slots_core(
+        &self,
+        slot_ids: &[SlotId],
+        storage: Option<ValueTypeStorageLifetime>,
+    ) -> Result<Self, String> {
         let mut slots = Vec::with_capacity(slot_ids.len());
         for slot_id in slot_ids {
             let slot = self.slot(*slot_id).cloned().ok_or_else(|| {
@@ -1288,6 +1989,9 @@ impl ChunkSchema {
                 )
             })?;
             slots.push(slot);
+        }
+        if let Some(storage) = storage {
+            return Self::try_new_typed(slots, storage);
         }
         match self.metadata_materializations() {
             Some(source) => Self::try_new_with_metadata_source(
@@ -1320,6 +2024,9 @@ impl ChunkSchema {
     }
 
     pub fn concat(parts: &[ChunkSchemaRef]) -> Result<Self, String> {
+        if parts.iter().any(|part| part.is_typed()) {
+            return Err("typed schema concatenation requires a supplied creation lifetime".into());
+        }
         let mut slots = Vec::new();
         let mut origins = None::<Vec<MetadataFieldLoan>>;
         for part in parts {
@@ -1340,6 +2047,25 @@ impl ChunkSchema {
             ),
             None => Self::try_new(slots),
         }
+    }
+
+    pub fn concat_typed(
+        parts: &[ChunkSchemaRef],
+        storage: ValueTypeStorageLifetime,
+    ) -> Result<Self, String> {
+        if parts.iter().any(|part| !part.is_typed()) {
+            return Err("typed schema concatenation requires explicit typed sources".into());
+        }
+        let count = parts.iter().try_fold(0usize, |count, part| {
+            count
+                .checked_add(part.slots().len())
+                .ok_or("typed schema concatenation field count overflow")
+        })?;
+        let mut slots = Vec::with_capacity(count);
+        for part in parts {
+            slots.extend_from_slice(part.slots());
+        }
+        Self::try_new_typed(slots, storage)
     }
 }
 
@@ -1497,6 +2223,7 @@ pub(super) fn align_chunk_schema_to_columns(
 
 #[cfg(test)]
 mod tests {
+    use novarocks_type_contract::{ValueKind, ValueLogicalType, ValueTypeStorageLifetime};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1518,7 +2245,7 @@ mod tests {
             ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnerLimits,
         };
         let owner = ArrowMetadataOwner::try_new(
-            vec![("nr_logical_type".to_string(), "JSON".to_string())],
+            vec![("nr_logical_type".to_string(), "json".to_string())],
             MetadataOwnerLimits {
                 entries: 1,
                 construction_bytes: 4096,
@@ -1584,7 +2311,7 @@ mod tests {
             construction_bytes: 4096,
         };
         let item =
-            ArrowMetadataOwner::try_new(vec![("nr_logical_type".into(), "JSON".into())], limits)
+            ArrowMetadataOwner::try_new(vec![("nr_logical_type".into(), "json".into())], limits)
                 .unwrap()
                 .into_field("item".into(), DataType::Utf8, false);
         let list = ArrowMetadataOwner::try_new(vec![], limits)
@@ -1673,7 +2400,7 @@ mod tests {
             construction_bytes: 4096,
         };
         let child =
-            ArrowMetadataOwner::try_new(vec![("nr_logical_type".into(), "JSON".into())], limits)
+            ArrowMetadataOwner::try_new(vec![("nr_logical_type".into(), "json".into())], limits)
                 .unwrap()
                 .into_field("item".into(), DataType::Utf8, true);
         let exact_child = Arc::clone(child.field());
@@ -1720,61 +2447,361 @@ mod tests {
 
     #[test]
     fn static_layout_thaw_narrows_each_slot_and_keeps_actual_schema_owner() {
-        use novarocks_local_program::{StaticFieldSchema, StaticLayout};
-        // A whole-layout index on every slot would produce 66,049 entries and
-        // reject this valid 257-field layout when the schema is reconstructed.
-        let source = ChunkSchema::try_new((0..257).map(owned_slot).collect()).unwrap();
-        let layout = StaticLayout::try_new_exact(
-            source.arrow_schema_ref(),
-            Arc::from(source.slot_ids()),
-            source
-                .slots()
-                .iter()
-                .map(|slot| {
-                    (
-                        StaticFieldSchema::new(Some(LogicalType::Json), vec![]),
-                        slot.unique_id(),
-                    )
-                })
-                .collect(),
-        )
-        .unwrap()
-        .with_metadata_origins(
-            source.field_metadata_origins().unwrap().clone(),
-            source.schema_metadata_origin().cloned(),
-        )
-        .unwrap();
-        let restored = ChunkSchema::from_static_layout(&layout).unwrap();
-        assert_eq!(source, *restored);
-        assert!(Arc::ptr_eq(
-            &source.arrow_schema_ref(),
-            &restored.arrow_schema_ref()
-        ));
+        use crate::exec::pipeline::operator::input_construction::{
+            ConstructionFailure, try_runtime_input_construction_factory,
+        };
+        use novarocks_local_program::{LayoutCreationFailure, StaticLayout};
+        use novarocks_type_contract::owned_resources::layout::arc_layout;
+        use novarocks_type_contract::{
+            CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
+            TypedValueBinding,
+        };
+        struct Control;
+        impl PureCompileControl for Control {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                assert!(units <= 256);
+                Ok(())
+            }
+        }
+        // Original legitimate source annotations/IDs/NULL and exact 257-field
+        // receipt population remain independent of the execution declaration.
+        let original_source = ChunkSchema::try_new((0..257).map(owned_slot).collect()).unwrap();
         assert_eq!(
-            restored.field_metadata_origins().unwrap().owners().len(),
+            original_source
+                .field_metadata_origins()
+                .unwrap()
+                .owners()
+                .len(),
             257
         );
-        for (old, new) in source.slots().iter().zip(restored.slots()) {
+        for slot in original_source.slots() {
+            let narrow = original_source
+                .field_metadata_origins()
+                .unwrap()
+                .for_field_tree(slot.field_ref(), 65536, 64)
+                .unwrap();
+            assert_eq!(narrow.owners().len(), 1);
+            assert!(narrow.metadata_bytes_for(slot.field_ref()).is_some());
+            assert_eq!(slot.field().metadata()["nr_logical_type"], "json");
+            assert!(!slot.nullable());
+        }
+        let declaration =
+            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+                .unwrap();
+        let types = vec![declaration.clone(); 257];
+        let slots = original_source.slot_ids();
+        let schema = Arc::new(Schema::new(
+            (0..257)
+                .map(|id| Field::new(format!("v{id}"), DataType::Utf8, false))
+                .collect::<Vec<_>>(),
+        ));
+        let declared = crate::exec::chunk::typed_fixture::layout(schema.clone(), slots, &types);
+        let factory = try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("actual static thaw"),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        )
+        .unwrap();
+        let owner = factory
+            .begin_compiled_layout_construction(&declared)
+            .unwrap();
+        owner
+            .request(arc_layout(std::alloc::Layout::array::<SlotId>(slots.len()).unwrap()).unwrap())
+            .unwrap();
+        let slot_ids = Arc::from(slots);
+        owner
+            .request(
+                std::alloc::Layout::array::<(TypedValueBinding, Option<i32>)>(slots.len()).unwrap(),
+            )
+            .unwrap();
+        let bindings = types
+            .iter()
+            .zip(original_source.slots())
+            .map(|(ty, slot)| (ty.typed_binding().clone(), slot.unique_id()))
+            .collect();
+        let layout = StaticLayout::try_new_typed_with_creator(
+            schema.clone(),
+            slot_ids,
+            bindings,
+            owner.storage_lifetime(),
+            |layout| {
+                owner
+                    .request(layout)
+                    .map_err(LayoutCreationFailure::Creator)
+            },
+            &Control,
+        )
+        .unwrap();
+        // The old nullable=true semantic claim contradicts its non-null field.
+        // It remains an explicit strong negative rather than a weak success.
+        let widening =
+            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+                .unwrap();
+        let negative = StaticLayout::try_new_typed_with_creator(
+            schema.clone(),
+            Arc::from(slots),
+            vec![(widening.typed_binding().clone(), None); 257],
+            owner.storage_lifetime(),
+            |layout| {
+                owner
+                    .request(layout)
+                    .map_err(LayoutCreationFailure::Creator)
+            },
+            &Control,
+        );
+        assert!(matches!(
+            negative,
+            Err(LayoutCreationFailure::<ConstructionFailure>::Layout(
+                novarocks_local_program::LayoutCompileError::Layout(
+                    novarocks_local_program::LayoutError::ValueBindingMismatch
+                )
+            ))
+        ));
+        let typed_source = factory.create_compiled_chunk_schema(&layout).unwrap();
+        let restored = factory.create_compiled_chunk_schema(&layout).unwrap();
+        assert_eq!(*typed_source, *restored);
+        assert!(restored.is_typed());
+        assert_eq!(restored.slot_ids(), slots);
+        assert_eq!(restored.arrow_schema_ref().metadata().capacity(), 0);
+        for (index, new) in restored.slots().iter().enumerate() {
+            assert!(Arc::ptr_eq(
+                &layout.schema().fields()[index],
+                new.field_ref()
+            ));
+            assert_eq!(new.typed_binding(), declaration.typed_binding());
+            assert_eq!(new.unique_id(), Some(index as i32));
+            assert_eq!(new.field().metadata().capacity(), 0);
+            assert!(!new.nullable());
+        }
+        let projected_owner = factory.begin_compiled_layout_construction(&layout).unwrap();
+        let projected = layout
+            .project_by_slots_typed_with_creator(
+                &[SlotId::new(19), SlotId::new(3)],
+                projected_owner.storage_lifetime(),
+                |request| {
+                    projected_owner
+                        .request(request)
+                        .map_err(LayoutCreationFailure::Creator)
+                },
+                &Control,
+            )
+            .unwrap();
+        let restored = factory.create_compiled_chunk_schema(&projected).unwrap();
+        assert_eq!(restored.slot_ids(), &[SlotId::new(19), SlotId::new(3)]);
+        assert!(Arc::ptr_eq(
+            &layout.schema().fields()[19],
+            restored.slots()[0].field_ref()
+        ));
+        assert_eq!(
+            restored.slots()[0].typed_binding(),
+            declaration.typed_binding()
+        );
+        // Preserve the source thaw/projection population and exact schema
+        // receipts on the actual source owner, never on an equal execution copy.
+        let source_restored = ChunkSchema::try_ref_from_owned_schema_and_slot_ids(
+            original_source.schema_metadata_origin().unwrap(),
+            original_source.field_metadata_origins().unwrap(),
+            slots,
+        )
+        .unwrap();
+        assert_eq!(
+            original_source.arrow_schema_ref(),
+            source_restored.arrow_schema_ref()
+        );
+        assert_eq!(original_source.slot_ids(), source_restored.slot_ids());
+        // Source-schema loans contain no execution unique-ID channel. The
+        // actual typed thaw above preserves every original Some(id) exactly.
+        for (id, slot) in original_source.slots().iter().enumerate() {
+            assert_eq!(slot.unique_id(), Some(id as i32));
+        }
+        assert!(Arc::ptr_eq(
+            &original_source.arrow_schema_ref(),
+            &source_restored.arrow_schema_ref()
+        ));
+        assert_eq!(
+            source_restored
+                .field_metadata_origins()
+                .unwrap()
+                .owners()
+                .len(),
+            257
+        );
+        for (old, new) in original_source.slots().iter().zip(source_restored.slots()) {
             assert!(Arc::ptr_eq(old.field_ref(), new.field_ref()));
             assert_eq!(new.metadata_origins().unwrap().owners().len(), 1);
         }
-        let projected = layout
-            .project_by_slots(&[SlotId::new(19), SlotId::new(3)])
+        let source_projection = original_source
+            .schema_metadata_origin()
+            .unwrap()
+            .derive_schema(
+                vec![
+                    original_source.slots()[19].field_ref().clone(),
+                    original_source.slots()[3].field_ref().clone(),
+                ]
+                .into(),
+                novarocks_types::arrow_metadata_owner::MetadataOwnerLimits {
+                    entries: 0,
+                    construction_bytes: 0,
+                },
+            )
             .unwrap();
-        let restored = ChunkSchema::from_static_layout(&projected).unwrap();
-        assert_eq!(restored.slot_ids(), &[SlotId::new(19), SlotId::new(3)]);
+        let source_restored = ChunkSchema::try_ref_from_owned_schema_and_slot_ids(
+            &source_projection,
+            original_source.field_metadata_origins().unwrap(),
+            &[SlotId::new(19), SlotId::new(3)],
+        )
+        .unwrap();
+        assert_eq!(
+            source_restored.slot_ids(),
+            &[SlotId::new(19), SlotId::new(3)]
+        );
         assert!(Arc::ptr_eq(
-            source.slots()[19].field_ref(),
-            restored.slots()[0].field_ref()
+            original_source.slots()[19].field_ref(),
+            source_restored.slots()[0].field_ref()
         ));
-        assert_eq!(restored.field_metadata_origins().unwrap().owners().len(), 2);
+        assert_eq!(
+            source_restored
+                .field_metadata_origins()
+                .unwrap()
+                .owners()
+                .len(),
+            2
+        );
         assert!(
-            restored
+            source_restored
                 .schema_metadata_origin()
                 .unwrap()
-                .backing_bytes_for(&restored.arrow_schema_ref())
+                .backing_bytes_for(&source_restored.arrow_schema_ref())
                 .is_some()
         );
+    }
+
+    #[test]
+    fn typed_layout_import_keeps_explicit_nested_domain_and_real_creation_hold() {
+        use novarocks_local_program::StaticLayout;
+        use novarocks_type_contract::{
+            CompileControlError, CompilePhase, PureCompileControl, TypedValueBinding, ValueField,
+            ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef, ValueTypeStorageHold,
+            ValueTypeStorageLifetime,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Control;
+        impl PureCompileControl for Control {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                Ok(())
+            }
+        }
+        struct Hold(Arc<AtomicUsize>);
+        impl ValueTypeStorageHold for Hold {}
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let storage = ValueTypeStorageLifetime::held(Arc::new(Hold(drops.clone())));
+        let child = ValueTypeRef::try_new(
+            ValueKind::Nominal(ValueLogicalType::Json),
+            true,
+            storage.clone(),
+        )
+        .unwrap();
+        let value = ValueTypeRef::try_new(
+            ValueKind::Struct(
+                vec![ValueField::new("payload", child, storage.clone())].into_boxed_slice(),
+            ),
+            false,
+            storage.clone(),
+        )
+        .unwrap();
+        let carrier = DataType::Struct(vec![Field::new("payload", DataType::Utf8, true)].into());
+        let field = Arc::new(Field::new("output", carrier.clone(), false));
+        let binding = TypedValueBinding::try_new(
+            value,
+            ValueLayout::try_new(&carrier, storage.clone()).unwrap(),
+        )
+        .unwrap();
+        let layout = StaticLayout::try_new_typed_for_compile(
+            Arc::new(Schema::new(vec![field.clone()])),
+            Arc::from([SlotId::new(7)]),
+            vec![(binding, Some(91))],
+            storage.clone(),
+            |_| Ok(()),
+            &Control,
+        )
+        .unwrap();
+        let restored = ChunkSchema::from_compiled_layout(&layout).unwrap();
+        let static_restored = ChunkSchema::from_static_layout(&layout).unwrap();
+        let mut requests = Vec::new();
+        let funded_restored = ChunkSchema::from_compiled_layout_owned_observed::<String>(
+            &layout,
+            storage.clone(),
+            |request| {
+                requests.push(request);
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(requests.len(), 7);
+        assert_eq!(
+            requests[0],
+            std::alloc::Layout::array::<ChunkSlotSchema>(1).unwrap()
+        );
+        for stop in 0..requests.len() {
+            let mut seen = 0;
+            let rejected = ChunkSchema::from_compiled_layout_owned_observed::<String>(
+                &layout,
+                storage.clone(),
+                |_| {
+                    let index = seen;
+                    seen += 1;
+                    if index == stop {
+                        Err(format!("request refused {stop}"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| Ok(()),
+            );
+            assert!(matches!(rejected, Err(error) if error == format!("request refused {stop}")));
+            assert_eq!(seen, stop + 1);
+        }
+        let mut request_count = 0;
+        let refused_work = ChunkSchema::from_compiled_layout_owned_observed::<String>(
+            &layout,
+            storage.clone(),
+            |_| {
+                request_count += 1;
+                Ok(())
+            },
+            |_| Err("schema control refused".into()),
+        );
+        assert!(matches!(refused_work, Err(error) if error == "schema control refused"));
+        assert_eq!(request_count, 0);
+        assert!(restored.is_typed());
+        assert!(Arc::ptr_eq(restored.slots()[0].field_ref(), &field));
+        assert_eq!(restored.slots()[0].unique_id(), Some(91));
+        let retained_binding = restored.slots()[0].typed_binding().clone();
+        let retained_child = retained_binding
+            .value_type()
+            .child_type_at(0)
+            .unwrap()
+            .clone();
+        assert_eq!(retained_child.domain(), Some(ValueLogicalType::Json));
+        drop(layout);
+        drop(field);
+        drop(storage);
+        drop(restored);
+        drop(static_restored);
+        drop(funded_restored);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(retained_binding.layout().data_type(), &carrier);
+        drop(retained_binding);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(retained_child);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1839,7 +2866,10 @@ mod tests {
             .slot(SlotId::new(7))
             .expect("slot schema");
         assert_eq!(slot.data_type(), &DataType::Binary);
-        assert_eq!(slot.field_schema().logical_type(), Some(LogicalType::Hll));
+        assert_eq!(
+            slot.field_schema().logical_type(),
+            Some(ValueLogicalType::Hll)
+        );
         assert_eq!(logical_type_of_field(slot.field()), Some(LogicalType::Hll));
         assert_eq!(slot.name(), "a");
         assert_eq!(slot.unique_id(), Some(77));
@@ -1903,8 +2933,8 @@ mod tests {
 
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
 
-        assert_eq!(chunk.batch.num_columns(), 0);
-        assert_eq!(chunk.batch.num_rows(), 3);
+        assert_eq!(chunk.record_batch().num_columns(), 0);
+        assert_eq!(chunk.record_batch().num_rows(), 3);
     }
 
     #[test]
@@ -1954,7 +2984,7 @@ mod tests {
     }
 
     #[test]
-    fn align_chunk_schema_to_columns_widens_runtime_map_key_nullability() {
+    fn align_chunk_schema_to_columns_rejects_nullable_runtime_map_keys() {
         let expected_map = DataType::Map(
             Arc::new(Field::new(
                 "entries",
@@ -1995,14 +3025,8 @@ mod tests {
             false,
         )) as ArrayRef;
 
-        let aligned = super::align_chunk_schema_to_columns(&[map], &schema).expect("align schema");
-        let DataType::Map(entries_field, _) = aligned.slots()[0].data_type() else {
-            panic!("expected map type");
-        };
-        let DataType::Struct(entry_fields) = entries_field.data_type() else {
-            panic!("expected entry struct");
-        };
-        assert!(entry_fields[0].is_nullable(), "runtime map key must widen");
+        let error = super::align_chunk_schema_to_columns(&[map], &schema).unwrap_err();
+        assert_eq!(error, "map key type is nullable");
     }
 
     #[test]

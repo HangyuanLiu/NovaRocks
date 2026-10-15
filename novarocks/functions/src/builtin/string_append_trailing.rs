@@ -76,7 +76,7 @@ fn row_plan<'a>(
             let FunctionArgumentType::Value(source) = &types[index] else {
                 return Err(invalid("append_trailing requires checked value arguments"));
             };
-            if !source.nullable {
+            if !source.nullable() {
                 return Err(internal(
                     "append_trailing non-null source contains selected SQL NULL",
                 ));
@@ -158,7 +158,8 @@ pub(super) fn check_argument_type(ty: &FunctionArgumentType) -> Result<(), Stati
     let FunctionArgumentType::Value(source) = ty else {
         return Err(StaticProfileFailure::ValueArgument);
     };
-    if source.logical_type != ValueLogicalType::Physical || source.data_type != DataType::Utf8 {
+    if source.logical_type() != ValueLogicalType::Physical || source.data_type() != &DataType::Utf8
+    {
         return Err(StaticProfileFailure::SourceType);
     }
     Ok(())
@@ -167,9 +168,9 @@ pub(super) fn check_argument_type(ty: &FunctionArgumentType) -> Result<(), Stati
 pub(super) fn check_result_type(
     target: &crate::FunctionValueType,
 ) -> Result<(), StaticProfileFailure> {
-    if target.logical_type != ValueLogicalType::Physical
-        || target.data_type != DataType::Utf8
-        || !target.nullable
+    if target.logical_type() != ValueLogicalType::Physical
+        || target.data_type() != &DataType::Utf8
+        || !target.nullable()
     {
         return Err(StaticProfileFailure::ResultType);
     }
@@ -275,7 +276,7 @@ pub(super) fn evaluate_string_append_trailing<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

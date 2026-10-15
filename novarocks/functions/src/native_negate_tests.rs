@@ -64,7 +64,7 @@ fn recipe(ty: DataType) -> PreparedNativeNegateRecipe {
     let t = if ty == DataType::FixedSizeBinary(16) {
         FunctionValueType::try_with_logical_type(ty, true, ValueLogicalType::LargeInt).unwrap()
     } else {
-        FunctionValueType::new(ty, true)
+        FunctionValueType::from_legacy_declared_projection(ty, true)
     };
     PreparedNativeNegateRecipe::try_new(&t, &t, &Compile).unwrap()
 }
@@ -183,7 +183,7 @@ fn native_negate_original_wider_numeric_zero_refusals_are_explicit() {
         DataType::Decimal64(18, 2),
         DataType::Null,
     ] {
-        let t = FunctionValueType::new(ty.clone(), true);
+        let t = FunctionValueType::from_legacy_declared_projection(ty.clone(), true);
         let error = PreparedNativeNegateRecipe::try_new(&t, &t, &Compile).unwrap_err();
         assert!(
             matches!(error,ArithmeticPrepareError::Kernel(KernelFailure::InvalidProgram(message))if message.message()==format!("NEGATE is not supported for data type {ty:?}"))
@@ -312,13 +312,13 @@ fn native_negate_computed_domain_is_exact_for_every_original_full_carrier() {
                 )
                 .unwrap()
             } else {
-                FunctionValueType::new(dtype.clone(), nullable)
+                FunctionValueType::from_legacy_declared_projection(dtype.clone(), nullable)
             };
             let computed = native_negate_computed_result_type(&source, &Compile).unwrap();
-            assert_eq!(computed.logical_type, source.logical_type);
-            assert_eq!(computed.data_type, source.data_type);
+            assert_eq!(computed.logical_type(), source.logical_type());
+            assert_eq!(computed.data_type(), source.data_type());
             assert_eq!(
-                computed.nullable,
+                computed.nullable(),
                 nullable
                     || matches!(
                         dtype,
@@ -354,7 +354,8 @@ fn native_negate_computed_full_decimal_carriers_preserve_original_successful_nul
             .unwrap(),
         ) as ArrayRef,
     ] {
-        let source = FunctionValueType::new(input.data_type().clone(), false);
+        let source =
+            FunctionValueType::from_legacy_declared_projection(input.data_type().clone(), false);
         let computed = native_negate_computed_result_type(&source, &Compile).unwrap();
         let recipe = PreparedNativeNegateRecipe::try_new(&source, &computed, &Compile).unwrap();
         let selected = recipe

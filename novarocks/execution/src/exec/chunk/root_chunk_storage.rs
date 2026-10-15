@@ -27,6 +27,15 @@ use super::root_schema_backing::{
 fn sources(
     schema: &ChunkSchema,
 ) -> Result<(RootSchemaSource<'_>, RootFieldSource<'_>), RootArrayStorageError> {
+    if schema.is_typed() {
+        // The private typed author guarantees metadata-free representation;
+        // the inspector independently checks every actual zero capacity. This
+        // is no receipt for a provider or arbitrary empty-map history.
+        return Ok((
+            RootSchemaSource::CanonicalExecution,
+            RootFieldSource::CanonicalExecution,
+        ));
+    }
     if let Some(original) = schema.metadata_materializations() {
         if !original.schema_owner().lends(&schema.arrow_schema_ref()) {
             return Err(RootArrayStorageError::UnknownMetadataOwner);
@@ -66,6 +75,11 @@ fn inspect_indices<'a>(
     fields: RootFieldSource<'a>,
     inspection: &mut RootSchemaInspection<'a>,
 ) -> Result<(), RootArrayStorageError> {
+    if matches!(fields, RootFieldSource::CanonicalExecution) {
+        // Canonical metadata has no provenance index; the complete schema
+        // walk below independently checks the zero-capacity representation.
+        return Ok(());
+    }
     for slot in schema.slots() {
         if let Some(local) = slot.metadata_origins() {
             inspection.inspect_origin_index(local).map_err(map_error)?;
@@ -77,6 +91,7 @@ fn inspect_indices<'a>(
         RootFieldSource::M07(origins) => {
             inspection.inspect_origin_index(origins).map_err(map_error)
         }
+        RootFieldSource::CanonicalExecution => Ok(()),
         RootFieldSource::Original { index, attached } => {
             if let Some(origins) = attached {
                 inspection
@@ -108,7 +123,7 @@ pub fn borrowed_root_chunk_storage(
     limits: RootArrayStorageLimits,
 ) -> Result<usize, RootArrayStorageError> {
     let cap = limits.bytes.min(96 * 1024 * 1024);
-    if chunk.batch.num_columns() > RootProfileV1::MAX_COLUMNS
+    if chunk.record_batch().num_columns() > RootProfileV1::MAX_COLUMNS
         || chunk.chunk_schema().slots().len() > RootProfileV1::MAX_COLUMNS
     {
         return Err(RootArrayStorageError::WorkExceeded);
@@ -117,10 +132,12 @@ pub fn borrowed_root_chunk_storage(
     let (top, origins) = sources(schema)?;
     // Validate the ACTUAL batch Arc first. Expected equality is not provenance;
     // an independently allocated equal map can have arbitrary table history.
-    let actual = chunk.batch.schema();
+    let actual = chunk.record_batch().schema();
     match top {
         RootSchemaSource::M07(owner) if owner.backing_bytes_for(&actual).is_some() => {}
         RootSchemaSource::Original(owner) if owner.lends(&actual) => {}
+        RootSchemaSource::CanonicalExecution
+            if std::sync::Arc::ptr_eq(&actual, &schema.arrow_schema_ref()) => {}
         _ => return Err(RootArrayStorageError::UnknownMetadataOwner),
     }
     let mut metadata = RootSchemaInspection::new(
@@ -142,7 +159,7 @@ pub fn borrowed_root_chunk_storage(
         .checked_sub(metadata.bytes())
         .ok_or(RootArrayStorageError::CapacityExceeded)?;
     let storage = borrowed_root_batch_storage_with_types(
-        &chunk.batch,
+        chunk.record_batch(),
         RootArrayStorageLimits {
             bytes: storage_cap,
             ..limits
@@ -200,3 +217,7 @@ fn map_error(error: RootSchemaBackingError) -> RootArrayStorageError {
 #[cfg(test)]
 #[path = "root_positive_source_tests.rs"]
 mod root_positive_source_tests;
+
+#[cfg(test)]
+#[path = "canonical_root_source_tests.rs"]
+mod canonical_root_source_tests;

@@ -17,7 +17,7 @@
 
 //! Fragment lambda expression lowering.
 
-use super::{decode_type, lower_required_child};
+use super::{decode_type_with_decoder, lower_required_child};
 use arrow::datatypes::DataType;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_proto_codec::FieldPath;
@@ -32,12 +32,15 @@ pub(crate) fn lower_lambda(
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
     data_type: DataType,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, super::NativeExpressionDecodeError> {
     let body = lower_required_child(
         &lambda.body,
         path.clone().field("body"),
         arena,
         input_layout,
+        type_decoder,
     )?;
     let mut arg_slots = Vec::with_capacity(lambda.params.len());
     for (idx, param) in lambda.params.iter().enumerate() {
@@ -47,12 +50,11 @@ pub(crate) fn lower_lambda(
                 "native Lambda parameter requires type",
             )
         })?;
-        let _param_type = decode_type(type_desc).map_err(|error| {
-            super::NativeExpressionDecodeError::invalid_value(
-                path.clone().field("params").index(idx).field("type"),
-                error,
-            )
-        })?;
+        let _param_type = decode_type_with_decoder(
+            type_desc,
+            path.clone().field("params").index(idx).field("type"),
+            type_decoder,
+        )?;
         if param.slot_id <= 0 {
             return Err(super::NativeExpressionDecodeError::out_of_range(
                 path.clone().field("params").index(idx).field("slot_id"),
@@ -101,6 +103,7 @@ mod tests {
         let body = scalar_expr(
             item_type.clone(),
             expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                allow_throw_exception: None,
                 decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 op: expr::BinaryOp::Add as i32,
                 left: Some(Box::new(lambda_param)),
@@ -119,16 +122,41 @@ mod tests {
                 body: Some(Box::new(body)),
             })),
         );
-        let call = scalar_expr(
+        let mut call = scalar_expr(
             array_type.clone(),
             expr::expr::Kind::FunctionCall(expr::FunctionCall {
+                frozen_binding: None,
+                original_request_id: None,
                 function_name: "array_map".to_string(),
-                args: vec![lambda, col(1, array_type)],
+                args: vec![lambda, col(1, array_type.clone())],
                 distinct: false,
             }),
         );
 
-        let (arena, id) = lower_with_slots(&call, &[1, 7]);
+        let source = super::super::fixture_scalar_sources::ScalarSource::new(
+            "array_map",
+            &[
+                novarocks_functions::FunctionArgument::Lambda {
+                    parameter_types:
+                        novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(Box::from(
+                            [novarocks_type_contract::FunctionValueType::new(
+                                item_type.clone(),
+                                true,
+                            )],
+                        )),
+                    result_type: novarocks_type_contract::FunctionValueType::new(item_type, true),
+                },
+                novarocks_functions::FunctionArgument::Value {
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        array_type.clone(),
+                        true,
+                    ),
+                    constant: None,
+                },
+            ],
+        );
+        source.attach(&mut call, 701);
+        let (arena, id) = source.lower(&call, &[1, 7], 701);
         let Some(ExprNode::FunctionCall { kind, args }) = arena.node(id) else {
             panic!("expected array_map function call");
         };
@@ -157,6 +185,7 @@ mod tests {
             arena.node(*right),
             Some(ExprNode::SlotId(slot)) if *slot == SlotId::new(7)
         ));
+        super::super::tests::assert_complete_frozen(arena);
     }
 
     #[test]
@@ -193,5 +222,6 @@ mod tests {
         assert_eq!(arg_slots, &vec![SlotId::new(3)]);
         assert!(common_sub_exprs.is_empty());
         assert!(!is_nondeterministic);
+        super::super::tests::assert_complete_frozen(arena);
     }
 }

@@ -22,11 +22,12 @@ use arrow_schema::DataType;
 
 use novarocks_type_contract::{
     AggregateStateFormatId, CompileCheckpoints, CompileControlError, CompilePhase,
-    FunctionArgumentEvaluation, FunctionFailureBehavior, FunctionId, FunctionKind,
-    FunctionOverloadId, FunctionVolatility, PureCompileControl, SemanticParameterRef,
+    FunctionArgumentEvaluation, FunctionArgumentTypes, FunctionFailureBehavior, FunctionId,
+    FunctionKind, FunctionOverloadId, FunctionVolatility, PureCompileControl, SemanticParameterRef,
+    TypedFactSlice,
 };
 
-use crate::{ExprId, FunctionArgumentType, ValueId, ValueType};
+use crate::{ExprId, ValueId, ValueType};
 
 /// One expression use occurrence. Shared ExprIds retain independent demand;
 /// this value does not authorize caching across uses or control domains.
@@ -64,7 +65,7 @@ pub struct BoundFunction {
     pub function_id: FunctionId,
     pub overload: FunctionOverloadId,
     pub kind: FunctionKind,
-    pub argument_types: Box<[FunctionArgumentType]>,
+    pub argument_types: FunctionArgumentTypes,
     pub result_type: ValueType,
     /// Explicit migration provenance. V2 never manufactures this metadata;
     /// its occurrence effects and environment belong to FrozenFragmentCalls.
@@ -78,7 +79,7 @@ impl BoundFunction {
         function_id: FunctionId,
         overload: FunctionOverloadId,
         kind: FunctionKind,
-        argument_types: Box<[FunctionArgumentType]>,
+        argument_types: FunctionArgumentTypes,
         result_type: ValueType,
     ) -> Self {
         Self {
@@ -117,8 +118,8 @@ impl BoundFunction {
 pub struct BoundTableFunction {
     pub function_id: FunctionId,
     pub overload: FunctionOverloadId,
-    pub argument_types: Box<[FunctionArgumentType]>,
-    pub result_types: Box<[ValueType]>,
+    pub argument_types: FunctionArgumentTypes,
+    pub result_types: TypedFactSlice<ValueType>,
     /// Original legacy producer provenance, absent on a V2 exact signature.
     pub legacy_metadata: Option<LegacyBindingMetadata>,
 }
@@ -128,8 +129,8 @@ impl BoundTableFunction {
     pub fn from_exact_signature(
         function_id: FunctionId,
         overload: FunctionOverloadId,
-        argument_types: Box<[FunctionArgumentType]>,
-        result_types: Box<[ValueType]>,
+        argument_types: FunctionArgumentTypes,
+        result_types: TypedFactSlice<ValueType>,
     ) -> Self {
         Self {
             function_id,
@@ -855,7 +856,7 @@ pub fn join_key_source_value(arena: &ExprArena, expression: ExprId) -> Option<Va
         ExprKind::Value(value) => Some(*value),
         ExprKind::Cast { expr, target, .. } => {
             let operand = arena.get(*expr)?;
-            widening_keeps_key_identity(&operand.ty.data_type, target)
+            widening_keeps_key_identity(&operand.ty.data_type(), target)
                 .then(|| join_key_source_value(arena, *expr))
                 .flatten()
         }

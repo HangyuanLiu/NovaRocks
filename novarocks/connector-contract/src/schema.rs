@@ -65,6 +65,14 @@ pub(crate) fn owned_field_materialization_core<O: OwnedCopy>(
     field: &Field,
     context: &mut O,
 ) -> Result<Option<MaterializedField>, O::Error> {
+    context.begin_field()?;
+    let field = owned_field_materialization_body(field, context)?;
+    Ok(field)
+}
+fn owned_field_materialization_body<O: OwnedCopy>(
+    field: &Field,
+    context: &mut O,
+) -> Result<Option<MaterializedField>, O::Error> {
     let base = context.add(size_of::<Field>(), field.name().capacity())?;
     let base = context.add(
         base,
@@ -224,13 +232,15 @@ fn owned_arc_field<O: OwnedCopy>(
     field: &Field,
     context: &mut O,
 ) -> Result<Option<Arc<Field>>, O::Error> {
+    context.begin_field()?;
     context.arc::<Field>()?;
     let minimum = layout::arc_layout(Layout::new::<Field>()).map_err(|_| context.arithmetic())?;
     context.source_floor(minimum.size())?;
     context.work(128)?;
     context.prepare_field_materialization()?;
-    let field = owned_field_materialization_core(field, context)?;
+    let field = owned_field_materialization_body(field, context)?;
     if !context.materializes() {
+        let _ = context.finish_field()?;
         return Ok(None);
     }
     let field = present(field, context)?;
@@ -239,6 +249,8 @@ fn owned_arc_field<O: OwnedCopy>(
     context.step()?;
     context.flush()?;
     context.materialized_field(&field)?;
+    let storage = context.finish_field()?;
+    context.retain_shared_field(storage)?;
     Ok(Some(field.into_original_field_ref()))
 }
 
@@ -250,7 +262,7 @@ fn union_requests<O: OwnedCopy>(count: usize, context: &mut O) -> Result<(), O::
     let mut capacity = 4usize;
     if success_prefix != 0 {
         loop {
-            context.array::<(i8, Arc<Field>)>(capacity, 1)?;
+            context.temporary_array::<(i8, Arc<Field>)>(capacity, 1)?;
             context.work(context.mul(context.mul(capacity, size_of::<(i8, Arc<Field>)>())?, 2)?)?;
             if capacity >= success_prefix {
                 break;
@@ -320,7 +332,7 @@ fn owned_type_core<O: OwnedCopy>(
             )
             .map_err(|_| context.arithmetic())?;
             context.source_floor(minimum.size())?;
-            context.array::<Arc<Field>>(fields.len(), 1)?;
+            context.temporary_array::<Arc<Field>>(fields.len(), 1)?;
             context.arc_slice::<Arc<Field>>(fields.len())?;
             context.work(context.mul(context.mul(fields.len(), size_of::<Arc<Field>>())?, 2)?)?;
             let mut values = if context.materializes() {
@@ -352,8 +364,8 @@ fn owned_type_core<O: OwnedCopy>(
             )
             .map_err(|_| context.arithmetic())?;
             context.source_floor(minimum.size())?;
-            context.array::<i8>(fields.len(), 1)?;
-            context.array::<Arc<Field>>(fields.len(), 1)?;
+            context.temporary_array::<i8>(fields.len(), 1)?;
+            context.temporary_array::<Arc<Field>>(fields.len(), 1)?;
             union_requests(fields.len(), context)?;
             let mut ids = if context.materializes() {
                 Some(reserve(fields.len(), context)?)

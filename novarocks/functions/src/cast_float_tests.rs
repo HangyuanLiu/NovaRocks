@@ -68,7 +68,7 @@ impl KernelEvaluationControl for Control {
     }
 }
 fn ty(carrier: DataType, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(carrier, nullable)
+    FunctionValueType::from_legacy_declared_projection(carrier, nullable)
 }
 fn prepare(
     source: FunctionValueType,
@@ -601,7 +601,7 @@ fn float_compile_original_three_causes_keep_all_refusal_prefixes_and_metadata_qu
         let trace = baseline.trace.lock().unwrap().clone();
         assert_eq!(trace[0], 0);
         assert!(trace.last().copied().unwrap() > 0);
-        if matches!(source.data_type, DataType::Struct(_)) {
+        if matches!(source.data_type(), DataType::Struct(_)) {
             assert!(trace.contains(&256));
         }
         for at in 0..trace.len() {

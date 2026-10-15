@@ -29,6 +29,8 @@ use novarocks_type_contract::{
     PureCompileControl,
 };
 use std::sync::Arc;
+mod encoding;
+pub use encoding::AggregateArgumentEncoding;
 
 /// Per-call phase; a node may mix update and merge calls. Sequence identity and
 /// complete/partial responsibility remain in the checked program lineage.
@@ -78,6 +80,17 @@ pub(crate) fn align_aggregate_merge_state_observed<'a>(
     Ok(AlignedAggregateMergeState { input, owned })
 }
 
+/// Borrow the original state-domain author at a transport input frontier.
+/// The caller keeps its existing checkpoint scope; this emits no new footer,
+/// selection, options, type tree, or constructor reservation.
+pub fn check_aggregate_merge_state_type_observed(
+    input: &FunctionValueType,
+    intermediate: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), KernelFailure> {
+    validate_aggregate_merge_state_observed(input, intermediate, work).map(|_| ())
+}
+
 pub(crate) fn validate_aggregate_merge_state_observed<'a>(
     input: &'a FunctionValueType,
     intermediate: &'a FunctionValueType,
@@ -86,7 +99,7 @@ pub(crate) fn validate_aggregate_merge_state_observed<'a>(
     validate_type_observed(input, work)?;
     if !input.same_value_domain_observed::<KernelFailure>(intermediate, || {
         work.step().map_err(compile_failure)
-    })? || (intermediate.nullable && !input.nullable)
+    })? || (intermediate.nullable() && !input.nullable())
     {
         return Err(invalid(
             "aggregate merge state layout differs from its selected intermediate domain",
@@ -401,6 +414,7 @@ fn value_type(value: &FunctionArgumentType) -> &FunctionValueType {
 #[derive(Clone, Copy, Debug)]
 pub struct SelectedAggregateUpdateInput<'call, 'a> {
     contract: &'call AggregateCallContract,
+    installed_owner: Option<&'call dyn crate::aggregate_erasure::ErasedAggregateOps>,
     selection: Selection<'a>,
     logical_arguments: &'a [EvaluatedArgument<'a>],
     order_arguments: &'a [EvaluatedArgument<'a>],
@@ -431,11 +445,128 @@ impl<'call, 'a> SelectedAggregateUpdateInput<'call, 'a> {
         }
         Ok(Self {
             contract,
+            installed_owner: None,
             selection,
             logical_arguments,
             order_arguments,
         })
     }
+    /// Use only encoding facts from the actual installed local implementation.
+    /// Sources are the caller's existing complete bindings; no type is inferred
+    /// from Arrow metadata and no holder or capability vector is allocated.
+    pub fn try_new_with_typed_sources(
+        contract: &'call AggregateCallContract,
+        selection: Selection<'a>,
+        logical_arguments: &'a [EvaluatedArgument<'a>],
+        order_arguments: &'a [EvaluatedArgument<'a>],
+        logical_sources: &[&FunctionValueType],
+        order_sources: &[&FunctionValueType],
+        encodings: &[AggregateArgumentEncoding<'call>],
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, KernelFailure> {
+        if logical_sources.len() != logical_arguments.len()
+            || order_sources.len() != order_arguments.len()
+            || encodings.len() != logical_arguments.len() + order_arguments.len()
+        {
+            control.checkpoint(0)?;
+            return Err(invalid(
+                "typed aggregate update differs from exact call phase/channels",
+            ));
+        }
+        Self::try_new_with_typed_source_lookup(
+            contract,
+            selection,
+            logical_arguments,
+            order_arguments,
+            |ordinal| {
+                let source = if ordinal < logical_sources.len() {
+                    logical_sources.get(ordinal)
+                } else {
+                    order_sources.get(ordinal - logical_sources.len())
+                };
+                source
+                    .copied()
+                    .ok_or_else(|| invalid("typed aggregate source ordinal is absent"))
+            },
+            |ordinal| {
+                encodings
+                    .get(ordinal)
+                    .copied()
+                    .ok_or_else(|| invalid("installed aggregate encoding ordinal is absent"))
+            },
+            control,
+        )
+    }
+
+    /// Borrow exact checked source definitions and installed implementation
+    /// facts directly. The host needs no per-batch source/capability vectors.
+    pub fn try_new_with_typed_source_lookup<'source>(
+        contract: &'call AggregateCallContract,
+        selection: Selection<'a>,
+        logical_arguments: &'a [EvaluatedArgument<'a>],
+        order_arguments: &'a [EvaluatedArgument<'a>],
+        mut source_at: impl FnMut(usize) -> Result<&'source FunctionValueType, KernelFailure>,
+        mut encoding_at: impl FnMut(usize) -> Result<AggregateArgumentEncoding<'call>, KernelFailure>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, KernelFailure> {
+        control.checkpoint(0)?;
+        if !contract.phase.consumes_logical_arguments()
+            || logical_arguments.len() != contract.logical_argument_types().len()
+            || order_arguments.len() != contract.order_argument_types().len()
+        {
+            return Err(invalid(
+                "typed aggregate update differs from exact call phase/channels",
+            ));
+        }
+        let mut installed_owner: Option<&'call dyn crate::aggregate_erasure::ErasedAggregateOps> =
+            None;
+        for (ordinal, (argument, expected)) in logical_arguments
+            .iter()
+            .chain(order_arguments.iter())
+            .zip(
+                contract
+                    .logical_argument_types()
+                    .chain(contract.order_argument_types()),
+            )
+            .enumerate()
+        {
+            let source = source_at(ordinal)?;
+            let encoding = encoding_at(ordinal)?;
+            encoding.validate_scope(contract, ordinal)?;
+            let owner = encoding.installed_owner()?;
+            if installed_owner.is_some_and(|previous| !std::ptr::addr_eq(previous, owner)) {
+                return Err(invalid(
+                    "aggregate typed inputs differ in installed adapter owner",
+                ));
+            }
+            installed_owner = Some(owner);
+            encoding::validate_typed_argument(
+                *argument, source, expected, selection, encoding, control,
+            )?;
+        }
+        Ok(Self {
+            contract,
+            installed_owner,
+            selection,
+            logical_arguments,
+            order_arguments,
+        })
+    }
+
+    pub(crate) fn validate_installed_owner(
+        self,
+        owner: Option<&dyn crate::aggregate_erasure::ErasedAggregateOps>,
+    ) -> Result<(), KernelFailure> {
+        if let Some(expected) = self.installed_owner {
+            if !owner.is_some_and(|actual| std::ptr::addr_eq(expected, actual)) {
+                return Err(invalid(
+                    "aggregate typed input differs from actual installed adapter",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub const fn contract(self) -> &'call AggregateCallContract {
         self.contract
     }

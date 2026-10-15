@@ -21,17 +21,11 @@
 
 use super::{
     ConstantDecodeProjectionLimits, PhysicalConstantCodecError as Error, finish, record_sources,
-    record_sources_captured, recursive,
+    record_sources_captured_observed, recursive,
 };
 use crate::{
-    ipc_flat_stream_v2::{
-        PreparedFlatReader, preflight_flat_constant_stream, preflight_flat_constant_stream_in,
-        progress::IpcReaderProgressFacts,
-    },
-    ipc_recursive_stream_v2::{
-        PreparedRecursiveReader, preflight_recursive_constant_stream,
-        preflight_recursive_constant_stream_in,
-    },
+    ipc_flat_stream_v2::{preflight_flat_constant_stream, progress::IpcReaderProgressFacts},
+    ipc_recursive_stream_v2::preflight_recursive_constant_stream,
     physical_type_v2::DecodedTypeTable,
     resource_source_model::{LOCKED_FAMILY, LOCKED_TOOLCHAIN},
 };
@@ -41,6 +35,8 @@ use novarocks_physical_plan::{ConstantPoolId, ConstantPools, ConstantReferenceEr
 use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+    ValueSchemaCreationFactory, ValueSchemaCreationScope, ValueSchemaScopeBeginFailure,
+    ValueTypeStorageLifetime,
 };
 use std::{alloc::Layout, mem, sync::Arc};
 
@@ -68,14 +64,87 @@ pub struct ConstantNamespaceResourceFacts {
     pub new_allocation_request_bytes_upper_bound: usize,
     pub coexisting_source_and_request_bytes_upper_bound: usize,
     pub cumulative_library_work_upper_bound: usize,
+    pub additional_preparation_request_bytes: usize,
+    pub namespace_scope_request_bytes_upper_bound: usize,
+    pub retained_new_allocation_request_bytes_upper_bound: usize,
 }
 
-type Admit<'a> = dyn FnMut(&ConstantNamespaceResourceFacts) -> Result<(), CompileControlError> + 'a;
-fn gate_parent(
+trait NamespaceFailure:
+    crate::ipc_flat_stream_v2::ReaderFailure + From<Error> + From<ConstantReferenceError>
+{
+}
+impl<E> NamespaceFailure for E where
+    E: crate::ipc_flat_stream_v2::ReaderFailure + From<Error> + From<ConstantReferenceError>
+{
+}
+struct NamespaceCreation<'a,'port,E> {
+    creation:&'a mut novarocks_type_contract::ValueSchemaCreation<'port,E>,
+    metadata:Option<&'a novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>,
+}
+type HostFailure<H> = crate::host_projection_v2::ProjectionFailure<Error, H>;
+struct MappedNamespaceFactory<'a, F, H> {
+    factory: &'a F,
+    marker: std::marker::PhantomData<fn() -> H>,
+}
+struct MappedNamespaceScope<S, H>(S, std::marker::PhantomData<fn() -> H>);
+impl<S: ValueSchemaCreationScope<H>, H> ValueSchemaCreationScope<HostFailure<H>>
+    for MappedNamespaceScope<S, H>
+{
+    fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+        self.0.storage_lifetime()
+    }
+    fn request_layout(&mut self, layout: Layout) -> Result<(), HostFailure<H>> {
+        self.0.request_layout(layout).map_err(HostFailure::Host)
+    }
+    fn observe_opaque_upper_bound(&mut self, bytes: usize) -> Result<(), HostFailure<H>> {
+        self.0
+            .observe_opaque_upper_bound(bytes)
+            .map_err(HostFailure::Host)
+    }
+}
+impl<F: ValueSchemaCreationFactory<H>, H> ValueSchemaCreationFactory<HostFailure<H>>
+    for MappedNamespaceFactory<'_, F, H>
+{
+    type Scope<'a>
+        = MappedNamespaceScope<F::Scope<'a>, H>
+    where
+        Self: 'a;
+    fn begin_scope(&self) -> Result<Self::Scope<'_>, HostFailure<H>> {
+        self.factory
+            .begin_scope()
+            .map(|scope| MappedNamespaceScope(scope, std::marker::PhantomData))
+            .map_err(HostFailure::Host)
+    }
+    fn begin_scope_observed<O>(
+        &self,
+        observe: &mut dyn FnMut(Layout) -> Result<(), O>,
+    ) -> Result<Self::Scope<'_>, ValueSchemaScopeBeginFailure<O, HostFailure<H>>> {
+        self.factory
+            .begin_scope_observed(observe)
+            .map(|scope| MappedNamespaceScope(scope, std::marker::PhantomData))
+            .map_err(|error| match error {
+                ValueSchemaScopeBeginFailure::Observer(error) => {
+                    ValueSchemaScopeBeginFailure::Observer(error)
+                }
+                ValueSchemaScopeBeginFailure::Creator(error) => {
+                    ValueSchemaScopeBeginFailure::Creator(HostFailure::Host(error))
+                }
+            })
+    }
+}
+fn map_admission<H>(error: crate::host_projection_v2::AdmissionRefusal<H>) -> HostFailure<H> {
+    match error {
+        crate::host_projection_v2::AdmissionRefusal::Control(error) => error.into(),
+        crate::host_projection_v2::AdmissionRefusal::Host(error) => HostFailure::Host(error),
+    }
+}
+type Admit<'a, E = CompileControlError> =
+    dyn FnMut(&ConstantNamespaceResourceFacts) -> Result<(), E> + 'a;
+fn gate_parent<E: From<CompileControlError>>(
     facts: &ConstantNamespaceResourceFacts,
     limits: ConstantNamespaceProjectionLimits,
-    admit: &mut Admit<'_>,
-) -> Result<(), CompileControlError> {
+    admit: &mut Admit<'_, E>,
+) -> Result<(), E> {
     for (actual, maximum) in [
         (facts.record_count, limits.max_records),
         (
@@ -96,7 +165,7 @@ fn gate_parent(
         ),
     ] {
         if actual > maximum {
-            return Err(CompileControlError::ResourceExhausted);
+            return Err(CompileControlError::ResourceExhausted.into());
         }
     }
     admit(facts)
@@ -118,7 +187,10 @@ fn with_child(
     )?;
     facts.preparation_request_bytes = sum(
         facts.prepared_storage_request_bytes,
-        facts.geometry_scratch_request_bytes,
+        add_control(
+            facts.geometry_scratch_request_bytes,
+            base.additional_preparation_request_bytes,
+        )?,
     )?;
     facts.reader_request_bytes_upper_bound = sum(
         base.reader_request_bytes_upper_bound,
@@ -133,7 +205,10 @@ fn with_child(
             facts.prepared_storage_request_bytes,
             facts.pool_table_request_bytes_upper_bound,
         )?,
-        facts.reader_request_bytes_upper_bound,
+        sum(
+            facts.reader_request_bytes_upper_bound,
+            facts.namespace_scope_request_bytes_upper_bound,
+        )?,
     )?;
     facts.coexisting_source_and_request_bytes_upper_bound = sum(
         facts.source_retained_bytes,
@@ -146,63 +221,108 @@ fn with_child(
     Ok(facts)
 }
 
-enum PreparedReader<'raw, 'table, 'control> {
-    Flat(PreparedFlatReader<'raw, 'table, 'table, 'control>),
-    Recursive(PreparedRecursiveReader<'raw, 'table, 'table, 'control>),
-}
-impl PreparedReader<'_, '_, '_> {
-    fn geometry_requests(&self) -> (usize, usize) {
-        match self {
-            Self::Flat(value) => (
-                value.geometry_scratch_request_bytes(),
-                value.geometry_scratch_request_count(),
-            ),
-            Self::Recursive(value) => (
-                value.geometry_scratch_request_bytes(),
-                value.geometry_scratch_request_count(),
-            ),
-        }
-    }
-    fn reader_requests(&self) -> (usize, usize, usize) {
-        match self {
-            Self::Flat(value) => {
-                let facts = value.facts();
-                (
-                    facts.new_allocation_request_bytes_upper_bound,
-                    facts.allocation_request_count_upper_bound,
-                    facts.cumulative_library_work_upper_bound,
-                )
-            }
-            Self::Recursive(value) => {
-                let facts = value.facts();
-                (
-                    facts.new_allocation_request_bytes_upper_bound,
-                    facts.allocation_request_count_upper_bound,
-                    facts.cumulative_library_work_upper_bound,
-                )
-            }
-        }
-    }
-    fn materialize(self, control: &dyn PureCompileControl) -> Result<ConstantPool, Error> {
-        Ok(match self {
-            Self::Flat(value) => value.materialize(control)?,
-            Self::Recursive(value) => value.materialize(control)?,
-        })
-    }
-    fn materialize_in(
-        self,
-        admit: &mut dyn FnMut(&IpcReaderProgressFacts) -> Result<(), CompileControlError>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<ConstantPool, Error> {
-        Ok(match self {
-            Self::Flat(value) => value.materialize_in(admit, work)?,
-            Self::Recursive(value) => value.materialize_in(admit, work)?,
-        })
-    }
-}
+use super::borrowed_reader::{PreparedReader, prepare_reader_from_sources_observed};
+
+use super::record_scopes::{
+    ConstantRecordConstructionFacts, ConstantRecordScopes, ScopedPreparedConstantRecord,
+};
 struct PreparedRecord<'raw, 'table, 'control> {
     id: ConstantPoolId,
-    reader: PreparedReader<'raw, 'table, 'control>,
+    reader: PreparedRecordReader<'raw, 'table, 'control>,
+}
+enum PreparedRecordReader<'raw, 'table, 'control> {
+    Original {
+        reader: PreparedReader<'raw, 'table, 'control>,
+        source: Option<novarocks_constant_contract::ConstantSourceOwner>,
+    },
+    Scoped {
+        reader: ScopedPreparedConstantRecord<'raw, 'table, 'control>,
+        prepared: ConstantRecordConstructionFacts,
+    },
+}
+fn add_control(a: usize, b: usize) -> Result<usize, CompileControlError> {
+    a.checked_add(b)
+        .ok_or(CompileControlError::ResourceExhausted)
+}
+fn with_namespace_temporary_layout(
+    mut facts: ConstantNamespaceResourceFacts,
+    layout: Layout,
+) -> Result<ConstantNamespaceResourceFacts, CompileControlError> {
+    if layout.size() == 0 {
+        return Ok(facts);
+    }
+    facts.namespace_scope_request_bytes_upper_bound = add_control(
+        facts.namespace_scope_request_bytes_upper_bound,
+        layout.size(),
+    )?;
+    facts.additional_preparation_request_bytes =
+        add_control(facts.additional_preparation_request_bytes, layout.size())?;
+    facts.preparation_request_bytes = add_control(facts.preparation_request_bytes, layout.size())?;
+    facts.new_allocation_request_bytes_upper_bound = add_control(
+        facts.new_allocation_request_bytes_upper_bound,
+        layout.size(),
+    )?;
+    facts.coexisting_source_and_request_bytes_upper_bound = add_control(
+        facts.coexisting_source_and_request_bytes_upper_bound,
+        layout.size(),
+    )?;
+    facts.allocation_request_count_upper_bound =
+        add_control(facts.allocation_request_count_upper_bound, 1)?;
+    Ok(facts)
+}
+fn with_scoped_child(
+    base: ConstantNamespaceResourceFacts,
+    child: &ConstantRecordConstructionFacts,
+) -> Result<ConstantNamespaceResourceFacts, CompileControlError> {
+    let progress = IpcReaderProgressFacts {
+        geometry_scratch_request_bytes: child.geometry_scratch_request_bytes,
+        geometry_scratch_request_count: child.geometry_scratch_request_count,
+        new_allocation_request_bytes_upper_bound: child.new_request_bytes_upper_bound,
+        allocation_request_count_upper_bound: child.allocation_requests_upper_bound,
+        cumulative_library_work_upper_bound: child.cumulative_library_work_upper_bound,
+        ..Default::default()
+    };
+    let mut facts = with_child(base, &progress)?;
+    let extra = child
+        .preparation_request_bytes_upper_bound
+        .checked_sub(child.geometry_scratch_request_bytes)
+        .ok_or(CompileControlError::ResourceExhausted)?;
+    facts.additional_preparation_request_bytes =
+        add_control(base.additional_preparation_request_bytes, extra)?;
+    facts.preparation_request_bytes = add_control(facts.preparation_request_bytes, extra)?;
+    Ok(facts)
+}
+fn with_materialization_prefix(
+    base: ConstantNamespaceResourceFacts,
+    prepared: &ConstantRecordConstructionFacts,
+    child: &ConstantRecordConstructionFacts,
+) -> Result<ConstantNamespaceResourceFacts, CompileControlError> {
+    let bytes = child
+        .new_request_bytes_upper_bound
+        .checked_sub(prepared.new_request_bytes_upper_bound)
+        .ok_or(CompileControlError::ResourceExhausted)?;
+    let requests = child
+        .allocation_requests_upper_bound
+        .checked_sub(prepared.allocation_requests_upper_bound)
+        .ok_or(CompileControlError::ResourceExhausted)?;
+    let mut facts = base;
+    facts.reader_request_bytes_upper_bound =
+        add_control(facts.reader_request_bytes_upper_bound, bytes)?;
+    facts.new_allocation_request_bytes_upper_bound =
+        add_control(facts.new_allocation_request_bytes_upper_bound, bytes)?;
+    facts.coexisting_source_and_request_bytes_upper_bound =
+        add_control(facts.coexisting_source_and_request_bytes_upper_bound, bytes)?;
+    facts.allocation_request_count_upper_bound =
+        add_control(facts.allocation_request_count_upper_bound, requests)?;
+    Ok(facts)
+}
+fn flatten_scoped_failure<E: From<Error>>(
+    error: crate::host_projection_v2::ProjectionFailure<Error, E>,
+) -> E {
+    match error {
+        crate::host_projection_v2::ProjectionFailure::Host(error) => error,
+        crate::host_projection_v2::ProjectionFailure::Codec(error) => error.into(),
+    }
 }
 
 /// Private construction freezes the same checked stream, type, policy and
@@ -211,6 +331,8 @@ pub struct PreparedConstantNamespace<'raw, 'table, 'control> {
     records: Vec<PreparedRecord<'raw, 'table, 'control>>,
     facts: ConstantNamespaceResourceFacts,
     control: &'control dyn PureCompileControl,
+    preparation_storage: ValueTypeStorageLifetime,
+    limits: ConstantNamespaceProjectionLimits,
 }
 impl PreparedConstantNamespace<'_, '_, '_> {
     pub const fn facts(&self) -> &ConstantNamespaceResourceFacts {
@@ -221,7 +343,11 @@ impl PreparedConstantNamespace<'_, '_, '_> {
     /// or byte-based backing deduplication exists. Package closure is later.
     pub fn materialize(self) -> Result<ConstantPools, Error> {
         let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Decode)?;
-        let result = self.materialize_core(None, &mut work);
+        let result = self
+            .materialize_core::<Error, crate::value_type_table::resources::NoFactory>(
+                None, None, None, None, &mut work,
+            )
+            .map(|(pools, _)| pools);
         finish(work, result)
     }
     pub(crate) fn materialize_in(
@@ -235,44 +361,320 @@ impl PreparedConstantNamespace<'_, '_, '_> {
             ));
         }
         admit(&self.facts)?;
-        self.materialize_core(Some(admit), work)
+        self.materialize_core::<Error, crate::value_type_table::resources::NoFactory>(
+            Some(&mut |facts| admit(facts).map_err(Error::from)),
+            None,
+            None,
+            None,
+            work,
+        )
+        .map(|(pools, _)| pools)
     }
-    fn materialize_core(
+    pub fn materialize_with_creator_in<H>(
         self,
-        mut admit: Option<&mut Admit<'_>>,
+        creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+        admit: &mut dyn FnMut(
+            &ConstantNamespaceResourceFacts,
+        )
+            -> Result<(), crate::host_projection_v2::AdmissionRefusal<H>>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<ConstantPools, Error> {
+    ) -> Result<ConstantPools, crate::host_projection_v2::ProjectionFailure<Error, H>> {
+        if !std::ptr::addr_eq(self.control, work.control()) {
+            return Err(
+                shape("constant namespace caller work has a different original control").into(),
+            );
+        }
+        creation.with_error_mapping(
+            crate::host_projection_v2::ProjectionFailure::Host,
+            |mapped| {
+                let mut capture = |facts: &ConstantNamespaceResourceFacts| {
+                    admit(facts).map_err(|error| match error {
+                        crate::host_projection_v2::AdmissionRefusal::Control(cause) => cause.into(),
+                        crate::host_projection_v2::AdmissionRefusal::Host(error) => {
+                            crate::host_projection_v2::ProjectionFailure::Host(error)
+                        }
+                    })
+                };
+                capture(&self.facts)?;
+                self.materialize_core::<_, crate::value_type_table::resources::NoFactory>(
+                    Some(&mut capture),
+                    Some(mapped),
+                    None,
+                    None,
+                    work,
+                )
+                .map(|(pools, _)| pools)
+            },
+        )
+    }
+    /// Materialize all previously checked records with the same actual factory.
+    /// The table loan is independent of each selected pool/array loan.
+    pub fn materialize_with_factory_in<H, F: ValueSchemaCreationFactory<H>>(
+        self,
+        factory: &F,
+        admit: &mut dyn FnMut(
+            &ConstantNamespaceResourceFacts,
+        )
+            -> Result<(), crate::host_projection_v2::AdmissionRefusal<H>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(ConstantPools, ConstantNamespaceResourceFacts), HostFailure<H>> {
+        if !std::ptr::addr_eq(self.control, work.control()) {
+            return Err(
+                shape("constant namespace caller work has a different original control").into(),
+            );
+        }
+        let limits = self.limits;
+        let mut capture =
+            |facts: &ConstantNamespaceResourceFacts| admit(facts).map_err(map_admission);
+        capture(&self.facts)?;
+        let mapped = MappedNamespaceFactory {
+            factory,
+            marker: std::marker::PhantomData,
+        };
+        self.materialize_core(Some(&mut capture), None, Some(&mapped), Some(limits), work)
+    }
+    fn materialize_core<E: NamespaceFailure, F: ValueSchemaCreationFactory<E>>(
+        mut self,
+        mut admit: Option<&mut Admit<'_, E>>,
+        mut creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, E>>,
+        factory: Option<&F>,
+        limits: Option<ConstantNamespaceProjectionLimits>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(ConstantPools, ConstantNamespaceResourceFacts), E> {
         (|| {
+            if self.records.iter().any(|record| {
+                matches!(
+                    &record.reader,
+                    PreparedRecordReader::Original {
+                        source: Some(_),
+                        ..
+                    }
+                )
+            }) && creation.is_none()
+            {
+                return Err(shape(
+                    "constant namespace materialization requires its supplied creator",
+                )
+                .into());
+            }
+            if let Some(creator) = creation.as_deref_mut() {
+                creator
+                    .observe_opaque_upper_bound(self.facts.pool_table_request_bytes_upper_bound)?;
+            }
+            let mut scope_queue = None;
+            let mut queue_storage = ValueTypeStorageLifetime::pure();
+            if let Some(factory) = factory.filter(|_| !self.records.is_empty()) {
+                if self
+                    .records
+                    .iter()
+                    .any(|record| !matches!(record.reader, PreparedRecordReader::Scoped { .. }))
+                {
+                    return Err(shape(
+                        "factory namespace requires its prepared original source custody",
+                    )
+                    .into());
+                }
+                let limits = limits.ok_or_else(|| {
+                    E::from(shape("constant namespace factory limits are absent"))
+                })?;
+                let parent = admit
+                    .as_deref_mut()
+                    .ok_or_else(|| E::from(shape("constant namespace factory parent is absent")))?;
+                work.flush()?;
+                let mut queue_scope = factory
+                    .begin_scope_observed(&mut |layout| {
+                        self.facts = with_namespace_temporary_layout(self.facts, layout)?;
+                        gate_parent(&self.facts, limits, parent)
+                    })
+                    .map_err(|error| match error {
+                        ValueSchemaScopeBeginFailure::Observer(error) => error,
+                        ValueSchemaScopeBeginFailure::Creator(error) => error,
+                    })?;
+                let layout =
+                    Layout::array::<ConstantRecordScopes<F::Scope<'_>>>(self.records.len())
+                        .map_err(|_| CompileControlError::ResourceExhausted)?;
+                self.facts = with_namespace_temporary_layout(self.facts, layout)?;
+                gate_parent(&self.facts, limits, parent)?;
+                work.flush()?;
+                if layout.size() != 0 {
+                    queue_scope.request_layout(layout)?;
+                }
+                let mut scopes = Vec::new();
+                let reserved = scopes.try_reserve_exact(self.records.len());
+                crate::allocation_exit_v2::reserve_exit::<Error>(reserved, work)?;
+                for record in &mut self.records {
+                    let PreparedRecordReader::Scoped { reader, prepared } = &mut record.reader
+                    else {
+                        unreachable!("all factory records checked")
+                    };
+                    let base = self.facts;
+                    let mut complete = base;
+                    let record_scopes = reader
+                        .prepare_materialization_scopes(
+                            factory,
+                            &mut |child| {
+                                complete = with_materialization_prefix(base, prepared, child)?;
+                                gate_parent(&complete, limits, parent)
+                                    .map_err(crate::host_projection_v2::ProjectionFailure::Host)
+                            },
+                            work,
+                        )
+                        .map_err(flatten_scoped_failure)?;
+                    self.facts = complete;
+                    *prepared = reader.construction_facts()?;
+                    scopes.push(record_scopes);
+                    work.step()?;
+                }
+                queue_storage = queue_scope.storage_lifetime();
+                scope_queue = Some(scopes.into_iter());
+            }
+            let mut table_scope = if let Some(factory) =
+                factory.filter(|_| !self.records.is_empty())
+            {
+                work.flush()?;
+                let scope = factory
+                    .begin_scope_observed(&mut |layout| {
+                        self.facts.namespace_scope_request_bytes_upper_bound = add_control(
+                            self.facts.namespace_scope_request_bytes_upper_bound,
+                            layout.size(),
+                        )?;
+                        self.facts.new_allocation_request_bytes_upper_bound = add_control(
+                            self.facts.new_allocation_request_bytes_upper_bound,
+                            layout.size(),
+                        )?;
+                        self.facts.coexisting_source_and_request_bytes_upper_bound = add_control(
+                            self.facts.coexisting_source_and_request_bytes_upper_bound,
+                            layout.size(),
+                        )?;
+                        self.facts.allocation_request_count_upper_bound =
+                            add_control(self.facts.allocation_request_count_upper_bound, 1)?;
+                        self.facts.retained_new_allocation_request_bytes_upper_bound = add_control(
+                            self.facts.pool_table_request_bytes_upper_bound,
+                            layout.size(),
+                        )?;
+                        gate_parent(
+                            &self.facts,
+                            limits.ok_or_else(|| {
+                                E::from(shape("constant namespace factory limits are absent"))
+                            })?,
+                            admit.as_deref_mut().ok_or_else(|| {
+                                E::from(shape("constant namespace factory parent is absent"))
+                            })?,
+                        )
+                    })
+                    .map_err(|error| match error {
+                        ValueSchemaScopeBeginFailure::Observer(error) => error,
+                        ValueSchemaScopeBeginFailure::Creator(error) => error,
+                    })?;
+                Some(scope)
+            } else {
+                None
+            };
+            if let Some(scope) = table_scope.as_mut() {
+                work.flush()?;
+                scope
+                    .observe_opaque_upper_bound(self.facts.pool_table_request_bytes_upper_bound)?;
+            }
             let mut pools = ConstantPools::empty();
             for record in self.records {
                 work.step()?;
                 work.flush()?;
-                let pool = if let Some(parent) = &mut admit {
-                    let (geometry_bytes, geometry_count) = record.reader.geometry_requests();
-                    let (reader_bytes, reader_count, reader_work) = record.reader.reader_requests();
-                    record.reader.materialize_in(
-                        &mut |progress| {
-                            if progress.geometry_scratch_request_bytes > geometry_bytes
-                                || progress.geometry_scratch_request_count > geometry_count
-                                || progress.new_allocation_request_bytes_upper_bound > reader_bytes
-                                || progress.allocation_request_count_upper_bound > reader_count
-                                || progress.cumulative_library_work_upper_bound > reader_work
-                            {
-                                return Err(CompileControlError::ResourceExhausted);
+                let pool = match record.reader {
+                    PreparedRecordReader::Scoped { reader, prepared } => {
+                        let scopes = scope_queue.as_mut().and_then(Iterator::next).ok_or_else(
+                            || {
+                                E::from(shape(
+                                    "scoped constant namespace materialization scopes are absent",
+                                ))
+                            },
+                        )?;
+                        let parent = admit.as_deref_mut().ok_or_else(|| {
+                            E::from(shape(
+                                "scoped constant namespace requires its original parent",
+                            ))
+                        })?;
+                        let limits = limits.ok_or_else(|| {
+                            E::from(shape("scoped constant namespace limits are absent"))
+                        })?;
+                        let base = self.facts;
+                        let mut complete = base;
+                        let (pool, final_facts) = reader
+                            .materialize_with_scopes_in(
+                                scopes,
+                                &mut |child| {
+                                    complete = with_materialization_prefix(base, &prepared, child)?;
+                                    gate_parent(&complete, limits, parent)
+                                        .map_err(crate::host_projection_v2::ProjectionFailure::Host)
+                                },
+                                work,
+                            )
+                            .map_err(flatten_scoped_failure)?;
+                        self.facts = complete;
+                        self.facts.retained_new_allocation_request_bytes_upper_bound = add_control(
+                            self.facts.retained_new_allocation_request_bytes_upper_bound,
+                            final_facts.retained_new_bytes_upper_bound,
+                        )?;
+                        pool
+                    }
+                    PreparedRecordReader::Original { reader, source } => {
+                        if let Some(parent) = &mut admit {
+                            let (geometry_bytes, geometry_count) = reader.geometry_requests();
+                            let (reader_bytes, reader_count, reader_work) =
+                                reader.reader_requests();
+                            let mut capture = |progress: &IpcReaderProgressFacts| {
+                                if progress.geometry_scratch_request_bytes > geometry_bytes
+                                    || progress.geometry_scratch_request_count > geometry_count
+                                    || progress.new_allocation_request_bytes_upper_bound
+                                        > reader_bytes
+                                    || progress.allocation_request_count_upper_bound > reader_count
+                                    || progress.cumulative_library_work_upper_bound > reader_work
+                                {
+                                    return Err(E::from(CompileControlError::ResourceExhausted));
+                                }
+                                parent(&self.facts)
+                            };
+                            if let Some(creator) = creation.as_deref_mut() {
+                                let source = source.ok_or_else(|| {
+                                    shape("constant namespace creator record lacks source custody")
+                                })?;
+                                reader
+                                    .materialize_with_creator_observed(
+                                        source,
+                                        creator,
+                                        &mut |progress| {
+                                            capture(progress).map_err(
+                                                crate::host_projection_v2::ProjectionFailure::Host,
+                                            )
+                                        },
+                                        work,
+                                    )
+                                    .map_err(|error| match error {
+                                        crate::host_projection_v2::ProjectionFailure::Host(
+                                            error,
+                                        ) => error,
+                                        crate::host_projection_v2::ProjectionFailure::Codec(
+                                            error,
+                                        ) => error.into(),
+                                    })?
+                            } else {
+                                reader.materialize_pure_observed(&mut capture, work)?
                             }
-                            parent(&self.facts)
-                        },
-                        work,
-                    )?
-                } else {
-                    record.reader.materialize(work.control())?
+                        } else {
+                            reader.materialize(work.control())?
+                        }
+                    }
                 };
                 work.flush()?;
                 let inserted = pools.insert(record.id, pool);
                 work.step()?;
                 inserted?;
             }
-            Ok(pools)
+            if let Some(scope) = table_scope {
+                pools = pools.with_storage_lifetime(scope.storage_lifetime());
+            }
+            drop(scope_queue);
+            drop(queue_storage);
+            Ok((pools, self.facts))
         })()
     }
 }
@@ -435,7 +837,7 @@ pub fn prepare_constant_namespace<'raw, 'table, 'control>(
     control: &'control dyn PureCompileControl,
 ) -> Result<PreparedConstantNamespace<'raw, 'table, 'control>, Error> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
-    let result = prepare_core(
+    let result = prepare_core::<_, crate::value_type_table::resources::NoFactory>(
         records,
         types,
         source_retained_bytes,
@@ -443,6 +845,9 @@ pub fn prepare_constant_namespace<'raw, 'table, 'control>(
         record_limits,
         limits,
         verifier,
+        None,
+        None,
+        None,
         None,
         &mut work,
     );
@@ -460,6 +865,98 @@ pub(crate) fn prepare_constant_namespace_in<'raw, 'table, 'control>(
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedConstantNamespace<'raw, 'table, 'control>, Error> {
+    prepare_core::<_, crate::value_type_table::resources::NoFactory>(
+        records,
+        types,
+        source_retained_bytes,
+        policy,
+        record_limits,
+        limits,
+        verifier,
+        Some(&mut |facts| admit(facts).map_err(Error::from)),
+        None,
+        None,
+        None,
+        work,
+    )
+}
+
+pub fn prepare_constant_namespace_with_creator_in<'raw, 'table, 'control, H>(
+    records: &'raw [wire::IpcConstantPool],
+    types: &'table DecodedTypeTable,
+    source_retained_bytes: usize,
+    source_metadata:Option<&novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>,
+    policy: ConstantPolicy,
+    record_limits: ConstantDecodeProjectionLimits,
+    limits: ConstantNamespaceProjectionLimits,
+    verifier: &VerifierOptions,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    admit: &mut dyn FnMut(
+        &ConstantNamespaceResourceFacts,
+    ) -> Result<(), crate::host_projection_v2::AdmissionRefusal<H>>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<
+    PreparedConstantNamespace<'raw, 'table, 'control>,
+    crate::host_projection_v2::ProjectionFailure<Error, H>,
+> {
+    creation.with_error_mapping(
+        crate::host_projection_v2::ProjectionFailure::Host,
+        |mapped| {
+            prepare_core::<_, crate::value_type_table::resources::NoFactory>(
+                records,
+                types,
+                source_retained_bytes,
+                policy,
+                record_limits,
+                limits,
+                verifier,
+                Some(&mut |facts| {
+                    admit(facts).map_err(|error| match error {
+                        crate::host_projection_v2::AdmissionRefusal::Control(cause) => cause.into(),
+                        crate::host_projection_v2::AdmissionRefusal::Host(error) => {
+                            crate::host_projection_v2::ProjectionFailure::Host(error)
+                        }
+                    })
+                }),
+                Some(NamespaceCreation {
+                    creation: mapped,
+                    metadata: source_metadata,
+                }),
+                None,
+                None,
+                work,
+            )
+        },
+    )
+}
+
+/// All-record preparation on the actual factory. The original reader model,
+/// source law, receiving profiles and cumulative parent gate are unchanged.
+pub fn prepare_constant_namespace_with_factory_in<
+    'raw,
+    'table,
+    'control,
+    H,
+    F: ValueSchemaCreationFactory<H>,
+>(
+    records: &'raw [wire::IpcConstantPool],
+    types: &'table DecodedTypeTable,
+    source_retained_bytes: usize,
+    source_metadata: Option<&novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>,
+    policy: ConstantPolicy,
+    record_limits: ConstantDecodeProjectionLimits,
+    limits: ConstantNamespaceProjectionLimits,
+    verifier: &VerifierOptions,
+    factory: &F,
+    admit: &mut dyn FnMut(
+        &ConstantNamespaceResourceFacts,
+    ) -> Result<(), crate::host_projection_v2::AdmissionRefusal<H>>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedConstantNamespace<'raw, 'table, 'control>, HostFailure<H>> {
+    let mapped = MappedNamespaceFactory {
+        factory,
+        marker: std::marker::PhantomData,
+    };
     prepare_core(
         records,
         types,
@@ -468,12 +965,15 @@ pub(crate) fn prepare_constant_namespace_in<'raw, 'table, 'control>(
         record_limits,
         limits,
         verifier,
-        Some(admit),
+        Some(&mut |facts| admit(facts).map_err(map_admission)),
+        None,
+        Some(&mapped),
+        source_metadata,
         work,
     )
 }
 
-fn prepare_core<'raw, 'table, 'control>(
+fn prepare_core<'raw, 'table, 'control, E: NamespaceFailure, F: ValueSchemaCreationFactory<E>>(
     records: &'raw [wire::IpcConstantPool],
     types: &'table DecodedTypeTable,
     source_retained_bytes: usize,
@@ -481,13 +981,16 @@ fn prepare_core<'raw, 'table, 'control>(
     record_limits: ConstantDecodeProjectionLimits,
     limits: ConstantNamespaceProjectionLimits,
     verifier: &VerifierOptions,
-    mut admit: Option<&mut Admit<'_>>,
+    mut admit: Option<&mut Admit<'_, E>>,
+    mut creation: Option<NamespaceCreation<'_, '_, E>>,
+    factory: Option<&F>,
+    source_metadata: Option<&novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>,
     work: &mut CompileCheckpoints<'control>,
-) -> Result<PreparedConstantNamespace<'raw, 'table, 'control>, Error> {
+) -> Result<PreparedConstantNamespace<'raw, 'table, 'control>, E> {
     (|| {
         let mut facts = if let Some(parent) = &mut admit {
             if !LOCKED_FAMILY || !LOCKED_TOOLCHAIN {
-                return Err(shape("constant namespace source model drift"));
+                return Err(shape("constant namespace source model drift").into());
             }
             let parts =
                 initial_parts(records.len()).map_err(|_| CompileControlError::ResourceExhausted)?;
@@ -519,16 +1022,109 @@ fn prepare_core<'raw, 'table, 'control>(
             work,
         )?;
         work.flush()?;
+        if let Some(creator) = creation.as_mut() {
+            let layout = Layout::array::<PreparedRecord<'_, '_, '_>>(records.len())
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            if layout.size() != 0 {
+                creator.creation.request_layout(layout)?;
+            }
+        }
+        let mut preparation_scope = if let Some(factory) = factory.filter(|_| !records.is_empty()) {
+            Some(
+                factory
+                    .begin_scope_observed(&mut |layout| {
+                        facts = with_namespace_temporary_layout(facts, layout)?;
+                        gate_parent(
+                            &facts,
+                            limits,
+                            admit.as_deref_mut().ok_or_else(|| {
+                                E::from(shape("constant namespace factory parent is absent"))
+                            })?,
+                        )
+                    })
+                    .map_err(|error| match error {
+                        ValueSchemaScopeBeginFailure::Observer(error) => error,
+                        ValueSchemaScopeBeginFailure::Creator(error) => error,
+                    })?,
+            )
+        } else {
+            None
+        };
+        if let Some(scope) = preparation_scope.as_mut() {
+            let layout = Layout::array::<PreparedRecord<'_, '_, '_>>(records.len())
+                .map_err(|_| CompileControlError::ResourceExhausted)?;
+            if layout.size() != 0 {
+                work.flush()?;
+                scope.request_layout(layout)?;
+            }
+        }
         let mut prepared = Vec::new();
         let reserved = prepared.try_reserve_exact(records.len());
         crate::allocation_exit_v2::reserve_exit::<Error>(reserved, work)?;
         for record in records {
+            if let Some(factory) = factory {
+                let base = facts;
+                let live_source = add(source_retained_bytes, facts.preparation_request_bytes)?;
+                let parent = admit
+                    .as_deref_mut()
+                    .ok_or_else(|| E::from(shape("constant namespace factory parent is absent")))?;
+                let mut completed = base;
+                let mut frozen = None;
+                record_sources_captured_observed(
+                    record,
+                    types,
+                    source_retained_bytes,
+                    &mut |value_type, field, work| {
+                        let reader = super::record_scopes::prepare_profile(
+                            record,
+                            value_type,
+                            field.field(),
+                            field.storage_lifetime(),
+                            source_metadata.ok_or_else(|| {
+                                E::from(shape(
+                                    "constant namespace factory source metadata is absent",
+                                ))
+                            })?,
+                            source_retained_bytes,
+                            live_source,
+                            Some((policy, record_limits, verifier)),
+                            factory,
+                            &mut |child| {
+                                completed = with_scoped_child(base, child)?;
+                                gate_parent(&completed, limits, parent)
+                                    .map_err(crate::host_projection_v2::ProjectionFailure::Host)
+                            },
+                            work,
+                        )
+                        .map_err(flatten_scoped_failure)?;
+                        let prepared = reader.construction_facts()?;
+                        frozen = Some((reader, prepared));
+                        Ok::<(), E>(())
+                    },
+                    work,
+                )?;
+                let (reader, receipt) = frozen.ok_or_else(|| {
+                    E::from(shape(
+                        "constant namespace factory record source was not captured",
+                    ))
+                })?;
+                facts = completed;
+                prepared.push(PreparedRecord {
+                    id: ConstantPoolId::new(record.id),
+                    reader: PreparedRecordReader::Scoped {
+                        reader,
+                        prepared: receipt,
+                    },
+                });
+                work.step()?;
+                continue;
+            }
             if let Some(parent) = &mut admit {
                 let base = facts;
                 let live_source = add(source_retained_bytes, facts.preparation_request_bytes)
                     .map_err(|_| CompileControlError::ResourceExhausted)?;
                 let mut snapshot = IpcReaderProgressFacts::default();
-                let reader = prepare_record_reader_in(
+                let (reader, source) = prepare_record_reader_observed(
                     record,
                     types,
                     source_retained_bytes,
@@ -554,6 +1150,7 @@ fn prepare_core<'raw, 'table, 'control>(
                             .max(progress.cumulative_library_work_upper_bound);
                         gate_parent(&with_child(base, &snapshot)?, limits, *parent)
                     },
+                    creation.as_mut(),
                     work,
                 )?;
                 let (geometry_bytes, geometry_count) = reader.geometry_requests();
@@ -567,7 +1164,8 @@ fn prepare_core<'raw, 'table, 'control>(
                 {
                     return Err(shape(
                         "constant reader complete projection omits an admitted preparation prefix",
-                    ));
+                    )
+                    .into());
                 }
                 snapshot.geometry_scratch_request_bytes = geometry_bytes;
                 snapshot.geometry_scratch_request_count = geometry_count;
@@ -578,7 +1176,7 @@ fn prepare_core<'raw, 'table, 'control>(
                 gate_parent(&facts, limits, *parent)?;
                 prepared.push(PreparedRecord {
                     id: ConstantPoolId::new(record.id),
-                    reader,
+                    reader: PreparedRecordReader::Original { reader, source },
                 });
                 work.step()?;
                 continue;
@@ -689,7 +1287,10 @@ fn prepare_core<'raw, 'table, 'control>(
             )?;
             prepared.push(PreparedRecord {
                 id: ConstantPoolId::new(record.id),
-                reader,
+                reader: PreparedRecordReader::Original {
+                    reader,
+                    source: None,
+                },
             });
             work.step()?;
         }
@@ -697,6 +1298,10 @@ fn prepare_core<'raw, 'table, 'control>(
             records: prepared,
             facts,
             control: work.control(),
+            preparation_storage: preparation_scope
+                .map(|scope| scope.storage_lifetime())
+                .unwrap_or_else(ValueTypeStorageLifetime::pure),
+            limits,
         })
     })()
 }
@@ -728,7 +1333,7 @@ pub fn decode_constant_namespace(
     .materialize()
 }
 
-fn prepare_record_reader_in<'raw, 'table, 'control>(
+fn prepare_record_reader_observed<'raw, 'table, 'control, E: NamespaceFailure>(
     record: &'raw wire::IpcConstantPool,
     types: &'table DecodedTypeTable,
     original_source: usize,
@@ -736,58 +1341,70 @@ fn prepare_record_reader_in<'raw, 'table, 'control>(
     policy: ConstantPolicy,
     limits: ConstantDecodeProjectionLimits,
     verifier: &VerifierOptions,
-    admit: &mut dyn FnMut(&IpcReaderProgressFacts) -> Result<(), CompileControlError>,
+    admit: &mut dyn FnMut(&IpcReaderProgressFacts) -> Result<(), E>,
+    mut creation: Option<&mut NamespaceCreation<'_, '_, E>>,
     work: &mut CompileCheckpoints<'control>,
-) -> Result<PreparedReader<'raw, 'table, 'control>, Error> {
+) -> Result<
+    (
+        PreparedReader<'raw, 'table, 'control>,
+        Option<novarocks_constant_contract::ConstantSourceOwner>,
+    ),
+    E,
+> {
     let mut reader = None;
-    record_sources_captured(
+    record_sources_captured_observed(
         record,
         types,
         original_source,
         &mut |value_type, field, work| {
-            reader = Some(if recursive(field.data_type()) {
-                let stream = preflight_recursive_constant_stream_in(
-                    &record.arrow_ipc,
-                    field,
-                    limits.recursive_stream,
-                    verifier,
-                    live_source,
-                    admit,
-                    work,
-                )?;
-                PreparedReader::Recursive(stream.prepare_pool_borrowed_in(
-                    Arc::clone(field),
+            let original_field = field.field();
+            let prepared = if let Some(creator) = creation.as_mut() {
+                let prepared = prepare_reader_from_sources_observed(
+                    record,
                     value_type,
+                    original_field,
                     live_source,
                     policy,
-                    limits.recursive_reader,
+                    limits,
+                    verifier,
                     admit,
+                    Some(&mut |layout| creator.creation.request_layout(layout)),
                     work,
-                )?)
+                )?;
+                let source =
+                    novarocks_constant_contract::ConstantSourceOwner::try_new_with_creator_in(
+                        original_field,
+                        creator.metadata.ok_or_else(||shape("constant source metadata is missing its original creator namespace"))?,
+                        original_source,
+                        field.storage_lifetime(),
+                        creator.creation,
+                        work,
+                    )
+                    .map_err(crate::ipc_flat_stream_v2::pool_resources::flatten_constant_failure)?;
+                (prepared, Some(source))
             } else {
-                let stream = preflight_flat_constant_stream_in(
-                    &record.arrow_ipc,
-                    field,
-                    limits.flat_stream,
-                    verifier,
-                    live_source,
-                    admit,
-                    work,
-                )?;
-                PreparedReader::Flat(stream.prepare_pool_borrowed_in(
-                    Arc::clone(field),
-                    value_type,
-                    live_source,
-                    policy,
-                    limits.flat_reader,
-                    admit,
-                    work,
-                )?)
-            });
-            Ok(())
+                (
+                    prepare_reader_from_sources_observed(
+                        record,
+                        value_type,
+                        original_field,
+                        live_source,
+                        policy,
+                        limits,
+                        verifier,
+                        admit,
+                        None,
+                        work,
+                    )?,
+                    None,
+                )
+            };
+            reader = Some(prepared);
+            Ok::<(), E>(())
         },
         work,
     )?;
-    reader
-        .ok_or_else(|| shape("constant reader was not prepared from its captured original sources"))
+    reader.ok_or_else(|| {
+        shape("constant reader was not prepared from its captured original sources").into()
+    })
 }

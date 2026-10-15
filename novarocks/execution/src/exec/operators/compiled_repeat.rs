@@ -27,22 +27,22 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array, new_null_array};
+use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, SchemaRef};
-use arrow::record_batch::RecordBatch;
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
 
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::fragment::ExecutionResult;
 use crate::runtime::runtime_state::RuntimeState;
 
 pub struct CompiledRepeatProcessorFactory {
     name: String,
     /// The frozen input port; channels are read by position.
     input: SchemaRef,
-    output: ChunkSchemaRef,
+    input_layout: novarocks_local_program::StaticLayout,
+    output_layout: novarocks_local_program::StaticLayout,
     /// Per grouping set, the input ordinals replaced by NULL.
     null_ordinals: Arc<[Vec<usize>]>,
     /// Per grouping set, the value of every GROUPING output in order.
@@ -90,7 +90,28 @@ impl CompiledRepeatProcessorFactory {
         }
         let input_fields = input_layout.schema().fields();
         let output_fields = output_layout.schema().fields();
-        for (input_field, output_field) in input_fields.iter().zip(output_fields.iter()) {
+        for (ordinal, (input_field, output_field)) in
+            input_fields.iter().zip(output_fields.iter()).enumerate()
+        {
+            if let (Some(input), Some(output)) = (
+                input_layout.value_binding_at(ordinal),
+                output_layout.value_binding_at(ordinal),
+            ) {
+                if (input.value_type().nullable() && !output.value_type().nullable())
+                    || !input
+                        .borrowed()
+                        .same_physical_binding_ignoring_root_nullability_observed(
+                            output.borrowed(),
+                            || Ok::<(), String>(()),
+                        )?
+                {
+                    return Err(invalid(
+                        "changes a passthrough channel's complete value binding",
+                    ));
+                }
+            } else if input_layout.is_typed() || output_layout.is_typed() {
+                return Err(invalid("is missing a passthrough value binding"));
+            }
             if input_field.data_type() != output_field.data_type() {
                 return Err(invalid("changes a passthrough channel type"));
             }
@@ -123,7 +144,8 @@ impl CompiledRepeatProcessorFactory {
         Ok(Self {
             name: format!("COMPILED_REPEAT (node={at})"),
             input: input_layout.schema().clone(),
-            output: ChunkSchema::from_compiled_layout(output_layout)?,
+            input_layout: input_layout.clone(),
+            output_layout: output_layout.clone(),
             null_ordinals: Arc::from(null_ordinals),
             grouping_values: Arc::from(grouping_values),
         })
@@ -139,7 +161,10 @@ impl OperatorFactory for CompiledRepeatProcessorFactory {
         Box::new(CompiledRepeatProcessor {
             name: self.name.clone(),
             input_schema: Arc::clone(&self.input),
-            output: Arc::clone(&self.output),
+            input_layout: self.input_layout.clone(),
+            output_layout: self.output_layout.clone(),
+            output: None,
+            construction: None,
             null_ordinals: Arc::clone(&self.null_ordinals),
             grouping_values: Arc::clone(&self.grouping_values),
             input: None,
@@ -153,36 +178,65 @@ impl OperatorFactory for CompiledRepeatProcessorFactory {
 struct CompiledRepeatProcessor {
     name: String,
     input_schema: SchemaRef,
-    output: ChunkSchemaRef,
+    input_layout: novarocks_local_program::StaticLayout,
+    output_layout: novarocks_local_program::StaticLayout,
+    output: Option<ChunkSchemaRef>,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     null_ordinals: Arc<[Vec<usize>]>,
     grouping_values: Arc<[Vec<i64>]>,
-    input: Option<RecordBatch>,
+    input: Option<ChunkBatchProjection>,
     next_set: usize,
     finishing: bool,
     finished: bool,
 }
 
 impl CompiledRepeatProcessor {
-    fn expand(&self, input: &RecordBatch, set: usize) -> ExecutionResult<Chunk> {
-        let rows = input.num_rows();
-        let fields = self.output.arrow_schema_ref();
-        let mut columns: Vec<ArrayRef> = input.columns().to_vec();
-        for &ordinal in &self.null_ordinals[set] {
-            columns[ordinal] = new_null_array(fields.field(ordinal).data_type(), rows);
-        }
-        for &value in &self.grouping_values[set] {
-            columns.push(Arc::new(Int64Array::from_value(value, rows)));
-        }
-        let batch = RecordBatch::try_new(fields, columns)
-            .map_err(|error| ExecutionFailure::from(format!("compiled Repeat output: {error}")))?;
-        Ok(Chunk::try_new_with_chunk_schema(
-            batch,
-            Arc::clone(&self.output),
-        )?)
+    fn prepared_output(&self) -> ExecutionResult<&ChunkSchemaRef> {
+        self.output.as_ref().ok_or_else(|| {
+            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into()
+        })
+    }
+    fn expand(&self, input: &Chunk, set: usize) -> ExecutionResult<Chunk> {
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        super::repeat_processor::repeat_output_columns_owned(
+            input,
+            self.prepared_output()?,
+            self.null_ordinals[set].iter().copied().map(Ok::<_, String>),
+            self.grouping_values[set]
+                .iter()
+                .copied()
+                .map(Ok::<_, String>),
+            factory.as_ref(),
+            |value, rows| Arc::new(Int64Array::from_value(value, rows)),
+        )
     }
 }
 
 impl Operator for CompiledRepeatProcessor {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.construction = Some(factory);
+    }
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        if self.output.is_some() {
+            return Ok(());
+        }
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        self.output = Some(factory.create_compiled_chunk_schema(&self.output_layout)?);
+        Ok(())
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -205,16 +259,28 @@ impl ProcessorOperator for CompiledRepeatProcessor {
         self.input.is_some()
     }
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+        self.prepared_output()?;
         if self.input.is_some() {
             return Err("compiled Repeat received input while expanding".into());
         }
         if chunk.is_empty() {
             return Ok(());
         }
-        if chunk.batch.schema().as_ref() != self.input_schema.as_ref() {
+        if chunk.record_batch().schema().as_ref() != self.input_schema.as_ref() {
             return Err("compiled Repeat input differs from its frozen input port".into());
         }
-        self.input = Some(chunk.batch);
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        super::repeat_processor::validate_repeat_input(
+            &chunk,
+            self.input_schema.as_ref(),
+            self.input_layout.slots(),
+            |ordinal| self.input_layout.value_binding_at(ordinal),
+            factory.as_ref(),
+        )?;
+        self.input = Some(chunk.into_batch_projection());
         self.next_set = 0;
         Ok(())
     }
@@ -225,7 +291,8 @@ impl ProcessorOperator for CompiledRepeatProcessor {
             }
             return Ok(None);
         };
-        let output = self.expand(input, self.next_set)?;
+        let source = input.clone().into_chunk();
+        let output = self.expand(&source, self.next_set)?;
         self.next_set += 1;
         if self.next_set == self.grouping_values.len() {
             self.input = None;
@@ -236,6 +303,7 @@ impl ProcessorOperator for CompiledRepeatProcessor {
         Ok(Some(output))
     }
     fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+        self.prepared_output()?;
         self.finishing = true;
         if self.input.is_none() {
             self.finished = true;

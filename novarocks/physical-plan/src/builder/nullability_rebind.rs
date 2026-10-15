@@ -534,14 +534,7 @@ fn exact_type(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), NullabilityRebindError> {
     work.step()?;
-    if a.nullable != b.nullable
-        || a.logical_type != b.logical_type
-        || !arrow_data_types_exact_borrowed_observed::<NullabilityRebindError>(
-            &a.data_type,
-            &b.data_type,
-            || work.step().map_err(NullabilityRebindError::from),
-        )?
-    {
+    if !a.exactly_equals_observed(b, || work.step().map_err(NullabilityRebindError::from))? {
         return Err(NullabilityRebindError::Association(
             "earlier full type differs from its actual construction definition",
         ));
@@ -554,11 +547,11 @@ fn root_admission(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), NullabilityRebindError> {
     work.step()?;
-    if a.nullable && !b.nullable
-        || a.logical_type != b.logical_type
+    if (a.nullable() && !b.nullable())
+        || !a.same_value_domain_observed(b, || work.step().map_err(NullabilityRebindError::from))?
         || !arrow_data_types_exact_borrowed_observed::<NullabilityRebindError>(
-            &a.data_type,
-            &b.data_type,
+            a.data_type(),
+            b.data_type(),
             || work.step().map_err(NullabilityRebindError::from),
         )?
     {

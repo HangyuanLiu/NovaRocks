@@ -64,7 +64,7 @@ fn function(volatility: FunctionVolatility) -> BoundFunction {
         function_id: FunctionId::try_new("fixture/guarantee/boolean").unwrap(),
         overload: FunctionOverloadId::try_new("fixture/guarantee/boolean/zero").unwrap(),
         kind: FunctionKind::Scalar,
-        argument_types: Box::default(),
+        argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::default()),
         result_type: ty(DataType::Boolean, false),
         legacy_metadata: Some(crate::LegacyBindingMetadata {
             volatility,
@@ -166,6 +166,7 @@ fn fixture_uses_and_calls(fragment: &Fragment) -> (PhysicalRootUses, FrozenFragm
             };
             assert_eq!(function.function_id.as_str(), "fixture/guarantee/boolean");
             Some(FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,

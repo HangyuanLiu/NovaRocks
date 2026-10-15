@@ -65,21 +65,16 @@ fn id(hi: i64, lo: i64) -> common::UniqueId {
 }
 
 fn scalar_type(prim: common::PrimitiveType) -> common::TypeDesc {
-    common::TypeDesc {
-        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-            r#type: prim as i32,
-            len: None,
-            precision: None,
-            scale: None,
-            time_unit: None,
-            time_zone: None,
-        })),
-    }
+    super::common::scalar_ref(prim, false)
 }
 
 fn column_expr(column_id: u32, name: &str) -> expr::Expr {
     expr::Expr {
-        r#type: Some(scalar_type(common::PrimitiveType::Bigint)),
+        original_definition_id: None,
+        r#type: Some(super::common::scalar_ref(
+            common::PrimitiveType::Bigint,
+            true,
+        )),
         nullable: true,
         kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
             column_id,
@@ -91,6 +86,7 @@ fn column_expr(column_id: u32, name: &str) -> expr::Expr {
 
 fn literal_bool(value: bool) -> expr::Expr {
     expr::Expr {
+        original_definition_id: None,
         r#type: Some(scalar_type(common::PrimitiveType::Boolean)),
         nullable: false,
         kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
@@ -223,6 +219,10 @@ fn release_stream_plan_fragment() -> plan::PlanFragment {
 
 fn release_plan_fragment() -> plan::PlanFragment {
     plan::PlanFragment {
+        expression_control: None,
+        frozen_calls: None,
+        semantic_parameters: None,
+        writer_semantic_parameters: None,
         fragment_id: 1,
         root: Some(plan::DistributedNode {
             node_id: 10,
@@ -251,7 +251,6 @@ fn release_plan_fragment() -> plan::PlanFragment {
                                     data_type: Some(scalar_type(common::PrimitiveType::Bigint)),
                                     nullable: false,
                                     write_default_json: None,
-                                    logical_type: None,
                                 }],
                                 iceberg_row_lineage_metadata_columns: vec![],
                                 source: None,
@@ -276,6 +275,7 @@ fn release_plan_fragment() -> plan::PlanFragment {
                     children: vec![],
                     payload: Some(plan::distributed_node::Payload::Exchange(
                         plan::ExchangeReceiver {
+                            original_edge_id: None,
                             partition_type: plan::PartitionType::Hash as i32,
                             partition_exprs: vec![column_expr(1, "l_orderkey")],
                             source_fragment_id: 2,
@@ -326,6 +326,10 @@ fn release_plan_fragment() -> plan::PlanFragment {
             fragment_id: 1,
             bindings: vec![],
         }),
+        execution_types: Some(super::common::scalar_table()),
+        original_call_requests: None,
+        constants: vec![],
+        constant_source_fields: None,
     }
 }
 
@@ -421,13 +425,16 @@ fn release_fetch_result_response() -> novarocks::FetchResultResponse {
 
 fn release_expr() -> expr::Expr {
     expr::Expr {
+        original_definition_id: None,
         r#type: Some(scalar_type(common::PrimitiveType::Boolean)),
         nullable: false,
         kind: Some(expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+            allow_throw_exception: None,
             decimal_overflow_policy: expr::DecimalOverflowPolicy::Unspecified as i32,
             op: expr::BinaryOp::Gt as i32,
             left: Some(Box::new(column_expr(1, "l_orderkey"))),
             right: Some(Box::new(expr::Expr {
+                original_definition_id: None,
                 r#type: Some(scalar_type(common::PrimitiveType::Bigint)),
                 nullable: false,
                 kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
@@ -650,7 +657,23 @@ fn release_fetch_result_response_fixture_decodes() {
 
 #[test]
 fn release_plan_and_expr_fixtures_decode() {
-    let fragment: plan::PlanFragment = decode_fixture("PlanFragment", PLAN_FRAGMENT_FIXTURE_HEX);
+    // Historical wire bytes still decode unknown retired tags, but cannot
+    // supply the mandatory reference or the owning type namespace.
+    let legacy: plan::PlanFragment = decode_fixture("PlanFragment", PLAN_FRAGMENT_FIXTURE_HEX);
+    assert!(legacy.execution_types.is_none());
+    assert!(
+        super::common::binding_from_ref(
+            legacy.output_columns[0].r#type.as_ref().unwrap(),
+            &super::common::scalar_table()
+        )
+        .is_err()
+    );
+    let fragment: plan::PlanFragment =
+        plan::PlanFragment::decode(release_plan_fragment().encode_to_vec().as_slice()).unwrap();
+    assert_eq!(
+        fragment.execution_types.as_ref(),
+        Some(&super::common::scalar_table())
+    );
     assert_eq!(fragment.fragment_id, 1);
     let root = fragment.root.expect("PlanFragment fixture root");
     assert_eq!(root.node_id, 10);
@@ -679,7 +702,29 @@ fn release_plan_and_expr_fixtures_decode() {
     );
     assert_eq!(root.children.len(), 2);
 
-    let expression: expr::Expr = decode_fixture("Expr", EXPR_FIXTURE_HEX);
+    let legacy_expression: expr::Expr = decode_fixture("Expr", EXPR_FIXTURE_HEX);
+    assert_eq!(
+        legacy_expression.r#type.as_ref().unwrap().value_binding_id,
+        None
+    );
+    assert!(
+        super::common::binding_from_ref(
+            legacy_expression.r#type.as_ref().unwrap(),
+            &super::common::scalar_table()
+        )
+        .is_err()
+    );
+    let expression: expr::Expr =
+        expr::Expr::decode(release_expr().encode_to_vec().as_slice()).unwrap();
+    assert_eq!(
+        super::common::scalar_from_ref(
+            expression.r#type.as_ref().unwrap(),
+            &super::common::scalar_table(),
+            expression.nullable
+        )
+        .unwrap(),
+        common::PrimitiveType::Boolean as i32
+    );
     let binary = match expression.kind.as_ref() {
         Some(expr::expr::Kind::BinaryOp(binary)) => binary,
         other => panic!("Expr fixture kind expected BinaryOp, got {other:?}"),

@@ -141,13 +141,45 @@ fn actual_arrow_ipc_dictionary_root_reassigns_id_but_keeps_order_metadata_and_va
     assert!(!arrow_fields_exact(source.field(), &field));
     assert_eq!(utf8_at(output.column(0), 0), "beta");
     assert_eq!(utf8_at(output.column(0), 1), "alpha");
+    let dictionary = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<DictionaryArray<Int8Type>>()
+        .unwrap();
+    assert_eq!(dictionary.keys().values().as_ref(), &[1, 0]);
+    let values = dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(values.len(), 2);
+    assert_eq!(values.value(0), "alpha");
+    assert_eq!(values.value(1), "beta");
     let decoded = pool(field, output.column(0).clone());
+    assert_eq!(source.field().dict_id(), Some(-99));
+    assert_eq!(source.field().dict_is_ordered(), Some(true));
+    assert_eq!(decoded.field().dict_id(), Some(0));
+    assert_eq!(source.value_type(), decoded.value_type());
+    assert_eq!(source.value_type().data_type(), &DataType::Utf8);
+    for row in 0..2 {
+        assert!(
+            source
+                .value(row)
+                .unwrap()
+                .equals_observed(
+                    &decoded.value(row).unwrap(),
+                    CompilePhase::Validate,
+                    &TestControl
+                )
+                .unwrap()
+        );
+    }
     assert!(
         !source
             .value(0)
             .unwrap()
             .equals_observed(
-                &decoded.value(0).unwrap(),
+                &decoded.value(1).unwrap(),
                 CompilePhase::Validate,
                 &TestControl
             )
@@ -193,15 +225,63 @@ fn actual_arrow_ipc_dictionary_shared_authored_id_keeps_independent_struct_value
     assert_eq!(utf8_at(structure.column(0), 1), "left-one");
     assert_eq!(utf8_at(structure.column(1), 0), "right-one");
     assert_eq!(utf8_at(structure.column(1), 1), "right-zero");
-    let DataType::Struct(authored) = &source.value_type().data_type else {
+    let DataType::Struct(authored) = source.field().data_type() else {
         panic!("actual source is Struct")
     };
     assert_eq!(authored[0].dict_id(), Some(9));
     assert_eq!(authored[1].dict_id(), Some(9));
+    assert_eq!(authored[0].dict_is_ordered(), Some(true));
+    assert_eq!(authored[1].dict_is_ordered(), Some(true));
+    assert_eq!(fields[0].metadata(), authored[0].metadata());
+    assert_eq!(fields[1].metadata(), authored[1].metadata());
+    for (column, keys, expected_values) in [
+        (0, [0, 1], ["left-zero", "left-one"]),
+        (1, [1, 0], ["right-zero", "right-one"]),
+    ] {
+        let dictionary = structure
+            .column(column)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
+            .unwrap();
+        assert_eq!(dictionary.keys().values().as_ref(), &keys);
+        let values = dictionary
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.len(), expected_values.len());
+        for (row, expected) in expected_values.into_iter().enumerate() {
+            assert_eq!(values.value(row), expected);
+        }
+    }
+    let DataType::Struct(normalized) = source.value_type().data_type() else {
+        panic!("complete value layout is Struct")
+    };
+    for field in normalized {
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        assert_eq!(field.dict_id(), None);
+        assert_eq!(field.dict_is_ordered(), None);
+        assert_eq!(field.metadata().capacity(), 0);
+    }
     assert!(!arrow_fields_exact(
         source.field(),
         output.schema().field(0)
     ));
+    let decoded = pool(output.schema().field(0).clone(), output.column(0).clone());
+    assert_eq!(source.value_type(), decoded.value_type());
+    for row in 0..2 {
+        assert!(
+            source
+                .value(row)
+                .unwrap()
+                .equals_observed(
+                    &decoded.value(row).unwrap(),
+                    CompilePhase::Validate,
+                    &TestControl
+                )
+                .unwrap()
+        );
+    }
 }
 
 #[test]

@@ -23,7 +23,7 @@
 //! Expansion/Arrow retained memory and opaque allocation are still OPEN.
 
 use super::compiled_expression::RuntimeKernelControl;
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{FinishingWait, Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
@@ -45,7 +45,7 @@ pub(crate) struct CompiledGenerateSeriesProcessorFactory {
     name: String,
     input: SchemaRef,
     parameters: Arc<[usize]>,
-    output: ChunkSchemaRef,
+    output_layout: novarocks_local_program::StaticLayout,
     error: Arc<RuntimeErrorState>,
 }
 impl CompiledGenerateSeriesProcessorFactory {
@@ -93,12 +93,12 @@ impl CompiledGenerateSeriesProcessorFactory {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let output = ChunkSchema::from_compiled_layout(graph_node.output_layout())?;
+        let output_layout = graph_node.output_layout().clone();
         Ok(Self {
             name: format!("COMPILED_GENERATE_SERIES (node={})", node.index()),
             input: layout.schema().clone(),
             parameters: Arc::from(parameters),
-            output,
+            output_layout,
             error,
         })
     }
@@ -110,7 +110,9 @@ impl CompiledGenerateSeriesProcessorFactory {
             name: self.name.clone(),
             input: Arc::clone(&self.input),
             parameters: Arc::clone(&self.parameters),
-            output: Arc::clone(&self.output),
+            output_layout: self.output_layout.clone(),
+            output: None,
+            construction: None,
             control,
             pending: None,
             offset: 0,
@@ -163,7 +165,9 @@ struct CompiledGenerateSeriesProcessor {
     name: String,
     input: SchemaRef,
     parameters: Arc<[usize]>,
-    output: ChunkSchemaRef,
+    output_layout: novarocks_local_program::StaticLayout,
+    output: Option<ChunkSchemaRef>,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     control: Arc<dyn KernelEvaluationControl>,
     pending: Option<Chunk>,
     offset: usize,
@@ -172,14 +176,20 @@ struct CompiledGenerateSeriesProcessor {
     failed: bool,
 }
 impl CompiledGenerateSeriesProcessor {
+    fn prepared_output(&self) -> ExecutionResult<&ChunkSchemaRef> {
+        self.output.as_ref().ok_or_else(|| {
+            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into()
+        })
+    }
     fn invoke(&self, chunk: &Chunk) -> ExecutionResult<Option<Chunk>> {
+        let output_schema = self.prepared_output()?;
         let mut work = Work::begin(self.control.as_ref())?;
         if chunk.len() != 1 || chunk.schema().as_ref() != self.input.as_ref() {
             return Err(invalid(
                 "compiled series input differs from its frozen bounds port",
             ));
         }
-        let batch = &chunk.batch;
+        let batch = chunk.record_batch();
         let start = batch.column(self.parameters[0]);
         let stop = batch.column(self.parameters[1]);
         let step = self.parameters.get(2).map(|ordinal| batch.column(*ordinal));
@@ -196,7 +206,11 @@ impl CompiledGenerateSeriesProcessor {
             work.flush()?;
             return Ok(None);
         }
-        let data_type = self.output.arrow_schema_ref().field(0).data_type().clone();
+        let data_type = output_schema
+            .arrow_schema_ref()
+            .field(0)
+            .data_type()
+            .clone();
         let column = generate_series_core::result_column_observed(
             expanded.values,
             &[data_type],
@@ -208,11 +222,30 @@ impl CompiledGenerateSeriesProcessor {
             Err(SeriesFailure::Data(message)) => return Err(message.into()),
         };
         work.flush()?;
-        let batch = RecordBatch::try_new(self.output.arrow_schema_ref(), vec![column])
-            .map_err(|error| ExecutionFailure::from(error.to_string()))?;
-        work.flush()?;
-        let output = Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.output))
-            .map_err(ExecutionFailure::from)?;
+        let output = if output_schema.is_typed() {
+            use crate::exec::pipeline::operator::ConstructionFailure;
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?;
+            let owner = factory.begin_typed_construction(output_schema)?;
+            owner.observe(
+                0,
+                &[],
+                crate::exec::chunk::ArrayNormalizationStep::CreateChunkColumns { channels: 1 },
+            )?;
+            Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+                Arc::clone(output_schema),
+                vec![column],
+                expanded.total_rows,
+                owner.storage_lifetime(),
+                |step| owner.observe(0, &[], step),
+            )?
+        } else {
+            let batch = RecordBatch::try_new(output_schema.arrow_schema_ref(), vec![column])
+                .map_err(|error| ExecutionFailure::from(error.to_string()))?;
+            Chunk::try_new_with_chunk_schema(batch, Arc::clone(output_schema))?
+        };
         work.flush()?;
         Ok(Some(output))
     }
@@ -225,6 +258,39 @@ impl CompiledGenerateSeriesProcessor {
     }
 }
 impl Operator for CompiledGenerateSeriesProcessor {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.construction = Some(factory);
+    }
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        self.alive()?;
+        if self.output.is_some() {
+            return Ok(());
+        }
+        let result = (|| -> ExecutionResult<ChunkSchemaRef> {
+            use crate::exec::pipeline::operator::ConstructionFailure;
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?;
+            Ok(factory.create_compiled_chunk_schema(&self.output_layout)?)
+        })();
+        match result {
+            Ok(output) => {
+                self.output = Some(output);
+                Ok(())
+            }
+            Err(cause) => {
+                self.failed = true;
+                Err(cause)
+            }
+        }
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -251,6 +317,7 @@ impl ProcessorOperator for CompiledGenerateSeriesProcessor {
     }
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         self.alive()?;
+        self.prepared_output()?;
         if self.accepted || self.finishing {
             self.failed = true;
             return Err(invalid("compiled series accepts its bounds port once"));
@@ -280,7 +347,33 @@ impl ProcessorOperator for CompiledGenerateSeriesProcessor {
         };
         let total = chunk.len();
         let rows = state.chunk_size().max(1).min(total - self.offset);
-        let output = chunk.slice(self.offset, rows);
+        let sliced = (|| -> ExecutionResult<Chunk> {
+            let output = if chunk.chunk_schema().is_typed() {
+                use crate::exec::pipeline::operator::ConstructionFailure;
+                let factory = self
+                    .construction
+                    .as_ref()
+                    .ok_or(ConstructionFailure::MissingOwner)?;
+                let owner = factory.begin_input_construction(chunk)?;
+                chunk.slice_typed_observed::<ConstructionFailure, _>(
+                    self.offset,
+                    rows,
+                    owner.storage_lifetime(),
+                    |step| owner.observe(0, &[], step),
+                )?
+            } else {
+                chunk.slice(self.offset, rows)
+            };
+            Ok(output)
+        })();
+        let output = match sliced {
+            Ok(output) => output,
+            Err(cause) => {
+                self.failed = true;
+                self.pending = None;
+                return Err(cause);
+            }
+        };
         if let Err(cause) = self.control.checkpoint(0) {
             self.failed = true;
             self.pending = None;

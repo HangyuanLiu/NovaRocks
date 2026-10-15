@@ -59,8 +59,8 @@ fn check(mode: SqlPhysicalEmissionMode) {
                     panic!("real selected value argument")
                 };
                 assert_eq!(value_type, bound);
-                assert_eq!(bound.logical_type, ValueLogicalType::Physical);
-                assert_eq!(bound.data_type, DataType::Utf8);
+                assert_eq!(bound.logical_type(), ValueLogicalType::Physical);
+                assert_eq!(bound.data_type().clone(), DataType::Utf8);
                 assert_eq!(&fragment.expressions().get(*child).unwrap().ty, bound);
             }
             assert_eq!(node.ty, function.result_type);

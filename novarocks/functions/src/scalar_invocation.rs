@@ -81,6 +81,16 @@ pub trait PureInvocationScalarImplementation:
         contract: Arc<ScalarCallContract>,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Arc<dyn PreparedInvocationScalarKernel>, KernelFailure>;
+    fn prepare_invocation_scalar_checked(
+        &self,
+        _input: CallEffectInput<'_>,
+        _checked: &crate::CheckedCallEffectInput<'_>,
+        _contract: Arc<ScalarCallContract>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Arc<dyn PreparedInvocationScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>>
+    {
+        Err(crate::CheckedOwnerFailure::UnconvertedOwner)
+    }
 }
 #[derive(Debug)]
 pub struct InvocationScalarSpecialization {
@@ -125,20 +135,94 @@ fn specialize_invocation_scalar_once<O: PureInvocationScalarImplementation + ?Si
     arguments: ScopedExpressionEffects,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<InvocationScalarSpecialization, FunctionSpecializationFailure> {
-    let (receipt, effects) = crate::specialization::refine_once_for_specialization(
-        owner, input, frozen, arguments, control,
-    )?;
+    specialize_invocation_scalar_once_core(
+        owner,
+        input,
+        selected,
+        frozen,
+        arguments,
+        control,
+        |arguments| {
+            crate::specialization::refine_once_for_specialization(
+                owner, input, frozen, arguments, control,
+            )
+        },
+        |contract| {
+            owner
+                .prepare_invocation_scalar(input, contract, control)
+                .map_err(FunctionSpecializationFailure::Kernel)
+        },
+    )
+}
+
+pub(crate) fn specialize_invocation_scalar_once_checked<
+    O: PureInvocationScalarImplementation + ?Sized,
+>(
+    owner: &O,
+    checked: &crate::CheckedCallEffectInput<'_>,
+    input: CallEffectInput<'_>,
+    selected: Arc<FunctionBindingSelection>,
+    frozen: Option<&novarocks_type_contract::CallEffects>,
+    arguments: ScopedExpressionEffects,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<InvocationScalarSpecialization, crate::CheckedOwnerFailure<FunctionSpecializationFailure>>
+{
+    specialize_invocation_scalar_once_core(
+        owner,
+        input,
+        selected,
+        frozen,
+        arguments,
+        control,
+        |arguments| {
+            crate::specialization::refine_once_checked(
+                owner, checked, input, frozen, arguments, control,
+            )
+        },
+        |contract| {
+            owner
+                .prepare_invocation_scalar_checked(input, checked, contract, control)
+                .map_err(|error| match error {
+                    crate::CheckedOwnerFailure::Original(error) => {
+                        crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::Kernel(
+                            error,
+                        ))
+                    }
+                    crate::CheckedOwnerFailure::UnconvertedOwner => {
+                        crate::CheckedOwnerFailure::UnconvertedOwner
+                    }
+                })
+        },
+    )
+}
+
+fn specialize_invocation_scalar_once_core<
+    'a,
+    O: PureInvocationScalarImplementation + ?Sized,
+    E: From<FunctionSpecializationFailure>,
+>(
+    _owner: &O,
+    input: CallEffectInput<'a>,
+    selected: Arc<FunctionBindingSelection>,
+    _frozen: Option<&novarocks_type_contract::CallEffects>,
+    arguments: ScopedExpressionEffects,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+    refine: impl FnOnce(
+        ScopedExpressionEffects,
+    ) -> Result<(crate::RefinedCallEffects<'a>, ScopedExpressionEffects), E>,
+    prepare: impl FnOnce(Arc<ScalarCallContract>) -> Result<Arc<dyn PreparedInvocationScalarKernel>, E>,
+) -> Result<InvocationScalarSpecialization, E> {
+    let (receipt, effects) = refine(arguments)?;
     let contract = Arc::new(
         ScalarCallContract::from_refined_invocation(input, &receipt, selected, control)
             .map_err(FunctionSpecializationFailure::Kernel)?,
     );
-    let prepared = owner
-        .prepare_invocation_scalar(input, contract.clone(), control)
-        .map_err(FunctionSpecializationFailure::Kernel)?;
+    let prepared = prepare(contract.clone())?;
     if !Arc::ptr_eq(prepared.contract(), &contract) {
         return Err(FunctionSpecializationFailure::Kernel(internal(
             "scalar preparation replaced its exact immutable contract",
-        )));
+        ))
+        .into());
     }
     // The typed ABI is the sole own-invocation failure capability author.
     // No names, input value probes, or row-error refinement classify it.

@@ -39,73 +39,13 @@ message Status {
   string message = 2;  // human-readable detail when code != 0
 }
 
-// Recursive SQL type descriptor. Replaces the flat thrift TTypeDesc node array
-// (thrift lacked recursion; proto does not). Mirrors the SQL primitive type set,
-// NOT raw Arrow -- Arrow cannot distinguish JSON vs VARCHAR, HLL vs VARBINARY.
-// Owner: produced by future FE/native encode conversion layer and consumed by
-// future BE/native prepare conversion layer. Planner/exec must not import
-// generated proto directly.
+// Complete value binding in the explicit fragment or runtime-filter domain
+// owner's ExecutionTypeTable. Generated DTOs stay at the native boundary.
 message TypeDesc {
-  oneof kind {
-    ScalarType scalar = 1;  // scalar SQL type
-    ListType list = 2;      // list SQL type
-    MapType map = 3;        // map SQL type
-    StructType strct = 4;   // struct SQL type
-  }
-}
-
-// Scalar SQL type descriptor.
-// Owner: produced by future FE/native encode conversion layer and consumed by
-// future BE/native prepare conversion layer. Planner/exec must not import
-// generated proto directly.
-message ScalarType {
-  PrimitiveType type = 1;   // primitive SQL type
-  optional int32 len = 2;        // CHAR / VARCHAR length
-  optional int32 precision = 3;  // DECIMAL precision
-  optional int32 scale = 4;      // DECIMAL scale
-  // DATETIME time unit. Accepted values are unset or 2 for microseconds, and 3
-  // for nanoseconds, mirroring src/types/arrow_thrift.rs. Conversion boundaries
-  // must reject any other value.
-  optional int32 time_unit = 5;
-  // DATETIME time zone. Present exactly when the engine's timestamp carries
-  // one, and then it is the zone verbatim. A timestamp with a zone and one
-  // without are different types, so dropping this would silently rewrite a
-  // column's type across the process boundary.
-  optional string time_zone = 6;
-}
-
-// List SQL type descriptor.
-// Owner: produced by future FE/native encode conversion layer and consumed by
-// future BE/native prepare conversion layer. Planner/exec must not import
-// generated proto directly.
-message ListType {
-  TypeDesc element = 1;  // element type
-}
-
-// Map SQL type descriptor.
-// Owner: produced by future FE/native encode conversion layer and consumed by
-// future BE/native prepare conversion layer. Planner/exec must not import
-// generated proto directly.
-message MapType {
-  TypeDesc key = 1;    // key type
-  TypeDesc value = 2;  // value type
-}
-
-// Struct SQL type descriptor.
-// Owner: produced by future FE/native encode conversion layer and consumed by
-// future BE/native prepare conversion layer. Planner/exec must not import
-// generated proto directly.
-message StructType {
-  repeated StructField fields = 1;  // ordered struct fields
-}
-
-// Named field inside a struct SQL type.
-// Owner: produced by future FE/native encode conversion layer and consumed by
-// future BE/native prepare conversion layer. Planner/exec must not import
-// generated proto directly.
-message StructField {
-  string name = 1;    // field name
-  TypeDesc type = 2;  // field type
+  reserved 1, 2, 3, 4;
+  reserved "scalar", "list", "map", "strct";
+  // Presence is required; zero is a valid ID. Inline type inference is forbidden.
+  optional uint32 value_binding_id = 5;
 }
 
 // SQL primitive type set (mirrors the TPrimitiveType subset NovaRocks maps in
@@ -184,4 +124,11 @@ message OutputColumn {
   TypeDesc type = 3;     // output column SQL type
   bool nullable = 4;     // true when output column can be NULL
   bool is_internal = 5;  // true when column is engine-internal
+}
+
+// Shared aggregate state owner contract; no executable capability.
+enum AggregateStateArgumentContract {
+  AGGREGATE_STATE_ARGUMENT_CONTRACT_UNSPECIFIED = 0;
+  AGGREGATE_STATE_ARGUMENT_CONTRACT_EXACT_SIGNATURE = 1;
+  AGGREGATE_STATE_ARGUMENT_CONTRACT_VALUE_ROOT_NULLABILITY_INDEPENDENT = 2;
 }

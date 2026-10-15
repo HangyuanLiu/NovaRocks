@@ -43,6 +43,7 @@ pub mod aggregate_types;
 pub mod approx_percentile_aggregate_core;
 pub mod approx_percentile_core;
 mod arithmetic;
+pub mod array_projection;
 mod binding;
 pub mod bit_array;
 pub mod bit_numeric;
@@ -73,6 +74,7 @@ mod exact_installed_owner_selection_tests;
 mod exact_overload_selection_tests;
 pub mod exact_percentile_core;
 pub mod exact_percentile_failure;
+mod frozen_writer_preparation;
 pub mod generate_series_core;
 mod higher_order_call;
 mod higher_order_kernel;
@@ -83,6 +85,7 @@ mod kernel_input;
 mod lambda_rows;
 pub mod largeint;
 pub mod largeint_text;
+mod logical_null;
 pub mod math_numeric;
 pub mod opaque_memory;
 pub mod parse_json_core;
@@ -91,6 +94,14 @@ pub mod pattern_memo;
 pub mod percentile_hash_core;
 pub mod percentile_input;
 mod pure_catalogue;
+#[cfg(test)]
+mod test_value_ingress;
+pub use frozen_writer_preparation::{
+    FrozenWriterAggregatePreparation, prepare_frozen_writer_aggregate,
+    prepare_frozen_writer_aggregate_with_creator_in,
+    prepare_frozen_writer_aggregate_with_empty_order_keys,
+    prepare_frozen_writer_aggregate_with_empty_order_keys_and_creator_in,
+};
 mod scalar_kernel;
 pub mod selected_copy;
 pub mod sketch_hash;
@@ -124,7 +135,8 @@ pub use kernel_input::{
 };
 pub use lambda_rows::*;
 pub use novarocks_constant_contract::{
-    ConstantError, ConstantPolicy, ConstantPool, ConstantResourceFacts, ConstantValue,
+    ConstantCreationFailure, ConstantError, ConstantOwnerResourceFacts, ConstantPolicy,
+    ConstantPool, ConstantResourceFacts, ConstantValue,
 };
 pub use novarocks_type_contract::{
     AggregateStateArgumentContract, AggregateStateFormatId as AggregateStateFormatIdentity,
@@ -337,8 +349,29 @@ impl ResolvedAggregateSignature {
     }
 }
 
+/// Borrowed construction facts from the same exact aggregate family author.
+/// The loan is temporary. It neither grants capacity nor owns a selected binding.
+#[derive(Clone, Copy)]
+pub struct AggregateUpdateSignatureRecipe<'a> {
+    pub original: &'a AggregateOverloadDeclaration,
+    pub argument_types: &'a [DataType],
+    pub intermediate_type: &'a DataType,
+    pub output_type: &'a DataType,
+}
+
 /// Safe parametric aggregate signature resolver.
 pub trait AggregateSignatureResolver: Send + Sync {
+    /// Optional scoped-construction loan from the original fixed-overload author.
+    /// None is an explicit staging boundary; callers must not run pure resolution
+    /// after it. Full value-domain validation still precedes this loan.
+    fn borrow_update_signature<'a>(
+        &'a self,
+        _selected_overload: &str,
+        _arguments: &'a [FunctionValueType],
+    ) -> Result<Option<AggregateUpdateSignatureRecipe<'a>>, FunctionResolutionError> {
+        Ok(None)
+    }
+
     /// Declare the complete value domains admitted by this family before any
     /// carrier-only kernel signature is materialized.
     fn validate_value_arguments(
@@ -349,7 +382,7 @@ pub trait AggregateSignatureResolver: Send + Sync {
             argument
                 .validate()
                 .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?;
-            if argument.logical_type != novarocks_type_contract::ValueLogicalType::Physical {
+            if argument.logical_type() != novarocks_type_contract::ValueLogicalType::Physical {
                 return Err(FunctionResolutionError::BadSignature(
                     "aggregate family does not declare this root logical identity".into(),
                 ));
@@ -711,6 +744,17 @@ pub enum AggregateStateMemoryPolicy {
 /// type may itself be an enum when overloads use different state shapes; that
 /// choice remains private to the contributor and never becomes a raw ABI.
 pub trait TypedAggregateFamily: Send + Sync + 'static {
+    /// Optional scoped-construction loan from the original fixed-overload author.
+    /// None is an explicit staging boundary; callers must not run pure resolution
+    /// after it. Full value-domain validation still precedes this loan.
+    fn borrow_update_signature<'a>(
+        &'a self,
+        _selected_overload: &str,
+        _arguments: &'a [FunctionValueType],
+    ) -> Result<Option<AggregateUpdateSignatureRecipe<'a>>, FunctionResolutionError> {
+        Ok(None)
+    }
+
     type Kernel: TypedAggregateKernel;
     type PrepareError: fmt::Display + Send + Sync + 'static;
 
@@ -724,7 +768,7 @@ pub trait TypedAggregateFamily: Send + Sync + 'static {
             argument
                 .validate()
                 .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?;
-            if argument.logical_type != novarocks_type_contract::ValueLogicalType::Physical {
+            if argument.logical_type() != novarocks_type_contract::ValueLogicalType::Physical {
                 return Err(FunctionResolutionError::BadSignature(
                     "aggregate family does not declare this root logical identity".into(),
                 ));
@@ -895,6 +939,15 @@ struct TypedFamilySignatureResolver<F> {
 }
 
 impl<F: TypedAggregateFamily> AggregateSignatureResolver for TypedFamilySignatureResolver<F> {
+    fn borrow_update_signature<'a>(
+        &'a self,
+        selected_overload: &str,
+        arguments: &'a [FunctionValueType],
+    ) -> Result<Option<AggregateUpdateSignatureRecipe<'a>>, FunctionResolutionError> {
+        self.family
+            .borrow_update_signature(selected_overload, arguments)
+    }
+
     fn validate_value_arguments(
         &self,
         argument_types: &[novarocks_type_contract::FunctionValueType],
@@ -2703,7 +2756,7 @@ pub use native_between::*;
 pub mod integral_decimal128;
 
 pub mod native_inlist;
-pub use native_inlist::PreparedNativeInListRecipe;
+pub use native_inlist::{NativeInListCreationFailure, PreparedNativeInListRecipe};
 
 pub mod hll_hash_core;
 
@@ -2743,7 +2796,9 @@ pub mod window_input_order;
 pub use window_invocation_data::WindowInvocationScope;
 
 mod array_backing_geometry;
-pub use arrow_result_custody::{SourceBackingOwner, retain_source_backing};
+pub use arrow_result_custody::{
+    SourceBackingOwner, preflight_buffer_adoption_structure, retain_source_backing,
+};
 
 pub mod string_repeat_pad_core;
 
@@ -2758,3 +2813,8 @@ pub mod approx_top_k_core;
 
 #[cfg(test)]
 mod common_type_m07_contract_tests;
+
+pub mod arrow_ipc_construction;
+pub mod arrow_sort_construction;
+
+pub use array_backing_geometry::source_metadata_bytes_observed;

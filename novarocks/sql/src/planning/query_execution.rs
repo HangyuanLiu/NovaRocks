@@ -201,12 +201,12 @@ pub fn pinned_version_resolved_analyzer_table(
 /// schema as any synthetic source; the file set itself never enters SQL.
 pub fn pinned_file_set_resolved_analyzer_table(
     identity: &FrozenConnectorScanIdentity,
-    input_schema: SchemaRef,
+    columns: Vec<novarocks_types::schema::ColumnDef>,
     binding: SqlTableBindingId,
 ) -> ResolvedAnalyzerTable {
-    synthetic_resolved_analyzer_table(
+    synthetic_resolved_analyzer_table_from_columns(
         identity,
-        input_schema,
+        columns,
         binding,
         crate::planner::table::SqlScanKind::PinnedFileSet,
     )
@@ -218,12 +218,12 @@ pub fn pinned_file_set_resolved_analyzer_table(
 /// itself never enters SQL.
 pub fn table_execute_resolved_analyzer_table(
     identity: &FrozenConnectorScanIdentity,
-    input_schema: SchemaRef,
+    columns: Vec<novarocks_types::schema::ColumnDef>,
     binding: SqlTableBindingId,
 ) -> ResolvedAnalyzerTable {
-    synthetic_resolved_analyzer_table(
+    synthetic_resolved_analyzer_table_from_columns(
         identity,
-        input_schema,
+        columns,
         binding,
         crate::planner::table::SqlScanKind::TableExecute,
     )
@@ -236,6 +236,15 @@ fn synthetic_resolved_analyzer_table(
     kind: crate::planner::table::SqlScanKind,
 ) -> ResolvedAnalyzerTable {
     let columns = column_defs(&input_schema);
+    synthetic_resolved_analyzer_table_from_columns(identity, columns, binding, kind)
+}
+
+fn synthetic_resolved_analyzer_table_from_columns(
+    identity: &FrozenConnectorScanIdentity,
+    columns: Vec<novarocks_types::schema::ColumnDef>,
+    binding: SqlTableBindingId,
+    kind: crate::planner::table::SqlScanKind,
+) -> ResolvedAnalyzerTable {
     let planner_identity = identity.planner_identity();
     ResolvedAnalyzerTable::from_planner(
         Some(identity.catalog()),
@@ -302,12 +311,12 @@ pub fn build_frozen_connector_scan_plan(
 /// a pinned file set.  The physical tree stays opaque outside SQL.
 pub fn build_pinned_file_set_scan_plan(
     identity: &FrozenConnectorScanIdentity,
-    input_schema: &SchemaRef,
+    input_columns: &[novarocks_types::schema::ColumnDef],
     binding: SqlTableBindingId,
-) -> FrozenConnectorScanPlan {
-    build_synthetic_scan_plan(
+) -> Result<FrozenConnectorScanPlan, String> {
+    build_synthetic_scan_plan_from_columns(
         identity,
-        input_schema,
+        input_columns,
         binding,
         crate::planner::table::SqlScanKind::PinnedFileSet,
     )
@@ -318,12 +327,12 @@ pub fn build_pinned_file_set_scan_plan(
 /// outside SQL.
 pub fn build_table_execute_scan_plan(
     identity: &FrozenConnectorScanIdentity,
-    input_schema: &SchemaRef,
+    input_columns: &[novarocks_types::schema::ColumnDef],
     binding: SqlTableBindingId,
-) -> FrozenConnectorScanPlan {
-    build_synthetic_scan_plan(
+) -> Result<FrozenConnectorScanPlan, String> {
+    build_synthetic_scan_plan_from_columns(
         identity,
-        input_schema,
+        input_columns,
         binding,
         crate::planner::table::SqlScanKind::TableExecute,
     )
@@ -336,29 +345,69 @@ fn build_synthetic_scan_plan(
     kind: crate::planner::table::SqlScanKind,
 ) -> FrozenConnectorScanPlan {
     let mut factory = ColumnRefFactory::new();
-    let mut output_columns = Vec::with_capacity(input_schema.fields().len());
-    for field in input_schema.fields() {
-        output_columns.push(OutputColumn {
-            column_id: factory.create(
-                None,
-                field.name().to_string(),
-                novarocks_type_contract::FunctionValueType::new(
-                    field.data_type().clone(),
-                    field.is_nullable(),
-                ),
-            ),
-            name: field.name().to_string(),
-            value_type: novarocks_type_contract::FunctionValueType::new(
+    let output_columns = input_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let value_type = novarocks_type_contract::FunctionValueType::new(
                 field.data_type().clone(),
                 field.is_nullable(),
-            ),
+            );
+            OutputColumn {
+                column_id: factory.create(None, field.name().clone(), value_type.clone()),
+                name: field.name().clone(),
+                value_type,
+                is_internal: false,
+            }
+        })
+        .collect();
+    finish_synthetic_scan_plan(
+        identity,
+        column_defs(input_schema),
+        output_columns,
+        binding,
+        kind,
+    )
+}
 
+fn build_synthetic_scan_plan_from_columns(
+    identity: &FrozenConnectorScanIdentity,
+    input_columns: &[novarocks_types::schema::ColumnDef],
+    binding: SqlTableBindingId,
+    kind: crate::planner::table::SqlScanKind,
+) -> Result<FrozenConnectorScanPlan, String> {
+    let mut factory = ColumnRefFactory::new();
+    let mut output_columns = Vec::with_capacity(input_columns.len());
+    for column in input_columns {
+        let value_type = column
+            .declared_value_type()
+            .map_err(|error| error.to_string())?;
+        output_columns.push(OutputColumn {
+            column_id: factory.create(None, column.name.clone(), value_type.clone()),
+            name: column.name.clone(),
+            value_type,
             is_internal: false,
         });
     }
+    Ok(finish_synthetic_scan_plan(
+        identity,
+        input_columns.to_vec(),
+        output_columns,
+        binding,
+        kind,
+    ))
+}
+
+fn finish_synthetic_scan_plan(
+    identity: &FrozenConnectorScanIdentity,
+    columns: Vec<novarocks_types::schema::ColumnDef>,
+    output_columns: Vec<OutputColumn>,
+    binding: SqlTableBindingId,
+    kind: crate::planner::table::SqlScanKind,
+) -> FrozenConnectorScanPlan {
     let table = crate::planner::table::TableDef {
         name: identity.table().to_string(),
-        columns: column_defs(input_schema),
+        columns,
         iceberg_row_lineage_metadata_columns: Vec::new(),
         source: crate::planner::table::ScanSource::Sql(crate::planner::table::SqlScanSource::new(
             binding,

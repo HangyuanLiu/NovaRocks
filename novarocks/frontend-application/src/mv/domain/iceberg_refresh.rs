@@ -19,6 +19,7 @@
 //! current Iceberg catalog. Aggregate shapes are accepted at CREATE time for
 //! target schema and contract persistence; refresh execution is gated later.
 
+use crate::connector::schema_creation::FrontendSchemaLoad;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -438,6 +439,7 @@ impl IcebergMvCreateProviderAdapter {
         &self,
         staged: &crate::mv::domain::staged_create::StagedMvCreateTarget,
         target: &IcebergMvTarget,
+        columns: &[TableColumnDef],
     ) -> Result<novarocks_spi::connector::ConnectorStagedWriteProof, MvCreateProviderError> {
         let host = self
             .ports
@@ -471,7 +473,7 @@ impl IcebergMvCreateProviderAdapter {
                 // The session writes no rows, but it still describes the
                 // shape of the target it is opened on.
                 input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
-                    fields: staged_target_write_fields(staged)?,
+                    fields: staged_target_write_fields(staged, columns)?,
                 },
                 base: None,
                 flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::StagedCreate(
@@ -686,7 +688,8 @@ impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
                 prepared_target,
             )
             .map_err(engine_target_error)?;
-            let write = self.seal_empty_staged_write(target, &prepared.target)?;
+            let write =
+                self.seal_empty_staged_write(target, &prepared.target, &prepared.columns)?;
             (documents, write)
         };
         let target = self.take_staged_target(&prepared, staged)?;
@@ -1151,28 +1154,61 @@ fn prepare_iceberg_mv_create_with_ports(
     })
 }
 
-/// The declared shape of an invisible staged target, from the provider's own
-/// prepared field bindings.
+/// The original CREATE declaration supplies execution semantics. The exact
+/// staged provider bindings independently fix field order, names and NULL.
 fn staged_target_write_fields(
     staged: &crate::mv::domain::staged_create::StagedMvCreateTarget,
+    columns: &[TableColumnDef],
 ) -> Result<Vec<novarocks_spi::connector::ConnectorWriteFieldRequest>, MvCreateProviderError> {
     let prepared = staged.handle().document_target().ok_or_else(|| {
         engine_target_error(
             "staged MV CREATE target carries no prepared document binding".to_string(),
         )
     })?;
+    if prepared.fields().len() != columns.len() {
+        return Err(engine_target_error(
+            "MV staged target declaration arity changed".to_string(),
+        ));
+    }
     prepared
         .fields()
         .iter()
-        .map(|field| {
-            let data_type =
-                crate::mv::domain::rewrite::context::arrow_type_from_contract_signature(
-                    field.type_signature(),
-                )
+        .enumerate()
+        .map(|(ordinal, field)| {
+            let declaration = columns
+                .get(field.request_ordinal() as usize)
+                .ok_or_else(|| {
+                    engine_target_error("MV staged target request ordinal is absent".to_string())
+                })?;
+            if field.request_ordinal() as usize != ordinal
+                || field.name() != declaration.name
+                || field.nullable() != declaration.nullable
+            {
+                return Err(engine_target_error(
+                    "MV staged target declaration changed".to_string(),
+                ));
+            }
+            let data_type = novarocks_sql::literal::sql_type_to_arrow_type(&declaration.data_type)
                 .map_err(engine_target_error)?;
-            Ok(novarocks_spi::connector::ConnectorWriteFieldRequest::new(
-                arrow::datatypes::Field::new(field.name(), data_type, field.nullable()),
-            ))
+            let binding = novarocks_types::execution_value_type_from_declaration(
+                &declaration.data_type,
+                &data_type,
+                declaration.nullable,
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            )
+            .map_err(|error| engine_target_error(error.to_string()))?;
+            let value_type =
+                novarocks_type_contract::FunctionValueType::try_from_typed_binding(binding)
+                    .map_err(|error| engine_target_error(error.to_string()))?;
+            novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                arrow::datatypes::Field::new(
+                    field.name(),
+                    value_type.data_type().clone(),
+                    field.nullable(),
+                ),
+                value_type,
+            )
+            .map_err(|error| engine_target_error(error.to_string()))
         })
         .collect()
 }
@@ -1266,10 +1302,8 @@ fn ensure_mv_create_target_absent_with_connector_control(
         );
     }
     let instance_id = lease.binding().descriptor().instance_id.clone();
-    match lease
-        .binding()
-        .metadata()
-        .load_table(novarocks_spi::connector::ConnectorTableRequest {
+    match lease.binding().metadata().load_frontend_table(
+        novarocks_spi::connector::ConnectorTableRequest {
             table: novarocks_spi::connector::ConnectorTableIdentity {
                 instance_id,
                 namespace: Arc::from(target.namespace.as_str()),
@@ -1277,7 +1311,8 @@ fn ensure_mv_create_target_absent_with_connector_control(
             },
             resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
             context: connector_context.clone(),
-        }) {
+        },
+    ) {
         Ok(_) => Err(format!(
             "Iceberg MV target table {}.{}.{} already exists",
             target.catalog, target.namespace, target.table
@@ -1867,7 +1902,7 @@ pub fn reobserve_and_project_iceberg_mv_with_ports(
     let metadata = lease
         .binding()
         .metadata()
-        .load_table(novarocks_spi::connector::ConnectorTableRequest {
+        .load_frontend_table(novarocks_spi::connector::ConnectorTableRequest {
             table,
             resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
             context: connector_context.clone(),

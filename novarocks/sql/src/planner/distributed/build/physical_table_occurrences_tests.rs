@@ -124,7 +124,7 @@ impl Fixture {
         let catalog = build_builtin_engine_function_catalog().unwrap();
         let mut pools = ConstantPools::empty();
         if sources.iter().any(|s| matches!(s, Source::Pool)) {
-            let DataType::List(field) = &types[0].data_type else {
+            let DataType::List(field) = &types[0].data_type() else {
                 panic!("list")
             };
             let array = ListArray::new(
@@ -262,7 +262,11 @@ impl Fixture {
             panic!("relation")
         };
         if bad_result {
-            result_types[0] = ty(DataType::Int32, true);
+            let mut changed = result_types.to_vec();
+            changed[0] = ty(DataType::Int32, true);
+            result_types = novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                changed.into_boxed_slice(),
+            );
         }
         let function = BoundTableFunction {
             function_id: resolved.function_id,

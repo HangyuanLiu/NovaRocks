@@ -130,7 +130,10 @@ fn parametric_binding_loan_retains_the_original_fixed_author_and_control() {
     let definition = catalog.definition_by_id(&id()).unwrap();
     let cloned = definition.clone();
     let author = definition.binding_resolver().unwrap();
-    assert!(Arc::ptr_eq(author, cloned.binding_resolver().unwrap()));
+    assert!(same_resolver_owner(
+        author,
+        cloned.binding_resolver().unwrap()
+    ));
     let args = [argument(DataType::Int64, true)];
     let overload = FunctionOverloadId::try_new(LEFT).unwrap();
     let control = Trace::default();
@@ -173,7 +176,7 @@ fn id() -> FunctionId {
 }
 fn argument(ty: DataType, nullable: bool) -> FunctionArgument {
     FunctionArgument::Value {
-        value_type: FunctionValueType::new(ty, nullable),
+        value_type: FunctionValueType::from_legacy_declared_projection(ty, nullable),
         constant: None,
     }
 }
@@ -420,21 +423,27 @@ fn parametric_exact_validation_rejects_full_selected_contract_drift() {
     let selected = select(&catalog, LEFT, &args, &Trace::default()).unwrap();
     let mut variants = Vec::new();
     let mut changed = (*selected).clone();
-    let FunctionArgumentType::Value(ty) = &mut changed.argument_types[0] else {
+    let mut arguments = changed.argument_types.as_slice().to_vec();
+    let FunctionArgumentType::Value(ty) = &mut arguments[0] else {
         unreachable!()
     };
-    ty.nullable = false;
+    *ty = ty
+        .with_nullable(false)
+        .expect("valid function nullability declaration");
+    changed.argument_types = novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+        arguments.into_boxed_slice(),
+    );
     variants.push(changed);
     let mut changed = (*selected).clone();
     changed.result_type = FunctionResultType::Scalar(FunctionValueType::new(DataType::Int64, true));
     variants.push(changed);
     let mut changed = (*selected).clone();
-    changed
-        .aggregate
-        .as_mut()
-        .unwrap()
-        .intermediate_type
-        .nullable = true;
+    {
+        let intermediate = &mut changed.aggregate.as_mut().unwrap().intermediate_type;
+        *intermediate = intermediate
+            .with_nullable(true)
+            .expect("valid function nullability declaration");
+    }
     variants.push(changed);
     let mut changed = (*selected).clone();
     changed.aggregate.as_mut().unwrap().state_format =
@@ -941,4 +950,88 @@ fn parametric_state_law_preserves_ordinary_tail_and_original_author_control_with
         invalid,
         Err(FunctionCatalogError::InvalidStableIdentity { .. })
     ));
+}
+
+#[test]
+fn fixed_binding_carrier_shares_actual_author_and_keeps_field_prefix() {
+    let catalogue = crate::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
+    let cloned = catalogue.clone();
+    let rebuilt = crate::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
+    for name in ["abs", "field"] {
+        let original = catalogue
+            .definition(name, FunctionKind::Scalar)
+            .unwrap()
+            .binding_resolver()
+            .unwrap();
+        let loan = cloned
+            .definition(name, FunctionKind::Scalar)
+            .unwrap()
+            .binding_resolver()
+            .unwrap();
+        let independent = rebuilt
+            .definition(name, FunctionKind::Scalar)
+            .unwrap()
+            .binding_resolver()
+            .unwrap();
+        assert!(same_resolver_owner(original, loan));
+        assert!(!same_resolver_owner(original, independent));
+    }
+    let args = [
+        argument(DataType::Int64, false),
+        argument(DataType::Int64, false),
+    ];
+    let selected = catalogue
+        .resolve_bound_user(
+            "field",
+            FunctionKind::Scalar,
+            request(&args),
+            &Trace::default(),
+        )
+        .unwrap();
+    let original = catalogue
+        .definition("field", FunctionKind::Scalar)
+        .unwrap()
+        .binding_resolver()
+        .unwrap();
+    // The real FIELD wrapper checks its logical arity before entering its
+    // fixed scalar delegate. Merely loaning the nested core would lose this.
+    let wrong = FunctionBindingRequest {
+        logical_argument_count: 1,
+        ..request(&args)
+    };
+    let baseline = Trace::default();
+    let failure = original
+        .validate_selected(&selected.selected, wrong, &baseline)
+        .unwrap_err();
+    assert!(
+        matches!(&failure, FunctionBindingError::InvalidBinding(message) if message.contains("field unsupported argument shape (1 total)"))
+    );
+    assert_eq!(
+        *baseline.calls.lock().unwrap(),
+        [(CompilePhase::FunctionSpecialization, 0)]
+    );
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let stop = Trace {
+            calls: Mutex::new(Vec::new()),
+            stop: Some((1, cause)),
+        };
+        assert!(
+            matches!(original.validate_selected(&selected.selected,wrong,&stop), Err(FunctionBindingError::Control(actual)) if actual==cause)
+        );
+        assert_eq!(*stop.calls.lock().unwrap(), *baseline.calls.lock().unwrap());
+    }
+    original
+        .validate_selected(&selected.selected, request(&args), &Trace::default())
+        .unwrap();
+}
+
+fn same_resolver_owner(
+    left: &FunctionBindingResolverOwner,
+    right: &FunctionBindingResolverOwner,
+) -> bool {
+    std::ptr::addr_eq(left.as_ref(), right.as_ref())
 }

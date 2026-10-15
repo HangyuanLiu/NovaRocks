@@ -361,8 +361,11 @@ mod plan_tests {
         };
         assert_eq!(node.output_columns.len(), 1);
         assert_eq!(node.output_columns[0].name, "x");
-        assert_eq!(node.output_columns[0].value_type.data_type, DataType::Int32);
-        assert!(!node.output_columns[0].value_type.nullable);
+        assert_eq!(
+            node.output_columns[0].value_type.data_type().clone(),
+            DataType::Int32
+        );
+        assert!(!node.output_columns[0].value_type.nullable());
     }
 
     #[test]

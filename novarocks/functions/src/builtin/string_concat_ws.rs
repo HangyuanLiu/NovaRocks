@@ -88,7 +88,7 @@ fn selected_text<'a>(
     let is_null = values.is_null(row);
     work.step()?;
     if is_null {
-        if !source.nullable {
+        if !source.nullable() {
             return Err(internal(
                 "concat_ws non-null source contains selected SQL NULL",
             ));
@@ -162,9 +162,9 @@ pub(super) fn evaluate_string_concat_ws<'a>(
         let target = input.contract().result_type();
         if input.arguments().len() < 2
             || selected.argument_types.len() != input.arguments().len()
-            || target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
+            || target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Utf8
+            || !target.nullable()
         {
             return Err(invalid(
                 "concat_ws differs from its installed variadic Utf8 profile",
@@ -174,8 +174,8 @@ pub(super) fn evaluate_string_concat_ws<'a>(
             let FunctionArgumentType::Value(source) = ty else {
                 return Err(invalid("concat_ws requires only checked value arguments"));
             };
-            let exact = source.logical_type == ValueLogicalType::Physical
-                && source.data_type == DataType::Utf8;
+            let exact = source.logical_type() == ValueLogicalType::Physical
+                && source.data_type() == &DataType::Utf8;
             work.step()?;
             if !exact {
                 return Err(invalid(
@@ -264,7 +264,7 @@ pub(super) fn evaluate_string_concat_ws<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

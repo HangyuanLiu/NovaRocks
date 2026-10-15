@@ -56,11 +56,11 @@ pub(super) fn evaluate_sec_to_time<'a>(
             ));
         };
         let target = input.target;
-        if source.logical_type != ValueLogicalType::Physical
-            || source.data_type != DataType::Int64
-            || target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
+        if source.logical_type() != ValueLogicalType::Physical
+            || source.data_type() != &DataType::Int64
+            || target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Utf8
+            || !target.nullable()
         {
             return Err(invalid(
                 "sec_to_time differs from its exact Int64 to nullable Utf8 profile",
@@ -98,7 +98,7 @@ pub(super) fn evaluate_sec_to_time<'a>(
                 return Err(internal("sec_to_time selected row is out of bounds"));
             }
             let value = if values.is_null(row) {
-                if !source.nullable {
+                if !source.nullable() {
                     return Err(internal("sec_to_time non-null source contains SQL NULL"));
                 }
                 None
@@ -116,7 +116,7 @@ pub(super) fn evaluate_sec_to_time<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

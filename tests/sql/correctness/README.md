@@ -213,3 +213,21 @@ UEA-4G 的额外原生验收入口是 system scenario `connector/iceberg-delete-
 当前阶段不维护 delete 性能对照，旧performance场景和脚本已退出。有限 warm/concurrent 行袋与旧/latest snapshot读取由 `connector/iceberg-delete-warm-concurrent` 承担；cold多文件/split/page-source性质仍由显式 `connector/iceberg-delete-applicability` 承担，不能以warm结果替代。两者都要求真实输入和退出；供给与消费分离，见 [system指南](../../system-test-runner/README.md)。
 
 三套数据集正确性共用正常runner入口和原native生命周期；准备/READY/check-only/失败差异/清理命令见 [SQL入口](../README.md)。每周完整轮次当前由领域维护者手工执行，自动调度尚未交付；未运行不记PASS。
+
+## 递归执行类型与 schema 交接
+
+此类变更的长期合同见 [ADR-0176](../../../docs/adr/ADR-0176-recursive-execution-types-and-independent-storage-ownership.md)，API 见 [执行类型指南](../../../docs/guides/development/typed-execution-types.md)。SQL 用例维护用户结果与错误；creator 报价、首因和最后引用退出由对应 Rust owner-local 测试维护，不向 SQL runner 添加类型作者或资源内部断言。
+
+可按行为面选择现有用例：
+
+| 行为 | suite / case | 验证内容 |
+|---|---|---|
+| 嵌套领域 | complex-type / json_list_semantic_schema | List 子节点 JSON 领域穿过 SQL、表达式与结果出口 |
+| 命名结构 | complex-type / complex_struct_union_field_order | Struct/Union 字段顺序与命名语义 |
+| 聚合领域 | aggregate / array_agg_json_semantic_schema；opaque_result_domain_handoff | collection 子节点与 opaque 结果领域交接 |
+| 字典 | low-cardinality / null_roundtrip；agg_collection_string_dict_semantics | 编码适配后的值和 NULL，不使用字典编号充当值身份 |
+| NULL 保证 | join / join_left_outer_null_fill；join_full_outer_null_fill | 公开声明反映实际 NULL 扩展，root 精确校验 |
+| 外部字段 | iceberg-ddl / schema_evolution_nested；schema_evolution_reorder | provider 字段身份与演进，不把来源属性当执行类型 |
+| 写入往返 | iceberg-dml / variant_insert；variant_mutations | 原 target/source 事实及完整领域读回 |
+
+涉及冻结 wire、跨 BE exchange 或真实退出时使用现有 `--cluster-mode cross-process --cluster-size 3` 路径；需要 REST/MinIO/Spark 的用例消费原 fixture publication。纯语义或 creator/refusal 的问题优先在所属 crate 验证。实际 case 发现数以 runner 当前发现为准，零命中不算通过；上述示例不代替所属变更冻结的完整必跑集合。

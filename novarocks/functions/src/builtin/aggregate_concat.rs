@@ -214,7 +214,7 @@ impl PreparedAggregateKernel for ConcatKernel {
                 .merge_row(
                     state,
                     address,
-                    &self.contract.intermediate_type().data_type,
+                    self.contract.intermediate_type().data_type(),
                     &mut scalar_work,
                 )
                 .map_err(ScalarStateError::into_kernel_failure)
@@ -235,7 +235,7 @@ impl PreparedAggregateKernel for ConcatKernel {
         observed(control, |work| {
             let states = checked_states(states, work)?;
             core::build_intermediate_array(
-                &self.contract.intermediate_type().data_type,
+                self.contract.intermediate_type().data_type(),
                 states.iter().copied(),
                 &mut ScalarWork::new(Some(work)),
             )
@@ -253,7 +253,7 @@ impl PreparedAggregateKernel for ConcatKernel {
         observed(control, |work| {
             let states = checked_states(states, work)?;
             core::build_final_array(
-                &self.contract.intermediate_type().data_type,
+                self.contract.intermediate_type().data_type(),
                 states.iter().copied(),
                 self.contract
                     .state_interpretation()
@@ -310,37 +310,47 @@ pub(super) fn validate_contract(
         };
         // The legacy scalar codec reads the exact carrier independently of
         // logical annotations; binding retains those annotations unchanged.
-        if !super::aggregate_any_value::supported(&value.data_type, work)? {
+        if !super::aggregate_any_value::supported(value.data_type(), work)? {
             return Err(invalid(&format!(
                 "group_concat has no installed scalar profile for {:?}",
-                value.data_type
+                value.data_type()
             )));
         }
-        if index == count - 1 && value.data_type != DataType::Utf8 {
+        if index == count - 1 && value.data_type() != &DataType::Utf8 {
             return Err(invalid(
                 "group_concat requires the canonical UTF8 separator",
             ));
         }
     }
-    let expected_types: Vec<_> = arguments
-        .iter()
-        .map(|value| {
-            let FunctionArgumentType::Value(value) = value else {
+    // Exact selected field metadata is retained; only original codec shape is validated.
+    let fields = core::validate_intermediate_type(contract.intermediate_type().data_type())
+        .map_err(|error| invalid(&error))?;
+    let mut actual_types =
+        core::intermediate_arg_types_borrowed(contract.intermediate_type().data_type())
+            .map_err(|error| invalid(&error))?;
+    let exact_channels = if fields.len() != arguments.len() {
+        false
+    } else {
+        let mut same = true;
+        for (actual, argument) in actual_types.by_ref().zip(arguments.iter()) {
+            let FunctionArgumentType::Value(expected) = argument else {
                 unreachable!("checked value channels")
             };
-            value.data_type.clone()
-        })
-        .collect();
-    // Exact selected field metadata is retained; only original codec shape is validated.
-    let fields = core::validate_intermediate_type(&contract.intermediate_type().data_type)
-        .map_err(|error| invalid(&error))?;
-    let actual_types = core::intermediate_arg_types(&contract.intermediate_type().data_type)
-        .map_err(|error| invalid(&error))?;
-    if fields.len() != arguments.len()
-        || actual_types != expected_types
-        || !contract.intermediate_type().nullable
-        || contract.final_type().data_type != DataType::Utf8
-        || !contract.final_type().nullable
+            if !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+                actual,
+                expected.data_type(),
+                || work.step().map_err(compile_failure),
+            )? {
+                same = false;
+                break;
+            }
+        }
+        same
+    };
+    if !exact_channels
+        || !contract.intermediate_type().nullable()
+        || contract.final_type().data_type() != &DataType::Utf8
+        || !contract.final_type().nullable()
     {
         return Err(invalid(
             "group_concat selected result or intermediate differs from its exact nullable UTF8 and STRUCT<ARRAY> state",

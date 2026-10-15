@@ -41,7 +41,7 @@ fn by_window_source_custody_actual_chunk_charge_survives_last_buffer_loan() {
     let input_tracker = MemTracker::new_child("original input", &query);
     let wrap_tracker = MemTracker::new_child("actual wrapping host", &query);
     let original = owned_source(&input_tracker);
-    let array = Arc::clone(original.batch.column(X));
+    let array = Arc::clone(original.record_batch().column(X));
     let stock = input_tracker.current();
     assert!(stock > 0);
     let mut control = RuntimeKernelControl::new(Arc::new(RuntimeErrorState::default()));

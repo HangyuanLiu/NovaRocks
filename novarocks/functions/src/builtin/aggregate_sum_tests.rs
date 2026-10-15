@@ -281,7 +281,7 @@ fn two_phase(
         partial.update(part)?;
         // A partial emission never range-checks the exact sum.
         let state = partial.emit()?;
-        assert_eq!(state.data_type(), &fixture.state.data_type);
+        assert_eq!(state.data_type(), fixture.state.data_type());
         states.push(state);
     }
     let mut last = Group::new(fixture.handle(AggregateKernelPhase::Final));
@@ -366,13 +366,13 @@ fn sum_types_follow_the_exact_ruling_for_every_input_domain() {
         ),
     ] {
         let fixture = Fixture::new(
-            FunctionValueType::new(source.clone(), true),
+            FunctionValueType::from_legacy_declared_projection(source.clone(), true),
             DecimalOverflowPolicy::ReportError,
         );
-        assert_eq!(fixture.result().data_type, result, "{source:?}");
-        assert!(fixture.result().nullable);
-        assert_eq!(fixture.state.data_type, state, "{source:?}");
-        assert!(fixture.state.nullable);
+        assert_eq!(fixture.result().data_type().clone(), result, "{source:?}");
+        assert!(fixture.result().nullable());
+        assert_eq!(fixture.state.data_type().clone(), state, "{source:?}");
+        assert!(fixture.state.nullable());
         for phase in [
             AggregateKernelPhase::Single,
             AggregateKernelPhase::Partial,

@@ -581,8 +581,29 @@ fn recursive_sparse_metadata_invoice_and_k_work_refuse_before_constant_preflight
 }
 
 #[test]
-fn recursive_long_metadata_key_comparisons_preserve_every_original_control_prefix() {
-    let (array, field) = metadata_struct(20, false);
+fn recursive_actual_long_source_names_preserve_every_original_control_prefix() {
+    // Source maps are opaque bounded library work. The actual Rust walk
+    // compares source names, so give its real sort long common-prefix names.
+    let fields = (0..20)
+        .map(|index| {
+            Arc::new(
+                Field::new(
+                    format!("{}{:04}", "n".repeat(1020), index),
+                    DataType::Int32,
+                    true,
+                )
+                .with_metadata(HashMap::from([(
+                    "source.attribute".into(),
+                    "retained".into(),
+                )])),
+            )
+        })
+        .collect::<Vec<_>>();
+    let arrays = (0..20)
+        .map(|_| Arc::new(Int32Array::from(vec![Some(7), None])) as ArrayRef)
+        .collect::<Vec<_>>();
+    let array: ArrayRef = Arc::new(StructArray::new(fields.into(), arrays, None));
+    let field = Field::new("root", array.data_type().clone(), true);
     let (metadata, body) = encoded(array, &field);
     let checked = geometry(&metadata, &body, &field);
     let input = input(&field, &metadata, &body, &checked);

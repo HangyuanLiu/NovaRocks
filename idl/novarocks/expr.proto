@@ -24,6 +24,9 @@ syntax = "proto3";
 package novarocks.expr;
 
 import "common.proto";
+import "call_request.proto";
+import "physical_package_v2.proto";
+import "physical_semantics_v2.proto";
 
 // Typed scalar expression tree node.
 // Owner: produced by the future FE/native plan encoder and consumed by the
@@ -31,6 +34,8 @@ import "common.proto";
 message Expr {
   novarocks.common.TypeDesc type = 1;  // SQL type of this expression node.
   bool nullable = 2;                   // true when this expression can return NULL.
+  // Original definition identity; invocation/use identity remains separate.
+  optional uint32 original_definition_id = 3;
   oneof kind {
     ColumnRef column_ref = 10;            // column reference by ColumnId.
     LiteralExpr literal = 11;             // scalar literal.
@@ -49,6 +54,9 @@ message Expr {
     LambdaParamRef lambda_param_ref = 24; // lambda parameter reference.
     LambdaExpr lambda = 25;               // lambda body and parameter bindings.
     NestedExpr nested = 26;               // parenthesized expression wrapper.
+    // Strong PlanTree literals borrow the enclosing fragment's admitted pool.
+    // The complete Expr.type independently names that same owner's FVT.
+    novarocks.call_request.ConstantReference constant_reference = 27;
     // ExprKind::SubqueryPlaceholder is intentionally absent: subqueries are
     // decorrelated before codegen; BE prepare must fail fast if one reaches it.
   }
@@ -86,6 +94,8 @@ message BinaryOpExpr {
   Expr left = 2;    // left operand.
   Expr right = 3;   // right operand.
   DecimalOverflowPolicy decimal_overflow_policy = 4; // mandatory frozen expression policy.
+  // Required for arithmetic; absent for other original operators.
+  novarocks.physical_semantics_v2.SemanticParameterRef allow_throw_exception = 5;
 }
 
 // Unary operator expression.
@@ -103,6 +113,9 @@ message FunctionCall {
   string function_name = 1;  // scalar function registry name.
   repeated Expr args = 2;    // call arguments in source order.
   bool distinct = 3;         // true for DISTINCT calls when supported.
+  // Exact signature in the enclosing execution-binding namespace.
+  novarocks.physical_package_v2.FunctionBindingDefinition frozen_binding = 4;
+  optional uint32 original_request_id = 5;
 }
 
 // Aggregate function call identified by function name, not opcode.
@@ -135,6 +148,7 @@ message CastExpr {
   Expr operand = 1;                         // expression being cast.
   novarocks.common.TypeDesc target = 2;     // target SQL type.
   DecimalOverflowPolicy decimal_overflow_policy = 3; // mandatory frozen expression policy.
+  novarocks.physical_semantics_v2.SemanticParameterRef allow_throw_exception = 4;
 }
 
 // IS NULL / IS NOT NULL predicate.

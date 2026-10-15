@@ -250,6 +250,22 @@ fn assert_fresh(owner: &SqlAuthoredPhysicalPlan, expected: (usize, usize)) {
             let frozen = &result.calls.entries()[&site];
             assert_eq!(frozen.site, site);
             assert_eq!(frozen.context, context);
+            let original = occurrences
+                .writer_value_uses()
+                .find(|(actual, _, _)| *actual == site)
+                .unwrap()
+                .2;
+            assert_eq!(frozen.materialized_writer_input, Some(original));
+            assert!(
+                !occurrences
+                    .root_uses
+                    .flow()
+                    .uses()
+                    .contains_key(&original.use_id)
+            );
+            let root = &occurrences.root_uses.flow().domains()[&original.domain];
+            assert!(root.parent.is_none() && root.guard.is_none());
+
             assert_eq!(
                 frozen.decimal_overflow_policy,
                 relational[&site].decimal_overflow_policy
@@ -593,8 +609,13 @@ impl SqlFunctionCatalog for LateSelectionCatalog {
                     AggregateStateFormatId::try_new("test/adversarial-late-state/v1").unwrap()
             }
             SelectionFault::NominalState => {
-                state.intermediate_type.logical_type =
-                    novarocks_type_contract::ValueLogicalType::Bitmap
+                state.intermediate_type =
+                    novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                        state.intermediate_type.data_type().clone(),
+                        state.intermediate_type.nullable(),
+                        novarocks_type_contract::ValueLogicalType::Bitmap,
+                    )
+                    .unwrap()
             }
         }
         Ok(Arc::new(bad))
@@ -907,5 +928,73 @@ fn real_writer_wide_fresh_calls_sample_actual_control_quantums_without_losing_sp
                 assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
             }
         }
+    }
+}
+
+#[test]
+fn real_writer_frozen_materialized_receipt_rejects_absence_foreign_domain_and_duplicate_use() {
+    let owner = authored(&[2], &[false]);
+    for fragment in writer_fragments(&owner) {
+        let occurrences = author_physical_occurrences_observed(
+            fragment,
+            owner.function_catalog().as_ref(),
+            &Control::default(),
+        )
+        .unwrap();
+        let (policy, relational) = scopes(&owner, fragment, &occurrences);
+        let expressions = BTreeMap::new();
+        let source = input(
+            &owner,
+            fragment,
+            &occurrences,
+            policy,
+            &relational,
+            &expressions,
+        );
+        let authored =
+            author_sql_fragment_effects_observed(&owner, source, &Control::default()).unwrap();
+        let original = authored
+            .calls
+            .entries()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(original.len() >= 2);
+        let check = |calls| {
+            FrozenFragmentCalls::try_new(
+                fragment,
+                &occurrences.root_uses,
+                calls,
+                &Control::default(),
+            )
+        };
+        check(original.clone()).unwrap();
+        let mut absent = original.clone();
+        absent[0].materialized_writer_input = None;
+        assert!(matches!(check(absent), Err(FrozenCallError::WrongContext)));
+        let mut foreign = original.clone();
+        foreign[0]
+            .materialized_writer_input
+            .as_mut()
+            .unwrap()
+            .domain = novarocks_type_contract::EvaluationDomainId::new(u32::MAX);
+        assert!(
+            !occurrences
+                .root_uses
+                .flow()
+                .domains()
+                .contains_key(&novarocks_type_contract::EvaluationDomainId::new(u32::MAX))
+        );
+        assert!(matches!(
+            check(foreign),
+            Err(FrozenCallError::InvalidDomain)
+        ));
+        let mut duplicate = original.clone();
+        duplicate[1]
+            .materialized_writer_input
+            .as_mut()
+            .unwrap()
+            .use_id = original[0].materialized_writer_input.unwrap().use_id;
+        assert!(matches!(check(duplicate), Err(FrozenCallError::SharedUse)));
     }
 }

@@ -71,7 +71,7 @@ pub(super) fn definition(
 }
 
 struct AbsOwner {
-    resolver: BuiltinScalarResolver,
+    resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
@@ -104,7 +104,7 @@ impl AbsOwner {
             })
             .collect();
         Ok(Self {
-            resolver,
+            resolver: Arc::new(resolver),
             declaration,
             implementations,
         })
@@ -156,6 +156,10 @@ impl FunctionBindingResolver for AbsOwner {
 }
 
 impl PureFunctionMetadataOwner for AbsOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -184,6 +188,56 @@ impl FunctionEffectOwner for AbsOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
+        self.refine_core(input, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_core(input, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
+    }
+}
+
+impl PureScalarImplementation for AbsOwner {
+    fn prepare_scalar(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        self.prepare_core(input, contract, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn prepare_scalar_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_core(input, contract, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
+    }
+}
+
+impl AbsOwner {
+    fn refine_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(FunctionEffectOwnerError::Control)?;
         work.step().map_err(FunctionEffectOwnerError::Control)?;
@@ -201,23 +255,20 @@ impl FunctionEffectOwner for AbsOwner {
             .into());
         }
         work.flush().map_err(FunctionEffectOwnerError::Control)?;
-        self.validate_selected(input.selected, input.request, control)
-            .map_err(|error| match error {
-                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
-                other => FunctionEffectOwnerError::Owner(other),
-            })?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+            other => FunctionEffectOwnerError::Owner(other),
+        })?;
         let result = self.call_effects(input.proof_scope);
         work.finish().map_err(FunctionEffectOwnerError::Control)?;
         Ok(result)
     }
-}
-
-impl PureScalarImplementation for AbsOwner {
-    fn prepare_scalar(
+    fn prepare_core(
         &self,
         input: CallEffectInput<'_>,
         contract: Arc<ScalarCallContract>,
         control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
     ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(compile_failure)?;
@@ -236,11 +287,10 @@ impl PureScalarImplementation for AbsOwner {
             ));
         }
         work.flush().map_err(compile_failure)?;
-        self.validate_selected(input.selected, input.request, control)
-            .map_err(|error| match error {
-                FunctionBindingError::Control(error) => compile_failure(error),
-                _ => invalid("ABS preparation has a stale selected binding"),
-            })?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => compile_failure(error),
+            _ => invalid("ABS preparation has a stale selected binding"),
+        })?;
         work.finish().map_err(compile_failure)?;
         // The prepared object retains the same canonical contract. Its body is
         // a static pure implementation and needs no live resolver or authority.
@@ -410,11 +460,14 @@ mod tests {
                 } else {
                     ValueLogicalType::Physical
                 };
-                let arguments = [argument(FunctionValueType {
-                    data_type: source.clone(),
-                    nullable,
-                    logical_type: source_logical,
-                })];
+                let arguments = [argument(
+                    FunctionValueType::try_from_legacy_declared_projection(
+                        source.clone(),
+                        nullable,
+                        source_logical,
+                    )
+                    .expect("valid temporary legacy function value declaration"),
+                )];
                 let selected = Arc::new(
                     owner
                         .resolve(request(&arguments), crate::binding_test_control())
@@ -422,19 +475,22 @@ mod tests {
                 );
                 assert_eq!(
                     selected.argument_types.as_ref(),
-                    &[FunctionArgumentType::Value(FunctionValueType {
-                        data_type: source.clone(),
-                        nullable,
-                        logical_type: source_logical,
-                    })]
+                    &[FunctionArgumentType::Value(
+                        FunctionValueType::try_from_legacy_declared_projection(
+                            source.clone(),
+                            nullable,
+                            source_logical
+                        )
+                        .expect("valid temporary legacy function value declaration")
+                    )]
                 );
                 let FunctionResultType::Scalar(result) = &selected.result_type else {
                     panic!("ABS must have a scalar result");
                 };
-                assert_eq!(result.data_type, target);
-                assert_eq!(result.nullable, nullable);
+                assert_eq!(result.data_type().clone(), target);
+                assert_eq!(result.nullable(), nullable);
                 assert_eq!(
-                    result.logical_type,
+                    result.logical_type(),
                     if target == DataType::FixedSizeBinary(16) {
                         ValueLogicalType::LargeInt
                     } else {
@@ -478,11 +534,14 @@ mod tests {
     fn actual_abs_owner_rejects_opaque_fixed16_and_stale_output_profiles() {
         let owner = owner();
         for logical_type in [ValueLogicalType::Physical, ValueLogicalType::Uuid] {
-            let arguments = [argument(FunctionValueType {
-                data_type: DataType::FixedSizeBinary(16),
-                nullable: false,
-                logical_type,
-            })];
+            let arguments = [argument(
+                FunctionValueType::try_from_legacy_declared_projection(
+                    DataType::FixedSizeBinary(16),
+                    false,
+                    logical_type,
+                )
+                .expect("valid temporary legacy function value declaration"),
+            )];
             assert!(
                 owner
                     .resolve(request(&arguments), crate::binding_test_control())
@@ -638,7 +697,10 @@ mod tests {
             .unwrap();
         let values = full.values().as_any().downcast_ref::<Int16Array>().unwrap();
         assert_eq!(values.values().as_ref(), &[128, 5, 7]);
-        assert_eq!(fe.contract().result_type().data_type, DataType::Int16);
+        assert_eq!(
+            fe.contract().result_type().data_type().clone(),
+            DataType::Int16
+        );
         assert_eq!(fe.retained_bytes().unwrap(), fe.retained_upper_bound());
     }
 }

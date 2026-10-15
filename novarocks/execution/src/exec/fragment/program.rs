@@ -50,6 +50,74 @@ impl ExchangeInputContract {
     }
 }
 
+/// Ordered owner-local exchange contracts. Adoption moves the real backing;
+/// it neither reconstructs schemas nor allocates a second tree index.
+#[derive(Debug)]
+pub struct ExchangeInputContracts {
+    entries: Vec<(FragmentNodeId, ExchangeInputContract)>,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl ExchangeInputContracts {
+    pub fn try_from_sorted_observed<E: From<FragmentBindingError>>(
+        entries: Vec<(FragmentNodeId, ExchangeInputContract)>,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<Self, E> {
+        for pair in entries.windows(2) {
+            let ordered = pair[0].0 < pair[1].0;
+            observe()?;
+            if !ordered {
+                return Err(FragmentBindingError::new(
+                    FragmentBindingTarget::Program,
+                    FragmentBindingErrorKind::InvalidAssignment,
+                    "exchange contracts must have strictly ordered unique node IDs",
+                )
+                .into());
+            }
+        }
+        Ok(Self {
+            entries,
+            _storage: storage,
+        })
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    pub fn get(&self, id: &FragmentNodeId) -> Option<&ExchangeInputContract> {
+        self.entries
+            .binary_search_by_key(id, |entry| entry.0)
+            .ok()
+            .map(|index| &self.entries[index].1)
+    }
+    pub fn contains_key(&self, id: &FragmentNodeId) -> bool {
+        self.get(id).is_some()
+    }
+    pub fn keys(&self) -> impl ExactSizeIterator<Item = &FragmentNodeId> {
+        self.entries.iter().map(|entry| &entry.0)
+    }
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&FragmentNodeId, &ExchangeInputContract)> {
+        self.entries.iter().map(|entry| (&entry.0, &entry.1))
+    }
+}
+fn exchange_contract_pair(
+    entry: &(FragmentNodeId, ExchangeInputContract),
+) -> (&FragmentNodeId, &ExchangeInputContract) {
+    (&entry.0, &entry.1)
+}
+impl<'a> IntoIterator for &'a ExchangeInputContracts {
+    type Item = (&'a FragmentNodeId, &'a ExchangeInputContract);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (FragmentNodeId, ExchangeInputContract)>,
+        fn(&'a (FragmentNodeId, ExchangeInputContract)) -> Self::Item,
+    >;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter().map(exchange_contract_pair)
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct FragmentSinkSpec {
@@ -149,7 +217,7 @@ pub struct FragmentProgram {
     sink_assignment_requirement: FragmentSinkAssignmentRequirement,
     program_options: FragmentProgramOptions,
     scan_sources: BTreeMap<FragmentNodeId, ScanSourceContract>,
-    exchange_inputs: BTreeMap<FragmentNodeId, ExchangeInputContract>,
+    exchange_inputs: ExchangeInputContracts,
     runtime_filters: RuntimeFilterContract,
 }
 
@@ -171,6 +239,30 @@ impl FragmentProgram {
         program_options: FragmentProgramOptions,
         scan_sources: BTreeMap<FragmentNodeId, ScanSourceContract>,
         exchange_inputs: BTreeMap<FragmentNodeId, ExchangeInputContract>,
+        runtime_filters: RuntimeFilterContract,
+    ) -> Result<Self, FragmentBindingError> {
+        // Explicit expansion adapter for existing pure callers. Native passes
+        // its observed sorted backing and actual storage through the strong API.
+        let entries = exchange_inputs.into_iter().collect();
+        let contracts = ExchangeInputContracts::try_from_sorted_observed(
+            entries,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            || Ok::<_, FragmentBindingError>(()),
+        )?;
+        Self::try_new_with_exchange_inputs(
+            local_program,
+            program_options,
+            scan_sources,
+            contracts,
+            runtime_filters,
+        )
+    }
+
+    pub fn try_new_with_exchange_inputs(
+        local_program: Arc<LocalProgramGraph>,
+        program_options: FragmentProgramOptions,
+        scan_sources: BTreeMap<FragmentNodeId, ScanSourceContract>,
+        exchange_inputs: ExchangeInputContracts,
         runtime_filters: RuntimeFilterContract,
     ) -> Result<Self, FragmentBindingError> {
         if local_program.nodes().iter().any(|node| {
@@ -251,7 +343,7 @@ impl FragmentProgram {
         &self.scan_sources
     }
 
-    pub fn exchange_inputs(&self) -> &BTreeMap<FragmentNodeId, ExchangeInputContract> {
+    pub fn exchange_inputs(&self) -> &ExchangeInputContracts {
         &self.exchange_inputs
     }
 
@@ -298,7 +390,7 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::sync::Arc;
 
-    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
     use crate::exec::fragment::sink::DataStreamPartitionType;
     use crate::exec::fragment::sink::{
@@ -317,7 +409,7 @@ mod tests {
             arena: ExprArena::default(),
             root: ExecNode {
                 kind: ExecNodeKind::Values(ValuesNode {
-                    chunk: Chunk::default(),
+                    chunk: crate::exec::chunk::typed_fixture::columns(&[], &[], &[], Vec::new(), 0),
                     node_id: 7,
                 }),
             },
@@ -326,9 +418,12 @@ mod tests {
 
     fn root_not_minimum_node_id_plan() -> ExecPlan {
         let mut arena = ExprArena::default();
-        arena.push_typed(
+        arena.push_value_typed(
             ExprNode::Literal(LiteralValue::Bool(true)),
-            arrow::datatypes::DataType::Boolean,
+            novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Boolean,
+                false,
+            ),
         );
         ExecPlan {
             arena,
@@ -336,7 +431,13 @@ mod tests {
                 kind: ExecNodeKind::Filter(FilterNode {
                     input: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::default(),
+                            chunk: crate::exec::chunk::typed_fixture::columns(
+                                &[],
+                                &[],
+                                &[],
+                                Vec::new(),
+                                0,
+                            ),
                             node_id: 3,
                         }),
                     }),
@@ -348,17 +449,15 @@ mod tests {
     }
 
     fn frozen(plan: ExecPlan, sink: StaticSinkProgram) -> Arc<LocalProgramGraph> {
-        let profile = plan
-            .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
-            .unwrap();
+        let profile =
+            crate::exec::chunk::typed_fixture::profile(&plan, NonZeroUsize::new(1).unwrap(), None);
         let requirements = if matches!(sink, StaticSinkProgram::Result) {
             vec![ExternalSinkRequirement::Result]
         } else {
             Vec::new()
         };
-        let (program, runtime) = plan
-            .into_local_program_and_bindings(profile, BTreeMap::new(), requirements, sink)
-            .unwrap();
+        let (program, runtime) =
+            crate::exec::chunk::typed_fixture::lower(plan, profile, requirements, sink);
         assert_eq!(runtime.scan_count(), 0);
         Arc::new(program)
     }

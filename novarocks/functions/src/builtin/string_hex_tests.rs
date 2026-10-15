@@ -94,7 +94,7 @@ fn output(result: &SelectedValues<'_>) -> Vec<Option<String>> {
         .collect()
 }
 fn pool(array: ArrayRef) -> ConstantPool {
-    let ty = FunctionValueType::new(array.data_type().clone(), true);
+    let ty = FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true);
     ConstantPool::try_new(
         Arc::new(
             ty.try_to_field("original")
@@ -318,7 +318,7 @@ fn string_hex_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_s
         for source in [
             FunctionValueType::new(DataType::LargeUtf8, true),
             FunctionValueType::new(DataType::LargeBinary, true),
-            FunctionValueType::new(
+            FunctionValueType::from_legacy_declared_projection(
                 DataType::List(Arc::new(arrow_schema::Field::new(
                     "item",
                     DataType::Int64,
@@ -347,7 +347,7 @@ fn string_hex_compile_success_and_ordinary_tail_preserve_all_callback_causes() {
     ] {
         let good = CompileControl::default();
         let success = matches!(
-            ty.data_type,
+            ty.data_type(),
             DataType::Utf8 | DataType::Binary | DataType::Int64
         );
         assert_eq!(
@@ -463,7 +463,10 @@ fn string_hex_all_three_profiles_preserve_handwritten_bytes_and_integer_oracles(
                 DecimalOverflowPolicy::OutputNull,
                 DecimalOverflowPolicy::ReportError,
             ] {
-                let ty = FunctionValueType::new(array.data_type().clone(), nullable);
+                let ty = FunctionValueType::from_legacy_declared_projection(
+                    array.data_type().clone(),
+                    nullable,
+                );
                 let prepared = prepared_for_test_with_policy("hex", &[ty], policy).unwrap();
                 assert_eq!(prepared.contract().result_type(), &source(true));
                 assert_eq!(prepared.contract().decimal_overflow_policy(), policy);
@@ -521,12 +524,13 @@ fn string_hex_profile_slices_sparse_compact_scalar_and_original_cv_ordinals_are_
         ),
     ];
     for (original, scalar, compact_values, expected) in profiles {
-        let ty = FunctionValueType::new(original.data_type().clone(), true);
+        let ty =
+            FunctionValueType::from_legacy_declared_projection(original.data_type().clone(), true);
         let sliced = original.slice(1, 3);
         let rows = [0, 2];
         let selection = Selection::try_sparse(3, &rows).unwrap();
         let compact =
-            SelectedValues::try_new(selection, &ty.data_type, compact_values, Box::default())
+            SelectedValues::try_new(selection, ty.data_type(), compact_values, Box::default())
                 .unwrap();
         let mut kernel = instance_for(ty);
         for arg in [
@@ -608,7 +612,8 @@ fn string_hex_strict_null_and_inactive_bytes_never_read_or_emit_hidden_payload()
         bytes(vec![None, Some(b"")]),
         integers(vec![None, Some(0)]),
     ] {
-        let ty = FunctionValueType::new(array.data_type().clone(), true);
+        let ty =
+            FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true);
         let expected = if array.data_type() == &DataType::Int64 {
             "0"
         } else {
@@ -636,7 +641,8 @@ fn string_hex_empty_child_errors_bad_carrier_addresses_and_nonnull_poison_withou
         bytes(vec![Some(b"abc")]),
         integers(vec![Some(0)]),
     ] {
-        let ty = FunctionValueType::new(array.data_type().clone(), true);
+        let ty =
+            FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true);
         let arguments = [EvaluatedArgument::Column(&array)];
         let empty = Selection::try_sparse(1, &[]).unwrap();
         let mut kernel = instance_for(ty.clone());
@@ -648,15 +654,15 @@ fn string_hex_empty_child_errors_bad_carrier_addresses_and_nonnull_poison_withou
             )
             .is_empty()
         );
-        let null = arrow_array::new_null_array(&ty.data_type, 1);
+        let null = arrow_array::new_null_array(ty.data_type(), 1);
         let failed = SelectedValues::try_new(
             Selection::all(1),
-            &ty.data_type,
+            ty.data_type(),
             null.clone(),
             Box::from([crate::RowDataError::new(0, "required child failed")]),
         )
         .unwrap();
-        let missing = arrow_array::new_empty_array(&ty.data_type);
+        let missing = arrow_array::new_empty_array(ty.data_type());
         let wrong = Arc::new(arrow_array::Float64Array::from(vec![1.0])) as ArrayRef;
         for bad in [
             EvaluatedArgument::SelectedColumn(&failed),
@@ -679,7 +685,9 @@ fn string_hex_empty_child_errors_bad_carrier_addresses_and_nonnull_poison_withou
             assert!(after.trace.lock().unwrap().is_empty());
         }
         let mut nonnull = ty;
-        nonnull.nullable = false;
+        nonnull = nonnull
+            .with_nullable(false)
+            .expect("valid function nullability declaration");
         assert!(matches!(
             instance_for(nonnull).evaluate(
                 Selection::all(1),

@@ -99,7 +99,7 @@ pub(crate) trait AnalyticInputWork {
         indices: &Arc<UInt32Array>,
     ) -> Result<ArrayRef, AnalyticCopyFailure<Self::Failure>> {
         take(
-            source.batch.column(ordinal).as_ref(),
+            source.record_batch().column(ordinal).as_ref(),
             indices.as_ref(),
             None,
         )
@@ -167,26 +167,26 @@ pub(crate) fn legacy<T>(
 /// schema disregard, column order and final RecordBatch validator are unchanged.
 fn original_concat_batches<W: AnalyticInputWork>(
     schema: &SchemaRef,
-    input_batches: &[RecordBatch],
+    input_batches: &[&RecordBatch],
     sources: &[Chunk],
     scope: &mut W::Scope,
     work: &mut W,
 ) -> Result<RecordBatch, AnalyticCopyFailure<W::Failure>> {
     if schema.fields().is_empty() {
-        let num_rows: usize = input_batches.iter().map(RecordBatch::num_rows).sum();
+        let num_rows: usize = input_batches.iter().map(|batch| batch.num_rows()).sum();
         let mut options = RecordBatchOptions::default();
         options.row_count = Some(num_rows);
         return RecordBatch::try_new_with_options(schema.clone(), vec![], &options)
             .map_err(AnalyticCopyFailure::OriginalArrow);
     }
-    let batches: Vec<&RecordBatch> = input_batches.iter().collect();
+    let batches = input_batches;
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(schema.clone()));
     }
     let field_num = schema.fields().len();
     let mut arrays = Vec::with_capacity(field_num);
     for i in 0..field_num {
-        let array = work.concat_column(scope, &batches, sources, i)?;
+        let array = work.concat_column(scope, batches, sources, i)?;
         arrays.push(array);
     }
     RecordBatch::try_new(schema.clone(), arrays).map_err(AnalyticCopyFailure::OriginalArrow)
@@ -209,7 +209,7 @@ pub(crate) fn gather<W: AnalyticInputWork>(
         let mut batches = Vec::with_capacity(input.len());
         for chunk in input {
             work.step().map_err(|e| controlled(stage, e))?;
-            batches.push(chunk.batch.clone());
+            batches.push(chunk.record_batch());
         }
         work.boundary().map_err(|e| controlled(stage, e))?;
         match original_concat_batches(&input_schema, &batches, input, &mut scope, work) {
@@ -363,8 +363,8 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
     work.boundary().map_err(|e| controlled(stage, e))?;
     let indices = Arc::new(indices.finish());
     work.boundary().map_err(|e| controlled(stage, e))?;
-    let mut columns = Vec::with_capacity(chunk.batch.num_columns());
-    for ordinal in 0..chunk.batch.num_columns() {
+    let mut columns = Vec::with_capacity(chunk.record_batch().num_columns());
+    for ordinal in 0..chunk.record_batch().num_columns() {
         work.boundary().map_err(|e| controlled(stage, e))?;
         let value = match work.take_column(&mut scope, chunk, ordinal, &indices) {
             Ok(value) => value,

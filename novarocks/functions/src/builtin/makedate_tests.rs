@@ -353,7 +353,7 @@ fn makedate_actual_owner_fresh_frozen_full_facts_and_raw_preparation_are_exact()
         )
         .unwrap();
     assert!(
-        matches!(&resolved.argument_types[0], FunctionArgumentType::Value(ty) if ty.data_type==DataType::Int64)
+        matches!(&resolved.argument_types[0], FunctionArgumentType::Value(ty) if ty.data_type()==&DataType::Int64)
     );
     for bad in [
         DataType::Int32,
@@ -364,7 +364,10 @@ fn makedate_actual_owner_fresh_frozen_full_facts_and_raw_preparation_are_exact()
         assert!(
             prepared_for_test_with_policy(
                 "makedate",
-                &[FunctionValueType::new(bad, true), source(true)],
+                &[
+                    FunctionValueType::from_legacy_declared_projection(bad, true),
+                    source(true)
+                ],
                 DecimalOverflowPolicy::OutputNull
             )
             .is_err()
@@ -614,7 +617,7 @@ fn makedate_every_compile_callback_preserves_three_original_causes_and_ordinary_
         vec![FunctionValueType::new(DataType::Int32, true), source(true)],
     ] {
         let good = CompileControl::default();
-        let success = types.len() == 2 && types[0].data_type == DataType::Int64;
+        let success = types.len() == 2 && types[0].data_type() == &DataType::Int64;
         assert_eq!(
             prepared_for_test_with_control(
                 "makedate",

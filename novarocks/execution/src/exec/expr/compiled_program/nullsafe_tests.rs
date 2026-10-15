@@ -104,6 +104,7 @@ fn checked_package(
                 )
                 .unwrap();
             frozen.push(FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -423,7 +424,7 @@ fn all_fifteen_frozen_nullsafe_profiles_keep_nonnullable_boolean_sparse_rows_and
         let mut evaluator = instance(&program);
         for _ in 0..2 {
             let output = evaluator.evaluate(&batch, selection, &Control).unwrap();
-            let expected = if ty.data_type == DataType::Null {
+            let expected = if *ty.data_type() == DataType::Null {
                 vec![Some(true); 4]
             } else {
                 vec![Some(false), Some(false), Some(true), Some(true)]

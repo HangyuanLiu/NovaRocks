@@ -337,22 +337,19 @@ fn window_canonical_first_last_normalization_keeps_complete_selected_result() {
         assert_eq!(query.output_columns[index].value_type, expr.value_type);
     }
     assert_eq!(
-        projection(&query, 0).value_type.logical_type,
+        projection(&query, 0).value_type.logical_type(),
         ValueLogicalType::Json
     );
     assert_eq!(
         projection(&query, 1).value_type,
         projection(&query, 2).value_type
     );
-    let DataType::LargeList(item) = &projection(&query, 1).value_type.data_type else {
+    let DataType::LargeList(item) = &projection(&query, 1).value_type.data_type() else {
         panic!("source LargeList");
     };
-    assert_eq!(item.name(), "actual_item");
+    assert_eq!(item.name(), "item");
     assert!(!item.is_nullable());
-    assert_eq!(
-        item.metadata().get("provider").map(String::as_str),
-        Some("original")
-    );
+    assert_eq!(item.metadata().capacity(), 0);
 }
 
 #[derive(Default)]
@@ -562,13 +559,21 @@ impl SqlFunctionCatalog for FaultCatalog {
                 WindowFault::ReboundArgument => {
                     // Preserve identity and overload, but contradict the actual
                     // already-coerced offset's complete value type.
-                    binding.selected.argument_types[1] =
+                    let mut arguments = binding.selected.argument_types.to_vec();
+                    arguments[1] =
                         FunctionArgumentType::Value(FunctionValueType::new(DataType::Int32, false));
+                    binding.selected.argument_types =
+                        novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                            arguments.into_boxed_slice(),
+                        );
                 }
                 WindowFault::ReboundArity => {
-                    binding.selected.argument_types = binding.selected.argument_types[..1]
-                        .to_vec()
-                        .into_boxed_slice();
+                    binding.selected.argument_types =
+                        novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                            binding.selected.argument_types[..1]
+                                .to_vec()
+                                .into_boxed_slice(),
+                        );
                 }
                 WindowFault::Control(..) => {}
             }
@@ -734,17 +739,14 @@ fn window_wide_rebound_gate_observes_original_nested_source_and_terminal_control
     )
     .unwrap();
     let original = projection(&source, 0);
-    let DataType::Struct(fields) = &original.value_type.data_type else {
+    let DataType::Struct(fields) = &original.value_type.data_type() else {
         panic!("actual provider Struct");
     };
     assert_eq!(fields.len(), 320);
     for (ordinal, field) in fields.iter().enumerate() {
         assert_eq!(field.name(), &format!("authored_{ordinal}"));
         assert_eq!(field.is_nullable(), ordinal % 2 == 0);
-        assert_eq!(
-            field.metadata().get("provider"),
-            Some(&format!("source-{ordinal}"))
-        );
+        assert_eq!(field.metadata().capacity(), 0);
     }
     for name in ["first_value", "last_value"] {
         let control = Trace::default();

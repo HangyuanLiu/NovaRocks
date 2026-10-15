@@ -31,6 +31,15 @@
 use std::sync::Arc;
 
 mod compiled;
+#[cfg(test)]
+pub(crate) use compiled::expand_tests::{unpivot_program, unpivot_rows};
+#[cfg(test)]
+pub(crate) use compiled::family_fixture::{
+    compile as compile_family_fixture, package_with_sink as family_package_with_sink,
+    package_with_sink_and_names as family_package_with_sink_and_names, values as family_values,
+};
+#[cfg(test)]
+pub(crate) use compiled::{compiled_statistics_finish_fixture, compiled_statistics_writer_fixture};
 mod local;
 pub(crate) use compiled::build_compiled_pipeline_graph;
 pub(crate) use local::build_native_pipeline_graph_for_local_program_with_runtime_settings;
@@ -703,35 +712,138 @@ fn ensure_hash_on_input_slots(
 }
 
 pub fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chunk::ChunkSchemaRef> {
-    match &node.kind {
+    output_chunk_schema_for_node_inner::<std::convert::Infallible>(node, None)
+        .expect("the explicit pure schema lookup has no creator or control callback")
+}
+
+pub(crate) fn output_chunk_schema_for_node_with_creator<H>(
+    node: &ExecNode,
+    creation: &mut crate::exec::node::LocalLayoutCreation<'_, H>,
+) -> Result<
+    Option<crate::exec::chunk::ChunkSchemaRef>,
+    crate::exec::node::LocalProgramCreationFailure<H>,
+> {
+    output_chunk_schema_for_node_inner(node, Some(creation))
+}
+
+// One stack-owned observer is shared by the request and weighted-work ports.
+// Only the original CompileCheckpoints state is exclusively borrowed; caller H is
+// returned directly by its request closure and is never stored or recovered.
+struct RepeatLoweringWork<'a> {
+    checkpoints: std::cell::RefCell<novarocks_type_contract::CompileCheckpoints<'a>>,
+}
+impl<'a> RepeatLoweringWork<'a> {
+    fn try_new(
+        control: &'a dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, novarocks_type_contract::CompileControlError> {
+        Ok(Self {
+            checkpoints: std::cell::RefCell::new(
+                novarocks_type_contract::CompileCheckpoints::try_new(
+                    control,
+                    novarocks_type_contract::CompilePhase::LowerProgram,
+                )?,
+            ),
+        })
+    }
+    fn flush(&self) -> Result<(), novarocks_type_contract::CompileControlError> {
+        self.checkpoints.borrow_mut().flush()
+    }
+    fn observe(&self, units: usize) -> Result<(), novarocks_type_contract::CompileControlError> {
+        let mut checkpoints = self.checkpoints.borrow_mut();
+        if units == 0 {
+            return checkpoints.flush();
+        }
+        for _ in 0..units {
+            checkpoints.step()?;
+        }
+        Ok(())
+    }
+}
+
+fn output_chunk_schema_for_node_inner<H>(
+    node: &ExecNode,
+    mut creation: Option<&mut crate::exec::node::LocalLayoutCreation<'_, H>>,
+) -> Result<
+    Option<crate::exec::chunk::ChunkSchemaRef>,
+    crate::exec::node::LocalProgramCreationFailure<H>,
+> {
+    if let Some(creation) = creation.as_ref() {
+        creation
+            .control
+            .checkpoint(novarocks_type_contract::CompilePhase::LowerProgram, 0)?;
+    }
+    let result = match &node.kind {
         ExecNodeKind::AssertNumRows(AssertNumRowsNode { input, .. }) => {
-            output_chunk_schema_for_node(input)
+            output_chunk_schema_for_node_inner(input, creation)?
         }
         ExecNodeKind::Values(values) => Some(values.chunk.chunk_schema_ref()),
         ExecNodeKind::Project(project) => Some(Arc::clone(&project.output_chunk_schema)),
         ExecNodeKind::Unpivot(unpivot) => Some(Arc::clone(&unpivot.output_chunk_schema)),
         ExecNodeKind::Filter(FilterNode { input, .. })
         | ExecNodeKind::Limit(LimitNode { input, .. })
-        | ExecNodeKind::Sort(SortNode { input, .. }) => output_chunk_schema_for_node(input),
+        | ExecNodeKind::Sort(SortNode { input, .. }) => {
+            output_chunk_schema_for_node_inner(input, creation)?
+        }
         ExecNodeKind::Repeat(RepeatNode {
             input,
             null_slot_ids,
             grouping_slot_ids,
             ..
-        }) => crate::exec::operators::repeat_output_chunk_schema(
-            &output_chunk_schema_for_node(input)?,
-            null_slot_ids,
-            grouping_slot_ids,
-        )
-        .ok(),
-        ExecNodeKind::ChangeEventExpand(node) => Some(Arc::clone(&node.output_chunk_schema)),
-        ExecNodeKind::UnionAll(UnionAllNode { inputs, .. }) => {
-            inputs.first().and_then(output_chunk_schema_for_node)
+        }) => {
+            let Some(input_schema) =
+                output_chunk_schema_for_node_inner(input, creation.as_deref_mut())?
+            else {
+                return Ok(None);
+            };
+            if let Some(creation) = creation {
+                let work = RepeatLoweringWork::try_new(creation.control)?;
+                let storage = creation.storage.clone();
+                let input_arrow = input_schema.arrow_schema_ref();
+                let input_slots = input_schema.slot_ids();
+                Some(crate::exec::operators::repeat_output_chunk_schema_observed(
+                    input_arrow.as_ref(),
+                    &input_slots,
+                    |ordinal| {
+                        input_schema
+                            .slots()
+                            .get(ordinal)
+                            .filter(|slot| slot.is_typed())
+                            .map(|slot| (slot.typed_binding(), slot.unique_id()))
+                    },
+                    input_schema.storage_lifetime(),
+                    null_slot_ids,
+                    grouping_slot_ids,
+                    storage,
+                    |layout| {
+                        work.flush()?;
+                        (creation.temporary_request)(layout)
+                            .map_err(crate::exec::node::LocalProgramCreationFailure::Creator)
+                    },
+                    |layout| {
+                        work.flush()?;
+                        (creation.request)(layout)
+                            .map_err(crate::exec::node::LocalProgramCreationFailure::Creator)
+                    },
+                    |units| work.observe(units).map_err(Into::into),
+                )?)
+            } else {
+                crate::exec::operators::repeat_output_chunk_schema(
+                    &input_schema,
+                    null_slot_ids,
+                    grouping_slot_ids,
+                )
+                .ok()
+            }
         }
+        ExecNodeKind::ChangeEventExpand(node) => Some(Arc::clone(&node.output_chunk_schema)),
+        ExecNodeKind::UnionAll(UnionAllNode { inputs, .. }) => match inputs.first() {
+            Some(input) => output_chunk_schema_for_node_inner(input, creation)?,
+            None => None,
+        },
         ExecNodeKind::ExchangeSource(exchange) => Some(Arc::clone(&exchange.expected_chunk_schema)),
         ExecNodeKind::Scan(scan) => Some(scan.output_chunk_schema()),
         ExecNodeKind::RuntimeFilterConsumer(consumer) => {
-            output_chunk_schema_for_node(&consumer.input)
+            output_chunk_schema_for_node_inner(&consumer.input, creation)?
         }
         ExecNodeKind::Aggregate(aggregate) => Some(Arc::clone(&aggregate.output_chunk_schema)),
         ExecNodeKind::Join(join) => Some(Arc::clone(&join.join_scope_chunk_schema)),
@@ -747,7 +859,8 @@ pub fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chun
         ExecNodeKind::TableFinish(node) => {
             Some(Arc::clone(node.root_result_schema().chunk_schema()))
         }
-    }
+    };
+    Ok(result)
 }
 
 fn keyed_assert_distribution_keys(
@@ -1116,32 +1229,39 @@ fn build_pipeline_for_node(
             Ok(build)
         }
         ExecNodeKind::Project(ProjectNode {
-            input,
-            node_id,
-            is_subordinate,
-            validate_final_result_input,
-            exprs,
-            expr_slot_ids,
-            expr_slot_schemas,
-            output_indices,
-            output_chunk_schema,
+            input: _input,
+            node_id: _node_id,
+            is_subordinate: _is_subordinate,
+            validate_final_result_input: _validate_final_result_input,
+            exprs: _exprs,
+            expr_slot_ids: _expr_slot_ids,
+            expr_slot_schemas: _expr_slot_schemas,
+            output_indices: _output_indices,
+            output_chunk_schema: _output_chunk_schema,
         }) => {
-            let mut build = build_pipeline_for_node(input, ctx)?;
-            build.pipeline.factories.push(Box::new(
-                ProjectProcessorFactory::new(
-                    *node_id,
-                    *is_subordinate,
-                    Arc::clone(&ctx.arena),
-                    exprs.clone(),
-                    expr_slot_ids.clone(),
-                    expr_slot_schemas.clone(),
-                    output_indices.clone(),
-                    output_chunk_schema.clone(),
-                )
-                .with_final_result_input_validation(*validate_final_result_input),
-            ));
-            build.stream = StreamDesc::any(build.pipeline.dop);
-            Ok(build)
+            #[cfg(test)]
+            {
+                let mut build = build_pipeline_for_node(_input, ctx)?;
+                build.pipeline.factories.push(Box::new(
+                    ProjectProcessorFactory::from_fixture_schema(
+                        *_node_id,
+                        *_is_subordinate,
+                        Arc::clone(&ctx.arena),
+                        _exprs.clone(),
+                        _expr_slot_ids.clone(),
+                        _expr_slot_schemas.clone(),
+                        _output_indices.clone(),
+                        _output_chunk_schema.clone(),
+                    )
+                    .with_final_result_input_validation(*_validate_final_result_input),
+                ));
+                build.stream = StreamDesc::any(build.pipeline.dop);
+                Ok(build)
+            }
+            #[cfg(not(test))]
+            {
+                Err("legacy Project graph construction is retired; use the frozen LocalProgram declaration".into())
+            }
         }
         ExecNodeKind::Unpivot(node) => {
             let mut build = build_pipeline_for_node(&node.input, ctx)?;
@@ -1187,16 +1307,17 @@ fn build_pipeline_for_node(
             repeat_times,
         }) => {
             let mut build = build_pipeline_for_node(input, ctx)?;
-            build
-                .pipeline
-                .factories
-                .push(Box::new(RepeatProcessorFactory::new(
+            build.pipeline.factories.push(Box::new(
+                RepeatProcessorFactory::new_from_declared_input(
                     *node_id,
                     null_slot_ids.clone(),
                     grouping_slot_ids.clone(),
                     grouping_list.clone(),
                     *repeat_times,
-                )));
+                    output_chunk_schema_for_node(input)
+                        .ok_or_else(|| "Repeat input declaration is absent".to_string())?,
+                )?,
+            ));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
@@ -1244,43 +1365,67 @@ fn build_pipeline_for_node(
             partition_exprs,
             partition_limit,
         }) => {
-            let build = build_pipeline_for_node(input, ctx)?;
-            let mut build = gather_to_one(build, ctx, *node_id);
-            if *use_top_n {
-                build
-                    .pipeline
-                    .factories
-                    .push(Box::new(SortProcessorFactory::new_topn(
-                        *node_id,
-                        Arc::clone(&ctx.arena),
-                        order_by.clone(),
-                        *limit,
-                        *offset,
-                        *topn_type,
-                        *max_buffered_rows,
-                        *max_buffered_bytes,
-                        partition_exprs.clone(),
-                        *partition_limit,
-                    )));
-            } else {
-                build
-                    .pipeline
-                    .factories
-                    .push(Box::new(SortProcessorFactory::new(
-                        *node_id,
-                        Arc::clone(&ctx.arena),
-                        order_by.clone(),
-                        *limit,
-                        *offset,
-                        *topn_type,
-                        *max_buffered_rows,
-                        *max_buffered_bytes,
-                        partition_exprs.clone(),
-                        *partition_limit,
-                    )));
+            #[cfg(not(test))]
+            {
+                let _ = (
+                    input,
+                    node_id,
+                    use_top_n,
+                    order_by,
+                    limit,
+                    offset,
+                    topn_type,
+                    max_buffered_rows,
+                    max_buffered_bytes,
+                    partition_exprs,
+                    partition_limit,
+                );
+                // Installed native execution uses the frozen LocalProgram path.
+                // This old construction graph has no declared StaticLayout port.
+                Err(
+                    "legacy Sort graph construction is retired; use the frozen LocalProgram layout"
+                        .into(),
+                )
             }
-            build.stream = StreamDesc::single();
-            Ok(build)
+            #[cfg(test)]
+            {
+                let input_schema = output_chunk_schema_for_node(input).ok_or_else(|| {
+                    "legacy Sort fixture lacks its explicit node-declared input schema".to_string()
+                })?;
+                let build = build_pipeline_for_node(input, ctx)?;
+                let mut build = gather_to_one(build, ctx, *node_id);
+                let factory = if *use_top_n {
+                    SortProcessorFactory::new_topn(
+                        *node_id,
+                        Arc::clone(&ctx.arena),
+                        order_by.clone(),
+                        *limit,
+                        *offset,
+                        *topn_type,
+                        *max_buffered_rows,
+                        *max_buffered_bytes,
+                        partition_exprs.clone(),
+                        *partition_limit,
+                    )
+                } else {
+                    SortProcessorFactory::new(
+                        *node_id,
+                        Arc::clone(&ctx.arena),
+                        order_by.clone(),
+                        *limit,
+                        *offset,
+                        *topn_type,
+                        *max_buffered_rows,
+                        *max_buffered_bytes,
+                        partition_exprs.clone(),
+                        *partition_limit,
+                    )
+                }
+                .with_fixture_input_schema(input_schema);
+                build.pipeline.factories.push(Box::new(factory));
+                build.stream = StreamDesc::single();
+                Ok(build)
+            }
         }
         ExecNodeKind::TableFunction(TableFunctionNode {
             input,
@@ -1431,21 +1576,24 @@ fn build_pipeline_for_node(
                         &topn_producers,
                         &ctx.runtime_filter_execution,
                     )?;
-                    Box::new(AggregateProcessorFactory::new_native(
-                        *node_id,
-                        Arc::clone(&ctx.arena),
-                        group_by.clone(),
-                        partial_functions,
-                        Arc::clone(&ctx.function_set),
-                        resolved_aggregates.clone(),
-                        true,
-                        false,
-                        output_chunk_schema.clone(),
-                        topn_producers,
-                        runtime_filter_session,
-                        dop,
-                        None,
-                    )?)
+                    Box::new(
+                        AggregateProcessorFactory::new_native(
+                            *node_id,
+                            Arc::clone(&ctx.arena),
+                            group_by.clone(),
+                            partial_functions,
+                            Arc::clone(&ctx.function_set),
+                            resolved_aggregates.clone(),
+                            true,
+                            false,
+                            output_chunk_schema.clone(),
+                            topn_producers,
+                            runtime_filter_session,
+                            dop,
+                            None,
+                        )?
+                        .with_local_partial_output(),
+                    )
                 };
 
                 build.pipeline.factories.push(partial_agg_factory);
@@ -1507,21 +1655,24 @@ fn build_pipeline_for_node(
                     func.input_is_intermediate = false;
                 }
                 let local_factory: Box<dyn OperatorFactory> = {
-                    Box::new(AggregateProcessorFactory::new_native(
-                        *node_id,
-                        Arc::clone(&ctx.arena),
-                        group_by.clone(),
-                        partial_functions,
-                        Arc::clone(&ctx.function_set),
-                        resolved_aggregates.clone(),
-                        true,
-                        false,
-                        output_chunk_schema.clone(),
-                        Vec::new(),
-                        None,
-                        dop,
-                        None,
-                    )?)
+                    Box::new(
+                        AggregateProcessorFactory::new_native(
+                            *node_id,
+                            Arc::clone(&ctx.arena),
+                            group_by.clone(),
+                            partial_functions,
+                            Arc::clone(&ctx.function_set),
+                            resolved_aggregates.clone(),
+                            true,
+                            false,
+                            output_chunk_schema.clone(),
+                            Vec::new(),
+                            None,
+                            dop,
+                            None,
+                        )?
+                        .with_local_partial_output(),
+                    )
                 };
                 build.pipeline.factories.push(local_factory);
 
@@ -2340,8 +2491,10 @@ mod tests {
             &self,
             _budget: novarocks_spi::connector::read_stack::ConnectorPollBudget,
             _profile: Option<crate::runtime::profile::RuntimeProfile>,
-        ) -> Result<crate::exec::node::scan::ScanOutputStream, String> {
-            Err("builder tests never poll the stream".to_string())
+            _construction: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+        ) -> crate::runtime::fragment::ExecutionResult<crate::exec::node::scan::ScanOutputStream>
+        {
+            Err("builder tests never poll the stream".to_string().into())
         }
     }
 

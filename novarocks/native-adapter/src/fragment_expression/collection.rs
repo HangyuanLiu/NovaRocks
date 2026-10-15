@@ -19,7 +19,7 @@
 
 use arrow::datatypes::DataType;
 
-use super::{decode_expr_at, lower_expr_list};
+use super::{decode_expr_at_with_types, lower_expr_list};
 use novarocks_execution::exec::expr::function::FunctionKind;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_proto_codec::FieldPath;
@@ -33,6 +33,8 @@ pub(crate) fn lower_array_literal(
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
     data_type: DataType,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, super::NativeExpressionDecodeError> {
     if !matches!(data_type, DataType::List(_)) {
         return Err(super::NativeExpressionDecodeError::inconsistent(
@@ -40,7 +42,13 @@ pub(crate) fn lower_array_literal(
             format!("ARRAY literal expects List type, got {data_type:?}"),
         ));
     }
-    let elements = lower_expr_list(&call.args, path.field("args"), arena, input_layout)?;
+    let elements = lower_expr_list(
+        &call.args,
+        path.field("args"),
+        arena,
+        input_layout,
+        type_decoder,
+    )?;
     Ok(arena.push_typed(ExprNode::ArrayExpr { elements }, data_type))
 }
 
@@ -50,6 +58,9 @@ pub(crate) fn lower_map_constructor(
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
     data_type: DataType,
+    declared: Option<&novarocks_type_contract::FunctionValueType>,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, super::NativeExpressionDecodeError> {
     if !call.args.len().is_multiple_of(2) {
         return Err(super::NativeExpressionDecodeError::invalid_value(
@@ -85,36 +96,47 @@ pub(crate) fn lower_map_constructor(
 
     let expected_key_type = entry_fields[0].data_type().clone();
     let expected_value_type = entry_fields[1].data_type().clone();
+    let key_binding = match declared {
+        Some(source) => {
+            type_decoder.synthetic_child_binding(source, 0, path.clone().field("key"))?
+        }
+        None => None,
+    };
+    let value_binding = match declared {
+        Some(source) => {
+            type_decoder.synthetic_child_binding(source, 1, path.clone().field("value"))?
+        }
+        None => None,
+    };
     let mut key_elements = Vec::with_capacity(call.args.len() / 2);
     let mut value_elements = Vec::with_capacity(call.args.len() / 2);
 
     for (idx, arg) in call.args.iter().enumerate() {
-        let child = decode_expr_at(
-            arg,
-            path.clone().field("args").index(idx),
-            arena,
-            input_layout,
-        )?;
+        let arg_path = path.clone().field("args").index(idx);
+        let child =
+            decode_expr_at_with_types(arg, arg_path.clone(), arena, input_layout, type_decoder)?;
         if idx % 2 == 0 {
-            key_elements.push(
-                coerce_map_constructor_child(arena, child, &expected_key_type, idx, "key")
-                    .map_err(|error| {
-                        super::NativeExpressionDecodeError::invalid_value(
-                            path.clone().field("args").index(idx),
-                            error,
-                        )
-                    })?,
-            );
+            key_elements.push(coerce_map_constructor_child(
+                arena,
+                child,
+                &expected_key_type,
+                key_binding.as_ref(),
+                idx,
+                "key",
+                arg_path,
+                type_decoder,
+            )?);
         } else {
-            value_elements.push(
-                coerce_map_constructor_child(arena, child, &expected_value_type, idx, "value")
-                    .map_err(|error| {
-                        super::NativeExpressionDecodeError::invalid_value(
-                            path.clone().field("args").index(idx),
-                            error,
-                        )
-                    })?,
-            );
+            value_elements.push(coerce_map_constructor_child(
+                arena,
+                child,
+                &expected_value_type,
+                value_binding.as_ref(),
+                idx,
+                "value",
+                arg_path,
+                type_decoder,
+            )?);
         }
     }
 
@@ -137,25 +159,57 @@ fn coerce_map_constructor_child(
     arena: &mut ExprArena,
     child: ExprId,
     expected_type: &DataType,
+    expected_binding: Option<&novarocks_type_contract::FunctionValueType>,
     arg_idx: usize,
     role: &str,
-) -> Result<ExprId, String> {
+    path: FieldPath,
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
+) -> Result<ExprId, super::NativeExpressionDecodeError> {
     let child_type = arena.data_type(child).cloned().ok_or_else(|| {
-        format!(
-            "MAP constructor missing {role} child type at pair {}",
-            arg_idx / 2
+        super::NativeExpressionDecodeError::invalid_value(
+            path.clone(),
+            format!(
+                "MAP constructor missing {role} child type at pair {}",
+                arg_idx / 2,
+            ),
         )
     })?;
     if &child_type == expected_type || matches!(expected_type, DataType::Null) {
+        if let Some(expected) = expected_binding {
+            let actual = arena.value_type(child).ok_or_else(|| {
+                super::NativeExpressionDecodeError::missing(
+                    path.clone(),
+                    "MAP argument requires its complete declaration",
+                )
+            })?;
+            // Output key non-nullness is a per-row MAP obligation. It does not
+            // narrow or re-sign the nullable argument expression itself.
+            type_decoder.require_complete_binding(actual, expected, true, path)?;
+        }
         return Ok(child);
     }
-    Ok(arena.push_typed(
+    let target = match expected_binding {
+        Some(expected) => {
+            let actual = arena.value_type(child).ok_or_else(|| {
+                super::NativeExpressionDecodeError::missing(
+                    path.clone(),
+                    "MAP argument requires its complete declaration",
+                )
+            })?;
+            type_decoder
+                .synthetic_nullable_binding(expected, expected.nullable() || actual.nullable())?
+        }
+        None => None,
+    };
+    let id = arena.push_typed(
         ExprNode::Cast(
             child,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         ),
         expected_type.clone(),
-    ))
+    );
+    type_decoder.save_synthetic_binding(id, target.as_ref(), arena)?;
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -168,30 +222,70 @@ mod tests {
     use novarocks_proto_models::{common, expr};
     use std::sync::Arc;
 
+    fn original(
+        ty: DataType,
+        nullable: bool,
+        value: common::literal_value::Value,
+    ) -> (
+        novarocks_type_contract::FunctionValueType,
+        expr::LiteralExpr,
+    ) {
+        (
+            novarocks_type_contract::FunctionValueType::new(ty, nullable),
+            expr::LiteralExpr {
+                value: Some(common::LiteralValue { value: Some(value) }),
+            },
+        )
+    }
+    fn original_expressions(
+        originals: &[(
+            novarocks_type_contract::FunctionValueType,
+            expr::LiteralExpr,
+        )],
+    ) -> Vec<expr::Expr> {
+        originals
+            .iter()
+            .map(|(ty, literal)| {
+                scalar_expr(ty.clone(), expr::expr::Kind::Literal(literal.clone()))
+            })
+            .collect()
+    }
     #[test]
     fn lowers_array_literal_internal_function_to_array_expr() {
-        let array_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
-        let array = scalar_expr(
-            array_type.clone(),
+        let originals = [
+            original(
+                DataType::Int64,
+                false,
+                common::literal_value::Value::IntValue(1),
+            ),
+            original(
+                DataType::Int64,
+                false,
+                common::literal_value::Value::IntValue(2),
+            ),
+            original(
+                DataType::Int64,
+                true,
+                common::literal_value::Value::NullValue(true),
+            ),
+        ];
+        let source = super::super::fixture_scalar_sources::ScalarSource::with_literals(
+            "__array_literal",
+            &originals,
+        );
+        let array_type = source.result().data_type().clone();
+        let mut array = scalar_expr(
+            source.result().clone(),
             expr::expr::Kind::FunctionCall(expr::FunctionCall {
-                function_name: "__array_literal".to_string(),
-                args: vec![
-                    int_lit(1),
-                    int_lit(2),
-                    scalar_expr(
-                        DataType::Int64,
-                        expr::expr::Kind::Literal(expr::LiteralExpr {
-                            value: Some(common::LiteralValue {
-                                value: Some(common::literal_value::Value::NullValue(true)),
-                            }),
-                        }),
-                    ),
-                ],
+                frozen_binding: None,
+                original_request_id: None,
+                function_name: "__array_literal".into(),
+                args: original_expressions(&originals),
                 distinct: false,
             }),
         );
-
-        let (arena, id) = lower(&array);
+        source.attach(&mut array, 710);
+        let (arena, id) = source.lower(&array, &[1, 7, 42], 710);
         let Some(ExprNode::ArrayExpr { elements }) = arena.node(id) else {
             panic!("expected array literal to lower as ArrayExpr");
         };
@@ -199,37 +293,54 @@ mod tests {
         assert_eq!(arena.data_type(id), Some(&array_type));
         assert!(matches!(
             arena.node(elements[0]),
-            Some(ExprNode::Literal(LiteralValue::Int64(1)))
+            Some(ExprNode::Constant(value)) if value.try_i64().unwrap() == Some(1)
         ));
         assert!(matches!(
             arena.node(elements[2]),
-            Some(ExprNode::Literal(LiteralValue::Null))
+            Some(ExprNode::Constant(value)) if super::super::tests::fixture_constant_is_null(value)
         ));
+        super::super::tests::assert_complete_frozen(arena);
     }
 
     #[test]
     fn lowers_variadic_map_constructor_to_literal_call() {
-        let map_type = DataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                DataType::Struct(Fields::from(vec![
-                    Arc::new(Field::new("key", DataType::Int64, true)),
-                    Arc::new(Field::new("value", DataType::Utf8, true)),
-                ])),
+        let originals = [
+            original(
+                DataType::Int64,
                 false,
-            )),
-            false,
-        );
-        let map = scalar_expr(
-            map_type.clone(),
+                common::literal_value::Value::IntValue(1),
+            ),
+            original(
+                DataType::Utf8,
+                false,
+                common::literal_value::Value::StringValue("a".into()),
+            ),
+            original(
+                DataType::Int64,
+                false,
+                common::literal_value::Value::IntValue(2),
+            ),
+            original(
+                DataType::Utf8,
+                false,
+                common::literal_value::Value::StringValue("b".into()),
+            ),
+        ];
+        let source =
+            super::super::fixture_scalar_sources::ScalarSource::with_literals("map", &originals);
+        let map_type = source.result().data_type().clone();
+        let mut map = scalar_expr(
+            source.result().clone(),
             expr::expr::Kind::FunctionCall(expr::FunctionCall {
-                function_name: "map".to_string(),
-                args: vec![int_lit(1), string_lit("a"), int_lit(2), string_lit("b")],
+                frozen_binding: None,
+                original_request_id: None,
+                function_name: "map".into(),
+                args: original_expressions(&originals),
                 distinct: false,
             }),
         );
-
-        let (arena, id) = lower(&map);
+        source.attach(&mut map, 711);
+        let (arena, id) = source.lower(&map, &[1, 7, 42], 711);
         let Some(ExprNode::FunctionCall { kind, args }) = arena.node(id) else {
             panic!("expected map constructor to lower as function call");
         };
@@ -240,36 +351,47 @@ mod tests {
         assert_eq!(arena.data_type(args[2]), Some(&DataType::Int64));
         assert_eq!(arena.data_type(args[3]), Some(&DataType::Utf8));
         assert_eq!(arena.data_type(id), Some(&map_type));
+        super::super::tests::assert_complete_frozen(arena);
     }
 
     #[test]
     fn map_constructor_casts_null_children_to_entry_types() {
-        let map_type = DataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                DataType::Struct(Fields::from(vec![
-                    Arc::new(Field::new("key", DataType::Int64, true)),
-                    Arc::new(Field::new("value", DataType::Int64, true)),
-                ])),
+        let originals = [
+            original(
+                DataType::Null,
+                true,
+                common::literal_value::Value::NullValue(true),
+            ),
+            original(
+                DataType::Int64,
                 false,
-            )),
-            false,
-        );
-        let map = scalar_expr(
-            map_type,
+                common::literal_value::Value::IntValue(10),
+            ),
+            original(
+                DataType::Int64,
+                false,
+                common::literal_value::Value::IntValue(2),
+            ),
+            original(
+                DataType::Null,
+                true,
+                common::literal_value::Value::NullValue(true),
+            ),
+        ];
+        let source =
+            super::super::fixture_scalar_sources::ScalarSource::with_literals("map", &originals);
+        let mut map = scalar_expr(
+            source.result().clone(),
             expr::expr::Kind::FunctionCall(expr::FunctionCall {
-                function_name: "map".to_string(),
-                args: vec![
-                    null_lit(DataType::Null),
-                    int_lit(10),
-                    int_lit(2),
-                    null_lit(DataType::Null),
-                ],
+                frozen_binding: None,
+                original_request_id: None,
+                function_name: "map".into(),
+                args: original_expressions(&originals),
                 distinct: false,
             }),
         );
-
-        let (arena, id) = lower(&map);
+        source.attach(&mut map, 712);
+        let (arena, id) = source.lower(&map, &[1, 7, 42], 712);
         let Some(ExprNode::FunctionCall { args, .. }) = arena.node(id) else {
             panic!("expected map constructor to lower as function call");
         };
@@ -279,20 +401,148 @@ mod tests {
         assert!(matches!(arena.node(args[0]), Some(ExprNode::Cast(_, _))));
         assert_eq!(arena.data_type(args[3]), Some(&DataType::Int64));
         assert!(matches!(arena.node(args[3]), Some(ExprNode::Cast(_, _))));
+        super::super::tests::assert_complete_frozen(arena);
     }
 
     #[test]
     fn array_literal_requires_list_result_type() {
-        let array = scalar_expr(
+        let originals = [original(
+            DataType::Int64,
+            false,
+            common::literal_value::Value::IntValue(1),
+        )];
+        let source = super::super::fixture_scalar_sources::ScalarSource::with_literals(
+            "__array_literal",
+            &originals,
+        );
+        // The genuine constructor binding remains List. Only the actual
+        // expression result declaration is corrupt, so full validation rejects it.
+        let mut array = scalar_expr(
             DataType::Int64,
             expr::expr::Kind::FunctionCall(expr::FunctionCall {
-                function_name: "__array_literal".to_string(),
-                args: vec![int_lit(1)],
+                frozen_binding: None,
+                original_request_id: None,
+                function_name: "__array_literal".into(),
+                args: original_expressions(&originals),
                 distinct: false,
             }),
         );
+        source.attach(&mut array, 713);
+        let error = source.lower_error(&array, &[], 713);
+        assert!(
+            error.contains("scalar result differs from its complete frozen declaration"),
+            "{error}"
+        );
+        assert!(
+            error.contains("plan_fragment") && error.contains("invalid value"),
+            "{error}"
+        );
+    }
+}
 
-        let err = lower_err_with_slots(&array, &[]);
-        assert!(err.contains("ARRAY literal expects List type"), "{err}");
+#[cfg(test)]
+mod complete_binding_tests {
+    use super::super::tests::{assert_complete_frozen, json_type, scalar_expr};
+    use novarocks_execution::exec::expr::ExprNode;
+    use novarocks_proto_models::{common, expr};
+    use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+    #[test]
+    fn map_json_value_keeps_its_actual_source_domain_and_rejects_plain_same_carrier() {
+        let originals = [
+            (
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Utf8,
+                    false,
+                ),
+                expr::LiteralExpr {
+                    value: Some(common::LiteralValue {
+                        value: Some(common::literal_value::Value::StringValue("a".into())),
+                    }),
+                },
+            ),
+            (
+                json_type().with_nullable(false).unwrap(),
+                expr::LiteralExpr {
+                    value: Some(common::LiteralValue {
+                        value: Some(common::literal_value::Value::StringValue(
+                            "{\"v\":1}".into(),
+                        )),
+                    }),
+                },
+            ),
+        ];
+        let source =
+            super::super::fixture_scalar_sources::ScalarSource::with_literals("map", &originals);
+        let mut wire = scalar_expr(
+            source.result().clone(),
+            expr::expr::Kind::FunctionCall(expr::FunctionCall {
+                frozen_binding: None,
+                original_request_id: None,
+                function_name: "map".into(),
+                args: originals
+                    .iter()
+                    .map(|(ty, literal)| {
+                        scalar_expr(ty.clone(), expr::expr::Kind::Literal(literal.clone()))
+                    })
+                    .collect(),
+                distinct: false,
+            }),
+        );
+        source.attach(&mut wire, 714);
+        let (arena, id) = source.lower(&wire, &[1, 7, 42], 714);
+        let Some(ExprNode::FunctionCall { args, .. }) = arena.node(id) else {
+            panic!("MAP constructor");
+        };
+        assert_eq!(
+            arena.value_type(args[1]).unwrap().logical_type(),
+            ValueLogicalType::Json
+        );
+        assert_eq!(
+            arena
+                .field_schema(id)
+                .unwrap()
+                .map_value()
+                .unwrap()
+                .domain(),
+            Some(ValueLogicalType::Json)
+        );
+        assert_complete_frozen(arena);
+
+        let mut wrong = scalar_expr(
+            source.result().clone(),
+            expr::expr::Kind::FunctionCall(expr::FunctionCall {
+                frozen_binding: None,
+                original_request_id: None,
+                function_name: "map".to_owned(),
+                args: vec![
+                    scalar_expr(
+                        originals[0].0.clone(),
+                        expr::expr::Kind::Literal(originals[0].1.clone()),
+                    ),
+                    scalar_expr(
+                        FunctionValueType::new(arrow::datatypes::DataType::Utf8, false),
+                        expr::expr::Kind::Literal(expr::LiteralExpr {
+                            value: Some(common::LiteralValue {
+                                value: Some(common::literal_value::Value::StringValue(
+                                    "abc".into(),
+                                )),
+                            }),
+                        }),
+                    ),
+                ],
+                distinct: false,
+            }),
+        );
+        source.attach(&mut wrong, 714);
+        let error = source.lower_error(&wrong, &[], 714);
+        assert!(
+            error.contains("scalar actual value differs from its complete original argument"),
+            "{error}"
+        );
+        assert!(
+            error.contains("plan_fragment") && error.contains("invalid value"),
+            "{error}"
+        );
     }
 }

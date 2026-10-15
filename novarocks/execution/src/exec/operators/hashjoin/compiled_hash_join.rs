@@ -42,12 +42,11 @@
 //! close after the artifact is published, and any build failure or cancel
 //! fails them. The instance's one build driver is their one local partition.
 
+use super::join_hash_map::build_store::BuildStoreChunkProjection;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray};
-use arrow::compute::filter_record_batch;
-use arrow::record_batch::RecordBatch;
 use novarocks_functions::{KernelDiagnostic, KernelFailure};
 use novarocks_local_program::{
     JoinDistributionMode, LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole,
@@ -62,19 +61,22 @@ use super::build_requirements::{
 use super::join_hash_map::build_store::BuildStoreBuilder;
 use super::join_hash_map::finalize::{finalize_probe_rows, is_all_match_one};
 use super::join_hash_map::gather::{
-    MAX_JOIN_OUTPUT_ROWS_PER_BATCH, gather_left_with_null_right, gather_probe_build_batches,
+    JoinGatherError, MAX_JOIN_OUTPUT_ROWS_PER_BATCH, TypedJoinBatch, filter_probe_typed,
+    gather_left_with_null_right_typed, gather_probe_build_batches_typed,
 };
 use super::join_hash_map::method::{BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions};
 use super::join_hash_map::search::{JoinSelection, append_cross_selection};
 use super::native_runtime_filter::{
     NativeRuntimeFilterProducerFactory, NativeRuntimeFilterProducerSet,
 };
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::node::join::JoinType;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
 use crate::exec::pipeline::dependency::DependencyHandle;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{
+    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
@@ -85,6 +87,30 @@ fn failure(context: &str, error: impl std::fmt::Display) -> ExecutionFailure {
     ExecutionFailure::from(format!("{context}: {error}"))
 }
 
+/// Runtime role schemas retain their own finite source/new storage holds.
+/// They never retain the declaring plan, program or creating factory.
+pub(crate) struct PreparedJoinSchemas {
+    pub(crate) build: ChunkSchemaRef,
+    pub(crate) scope: ChunkSchemaRef,
+    pub(crate) output: ChunkSchemaRef,
+}
+
+pub(crate) fn prepare_join_schemas(
+    factory: &dyn InputConstructionFactory,
+    build: &novarocks_local_program::StaticLayout,
+    scope: &novarocks_local_program::StaticLayout,
+    output: &novarocks_local_program::StaticLayout,
+) -> ExecutionResult<PreparedJoinSchemas> {
+    let build = factory.create_compiled_chunk_schema(build)?;
+    let scope = factory.create_compiled_chunk_schema(scope)?;
+    let output = factory.create_compiled_chunk_schema(output)?;
+    Ok(PreparedJoinSchemas {
+        build,
+        scope,
+        output,
+    })
+}
+
 /// The frozen facts of one compiled Join node that both sides share.
 pub(crate) struct CompiledHashJoinPlan {
     node: ProgramNodeId,
@@ -93,9 +119,9 @@ pub(crate) struct CompiledHashJoinPlan {
     build_sites: Vec<ProgramExpressionRootSite>,
     residual: Option<ProgramExpressionRootSite>,
     eq_null_safe: Vec<bool>,
-    build: ChunkSchemaRef,
-    scope: ChunkSchemaRef,
-    output: ChunkSchemaRef,
+    build: novarocks_local_program::StaticLayout,
+    scope: novarocks_local_program::StaticLayout,
+    output: novarocks_local_program::StaticLayout,
     requirements: BuildComponentRequirements,
 }
 
@@ -168,9 +194,9 @@ impl CompiledHashJoinPlan {
             build_sites,
             residual,
             eq_null_safe: eq_null_safe.clone(),
-            build: ChunkSchema::from_compiled_layout(right_layout)?,
-            scope: ChunkSchema::from_compiled_layout(join_scope_layout)?,
-            output: ChunkSchema::from_compiled_layout(graph_node.output_layout())?,
+            build: right_layout.clone(),
+            scope: join_scope_layout.clone(),
+            output: graph_node.output_layout().clone(),
             requirements,
         })
     }
@@ -251,6 +277,9 @@ impl OperatorFactory for CompiledHashJoinBuildSinkFactory {
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             instances: None,
             store: BuildStoreBuilder::new(),
+            construction: None,
+            prepared_build: None,
+            prepare_failure: None,
             input_chunks: Vec::new(),
             key_batches: Vec::new(),
             row_count: 0,
@@ -275,6 +304,9 @@ struct CompiledHashJoinBuildSink {
     control: RuntimeKernelControl,
     instances: Option<Vec<CompiledExpressionInstance>>,
     store: BuildStoreBuilder,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
+    prepared_build: Option<ChunkSchemaRef>,
+    prepare_failure: Option<ExecutionFailure>,
     /// Retained only to charge the build rows to this operator's tracker
     /// until the artifact owns them.
     input_chunks: Vec<Chunk>,
@@ -289,6 +321,39 @@ struct CompiledHashJoinBuildSink {
 }
 
 impl Operator for CompiledHashJoinBuildSink {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.control.bind_construction_factory(Arc::clone(&factory));
+        self.construction = Some(factory);
+    }
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        if let Some(first) = &self.prepare_failure {
+            return Err(first.clone());
+        }
+        if self.prepared_build.is_some() {
+            return Ok(());
+        }
+        let result: ExecutionResult<_> = (|| {
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?;
+            Ok(factory.create_compiled_chunk_schema(&self.plan.build)?)
+        })();
+        match result {
+            Ok(schema) => {
+                self.prepared_build = Some(schema);
+                Ok(())
+            }
+            Err(first) => {
+                self.prepare_failure = Some(first.clone());
+                self.finished = true;
+                Err(first)
+            }
+        }
+    }
     fn name(&self) -> &str {
         &self.name
     }
@@ -339,6 +404,9 @@ impl ProcessorOperator for CompiledHashJoinBuildSink {
         false
     }
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+        if let Some(first) = &self.prepare_failure {
+            return Err(first.clone());
+        }
         if self.finished || chunk.is_empty() {
             return Ok(());
         }
@@ -366,6 +434,14 @@ impl ProcessorOperator for CompiledHashJoinBuildSink {
 
 impl CompiledHashJoinBuildSink {
     fn push_build_chunk(&mut self, mut chunk: Chunk) -> ExecutionResult<()> {
+        if let Some(first) = &self.prepare_failure {
+            return Err(first.clone());
+        }
+        let prepared = self
+            .prepared_build
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let owner = self.control.construction_owner(prepared)?;
         instances(
             &mut self.instances,
             &self.program,
@@ -375,7 +451,12 @@ impl CompiledHashJoinBuildSink {
         let roots = self.instances.as_mut().expect("instances were created");
         let mut keys = Vec::with_capacity(roots.len());
         for (instance, site) in roots.iter_mut().zip(&self.plan.build_sites) {
-            keys.push(evaluate_all(instance, *site, &chunk.batch, &self.control)?);
+            keys.push(evaluate_all(
+                instance,
+                *site,
+                chunk.record_batch(),
+                &self.control,
+            )?);
         }
         let base = self.row_count;
         let rows = chunk.len();
@@ -406,9 +487,7 @@ impl CompiledHashJoinBuildSink {
         self.key_batches
             .push(BuildKeyBatch::new(keys, rows).map_err(ExecutionFailure::from)?);
         if self.plan.requirements.requires_row_payload() {
-            self.store
-                .push_chunk(&chunk)
-                .map_err(ExecutionFailure::from)?;
+            self.store.push_chunk_owned(&chunk, owner.as_ref())?;
             if let Some(tracker) = self.chunks_tracker.as_ref() {
                 chunk.transfer_to(tracker);
             }
@@ -423,6 +502,14 @@ impl CompiledHashJoinBuildSink {
     /// Builds and publishes the instance's one artifact, then closes the
     /// runtime-filter producers: the published build is what they describe.
     fn publish_build(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        if let Some(first) = &self.prepare_failure {
+            return Err(first.clone());
+        }
+        let prepared = self
+            .prepared_build
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let owner = self.control.construction_owner(prepared)?;
         let requirements = self.plan.requirements;
         let mut table = match self.key_batches.first() {
             Some(first) => {
@@ -452,8 +539,7 @@ impl CompiledHashJoinBuildSink {
         self.key_batches.clear();
         let mut store = if requirements.requires_row_payload() {
             std::mem::replace(&mut self.store, BuildStoreBuilder::new())
-                .finish()
-                .map_err(ExecutionFailure::from)?
+                .finish_owned(owner.as_ref())?
         } else {
             None
         };
@@ -467,7 +553,10 @@ impl CompiledHashJoinBuildSink {
                 table.set_mem_tracker(MemTracker::new_child("BuildHashTable", &artifact));
             }
             if let Some(store) = store.as_mut() {
-                store.transfer_to(&MemTracker::new_child("BuildStore", &artifact));
+                store.transfer_to_with_header_owner(
+                    &MemTracker::new_child("BuildStore", &artifact),
+                    owner.as_ref(),
+                )?;
             }
         }
         let artifact = Arc::new(JoinBuildArtifact::new_native(
@@ -563,6 +652,9 @@ impl OperatorFactory for CompiledHashJoinProbeProcessorFactory {
             dep: self.state.dep(),
             state: Arc::clone(&self.state),
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+            construction: None,
+            schemas: None,
+            prepare_failure: None,
             sites,
             instances: None,
             build: None,
@@ -576,7 +668,7 @@ impl OperatorFactory for CompiledHashJoinProbeProcessorFactory {
 /// The loaded build artifact one probe driver reads.
 struct LoadedBuild {
     table: Option<Arc<JoinHashMap>>,
-    chunk: Option<Arc<Chunk>>,
+    chunk: Option<BuildStoreChunkProjection>,
     null_key_rows: Option<Arc<Vec<u32>>>,
     row_count: usize,
     has_null_key: bool,
@@ -589,6 +681,9 @@ struct CompiledHashJoinProbe {
     state: Arc<BroadcastJoinSharedState>,
     dep: DependencyHandle,
     control: RuntimeKernelControl,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
+    schemas: Option<PreparedJoinSchemas>,
+    prepare_failure: Option<ExecutionFailure>,
     /// Probe key roots in key order, then the residual root.
     sites: Vec<ProgramExpressionRootSite>,
     instances: Option<Vec<CompiledExpressionInstance>>,
@@ -599,6 +694,48 @@ struct CompiledHashJoinProbe {
 }
 
 impl Operator for CompiledHashJoinProbe {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.control.bind_construction_factory(Arc::clone(&factory));
+        self.construction = Some(factory);
+    }
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        if let Some(first) = &self.prepare_failure {
+            return Err(first.clone());
+        }
+        if self.schemas.is_some() {
+            return Ok(());
+        }
+        let result = (|| {
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?;
+            prepare_join_schemas(
+                factory.as_ref(),
+                &self.plan.build,
+                &self.plan.scope,
+                &self.plan.output,
+            )
+        })();
+        match result {
+            Ok(schemas) => {
+                self.schemas = Some(schemas);
+                Ok(())
+            }
+            Err(first) => {
+                // Only complete schema preparation is published. Earlier
+                // temporary schemas have already dropped on this refusal.
+                self.prepare_failure = Some(first.clone());
+                self.finishing = true;
+                self.finished = true;
+                Err(first)
+            }
+        }
+    }
+
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.control.bind_runtime_memory(state);
         Ok(())
@@ -622,15 +759,18 @@ impl Operator for CompiledHashJoinProbe {
 
 impl ProcessorOperator for CompiledHashJoinProbe {
     fn need_input(&self) -> bool {
-        !self.finishing
+        self.prepare_failure.is_none()
+            && self.schemas.is_some()
+            && !self.finishing
             && !self.finished
             && self.pending.is_empty()
             && (self.build.is_some() || self.state.has_build())
     }
     fn has_output(&self) -> bool {
-        !self.pending.is_empty()
+        self.prepare_failure.is_none() && !self.pending.is_empty()
     }
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+        self.prepared_schemas()?;
         if self.finishing || self.finished {
             return Err("compiled hash join probe received input after finishing".into());
         }
@@ -652,7 +792,12 @@ impl ProcessorOperator for CompiledHashJoinProbe {
         {
             let roots = self.instances.as_mut().expect("instances were created");
             for (instance, site) in roots.iter_mut().zip(&self.sites).take(keys) {
-                arrays.push(evaluate_all(instance, *site, &chunk.batch, &self.control)?);
+                arrays.push(evaluate_all(
+                    instance,
+                    *site,
+                    chunk.record_batch(),
+                    &self.control,
+                )?);
             }
         }
         let batches = match self.plan.join_type {
@@ -669,15 +814,20 @@ impl ProcessorOperator for CompiledHashJoinProbe {
         };
         for batch in batches {
             if batch.num_rows() > 0 {
-                self.pending.push_back(Chunk::try_new_with_chunk_schema(
-                    batch,
-                    Arc::clone(&self.plan.output),
-                )?);
+                let owner = self
+                    .control
+                    .construction_owner(&self.prepared_schemas()?.output)?;
+                self.pending.push_back(
+                    batch
+                        .into_chunk(owner.as_ref())
+                        .map_err(JoinGatherError::into_execution)?,
+                );
             }
         }
         Ok(())
     }
     fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+        self.prepared_schemas()?;
         let output = self.pending.pop_front();
         if self.finishing && self.pending.is_empty() {
             self.finished = true;
@@ -685,6 +835,7 @@ impl ProcessorOperator for CompiledHashJoinProbe {
         Ok(output)
     }
     fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+        self.prepared_schemas()?;
         self.finishing = true;
         if self.pending.is_empty() {
             self.finished = true;
@@ -692,6 +843,9 @@ impl ProcessorOperator for CompiledHashJoinProbe {
         Ok(())
     }
     fn precondition_dependency(&self) -> Option<DependencyHandle> {
+        if self.prepare_failure.is_some() {
+            return None;
+        }
         if self.build.is_some() || self.state.has_build() {
             None
         } else {
@@ -701,6 +855,15 @@ impl ProcessorOperator for CompiledHashJoinProbe {
 }
 
 impl CompiledHashJoinProbe {
+    fn prepared_schemas(&self) -> ExecutionResult<&PreparedJoinSchemas> {
+        if let Some(first) = &self.prepare_failure {
+            return Err(first.clone());
+        }
+        self.schemas
+            .as_ref()
+            .ok_or_else(|| ConstructionFailure::MissingOwner.into())
+    }
+
     fn load_build(&mut self) -> ExecutionResult<()> {
         if self.build.is_some() {
             return Ok(());
@@ -731,7 +894,7 @@ impl CompiledHashJoinProbe {
 
     /// The build rows the decision needs, present exactly when the build has
     /// rows and its kind retains them.
-    fn build_rows(&self) -> ExecutionResult<Option<Arc<Chunk>>> {
+    fn build_rows(&self) -> ExecutionResult<Option<BuildStoreChunkProjection>> {
         let build = self.loaded()?;
         if build.row_count == 0 {
             return Ok(None);
@@ -750,7 +913,7 @@ impl CompiledHashJoinProbe {
         probe: &Chunk,
         build: &Chunk,
         selection: &JoinSelection,
-    ) -> ExecutionResult<(JoinSelection, Vec<RecordBatch>)> {
+    ) -> ExecutionResult<(JoinSelection, Vec<TypedJoinBatch>)> {
         let site = self
             .plan
             .residual
@@ -762,24 +925,30 @@ impl CompiledHashJoinProbe {
             let end = offset
                 .saturating_add(MAX_JOIN_OUTPUT_ROWS_PER_BATCH)
                 .min(selection.len());
-            let gathered = gather_probe_build_batches(
+            let schema = self.prepared_schemas()?.scope.clone();
+            let owner = self.control.construction_owner(&schema)?;
+            let scratch = self.control.construction_owner(&schema)?;
+            let gathered = gather_probe_build_batches_typed(
                 probe,
                 build,
                 &selection.probe[offset..end],
                 &selection.build[offset..end],
-                &self.plan.scope.arrow_schema_ref(),
+                &schema,
                 true,
                 false,
+                owner.as_ref(),
+                scratch.as_ref(),
+                &self.control,
             )
-            .map_err(ExecutionFailure::from)?;
-            let [candidates] = <[RecordBatch; 1]>::try_from(gathered.batches)
+            .map_err(JoinGatherError::into_execution)?;
+            let [candidates] = <[TypedJoinBatch; 1]>::try_from(gathered.batches)
                 .map_err(|_| "compiled hash join residual candidates are not one batch")?;
             let instance = self
                 .instances
                 .as_mut()
                 .and_then(|roots| roots.last_mut())
                 .ok_or("compiled hash join residual instance is missing")?;
-            let truth = evaluate_all(instance, site, &candidates, &self.control)?;
+            let truth = evaluate_all(instance, site, candidates.record_batch(), &self.control)?;
             let mask = true_mask(&truth)?;
             for (ordinal, keep) in mask.iter().enumerate() {
                 if keep == Some(true) {
@@ -789,8 +958,9 @@ impl CompiledHashJoinProbe {
                     );
                 }
             }
-            let filtered = filter_record_batch(&candidates, &mask)
-                .map_err(|error| failure("compiled hash join residual filter", error))?;
+            let filtered = candidates
+                .filter(&mask, owner.as_ref())
+                .map_err(JoinGatherError::into_execution)?;
             if filtered.num_rows() > 0 {
                 batches.push(filtered);
             }
@@ -805,35 +975,41 @@ impl CompiledHashJoinProbe {
         probe: &Chunk,
         build: &Chunk,
         selection: &JoinSelection,
-    ) -> ExecutionResult<Vec<RecordBatch>> {
-        Ok(gather_probe_build_batches(
+    ) -> ExecutionResult<Vec<TypedJoinBatch>> {
+        let schema = self.prepared_schemas()?.scope.clone();
+        let owner = self.control.construction_owner(&schema)?;
+        let scratch = self.control.construction_owner(&schema)?;
+        Ok(gather_probe_build_batches_typed(
             probe,
             build,
             &selection.probe,
             &selection.build,
-            &self.plan.scope.arrow_schema_ref(),
+            &schema,
             true,
             is_all_match_one(selection, probe.len()),
+            owner.as_ref(),
+            scratch.as_ref(),
+            &self.control,
         )
-        .map_err(ExecutionFailure::from)?
+        .map_err(JoinGatherError::into_execution)?
         .batches)
     }
 
     /// Scope rows republished in the canonical output layout: the same
     /// arrays under the output's own fields.
-    fn output_of(&self, batch: RecordBatch) -> ExecutionResult<RecordBatch> {
-        RecordBatch::try_new(
-            self.plan.output.arrow_schema_ref(),
-            batch.columns().to_vec(),
-        )
-        .map_err(|error| failure("compiled hash join output", error))
+    fn output_of(&self, batch: TypedJoinBatch) -> ExecutionResult<TypedJoinBatch> {
+        let schema = self.prepared_schemas()?.output.clone();
+        let owner = self.control.construction_owner(&schema)?;
+        batch
+            .republish(schema, owner.as_ref())
+            .map_err(JoinGatherError::into_execution)
     }
 
     fn matched_pairs(
         &mut self,
         probe: &Chunk,
         keys: &[ArrayRef],
-    ) -> ExecutionResult<Option<(JoinSelection, Vec<RecordBatch>)>> {
+    ) -> ExecutionResult<Option<(JoinSelection, Vec<TypedJoinBatch>)>> {
         let table = match self.loaded()?.table.clone() {
             Some(table) if !table.is_empty() => table,
             _ => return Ok(None),
@@ -858,7 +1034,7 @@ impl CompiledHashJoinProbe {
         &mut self,
         probe: &Chunk,
         keys: &[ArrayRef],
-    ) -> ExecutionResult<Vec<RecordBatch>> {
+    ) -> ExecutionResult<Vec<TypedJoinBatch>> {
         let Some((_, batches)) = self.matched_pairs(probe, keys)? else {
             return Ok(Vec::new());
         };
@@ -872,7 +1048,7 @@ impl CompiledHashJoinProbe {
         &mut self,
         probe: &Chunk,
         keys: &[ArrayRef],
-    ) -> ExecutionResult<Vec<RecordBatch>> {
+    ) -> ExecutionResult<Vec<TypedJoinBatch>> {
         let (selection, matched) = self
             .matched_pairs(probe, keys)?
             .unwrap_or_else(|| (JoinSelection::new(), Vec::new()));
@@ -884,13 +1060,19 @@ impl CompiledHashJoinProbe {
             finalize_probe_rows(probe.len(), &selection, false, "compiled left outer join")
                 .map_err(ExecutionFailure::from)?
                 .selected;
-        if let Some(batch) = gather_left_with_null_right(
+        let schemas = self.prepared_schemas()?;
+        let owner = self.control.construction_owner(&schemas.output)?;
+        let scratch = self.control.construction_owner(&schemas.output)?;
+        if let Some(batch) = gather_left_with_null_right_typed(
             probe,
             &unmatched,
-            &self.plan.build.arrow_schema_ref(),
-            &self.plan.output.arrow_schema_ref(),
+            &schemas.build,
+            &schemas.output,
+            owner.as_ref(),
+            scratch.as_ref(),
+            &self.control,
         )
-        .map_err(ExecutionFailure::from)?
+        .map_err(JoinGatherError::into_execution)?
         {
             output.push(batch);
         }
@@ -901,7 +1083,7 @@ impl CompiledHashJoinProbe {
         &mut self,
         probe: &Chunk,
         keys: &[ArrayRef],
-    ) -> ExecutionResult<Vec<RecordBatch>> {
+    ) -> ExecutionResult<Vec<TypedJoinBatch>> {
         let semi = self.plan.join_type == JoinType::LeftSemi;
         let table = match self.loaded()?.table.clone() {
             Some(table) if !table.is_empty() => table,
@@ -937,7 +1119,7 @@ impl CompiledHashJoinProbe {
         &mut self,
         probe: &Chunk,
         keys: &[ArrayRef],
-    ) -> ExecutionResult<Vec<RecordBatch>> {
+    ) -> ExecutionResult<Vec<TypedJoinBatch>> {
         let rows = probe.len();
         let (row_count, has_null_key, null_key_rows, table) = {
             let build = self.loaded()?;
@@ -1078,13 +1260,20 @@ impl CompiledHashJoinProbe {
     }
 
     /// The probe rows `keep` selects, republished in the canonical output.
-    fn keep_probe(&self, probe: &Chunk, keep: &[bool]) -> ExecutionResult<Vec<RecordBatch>> {
+    fn keep_probe(&self, probe: &Chunk, keep: &[bool]) -> ExecutionResult<Vec<TypedJoinBatch>> {
         if !keep.iter().any(|keep| *keep) {
             return Ok(Vec::new());
         }
-        let filtered = filter_record_batch(&probe.batch, &BooleanArray::from(keep.to_vec()))
-            .map_err(|error| failure("compiled hash join probe filter", error))?;
-        Ok(vec![self.output_of(filtered)?])
+        let schema = self.prepared_schemas()?.output.clone();
+        let owner = self.control.construction_owner(&schema)?;
+        let filtered = filter_probe_typed(
+            probe,
+            &BooleanArray::from(keep.to_vec()),
+            schema,
+            owner.as_ref(),
+        )
+        .map_err(JoinGatherError::into_execution)?;
+        Ok(vec![filtered])
     }
 }
 
@@ -1114,7 +1303,22 @@ pub(crate) fn validate_join_scope(
         .fields()
         .iter()
         .chain(right.schema().fields()));
-    if slots && fields {
+    let complete = left.is_typed()
+        && right.is_typed()
+        && scope.is_typed()
+        && scope.slots().len() == left.slots().len() + right.slots().len()
+        && (0..scope.slots().len()).all(|index| {
+            let source = if index < left.slots().len() {
+                left.value_binding_at(index)
+            } else {
+                right.value_binding_at(index - left.slots().len())
+            };
+            match (source, scope.value_binding_at(index)) {
+                (Some(source), Some(actual)) => source == actual,
+                _ => false,
+            }
+        });
+    if slots && fields && complete {
         Ok(())
     } else {
         Err(format!(

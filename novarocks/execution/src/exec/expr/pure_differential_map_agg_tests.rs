@@ -117,10 +117,12 @@ fn pure_differential_map_agg_all_original_scalar_carriers_and_physical_fsb16() {
             );
         }
         for logical_type in [ValueLogicalType::Physical] {
-            let ty = FunctionValueType {
+            let ty = FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                nullable,
                 logical_type,
-                ..FunctionValueType::new(DataType::FixedSizeBinary(16), nullable)
-            };
+            )
+            .unwrap();
             let values = novarocks_types::largeint::array_from_i128(
                 &(0..ROWS)
                     .map(|r| {
@@ -253,42 +255,128 @@ fn pure_differential_map_agg_original_pool_constants_and_sparse_phase_selection(
     );
 }
 
-// Original registered v1 cannot re-derive top-level nominal input tags from
-// its DataType-only signature arguments. This is an admission witness, not
-// an aggregate value comparison or a pure-owner rejection claim.
+// Complete argument declarations preserve nominal children in both aggregate
+// owners. Both real phases must agree on values; an equivalent failure/panic
+// is not a successful replacement for the retired metadata-drift witness.
 #[test]
-fn pure_differential_map_agg_nominal_largeint_preserves_original_binding_refusal() {
-    const ORIGINAL_REASON: &str = r##"bind aggregate `map_agg`: aggregate `map_agg` resolved signature drift: planned=ResolvedAggregateSignature { overload: AggregateOverloadIdentity("builtin.aggregate/map_agg/derived-v1"), argument_types: [FixedSizeBinary(16), FixedSizeBinary(16)], intermediate_type: Map(Field { name: "entries", data_type: Struct([Field { name: "key", data_type: FixedSizeBinary(16), nullable: true, metadata: {"nr_logical_type": "largeint"} }, Field { name: "value", data_type: FixedSizeBinary(16), nullable: true, metadata: {"nr_logical_type": "largeint"} }]) }, false), output_type: Map(Field { name: "entries", data_type: Struct([Field { name: "key", data_type: FixedSizeBinary(16), nullable: true, metadata: {"nr_logical_type": "largeint"} }, Field { name: "value", data_type: FixedSizeBinary(16), nullable: true, metadata: {"nr_logical_type": "largeint"} }]) }, false), state_format: AggregateStateFormatId("novarocks/map_agg/state-v1") }, local=ResolvedAggregateSignature { overload: AggregateOverloadIdentity("builtin.aggregate/map_agg/derived-v1"), argument_types: [FixedSizeBinary(16), FixedSizeBinary(16)], intermediate_type: Map(Field { name: "entries", data_type: Struct([Field { name: "key", data_type: FixedSizeBinary(16), nullable: true }, Field { name: "value", data_type: FixedSizeBinary(16), nullable: true }]) }, false), output_type: Map(Field { name: "entries", data_type: Struct([Field { name: "key", data_type: FixedSizeBinary(16), nullable: true }, Field { name: "value", data_type: FixedSizeBinary(16), nullable: true }]) }, false), state_format: AggregateStateFormatId("novarocks/map_agg/state-v1") }"##;
-    for nullable in [false, true] {
-        for values in [
-            novarocks_types::largeint::array_from_i128(&[
-                Some(i128::MIN),
-                Some(i128::MAX),
-                Some(0),
-                Some(-1),
-            ])
-            .unwrap(),
-            new_empty_array(&DataType::FixedSizeBinary(16)),
-            new_null_array(&DataType::FixedSizeBinary(16), 4),
-        ] {
-            if !nullable && values.null_count() != 0 {
-                continue;
-            }
-            let ty = FunctionValueType {
-                logical_type: ValueLogicalType::LargeInt,
-                ..FunctionValueType::new(DataType::FixedSizeBinary(16), nullable)
-            };
-            let spec = AggregateDiffSpec::new("map_agg")
-                .typed_column(ty.clone(), values.clone())
-                .typed_column(ty, values)
-                .partitions(5, 105);
-            match super::aggregate::run_aggregate_differential(&spec) {
-                Err(super::DifferentialFailure::LegacyUnavailable { name, reason }) => {
-                    assert_eq!(name, "map_agg");
-                    assert_eq!(reason, ORIGINAL_REASON);
-                }
-                other => panic!("original nominal binding route changed: {other:?}"),
-            }
+fn pure_differential_map_agg_nominal_largeint_full_state_and_result() {
+    use novarocks_type_contract::{ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime};
+
+    let required = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        false,
+        ValueLogicalType::LargeInt,
+    )
+    .unwrap();
+    let nullable = required.with_nullable(true).unwrap();
+    let expected_layout = DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::FixedSizeBinary(16), false)),
+                    Arc::new(Field::new("value", DataType::FixedSizeBinary(16), true)),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    );
+    let expected = FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(
+            ValueKind::Map {
+                key: required.value_type().clone(),
+                value: nullable.value_type().clone(),
+            },
+            true,
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+        ValueLayout::try_new(&expected_layout, ValueTypeStorageLifetime::pure()).unwrap(),
+    )
+    .unwrap();
+    let assert_map_metadata_free = |ty: &DataType| {
+        let DataType::Map(entries, false) = ty else {
+            panic!("the original MAP_AGG carrier must remain an unordered map");
+        };
+        assert_eq!(entries.metadata().capacity(), 0);
+        assert_eq!(entries.name(), "entries");
+        assert!(!entries.is_nullable());
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("map entries must retain the exact key/value scaffold");
+        };
+        assert_eq!(fields.len(), 2);
+        for (field, name, nullable) in [(&fields[0], "key", false), (&fields[1], "value", true)] {
+            assert_eq!(field.name(), name);
+            assert_eq!(field.is_nullable(), nullable);
+            assert_eq!(field.data_type(), &DataType::FixedSizeBinary(16));
+            assert_eq!(field.metadata().capacity(), 0);
         }
+    };
+    let finite = || {
+        novarocks_types::largeint::array_from_i128(&[
+            Some(i128::MIN),
+            Some(i128::MAX),
+            Some(0),
+            Some(-1),
+        ])
+        .unwrap()
+    };
+    let check = |keys: ArrayRef,
+                 key_type: FunctionValueType,
+                 values: ArrayRef,
+                 value_type: FunctionValueType| {
+        assert_eq!(keys.len(), values.len());
+        let rows = keys.len();
+        for grouped in [false, true] {
+            let mut spec = AggregateDiffSpec::new("map_agg")
+                .typed_column(key_type.clone(), keys.clone())
+                .typed_column(value_type.clone(), values.clone())
+                .partitions(5, 105);
+            if grouped {
+                // Preserve sparse groups, including groups with no input.
+                spec = spec.grouped((0..rows).map(|row| row % 3).collect(), 5);
+            }
+            let summary = assert_aggregate_matches_v1(spec);
+            assert_eq!(summary.rows, rows);
+            assert_eq!(summary.groups, if grouped { 5 } else { 1 });
+            assert_eq!(summary.partitions, 5);
+            assert_eq!(summary.matched_failures, 0);
+            assert_eq!(summary.matched_panics, 0);
+            // The original algorithm emits a non-NULL empty map for empty
+            // states and skips NULL keys in both single and merged phases.
+            assert_eq!(summary.null_results, 0);
+            assert_eq!(summary.result_type, expected);
+            assert_eq!(summary.pure_state_type, expected);
+            assert_map_metadata_free(summary.result_type.data_type());
+            assert_map_metadata_free(summary.pure_state_type.data_type());
+            assert_map_metadata_free(&summary.legacy_intermediate_type);
+        }
+    };
+    // Both original root-nullability declarations remain independent of
+    // observed data. Empty and all-NULL input preserve the same nominal type.
+    for ty in [required.clone(), nullable.clone()] {
+        check(finite(), ty.clone(), finite(), ty.clone());
+        check(
+            new_empty_array(&DataType::FixedSizeBinary(16)),
+            ty.clone(),
+            new_empty_array(&DataType::FixedSizeBinary(16)),
+            ty,
+        );
     }
+    check(
+        new_null_array(&DataType::FixedSizeBinary(16), 4),
+        nullable.clone(),
+        new_null_array(&DataType::FixedSizeBinary(16), 4),
+        nullable.clone(),
+    );
+    // NULL values with real MIN/MAX/0/-1 keys test the value promise separately
+    // from NULL-key skipping; both phases still compare every original value.
+    check(
+        finite(),
+        required,
+        new_null_array(&DataType::FixedSizeBinary(16), 4),
+        nullable,
+    );
 }

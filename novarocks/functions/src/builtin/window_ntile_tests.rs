@@ -114,7 +114,8 @@ fn policy() -> ConstantPolicy {
     }
 }
 fn constant(array: ArrayRef, nullable: bool, ordinal: u32) -> ConstantValue {
-    let ty = FunctionValueType::new(array.data_type().clone(), nullable);
+    let ty =
+        FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), nullable);
     ConstantPool::try_new(
         Arc::new(ty.try_to_field("original-buckets").unwrap()),
         ty,
@@ -306,7 +307,7 @@ fn ntile_independent_quotient_remainder_oracles_policies_and_exact_installed_con
                 FunctionNullBehavior::CalledOnNull
             );
             assert!(call.effects().environment.is_empty());
-            assert!(prepared.contract().result_type().nullable);
+            assert!(prepared.contract().result_type().nullable());
             let args = [EvaluatedArgument::Constant(f.value())];
             let peers = [WindowRowRange {
                 start: 0,
@@ -588,7 +589,7 @@ fn ntile_null_dynamic_nonpositive_and_uncast_sources_are_explicit_prepare_refusa
     );
     // Original resolver may select a coercion, but CPU prepare never casts raw source.
     assert!(
-        matches!(&f.selected.argument_types[0],crate::FunctionArgumentType::Value(ty) if ty.data_type==DataType::Int64)
+        matches!(&f.selected.argument_types[0],crate::FunctionArgumentType::Value(ty) if ty.data_type()==&DataType::Int64)
     );
     assert!(
         f.prepare(options(None, false), &CompileControl::default())

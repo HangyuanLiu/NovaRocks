@@ -36,12 +36,13 @@ fn checked_input<'a>(
     source: &FunctionValueType,
     array: &'a dyn Array,
 ) -> Result<&'a Int64Array, KernelFailure> {
-    if source.logical_type != ValueLogicalType::Physical || source.data_type != DataType::Int64 {
+    if source.logical_type() != ValueLogicalType::Physical || source.data_type() != &DataType::Int64
+    {
         return Err(invalid(
             "makedate requires its exact Physical Int64 source domain",
         ));
     }
-    if array.data_type() != &source.data_type {
+    if array.data_type() != source.data_type() {
         return Err(internal(
             "makedate carrier differs from its exact selected source",
         ));
@@ -91,9 +92,9 @@ pub(super) fn evaluate_makedate<'a>(
             ));
         };
         let target = input.contract().result_type();
-        let exact = target.logical_type == ValueLogicalType::Physical
-            && target.data_type == DataType::Date32
-            && target.nullable;
+        let exact = target.logical_type() == ValueLogicalType::Physical
+            && target.data_type() == &DataType::Date32
+            && target.nullable();
         work.step()?;
         if !exact {
             return Err(invalid(
@@ -133,7 +134,7 @@ pub(super) fn evaluate_makedate<'a>(
                 }
                 let source_null = argument.array().is_null(row);
                 work.step()?;
-                if source_null && !types[index].nullable {
+                if source_null && !types[index].nullable() {
                     return Err(internal(
                         "makedate non-null source contains selected SQL NULL",
                     ));
@@ -172,7 +173,7 @@ pub(super) fn evaluate_makedate<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

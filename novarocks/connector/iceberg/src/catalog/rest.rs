@@ -1767,9 +1767,20 @@ mod tests {
             intent,
             purpose,
             input: ConnectorWriteInputRequest::Data {
-                fields: vec![ConnectorWriteFieldRequest::new(
-                    arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-                )],
+                fields: vec![
+                    ConnectorWriteFieldRequest::try_new_typed(
+                        arrow::datatypes::Field::new(
+                            "id",
+                            arrow::datatypes::DataType::Int64,
+                            false,
+                        ),
+                        novarocks_type_contract::FunctionValueType::new(
+                            arrow::datatypes::DataType::Int64,
+                            false,
+                        ),
+                    )
+                    .expect("INSERT caller declares required Int64 id"),
+                ],
             },
             base: None,
             flavor: ConnectorWriteSessionFlavor::Ordinary,

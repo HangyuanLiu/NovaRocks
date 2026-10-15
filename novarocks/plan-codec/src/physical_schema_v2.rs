@@ -19,11 +19,10 @@
 //! Connector public read facts remain with their original owners. Numerical
 //! request projections are not grants for opaque std/Arrow allocations.
 
+use crate::host_projection_v2::ProjectionFailure;
 use crate::{
-    allocation_exit_v2::reserve_exit,
-    arrow_metadata_v2::{copy_string, encode_metadata, ordered_key},
     binding_index_v2::{BindingIndex, prepare_work_upper_bound},
-    hashmap_resources_v2::{self as maps, HashMapResourceError},
+    hashmap_resources_v2::HashMapResourceError,
     physical_binding_v2::BindingCodecError,
     physical_node_v2::{
         self as resources, Model, NodeCodecError, NodeProjectionFacts, NodeProjectionLimits,
@@ -31,11 +30,19 @@ use crate::{
     physical_type_v2::{DecodedTypeTable, EncodedTypeTable, TypeCodecError},
 };
 use arrow::datatypes::{Field, Fields, Schema};
-use novarocks_proto_models::{physical_package_v2 as wire, plan::ArrowFieldMetadataEntry};
+use novarocks_type_contract::owned_resources::metadata_materialization::{
+    MaterializedFieldNamespace, MaterializedMetadataMap, MaterializedSchema,
+};
+use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
+mod creator;
+mod scopes;
+pub use creator::prepare_schemas_decode_with_creator_in;
+use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
-use std::{alloc::Layout, collections::HashMap, fmt, mem::size_of, sync::Arc};
+pub use scopes::decode_schemas_with_factory_in;
+use std::{alloc::Layout, fmt, mem::size_of, sync::Arc};
 
 #[derive(Debug)]
 pub enum SchemaCodecError {
@@ -44,16 +51,22 @@ pub enum SchemaCodecError {
     Binding(BindingCodecError),
     Node(NodeCodecError),
     SourceModel(&'static str),
+    ConstructionResource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
     InvalidShape(&'static str),
+    SourceCustody(novarocks_constant_contract::ConstantError),
+    SourceMetadata(novarocks_type_contract::owned_resources::metadata_materialization::MetadataMaterializationError),
 }
 impl fmt::Display for SchemaCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SourceCustody(e) => e.fmt(f),
+            Self::SourceMetadata(e) => write!(f, "schema original metadata: {e:?}"),
             Self::Control(e) => e.fmt(f),
             Self::Type(e) => e.fmt(f),
             Self::Binding(e) => e.fmt(f),
             Self::Node(e) => e.fmt(f),
             Self::SourceModel(s) | Self::InvalidShape(s) => f.write_str(s),
+            Self::ConstructionResource(error) => write!(f, "source schema construction: {error:?}"),
         }
     }
 }
@@ -96,7 +109,7 @@ impl From<HashMapResourceError> for SchemaCodecError {
     }
 }
 type Error = SchemaCodecError;
-type OwnedSchemaDefinitions = Box<[(u32, Schema)]>;
+type SchemaDefinitions = Box<[(u32, MaterializedSchema)]>;
 fn invalid(s: &'static str) -> Error {
     Error::InvalidShape(s)
 }
@@ -131,18 +144,6 @@ fn shape_equal(
 ) -> Result<(), Error> {
     work.step()?;
     if equal { Ok(()) } else { Err(invalid(message)) }
-}
-fn map_lower_floor(n: usize) -> Result<usize, Error> {
-    // Occupied inline pairs only: no claim about deleted buckets/private CAP.
-    bytes::<(String, String)>(n)
-}
-fn string_requests(model: &mut Model, key: &str, value: &str) -> Result<(), Error> {
-    model.request::<u8>(key.len(), 1)?;
-    model.request::<u8>(value.len(), 1)?;
-    Ok(())
-}
-fn sorting_work(entries: usize, max_key: usize) -> Result<usize, Error> {
-    mul(mul(entries, entries)?, add(mul(max_key, 2)?, 64)?)
 }
 #[derive(Clone, Copy)]
 pub struct SchemaSource<'source> {
@@ -202,17 +203,16 @@ fn encode_preflight(
     resources::floor(source, source_slice.max(types_floor), work)?;
     let mut max_schema_floor = 0;
     for entry in sources {
+        // Shape namespace cannot retain even empty spare annotation backing.
+        // Source annotations are authored independently in public source facts.
+        work.step()?;
+        if entry.source.metadata().capacity() != 0 {
+            return Err(invalid("Schema shape retains retired annotation backing"));
+        }
         let fields = entry.source.fields();
-        let metadata = entry.source.metadata();
         model.refs = add(model.refs, entry.field_ids.len())?;
-        model.items = add(model.items, add(entry.field_ids.len(), metadata.len())?)?;
+        model.items = add(model.items, entry.field_ids.len())?;
         model.request::<u32>(entry.field_ids.len(), 1)?;
-        model.request::<(&str, &str)>(metadata.len(), 1)?;
-        model.request::<ArrowFieldMetadataEntry>(metadata.len(), 1)?;
-        // The retained source invoice bounds raw control-tag iteration even
-        // after removals. Admit it before creating/advancing the real iterator.
-        let iteration = maps::source_iterator_work_upper_bound(source, metadata.len())?;
-        model.delegated_work = add(model.delegated_work, mul(iteration, 2)?)?;
         model.delegated_work = add(
             model.delegated_work,
             mul(entry.field_ids.len(), add(types.source_counts().1, 1)?)?,
@@ -223,49 +223,14 @@ fn encode_preflight(
             work,
             "Schema field occurrence count differs from original field IDs",
         )?;
-        let mut known = add(
+        let known = add(
             size_of::<Schema>(),
             add(
                 fields_layout(fields.len())?.size(),
-                add(
-                    bytes::<u32>(entry.field_ids.len())?,
-                    map_lower_floor(metadata.len())?,
-                )?,
+                bytes::<u32>(entry.field_ids.len())?,
             )?,
         )?;
-        let mut copied = 0;
-        let mut max_key = 0;
-        let metadata_work_base = model.delegated_work;
-        model.delegated_work = add(metadata_work_base, sorting_work(metadata.len(), 0)?)?;
-        admitted_facts(&model, source, types.source_counts().1, limits, admit, work)?;
-        work.flush()?;
-        let mut iter = metadata.iter();
-        work.step()?;
-        work.flush()?;
-        loop {
-            work.flush()?;
-            let next = iter.next();
-            if let Some((key, value)) = next {
-                known = add(known, add(key.capacity(), value.capacity())?)?;
-                copied = add(copied, add(key.len(), value.len())?)?;
-                max_key = max_key.max(key.len());
-                string_requests(&mut model, key, value)?;
-                model.delegated_work = add(
-                    metadata_work_base,
-                    add(sorting_work(metadata.len(), max_key)?, mul(copied, 8)?)?,
-                )?;
-                admit_model(&model, source, types.source_counts().1, limits, admit)?;
-            }
-            work.step()?;
-            work.flush()?;
-            let Some((_key, _value)) = next else { break };
-            admitted_facts(&model, source, types.source_counts().1, limits, admit, work)?;
-            work.step()?;
-        }
         max_schema_floor = max_schema_floor.max(known);
-        // Multiple entries may borrow the same Schema, Fields or field-ID
-        // allocation. This is a necessary maximum lower floor, not a sum that
-        // invents distinct ownership. The complete union is caller-invoiced.
         resources::floor(
             source,
             source_slice.max(types_floor).max(max_schema_floor),
@@ -300,13 +265,13 @@ fn decode_preflight(
     limits: NodeProjectionLimits,
     admit: &mut Admission<'_>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<NodeProjectionFacts, Error> {
+) -> Result<(Model, NodeProjectionFacts), Error> {
     let mut model = Model {
         items: definitions.len(),
         ..Model::default()
     };
     model.request::<usize>(definitions.len(), 1)?;
-    model.request::<(u32, Schema)>(definitions.len(), 2)?;
+    model.request::<(u32, MaterializedSchema)>(definitions.len(), 2)?;
     model.delegated_work = prepare_work_upper_bound(definitions.len())?;
     admitted_facts(&model, source, types.field_count(), limits, admit, work)?;
     let mut known = add(
@@ -316,23 +281,10 @@ fn decode_preflight(
     resources::floor(source, known, work)?;
     for entry in definitions {
         model.refs = add(model.refs, entry.field_ids.len())?;
-        model.items = add(
-            model.items,
-            add(entry.field_ids.len(), entry.metadata.len())?,
-        )?;
+        model.items = add(model.items, entry.field_ids.len())?;
         model.request::<Arc<Field>>(entry.field_ids.len(), 1)?;
         model.layout_request(fields_layout(entry.field_ids.len())?, 1)?;
-        let table = maps::fresh_table_layout::<String, String>(entry.metadata.len())?;
-        if let Some(layout) = table.layout {
-            model.layout_request(layout, 1)?;
-        }
-        known = add(
-            known,
-            add(
-                bytes::<u32>(entry.field_ids.capacity())?,
-                bytes::<ArrowFieldMetadataEntry>(entry.metadata.capacity())?,
-            )?,
-        )?;
+        known = add(known, bytes::<u32>(entry.field_ids.capacity())?)?;
         model.delegated_work = add(
             model.delegated_work,
             mul(
@@ -340,63 +292,16 @@ fn decode_preflight(
                 2,
             )?,
         )?;
-        let metadata_work_base = model.delegated_work;
-        model.delegated_work = add(
-            metadata_work_base,
-            add(
-                maps::fresh_string_table_work_upper_bound(entry.metadata.len(), 0, 0)?,
-                entry.metadata.len(),
-            )?,
-        )?;
-        admitted_facts(&model, source, types.field_count(), limits, admit, work)?;
-        let mut key_bytes = 0;
-        let mut copied = 0;
-        let mut max_key = 0;
-        for metadata in &entry.metadata {
-            known = add(
-                known,
-                add(metadata.key.capacity(), metadata.value.capacity())?,
-            )?;
-            string_requests(&mut model, &metadata.key, &metadata.value)?;
-            key_bytes = add(key_bytes, metadata.key.len())?;
-            copied = add(copied, add(metadata.key.len(), metadata.value.len())?)?;
-            max_key = max_key.max(metadata.key.len());
-            // Replace this entry's prefix contribution, never charge it twice.
-            model.delegated_work = add(
-                metadata_work_base,
-                add(
-                    maps::fresh_string_table_work_upper_bound(
-                        entry.metadata.len(),
-                        key_bytes,
-                        max_key,
-                    )?,
-                    add(
-                        mul(entry.metadata.len(), add(max_key, 1)?)?,
-                        mul(copied, 8)?,
-                    )?,
-                )?,
-            )?;
-            admitted_facts(&model, source, types.field_count(), limits, admit, work)?;
-            work.step()?;
-        }
         resources::floor(source, known, work)?;
         admitted_facts(&model, source, types.field_count(), limits, admit, work)?;
-        let mut previous = None;
-        for metadata in &entry.metadata {
-            let sorted = ordered_key(previous, &metadata.key, work)?;
-            shape_equal(
-                sorted,
-                work,
-                "Schema metadata keys are duplicated or not strictly ordered",
-            )?;
-            previous = Some(metadata.key.as_str());
-        }
         for id in &entry.field_ids {
             let found = types.field_observed(*id, work)?.is_some();
             shape_equal(found, work, "Schema Field reference is unknown")?;
         }
     }
-    admitted_facts(&model, source, types.field_count(), limits, admit, work)
+
+    let facts = admitted_facts(&model, source, types.field_count(), limits, admit, work)?;
+    Ok((model, facts))
 }
 fn encode_emit(
     sources: &[SchemaSource<'_>],
@@ -409,70 +314,56 @@ fn encode_emit(
             fields.push(*id);
             work.step()?;
         }
-        let metadata = encode_metadata(entry.source.metadata(), work)?;
         definitions.push(wire::SchemaDefinition {
             id: entry.id,
             field_ids: fields,
-            metadata,
         });
         work.step()?;
     }
     Ok(definitions)
 }
-fn decode_emit(
+fn decode_emit<H>(
+    emission: &mut impl scopes::SchemaEmission<H>,
     definitions: &[wire::SchemaDefinition],
     types: &DecodedTypeTable,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(OwnedSchemaDefinitions, usize), Error> {
-    let mut output = resources::reserve(definitions.len(), work)?;
-    let mut retained = bytes::<(u32, Schema)>(definitions.len())?;
+) -> Result<(SchemaDefinitions, usize), ProjectionFailure<Error, H>> {
+    emission.output(definitions.len(), work)?;
+    let mut output = resources::reserve(definitions.len(), work).map_err(Error::from)?;
+    let mut retained = bytes::<(u32, MaterializedSchema)>(definitions.len())?;
     for entry in definitions {
-        let mut fields = resources::reserve(entry.field_ids.len(), work)?;
+        emission.schema(entry.field_ids.len(), work)?;
+        let mut fields = resources::reserve(entry.field_ids.len(), work).map_err(Error::from)?;
         for id in &entry.field_ids {
-            let original = types.field_observed(*id, work)?;
+            let original = types.field_backing_observed(*id, work)?;
             work.step()?;
             let original =
                 original.ok_or_else(|| invalid("prepared Schema Field reference changed"))?;
             work.flush()?;
-            fields.push(Arc::clone(original));
+            emission.field(original, work)?;
+            fields.push(Arc::clone(original.field()));
             work.step()?;
             work.flush()?;
         }
         retained = add(retained, fields_layout(fields.len())?.size())?;
-        retained = add(retained, map_lower_floor(entry.metadata.len())?)?;
         work.flush()?;
+        let storage = emission.fields(fields.len(), work)?;
         let fields = Fields::from(fields);
         work.step()?;
         work.flush()?;
-        work.flush()?;
-        let mut metadata = HashMap::new();
+        // Metadata-free shape retains the original empty-map provenance only.
+        // Schema annotations belong to their separately authored facts owner.
+        let metadata = MaterializedMetadataMap::new_for_original_reserve();
         work.step()?;
-        work.flush()?;
-        let reserved = metadata.try_reserve(entry.metadata.len());
-        if reserved.is_ok() {
-            work.step()?;
-        }
-        reserve_exit::<Error>(reserved, work)?;
-        for value in &entry.metadata {
-            let key = copy_string(&value.key, work)?;
-            let value = copy_string(&value.value, work)?;
-            retained = add(retained, add(key.capacity(), value.capacity())?)?;
-            work.step()?;
-            work.flush()?;
-            let old = metadata.insert(key, value);
-            work.step()?;
-            work.flush()?;
-            shape_equal(
-                old.is_none(),
-                work,
-                "prepared Schema metadata identity changed",
-            )?;
-        }
-        let schema = Schema::new_with_metadata(fields, metadata);
+        let schema = metadata.into_schema(fields).with_storage_lifetime(storage);
         output.push((entry.id, schema));
         work.step()?;
     }
-    Ok((resources::boxed(output, work)?, retained))
+    emission.boxed(&output, work)?;
+    Ok((
+        resources::boxed(output, work).map_err(Error::from)?,
+        retained,
+    ))
 }
 /// Retains the actual borrowed source schema/Field/control owners.
 pub struct PreparedSchemasEncode<'loan, 'source, 'control> {
@@ -517,6 +408,27 @@ impl EncodedSchemas<'_, '_, '_> {
         )?;
         let at = self.index.find(id, |at| self.sources[at].id, work)?;
         Ok(at.map(|at| self.sources[at].source))
+    }
+    pub fn execution_binding_observed(
+        &self,
+        id: u32,
+        ordinal: usize,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&novarocks_type_contract::FunctionValueType>, Error> {
+        shape_equal(
+            std::ptr::eq(work.control(), self.control),
+            work,
+            "Schema lookup has a different original control",
+        )?;
+        let Some(at) = self.index.find(id, |at| self.sources[at].id, work)? else {
+            return Ok(None);
+        };
+        let Some(field) = self.sources[at].field_ids.get(ordinal) else {
+            return Ok(None);
+        };
+        self.types
+            .field_execution_type_observed(*field, work)
+            .map_err(Into::into)
     }
     pub fn into_wire(self) -> Vec<wire::SchemaDefinition> {
         self.definitions
@@ -611,18 +523,23 @@ pub struct PreparedSchemasDecode<'loan, 'control> {
     source_bytes: usize,
     index: BindingIndex,
     facts: NodeProjectionFacts,
+    storage: ValueTypeStorageLifetime,
 }
 pub struct DecodedSchemas<'loan, 'control> {
-    definitions: OwnedSchemaDefinitions,
+    wire_definitions: &'loan [wire::SchemaDefinition],
+    definitions: SchemaDefinitions,
     retained_bytes: usize,
     types: &'loan DecodedTypeTable,
     control: &'control dyn PureCompileControl,
     source_bytes: usize,
     index: BindingIndex,
     facts: NodeProjectionFacts,
+    storage: ValueTypeStorageLifetime,
+    metadata: Option<MaterializedFieldNamespace>,
+    _index_storage: ValueTypeStorageLifetime,
 }
 impl DecodedSchemas<'_, '_> {
-    pub fn definitions(&self) -> &[(u32, Schema)] {
+    pub fn definitions(&self) -> &[(u32, MaterializedSchema)] {
         &self.definitions
     }
     pub fn facts(&self) -> &NodeProjectionFacts {
@@ -634,11 +551,63 @@ impl DecodedSchemas<'_, '_> {
     pub fn types(&self) -> &DecodedTypeTable {
         self.types
     }
+    /// Borrow the actual source role roots from this validated occurrence.
+    /// The type namespace remains the sole field-graph validation authority.
+    pub fn field_roots_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&[u32]>, Error> {
+        shape_equal(
+            std::ptr::eq(work.control(), self.control),
+            work,
+            "Schema lookup has a different original control",
+        )?;
+        let at = self
+            .index
+            .find(id, |at| self.wire_definitions[at].id, work)?;
+        Ok(at.map(|at| self.wire_definitions[at].field_ids.as_slice()))
+    }
+    pub fn execution_binding_observed(
+        &self,
+        id: u32,
+        ordinal: usize,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&novarocks_type_contract::FunctionValueType>, Error> {
+        shape_equal(
+            std::ptr::eq(work.control(), self.control),
+            work,
+            "Schema lookup has a different original control",
+        )?;
+        let Some(at) = self
+            .index
+            .find(id, |at| self.wire_definitions[at].id, work)?
+        else {
+            return Ok(None);
+        };
+        let Some(field) = self.wire_definitions[at].field_ids.get(ordinal) else {
+            return Ok(None);
+        };
+        self.types
+            .field_execution_type_observed(*field, work)
+            .map_err(Into::into)
+    }
     pub fn schema_observed(
         &self,
         id: u32,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<&Schema>, Error> {
+        self.materialized_schema_observed(id, work)
+            .map(|owner| owner.map(MaterializedSchema::schema))
+    }
+    /// Borrow the actual schema and its original root-map creation provenance.
+    /// Format roles stay with the explicit consumer; metadata never authors an
+    /// execution binding at this source-only projection boundary.
+    pub fn materialized_schema_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&MaterializedSchema>, Error> {
         shape_equal(
             std::ptr::eq(work.control(), self.control),
             work,
@@ -656,8 +625,16 @@ impl DecodedSchemas<'_, '_> {
     pub fn retained_invoice_floor(&self) -> Result<usize, Error> {
         add(self.source_bytes, self.retained_output_floor()?)
     }
-    pub fn into_definitions(self) -> OwnedSchemaDefinitions {
-        self.definitions
+    pub fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+        self.storage.clone()
+    }
+    /// Move the actual source schema owners with their creator and source holds.
+    pub fn into_owned_definitions(self) -> OwnedSchemaDefinitions {
+        OwnedSchemaDefinitions {
+            definitions: self.definitions,
+            metadata: self.metadata,
+            storage: self.storage,
+        }
     }
 }
 impl<'loan, 'control> PreparedSchemasDecode<'loan, 'control> {
@@ -679,8 +656,15 @@ impl<'loan, 'control> PreparedSchemasDecode<'loan, 'control> {
             return Err(invalid("Schema emission has a different original control"));
         }
         admit(&self.facts)?;
-        let (definitions, retained_bytes) = decode_emit(self.definitions, self.types, work)?;
+        let (definitions, retained_bytes) = decode_emit(
+            &mut scopes::UnscopedEmission(self.storage.clone()),
+            self.definitions,
+            self.types,
+            work,
+        )
+        .map_err(ProjectionFailure::without_host)?;
         Ok(DecodedSchemas {
+            wire_definitions: self.definitions,
             definitions,
             retained_bytes,
             types: self.types,
@@ -688,6 +672,9 @@ impl<'loan, 'control> PreparedSchemasDecode<'loan, 'control> {
             source_bytes: self.source_bytes,
             index: self.index,
             facts: self.facts,
+            storage: self.storage.clone(),
+            metadata: self.types.metadata_namespace().cloned(),
+            _index_storage: self.storage.clone(),
         })
     }
 }
@@ -718,7 +705,27 @@ pub fn prepare_schemas_decode_observed_in<'loan, 'control>(
     admit: &mut Admission<'_>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<PreparedSchemasDecode<'loan, 'control>, Error> {
-    let facts = decode_preflight(
+    prepare_schemas_decode_core::<std::convert::Infallible>(
+        definitions,
+        types,
+        source_retained_bytes,
+        limits,
+        admit,
+        None,
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)
+}
+fn prepare_schemas_decode_core<'loan, 'control, H>(
+    definitions: &'loan [wire::SchemaDefinition],
+    types: &'loan DecodedTypeTable,
+    source_retained_bytes: usize,
+    limits: NodeProjectionLimits,
+    admit: &mut Admission<'_>,
+    mut creation: Option<&mut ValueSchemaCreation<'_, H>>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedSchemasDecode<'loan, 'control>, ProjectionFailure<Error, H>> {
+    let (_, facts) = decode_preflight(
         definitions,
         types,
         source_retained_bytes,
@@ -726,6 +733,19 @@ pub fn prepare_schemas_decode_observed_in<'loan, 'control>(
         admit,
         work,
     )?;
+    let storage = if let Some(creation) = creation.as_deref_mut() {
+        creator::observe_schema_construction(definitions, creation, work)?;
+        creation
+            .storage_lifetime()
+            .retaining_observed(&types.storage_lifetime(), |layout| {
+                creation
+                    .request_layout(layout)
+                    .map_err(ProjectionFailure::Host)
+            })?
+    } else {
+        // Pure new wrappers still retain the actual original Field creators.
+        types.storage_lifetime()
+    };
     let index = BindingIndex::prepare(definitions.len(), |at| definitions[at].id, work)?;
     Ok(PreparedSchemasDecode {
         definitions,
@@ -734,8 +754,50 @@ pub fn prepare_schemas_decode_observed_in<'loan, 'control>(
         source_bytes: source_retained_bytes,
         index,
         facts,
+        storage,
     })
 }
 #[cfg(test)]
 #[path = "physical_schema_v2/tests.rs"]
 mod tests;
+
+/// Independent source schema owners, original metadata provenance and finite
+/// creator responsibility. It retains no complete decoded type table/control.
+pub struct OwnedSchemaDefinitions {
+    definitions: SchemaDefinitions,
+    metadata: Option<MaterializedFieldNamespace>,
+    storage: ValueTypeStorageLifetime,
+}
+impl OwnedSchemaDefinitions {
+    pub fn definitions(&self) -> &[(u32, MaterializedSchema)] {
+        &self.definitions
+    }
+    pub fn source_field_metadata_namespace(&self) -> Option<&MaterializedFieldNamespace> {
+        self.metadata.as_ref()
+    }
+    pub fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+        self.storage.clone()
+    }
+}
+impl<H> From<CompileControlError> for ProjectionFailure<SchemaCodecError, H> {
+    fn from(error: CompileControlError) -> Self {
+        Self::Codec(error.into())
+    }
+}
+impl<H> From<TypeCodecError> for ProjectionFailure<SchemaCodecError, H> {
+    fn from(error: TypeCodecError) -> Self {
+        Self::Codec(error.into())
+    }
+}
+impl<H> From<BindingCodecError> for ProjectionFailure<SchemaCodecError, H> {
+    fn from(error: BindingCodecError) -> Self {
+        Self::Codec(error.into())
+    }
+}
+impl<H> From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for ProjectionFailure<SchemaCodecError, H>
+{
+    fn from(error: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::Codec(SchemaCodecError::ConstructionResource(error))
+    }
+}

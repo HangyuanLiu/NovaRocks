@@ -24,14 +24,20 @@
 //! admission or cooperative compilation receipt.
 
 use super::binding_control;
-use novarocks_type_contract::{CompileCheckpoints, PureCompileControl};
+mod typed;
+use novarocks_type_contract::{
+    CompileCheckpoints, PureCompileControl, is_default_json_structure_cast,
+};
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field};
+use arrow_schema::DataType;
+#[cfg(test)]
+use arrow_schema::Field;
+#[cfg(test)]
+use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
 use novarocks_type_contract::{
     ArgumentControl, FunctionEffectDeclaration, FunctionInstanceState, FunctionNullBehavior,
-    NR_LOGICAL_TYPE_KEY, ObservableEffects, ValueLogicalType, arrow_data_types_exact,
-    arrow_fields_exact, field_logical_type,
+    ObservableEffects, ValueLogicalType, arrow_data_types_exact,
 };
 
 use crate::{
@@ -47,6 +53,8 @@ pub const VALUE_CONVERSION_FUNCTION_ID: &str = "builtin.scalar/value_domain_conv
 
 pub(super) const JSON_TEXT: &str =
     "builtin.scalar/value_domain_conversion/json_text_same_structure/v1";
+pub(super) const OPAQUE_BINARY: &str =
+    "builtin.scalar/value_domain_conversion/opaque_to_binary_same_structure/v1";
 pub(super) const SIGNED_LARGEINT: &str =
     "builtin.scalar/value_domain_conversion/signed_to_largeint/v1";
 pub(super) const LARGEINT_SIGNED: &str =
@@ -89,6 +97,7 @@ pub(super) fn definition_parts()
     };
     let overloads = [
         (JSON_TEXT, "Json->PhysicalUtf8, or identical List/LargeList/FixedSizeList/Struct/Map shape with Json fields->PhysicalUtf8; preserve all other field facts", "explicit exact target; NULL preserved; JSON bytes unchanged"),
+        (OPAQUE_BINARY, "Hll/Bitmap/Object/Percentile/Variant->PhysicalBinary, or identical container shape with those opaque children->PhysicalBinary", "explicit exact target; original bytes and NULL preserved; no inverse domain establishment"),
         (SIGNED_LARGEINT, "Physical(Int8|Int16|Int32|Int64)->LargeInt(FixedSizeBinary16)", "explicit exact LargeInt target; signed i128 extension; NULL preserved"),
         (LARGEINT_SIGNED, "LargeInt(FixedSizeBinary16)->Physical(Int8|Int16|Int32|Int64)", "explicit nullable exact target; out-of-range value returns NULL; NULL preserved"),
         (LARGEINT_FLOAT, "LargeInt(FixedSizeBinary16)->Physical(Float32|Float64)", "explicit exact target; existing i128 as float rounding; NULL preserved"),
@@ -115,7 +124,7 @@ pub(super) fn definition_parts()
     Ok((declaration, ValueConversionResolver))
 }
 
-pub(super) struct ValueConversionResolver;
+pub(crate) struct ValueConversionResolver;
 
 #[cfg(test)]
 #[path = "value_conversion_exact_tests.rs"]
@@ -155,6 +164,15 @@ pub(super) fn recipe_selection(
     source: &FunctionValueType,
     target: &FunctionValueType,
 ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+    selection(recipe_family(source, target)?, source, target)
+}
+
+/// The original declaration's family decision, before any selection backing.
+/// Authorization borrows this decision; real publication uses selection above.
+pub(super) fn recipe_family(
+    source: &FunctionValueType,
+    target: &FunctionValueType,
+) -> Result<&'static str, FunctionBindingError> {
     let arguments = [FunctionArgument::Value {
         value_type: source.clone(),
         constant: None,
@@ -166,6 +184,7 @@ pub(super) fn recipe_selection(
     })?;
     let id = [
         JSON_TEXT,
+        OPAQUE_BINARY,
         SIGNED_LARGEINT,
         LARGEINT_SIGNED,
         LARGEINT_FLOAT,
@@ -175,7 +194,7 @@ pub(super) fn recipe_selection(
     .into_iter()
     .find(|id| pair_matches(id, source, target))
     .ok_or(FunctionBindingError::NoMatchingOverload)?;
-    selection(id, source, target)
+    Ok(id)
 }
 
 fn selection(
@@ -186,7 +205,9 @@ fn selection(
     Ok(FunctionBindingSelection {
         overload: FunctionOverloadId::try_new(id)
             .map_err(|_| invalid("invalid conversion overload identity"))?,
-        argument_types: vec![FunctionArgumentType::Value(source.clone())].into_boxed_slice(),
+        argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+            vec![FunctionArgumentType::Value(source.clone())].into_boxed_slice(),
+        ),
         result_type: FunctionResultType::Scalar(target.clone()),
         aggregate: None,
     })
@@ -199,9 +220,28 @@ pub(crate) fn assignment_domains_authorized(
     source: &FunctionValueType,
     target: &FunctionValueType,
 ) -> bool {
-    conversion_intermediate_type(source, target).is_ok()
+    is_default_json_structure_cast(source, target)
+        || conversion_intermediate_type(source, target).is_ok()
 }
 
+pub(super) fn assignment_domains_authorized_with_construction<E>(
+    source: &FunctionValueType,
+    target: &FunctionValueType,
+    creation: &mut super::scalar_construction::ScalarConstruction<'_, E>,
+) -> Result<bool, super::scalar_construction::Failure<E>> {
+    if is_default_json_structure_cast(source, target) {
+        return Ok(true);
+    }
+    match conversion_intermediate_type_with_construction(source, target, creation) {
+        Ok(_) => Ok(true),
+        Err(super::scalar_construction::OwnerFailure::Binding(_)) => Ok(false),
+        Err(super::scalar_construction::OwnerFailure::Construction(error)) => match error {
+            super::scalar_construction::Failure::ValueType(_)
+            | super::scalar_construction::Failure::Rule(_) => Ok(false),
+            error => Err(error),
+        },
+    }
+}
 /// Return the exact first conversion result for a two-stage assignment. The
 /// source-owned field names, nullability and metadata survive this first stage;
 /// an ordinary same-domain carrier CAST may then reach `target`. `None` means
@@ -213,176 +253,73 @@ pub fn conversion_intermediate_type(
     source: &FunctionValueType,
     target: &FunctionValueType,
 ) -> Result<Option<FunctionValueType>, FunctionBindingError> {
+    conversion_intermediate_type_with_construction(
+        source,
+        target,
+        &mut super::scalar_construction::ScalarConstruction::<std::convert::Infallible>::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            None,
+        ),
+    )
+    .map_err(super::scalar_construction::OwnerFailure::into_pure)
+}
+pub(super) fn conversion_intermediate_type_with_construction<E>(
+    source: &FunctionValueType,
+    target: &FunctionValueType,
+    creation: &mut super::scalar_construction::ScalarConstruction<'_, E>,
+) -> Result<Option<FunctionValueType>, super::scalar_construction::OwnerFailure<E>> {
     source
         .validate()
         .map_err(|_| invalid("invalid assignment source type"))?;
     target
         .validate()
         .map_err(|_| invalid("invalid assignment target type"))?;
-    if source.nullable && !target.nullable {
-        return Err(invalid(
-            "assignment target cannot narrow source nullability",
-        ));
+    if source.nullable() && !target.nullable() {
+        return Err(invalid("assignment target cannot narrow source nullability").into());
     }
-    if source.data_type == DataType::Null && source.logical_type == ValueLogicalType::Physical {
-        recipe_selection(source, target)?;
+    if source.data_type() == &DataType::Null && source.logical_type() == ValueLogicalType::Physical
+    {
+        recipe_family(source, target)?;
         return Ok(Some(target.clone()));
     }
-    if source.logical_type == target.logical_type
-        && novarocks_type_contract::preserves_nested_logical_identity(
-            &source.data_type,
-            &target.data_type,
-        )
-        && dictionary_identity_preserved(&source.data_type, &target.data_type)
+    if source.logical_type() == target.logical_type()
+        && typed::domains_preserved(source.value_type(), target.value_type())
     {
         return Ok(None);
     }
-    if recipe_selection(source, target).is_ok() {
+    if recipe_family(source, target).is_ok() {
         return Ok(Some(target.clone()));
     }
-    let logical_type = match (source.logical_type, target.logical_type) {
-        (ValueLogicalType::Json, ValueLogicalType::Physical) => ValueLogicalType::Physical,
-        (a, b) if a == b => a,
-        _ => return Err(FunctionBindingError::NoMatchingOverload),
+    let intermediate = match typed::same_shape_intermediate_with_construction(
+        source,
+        target,
+        typed::SameShapeConversion::JsonText,
+        creation,
+    ) {
+        Ok(value) => value,
+        Err(super::scalar_construction::OwnerFailure::Binding(
+            FunctionBindingError::NoMatchingOverload,
+        )) => typed::same_shape_intermediate_with_construction(
+            source,
+            target,
+            typed::SameShapeConversion::OpaqueBinary,
+            creation,
+        )?,
+        Err(error) => return Err(error),
     };
-    let intermediate = FunctionValueType::try_with_logical_type(
-        json_intermediate_carrier(&source.data_type, &target.data_type)?,
-        source.nullable,
-        logical_type,
-    )
-    .map_err(|_| invalid("invalid conversion intermediate type"))?;
-    recipe_selection(source, &intermediate)?;
-    if intermediate.logical_type != target.logical_type
-        || (intermediate.nullable && !target.nullable)
-        || !novarocks_type_contract::preserves_nested_logical_identity(
-            &intermediate.data_type,
-            &target.data_type,
-        )
-        || !dictionary_identity_preserved(&intermediate.data_type, &target.data_type)
-        || !(arrow_data_types_exact(&intermediate.data_type, &target.data_type)
-            || arrow_cast::can_cast_types(&intermediate.data_type, &target.data_type))
+    recipe_family(source, &intermediate)?;
+    if intermediate.logical_type() != target.logical_type()
+        || (intermediate.nullable() && !target.nullable())
+        || !typed::domains_preserved(intermediate.value_type(), target.value_type())
+        || !(arrow_data_types_exact(intermediate.data_type(), target.data_type())
+            || arrow_cast::can_cast_types(intermediate.data_type(), target.data_type()))
     {
         return Err(invalid(
             "conversion intermediate cannot reach the selected same-domain carrier target",
-        ));
+        )
+        .into());
     }
     Ok(Some(intermediate))
-}
-
-fn json_intermediate_field(
-    source: &Field,
-    target: &Field,
-) -> Result<Arc<Field>, FunctionBindingError> {
-    let source_domain =
-        field_logical_type(source).map_err(|_| invalid("invalid source field identity"))?;
-    let target_domain =
-        field_logical_type(target).map_err(|_| invalid("invalid target field identity"))?;
-    let changed = json_domain_pair(source_domain, target_domain)
-        .ok_or(FunctionBindingError::NoMatchingOverload)?;
-    let mut metadata = source.metadata().clone();
-    if changed {
-        metadata.remove(NR_LOGICAL_TYPE_KEY);
-    }
-    Ok(Arc::new(
-        source
-            .clone()
-            .with_data_type(json_intermediate_carrier(
-                source.data_type(),
-                target.data_type(),
-            )?)
-            .with_metadata(metadata),
-    ))
-}
-
-fn json_intermediate_carrier(
-    source: &DataType,
-    target: &DataType,
-) -> Result<DataType, FunctionBindingError> {
-    let no_match = || FunctionBindingError::NoMatchingOverload;
-    Ok(match (source, target) {
-        (DataType::List(a), DataType::List(b) | DataType::LargeList(b)) => {
-            DataType::List(json_intermediate_field(a, b)?)
-        }
-        (DataType::LargeList(a), DataType::List(b) | DataType::LargeList(b)) => {
-            DataType::LargeList(json_intermediate_field(a, b)?)
-        }
-        (
-            DataType::FixedSizeList(a, n),
-            DataType::FixedSizeList(b, _) | DataType::List(b) | DataType::LargeList(b),
-        ) => DataType::FixedSizeList(json_intermediate_field(a, b)?, *n),
-        (DataType::Struct(a), DataType::Struct(b)) if a.len() == b.len() => {
-            let by_name = a
-                .iter()
-                .all(|field| b.iter().any(|other| field.name() == other.name()));
-            DataType::Struct(
-                a.iter()
-                    .enumerate()
-                    .map(|(index, field)| {
-                        let target = if by_name {
-                            b.iter()
-                                .find(|other| field.name() == other.name())
-                                .ok_or_else(no_match)?
-                        } else {
-                            &b[index]
-                        };
-                        json_intermediate_field(field, target)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into(),
-            )
-        }
-        (DataType::Map(a, sorted), DataType::Map(b, _)) => {
-            DataType::Map(json_intermediate_field(a, b)?, *sorted)
-        }
-        _ if novarocks_type_contract::preserves_nested_logical_identity(source, target) => {
-            source.clone()
-        }
-        _ => return Err(no_match()),
-    })
-}
-
-/// Dictionary identities belong to fields even when Arrow's schema equality
-/// ignores them. Reaching a same-domain target cannot silently replace them.
-fn dictionary_identity_preserved(source: &DataType, target: &DataType) -> bool {
-    fn field(a: &Field, b: &Field) -> bool {
-        arrow_fields_exact(
-            &a.clone()
-                .with_name(b.name())
-                .with_nullable(b.is_nullable())
-                .with_data_type(b.data_type().clone())
-                .with_metadata(b.metadata().clone()),
-            b,
-        ) && dictionary_identity_preserved(a.data_type(), b.data_type())
-    }
-    match (source, target) {
-        (DataType::Dictionary(..), _) | (_, DataType::Dictionary(..)) => {
-            arrow_data_types_exact(source, target)
-        }
-        (
-            DataType::List(a) | DataType::LargeList(a) | DataType::FixedSizeList(a, _),
-            DataType::List(b) | DataType::LargeList(b) | DataType::FixedSizeList(b, _),
-        )
-        | (DataType::Map(a, _), DataType::Map(b, _)) => field(a, b),
-        (DataType::Struct(a), DataType::Struct(b)) if a.len() == b.len() => {
-            a.iter().zip(b).all(|(a, b)| field(a, b))
-        }
-        // These encodings are outside the semantic conversion families.
-        (
-            DataType::Union(..)
-            | DataType::RunEndEncoded(..)
-            | DataType::ListView(..)
-            | DataType::LargeListView(..),
-            _,
-        )
-        | (
-            _,
-            DataType::Union(..)
-            | DataType::RunEndEncoded(..)
-            | DataType::ListView(..)
-            | DataType::LargeListView(..),
-        ) => arrow_data_types_exact(source, target),
-        _ => true,
-    }
 }
 
 fn invalid(message: &str) -> FunctionBindingError {
@@ -417,7 +354,7 @@ fn input_shape<'a>(
     let target = request.expected_result_type.ok_or_else(|| {
         invalid("internal value-domain conversion requires an explicit complete target")
     })?;
-    if source.nullable && !target.nullable {
+    if source.nullable() && !target.nullable() {
         return Err(invalid(
             "conversion target cannot narrow source nullability",
         ));
@@ -436,44 +373,49 @@ fn signed(data_type: &DataType) -> bool {
 /// frozen validation. In particular FixedSizeBinary16 is not a numeric source.
 fn pair_matches(id: &str, source: &FunctionValueType, target: &FunctionValueType) -> bool {
     match id {
-        JSON_TEXT => {
-            let Some(root_changed) = json_domain_pair(source.logical_type, target.logical_type)
-            else {
-                return false;
-            };
-            json_carriers(&source.data_type, &target.data_type)
-                .is_some_and(|nested_changed| root_changed || nested_changed)
-        }
+        JSON_TEXT | OPAQUE_BINARY => typed::same_shape_pair(
+            source,
+            target,
+            if id == JSON_TEXT {
+                typed::SameShapeConversion::JsonText
+            } else {
+                typed::SameShapeConversion::OpaqueBinary
+            },
+            &mut || Ok(()),
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|changed| changed),
         SIGNED_LARGEINT => {
-            source.logical_type == ValueLogicalType::Physical
-                && signed(&source.data_type)
-                && target.logical_type == ValueLogicalType::LargeInt
-                && target.data_type == DataType::FixedSizeBinary(16)
+            source.logical_type() == ValueLogicalType::Physical
+                && signed(source.data_type())
+                && target.logical_type() == ValueLogicalType::LargeInt
+                && target.data_type() == &DataType::FixedSizeBinary(16)
         }
         LARGEINT_SIGNED => {
-            source.logical_type == ValueLogicalType::LargeInt
-                && source.data_type == DataType::FixedSizeBinary(16)
-                && target.logical_type == ValueLogicalType::Physical
-                && signed(&target.data_type)
-                && target.nullable
+            source.logical_type() == ValueLogicalType::LargeInt
+                && source.data_type() == &DataType::FixedSizeBinary(16)
+                && target.logical_type() == ValueLogicalType::Physical
+                && signed(target.data_type())
+                && target.nullable()
         }
         LARGEINT_FLOAT => {
-            source.logical_type == ValueLogicalType::LargeInt
-                && source.data_type == DataType::FixedSizeBinary(16)
-                && target.logical_type == ValueLogicalType::Physical
-                && matches!(target.data_type, DataType::Float32 | DataType::Float64)
+            source.logical_type() == ValueLogicalType::LargeInt
+                && source.data_type() == &DataType::FixedSizeBinary(16)
+                && target.logical_type() == ValueLogicalType::Physical
+                && matches!(target.data_type(), DataType::Float32 | DataType::Float64)
         }
         LARGEINT_TEXT => {
-            source.logical_type == ValueLogicalType::LargeInt
-                && source.data_type == DataType::FixedSizeBinary(16)
-                && target.logical_type == ValueLogicalType::Physical
-                && target.data_type == DataType::Utf8
+            source.logical_type() == ValueLogicalType::LargeInt
+                && source.data_type() == &DataType::FixedSizeBinary(16)
+                && target.logical_type() == ValueLogicalType::Physical
+                && target.data_type() == &DataType::Utf8
         }
         NULL_LIFT => {
-            source.logical_type == ValueLogicalType::Physical
-                && source.data_type == DataType::Null
-                && source.nullable
-                && target.nullable
+            source.logical_type() == ValueLogicalType::Physical
+                && source.data_type() == &DataType::Null
+                && source.nullable()
+                && target.nullable()
         }
         _ => false,
     }
@@ -486,64 +428,6 @@ fn json_domain_pair(source: ValueLogicalType, target: ValueLogicalType) -> Optio
         Some(false)
     } else {
         None
-    }
-}
-
-fn json_field(source: &Field, target: &Field) -> Option<bool> {
-    if !arrow_fields_exact(
-        &source
-            .clone()
-            .with_data_type(target.data_type().clone())
-            .with_metadata(target.metadata().clone()),
-        target,
-    ) {
-        return None;
-    }
-    let changed = json_domain_pair(
-        field_logical_type(source).ok()?,
-        field_logical_type(target).ok()?,
-    )?;
-    // Only the precise JSON domain tag is removed. No unrelated metadata can
-    // be added, removed or changed by this conversion.
-    if source.metadata().iter().any(|(key, value)| {
-        if changed && key == NR_LOGICAL_TYPE_KEY {
-            target.metadata().contains_key(key)
-        } else {
-            target.metadata().get(key) != Some(value)
-        }
-    }) || target
-        .metadata()
-        .keys()
-        .any(|key| !source.metadata().contains_key(key))
-    {
-        return None;
-    }
-    let nested_changed = json_carriers(source.data_type(), target.data_type())?;
-    Some(changed || nested_changed)
-}
-
-/// Only the container shapes already supported by SQL's existing nested
-/// conversion path are declared here. Other encodings may remain unchanged,
-/// but this overload does not authorize rebuilding their identities.
-fn json_carriers(source: &DataType, target: &DataType) -> Option<bool> {
-    match (source, target) {
-        (DataType::List(a), DataType::List(b))
-        | (DataType::LargeList(a), DataType::LargeList(b)) => json_field(a, b),
-        (DataType::FixedSizeList(a, an), DataType::FixedSizeList(b, bn)) if an == bn => {
-            json_field(a, b)
-        }
-        (DataType::Struct(a), DataType::Struct(b)) if a.len() == b.len() => {
-            let mut changed = false;
-            for (a, b) in a.iter().zip(b) {
-                changed |= json_field(a, b)?;
-            }
-            Some(changed)
-        }
-        (DataType::Map(a, sorted_a), DataType::Map(b, sorted_b)) if sorted_a == sorted_b => {
-            json_field(a, b)
-        }
-        _ if arrow_data_types_exact(source, target) => Some(false),
-        _ => None,
     }
 }
 
@@ -580,6 +464,7 @@ impl FunctionBindingResolver for ValueConversionResolver {
             let (source, target) = input_shape(request)?;
             for id in [
                 JSON_TEXT,
+                OPAQUE_BINARY,
                 SIGNED_LARGEINT,
                 LARGEINT_SIGNED,
                 LARGEINT_FLOAT,
@@ -644,101 +529,20 @@ fn pair_matches_observed(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<bool, FunctionBindingError> {
     work.step()?;
-    if id != JSON_TEXT {
+    if id != JSON_TEXT && id != OPAQUE_BINARY {
         return Ok(pair_matches(id, source, target));
     }
-    let Some(changed) = json_domain_pair(source.logical_type, target.logical_type) else {
-        return Ok(false);
-    };
-    Ok(
-        json_carriers_observed(&source.data_type, &target.data_type, work)?
-            .is_some_and(|nested| changed || nested),
-    )
-}
-
-fn json_field_observed(
-    source: &Field,
-    target: &Field,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Option<bool>, FunctionBindingError> {
-    work.step()?;
-    let shape = source
-        .clone()
-        .with_data_type(target.data_type().clone())
-        .with_metadata(target.metadata().clone());
-    if !novarocks_type_contract::arrow_fields_exact_observed::<crate::KernelFailure>(
-        &shape,
+    Ok(typed::same_shape_pair(
+        source,
         target,
-        || work.step().map_err(crate::kernel_control::compile_failure),
-    )
-    .map_err(binding_control::type_error)?
-    {
-        return Ok(None);
-    }
-    let (Ok(source_domain), Ok(target_domain)) =
-        (field_logical_type(source), field_logical_type(target))
-    else {
-        return Ok(None);
-    };
-    let Some(changed) = json_domain_pair(source_domain, target_domain) else {
-        return Ok(None);
-    };
-    for (key, value) in source.metadata() {
-        work.step()?;
-        if if changed && key == NR_LOGICAL_TYPE_KEY {
-            target.metadata().contains_key(key)
+        if id == JSON_TEXT {
+            typed::SameShapeConversion::JsonText
         } else {
-            target.metadata().get(key) != Some(value)
-        } {
-            return Ok(None);
-        }
-    }
-    for key in target.metadata().keys() {
-        work.step()?;
-        if !source.metadata().contains_key(key) {
-            return Ok(None);
-        }
-    }
-    Ok(
-        json_carriers_observed(source.data_type(), target.data_type(), work)?
-            .map(|nested| changed || nested),
-    )
-}
-
-fn json_carriers_observed(
-    source: &DataType,
-    target: &DataType,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Option<bool>, FunctionBindingError> {
-    work.step()?;
-    match (source, target) {
-        (DataType::List(a), DataType::List(b))
-        | (DataType::LargeList(a), DataType::LargeList(b)) => json_field_observed(a, b, work),
-        (DataType::FixedSizeList(a, an), DataType::FixedSizeList(b, bn)) if an == bn => {
-            json_field_observed(a, b, work)
-        }
-        (DataType::Struct(a), DataType::Struct(b)) if a.len() == b.len() => {
-            let mut changed = false;
-            for (a, b) in a.iter().zip(b) {
-                work.step()?;
-                let Some(nested) = json_field_observed(a, b, work)? else {
-                    return Ok(None);
-                };
-                changed |= nested;
-            }
-            Ok(Some(changed))
-        }
-        (DataType::Map(a, sa), DataType::Map(b, sb)) if sa == sb => json_field_observed(a, b, work),
-        _ => Ok(
-            novarocks_type_contract::arrow_data_types_exact_observed::<crate::KernelFailure>(
-                source,
-                target,
-                || work.step().map_err(crate::kernel_control::compile_failure),
-            )
-            .map_err(binding_control::type_error)?
-            .then_some(false),
-        ),
-    }
+            typed::SameShapeConversion::OpaqueBinary
+        },
+        &mut || work.step().map_err(Into::into),
+    )?
+    .is_some_and(|changed| changed))
 }
 
 #[cfg(test)]
@@ -761,7 +565,7 @@ mod tests {
         }
     }
     fn physical(carrier: DataType, nullable: bool) -> FunctionValueType {
-        FunctionValueType::new(carrier, nullable)
+        FunctionValueType::from_legacy_declared_projection(carrier, nullable)
     }
     fn logical(carrier: DataType, nullable: bool, domain: ValueLogicalType) -> FunctionValueType {
         FunctionValueType::try_with_logical_type(carrier, nullable, domain).unwrap()
@@ -803,11 +607,72 @@ mod tests {
     }
 
     #[test]
+    fn explicit_opaque_binary_erasure_freezes_the_only_owner_without_inverse_authority() {
+        for (domain, carrier) in [
+            (ValueLogicalType::Hll, DataType::Binary),
+            (ValueLogicalType::Bitmap, DataType::Binary),
+            (ValueLogicalType::Object, DataType::Binary),
+            (ValueLogicalType::Percentile, DataType::Binary),
+            (ValueLogicalType::Variant, DataType::LargeBinary),
+        ] {
+            let source = logical(carrier.clone(), true, domain);
+            let target = physical(carrier.clone(), true);
+            freeze(source.clone(), &target, OPAQUE_BINARY);
+            assert!(
+                resolve_value_conversion(&target, &source, crate::binding_test_control()).is_err()
+            );
+            assert!(
+                conversion_intermediate_type(&source, &physical(DataType::Utf8, true)).is_err()
+            );
+            assert!(
+                resolve_value_conversion(
+                    &source,
+                    &physical(carrier.clone(), false),
+                    crate::binding_test_control()
+                )
+                .is_err()
+            );
+        }
+        let source = logical(DataType::LargeBinary, true, ValueLogicalType::Variant);
+        let final_target = physical(DataType::Binary, true);
+        let intermediate = conversion_intermediate_type(&source, &final_target)
+            .unwrap()
+            .unwrap();
+        assert_eq!(intermediate.data_type(), source.data_type());
+        assert_eq!(intermediate.logical_type(), ValueLogicalType::Physical);
+        freeze(source, &intermediate, OPAQUE_BINARY);
+        // No UTF8 JSON-validation or fixed-width opaque source is introduced.
+        assert!(
+            resolve_value_conversion(
+                &physical(DataType::Utf8, false),
+                &logical(DataType::Utf8, false, ValueLogicalType::Json),
+                crate::binding_test_control()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn exact_hidden_owner_and_full_effects_are_declared() {
         let definition = value_conversion_definition().unwrap();
         let declaration = definition.binding_declaration().unwrap();
         declaration.validate_complete_effects().unwrap();
-        assert_eq!(declaration.overloads().len(), 6);
+        assert_eq!(
+            declaration
+                .overloads()
+                .iter()
+                .map(|overload| overload.identity.as_str())
+                .collect::<Vec<_>>(),
+            [
+                JSON_TEXT,
+                LARGEINT_FLOAT,
+                LARGEINT_SIGNED,
+                LARGEINT_TEXT,
+                NULL_LIFT,
+                OPAQUE_BINARY,
+                SIGNED_LARGEINT
+            ]
+        );
         for overload in declaration.overloads() {
             assert_eq!(overload.effects.as_ref().unwrap(), &effects());
         }
@@ -924,16 +789,16 @@ mod tests {
             false,
         );
         freeze(source.clone(), &target, JSON_TEXT);
-        for child in [
-            json_field_type(false, "renamed", true),
-            json_field_type(false, "item", false),
-            Arc::new(Field::new("item", DataType::Utf8, true)),
+        for (child, refused) in [
+            (json_field_type(false, "renamed", true), false),
+            (json_field_type(false, "item", false), true),
+            (Arc::new(Field::new("item", DataType::Utf8, true)), false),
         ] {
             let wrong = physical(
                 DataType::Struct(vec![Field::new("items", DataType::List(child), false)].into()),
                 false,
             );
-            assert!(
+            assert_eq!(
                 catalog()
                     .resolve_bound_trusted(
                         VALUE_CONVERSION_NAME,
@@ -941,7 +806,8 @@ mod tests {
                         request(&[value(source.clone())], &wrong),
                         crate::binding_test_control()
                     )
-                    .is_err()
+                    .is_err(),
+                refused
             );
         }
     }
@@ -1158,9 +1024,9 @@ mod tests {
                     request(&source, &changed_order),
                     crate::binding_test_control()
                 )
-                .is_err()
+                .is_ok()
         );
-        assert_ne!(target, changed_order);
+        assert_eq!(target, changed_order);
         assert!(
             catalog
                 .validate_bound(
@@ -1168,7 +1034,7 @@ mod tests {
                     request(&source, &changed_order),
                     crate::binding_test_control()
                 )
-                .is_err()
+                .is_ok()
         );
         let mut forged = binding.clone();
         forged.selected.result_type = FunctionResultType::Scalar(changed_order);
@@ -1179,7 +1045,7 @@ mod tests {
                     request(&source, &target),
                     crate::binding_test_control()
                 )
-                .is_err()
+                .is_ok()
         );
     }
 
@@ -1194,22 +1060,22 @@ mod tests {
         let intermediate = conversion_intermediate_type(&source, &target)
             .unwrap()
             .unwrap();
-        let DataType::List(field) = &intermediate.data_type else {
+        let DataType::List(field) = intermediate.data_type() else {
             panic!("list");
         };
-        assert_eq!(field.name(), "provider-item");
+        assert_eq!(field.name(), "item");
         assert!(!field.is_nullable());
-        assert_eq!(field.metadata().get("source").unwrap(), "user-column");
+        assert!(field.metadata().is_empty());
         assert!(!field.metadata().contains_key(NR_LOGICAL_TYPE_KEY));
-        assert!(!intermediate.nullable);
+        assert!(!intermediate.nullable());
         freeze(source, &intermediate, JSON_TEXT);
         assert!(novarocks_type_contract::preserves_nested_logical_identity(
-            &intermediate.data_type,
-            &target.data_type
+            intermediate.data_type(),
+            target.data_type()
         ));
         assert!(arrow_cast::can_cast_types(
-            &intermediate.data_type,
-            &target.data_type
+            intermediate.data_type(),
+            target.data_type()
         ));
         assert!(
             conversion_intermediate_type(&intermediate, &target)
@@ -1241,10 +1107,9 @@ mod tests {
             assert!(
                 resolve_value_conversion(
                     &source,
-                    &FunctionValueType {
-                        nullable: false,
-                        ..target
-                    },
+                    &target
+                        .with_nullable(false)
+                        .expect("valid function nullability declaration"),
                     crate::binding_test_control()
                 )
                 .is_err()
@@ -1258,4 +1123,55 @@ mod tests {
             .is_err()
         );
     }
+}
+
+/// The sole unchanged computation for a validated SameShape/Keep operation.
+/// This clones an existing Arc: no ArrayData, Field, array/header or buffer is
+/// constructed. It grants no conversion capability; callers must establish
+/// their own exact selected/source contract before selecting this operation.
+pub fn share_same_structure_keep(array: &arrow_array::ArrayRef) -> arrow_array::ArrayRef {
+    Arc::clone(array)
+}
+
+/// The existing default same-carrier JSON-to-text CAST, including unchanged
+/// container layouts. The family matcher still owns all logical child changes;
+/// equal carriers alone cannot authorize the operation or narrow NULLs.
+pub fn is_default_json_text_keep(source: &FunctionValueType, target: &FunctionValueType) -> bool {
+    (!source.nullable() || target.nullable())
+        && arrow_data_types_exact(source.data_type(), target.data_type())
+        && pair_matches(JSON_TEXT, source, target)
+}
+pub fn is_default_json_text_keep_overload(overload: &FunctionOverloadId) -> bool {
+    overload.as_str() == JSON_TEXT
+}
+
+/// The current default host's exact original opaque CAST leaf. Other opaque
+/// containers and widths remain outside this opaque host port. This is a
+/// support check, not an overload resolver or proof.
+pub fn is_default_percentile_binary_keep(
+    source: &FunctionValueType,
+    target: &FunctionValueType,
+) -> bool {
+    source.logical_type() == ValueLogicalType::Percentile
+        && source.data_type() == &DataType::Binary
+        && target.logical_type() == ValueLogicalType::Physical
+        && matches!(
+            target.value_type().kind(),
+            novarocks_type_contract::ValueKind::Binary
+        )
+        && target.data_type() == &DataType::Binary
+        && source.nullable() == target.nullable()
+}
+pub fn is_default_percentile_binary_keep_overload(overload: &FunctionOverloadId) -> bool {
+    overload.as_str() == OPAQUE_BINARY
+}
+
+/// These exact installed conversions reuse the original default scalar CAST.
+/// The caller must first validate the complete frozen request and selection.
+/// Opaque or JSON structure conversions do not enter this dispatch by carrier.
+pub fn is_default_scalar_carrier_cast_overload(overload: &FunctionOverloadId) -> bool {
+    matches!(
+        overload.as_str(),
+        SIGNED_LARGEINT | LARGEINT_SIGNED | LARGEINT_FLOAT | LARGEINT_TEXT | NULL_LIFT
+    )
 }

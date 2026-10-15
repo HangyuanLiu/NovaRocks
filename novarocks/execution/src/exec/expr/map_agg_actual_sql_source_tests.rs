@@ -251,11 +251,11 @@ fn map_agg_actual_original_required_sql_full_signature_source() {
                         _ => panic!("actual MAP_AGG logical arguments are values"),
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(types[0].data_type, DataType::Utf8);
-                assert_eq!(types[1].data_type, DataType::Int32);
-                assert!(types.iter().all(|ty| ty.nullable));
+                assert_eq!(types[0].data_type().clone(), DataType::Utf8);
+                assert_eq!(types[1].data_type().clone(), DataType::Int32);
+                assert!(types.iter().all(|ty| ty.nullable()));
                 assert!(matches!(
-                    call.binding.function.result_type.data_type,
+                    call.binding.function.result_type.data_type(),
                     DataType::Map(_, false)
                 ));
                 assert_eq!(

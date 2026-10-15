@@ -96,6 +96,8 @@ pub(crate) enum PackageTypeChannel {
     CastTarget,
     Intermediate,
     Field(usize),
+    ScanExecutionValue(usize),
+    ScanSourceField(usize),
     CutImport(usize),
     CutProjection(usize),
     CutDestinationImport(usize),
@@ -118,9 +120,15 @@ pub(crate) struct PackageTypeOccurrence {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PackageTypeSource<'source> {
     Value(&'source p::ValueType),
+    MissingReadSchema,
     /// Cast stores a carrier only; this loan does not invent logical flags.
     Carrier(&'source DataType),
     StrictField(&'source Arc<Field>),
+    SourceField(&'source Arc<Field>),
+    ExecutionField {
+        field: &'source Arc<Field>,
+        value: &'source p::ValueType,
+    },
     /// The original immutable draft owns this inline field and writer law.
     WriterField {
         recipe: &'source ConnectorWriteRecipeDraft,
@@ -497,7 +505,7 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
         walk.emit(
             O::Constant(*id),
             C::ConstantField,
-            PackageTypeSource::StrictField(pool.field_ref()),
+            PackageTypeSource::SourceField(pool.field_ref()),
         )?;
         walk.completed()?;
     }
@@ -532,10 +540,35 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
         walk.completed()?;
     }
     for (node, scan) in package.scans() {
-        for (ordinal, field) in scan.public_facts().schema().fields().iter().enumerate() {
+        let public = scan.public_facts();
+        let (Some(execution), Some(source)) =
+            (public.execution_schema(), public.source_schema_facts())
+        else {
+            walk.emit(
+                O::Scan(*node),
+                C::Value,
+                PackageTypeSource::MissingReadSchema,
+            )?;
+            continue;
+        };
+        for (ordinal, (field, value)) in execution
+            .schema()
+            .fields()
+            .iter()
+            .zip(execution.bindings())
+            .enumerate()
+        {
+            walk.value(O::Scan(*node), C::ScanExecutionValue(ordinal), value)?;
             walk.emit(
                 O::Scan(*node),
                 C::Field(ordinal),
+                PackageTypeSource::ExecutionField { field, value },
+            )?;
+        }
+        for (ordinal, field) in source.shape().schema().fields().iter().enumerate() {
+            walk.emit(
+                O::Scan(*node),
+                C::ScanSourceField(ordinal),
                 PackageTypeSource::StrictField(field),
             )?;
         }

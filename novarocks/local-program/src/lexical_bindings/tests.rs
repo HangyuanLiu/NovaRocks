@@ -101,7 +101,9 @@ fn signature() -> Box<[FunctionArgumentType]> {
     Box::from([
         FunctionArgumentType::Value(int()),
         FunctionArgumentType::Lambda {
-            parameter_types: Box::from([int()]),
+            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                Box::from([int()]),
+            ),
             result_type: int(),
         },
     ])
@@ -149,7 +151,9 @@ impl FunctionBindingResolver for Owner {
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         let selected = FunctionBindingSelection {
             overload: oid(),
-            argument_types: signature(),
+            argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                signature(),
+            ),
             result_type: FunctionResultType::Scalar(int()),
             aggregate: None,
         };
@@ -163,7 +167,7 @@ impl FunctionBindingResolver for Owner {
         _control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         if selected.overload != oid()
-            || selected.argument_types != signature()
+            || selected.argument_types.as_slice() != signature().as_ref()
             || selected.result_type != FunctionResultType::Scalar(int())
             || selected.aggregate.is_some()
             || request.logical_argument_count != 2
@@ -512,13 +516,17 @@ fn build_project(
                 constant: None,
             },
             FunctionArgument::Lambda {
-                parameter_types: Box::from([int()]),
+                parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                    Box::from([int()]),
+                ),
                 result_type: int(),
             },
         ];
         let selected = Arc::new(FunctionBindingSelection {
             overload: oid(),
-            argument_types: signature(),
+            argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                signature(),
+            ),
             result_type: FunctionResultType::Scalar(int()),
             aggregate: None,
         });
@@ -1152,4 +1160,116 @@ fn nested_capture_transitively_retains_the_actual_prior_projected_producer() {
     let checked = construct(fixture).unwrap();
     assert_eq!(checked.lambdas()[&occurrence(2)].captures[0], projected(0));
     assert_eq!(checked.lambdas()[&occurrence(5)].captures[0], capture(2));
+}
+
+// These neutral-constructor probes observe actual request ports and finite
+// holders. They do not stand in for BE tracker or Native capture publication.
+struct LexicalCreationHold(Arc<std::sync::atomic::AtomicUsize>);
+impl novarocks_type_contract::ValueTypeStorageHold for LexicalCreationHold {}
+impl Drop for LexicalCreationHold {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+fn lexical_creation_storage(
+    exits: &Arc<std::sync::atomic::AtomicUsize>,
+) -> ValueTypeStorageLifetime {
+    ValueTypeStorageLifetime::held(Arc::new(LexicalCreationHold(exits.clone())))
+}
+#[test]
+fn lexical_created_maps_keep_retained_owner_after_temporary_and_creator_exit() {
+    let fixture = parameter_fixture();
+    let expected = construct(parameter_fixture()).unwrap();
+    let temporary_exits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let retained_exits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let temporary_events = std::cell::RefCell::new(Vec::new());
+    let retained_events = std::cell::RefCell::new(Vec::new());
+    let result = {
+        let mut tr = |layout: std::alloc::Layout| -> Result<(), u64> {
+            temporary_events.borrow_mut().push(layout.size());
+            Ok(())
+        };
+        let mut to = |bytes: usize| -> Result<(), u64> {
+            temporary_events.borrow_mut().push(bytes);
+            Ok(())
+        };
+        let mut rr = |layout: std::alloc::Layout| -> Result<(), u64> {
+            retained_events.borrow_mut().push(layout.size());
+            Ok(())
+        };
+        let mut ro = |bytes: usize| -> Result<(), u64> {
+            retained_events.borrow_mut().push(bytes);
+            Ok(())
+        };
+        let mut temporary = novarocks_type_contract::ValueSchemaCreation::new(
+            lexical_creation_storage(&temporary_exits),
+            &mut tr,
+            &mut to,
+        );
+        let mut retained = novarocks_type_contract::ValueSchemaCreation::new(
+            lexical_creation_storage(&retained_exits),
+            &mut rr,
+            &mut ro,
+        );
+        ProgramLexicalBindings::try_new_with_creator_in(
+            fixture.channels,
+            fixture.lambdas,
+            fixture.slots,
+            ValueTypeStorageLifetime::pure(),
+            &mut temporary,
+            &mut retained,
+            &Control::default(),
+        )
+        .unwrap()
+    };
+    assert_eq!(result.lambdas(), expected.lambdas());
+    assert_eq!(result.slots(), expected.slots());
+    assert!(!temporary_events.borrow().is_empty());
+    assert!(!retained_events.borrow().is_empty());
+    assert_eq!(temporary_exits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(retained_exits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let late = result.clone();
+    drop(result);
+    assert_eq!(retained_exits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(late);
+    assert_eq!(retained_exits.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+#[test]
+fn lexical_first_creator_cause_is_preserved_without_temporary_or_callback_tail() {
+    let fixture = parameter_fixture();
+    let calls = std::cell::Cell::new(0usize);
+    let mut reject = |_: std::alloc::Layout| -> Result<(), u64> {
+        panic!("first insertion uses opaque geometry")
+    };
+    let mut opaque = |_: usize| -> Result<(), u64> {
+        assert_eq!(calls.replace(calls.get() + 1), 0);
+        Err(91)
+    };
+    let mut temporary_request = |_: std::alloc::Layout| -> Result<(), u64> {
+        panic!("temporary callback after original refusal")
+    };
+    let mut temporary_opaque =
+        |_: usize| -> Result<(), u64> { panic!("temporary callback after original refusal") };
+    let mut temporary = novarocks_type_contract::ValueSchemaCreation::new(
+        ValueTypeStorageLifetime::pure(),
+        &mut temporary_request,
+        &mut temporary_opaque,
+    );
+    let mut retained = novarocks_type_contract::ValueSchemaCreation::new(
+        ValueTypeStorageLifetime::pure(),
+        &mut reject,
+        &mut opaque,
+    );
+    let error = ProgramLexicalBindings::try_new_with_creator_in(
+        fixture.channels,
+        fixture.lambdas,
+        fixture.slots,
+        ValueTypeStorageLifetime::pure(),
+        &mut temporary,
+        &mut retained,
+        &Control::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, ProgramCreationFailure::Creator(91)));
+    assert_eq!(calls.get(), 1);
 }

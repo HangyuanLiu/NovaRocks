@@ -76,11 +76,17 @@ fn hll_payload_aggregate_actual_original_required_sql_full_signature_source() {
                         panic!("actual original source payload")
                     };
                     assert_eq!(selected, value_type);
-                    assert_eq!(selected.data_type, DataType::Binary);
-                    assert!(selected.nullable);
-                    assert_eq!(call.binding.intermediate_type.data_type, DataType::Binary);
-                    assert_eq!(call.binding.function.result_type.data_type, output);
-                    assert!(call.binding.function.result_type.nullable);
+                    assert_eq!(selected.data_type().clone(), DataType::Binary);
+                    assert!(selected.nullable());
+                    assert_eq!(
+                        call.binding.intermediate_type.data_type().clone(),
+                        DataType::Binary
+                    );
+                    assert_eq!(
+                        call.binding.function.result_type.data_type().clone(),
+                        output
+                    );
+                    assert!(call.binding.function.result_type.nullable());
                     eprintln!(
                         "HLL_PAYLOAD actual source fragment={:?} definition={definition:?} binding={:?} request={request:?}",
                         fragment.id(),

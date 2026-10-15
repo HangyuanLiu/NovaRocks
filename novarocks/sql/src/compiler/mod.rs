@@ -43,7 +43,8 @@ pub use crate::planner::distributed::build::{
     SqlSourceJournalError,
 };
 pub use crate::planner::distributed::build::{
-    FragmentPackageSemantics, PackageSemanticsError, author_fragment_package_semantics,
+    FragmentPackageSemantics, NativeWriterPreparation, PackageSemanticsError,
+    author_fragment_package_semantics, author_native_writer_preparation,
     check_pure_call_definitions_observed,
 };
 #[cfg(test)]
@@ -517,6 +518,11 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
 }
 
 pub use crate::common::expr::{BinOp, LiteralValue, UnOp};
+pub(crate) mod materialized_values;
+pub use materialized_values::{
+    SqlConstantExpressionSite, SqlConstantExpressionStep, SqlConstantQueryStep,
+    SqlExpressionConstant, SqlExpressionConstants, SqlMaterializedValuesSite,
+};
 mod fold_observation;
 pub use fold_observation::{
     SqlFoldDependencyInput, SqlFoldDependencyObserver, SqlFoldDependencySource,
@@ -736,6 +742,10 @@ pub struct SqlStatementInput {
 enum SqlStatementInputKind {
     Sql(String),
     ParsedQuery(Box<novarocks_parser::ast::Query>),
+    MaterializedValuesQuery {
+        query: Box<novarocks_parser::ast::Query>,
+        source: materialized_values::MaterializedValues,
+    },
     /// A SQL-owned logical transformation that must re-enter the canonical
     /// optimizer kernel without reopening catalog resolution.  Application
     /// code uses this only after compiler-produced logical facts have been
@@ -757,6 +767,36 @@ impl SqlStatementInput {
         Self {
             kind: SqlStatementInputKind::ParsedQuery(query),
         }
+    }
+
+    /// A checked materialized relation is a distinct input owner, not a SQL
+    /// cast author or parser literal. The exact structural site belongs to the
+    /// same query; every constant retains its original immutable pool.
+    pub fn materialized_values_query(
+        query: Box<novarocks_parser::ast::Query>,
+        site: SqlMaterializedValuesSite,
+        rows: std::sync::Arc<[Box<[novarocks_functions::ConstantValue]>]>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, SqlCompileError> {
+        let source = materialized_values::MaterializedValues::try_new(&query, site, rows, control)?;
+        Ok(Self {
+            kind: SqlStatementInputKind::MaterializedValuesQuery { query, source },
+        })
+    }
+
+    /// Bind complete constants to exact expressions of the same owned query.
+    /// Other syntax uses its original analyzer and evaluation semantics.
+    pub fn query_with_expression_constants(
+        query: Box<novarocks_parser::ast::Query>,
+        constants: SqlExpressionConstants,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, SqlCompileError> {
+        let source = materialized_values::MaterializedValues::try_new_expressions(
+            &query, constants, control,
+        )?;
+        Ok(Self {
+            kind: SqlStatementInputKind::MaterializedValuesQuery { query, source },
+        })
     }
 
     pub(crate) fn logical_plan(
@@ -1568,7 +1608,7 @@ impl SqlCompiler {
                     )
                 })?;
                 let (resolved, ctes, mut factory) =
-                    crate::analyzer::analyze_with_function_catalog_and_sql_semantics(
+                    crate::analyzer::analyze_with_materialized_values_and_sql_semantics(
                         &query,
                         catalog,
                         &request.session.current_database,
@@ -1576,6 +1616,12 @@ impl SqlCompiler {
                         &request.session.sql_semantics,
                         request.constant_policy,
                         &request.control,
+                        match &request.statement.kind {
+                            SqlStatementInputKind::MaterializedValuesQuery { source, .. } => {
+                                Some(source)
+                            }
+                            _ => None,
+                        },
                     )
                     .map_err(SqlCompileError::from)?;
                 request.check_control()?;
@@ -1870,7 +1916,10 @@ fn parse_query(
 ) -> Result<novarocks_parser::ast::Query, SqlCompileError> {
     let sql = match &statement.kind {
         SqlStatementInputKind::Sql(sql) => sql,
-        SqlStatementInputKind::ParsedQuery(query) => return Ok((**query).clone()),
+        SqlStatementInputKind::ParsedQuery(query)
+        | SqlStatementInputKind::MaterializedValuesQuery { query, .. } => {
+            return Ok((**query).clone());
+        }
         SqlStatementInputKind::LogicalPlan { .. } => {
             return Err(SqlCompileError::InvalidRequest(
                 "logical SQL compiler input must bypass parsing".to_string(),
@@ -2720,7 +2769,6 @@ mod tests {
     #[test]
     fn array_agg_json_semantic_schema_survives_optimizer_and_exact_final_plan() {
         use arrow::datatypes::DataType;
-        use novarocks_types::logical::{LogicalType, logical_type_of_field};
         for sql in [
             "select array_agg(json_object('2:3')) as j, array_agg(cast(json_object('2:3') as varchar)) as s",
             "with q as (select cast(json_object('k',1) as json) as j) select array_agg(j) as j, array_agg(cast(j as varchar)) as s from q",
@@ -2774,24 +2822,21 @@ mod tests {
             .unwrap();
             let result = plan.plan().result_port().unwrap();
             assert_eq!(result.fields.len(), 2);
-            let DataType::List(json_item) = &result.fields[0].ty.data_type else {
+            let DataType::List(json_item) = &result.fields[0].ty.data_type() else {
                 panic!("expected JSON List");
             };
-            let DataType::List(string_item) = &result.fields[1].ty.data_type else {
+            let DataType::List(string_item) = &result.fields[1].ty.data_type() else {
                 panic!("expected STRING List");
             };
-            assert_eq!(logical_type_of_field(json_item), Some(LogicalType::Json));
-            assert_eq!(logical_type_of_field(string_item), None);
-            let field = arrow::datatypes::Field::new(
-                "j",
-                result.fields[0].ty.data_type.clone(),
-                result.fields[0].ty.nullable,
+            assert_eq!(json_item.metadata().capacity(), 0);
+            assert_eq!(string_item.metadata().capacity(), 0);
+            assert_eq!(
+                result.fields[0].ty.child_at(0).unwrap().logical_type(),
+                novarocks_type_contract::ValueLogicalType::Json
             );
-            assert!(
-                novarocks_types::FieldRenderSchema::from_field(&field)
-                    .list_item()
-                    .unwrap()
-                    .is_json_value()
+            assert_eq!(
+                result.fields[1].ty.child_at(0).unwrap().logical_type(),
+                novarocks_type_contract::ValueLogicalType::Physical
             );
             let mut aggregate_count = 0;
             for fragment in plan.plan().fragments().values() {
@@ -2803,7 +2848,8 @@ mod tests {
                                 call.binding.function.function_id.as_str(),
                                 "builtin.aggregate/array_agg/v1"
                             );
-                            let DataType::List(item) = &call.binding.function.result_type.data_type
+                            let DataType::List(item) =
+                                &call.binding.function.result_type.data_type()
                             else {
                                 panic!("expected physical aggregate List");
                             };
@@ -2812,15 +2858,29 @@ mod tests {
                             else {
                                 panic!("aggregate input must be a value");
                             };
-                            let expected = (input.logical_type
-                                == novarocks_type_contract::ValueLogicalType::Json)
-                                .then_some(LogicalType::Json);
-                            assert_eq!(logical_type_of_field(item), expected);
-                            let DataType::List(item) = &call.binding.intermediate_type.data_type
+                            assert_eq!(item.metadata().capacity(), 0);
+                            assert_eq!(
+                                call.binding
+                                    .function
+                                    .result_type
+                                    .child_at(0)
+                                    .unwrap()
+                                    .logical_type(),
+                                input.logical_type()
+                            );
+                            let DataType::List(item) = &call.binding.intermediate_type.data_type()
                             else {
-                                panic!("expected physical state List");
+                                panic!("expected state List")
                             };
-                            assert_eq!(logical_type_of_field(item), None);
+                            assert_eq!(item.metadata().capacity(), 0);
+                            assert_eq!(
+                                call.binding
+                                    .intermediate_type
+                                    .child_at(0)
+                                    .unwrap()
+                                    .logical_type(),
+                                input.logical_type()
+                            );
                         }
                     }
                 }
@@ -2828,6 +2888,71 @@ mod tests {
             if sql.contains("array_agg") {
                 assert!(aggregate_count >= 1);
             }
+        }
+    }
+
+    #[test]
+    fn ordered_array_agg_nullable_json_union_reaches_exact_final_plan() {
+        // Exact original public SQL source, using the ordinary builtin catalog
+        // and compiler path, not a hand-built selected signature or expression.
+        let sql = "WITH q AS (SELECT 1 AS n, json_object('k',1) AS j UNION ALL SELECT 2, json_object('k',2) UNION ALL SELECT 3, NULL) SELECT array_agg(j ORDER BY n) AS json_values, array_agg(CAST(j AS VARCHAR) ORDER BY n) AS string_values FROM q";
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
+        let cancellation = Arc::new(Cancellation::default());
+        let request = SqlAnalyzeRequest::new(
+            SqlStatementInput::sql(sql),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
+                current_catalog: None,
+                current_database: "default".into(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            &catalog_snapshot,
+            crate::functions::builtin_sql_function_catalog(),
+            noop_constant_evaluator(),
+            None,
+            crate::constant::test_constant_policy(),
+            SqlPhysicalEmissionMode::OriginalNativeV1,
+            control(None, &cancellation),
+        );
+        let optimized = analyze_then_optimize(request)
+            .unwrap()
+            .into_optimized_output()
+            .unwrap();
+        let physical =
+            crate::planner::optimizer_bridge::to_physical_plan(&optimized.optimized_tree).unwrap();
+        let authored = crate::planner::distributed::build::lower_final_physical_plan(
+            &physical,
+            novarocks_physical_plan::PlanVersionId::try_new([41; 16]).unwrap(),
+            novarocks_physical_plan::PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            optimized.function_catalog,
+            optimized.root_allow_throw_exception,
+            crate::constant::test_constant_policy(),
+            SqlPhysicalEmissionMode::OriginalNativeV1,
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .finish_observed(&SqlCompileControl::unbounded())
+        .unwrap();
+        let output = authored.plan().result_port().unwrap();
+        assert_eq!(output.fields.len(), 2);
+        for (field, domain) in output.fields.iter().zip([
+            novarocks_type_contract::ValueLogicalType::Json,
+            novarocks_type_contract::ValueLogicalType::Physical,
+        ]) {
+            let arrow::datatypes::DataType::List(item) = field.ty.data_type() else {
+                panic!("the original aggregate output must remain a List");
+            };
+            assert_eq!(item.metadata().capacity(), 0);
+            let child = field.ty.child_at(0).unwrap();
+            assert!(child.nullable(), "the original UNION includes SQL NULL");
+            assert_eq!(child.logical_type(), domain);
         }
     }
 
@@ -3169,12 +3294,12 @@ mod tests {
         };
         assert!(
             args.iter()
-                .all(|arg| arg.value_type.data_type == DataType::Float64)
+                .all(|arg| *arg.value_type.data_type() == DataType::Float64)
         );
         assert!(binding.selected.argument_types.iter().all(|arg| matches!(arg,
-            novarocks_functions::FunctionArgumentType::Value(value) if value.data_type == DataType::Float64)));
-        assert_eq!(field.value_type.data_type, DataType::Int32);
-        assert!(!field.value_type.nullable);
+            novarocks_functions::FunctionArgumentType::Value(value) if *value.data_type() == DataType::Float64)));
+        assert_eq!(field.value_type.data_type().clone(), DataType::Int32);
+        assert!(!field.value_type.nullable());
     }
 
     #[test]
@@ -3245,8 +3370,8 @@ mod tests {
             .unwrap();
             let result = plan.plan().result_port().unwrap();
             assert_eq!(result.fields.len(), 1);
-            assert_eq!(result.fields[0].ty.data_type, expected);
-            assert!(result.fields[0].ty.nullable);
+            assert_eq!(result.fields[0].ty.data_type().clone(), expected);
+            assert!(result.fields[0].ty.nullable());
         }
     }
 

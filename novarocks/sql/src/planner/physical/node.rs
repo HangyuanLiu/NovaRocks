@@ -344,7 +344,7 @@ pub(crate) fn hash_aggregate_outputs_intermediate(mode: AggMode) -> bool {
 pub(crate) fn aggregate_intermediate_type(call: &AggregateCall) -> Result<DataType, String> {
     Ok(crate::functions::aggregate_selection(call.source.binding())
         .intermediate_type
-        .data_type
+        .data_type()
         .clone())
 }
 
@@ -371,7 +371,7 @@ mod aggregate_wire_tests {
         AggregateCall {
             name: name.to_string(),
             distinct,
-            result_type: DataType::Int64,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             output_column_id: ColumnId::new_for_test(1),
             source: crate::binding::AggregateArgumentSource::uncertified(
                 args.into_iter()

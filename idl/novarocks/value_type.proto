@@ -1,0 +1,132 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.value_type;
+
+// Shared recursive semantic vocabulary. All children are explicit references
+// into the owner's flat namespace; zero is valid when presence is explicit.
+// Physical offset widths and per-batch encoding do not belong to this table.
+message LogicalTypeDefinition {
+  optional uint32 id = 1;
+  bool nullable = 2;
+  oneof kind {
+    ScalarValue scalar = 3;
+    NominalValue nominal = 4;
+    uint32 list_item_type_id = 5;
+    FixedSizeListValue fixed_size_list = 6;
+    StructValue struct_value = 7;
+    MapValue map_value = 8;
+    UnionValue union_value = 9;
+  }
+}
+
+// Parameters are authored, never inferred from actual data. Codecs validate
+// the parameter grammar for the selected kind and reject irrelevant fields.
+message ScalarValue {
+  ScalarKind kind = 1;
+  optional int32 fixed_binary_width = 2;
+  optional uint32 precision = 3;
+  optional sint32 scale = 4;
+  optional TimeUnit time_unit = 5;
+  optional string timezone = 6;
+  optional IntervalUnit interval_unit = 7;
+}
+
+enum ScalarKind {
+  SCALAR_KIND_UNSPECIFIED = 0;
+  SCALAR_KIND_NULL = 1;
+  SCALAR_KIND_BOOLEAN = 2;
+  SCALAR_KIND_INT8 = 3;
+  SCALAR_KIND_INT16 = 4;
+  SCALAR_KIND_INT32 = 5;
+  SCALAR_KIND_INT64 = 6;
+  SCALAR_KIND_UINT8 = 7;
+  SCALAR_KIND_UINT16 = 8;
+  SCALAR_KIND_UINT32 = 9;
+  SCALAR_KIND_UINT64 = 10;
+  SCALAR_KIND_FLOAT16 = 11;
+  SCALAR_KIND_FLOAT32 = 12;
+  SCALAR_KIND_FLOAT64 = 13;
+  SCALAR_KIND_STRING = 14;
+  SCALAR_KIND_BINARY = 15;
+  SCALAR_KIND_FIXED_SIZE_BINARY = 16;
+  SCALAR_KIND_DATE32 = 17;
+  SCALAR_KIND_DATE64 = 18;
+  SCALAR_KIND_TIMESTAMP = 19;
+  SCALAR_KIND_TIME32 = 20;
+  SCALAR_KIND_TIME64 = 21;
+  SCALAR_KIND_DURATION = 22;
+  SCALAR_KIND_INTERVAL = 23;
+  SCALAR_KIND_DECIMAL32 = 24;
+  SCALAR_KIND_DECIMAL64 = 25;
+  SCALAR_KIND_DECIMAL128 = 26;
+  SCALAR_KIND_DECIMAL256 = 27;
+}
+
+enum NominalValue {
+  NOMINAL_VALUE_UNSPECIFIED = 0;
+  NOMINAL_VALUE_JSON = 1;
+  NOMINAL_VALUE_VARIANT = 2;
+  NOMINAL_VALUE_HLL = 3;
+  NOMINAL_VALUE_BITMAP = 4;
+  NOMINAL_VALUE_OBJECT = 5;
+  NOMINAL_VALUE_PERCENTILE = 6;
+  NOMINAL_VALUE_LARGE_INT = 7;
+  NOMINAL_VALUE_UUID = 8;
+}
+
+enum TimeUnit {
+  TIME_UNIT_UNSPECIFIED = 0;
+  TIME_UNIT_SECOND = 1;
+  TIME_UNIT_MILLISECOND = 2;
+  TIME_UNIT_MICROSECOND = 3;
+  TIME_UNIT_NANOSECOND = 4;
+}
+
+enum IntervalUnit {
+  INTERVAL_UNIT_UNSPECIFIED = 0;
+  INTERVAL_UNIT_YEAR_MONTH = 1;
+  INTERVAL_UNIT_DAY_TIME = 2;
+  INTERVAL_UNIT_MONTH_DAY_NANO = 3;
+}
+
+message FixedSizeListValue {
+  optional uint32 item_type_id = 1;
+  int32 length = 2;
+}
+
+// Names belong to named SQL structures. List/Map roles use dedicated fields.
+message NamedValueField {
+  string name = 1;
+  optional uint32 value_type_id = 2;
+}
+message StructValue {
+  repeated NamedValueField fields = 1;
+}
+message MapValue {
+  optional uint32 key_type_id = 1;
+  optional uint32 value_type_id = 2;
+}
+message UnionValueField {
+  int32 type_id = 1;
+  NamedValueField field = 2;
+}
+message UnionValue {
+  repeated UnionValueField fields = 1;
+}

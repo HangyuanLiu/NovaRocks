@@ -186,10 +186,9 @@ fn apply_plan_inner(
     let win_id = factory.borrow_mut().create(
         None,
         format!("{}_window", m.inner_agg.name),
-        novarocks_type_contract::FunctionValueType {
-            nullable: true,
-            ..m.inner_agg_output.value_type.clone()
-        },
+        (m.inner_agg_output.value_type.clone())
+            .with_nullable(true)
+            .expect("valid value root nullability transform"),
     );
     let win_expr = crate::optimizer::operator::ScalarWindowSpec {
         output_column_id: win_id,
@@ -207,10 +206,9 @@ fn apply_plan_inner(
     let win_output = OutputColumn {
         column_id: win_id,
         name: format!("{}_window", m.inner_agg.name),
-        value_type: novarocks_type_contract::FunctionValueType {
-            nullable: true,
-            ..m.inner_agg_output.value_type.clone()
-        },
+        value_type: (m.inner_agg_output.value_type.clone())
+            .with_nullable(true)
+            .expect("valid value root nullability transform"),
 
         is_internal: true,
     };
@@ -915,7 +913,10 @@ mod tests {
                 aggregates: vec![AggregateCall {
                     name: "avg".to_string(),
                     distinct: false,
-                    result_type: DataType::Float64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Float64,
+                        true,
+                    ),
                     output_column_id: AVG_RESULT,
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)],
@@ -1874,7 +1875,10 @@ mod tests {
             aggregates: vec![AggregateCall {
                 name: "avg".to_string(),
                 distinct: false,
-                result_type: DataType::Float64,
+                result_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Float64,
+                    true,
+                ),
                 output_column_id: AVG_RESULT,
                 source: crate::binding::AggregateArgumentSource::uncertified(
                     vec![col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)],
@@ -2126,7 +2130,10 @@ mod tests {
                 aggregates: vec![AggregateCall {
                     name: "avg".to_string(),
                     distinct: false,
-                    result_type: DataType::Float64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Float64,
+                        true,
+                    ),
                     output_column_id: AVG_RESULT,
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)],

@@ -424,14 +424,14 @@ impl DsHllKernel {
             }
             let source = EmissionStates(owned);
             let output = if intermediate {
-                &self.contract.intermediate_type().data_type
+                self.contract.intermediate_type().data_type()
             } else {
                 let FunctionResultType::Scalar(output) =
                     &self.contract.call().selected().result_type
                 else {
                     return Err(invalid("DS HLL result is not scalar").into());
                 };
-                &output.data_type
+                output.data_type()
             };
             let mut sink = FailureSink {
                 allocator: &allocator,
@@ -784,8 +784,8 @@ pub(super) fn validate_contract(
     let FunctionResultType::Scalar(output) = &contract.call().selected().result_type else {
         return Err(invalid("DS HLL requires its original scalar result"));
     };
-    if !matches!(output.data_type, DataType::Int64 | DataType::Binary)
-        || contract.intermediate_type().data_type != DataType::Binary
+    if !matches!(output.data_type(), DataType::Int64 | DataType::Binary)
+        || contract.intermediate_type().data_type() != &DataType::Binary
     {
         return Err(invalid(
             "DS HLL selected result or state differs from its original profile",

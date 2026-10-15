@@ -75,7 +75,7 @@ pub(super) fn definition(
 struct TemporalOwner {
     operation: TemporalSourceKind,
     declaration: FunctionBindingDeclaration,
-    resolver: BuiltinScalarResolver,
+    resolver: Arc<BuiltinScalarResolver>,
     implementations: Box<[PureImplementationDeclaration]>,
 }
 impl TemporalOwner {
@@ -116,7 +116,7 @@ impl TemporalOwner {
         Ok(Self {
             operation,
             declaration,
-            resolver,
+            resolver: Arc::new(resolver),
             implementations,
         })
     }
@@ -164,6 +164,10 @@ impl FunctionBindingResolver for TemporalOwner {
     }
 }
 impl PureFunctionMetadataOwner for TemporalOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -201,6 +205,31 @@ impl FunctionEffectOwner for TemporalOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
+        self.refine_selected_core(input, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_selected_core(input, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
+    }
+}
+
+impl TemporalOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
         binding_control::scope(control, |work| {
             work.step()?;
             if input.function_id != self.declaration.function_id()
@@ -242,9 +271,9 @@ impl FunctionEffectOwner for TemporalOwner {
                 crate::FunctionArgumentType::Value(ty) => ty,
                 _ => return Err(FunctionBindingError::NoMatchingOverload),
             };
-            if first.logical_type != novarocks_type_contract::ValueLogicalType::Physical
+            if first.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
                 || !matches!(
-                    first.data_type,
+                    first.data_type(),
                     arrow_schema::DataType::Utf8
                         | arrow_schema::DataType::Date32
                         | arrow_schema::DataType::Timestamp(
@@ -268,7 +297,7 @@ impl FunctionEffectOwner for TemporalOwner {
                     // Original raw override admission is Arrow Utf8, including
                     // an explicitly declared JSON/Variant UTF8 source domain.
                     TemporalSourceRole::RawOverride => {
-                        channel.value_type.data_type == arrow_schema::DataType::Utf8
+                        *channel.value_type.data_type() == arrow_schema::DataType::Utf8
                     }
                     TemporalSourceRole::Format => match &input.selected.argument_types[1] {
                         crate::FunctionArgumentType::Value(expected) => {
@@ -277,20 +306,20 @@ impl FunctionEffectOwner for TemporalOwner {
                         _ => false,
                     },
                     TemporalSourceRole::OriginalSeconds => {
-                        channel.value_type.logical_type
+                        channel.value_type.logical_type()
                             == novarocks_type_contract::ValueLogicalType::Physical
-                            && channel.value_type.data_type == arrow_schema::DataType::Int64
+                            && *channel.value_type.data_type() == arrow_schema::DataType::Int64
                     }
                     TemporalSourceRole::ImmediateCastSource => {
                         matches!(facts.shape(), TemporalSourceShape::SecondsCastString)
-                            == (channel.value_type.data_type == arrow_schema::DataType::Utf8)
+                            == (*channel.value_type.data_type() == arrow_schema::DataType::Utf8)
                     }
                     // The original deepest-source branch uses the sole Arrow cast;
                     // admission checks its declared carrier, never guessed source text.
                     TemporalSourceRole::DeepestCastSource => {
                         work.flush()?;
                         let valid = arrow_cast::can_cast_types(
-                            &channel.value_type.data_type,
+                            channel.value_type.data_type(),
                             &arrow_schema::DataType::Utf8,
                         );
                         work.flush()?;
@@ -303,7 +332,7 @@ impl FunctionEffectOwner for TemporalOwner {
             }
             binding_control::request_types(input.request, work)?;
             work.flush()?;
-            self.validate_selected(input.selected, input.request, control)?;
+            validate()?;
             work.step()?;
             let mut effects = self.call_effects(input.proof_scope);
             if facts.shape() != TemporalSourceShape::SecondsCastOther {

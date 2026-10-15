@@ -142,8 +142,8 @@ fn lower_column(
         .columns
         .iter()
         .find(|output| output.column_id == *column_id)?;
-    if output.value_type.data_type != expression.value_type.data_type
-        || output.value_type.nullable != expression.value_type.nullable
+    if output.value_type.data_type() != expression.value_type.data_type()
+        || output.value_type.nullable() != expression.value_type.nullable()
     {
         return None;
     }
@@ -203,8 +203,8 @@ fn single_range(value_type: ConnectorValueType, low: Bound, high: Bound) -> Opti
 
 fn lower_literal(expression: &TypedExpr, expected: ConnectorValueType) -> Option<ConnectorValue> {
     let expression = unnest(expression);
-    if expression.value_type.nullable
-        || exact_predicate_value_type(&expression.value_type.data_type)? != expected
+    if expression.value_type.nullable()
+        || exact_predicate_value_type(&expression.value_type.data_type())? != expected
     {
         return None;
     }
@@ -467,8 +467,14 @@ mod tests {
         for data_type in composite_types {
             for negated in [false, true] {
                 let mut expression = column_ref();
-                expression.value_type.data_type = data_type.clone();
-                expression.value_type.nullable = true;
+                expression.value_type =
+                    novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                        data_type.clone(),
+                        expression.value_type.nullable(),
+                        expression.value_type.logical_type(),
+                    )
+                    .unwrap();
+                expression.value_type = expression.value_type.with_nullable(true).unwrap();
                 let predicate = TypedExpr {
                     kind: ExprKind::IsNull {
                         expr: Box::new(expression),
@@ -480,8 +486,15 @@ mod tests {
                     ),
                 };
                 let mut scan = scan(vec![predicate]);
-                scan.columns[0].value_type.data_type = data_type.clone();
-                scan.columns[0].value_type.nullable = true;
+                scan.columns[0].value_type =
+                    novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                        data_type.clone(),
+                        scan.columns[0].value_type.nullable(),
+                        scan.columns[0].value_type.logical_type(),
+                    )
+                    .unwrap();
+                scan.columns[0].value_type =
+                    scan.columns[0].value_type.with_nullable(true).unwrap();
                 let columns = BTreeMap::from([(
                     ColumnId(1),
                     ProviderPredicateColumn {

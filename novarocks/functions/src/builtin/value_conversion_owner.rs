@@ -37,11 +37,15 @@ use crate::{
     SelectedValues,
 };
 
-fn implementation_pairs() -> [(&'static str, &'static str); 6] {
+fn implementation_pairs() -> [(&'static str, &'static str); 7] {
     [
         (
             value_conversion::JSON_TEXT,
             "builtin.scalar/value_domain_conversion/json_text_same_structure/selected-v1",
+        ),
+        (
+            value_conversion::OPAQUE_BINARY,
+            "builtin.scalar/value_domain_conversion/opaque_to_binary_same_structure/selected-v1",
         ),
         (
             value_conversion::SIGNED_LARGEINT,
@@ -83,7 +87,7 @@ pub(super) fn definition(
 }
 
 struct ValueConversionOwner {
-    resolver: ValueConversionResolver,
+    resolver: Arc<ValueConversionResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
@@ -129,7 +133,7 @@ impl ValueConversionOwner {
             })
             .collect::<Result<_, FunctionCatalogError>>()?;
         Ok(Self {
-            resolver,
+            resolver: Arc::new(resolver),
             declaration,
             implementations,
         })
@@ -180,6 +184,10 @@ impl FunctionBindingResolver for ValueConversionOwner {
 }
 
 impl PureFunctionMetadataOwner for ValueConversionOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::borrowed_conversion(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -207,40 +215,21 @@ impl FunctionEffectOwner for ValueConversionOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        let result = (|| {
-            let identity = input.function_id == self.declaration.function_id()
-                && input.kind == FunctionKind::Scalar;
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if !identity {
-                return Err(FunctionBindingError::UnknownFunction.into());
-            }
-            let scope = matches!(input.proof_scope, CallProofScope::Unconditional)
-                || input.proof_scope == CallProofScope::Domain(input.context.domain);
-            let environment = input.environment.is_empty();
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if !scope || !environment {
-                return Err(FunctionBindingError::InvalidBinding(
-                    "value conversion requires its exact proof scope and no environment".into(),
-                )
-                .into());
-            }
-            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        self.refine_selected_core(input, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => {
-                        FunctionEffectOwnerError::Control(error)
-                    }
-                    other => FunctionEffectOwnerError::Owner(other),
-                })?;
-            Ok(self.call_effects(input.proof_scope))
-        })();
-        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
-            return result;
-        }
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        result
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_selected_core(input, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -251,51 +240,21 @@ impl PureScalarImplementation for ValueConversionOwner {
         contract: Arc<ScalarCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        let result = (|| {
-            let exact = input.function_id == self.declaration.function_id()
-                && input.kind == FunctionKind::Scalar
-                && contract.function_id() == input.function_id
-                && std::ptr::eq(contract.selected(), input.selected)
-                && contract.context() == input.context
-                && contract.decimal_overflow_policy() == input.decimal_overflow_policy
-                && contract.effects() == &self.call_effects(input.proof_scope)
-                && input.environment.is_empty();
-            work.step().map_err(compile_failure)?;
-            if !exact {
-                return Err(invalid(
-                    "value conversion differs from its exact checked call",
-                ));
-            }
-            work.flush().map_err(compile_failure)?;
+        self.prepare_selected_core(input, contract, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => compile_failure(error),
-                    _ => invalid("value conversion preparation has a stale selected binding"),
-                })?;
-            work.flush().map_err(compile_failure)?;
-            let recipe = ConversionRecipe::try_new(&contract, control)?;
-            let recipe_retained_bytes = recipe.retained_bytes();
-            // Recipe data is immutable and shared. No instance compiles it again
-            // or acquires a runtime capability; preparation retains no control.
-            let prepared: Arc<dyn PreparedScalarKernel> = Arc::new(PreparedConversion {
-                contract,
-                recipe: Arc::new(recipe),
-                _recipe_retained_bytes: recipe_retained_bytes,
-            });
-            Ok(prepared)
-        })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
-            return result;
-        }
-        work.finish().map_err(compile_failure)?;
-        result
+        })
+    }
+    fn prepare_scalar_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_selected_core(input, contract, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -365,3 +324,96 @@ pub(super) fn prepared_for_test_with_policy(
 #[cfg(test)]
 #[path = "value_conversion_owner_tests.rs"]
 mod tests;
+
+impl ValueConversionOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        let result = (|| {
+            let identity = input.function_id == self.declaration.function_id()
+                && input.kind == FunctionKind::Scalar;
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if !identity {
+                return Err(FunctionBindingError::UnknownFunction.into());
+            }
+            let scope = matches!(input.proof_scope, CallProofScope::Unconditional)
+                || input.proof_scope == CallProofScope::Domain(input.context.domain);
+            let environment = input.environment.is_empty();
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if !scope || !environment {
+                return Err(FunctionBindingError::InvalidBinding(
+                    "value conversion requires its exact proof scope and no environment".into(),
+                )
+                .into());
+            }
+            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+                other => FunctionEffectOwnerError::Owner(other),
+            })?;
+            Ok(self.call_effects(input.proof_scope))
+        })();
+        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
+            return result;
+        }
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        result
+    }
+    fn prepare_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        let result = (|| {
+            let exact = input.function_id == self.declaration.function_id()
+                && input.kind == FunctionKind::Scalar
+                && contract.function_id() == input.function_id
+                && std::ptr::eq(contract.selected(), input.selected)
+                && contract.context() == input.context
+                && contract.decimal_overflow_policy() == input.decimal_overflow_policy
+                && contract.effects() == &self.call_effects(input.proof_scope)
+                && input.environment.is_empty();
+            work.step().map_err(compile_failure)?;
+            if !exact {
+                return Err(invalid(
+                    "value conversion differs from its exact checked call",
+                ));
+            }
+            work.flush().map_err(compile_failure)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => compile_failure(error),
+                _ => invalid("value conversion preparation has a stale selected binding"),
+            })?;
+            work.flush().map_err(compile_failure)?;
+            let recipe = ConversionRecipe::try_new(&contract, control)?;
+            let recipe_retained_bytes = recipe.retained_bytes();
+            // Recipe data is immutable and shared. No instance compiles it again
+            // or acquires a runtime capability; preparation retains no control.
+            let prepared: Arc<dyn PreparedScalarKernel> = Arc::new(PreparedConversion {
+                contract,
+                recipe: Arc::new(recipe),
+                _recipe_retained_bytes: recipe_retained_bytes,
+            });
+            Ok(prepared)
+        })();
+        if matches!(
+            &result,
+            Err(KernelFailure::Cancelled
+                | KernelFailure::DeadlineExceeded
+                | KernelFailure::ResourceExhausted)
+        ) {
+            return result;
+        }
+        work.finish().map_err(compile_failure)?;
+        result
+    }
+}

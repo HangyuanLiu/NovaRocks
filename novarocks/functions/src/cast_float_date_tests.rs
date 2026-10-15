@@ -83,7 +83,7 @@ fn recipe(
 ) -> PreparedCastRecipe {
     PreparedCastRecipe::try_new(
         CastOperation::Carrier,
-        &FunctionValueType::new(ty(wide), source_nullable),
+        &FunctionValueType::from_legacy_declared_projection(ty(wide), source_nullable),
         &FunctionValueType::new(DataType::Date32, result_nullable),
         policy,
         allow,
@@ -118,7 +118,10 @@ fn float_date_exact_nullability_successful_null_effect_and_all_policy_profiles()
                         ));
                         let result = PreparedCastRecipe::try_new(
                             CastOperation::Carrier,
-                            &FunctionValueType::new(ty(wide), source_nullable),
+                            &FunctionValueType::from_legacy_declared_projection(
+                                ty(wide),
+                                source_nullable,
+                            ),
                             &FunctionValueType::new(DataType::Date32, result_nullable),
                             policy,
                             allow,
@@ -131,7 +134,10 @@ fn float_date_exact_nullability_successful_null_effect_and_all_policy_profiles()
                         let r = result.unwrap();
                         assert_eq!(
                             r.source_type(),
-                            &FunctionValueType::new(ty(wide), source_nullable)
+                            &FunctionValueType::from_legacy_declared_projection(
+                                ty(wide),
+                                source_nullable
+                            )
                         );
                         assert_eq!(
                             r.result_type(),
@@ -174,7 +180,7 @@ fn float_date_nonzero_pool_ordinal_scalar_selected_origin_and_null_constant() {
             wide,
             vec![Some(f64::NAN), Some(19700102.0), None, Some(20240228.0)],
         );
-        let source = FunctionValueType::new(ty(wide), true);
+        let source = FunctionValueType::from_legacy_declared_projection(ty(wide), true);
         let pool = ConstantPool::try_new(
             Arc::new(source.try_to_field("original-float-constant").unwrap()),
             source,

@@ -57,7 +57,13 @@ pub fn decode_range_leaf(
         return Err(ArtifactCodecError::TrailingBytes);
     }
     let (keys, comparator_digest, timezone_bytes) = decode_contract(contract)?;
-    if comparator_digest != expected.comparator_digest() || keys != expected.keys() {
+    if comparator_digest != expected.comparator_digest()
+        || keys.len() != expected.keys().len()
+        || !keys
+            .iter()
+            .zip(expected.keys())
+            .all(|(actual, expected)| actual.same_physical_key(expected))
+    {
         return Err(ArtifactCodecError::ContractViolation);
     }
     let bound = decode_tuple(tuple, expected)?;
@@ -434,6 +440,22 @@ mod tests {
     use novarocks_execution::runtime_filter::contribution::{
         RuntimeOrderKey, RuntimeOrderNullOrder, RuntimeOrderSortDirection,
     };
+    #[test]
+    fn physical_range_frame_binds_to_an_existing_complete_typed_channel() {
+        let typed = RuntimeOrderKey::with_value_type(
+            novarocks_execution::runtime_filter::FunctionValueType::new(DataType::Int64, true),
+            RuntimeOrderSortDirection::Ascending,
+            RuntimeOrderNullOrder::Last,
+        );
+        let contract = RuntimeOrderContract::from_frozen([typed], [3; 32], [7; 32]);
+        let tuple = OrderedTuple::new([Some(OrderedScalar::Int64(9))]);
+        let bytes = encode_range_leaf(&contract, &tuple, LogicalVersion::FIRST).unwrap();
+        let (_, layout) =
+            decode_range_leaf(&bytes, &contract, LogicalVersion::FIRST, 4096).unwrap();
+        assert_eq!(layout.key_count, 1);
+        assert!(contract.keys()[0].value_type().is_some());
+    }
+
     #[test]
     fn nrrg_is_canonical_for_an_ordered_int64_bound() {
         let contract = RuntimeOrderContract::from_frozen(

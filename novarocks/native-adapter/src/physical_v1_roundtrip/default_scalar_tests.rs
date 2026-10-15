@@ -1,0 +1,1176 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Real FE encoding and default Native lowering/evaluation, with the original
+//! checked request and actual BE construction owner.
+use super::*;
+use arrow::array::{ArrayRef, Int16Array, Int32Array, StringArray};
+use novarocks_functions::{
+    FunctionArgument, FunctionBindingRequest, FunctionKind, FunctionResultType,
+};
+use novarocks_physical_plan::{
+    BoundFunction, ConstantPool, ConstantPoolId, ConstantReference, LegacyBindingMetadata,
+    PhysicalCallDefinition, PhysicalCallRequest, StaticFunctionArgument,
+};
+use novarocks_type_contract::{
+    CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
+};
+
+fn policy() -> novarocks_functions::ConstantPolicy {
+    novarocks_functions::ConstantPolicy {
+        max_rows: 16,
+        max_array_nodes: 128,
+        max_logical_elements: 1024,
+        max_retained_buffer_bytes: 1 << 20,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 20,
+        max_library_validation_bytes: 1 << 20,
+    }
+}
+
+fn encoded_constant_call(name: &str, argument: ValueType, array: ArrayRef) -> plan::PlanFragment {
+    encoded_constant_call_with_coercion(name, argument, array, None)
+}
+fn encoded_constant_call_with_coercion(
+    name: &str,
+    argument: ValueType,
+    array: ArrayRef,
+    coerced: Option<ValueType>,
+) -> plan::PlanFragment {
+    encoded_constant_call_with_target(name, argument, array, coerced, None)
+}
+fn encoded_constant_call_with_target(
+    name: &str,
+    argument: ValueType,
+    array: ArrayRef,
+    coerced: Option<ValueType>,
+    expected_target: Option<ValueType>,
+) -> plan::PlanFragment {
+    let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
+    let pool = ConstantPool::try_new(
+        Arc::new(arrow::datatypes::Field::new(
+            "original literal",
+            argument.data_type().clone(),
+            argument.nullable(),
+        )),
+        argument.clone(),
+        array.to_data(),
+        policy(),
+        CompilePhase::Encode,
+        compile_control(),
+    )
+    .unwrap();
+    let reference = ConstantReference {
+        pool: ConstantPoolId::new(37),
+        ordinal: 0,
+    };
+    let original_value = pool.value(0).unwrap();
+    let call_argument = coerced.as_ref().unwrap_or(&argument).clone();
+    let original_constant = if coerced.is_some() {
+        None
+    } else {
+        Some(reference)
+    };
+    let arguments = [FunctionArgument::Value {
+        value_type: call_argument.clone(),
+        constant: if coerced.is_some() {
+            None
+        } else {
+            Some(original_value)
+        },
+    }];
+    let request = FunctionBindingRequest {
+        arguments: &arguments,
+        logical_argument_count: 1,
+        expected_result_type: expected_target.as_ref(),
+    };
+    let resolved = if expected_target.is_some() {
+        // The original SQL converter author is a hidden trusted declaration;
+        // its exact target is frozen in the original request, not guessed in BE.
+        catalog.resolve_bound_trusted(name, FunctionKind::Scalar, request, compile_control())
+    } else {
+        catalog.resolve_bound_user(name, FunctionKind::Scalar, request, compile_control())
+    }
+    .unwrap();
+    let FunctionResultType::Scalar(result) = &resolved.selected.result_type else {
+        panic!("real scalar result")
+    };
+    let result = result.clone();
+    let function = BoundFunction {
+        function_id: resolved.function_id,
+        overload: resolved.selected.overload,
+        kind: resolved.kind,
+        argument_types: resolved.selected.argument_types,
+        result_type: result.clone(),
+        legacy_metadata: Some(LegacyBindingMetadata {
+            volatility: resolved.semantics.volatility,
+            argument_evaluation: resolved.semantics.argument_evaluation,
+            failure_behavior: resolved.semantics.failure_behavior,
+            intrinsic_row_error: resolved.semantics.intrinsic_row_error,
+            semantic_parameters: Box::default(),
+        }),
+    };
+    let mut builder = FragmentBuilder::new(FragmentId::new(73));
+    let node = builder.reserve_node_id().unwrap();
+    let literal = builder
+        .add_expression(node, argument.clone(), ExprKind::Constant(reference))
+        .unwrap();
+    let allow = novarocks_type_contract::SemanticParameterRef {
+        id: novarocks_type_contract::SemanticParameterId::new(11),
+        expected_key: novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+    };
+    let literal = if let Some(target) = &coerced {
+        builder
+            .add_expression(
+                node,
+                target.clone(),
+                ExprKind::Cast {
+                    expr: literal,
+                    target: target.data_type().clone(),
+                    decimal_overflow_policy:
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    allow_throw_exception: allow,
+                },
+            )
+            .unwrap()
+    } else {
+        literal
+    };
+    let call = builder
+        .add_expression(
+            node,
+            result.clone(),
+            ExprKind::FunctionCall {
+                function,
+                args: Box::from([literal]),
+            },
+        )
+        .unwrap();
+    let output = builder
+        .add_value(
+            result.clone(),
+            ValueOrigin::NodeOutput {
+                node,
+                output_ordinal: 0,
+            },
+        )
+        .unwrap();
+    builder
+        .insert_node_unchecked(PhysicalNode {
+            id: node,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: singleton_properties(),
+            output: OutputPort {
+                node,
+                columns: Box::from([output]),
+            },
+            kind: NodeKind::Values {
+                rows: Box::from([Box::from([call])]),
+            },
+        })
+        .unwrap();
+    let fragment = builder
+        .finish_definition(
+            node,
+            FragmentSink::Result,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+        )
+        .unwrap()
+        .with_call_requests_observed(
+            vec![(
+                PhysicalCallDefinition::Expression(call),
+                PhysicalCallRequest {
+                    arguments: Box::from([StaticFunctionArgument::Value {
+                        value_type: call_argument,
+                        constant: original_constant,
+                    }]),
+                    logical_argument_count: 1,
+                    expected_result_type: expected_target,
+                    constant_policy: policy(),
+                },
+            )],
+            compile_control(),
+        )
+        .unwrap();
+    let mut builder = PlanBuilder::new(PlanVersionId::try_new([73; 16]).unwrap());
+    if coerced.is_some() {
+        builder = builder.with_semantic_parameters(
+            novarocks_type_contract::SemanticParameters::try_new([(
+                allow.id,
+                novarocks_type_contract::SemanticParameterValue::AllowThrowException(false),
+            )])
+            .unwrap(),
+        );
+    }
+    builder.insert_constant_pool(reference.pool, pool).unwrap();
+    let plan = finish_scalar_fixture(builder, fragment, node, output);
+    let mut encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
+        &plan,
+        &catalog,
+        &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+        false,
+        compile_control(),
+    )
+    .unwrap();
+    assert_eq!(encoded.fragments.len(), 1);
+    encoded.fragments.remove(0)
+}
+
+fn call_expression(source: &plan::PlanFragment) -> &novarocks_proto_models::expr::Expr {
+    let Some(plan::distributed_node::Payload::Physical(node)) =
+        &source.root.as_ref().unwrap().payload
+    else {
+        panic!("actual physical source")
+    };
+    let Some(plan::plan_node::Kind::Values(values)) = &node.kind else {
+        panic!("actual Values source")
+    };
+    &values.rows[0].values[0]
+}
+fn call_expression_mut(source: &mut plan::PlanFragment) -> &mut novarocks_proto_models::expr::Expr {
+    let Some(plan::distributed_node::Payload::Physical(node)) =
+        &mut source.root.as_mut().unwrap().payload
+    else {
+        panic!("actual physical source")
+    };
+    let Some(plan::plan_node::Kind::Values(values)) = &mut node.kind else {
+        panic!("actual Values source")
+    };
+    &mut values.rows[0].values[0]
+}
+fn empty_input() -> Chunk {
+    let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(1));
+    let batch = arrow::array::RecordBatch::try_new_with_options(
+        Arc::new(arrow::datatypes::Schema::empty()),
+        Vec::new(),
+        &options,
+    )
+    .unwrap();
+    Chunk::try_new_with_chunk_schema(
+        batch,
+        Arc::new(novarocks_execution::exec::chunk::ChunkSchema::empty()),
+    )
+    .unwrap()
+}
+
+#[test]
+fn default_scalar_frozen_fe_constant_request_reaches_original_eval() {
+    let source = encoded_constant_call(
+        "abs",
+        ValueType::new(DataType::Int32, false),
+        Arc::new(Int32Array::from(vec![-7])),
+    );
+    let mut arena = ExprArena::default();
+    let id = with_fragment_types(&source, |types| {
+        crate::fragment_plan_node::decode_zero_input_expression(
+            call_expression(&source),
+            novarocks_proto_codec::FieldPath::root("expr"),
+            &mut arena,
+            types,
+        )
+    })
+    .unwrap();
+    let value = arena.eval(id, &empty_input()).unwrap();
+    assert_eq!(
+        value
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        7
+    );
+    assert_eq!(
+        arena.value_type(id).unwrap(),
+        &ValueType::new(DataType::Int64, false)
+    );
+
+    let source = encoded_constant_call(
+        "parse_json",
+        ValueType::new(DataType::Utf8, false),
+        Arc::new(StringArray::from(vec![" { \"a\" : 1 } "])),
+    );
+    let mut arena = ExprArena::default();
+    let id = with_fragment_types(&source, |types| {
+        crate::fragment_plan_node::decode_zero_input_expression(
+            call_expression(&source),
+            novarocks_proto_codec::FieldPath::root("expr"),
+            &mut arena,
+            types,
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        arena.value_type(id).unwrap().logical_type(),
+        ValueLogicalType::Json
+    );
+    let value = arena.eval(id, &empty_input()).unwrap();
+    assert_eq!(
+        value
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "{\"a\": 1}"
+    );
+}
+
+#[test]
+fn default_scalar_frozen_same_carrier_wrong_nominal_is_rejected() {
+    let mut source = encoded_constant_call(
+        "parse_json",
+        ValueType::new(DataType::Utf8, false),
+        Arc::new(StringArray::from(vec!["{\"a\":1}"])),
+    );
+    let expression = call_expression_mut(&mut source);
+    let Some(novarocks_proto_models::expr::expr::Kind::FunctionCall(call)) = &mut expression.kind
+    else {
+        panic!("real scalar source")
+    };
+    let plain = call.args[0]
+        .r#type
+        .as_ref()
+        .unwrap()
+        .value_binding_id
+        .unwrap();
+    assert_ne!(
+        expression.r#type.as_ref().unwrap().value_binding_id,
+        Some(plain)
+    );
+    call.frozen_binding.as_mut().unwrap().result = Some(novarocks_proto_models::physical_package_v2::function_binding_definition::Result::ScalarValueTypeId(plain));
+    let mut arena = ExprArena::default();
+    let failure = with_fragment_types(&source, |types| {
+        crate::fragment_plan_node::decode_zero_input_expression(
+            call_expression(&source),
+            novarocks_proto_codec::FieldPath::root("expr"),
+            &mut arena,
+            types,
+        )
+    })
+    .unwrap_err();
+    assert!(
+        failure.to_string().contains("complete frozen declaration"),
+        "{failure}"
+    );
+}
+
+#[derive(Default)]
+struct TraceControl(Mutex<Vec<(CompilePhase, u32)>>);
+impl PureCompileControl for TraceControl {
+    fn checkpoint(&self, phase: CompilePhase, work: u32) -> Result<(), CompileControlError> {
+        self.0.lock().unwrap().push((phase, work));
+        Ok(())
+    }
+}
+#[test]
+fn default_scalar_first_real_header_refusal_rolls_back_without_tail() {
+    let source = encoded_constant_call(
+        "abs",
+        ValueType::new(DataType::Int32, false),
+        Arc::new(Int32Array::from(vec![-7])),
+    );
+    let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+        "ordinary scalar first header",
+    );
+    let control = TraceControl::default();
+    let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
+    let creation = crate::native_type_construction::NativeTypeConstruction::try_with_control(
+        Arc::clone(&tracker),
+        &control,
+    )
+    .unwrap();
+    let mut resources =
+        crate::fragment_type_decode::NativeDecodeResources::try_new(&creation).unwrap();
+    resources.bind_function_catalog(&catalog);
+    let types =
+        crate::fragment_type_decode::decode_fragment_type_owner(&source, &mut resources).unwrap();
+    let original =
+        crate::fragment_original_sources::decode_original_requests(&source, &types, &mut resources)
+            .unwrap();
+    resources.work.flush().unwrap();
+    let baseline = tracker.current();
+    assert!(baseline > 0);
+    tracker.install_limit_once(baseline + 1).unwrap();
+    let mut arena = ExprArena::default();
+    let mut decoder = crate::fragment_type_decode::NativeTypeDecoder::Strong {
+        types: &types.execution,
+        original_requests: Some(original.as_ref()),
+        resources: &mut resources,
+    };
+    let failure = crate::fragment_plan_node::decode_zero_input_expression(
+        call_expression(&source),
+        novarocks_proto_codec::FieldPath::root("expr"),
+        &mut arena,
+        &mut decoder,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            failure.construction_cause(),
+            Some(crate::native_type_construction::NativeTypeConstructionError::Capacity(_))
+        ),
+        "{failure}"
+    );
+    assert_eq!(
+        tracker.current(),
+        baseline,
+        "the failed actual request rolls back its prospective bytes"
+    );
+    let stopped = control.0.lock().unwrap().len();
+    drop(decoder);
+    drop(resources); // Error exit performs no finish/footer.
+    assert_eq!(control.0.lock().unwrap().len(), stopped);
+    drop(arena);
+    drop(original);
+    drop(types);
+    drop(creation);
+    assert_eq!(
+        tracker.current(),
+        0,
+        "last actual immutable type/constant reference releases its finite responsibility"
+    );
+}
+
+#[test]
+fn default_scalar_frozen_original_request_keeps_explicit_coercion() {
+    let source = encoded_constant_call_with_coercion(
+        "abs",
+        ValueType::new(DataType::Int16, false),
+        Arc::new(Int16Array::from(vec![-12])),
+        Some(ValueType::new(DataType::Int32, false)),
+    );
+    let expression = call_expression(&source);
+    let Some(novarocks_proto_models::expr::expr::Kind::FunctionCall(call)) = &expression.kind
+    else {
+        panic!("ordinary actual call")
+    };
+    assert!(matches!(
+        call.args[0].kind,
+        Some(novarocks_proto_models::expr::expr::Kind::Cast(_))
+    ));
+    let mut arena = ExprArena::default();
+    let id = with_fragment_types(&source, |types| {
+        crate::fragment_plan_node::decode_zero_input_expression(
+            expression,
+            novarocks_proto_codec::FieldPath::root("expr"),
+            &mut arena,
+            types,
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        arena.value_type(id).unwrap(),
+        &ValueType::new(DataType::Int64, false)
+    );
+    let value = arena.eval(id, &empty_input()).unwrap();
+    assert_eq!(
+        value
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        12
+    );
+}
+
+fn encoded_original_lambda_call() -> plan::PlanFragment {
+    use arrow::array::ListArray;
+    let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
+    let values: ArrayRef = Arc::new(ListArray::from_iter_primitive::<
+        arrow::datatypes::Int32Type,
+        _,
+        _,
+    >([Some([Some(3), None, Some(8)])]));
+    let argument = ValueType::new(values.data_type().clone(), false);
+    let item = ValueType::new(DataType::Int32, true);
+    let parameter_types =
+        novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(Box::from([item.clone()]));
+    let pool = ConstantPool::try_new(
+        Arc::new(arrow::datatypes::Field::new(
+            "original list",
+            argument.data_type().clone(),
+            argument.nullable(),
+        )),
+        argument.clone(),
+        values.to_data(),
+        policy(),
+        CompilePhase::Encode,
+        compile_control(),
+    )
+    .unwrap();
+    let reference = ConstantReference {
+        pool: ConstantPoolId::new(38),
+        ordinal: 0,
+    };
+    let arguments = [
+        FunctionArgument::Lambda {
+            parameter_types: parameter_types.clone(),
+            result_type: item.clone(),
+        },
+        FunctionArgument::Value {
+            value_type: argument.clone(),
+            constant: Some(pool.value(0).unwrap()),
+        },
+    ];
+    let resolved = catalog
+        .resolve_bound_user(
+            "array_map",
+            FunctionKind::Scalar,
+            FunctionBindingRequest {
+                arguments: &arguments,
+                logical_argument_count: 2,
+                expected_result_type: None,
+            },
+            compile_control(),
+        )
+        .unwrap();
+    let FunctionResultType::Scalar(result) = &resolved.selected.result_type else {
+        panic!("real scalar result")
+    };
+    let result = result.clone();
+    let function = BoundFunction {
+        function_id: resolved.function_id,
+        overload: resolved.selected.overload,
+        kind: resolved.kind,
+        argument_types: resolved.selected.argument_types,
+        result_type: result.clone(),
+        legacy_metadata: Some(LegacyBindingMetadata {
+            volatility: resolved.semantics.volatility,
+            argument_evaluation: resolved.semantics.argument_evaluation,
+            failure_behavior: resolved.semantics.failure_behavior,
+            intrinsic_row_error: resolved.semantics.intrinsic_row_error,
+            semantic_parameters: Box::default(),
+        }),
+    };
+    let mut builder = FragmentBuilder::new(FragmentId::new(74));
+    let node = builder.reserve_node_id().unwrap();
+    let lambda = builder.reserve_expression_id().unwrap();
+    let parameter = builder.reserve_expression_id().unwrap();
+    builder
+        .insert_expression(novarocks_physical_plan::ExprNode {
+            id: parameter,
+            owner: node,
+            lambda_scope: Some(lambda),
+            ty: item.clone(),
+            kind: ExprKind::LambdaParameter { lambda, ordinal: 0 },
+        })
+        .unwrap();
+    builder
+        .insert_expression(novarocks_physical_plan::ExprNode {
+            id: lambda,
+            owner: node,
+            lambda_scope: None,
+            ty: item.clone(),
+            kind: ExprKind::Lambda {
+                parameter_types: Box::from([item.clone()]),
+                body: parameter,
+            },
+        })
+        .unwrap();
+    let literal = builder
+        .add_expression(node, argument.clone(), ExprKind::Constant(reference))
+        .unwrap();
+    let call = builder
+        .add_expression(
+            node,
+            result.clone(),
+            ExprKind::FunctionCall {
+                function,
+                args: Box::from([lambda, literal]),
+            },
+        )
+        .unwrap();
+    let output = builder
+        .add_value(
+            result,
+            ValueOrigin::NodeOutput {
+                node,
+                output_ordinal: 0,
+            },
+        )
+        .unwrap();
+    builder
+        .insert_node_unchecked(PhysicalNode {
+            id: node,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: singleton_properties(),
+            output: OutputPort {
+                node,
+                columns: Box::from([output]),
+            },
+            kind: NodeKind::Values {
+                rows: Box::from([Box::from([call])]),
+            },
+        })
+        .unwrap();
+    let fragment = builder
+        .finish_definition(
+            node,
+            FragmentSink::Result,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+        )
+        .unwrap()
+        .with_call_requests_observed(
+            vec![(
+                PhysicalCallDefinition::Expression(call),
+                PhysicalCallRequest {
+                    arguments: Box::from([
+                        StaticFunctionArgument::Lambda {
+                            parameter_types,
+                            result_type: item,
+                        },
+                        StaticFunctionArgument::Value {
+                            value_type: argument,
+                            constant: Some(reference),
+                        },
+                    ]),
+                    logical_argument_count: 2,
+                    expected_result_type: None,
+                    constant_policy: policy(),
+                },
+            )],
+            compile_control(),
+        )
+        .unwrap();
+    let mut builder = PlanBuilder::new(PlanVersionId::try_new([74; 16]).unwrap());
+    builder.insert_constant_pool(reference.pool, pool).unwrap();
+    let plan = finish_scalar_fixture(builder, fragment, node, output);
+    let mut encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
+        &plan,
+        &catalog,
+        &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+        false,
+        compile_control(),
+    )
+    .unwrap();
+    assert_eq!(encoded.fragments.len(), 1);
+    encoded.fragments.remove(0)
+}
+#[test]
+fn default_scalar_frozen_original_lambda_types_and_null_values_reach_original_eval() {
+    let source = encoded_original_lambda_call();
+    let mut arena = ExprArena::default();
+    let id = with_fragment_types(&source, |types| {
+        crate::fragment_plan_node::decode_zero_input_expression(
+            call_expression(&source),
+            novarocks_proto_codec::FieldPath::root("expr"),
+            &mut arena,
+            types,
+        )
+    })
+    .unwrap();
+    let output = arena.eval(id, &empty_input()).unwrap();
+    let output = output
+        .as_any()
+        .downcast_ref::<arrow::array::ListArray>()
+        .unwrap();
+    let items = output.value(0);
+    let items = items.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(items.iter().collect::<Vec<_>>(), [Some(3), None, Some(8)]);
+    assert!(
+        arena
+            .value_type(id)
+            .unwrap()
+            .value_type()
+            .child_type_at(0)
+            .unwrap()
+            .nullable()
+    );
+
+    // An actual lambda child declaration cannot be replaced by an equal
+    // carrier with a different child NULL law from the original request.
+    let mut changed = source.clone();
+    let expression = call_expression_mut(&mut changed);
+    let Some(novarocks_proto_models::expr::expr::Kind::FunctionCall(call)) = &mut expression.kind
+    else {
+        panic!("real scalar source")
+    };
+    let Some(novarocks_proto_models::expr::expr::Kind::Lambda(lambda)) = &mut call.args[0].kind
+    else {
+        panic!("real original lambda")
+    };
+    lambda.params[0].nullable = false;
+    let mut arena = ExprArena::default();
+    let failure = with_fragment_types(&changed, |types| {
+        crate::fragment_plan_node::decode_zero_input_expression(
+            call_expression(&changed),
+            novarocks_proto_codec::FieldPath::root("expr"),
+            &mut arena,
+            types,
+        )
+    })
+    .unwrap_err();
+    assert!(
+        failure.to_string().contains("lambda parameter"),
+        "{failure}"
+    );
+}
+
+// These fixtures author one scalar result from their real resolved value, not
+// the Arrow carrier or a sink default. Encoding binds its actual output slot.
+fn fixture_result_field(
+    value: &novarocks_type_contract::ValueTypeRef,
+) -> novarocks_result_contract::ScalarField {
+    use novarocks_result_contract::ScalarValueType as S;
+    use novarocks_type_contract::ValueKind as V;
+    let value_type = match value.kind() {
+        V::Scalar(DataType::Int32) => S::SignedInteger(32),
+        V::Scalar(DataType::Int64) => S::SignedInteger(64),
+        V::String => S::String,
+        V::Binary => S::Binary,
+        V::Nominal(ValueLogicalType::Json) => S::Json,
+        V::List(item) => S::List(Box::new(fixture_result_field(item))),
+        V::Map { key, value } => S::Map {
+            key: Box::new(fixture_result_field(key)),
+            value: Box::new(fixture_result_field(value)),
+        },
+        other => panic!("fixture has no declared scalar purpose for {other:?}"),
+    };
+    novarocks_result_contract::ScalarField {
+        nullable: value.nullable(),
+        value_type,
+    }
+}
+fn finish_scalar_fixture(
+    mut builder: PlanBuilder,
+    fragment: novarocks_physical_plan::Fragment,
+    node: novarocks_physical_plan::NodeId,
+    output: ValueId,
+) -> PhysicalPlan {
+    use novarocks_result_contract::{
+        FrozenRootOutput, RootOutputContract, RootProfileId, ScalarSchema,
+    };
+    let result = fragment.values()[&output].ty.clone();
+    let schema = ScalarSchema::try_new(fixture_result_field(result.value_type())).unwrap();
+    let domain = match result.logical_type() {
+        ValueLogicalType::Json => novarocks_physical_plan::ResultValueDomain::Json,
+        ValueLogicalType::Physical => novarocks_physical_plan::ResultValueDomain::Plain,
+        other => panic!("fixture root has no declared result domain for {other:?}"),
+    };
+    let fragment_id = fragment.id();
+    builder.add_fragment(fragment).unwrap();
+    builder
+        .set_result_port(ResultPort {
+            fragment: fragment_id,
+            output: OutputPort {
+                node,
+                columns: Box::from([output]),
+            },
+            fields: Box::from([ResultField {
+                domain,
+                name: "scalar".into(),
+                alias: None,
+                value: output,
+                ty: result,
+            }]),
+            scalar_schema: Some(schema.clone()),
+        })
+        .unwrap();
+    builder
+        .finish_observed(compile_control())
+        .unwrap()
+        .with_root_output(RootOutputContract::new(
+            RootProfileId::V1,
+            FrozenRootOutput::ScalarValue(schema),
+        ))
+        .unwrap()
+}
+
+#[test]
+fn default_array_literal_frozen_json_child_keeps_original_constructor() {
+    let json =
+        ValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json).unwrap();
+    let source = encoded_constant_call(
+        "__array_literal",
+        json,
+        Arc::new(StringArray::from(vec!["{\"a\":1}"])),
+    );
+    let mut arena = ExprArena::default();
+    let id = with_fragment_types(&source, |types| {
+        crate::fragment_plan_node::decode_zero_input_expression(
+            call_expression(&source),
+            novarocks_proto_codec::FieldPath::root("expr"),
+            &mut arena,
+            types,
+        )
+    })
+    .unwrap();
+    assert!(matches!(
+        arena.node(id),
+        Some(novarocks_execution::exec::expr::ExprNode::ArrayExpr { .. })
+    ));
+    assert_eq!(
+        arena
+            .value_type(id)
+            .unwrap()
+            .value_type()
+            .child_type_at(0)
+            .unwrap()
+            .kind(),
+        &novarocks_type_contract::ValueKind::Nominal(ValueLogicalType::Json)
+    );
+    let value = arena.eval(id, &empty_input()).unwrap();
+    let value = value
+        .as_any()
+        .downcast_ref::<arrow::array::ListArray>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        value
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "{\"a\":1}"
+    );
+}
+
+fn encoded_original_map_call() -> plan::PlanFragment {
+    let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
+    let key = ValueType::new(DataType::Int32, false);
+    let json =
+        ValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json).unwrap();
+    let mut pools = Vec::new();
+    let mut arguments = Vec::new();
+    let references = [
+        ConstantReference {
+            pool: ConstantPoolId::new(40),
+            ordinal: 0,
+        },
+        ConstantReference {
+            pool: ConstantPoolId::new(41),
+            ordinal: 0,
+        },
+    ];
+    let arrays: [ArrayRef; 2] = [
+        Arc::new(Int32Array::from(vec![7])),
+        Arc::new(StringArray::from(vec!["{\"a\":1}"])),
+    ];
+    for (ty, array) in [&key, &json].into_iter().zip(arrays) {
+        let pool = ConstantPool::try_new(
+            Arc::new(arrow::datatypes::Field::new(
+                "original pair",
+                ty.data_type().clone(),
+                ty.nullable(),
+            )),
+            ty.clone(),
+            array.to_data(),
+            policy(),
+            CompilePhase::Encode,
+            compile_control(),
+        )
+        .unwrap();
+        arguments.push(FunctionArgument::Value {
+            value_type: ty.clone(),
+            constant: Some(pool.value(0).unwrap()),
+        });
+        pools.push(pool);
+    }
+    let resolved = catalog
+        .resolve_bound_user(
+            "map",
+            FunctionKind::Scalar,
+            FunctionBindingRequest {
+                arguments: &arguments,
+                logical_argument_count: 2,
+                expected_result_type: None,
+            },
+            compile_control(),
+        )
+        .unwrap();
+    let FunctionResultType::Scalar(result) = &resolved.selected.result_type else {
+        panic!("real MAP result")
+    };
+    let result = result.clone();
+    let function = BoundFunction {
+        function_id: resolved.function_id,
+        overload: resolved.selected.overload,
+        kind: resolved.kind,
+        argument_types: resolved.selected.argument_types,
+        result_type: result.clone(),
+        legacy_metadata: Some(LegacyBindingMetadata {
+            volatility: resolved.semantics.volatility,
+            argument_evaluation: resolved.semantics.argument_evaluation,
+            failure_behavior: resolved.semantics.failure_behavior,
+            intrinsic_row_error: resolved.semantics.intrinsic_row_error,
+            semantic_parameters: Box::default(),
+        }),
+    };
+    let mut builder = FragmentBuilder::new(FragmentId::new(75));
+    let node = builder.reserve_node_id().unwrap();
+    let k = builder
+        .add_expression(node, key.clone(), ExprKind::Constant(references[0]))
+        .unwrap();
+    let v = builder
+        .add_expression(node, json.clone(), ExprKind::Constant(references[1]))
+        .unwrap();
+    let call = builder
+        .add_expression(
+            node,
+            result.clone(),
+            ExprKind::FunctionCall {
+                function,
+                args: Box::from([k, v]),
+            },
+        )
+        .unwrap();
+    let output = builder
+        .add_value(
+            result,
+            ValueOrigin::NodeOutput {
+                node,
+                output_ordinal: 0,
+            },
+        )
+        .unwrap();
+    builder
+        .insert_node_unchecked(PhysicalNode {
+            id: node,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: singleton_properties(),
+            output: OutputPort {
+                node,
+                columns: Box::from([output]),
+            },
+            kind: NodeKind::Values {
+                rows: Box::from([Box::from([call])]),
+            },
+        })
+        .unwrap();
+    let fragment = builder
+        .finish_definition(
+            node,
+            FragmentSink::Result,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+        )
+        .unwrap()
+        .with_call_requests_observed(
+            vec![(
+                PhysicalCallDefinition::Expression(call),
+                PhysicalCallRequest {
+                    arguments: Box::from([
+                        StaticFunctionArgument::Value {
+                            value_type: key,
+                            constant: Some(references[0]),
+                        },
+                        StaticFunctionArgument::Value {
+                            value_type: json,
+                            constant: Some(references[1]),
+                        },
+                    ]),
+                    logical_argument_count: 2,
+                    expected_result_type: None,
+                    constant_policy: policy(),
+                },
+            )],
+            compile_control(),
+        )
+        .unwrap();
+    let mut builder = PlanBuilder::new(PlanVersionId::try_new([75; 16]).unwrap());
+    for (reference, pool) in references.into_iter().zip(pools) {
+        builder.insert_constant_pool(reference.pool, pool).unwrap();
+    }
+    let plan = finish_scalar_fixture(builder, fragment, node, output);
+    let mut encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
+        &plan,
+        &catalog,
+        &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+        false,
+        compile_control(),
+    )
+    .unwrap();
+    assert_eq!(encoded.fragments.len(), 1);
+    encoded.fragments.remove(0)
+}
+#[test]
+fn default_map_frozen_json_value_keeps_original_constructor_and_checks_original_constant() {
+    let source = encoded_original_map_call();
+    let mut arena = ExprArena::default();
+    let id = with_fragment_types(&source, |types| {
+        crate::fragment_plan_node::decode_zero_input_expression(
+            call_expression(&source),
+            novarocks_proto_codec::FieldPath::root("expr"),
+            &mut arena,
+            types,
+        )
+    })
+    .unwrap();
+    assert!(matches!(
+        arena.node(id),
+        Some(novarocks_execution::exec::expr::ExprNode::FunctionCall {
+            kind: novarocks_execution::exec::expr::function::FunctionKind::Map("map"),
+            ..
+        })
+    ));
+    assert_eq!(
+        arena
+            .value_type(id)
+            .unwrap()
+            .value_type()
+            .child_type_at(1)
+            .unwrap()
+            .kind(),
+        &novarocks_type_contract::ValueKind::Nominal(ValueLogicalType::Json)
+    );
+    let value = arena.eval(id, &empty_input()).unwrap();
+    let value = value
+        .as_any()
+        .downcast_ref::<arrow::array::MapArray>()
+        .unwrap();
+    assert_eq!(
+        value
+            .keys()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        7
+    );
+    assert_eq!(
+        value
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "{\"a\":1}"
+    );
+
+    let mut changed = source.clone();
+    let Some(novarocks_proto_models::expr::expr::Kind::FunctionCall(call)) =
+        &mut call_expression_mut(&mut changed).kind
+    else {
+        panic!("real MAP source")
+    };
+    let Some(novarocks_proto_models::expr::expr::Kind::ConstantReference(reference)) =
+        &mut call.args[1].kind
+    else {
+        panic!("real original constant")
+    };
+    reference.row_ordinal = 1;
+    let mut arena = ExprArena::default();
+    let failure = with_fragment_types(&changed, |types| {
+        crate::fragment_plan_node::decode_zero_input_expression(
+            call_expression(&changed),
+            novarocks_proto_codec::FieldPath::root("expr"),
+            &mut arena,
+            types,
+        )
+    })
+    .unwrap_err();
+    assert!(
+        failure.to_string().contains("constant address differs"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn default_scalar_frozen_percentile_binary_target_reaches_original_keep_leaf() {
+    use arrow::array::BinaryArray;
+    use novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_NAME;
+    let source_type =
+        ValueType::try_with_logical_type(DataType::Binary, false, ValueLogicalType::Percentile)
+            .unwrap();
+    let target = ValueType::new(DataType::Binary, false);
+    let source = encoded_constant_call_with_target(
+        VALUE_CONVERSION_NAME,
+        source_type.clone(),
+        Arc::new(BinaryArray::from_vec(vec![b"original opaque percentile"])),
+        None,
+        Some(target.clone()),
+    );
+    let expression = call_expression(&source);
+    let Some(novarocks_proto_models::expr::expr::Kind::FunctionCall(call)) = &expression.kind
+    else {
+        panic!("exact converter call")
+    };
+    assert!(call.frozen_binding.is_some());
+    assert!(call.original_request_id.is_some());
+    let mut arena = ExprArena::default();
+    let id = with_fragment_types(&source, |types| {
+        crate::fragment_plan_node::decode_zero_input_expression(
+            expression,
+            novarocks_proto_codec::FieldPath::root("expr"),
+            &mut arena,
+            types,
+        )
+    })
+    .unwrap();
+    let Some(novarocks_execution::exec::expr::ExprNode::FunctionCall { kind, args }) =
+        arena.node(id)
+    else {
+        panic!("original default FunctionCall actor")
+    };
+    assert_eq!(
+        *kind,
+        novarocks_execution::exec::expr::function::FunctionKind::PercentileToBinary
+    );
+    assert_eq!(arena.value_type(args[0]), Some(&source_type));
+    assert_eq!(arena.value_type(id), Some(&target));
+    let result = arena.eval(id, &empty_input()).unwrap();
+    assert_eq!(
+        result
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap()
+            .value(0),
+        b"original opaque percentile"
+    );
+
+    // The same opaque overload has other Candidate owners. Complete original
+    // HLL semantics cannot be admitted as this default Percentile actor merely
+    // because it shares Binary and the same nullable contract.
+    let hll = encoded_constant_call_with_target(
+        VALUE_CONVERSION_NAME,
+        ValueType::try_with_logical_type(DataType::Binary, false, ValueLogicalType::Hll).unwrap(),
+        Arc::new(BinaryArray::from_vec(vec![b"original hll"])),
+        None,
+        Some(target),
+    );
+    let mut arena = ExprArena::default();
+    let error = with_fragment_types(&hll, |types| {
+        crate::fragment_plan_node::decode_zero_input_expression(
+            call_expression(&hll),
+            novarocks_proto_codec::FieldPath::root("expr"),
+            &mut arena,
+            types,
+        )
+    })
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("default host does not support this frozen value-domain conversion"),
+        "{error}"
+    );
+}

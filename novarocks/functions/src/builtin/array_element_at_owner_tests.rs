@@ -126,7 +126,7 @@ fn array_element_owner_two_real_index_overloads_keep_nullable_item_and_called_on
         ValueLogicalType::LargeInt,
     )
     .unwrap();
-    let list = FunctionValueType::new(
+    let list = FunctionValueType::from_legacy_declared_projection(
         DataType::List(Arc::new(item.try_to_field("item").unwrap())),
         true,
     );
@@ -134,7 +134,10 @@ fn array_element_owner_two_real_index_overloads_keep_nullable_item_and_called_on
     for index in [DataType::Int32, DataType::Int64] {
         let p = prepared_for_test(
             "__array_element_at",
-            &[list.clone(), FunctionValueType::new(index, true)],
+            &[
+                list.clone(),
+                FunctionValueType::from_legacy_declared_projection(index, true),
+            ],
         )
         .unwrap();
         assert_eq!(p.contract().result_type(), &item);

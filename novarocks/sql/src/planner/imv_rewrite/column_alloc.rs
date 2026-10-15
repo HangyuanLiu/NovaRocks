@@ -136,14 +136,14 @@ mod tests {
 
         assert_eq!(output.column_id.0, 1);
         assert_eq!(output.name, "__imv_branch");
-        assert_eq!(output.value_type.data_type, DataType::Int32);
-        assert!(!output.value_type.nullable);
+        assert_eq!(output.value_type.data_type().clone(), DataType::Int32);
+        assert!(!output.value_type.nullable());
         assert!(output.is_internal);
 
         let meta = factory.borrow().get(output.column_id).clone();
         assert_eq!(meta.name, "__imv_branch");
-        assert_eq!(meta.value_type.data_type, DataType::Int32);
-        assert!(!meta.value_type.nullable);
+        assert_eq!(meta.value_type.data_type().clone(), DataType::Int32);
+        assert!(!meta.value_type.nullable());
         assert_eq!(factory.borrow().peek_next_id(), 2);
     }
 

@@ -405,7 +405,7 @@ fn actual_reader_exact_empty_timezone_and_nominal_metadata_retain_source_author(
     ];
     for (array, ty, metadata) in cases {
         let field =
-            Arc::new(Field::new("source", ty.data_type.clone(), true).with_metadata(metadata));
+            Arc::new(Field::new("source", ty.data_type().clone(), true).with_metadata(metadata));
         let input = exact_schema_stream(&writer_stream(array, &field), &field);
         let stream = checked(&input, &field);
         let retention = retained(&input, &field);
@@ -414,7 +414,7 @@ fn actual_reader_exact_empty_timezone_and_nominal_metadata_retain_source_author(
         assert!(std::ptr::eq(pool.field(), field.as_ref()));
         assert_eq!(pool.value_type(), &ty);
         assert_eq!(pool.field().metadata(), field.metadata());
-        if ty.logical_type == ValueLogicalType::Json {
+        if ty.logical_type() == ValueLogicalType::Json {
             assert_eq!(
                 pool.value(0).unwrap().try_utf8().unwrap(),
                 Some("{\"x\":1}")

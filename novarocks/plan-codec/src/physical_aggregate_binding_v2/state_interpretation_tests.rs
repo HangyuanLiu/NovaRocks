@@ -52,7 +52,9 @@ fn original_codec_preserves_explicit_plain_and_every_state_order_bit() {
         ] {
             let source = I {
                 distinct,
-                order_keys: keys.into_boxed_slice(),
+                order_keys: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    keys.into_boxed_slice(),
+                ),
             };
             let control = Control::default();
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
@@ -99,14 +101,16 @@ fn original_codec_rejects_missing_distinct_direction_or_null_placement() {
 fn receipt_codec_keeps_control_cause_and_bounded_observation_on_long_keys() {
     let source = I {
         distinct: true,
-        order_keys: vec![
-            K {
-                ascending: true,
-                nulls_first: false
-            };
-            1025
-        ]
-        .into_boxed_slice(),
+        order_keys: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+            vec![
+                K {
+                    ascending: true,
+                    nulls_first: false
+                };
+                1025
+            ]
+            .into_boxed_slice(),
+        ),
     };
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();

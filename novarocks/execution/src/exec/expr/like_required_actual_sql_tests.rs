@@ -68,10 +68,13 @@ fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
                     "actual original LIKE fragment={id:?} definition={definition:?} operand={:?} pattern={:?} result={:?} negated={negated}",
                     input.ty, pattern.ty, node.ty
                 );
-                assert_eq!(input.ty.data_type, DataType::Utf8);
-                assert_eq!(pattern.ty.data_type, DataType::Utf8);
-                assert_eq!(node.ty.data_type, DataType::Boolean);
-                assert_eq!(node.ty.nullable, input.ty.nullable || pattern.ty.nullable);
+                assert_eq!(input.ty.data_type().clone(), DataType::Utf8);
+                assert_eq!(pattern.ty.data_type().clone(), DataType::Utf8);
+                assert_eq!(node.ty.data_type().clone(), DataType::Boolean);
+                assert_eq!(
+                    node.ty.nullable(),
+                    input.ty.nullable() || pattern.ty.nullable()
+                );
             }
         }
     }

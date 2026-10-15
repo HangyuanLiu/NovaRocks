@@ -225,7 +225,9 @@ fn apply_opt(
     );
     let anyval_id = factory.create(None, "any_value".to_string(), {
         let mut value_type = inner_scalar_value_type.clone();
-        value_type.nullable = true;
+        value_type = value_type
+            .with_nullable(true)
+            .expect("validated root NULL contract");
         value_type
     });
     // Mint internal assertion column id.
@@ -307,7 +309,9 @@ fn apply_opt(
         name: "any_value".to_string(),
         value_type: {
             let mut value_type = inner_scalar_value_type.clone();
-            value_type.nullable = true;
+            value_type = value_type
+                .with_nullable(true)
+                .expect("validated root NULL contract");
             value_type
         },
 
@@ -361,7 +365,10 @@ fn apply_opt(
 
     // Build the assert_true condition: cnt IS NULL OR cnt <= 1
     let mut joined_cnt_output = cnt_output.clone();
-    joined_cnt_output.value_type.nullable = true;
+    joined_cnt_output.value_type = joined_cnt_output
+        .value_type
+        .with_nullable(true)
+        .expect("validated root NULL contract");
     let cnt_ref = scalar_utils::column_ref(arena, &joined_cnt_output, &ctx.control_view())?;
     let cnt_is_null = arena.intern_observed(
         ScalarNode::IsNull {
@@ -448,7 +455,7 @@ fn build_output_project_items(
         .ok_or_else(|| {
             SqlCompileError::Compilation("missing scalar subquery output column".into())
         })?;
-    let inner_out_type = inner_value_type.data_type.clone();
+    let inner_out_type = inner_value_type.data_type().clone();
 
     let inner_col_ref = arena.intern_observed(
         ScalarNode::ColumnRef(inner_output_column_id),
@@ -727,7 +734,10 @@ mod tests {
                 aggregates: vec![AggregateCall {
                     name: "max".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                     output_column_id: MAX_RESULT,
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![col_ref(T2_V2, "v2", DataType::Int64)],
@@ -948,7 +958,10 @@ mod tests {
                 aggregates: vec![AggregateCall {
                     name: "max".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                     output_column_id: MAX_RESULT,
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![col_ref(T2_V2, "v2", DataType::Int64)],
@@ -1266,7 +1279,7 @@ mod tests {
         };
         assert_eq!(*isnull_id, cnt_id, "IS NULL must check cnt column");
         assert!(
-            isnull_expr.value_type.nullable,
+            isnull_expr.value_type.nullable(),
             "LEFT OUTER JOIN can null-extend count(1), so the row-check reference must be nullable"
         );
 
@@ -1288,7 +1301,7 @@ mod tests {
         };
         assert_eq!(*le_id, cnt_id, "<= must check cnt column");
         assert!(
-            le_left.value_type.nullable,
+            le_left.value_type.nullable(),
             "LEFT OUTER JOIN can null-extend count(1), so the comparison reference must be nullable"
         );
         let ExprKind::Literal(LiteralValue::Int(1)) = &le_right.kind else {

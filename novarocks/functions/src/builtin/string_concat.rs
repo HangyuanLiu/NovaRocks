@@ -86,7 +86,7 @@ fn row_length(
             return Err(internal("concat selected row is outside its carrier"));
         }
         if values.is_null(row) {
-            if !source.nullable {
+            if !source.nullable() {
                 return Err(internal(
                     "concat non-null source contains selected SQL NULL",
                 ));
@@ -115,9 +115,9 @@ pub(super) fn evaluate_string_concat<'a>(
         let target = input.contract().result_type();
         if input.arguments().is_empty()
             || selected.argument_types.len() != input.arguments().len()
-            || target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
+            || target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Utf8
+            || !target.nullable()
         {
             return Err(invalid(
                 "concat differs from its installed variadic Utf8 profile",
@@ -127,8 +127,8 @@ pub(super) fn evaluate_string_concat<'a>(
             let FunctionArgumentType::Value(source) = ty else {
                 return Err(invalid("concat requires only checked value arguments"));
             };
-            if source.logical_type != ValueLogicalType::Physical
-                || source.data_type != DataType::Utf8
+            if source.logical_type() != ValueLogicalType::Physical
+                || source.data_type() != &DataType::Utf8
             {
                 return Err(invalid(
                     "concat selected source is outside its installed profile",
@@ -201,7 +201,7 @@ pub(super) fn evaluate_string_concat<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

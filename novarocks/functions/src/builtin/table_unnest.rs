@@ -41,7 +41,7 @@ pub(super) fn prepare(
         ));
     }
     for value in contract.argument_types() {
-        let list = matches!(value.data_type, arrow_schema::DataType::List(_));
+        let list = matches!(value.data_type(), arrow_schema::DataType::List(_));
         work.step().map_err(compile_failure)?;
         if !list {
             return Err(invalid("UNNEST requires canonical List channels"));

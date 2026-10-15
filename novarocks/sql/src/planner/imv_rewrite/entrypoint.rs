@@ -747,7 +747,10 @@ pub(crate) mod tests {
                 aggregates: vec![AggregateCall {
                     name: "count".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                     output_column_id: sum_output.column_id,
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         Vec::new(),
@@ -790,7 +793,10 @@ pub(crate) mod tests {
                 aggregates: vec![AggregateCall {
                     name: "count".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                     output_column_id: aggregate_output.column_id,
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         Vec::new(),
@@ -1443,7 +1449,10 @@ pub(crate) mod tests {
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                     output_column_id: ColumnId(3),
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![column_ref(2, "v", DataType::Int64, true)],
@@ -1595,7 +1604,10 @@ pub(crate) mod tests {
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                     output_column_id: ColumnId(12),
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![column_expr(11, "v", true)],
@@ -2401,10 +2413,10 @@ pub(crate) mod tests {
             .find(|c| c.is_internal && c.name.eq_ignore_ascii_case("__change_op"))
             .expect("action column must be present");
         assert_eq!(
-            action.value_type.data_type,
+            action.value_type.data_type().clone(),
             arrow::datatypes::DataType::Int8
         );
-        assert!(!action.value_type.nullable);
+        assert!(!action.value_type.nullable());
     }
 
     #[test]

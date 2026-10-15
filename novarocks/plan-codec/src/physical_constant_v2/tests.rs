@@ -20,7 +20,9 @@ use crate::{
     ipc_flat_batch_v2::FlatBatchProjectionLimits,
     ipc_recursive_batch_v2::RecursiveBatchProjectionLimits,
     ipc_schema_v2::IpcSchemaProjectionLimits,
-    physical_type_v2::{TypeProjectionLimits, decode_type_table, encode_type_table_with_fields},
+    physical_type_v2::{
+        PackageTypeProjectionLimits, TypeProjectionLimits, decode_package_type_table_observed,
+    },
 };
 use arrow::{
     array::*,
@@ -184,15 +186,90 @@ fn types(
     value_id: u32,
     field_id: u32,
 ) -> DecodedTypeTable {
-    let wire = encode_type_table_with_fields(
-        &[(value_id, ty)],
-        &[(field_id, field)],
+    types_many(&[(value_id, ty)], &[(field_id, field)])
+}
+fn fixture_type_limits() -> PackageTypeProjectionLimits {
+    let old = type_limits();
+    let reader = decode_limits().recursive_reader;
+    PackageTypeProjectionLimits {
+        max_definitions: old.max_definitions,
+        max_expanded_nodes: old.max_expanded_nodes,
+        max_string_bytes: old.max_string_bytes,
+        max_allocation_requests: reader.max_new_allocation_request_bytes,
+        max_allocation_request_bytes: reader.max_new_allocation_request_bytes,
+        max_coexisting_source_and_request_bytes: reader.max_coexisting_source_and_request_bytes,
+        max_work: reader.max_cumulative_library_work,
+    }
+}
+fn types_many(
+    values: &[(u32, FunctionValueType)],
+    fields: &[(u32, Arc<Field>)],
+) -> DecodedTypeTable {
+    let value_refs = values
+        .iter()
+        .map(|(id, value)| (*id, value))
+        .collect::<Vec<_>>();
+    let field_refs = fields
+        .iter()
+        .map(|(id, field)| (*id, field))
+        .collect::<Vec<_>>();
+    let encoded = encoded_fixture_types(&value_refs, &field_refs);
+    decode_fixture_types(&encoded, fields)
+}
+fn encoded_fixture_types<'s>(
+    values: &'s [(u32, &'s FunctionValueType)],
+    fields: &'s [(u32, &'s Arc<Field>)],
+) -> crate::physical_type_v2::EncodedTypeTable<'s> {
+    let control = Control::good(CompilePhase::Encode);
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    let table = crate::physical_type_v2::encode_borrowed_type_namespaces_pure_in(
+        values,
+        &[],
+        fields,
         type_limits(),
-        &Control::good(CompilePhase::Encode),
+        &mut work,
     )
     .unwrap();
-    decode_type_table(&wire, type_limits(), &Control::good(CompilePhase::Decode)).unwrap()
+    work.finish().unwrap();
+    table
 }
+fn decode_fixture_types(
+    encoded: &crate::physical_type_v2::EncodedTypeTable<'_>,
+    fields: &[(u32, Arc<Field>)],
+) -> DecodedTypeTable {
+    // These are the actual declared source roots of this type-only fixture.
+    // IPC materialization uses its original records and the sole reader later.
+    let package = wire::FragmentPackage {
+        types: Some(encoded.as_wire().clone()),
+        source_fields: Some(
+            encoded
+                .as_source_wire()
+                .expect("actual source emission")
+                .clone(),
+        ),
+        constants: fields
+            .iter()
+            .map(|(id, _)| wire::IpcConstantPool {
+                source_field_id: Some(*id),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let control = Control::good(CompilePhase::Decode);
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let result = decode_package_type_table_observed(
+        &package,
+        SOURCE,
+        fixture_type_limits(),
+        &mut |_| Ok(()),
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
+    result
+}
+
 fn pool_with(array: ArrayRef, field: Arc<Field>, ty: FunctionValueType) -> ConstantPool {
     ConstantPool::try_new(
         field,
@@ -253,7 +330,7 @@ fn roundtrip(pool: &ConstantPool, id: u32, value_id: u32, field_id: u32) -> Cons
     let record = encode(pool, id, value_id, field_id);
     assert_eq!(record.id, id);
     assert_eq!(record.value_type_id, Some(value_id));
-    assert_eq!(record.field_id, Some(field_id));
+    assert_eq!(record.source_field_id, Some(field_id));
     assert_eq!(
         record.compression,
         wire::IpcCompression::Uncompressed as i32
@@ -262,7 +339,7 @@ fn roundtrip(pool: &ConstantPool, id: u32, value_id: u32, field_id: u32) -> Cons
     assert_eq!(decoded_id.get(), id);
     assert!(Arc::ptr_eq(
         result.field_ref(),
-        types.field(field_id).unwrap()
+        types.source_field(field_id).unwrap()
     ));
     assert_eq!(result.array().len(), pool.array().len());
     for ordinal in 0..pool.array().len() {
@@ -316,7 +393,7 @@ fn record_flat_bits_sparse_ids_and_original_unlabelled_logical_field_roundtrip()
         .unwrap();
     let original = pool_with(array, field, ty);
     let output = roundtrip(&original, 0, 0, u32::MAX);
-    assert_eq!(output.value_type().logical_type, ValueLogicalType::Json);
+    assert_eq!(output.value_type().logical_type(), ValueLogicalType::Json);
     assert!(!output.field().metadata().contains_key(NR_LOGICAL_TYPE_KEY));
     assert_eq!(
         output.field().metadata().get("provider").unwrap(),
@@ -470,7 +547,7 @@ fn record_headers_reject_absence_unknown_compression_and_namespaces_before_ipc()
     ] {
         let record = wire::IpcConstantPool {
             value_type_id: value_id,
-            field_id,
+            source_field_id: field_id,
             compression,
             arrow_ipc: vec![0xff],
             ..valid.clone()
@@ -564,19 +641,48 @@ fn record_field_value_pair_and_ipc_schema_mismatches_do_not_retag_or_reauthor() 
             .unwrap(),
     );
     let record = encode(&original, 0, 0, 0);
-    let types = types(field, FunctionValueType::new(DataType::Utf8, true), 0, 0);
-    assert!(
-        decode_constant_record(
-            &record,
-            &types,
-            SOURCE,
-            policy(),
-            decode_limits(),
-            &verifier(),
-            &Control::good(CompilePhase::Decode)
-        )
-        .is_err()
+    let plain_types = types(
+        Arc::clone(&field),
+        FunctionValueType::new(DataType::Utf8, true),
+        0,
+        0,
     );
+    let (_, plain) = decode_constant_record(
+        &record,
+        &plain_types,
+        SOURCE,
+        policy(),
+        decode_limits(),
+        &verifier(),
+        &Control::good(CompilePhase::Decode),
+    )
+    .unwrap();
+    assert_eq!(
+        plain.value_type().logical_type(),
+        ValueLogicalType::Physical
+    );
+    assert_eq!(
+        plain
+            .field()
+            .metadata()
+            .get(NR_LOGICAL_TYPE_KEY)
+            .map(String::as_str),
+        Some("json")
+    );
+    assert_eq!(plain.value_type().data_type(), &DataType::Utf8);
+    let json_types = types(field, original.value_type().clone(), 0, 0);
+    let (_, json) = decode_constant_record(
+        &record,
+        &json_types,
+        SOURCE,
+        policy(),
+        decode_limits(),
+        &verifier(),
+        &Control::good(CompilePhase::Decode),
+    )
+    .unwrap();
+    assert_eq!(json.value_type(), original.value_type());
+    assert_eq!(plain.array().to_data(), json.array().to_data());
 }
 
 #[test]
@@ -731,7 +837,7 @@ fn record_dictionary_and_fixed_list_are_explicitly_unsupported_in_both_routes() 
         let record = wire::IpcConstantPool {
             id: 0,
             value_type_id: Some(0),
-            field_id: Some(0),
+            source_field_id: Some(0),
             compression: wire::IpcCompression::Uncompressed as i32,
             arrow_ipc,
         };
@@ -925,7 +1031,6 @@ fn record_prepared_writer_uses_same_original_control_source_and_admitted_request
 
 mod write_namespace_tests {
     use super::*;
-    use crate::physical_type_v2::encode_type_table_sources;
     include!("write_namespace_tests.rs");
 }
 

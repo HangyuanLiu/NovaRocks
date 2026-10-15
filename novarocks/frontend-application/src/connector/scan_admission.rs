@@ -19,7 +19,7 @@
 
 pub fn admit_connector_change_window(
     table: &novarocks_spi::connector::ConnectorTableHandle,
-    schema: &arrow::datatypes::SchemaRef,
+    schema: &arrow::datatypes::Schema,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     context: novarocks_spi::connector::ConnectorRequestContext,
     window: novarocks_spi::connector::ConnectorChangeWindow,

@@ -38,7 +38,11 @@ pub(crate) fn policy() -> ConstantPolicy {
 }
 pub(crate) fn pool(array: ArrayRef, ty: FunctionValueType) -> ConstantPool {
     ConstantPool::try_new(
-        Arc::new(Field::new("constant", ty.data_type.clone(), ty.nullable)),
+        Arc::new(Field::new(
+            "constant",
+            ty.data_type().clone(),
+            ty.nullable(),
+        )),
         ty,
         array.to_data(),
         policy(),
@@ -74,7 +78,7 @@ pub(crate) fn utf8_typed(value: &str, ty: FunctionValueType) -> ConstantValue {
 pub(crate) fn null(ty: DataType) -> ConstantValue {
     pool(
         arrow_array::new_null_array(&ty, 1),
-        FunctionValueType::new(ty, true),
+        FunctionValueType::from_legacy_declared_projection(ty, true),
     )
     .value(0)
     .unwrap()
@@ -149,7 +153,7 @@ fn selected_text_ordinal_and_typed_null_are_actual_dynamic_binding_facts() {
     let FunctionResultType::Scalar(result) = &selected.result_type else {
         panic!("scalar");
     };
-    let DataType::Struct(fields) = &result.data_type else {
+    let DataType::Struct(fields) = result.data_type() else {
         panic!("struct");
     };
     assert_eq!(fields[0].name(), "actual");

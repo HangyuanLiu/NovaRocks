@@ -350,7 +350,7 @@ fn global_sort_downstream_project_filter_limit_keep_original_ordered_source() {
         .types()
         .get(&ProgramExpressionArena::Main)
         .unwrap();
-    assert!(ty.iter().any(|ty| matches!(ty, novarocks_type_contract::FunctionArgumentType::Value(ty) if ty.logical_type==ValueLogicalType::Json && ty.nullable)));
+    assert!(ty.iter().any(|ty| matches!(ty, novarocks_type_contract::FunctionArgumentType::Value(ty) if ty.logical_type()==ValueLogicalType::Json && ty.nullable())));
 }
 #[test]
 fn partition_topn_sort_mode_stays_explicitly_unsupported() {

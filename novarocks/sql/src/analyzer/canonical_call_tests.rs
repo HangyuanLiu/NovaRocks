@@ -375,19 +375,20 @@ fn canonical_hidden_array_literal_materializes_common_width_and_keeps_null_and_n
     .unwrap();
     let (_, binding, args) = call(project(&query, 0));
     for argument in args {
-        assert_eq!(argument.value_type.logical_type, ValueLogicalType::Json);
+        assert_eq!(argument.value_type.logical_type(), ValueLogicalType::Json);
         assert!(matches!(argument.kind, ExprKind::ColumnRef { .. }));
     }
     let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
         panic!("scalar");
     };
-    let DataType::List(item) = &result.data_type else {
+    let DataType::List(item) = &result.data_type() else {
         panic!("list");
     };
     assert_eq!(
-        novarocks_type_contract::field_logical_type(item),
-        Ok(ValueLogicalType::Json)
+        result,
+        &crate::test_value_types::string_list(true, true, false)
     );
+    assert_eq!(item.metadata().capacity(), 0);
     assert_eq!(&project(&query, 0).value_type, result);
 }
 
@@ -422,7 +423,9 @@ fn canonical_higher_order_helper_keeps_original_lambda_and_nested_source_metadat
     assert_eq!(
         binding.selected.argument_types[0],
         FunctionArgumentType::Lambda {
-            parameter_types: vec![expected.clone()].into_boxed_slice(),
+            parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                vec![expected.clone()].into_boxed_slice()
+            ),
             result_type: expected,
         }
     );
@@ -439,11 +442,21 @@ fn canonical_higher_order_helper_keeps_original_lambda_and_nested_source_metadat
         panic!("scalar");
     };
     assert_eq!(&expression.value_type, result);
-    let DataType::List(item) = &result.data_type else {
+    let DataType::List(item) = &result.data_type() else {
         panic!("list");
     };
     assert_eq!(item.data_type(), &DataType::Int64);
     assert!(item.is_nullable());
+    assert_eq!(item.name(), "item");
+    assert_eq!(item.metadata().capacity(), 0);
+    let DataType::List(source_item) = &source.carrier else {
+        panic!("expected original source list");
+    };
+    assert_eq!(source_item.name(), "source_element");
+    assert_eq!(
+        source_item.metadata().get("provider").map(String::as_str),
+        Some("exact original field")
+    );
 }
 
 #[derive(Default)]

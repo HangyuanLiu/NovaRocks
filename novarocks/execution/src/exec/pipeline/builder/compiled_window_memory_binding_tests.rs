@@ -84,8 +84,8 @@ fn by_runtime_memory_ready_actual_compiled_window_operator_borrows_prepared_task
         state.error_state(),
     )
     .unwrap();
-    // The actual factory delegates to this single typed constructor. The
-    // test bridge calls original prepare + bind_runtime_state, as Pipeline does.
+    // This bridge verifies the original runtime memory binding only.
+    // Schema preparation is checked separately with its actual creator.
     let before = binding.authority().root().committed_bytes();
     let installed = factory
         .bind_runtime_memory_for_test(&state)

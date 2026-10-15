@@ -16,7 +16,7 @@
 // under the License.
 
 #[test]
-fn root_positive_source_structural_compiled_statistics_unknown_owner() {
+fn root_positive_source_structural_compiled_statistics_canonical_owner() {
     for rows in [vec![], vec![(1, Some("a")), (2, None), (1, Some("a"))]] {
         let outcome = differential(0, &[rows], |_| true);
         let compiled = outcome
@@ -26,8 +26,13 @@ fn root_positive_source_structural_compiled_statistics_unknown_owner() {
         assert_same_rows(&compiled, &original);
         assert!(!compiled.is_empty());
         for chunk in compiled {
-            // The structural package fixture uses plain StaticLayouts. It
-            // publishes rows, but supplies neither decoded UEA nor M07 sources.
+            // Actual preparation owns the canonical schema independently of
+            // the retired metadata-origin receipts.
+            assert!(chunk.chunk_schema().is_typed());
+            assert_eq!(chunk.schema().metadata().capacity(), 0);
+            for field in chunk.schema().fields() {
+                assert_eq!(field.metadata().capacity(), 0);
+            }
             assert!(chunk.chunk_schema().metadata_materializations().is_none());
             assert!(chunk.chunk_schema().field_metadata_origins().is_none());
             assert!(chunk.chunk_schema().schema_metadata_origin().is_none());
@@ -36,17 +41,15 @@ fn root_positive_source_structural_compiled_statistics_unknown_owner() {
                 nodes: 8192,
                 depth: 64,
             };
-            assert_eq!(
-                crate::exec::chunk::borrowed_root_chunk_schema_storage(
-                    chunk.chunk_schema(),
-                    limits
-                ),
-                Err(crate::exec::chunk::RootArrayStorageError::UnknownMetadataOwner)
-            );
-            assert_eq!(
-                crate::exec::chunk::borrowed_root_chunk_storage(&chunk, limits),
-                Err(crate::exec::chunk::RootArrayStorageError::UnknownMetadataOwner)
-            );
+            let schema_bytes = crate::exec::chunk::borrowed_root_chunk_schema_storage(
+                chunk.chunk_schema(),
+                limits,
+            )
+            .expect("actual canonical schema creator");
+            let input_bytes = crate::exec::chunk::borrowed_root_chunk_storage(&chunk, limits)
+                .expect("canonical schema and actual batch backing");
+            assert!(schema_bytes > 0);
+            assert!(input_bytes > 0);
         }
     }
 }

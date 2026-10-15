@@ -26,12 +26,14 @@ use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, MAX_UNOBSERVED_COMPILE_WORK,
     PureCompileControl,
 };
+use novarocks_type_contract::{
+    TypedValueBinding, ValueTypeRef, ValueTypeStorageLifetime, write_value_type_identity_observed,
+};
 use novarocks_types::SlotId;
 use novarocks_types::arrow_metadata_owner::{FieldMetadataOrigins, MetadataOwnedSchema};
-use novarocks_types::logical::LogicalType;
 use sha2::{Digest, Sha256};
 
-use crate::{LayoutIdentity, StaticFieldSchema};
+use crate::LayoutIdentity;
 
 const MAX_SLOT_METADATA_DEPTH: usize = 64;
 const MAX_SLOT_METADATA_NODES: usize = 65_536;
@@ -40,12 +42,13 @@ const MAX_SLOT_METADATA_NODES: usize = 65_536;
 /// unique ID is a known absence, distinct from an unspecified slot record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StaticSlotMetadata {
-    field_schema: StaticFieldSchema,
+    field_schema: ValueTypeRef,
+    binding: Option<TypedValueBinding>,
     unique_id: Option<i32>,
 }
 
 impl StaticSlotMetadata {
-    const fn field_schema(&self) -> &StaticFieldSchema {
+    const fn field_schema(&self) -> &ValueTypeRef {
         &self.field_schema
     }
 }
@@ -60,6 +63,9 @@ pub struct StaticLayout {
     metadata_materializations: Option<SchemaMetadataMaterializations>,
     field_metadata_origins: Option<FieldMetadataOrigins>,
     schema_metadata_origin: Option<MetadataOwnedSchema>,
+    slot_index: Option<Arc<[(SlotId, usize)]>>,
+    typed_representation: bool,
+    storage: ValueTypeStorageLifetime,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +77,9 @@ pub enum LayoutError {
     TooManyMetadataNodes,
     Encode,
     MetadataOwnerConflict,
+    ValueBindingMismatch,
+    TypedProjectionRequiresOwner,
+    AllocationModel,
 }
 
 impl fmt::Display for LayoutError {
@@ -85,6 +94,9 @@ impl fmt::Display for LayoutError {
             Self::MetadataOwnerConflict => {
                 "static layout metadata origins conflict with exact owners"
             }
+            Self::ValueBindingMismatch => "static layout conflicts with its explicit value binding",
+            Self::TypedProjectionRequiresOwner => "typed static layout projection requires the creating owner's storage and request port",
+            Self::AllocationModel => "static layout allocation request cannot be represented",
         })
     }
 }
@@ -108,6 +120,18 @@ impl From<CompileControlError> for LayoutCompileError {
         Self::Control(error)
     }
 }
+impl From<novarocks_type_contract::ExecutionValueTypeError> for LayoutCompileError {
+    fn from(_: novarocks_type_contract::ExecutionValueTypeError) -> Self {
+        Self::Layout(LayoutError::ValueBindingMismatch)
+    }
+}
+impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for LayoutCompileError
+{
+    fn from(_: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::Layout(LayoutError::AllocationModel)
+    }
+}
 impl fmt::Display for LayoutCompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -123,6 +147,55 @@ impl std::error::Error for LayoutCompileError {
             Self::Control(error) => Some(error),
         }
     }
+}
+
+/// Creator refusals and original compile-control/shape failures remain distinct.
+#[derive(Debug)]
+pub enum LayoutCreationFailure<H> {
+    Layout(LayoutCompileError),
+    Creator(H),
+    Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+}
+impl<H> From<LayoutCompileError> for LayoutCreationFailure<H> {
+    fn from(error: LayoutCompileError) -> Self {
+        Self::Layout(error)
+    }
+}
+impl<H> From<LayoutError> for LayoutCreationFailure<H> {
+    fn from(error: LayoutError) -> Self {
+        Self::Layout(error.into())
+    }
+}
+impl<H> From<CompileControlError> for LayoutCreationFailure<H> {
+    fn from(error: CompileControlError) -> Self {
+        Self::Layout(error.into())
+    }
+}
+impl<H> From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for LayoutCreationFailure<H>
+{
+    fn from(error: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::Resource(error)
+    }
+}
+fn compile_with_creator<T, H>(
+    control: &dyn PureCompileControl,
+    operation: impl FnOnce(&mut LayoutWork<'_>) -> Result<T, LayoutCreationFailure<H>>,
+) -> Result<T, LayoutCreationFailure<H>> {
+    let mut work = LayoutWork(Some(CompileCheckpoints::try_new(
+        control,
+        CompilePhase::LowerProgram,
+    )?));
+    let result = operation(&mut work);
+    if matches!(
+        &result,
+        Err(LayoutCreationFailure::Creator(_)
+            | LayoutCreationFailure::Layout(LayoutCompileError::Control(_)))
+    ) {
+        return result;
+    }
+    work.flush()?;
+    result
 }
 
 // The absent observer belongs only to the existing legacy entry points. A
@@ -192,7 +265,7 @@ fn legacy<T>(
 
 impl StaticLayout {
     /// Schema-only construction explicitly records unknown slot semantics.
-    /// Production lowering uses `try_new_exact` from the decoded ChunkSchema.
+    /// Production lowering uses its actual typed layout creator.
     pub fn try_new(schema: SchemaRef, slots: Arc<[SlotId]>) -> Result<Self, LayoutError> {
         legacy(|work| Self::try_new_inner(schema, slots, None, work))
     }
@@ -204,40 +277,6 @@ impl StaticLayout {
         compile(control, |work| {
             Self::try_new_inner(schema, slots, None, work)
         })
-    }
-    pub fn try_new_exact(
-        schema: SchemaRef,
-        slots: Arc<[SlotId]>,
-        slot_metadata: Vec<(StaticFieldSchema, Option<i32>)>,
-    ) -> Result<Self, LayoutError> {
-        legacy(|work| Self::try_new_exact_inner(schema, slots, slot_metadata, work))
-    }
-    pub fn try_new_exact_for_compile(
-        schema: SchemaRef,
-        slots: Arc<[SlotId]>,
-        slot_metadata: Vec<(StaticFieldSchema, Option<i32>)>,
-        control: &dyn PureCompileControl,
-    ) -> Result<Self, LayoutCompileError> {
-        compile(control, |work| {
-            Self::try_new_exact_inner(schema, slots, slot_metadata, work)
-        })
-    }
-    fn try_new_exact_inner(
-        schema: SchemaRef,
-        slots: Arc<[SlotId]>,
-        slot_metadata: Vec<(StaticFieldSchema, Option<i32>)>,
-        work: &mut LayoutWork<'_>,
-    ) -> Result<Self, LayoutCompileError> {
-        let mut metadata = Vec::with_capacity(slot_metadata.len());
-        for (field_schema, unique_id) in slot_metadata {
-            metadata.push(StaticSlotMetadata {
-                field_schema,
-                unique_id,
-            });
-            work.step()?;
-        }
-        let metadata = work.opaque(|| Ok(Arc::from(metadata)))?;
-        Self::try_new_inner(schema, slots, Some(metadata), work)
     }
     fn try_new_inner(
         schema: SchemaRef,
@@ -271,6 +310,9 @@ impl StaticLayout {
             metadata_materializations: None,
             field_metadata_origins: None,
             schema_metadata_origin: None,
+            slot_index: None,
+            typed_representation: false,
+            storage: ValueTypeStorageLifetime::pure(),
         })
     }
     /// Consume the positively paired original Schema owner. No public API
@@ -327,9 +369,318 @@ impl StaticLayout {
     pub fn has_exact_slot_metadata(&self) -> bool {
         self.slot_metadata.is_some()
     }
-    pub fn slot_metadata_at(&self, index: usize) -> Option<(&StaticFieldSchema, Option<i32>)> {
+    pub fn slot_metadata_at(&self, index: usize) -> Option<(&ValueTypeRef, Option<i32>)> {
         let metadata = self.slot_metadata.as_ref()?.get(index)?;
         Some((&metadata.field_schema, metadata.unique_id))
+    }
+    pub fn value_binding(&self, slot: SlotId) -> Option<&TypedValueBinding> {
+        let index = if let Some(index) = &self.slot_index {
+            index[index.binary_search_by_key(&slot, |entry| entry.0).ok()?].1
+        } else {
+            self.slots.iter().position(|actual| *actual == slot)?
+        };
+        self.slot_metadata.as_ref()?.get(index)?.binding.as_ref()
+    }
+    pub fn value_binding_at(&self, index: usize) -> Option<&TypedValueBinding> {
+        self.slot_metadata.as_ref()?.get(index)?.binding.as_ref()
+    }
+    pub fn is_typed(&self) -> bool {
+        self.typed_representation
+    }
+
+    /// Validate an exchange projection against the already authored layout.
+    /// This borrows both bindings and allocates no projection scaffolds.
+    pub fn typed_projection_matches_for_compile(
+        &self,
+        output_columns: &[SlotId],
+        expected: &Self,
+        control: &dyn PureCompileControl,
+    ) -> Result<bool, LayoutCompileError> {
+        compile(control, |work| {
+            self.typed_projection_matches_inner(output_columns, expected, false, work)
+        })
+    }
+
+    pub fn typed_projection_matches(
+        &self,
+        output_columns: &[SlotId],
+        expected: &Self,
+    ) -> Result<bool, LayoutError> {
+        legacy(|work| self.typed_projection_matches_inner(output_columns, expected, false, work))
+    }
+
+    /// Writer execution values and provider row obligations have independent
+    /// root NULL guarantees. Every other slot/name/type/layout fact is exact.
+    pub(crate) fn writer_projection_matches_for_compile(
+        &self,
+        expected: &Self,
+        control: &dyn PureCompileControl,
+    ) -> Result<bool, LayoutCompileError> {
+        compile(control, |work| {
+            self.typed_projection_matches_inner(&[], expected, true, work)
+        })
+    }
+
+    pub(crate) fn writer_projection_matches(&self, expected: &Self) -> Result<bool, LayoutError> {
+        legacy(|work| self.typed_projection_matches_inner(&[], expected, true, work))
+    }
+
+    fn typed_projection_matches_inner(
+        &self,
+        output_columns: &[SlotId],
+        expected: &Self,
+        writer_row_obligation: bool,
+        work: &mut LayoutWork<'_>,
+    ) -> Result<bool, LayoutCompileError> {
+        work.step()?;
+        if !self.is_typed() || !expected.is_typed() {
+            return Err(LayoutError::ValueBindingMismatch.into());
+        }
+        if writer_row_obligation
+            && (self.schema.metadata().capacity() != 0
+                || expected.schema.metadata().capacity() != 0)
+        {
+            return Err(LayoutError::ValueBindingMismatch.into());
+        }
+        let columns = if output_columns.is_empty() {
+            self.slots()
+        } else {
+            output_columns
+        };
+        if columns.len() != expected.slots().len() {
+            return Ok(false);
+        }
+        let index = self
+            .slot_index
+            .as_ref()
+            .ok_or(LayoutError::ValueBindingMismatch)?;
+        for (ordinal, slot) in columns.iter().enumerate() {
+            work.step()?;
+            if *slot != expected.slots()[ordinal] {
+                return Ok(false);
+            }
+            let mut lo = 0;
+            let mut hi = index.len();
+            while lo < hi {
+                work.step()?;
+                let mid = lo + (hi - lo) / 2;
+                if index[mid].0 < *slot {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            let source_ordinal = index
+                .get(lo)
+                .filter(|entry| entry.0 == *slot)
+                .ok_or(LayoutError::UnknownSlot)?
+                .1;
+            let source_field = &self.schema.fields()[source_ordinal];
+            let target_field = &expected.schema.fields()[ordinal];
+            work.step()?;
+            if source_field.name().len() != target_field.name().len()
+                || (!writer_row_obligation
+                    && source_field.is_nullable() != target_field.is_nullable())
+                || (writer_row_obligation
+                    && (source_field.metadata().capacity() != 0
+                        || target_field.metadata().capacity() != 0))
+            {
+                return Ok(false);
+            }
+            for (a, b) in source_field
+                .name()
+                .as_bytes()
+                .chunks(MAX_UNOBSERVED_COMPILE_WORK as usize)
+                .zip(
+                    target_field
+                        .name()
+                        .as_bytes()
+                        .chunks(MAX_UNOBSERVED_COMPILE_WORK as usize),
+                )
+            {
+                for _ in a {
+                    work.step()?;
+                }
+                if a != b {
+                    return Ok(false);
+                }
+            }
+            let source = self
+                .slot_metadata
+                .as_ref()
+                .ok_or(LayoutError::ValueBindingMismatch)?;
+            let target = expected
+                .slot_metadata
+                .as_ref()
+                .ok_or(LayoutError::ValueBindingMismatch)?;
+            let source = &source[source_ordinal];
+            let target = &target[ordinal];
+            work.step()?;
+            if source.unique_id != target.unique_id {
+                return Ok(false);
+            }
+            if writer_row_obligation {
+                let source = source
+                    .binding
+                    .as_ref()
+                    .ok_or(LayoutError::ValueBindingMismatch)?;
+                let target = target
+                    .binding
+                    .as_ref()
+                    .ok_or(LayoutError::ValueBindingMismatch)?;
+                if !source
+                    .borrowed()
+                    .same_physical_binding_ignoring_root_nullability_observed(
+                        target.borrowed(),
+                        || work.step(),
+                    )?
+                {
+                    return Ok(false);
+                }
+            } else {
+                let mut a = Sha256::new();
+                let mut b = Sha256::new();
+                hash_field_schema(&mut a, &source.field_schema, work)?;
+                hash_field_schema(&mut b, &target.field_schema, work)?;
+                if a.finalize() != b.finalize() {
+                    return Ok(false);
+                }
+            }
+            let binding = source
+                .binding
+                .as_ref()
+                .ok_or(LayoutError::ValueBindingMismatch)?;
+            if !binding
+                .layout()
+                .matches_projection_observed(target_field.data_type(), |units| {
+                    for _ in 0..units {
+                        work.step()?;
+                    }
+                    Ok::<_, LayoutCompileError>(())
+                })?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    pub fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+        self.storage.clone()
+    }
+
+    /// Bind the actual static Arrow projection to its explicit immutable value
+    /// types. No domain is reconstructed from annotations, and independently
+    /// retained bindings keep their original creation responsibility.
+    pub fn try_new_typed_for_compile(
+        schema: SchemaRef,
+        slots: Arc<[SlotId]>,
+        bindings: Vec<(TypedValueBinding, Option<i32>)>,
+        storage: ValueTypeStorageLifetime,
+        mut request: impl FnMut(std::alloc::Layout) -> Result<(), LayoutCompileError>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, LayoutCompileError> {
+        match Self::try_new_typed_with_creator::<std::convert::Infallible>(
+            schema,
+            slots,
+            bindings,
+            storage,
+            |layout| request(layout).map_err(Into::into),
+            control,
+        ) {
+            Ok(value) => Ok(value),
+            Err(LayoutCreationFailure::Layout(error)) => Err(error),
+            Err(LayoutCreationFailure::Creator(never)) => match never {},
+            Err(LayoutCreationFailure::Resource(error)) => Err(error.into()),
+        }
+    }
+
+    pub fn try_new_typed_with_creator<H>(
+        schema: SchemaRef,
+        slots: Arc<[SlotId]>,
+        bindings: Vec<(TypedValueBinding, Option<i32>)>,
+        storage: ValueTypeStorageLifetime,
+        mut request: impl FnMut(std::alloc::Layout) -> Result<(), LayoutCreationFailure<H>>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, LayoutCreationFailure<H>> {
+        compile_with_creator(control, |work| {
+            work.step()?;
+            if schema.fields().len() != slots.len() || bindings.len() != slots.len() {
+                return Err(LayoutError::ArityMismatch.into());
+            }
+            if schema.metadata().capacity() != 0 {
+                return Err(LayoutError::ValueBindingMismatch.into());
+            }
+            let array_layout = std::alloc::Layout::array::<(SlotId, usize)>(slots.len())
+                .map_err(|_| LayoutCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?;
+            if !slots.is_empty() {
+                request(array_layout)?;
+            }
+            let mut ordered = Vec::with_capacity(slots.len());
+            for (index, slot) in slots.iter().enumerate() {
+                work.step()?;
+                ordered.push((*slot, index));
+            }
+            sort_slots_observed(&mut ordered, work)?;
+            for pair in ordered.windows(2) {
+                work.step()?;
+                if pair[0].0 == pair[1].0 {
+                    return Err(LayoutError::DuplicateSlot.into());
+                }
+            }
+            let metadata_layout = std::alloc::Layout::array::<StaticSlotMetadata>(slots.len())
+                .map_err(|_| LayoutCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?;
+            if !slots.is_empty() {
+                request(metadata_layout)?;
+            }
+            let mut metadata = Vec::with_capacity(slots.len());
+            let mut expanded = 0usize;
+            for (field, (binding, unique_id)) in schema.fields().iter().zip(bindings) {
+                work.step()?;
+                if field.metadata().capacity() != 0
+                    || field.is_nullable() != binding.nullable()
+                    || !binding.layout().matches_projection_observed(
+                        field.data_type(),
+                        |units| {
+                            for _ in 0..units {
+                                work.step()?;
+                            }
+                            Ok::<_, LayoutCompileError>(())
+                        },
+                    )?
+                {
+                    return Err(LayoutError::ValueBindingMismatch.into());
+                }
+                expanded = expanded
+                    .checked_add(binding.value_type().expanded_nodes())
+                    .filter(|nodes| *nodes <= MAX_SLOT_METADATA_NODES)
+                    .ok_or(LayoutError::TooManyMetadataNodes)?;
+                work.step()?;
+                metadata.push(StaticSlotMetadata {
+                    field_schema: binding.value_type().clone(),
+                    binding: Some(binding),
+                    unique_id,
+                });
+            }
+            request(
+                novarocks_type_contract::owned_resources::layout::arc_layout(metadata_layout)?,
+            )?;
+            work.step()?;
+            let slot_metadata = Some(Arc::from(metadata));
+            request(novarocks_type_contract::owned_resources::layout::arc_layout(array_layout)?)?;
+            work.step()?;
+            let slot_index = Some(Arc::from(ordered));
+            Ok(Self {
+                schema,
+                slots,
+                slot_metadata,
+                metadata_materializations: None,
+                field_metadata_origins: None,
+                schema_metadata_origin: None,
+                slot_index,
+                typed_representation: true,
+                storage,
+            })
+        })
     }
     /// Empty output columns mean the complete input layout, matching the
     /// stream sink's existing projection semantics.
@@ -343,6 +694,115 @@ impl StaticLayout {
     ) -> Result<Self, LayoutCompileError> {
         compile(control, |work| self.project_inner(output_columns, work))
     }
+
+    /// Construct new static projection scaffolds under their actual owner while
+    /// sharing original immutable fields/types and keeping only their storage
+    /// lifetimes. Empty output retains the existing complete-layout convention.
+    pub fn project_by_slots_typed_for_compile(
+        &self,
+        output_columns: &[SlotId],
+        storage: ValueTypeStorageLifetime,
+        mut request: impl FnMut(std::alloc::Layout) -> Result<(), LayoutCompileError>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, LayoutCompileError> {
+        match self.project_by_slots_typed_with_creator::<std::convert::Infallible>(
+            output_columns,
+            storage,
+            |layout| request(layout).map_err(Into::into),
+            control,
+        ) {
+            Ok(value) => Ok(value),
+            Err(LayoutCreationFailure::Layout(error)) => Err(error),
+            Err(LayoutCreationFailure::Resource(error)) => Err(error.into()),
+            Err(LayoutCreationFailure::Creator(never)) => match never {},
+        }
+    }
+
+    pub fn project_by_slots_typed_with_creator<H>(
+        &self,
+        output_columns: &[SlotId],
+        storage: ValueTypeStorageLifetime,
+        mut request: impl FnMut(std::alloc::Layout) -> Result<(), LayoutCreationFailure<H>>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, LayoutCreationFailure<H>> {
+        if !self.is_typed() {
+            return Err(LayoutError::ValueBindingMismatch.into());
+        }
+        if output_columns.is_empty() {
+            control.checkpoint(CompilePhase::LowerProgram, 0)?;
+            return Ok(self.clone());
+        }
+        let (schema, slots, bindings, storage) = compile_with_creator(control, |work| {
+            let storage = storage.retaining_observed(&self.storage, &mut request)?;
+            let count = output_columns.len();
+            request(layout_array::<arrow_schema::FieldRef>(count)?)?;
+            request(layout_array::<SlotId>(count)?)?;
+            request(layout_array::<(TypedValueBinding, Option<i32>)>(count)?)?;
+            let mut fields = Vec::with_capacity(count);
+            let mut slots = Vec::with_capacity(count);
+            let mut bindings = Vec::with_capacity(count);
+            for requested in output_columns {
+                let index = self
+                    .slot_index
+                    .as_ref()
+                    .ok_or(LayoutError::ValueBindingMismatch)?;
+                let mut lo = 0;
+                let mut hi = index.len();
+                while lo < hi {
+                    work.step()?;
+                    let mid = lo + (hi - lo) / 2;
+                    match index[mid].0.cmp(requested) {
+                        Ordering::Less => lo = mid + 1,
+                        _ => hi = mid,
+                    }
+                }
+                work.step()?;
+                let index = index
+                    .get(lo)
+                    .filter(|entry| entry.0 == *requested)
+                    .ok_or(LayoutError::UnknownSlot)?
+                    .1;
+                let metadata = self
+                    .slot_metadata
+                    .as_ref()
+                    .and_then(|values| values.get(index))
+                    .ok_or(LayoutError::ValueBindingMismatch)?;
+                let binding = metadata
+                    .binding
+                    .as_ref()
+                    .ok_or(LayoutError::ValueBindingMismatch)?;
+                work.step()?;
+                fields.push(Arc::clone(&self.schema.fields()[index]));
+                work.step()?;
+                bindings.push((binding.clone_observed(|| work.step())?, metadata.unique_id));
+                slots.push(*requested);
+            }
+            request(
+                novarocks_type_contract::owned_resources::layout::arc_layout(layout_array::<
+                    arrow_schema::FieldRef,
+                >(
+                    count
+                )?)?,
+            )?;
+            request(
+                novarocks_type_contract::owned_resources::layout::arc_layout(
+                    std::alloc::Layout::new::<Schema>(),
+                )?,
+            )?;
+            work.step()?;
+            let schema = Arc::new(Schema::new(fields));
+            request(
+                novarocks_type_contract::owned_resources::layout::arc_layout(layout_array::<
+                    SlotId,
+                >(
+                    count
+                )?)?,
+            )?;
+            work.step()?;
+            Ok((schema, Arc::from(slots), bindings, storage))
+        })?;
+        Self::try_new_typed_with_creator(schema, slots, bindings, storage, request, control)
+    }
     fn project_inner(
         &self,
         output_columns: &[SlotId],
@@ -350,6 +810,9 @@ impl StaticLayout {
     ) -> Result<Self, LayoutCompileError> {
         if output_columns.is_empty() {
             return Ok(self.clone());
+        }
+        if self.is_typed() {
+            return Err(LayoutError::TypedProjectionRequiresOwner.into());
         }
         let mut index_by_slot = BTreeMap::new();
         for (index, slot) in self.slots.iter().copied().enumerate() {
@@ -544,56 +1007,78 @@ impl StaticLayout {
         Ok(LayoutIdentity::from_sha256(digest))
     }
 }
+fn layout_array<T>(count: usize) -> Result<std::alloc::Layout, LayoutCompileError> {
+    std::alloc::Layout::array::<T>(count).map_err(|_| LayoutError::AllocationModel.into())
+}
+
+fn sort_slots_observed(
+    slots: &mut [(SlotId, usize)],
+    work: &mut LayoutWork<'_>,
+) -> Result<(), LayoutCompileError> {
+    fn sift(
+        slots: &mut [(SlotId, usize)],
+        mut root: usize,
+        end: usize,
+        work: &mut LayoutWork<'_>,
+    ) -> Result<(), LayoutCompileError> {
+        while root < end / 2 {
+            let mut child = root * 2 + 1;
+            work.step()?;
+            if child + 1 < end {
+                work.step()?;
+                if slots[child].0 < slots[child + 1].0 {
+                    child += 1;
+                }
+            }
+            work.step()?;
+            if slots[root].0 >= slots[child].0 {
+                break;
+            }
+            work.step()?;
+            slots.swap(root, child);
+            root = child;
+        }
+        Ok(())
+    }
+    let len = slots.len();
+    for root in (0..len / 2).rev() {
+        sift(slots, root, len, work)?;
+    }
+    for end in (1..len).rev() {
+        work.step()?;
+        slots.swap(0, end);
+        sift(slots, 0, end, work)?;
+    }
+    Ok(())
+}
+
 fn validate_metadata(
     metadata: &[StaticSlotMetadata],
     work: &mut LayoutWork<'_>,
 ) -> Result<(), LayoutCompileError> {
+    // Each immutable value node already passed its per-value depth/node rules.
+    // This port owns the expanded schema profile, including repeated roots.
     let mut count = 0usize;
-    let mut pending = Vec::with_capacity(metadata.len());
     for slot in metadata {
-        pending.push((slot.field_schema(), 1usize));
-        work.step()?;
-    }
-    while let Some((field, depth)) = pending.pop() {
-        count += 1;
+        count = count
+            .checked_add(slot.field_schema().expanded_nodes())
+            .ok_or(LayoutError::TooManyMetadataNodes)?;
         work.step()?;
         if count > MAX_SLOT_METADATA_NODES {
             return Err(LayoutError::TooManyMetadataNodes.into());
         }
-        if depth > MAX_SLOT_METADATA_DEPTH {
+        if slot.field_schema().depth() > MAX_SLOT_METADATA_DEPTH {
             return Err(LayoutError::TooDeep.into());
-        }
-        for child in field.children() {
-            pending.push((child, depth + 1));
-            work.step()?;
         }
     }
     Ok(())
 }
 fn hash_field_schema(
     digest: &mut Sha256,
-    root: &StaticFieldSchema,
+    root: &ValueTypeRef,
     work: &mut LayoutWork<'_>,
 ) -> Result<(), LayoutCompileError> {
-    let mut pending = vec![root];
-    while let Some(field) = pending.pop() {
-        let tag = match field.logical_type() {
-            None => 0,
-            Some(LogicalType::Json) => 1,
-            Some(LogicalType::Hll) => 2,
-            Some(LogicalType::Bitmap) => 3,
-            Some(LogicalType::Object) => 4,
-            Some(LogicalType::Percentile) => 5,
-        };
-        digest.update([tag]);
-        digest.update((field.children().len() as u64).to_le_bytes());
-        work.step()?;
-        for child in field.children().iter().rev() {
-            pending.push(child);
-            work.step()?;
-        }
-    }
-    Ok(())
+    write_value_type_identity_observed(root, |bytes| work.hash_bytes(digest, bytes))
 }
 fn compare_keys(
     left: &str,
@@ -691,7 +1176,179 @@ fn canonicalize_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_type_contract::{ValueKind, ValueLogicalType, ValueTypeStorageLifetime};
+    fn value(kind: ValueKind, nullable: bool) -> ValueTypeRef {
+        ValueTypeRef::try_new(kind, nullable, ValueTypeStorageLifetime::pure()).unwrap()
+    }
     use arrow_schema::{DataType, Field, Schema};
+    fn complete(value: ValueTypeRef, carrier: &DataType) -> TypedValueBinding {
+        TypedValueBinding::try_new(
+            value,
+            novarocks_type_contract::ValueLayout::try_new(
+                carrier,
+                ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+    // FE fixture declarations are pure. This callback records numerical
+    // constructor contributions; it is not a BE creator or capacity grant.
+    fn pure_request(
+        bytes: &mut usize,
+        layout: std::alloc::Layout,
+    ) -> Result<(), LayoutCompileError> {
+        *bytes = bytes
+            .checked_add(layout.size())
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        Ok(())
+    }
+    fn typed_fixture(
+        schema: SchemaRef,
+        slots: Arc<[SlotId]>,
+        facts: Vec<(TypedValueBinding, Option<i32>)>,
+        control: &dyn PureCompileControl,
+    ) -> Result<StaticLayout, LayoutCompileError> {
+        let mut requested = 0;
+        StaticLayout::try_new_typed_for_compile(
+            schema,
+            slots,
+            facts,
+            ValueTypeStorageLifetime::pure(),
+            |layout| pure_request(&mut requested, layout),
+            control,
+        )
+    }
+    fn typed_projection(
+        source: &StaticLayout,
+        slots: &[SlotId],
+        control: &dyn PureCompileControl,
+    ) -> Result<StaticLayout, LayoutCompileError> {
+        let mut requested = 0;
+        source.project_by_slots_typed_for_compile(
+            slots,
+            ValueTypeStorageLifetime::pure(),
+            |layout| pure_request(&mut requested, layout),
+            control,
+        )
+    }
+
+    #[test]
+    fn writer_projection_preserves_complete_channels_with_independent_root_null_obligations() {
+        fn list(kind: ValueKind, child_nullable: bool, nullable: bool) -> TypedValueBinding {
+            complete(
+                value(ValueKind::List(value(kind, child_nullable)), nullable),
+                &DataType::List(Arc::new(Field::new("item", DataType::Utf8, child_nullable))),
+            )
+        }
+        fn declared(
+            binding: TypedValueBinding,
+            name: &str,
+            slot: u32,
+            unique: Option<i32>,
+        ) -> StaticLayout {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                name,
+                binding.data_type().clone(),
+                binding.nullable(),
+            )]));
+            typed_fixture(
+                schema,
+                Arc::from([SlotId::new(slot)]),
+                vec![(binding, unique)],
+                &OriginalControl::default(),
+            )
+            .unwrap()
+        }
+        let execution = declared(
+            list(ValueKind::Nominal(ValueLogicalType::Json), false, true),
+            "document",
+            1,
+            Some(9),
+        );
+        let provider = declared(
+            list(ValueKind::Nominal(ValueLogicalType::Json), false, false),
+            "document",
+            1,
+            Some(9),
+        );
+        assert_ne!(
+            execution.identity().unwrap(),
+            provider.identity().unwrap(),
+            "the exact public/exchange identity is unchanged"
+        );
+        assert!(
+            !execution.typed_projection_matches(&[], &provider).unwrap(),
+            "ordinary projected ports keep exact root NULL guarantees"
+        );
+        assert!(
+            execution.writer_projection_matches(&provider).unwrap(),
+            "the provider's NOT NULL remains a separate runtime row obligation"
+        );
+        assert!(provider.writer_projection_matches(&execution).unwrap());
+        for wrong in [
+            declared(
+                list(ValueKind::String, false, false),
+                "document",
+                1,
+                Some(9),
+            ),
+            declared(
+                list(ValueKind::Nominal(ValueLogicalType::Json), true, false),
+                "document",
+                1,
+                Some(9),
+            ),
+            declared(
+                list(ValueKind::Nominal(ValueLogicalType::Json), false, false),
+                "renamed",
+                1,
+                Some(9),
+            ),
+            declared(
+                list(ValueKind::Nominal(ValueLogicalType::Json), false, false),
+                "document",
+                2,
+                Some(9),
+            ),
+            declared(
+                list(ValueKind::Nominal(ValueLogicalType::Json), false, false),
+                "document",
+                1,
+                Some(10),
+            ),
+        ] {
+            assert!(
+                !execution.writer_projection_matches(&wrong).unwrap(),
+                "logical domain, child NULL, names, slot identity and unique identity remain exact"
+            );
+        }
+        let control = OriginalControl::default();
+        assert!(
+            execution
+                .writer_projection_matches_for_compile(&provider, &control)
+                .unwrap()
+        );
+        let trace = control.trace.lock().unwrap().clone();
+        assert!(!trace.is_empty());
+        for cause in causes() {
+            for prefix in 0..trace.len() {
+                let stopped = OriginalControl {
+                    stop: Some((prefix, cause)),
+                    ..OriginalControl::default()
+                };
+                assert_eq!(
+                    execution.writer_projection_matches_for_compile(&provider, &stopped),
+                    Err(LayoutCompileError::Control(cause))
+                );
+                assert_eq!(
+                    stopped.trace.lock().unwrap().as_slice(),
+                    &trace[..=prefix],
+                    "the original first control cause has no trailing comparison/footer"
+                );
+            }
+        }
+    }
 
     #[test]
     fn projection_keeps_exact_field_arcs_and_derives_only_known_schema_metadata() {
@@ -823,81 +1480,154 @@ mod tests {
     #[test]
     fn exact_slot_semantics_change_identity_without_arrow_schema_change() {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
-        let slots = Arc::from([SlotId::new(7)]);
-        let unspecified = StaticLayout::try_new(Arc::clone(&schema), Arc::clone(&slots)).unwrap();
-        let plain = StaticLayout::try_new_exact(
-            Arc::clone(&schema),
-            Arc::clone(&slots),
-            vec![(StaticFieldSchema::new(None, vec![]), None)],
-        )
-        .unwrap();
-        let logical = StaticLayout::try_new_exact(
-            Arc::clone(&schema),
-            Arc::clone(&slots),
+        let slots: Arc<[SlotId]> = Arc::from([SlotId::new(7)]);
+        let unspecified = StaticLayout::try_new(schema.clone(), slots.clone()).unwrap();
+        let control = OriginalControl::default();
+        let plain = typed_fixture(
+            schema.clone(),
+            slots.clone(),
             vec![(
-                StaticFieldSchema::new(Some(LogicalType::Json), vec![]),
+                complete(value(ValueKind::String, true), &DataType::Utf8),
                 None,
             )],
+            &control,
         )
         .unwrap();
-        let unique = StaticLayout::try_new_exact(
-            Arc::clone(&schema),
-            Arc::clone(&slots),
-            vec![(StaticFieldSchema::new(None, vec![]), Some(3))],
+        let logical = typed_fixture(
+            schema.clone(),
+            slots.clone(),
+            vec![(
+                complete(
+                    value(ValueKind::Nominal(ValueLogicalType::Json), true),
+                    &DataType::Utf8,
+                ),
+                None,
+            )],
+            &control,
+        )
+        .unwrap();
+        let unique = typed_fixture(
+            schema.clone(),
+            slots.clone(),
+            vec![(
+                complete(value(ValueKind::String, true), &DataType::Utf8),
+                Some(3),
+            )],
+            &control,
         )
         .unwrap();
         assert!(!unspecified.has_exact_slot_metadata());
         assert!(plain.has_exact_slot_metadata());
+        assert!(plain.is_typed() && logical.is_typed() && unique.is_typed());
         assert_ne!(unspecified.identity().unwrap(), plain.identity().unwrap());
         assert_ne!(plain.identity().unwrap(), logical.identity().unwrap());
         assert_ne!(plain.identity().unwrap(), unique.identity().unwrap());
         assert_eq!(
-            logical.slot_metadata_at(0).unwrap().0.logical_type(),
-            Some(LogicalType::Json)
+            logical.slot_metadata_at(0).unwrap().0.domain(),
+            Some(ValueLogicalType::Json)
         );
         assert_eq!(unique.slot_metadata_at(0).unwrap().1, Some(3));
+        assert!(Arc::ptr_eq(plain.schema(), &schema));
+        assert!(Arc::ptr_eq(logical.schema(), &schema));
     }
 
     #[test]
     fn projection_keeps_exact_nested_slot_metadata() {
-        let schema = Arc::new(Schema::new(vec![
+        let original_source = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, false),
             Field::new("b", DataType::Utf8, true),
         ]));
-        let nested = StaticFieldSchema::new(
-            None,
-            vec![StaticFieldSchema::new(Some(LogicalType::Bitmap), vec![])],
+        let nested = value(
+            ValueKind::List(value(ValueKind::Nominal(ValueLogicalType::Bitmap), true)),
+            true,
         );
-        let source = StaticLayout::try_new_exact(
-            schema,
-            Arc::from([SlotId::new(1), SlotId::new(2)]),
-            vec![
-                (StaticFieldSchema::new(None, vec![]), None),
-                (nested.clone(), Some(9)),
-            ],
-        )
-        .unwrap();
-        let projected = source.project_by_slots(&[SlotId::new(2)]).unwrap();
+        let nested_carrier = DataType::List(Arc::new(Field::new("item", DataType::Binary, true)));
+        let facts = vec![
+            (
+                complete(value(ValueKind::String, true), &DataType::Utf8),
+                None,
+            ),
+            (complete(nested.clone(), &nested_carrier), Some(9)),
+        ];
+        let control = OriginalControl::default();
+        let slots: Arc<[SlotId]> = Arc::from([SlotId::new(1), SlotId::new(2)]);
+        // The old source carrier is preserved independently. It cannot stand
+        // in for these explicit String/List<Bitmap> execution declarations.
+        assert!(matches!(
+            typed_fixture(
+                original_source.clone(),
+                slots.clone(),
+                facts.clone(),
+                &control
+            ),
+            Err(LayoutCompileError::Layout(
+                LayoutError::ValueBindingMismatch
+            ))
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", nested_carrier, true),
+        ]));
+        let source = typed_fixture(schema, slots, facts, &control).unwrap();
+        let projected = typed_projection(&source, &[SlotId::new(2)], &control).unwrap();
         assert_eq!(projected.slot_metadata_at(0), Some((&nested, Some(9))));
         assert_ne!(projected.identity().unwrap(), source.identity().unwrap());
         assert_eq!(
-            source.project_by_slots(&[]).unwrap().identity(),
+            typed_projection(&source, &[], &control).unwrap().identity(),
             source.identity()
         );
+        assert_eq!(original_source.field(0).data_type(), &DataType::Int64);
+        assert!(!original_source.field(0).is_nullable());
+        assert_eq!(original_source.field(1).data_type(), &DataType::Utf8);
+        assert!(original_source.field(1).is_nullable());
     }
 
     #[test]
-    fn rejects_unbounded_nested_slot_metadata() {
-        let mut field = StaticFieldSchema::new(None, vec![]);
-        for _ in 0..MAX_SLOT_METADATA_DEPTH {
-            field = StaticFieldSchema::new(None, vec![field]);
+    fn rejects_unbounded_expanded_schema_profile() {
+        let mut item = value(ValueKind::String, true);
+        let mut carrier = DataType::Utf8;
+        for _ in 1..MAX_SLOT_METADATA_DEPTH {
+            item = value(ValueKind::List(item), true);
+            carrier = DataType::List(Arc::new(Field::new("item", carrier, true)));
         }
-        let result = StaticLayout::try_new_exact(
-            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
-            Arc::from([SlotId::new(1)]),
-            vec![(field, None)],
+        let count = MAX_SLOT_METADATA_NODES / MAX_SLOT_METADATA_DEPTH + 1;
+        let binding = complete(item, &carrier);
+        let roots = vec![(binding, None); count];
+        let original_source = Arc::new(Schema::new(
+            (0..count)
+                .map(|i| Field::new(format!("v{i}"), DataType::Utf8, true))
+                .collect::<Vec<_>>(),
+        ));
+        let slots: Arc<[SlotId]> = Arc::from(
+            (0..count)
+                .map(|i| SlotId::new(i as u32))
+                .collect::<Vec<_>>(),
         );
-        assert!(matches!(result, Err(LayoutError::TooDeep)));
+        let control = OriginalControl::default();
+        assert!(matches!(
+            typed_fixture(
+                original_source.clone(),
+                slots.clone(),
+                roots.clone(),
+                &control
+            ),
+            Err(LayoutCompileError::Layout(
+                LayoutError::ValueBindingMismatch
+            ))
+        ));
+        let schema = Arc::new(Schema::new(
+            (0..count)
+                .map(|i| Field::new(format!("v{i}"), carrier.clone(), true))
+                .collect::<Vec<_>>(),
+        ));
+        let result = typed_fixture(schema, slots, roots, &control);
+        assert!(matches!(
+            result,
+            Err(LayoutCompileError::Layout(
+                LayoutError::TooManyMetadataNodes
+            ))
+        ));
+        assert_eq!(original_source.fields().len(), count);
     }
 
     #[derive(Default)]
@@ -937,44 +1667,65 @@ mod tests {
     fn compile_layout_preserves_projection_schema_and_known_absence() {
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("provider".to_string(), "exact-source".to_string());
-        let schema = Arc::new(Schema::new_with_metadata(
+        let original_source = Arc::new(Schema::new_with_metadata(
             vec![
                 Field::new("a", DataType::Int64, false),
                 Field::new("b", DataType::Utf8, true).with_metadata(metadata.clone()),
             ],
-            metadata,
+            metadata.clone(),
         ));
         let slots: Arc<[SlotId]> = Arc::from([SlotId::new(9), SlotId::new(3)]);
-        let nested = StaticFieldSchema::new(
-            None,
-            vec![StaticFieldSchema::new(Some(LogicalType::Json), vec![])],
+        let nested = value(
+            ValueKind::List(value(ValueKind::Nominal(ValueLogicalType::Json), true)),
+            true,
         );
+        let carrier = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
         let facts = vec![
-            (StaticFieldSchema::new(None, vec![]), None),
-            (nested.clone(), Some(17)),
+            (
+                complete(value(ValueKind::String, true), &DataType::Utf8),
+                None,
+            ),
+            (complete(nested.clone(), &carrier), Some(17)),
         ];
-        let legacy =
-            StaticLayout::try_new_exact(schema.clone(), slots.clone(), facts.clone()).unwrap();
         let control = OriginalControl::default();
-        let checked =
-            StaticLayout::try_new_exact_for_compile(schema.clone(), slots.clone(), facts, &control)
-                .unwrap();
+        assert!(matches!(
+            typed_fixture(
+                original_source.clone(),
+                slots.clone(),
+                facts.clone(),
+                &control
+            ),
+            Err(LayoutCompileError::Layout(
+                LayoutError::ValueBindingMismatch
+            ))
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", carrier, true),
+        ]));
+        let legacy = typed_fixture(
+            schema.clone(),
+            slots.clone(),
+            facts.clone(),
+            &OriginalControl::default(),
+        )
+        .unwrap();
+        let checked = typed_fixture(schema.clone(), slots.clone(), facts, &control).unwrap();
         assert!(Arc::ptr_eq(checked.schema(), &schema));
         assert_eq!(
             checked.identity_for_compile(&control).unwrap(),
             legacy.identity().unwrap()
         );
-        let projected = checked
-            .project_by_slots_for_compile(&[SlotId::new(3)], &control)
-            .unwrap();
+        let projected = typed_projection(&checked, &[SlotId::new(3)], &control).unwrap();
         assert_eq!(projected.slots(), &[SlotId::new(3)]);
         assert_eq!(projected.schema().field(0), schema.field(1));
         assert_eq!(projected.schema().metadata(), schema.metadata());
+        assert_eq!(projected.schema().metadata().capacity(), 0);
+        assert_eq!(projected.schema().field(0).metadata().capacity(), 0);
         assert_eq!(projected.slot_metadata_at(0), Some((&nested, Some(17))));
         assert_eq!(
             projected.identity_for_compile(&control).unwrap(),
-            legacy
-                .project_by_slots(&[SlotId::new(3)])
+            typed_projection(&legacy, &[SlotId::new(3)], &control)
                 .unwrap()
                 .identity()
                 .unwrap()
@@ -985,6 +1736,10 @@ mod tests {
             unknown.identity_for_compile(&control).unwrap(),
             checked.identity_for_compile(&control).unwrap()
         );
+        assert_eq!(original_source.field(0).data_type(), &DataType::Int64);
+        assert!(!original_source.field(0).is_nullable());
+        assert_eq!(original_source.field(1).metadata(), &metadata);
+        assert_eq!(original_source.metadata(), &metadata);
         assert!(
             control
                 .trace
@@ -1008,10 +1763,16 @@ mod tests {
                 let result = match entry {
                     0 => StaticLayout::try_new_for_compile(schema.clone(), slots.clone(), &control)
                         .map(|_| ()),
-                    1 => StaticLayout::try_new_exact_for_compile(
+                    1 => typed_fixture(
                         schema.clone(),
                         slots.clone(),
-                        vec![(StaticFieldSchema::new(None, vec![]), None)],
+                        vec![(
+                            complete(
+                                value(ValueKind::Scalar(DataType::Int64), false),
+                                &DataType::Int64,
+                            ),
+                            None,
+                        )],
                         &control,
                     )
                     .map(|_| ()),
@@ -1224,3 +1985,6 @@ impl std::fmt::Debug for StaticLayout {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod typed_tests;

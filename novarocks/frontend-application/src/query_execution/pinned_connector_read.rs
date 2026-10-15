@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 
-use arrow::datatypes::SchemaRef;
+use novarocks_connector_contract::ConnectorReadExecutionSchema;
 
 use crate::catalog_application::query_bindings::{
     QueryFrozenCohortRead, QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey,
@@ -50,7 +50,7 @@ use novarocks_sql::planning::query_execution::{
 pub(crate) fn admit_pinned_file_set_scan_binding(
     bindings: &QueryTableBindingStore,
     identity: &FrozenConnectorScanIdentity,
-    input_schema: &SchemaRef,
+    input_schema: &ConnectorReadExecutionSchema,
     read: QueryPinnedFileSetRead,
 ) -> Result<SqlTableBindingId, String> {
     bindings.resolve_or_insert_with_id(pinned_file_set_binding_key(identity), move |binding| {
@@ -63,7 +63,7 @@ pub(crate) fn admit_pinned_file_set_scan_binding(
 /// and binding store; neither is published to shared catalog state.
 pub(crate) fn pinned_file_set_query_local_overlay(
     identity: &FrozenConnectorScanIdentity,
-    input_schema: &SchemaRef,
+    input_schema: &ConnectorReadExecutionSchema,
     read: QueryPinnedFileSetRead,
 ) -> QueryLocalTableOverlay {
     let retained = PinnedFileSetOverlay {
@@ -82,7 +82,7 @@ pub(crate) fn pinned_file_set_query_local_overlay(
 // One captured owner fixes field destruction order across schema aliases.
 pub(crate) struct PinnedFileSetOverlay {
     identity: FrozenConnectorScanIdentity,
-    schema: SchemaRef,
+    schema: ConnectorReadExecutionSchema,
     read: QueryPinnedFileSetRead,
 }
 impl PinnedFileSetOverlay {
@@ -99,10 +99,14 @@ impl PinnedFileSetOverlay {
 /// Build the minimal physical scan carrier for one pinned cohort read.
 pub(crate) fn pinned_file_set_scan_physical_plan(
     identity: &FrozenConnectorScanIdentity,
-    input_schema: &SchemaRef,
+    input_schema: &ConnectorReadExecutionSchema,
     binding: SqlTableBindingId,
-) -> FrozenConnectorScanPlan {
-    build_pinned_file_set_scan_plan(identity, input_schema, binding)
+) -> Result<FrozenConnectorScanPlan, String> {
+    build_pinned_file_set_scan_plan(
+        identity,
+        &super::distributed_rewrite::connector_execution_columns(input_schema)?,
+        binding,
+    )
 }
 
 fn pinned_file_set_binding_key(identity: &FrozenConnectorScanIdentity) -> QueryTableBindingKey {
@@ -111,13 +115,17 @@ fn pinned_file_set_binding_key(identity: &FrozenConnectorScanIdentity) -> QueryT
 
 fn pinned_file_set_query_table_binding(
     identity: FrozenConnectorScanIdentity,
-    input_schema: SchemaRef,
+    input_schema: ConnectorReadExecutionSchema,
     binding: SqlTableBindingId,
     read: QueryPinnedFileSetRead,
 ) -> Result<QueryTableBinding, String> {
     let planning_lease = read.planning_lease.clone();
     Ok(QueryTableBinding {
-        resolved: pinned_file_set_resolved_analyzer_table(&identity, input_schema, binding),
+        resolved: pinned_file_set_resolved_analyzer_table(
+            &identity,
+            super::distributed_rewrite::connector_execution_columns(&input_schema)?,
+            binding,
+        ),
         statistics_pin: None,
         admission: QueryTableBindingAdmission::FrozenRead(planning_lease),
         source_metadata: None,

@@ -277,7 +277,18 @@ fn variant_direct_and_explicit_cast_inputs_use_canonical_payloads() {
         "VALUES (parse_json(CAST('42' AS VARCHAR)))",
         "SELECT parse_json(CAST('42' AS VARCHAR))",
     ] {
-        let query = shape(sql, &[column("v", DataType::LargeBinary)]);
+        let variant = ColumnDef::from_value_type(
+            "v".into(),
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                novarocks_type_contract::ValueLogicalType::Variant,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let query = shape(sql, &[variant]);
         let expr = match query.body.as_ref() {
             ast::SetExpr::Values(values) => &values.rows[0][0],
             body => projection_expr(select(body), 0),
@@ -580,6 +591,62 @@ fn source_filters_aliases_distinct_and_general_query_controls_are_retained() {
                 .unwrap()
                 .is_none(),
             "{sql}"
+        );
+    }
+}
+
+#[test]
+fn literal_target_casts_keep_original_bitmap_and_hll_declarations() {
+    use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+    fn analyze(query: ast::Query) -> Result<(), novarocks_sql::compiler::SqlCompileError> {
+        use novarocks_sql::compiler::{
+            SessionOptimizerSettings, SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent,
+            SqlCompiler, SqlPhysicalEmissionMode, SqlPlannerTableSnapshot, SqlPlanningEnvironment,
+            SqlSessionContext, SqlStatementInput,
+        };
+        let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
+        let snapshot = SqlPlannerTableSnapshot::new(&catalog);
+        let functions = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
+        SqlCompiler::analyze(SqlAnalyzeRequest::new(
+            SqlStatementInput::parsed_query(Box::new(query)),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                current_catalog: None,
+                current_database: "db".into(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+                sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            &snapshot,
+            &functions,
+            crate::query_execution::constant_eval::constant_evaluator(),
+            None,
+            crate::application::test_constant_policy(),
+            SqlPhysicalEmissionMode::OriginalNativeV1,
+            SqlCompileControl::unbounded(),
+        ))?
+        .into_pending()
+        .map(|_| ())
+    }
+    for (domain, source, target_name) in [
+        (ValueLogicalType::Bitmap, "to_bitmap(10)", "BITMAP"),
+        (ValueLogicalType::Hll, "hll_hash(10)", "HLL"),
+    ] {
+        let declared =
+            FunctionValueType::try_with_logical_type(DataType::Binary, true, domain).unwrap();
+        let target = ColumnDef::from_value_type("v".into(), declared, None).unwrap();
+        let query = shape(&format!("VALUES (({source}))"), &[target]);
+        let ast::Expr::Nested(nested) = cast_input(&rows(&query)[0][0], target_name) else {
+            panic!("source parentheses must stay on the original path");
+        };
+        let original_call = cast_input(&nested.expression, target_name);
+        assert_eq!(printer::print_expr(original_call), source);
+        analyze(query).expect("the actual compiler must accept the original complete opaque cast");
+        let error =
+            analyze(parse_query(&format!("SELECT CAST(X'00' AS {target_name})"))).unwrap_err();
+        assert!(
+            error.to_string().contains("no matching declared overload"),
+            "{error}"
         );
     }
 }

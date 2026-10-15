@@ -100,8 +100,8 @@ fn aggregate(
     let mut output = column(
         91,
         "aggregate_result",
-        result.data_type.clone(),
-        result.nullable,
+        result.data_type().clone(),
+        result.nullable(),
     );
     output.value_type = result.clone();
     let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
@@ -113,7 +113,7 @@ fn aggregate(
                 name: name.into(),
                 source: AggregateArgumentSource::logical_update(arguments, order, binding),
                 distinct: false,
-                result_type: output.value_type.data_type.clone(),
+                result_type: output.value_type.clone(),
                 output_column_id: output.column_id,
             }],
             is_merge: vec![false],
@@ -144,12 +144,12 @@ fn local(name: &str, args: Vec<TypedExpr>) -> PhysicalPlanNode {
     let mut state = column(
         91,
         "state",
-        intermediate.data_type.clone(),
-        intermediate.nullable,
+        intermediate.data_type().clone(),
+        intermediate.nullable(),
     );
     state.value_type = intermediate;
     spec.mode = AggMode::Local;
-    spec.aggregates[0].result_type = state.value_type.data_type.clone();
+    spec.aggregates[0].result_type = state.value_type.clone();
     spec.output_layout = AggregateOutputLayout::new(vec![], vec![state.clone()]);
     spec.output_columns = vec![state.clone()];
     result.output_columns = vec![state];
@@ -181,9 +181,14 @@ fn merge(
             .unwrap()
             .intermediate_type
             .clone();
-        let mut state = column(91, "intermediate_state", ty.data_type.clone(), ty.nullable);
+        let mut state = column(
+            91,
+            "intermediate_state",
+            ty.data_type().clone(),
+            ty.nullable(),
+        );
         state.value_type = ty;
-        spec.aggregates[0].result_type = state.value_type.data_type.clone();
+        spec.aggregates[0].result_type = state.value_type.clone();
         spec.output_layout = AggregateOutputLayout::new(vec![], vec![state.clone()]);
         spec.output_columns = vec![state.clone()];
         result.output_columns = vec![state];
@@ -381,12 +386,12 @@ pub fn ordered_array_state_source_for_test(
     let mut state = column(
         91,
         "ordered_state",
-        state_type.data_type.clone(),
-        state_type.nullable,
+        state_type.data_type().clone(),
+        state_type.nullable(),
     );
     state.value_type = state_type;
     spec.mode = AggMode::Local;
-    spec.aggregates[0].result_type = state.value_type.data_type.clone();
+    spec.aggregates[0].result_type = state.value_type.clone();
     spec.output_layout = AggregateOutputLayout::new(vec![], vec![state.clone()]);
     spec.output_columns = vec![state.clone()];
     partial.output_columns = vec![state.clone()];
@@ -399,7 +404,7 @@ pub fn ordered_array_state_source_for_test(
                     name: "array_agg".into(),
                     source: original.clone(),
                     distinct: false,
-                    result_type: output.value_type.data_type.clone(),
+                    result_type: output.value_type.clone(),
                     output_column_id: output.column_id,
                 }],
                 is_merge: vec![true],

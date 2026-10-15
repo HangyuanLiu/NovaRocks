@@ -213,7 +213,7 @@ fn extract_binding_all_six_units_preserve_canonical_targets_and_original_catalog
                 assert_eq!(call(special).1.selected, call(ordinary).1.selected);
                 for expression in [special, ordinary] {
                     let argument = &call(expression).2[0];
-                    if original.data_type != target.data_type {
+                    if original.data_type() != target.data_type() {
                         let ExprKind::Cast {
                             expr,
                             target: cast_target,
@@ -224,7 +224,7 @@ fn extract_binding_all_six_units_preserve_canonical_targets_and_original_catalog
                         };
                         assert_eq!(&expr.value_type, &original);
                         assert!(matches!(expr.kind, ExprKind::ColumnRef { .. }));
-                        assert_eq!(cast_target, &target.data_type);
+                        assert_eq!(cast_target, target.data_type());
                         assert_eq!(
                             *decimal_overflow_policy,
                             call(expression).1.decimal_overflow_policy()
@@ -336,7 +336,7 @@ fn extract_binding_keeps_lexical_policy_null_sources_and_explicit_constant_admis
                     panic!("canonical carrier cast");
                 };
                 assert_eq!(*decimal_overflow_policy, policy);
-                assert_eq!(expr.value_type.data_type, catalog.carrier);
+                assert_eq!(expr.value_type.data_type().clone(), catalog.carrier);
             }
         }
     }
@@ -352,7 +352,7 @@ fn extract_binding_keeps_lexical_policy_null_sources_and_explicit_constant_admis
         call(project(&query, 0)).1.selected,
         call(project(&query, 1)).1.selected
     );
-    assert!(special_args[0].value_type.nullable);
+    assert!(special_args[0].value_type.nullable());
     assert_eq!(special_args[0].value_type, ordinary_args[0].value_type);
     // Literal admission must consume the supplied policy, not a helper default.
     let mut policy = crate::constant::test_constant_policy();
@@ -482,8 +482,9 @@ impl CustomYear {
             }
             Ok(FunctionBindingSelection {
                 overload: FunctionOverloadId::try_new("test.scalar/custom_year/0/v1").unwrap(),
-                argument_types: vec![FunctionArgumentType::Value(value_type.clone())]
-                    .into_boxed_slice(),
+                argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    vec![FunctionArgumentType::Value(value_type.clone())].into_boxed_slice(),
+                ),
                 result_type: FunctionResultType::Scalar(FunctionValueType::new(
                     DataType::Int64,
                     false,

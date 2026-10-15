@@ -139,7 +139,9 @@ fn map_parts_actual_generic_declarations_freeze_logical_child_and_real_result_fi
                 _ => FunctionValueType::new(DataType::Int32, true),
             };
             let mut key = item.clone();
-            key.nullable = false;
+            key = key
+                .with_nullable(false)
+                .expect("valid function nullability declaration");
             let fields = vec![
                 Arc::new(key.try_to_field("authored-key").unwrap()),
                 Arc::new(item.try_to_field("authored-value").unwrap()),
@@ -149,21 +151,28 @@ fn map_parts_actual_generic_declarations_freeze_logical_child_and_real_result_fi
                 Field::new("authored-entries", DataType::Struct(fields), false)
                     .with_metadata([("source-fact".into(), "preserved".into())].into()),
             );
-            let source = FunctionValueType::new(DataType::Map(entries.clone(), true), true);
+            let source = FunctionValueType::from_legacy_declared_projection(
+                DataType::Map(entries.clone(), true),
+                true,
+            );
             let p = prepared_for_test(name, std::slice::from_ref(&source)).unwrap();
             assert_eq!(
                 p.contract().selected().argument_types.as_ref(),
                 &[crate::FunctionArgumentType::Value(source)]
             );
-            let DataType::List(field) = &p.contract().result_type().data_type else {
+            let DataType::List(field) = p.contract().result_type().data_type() else {
                 unreachable!()
             };
             assert_eq!(
-                novarocks_type_contract::field_logical_type(field).unwrap(),
+                p.contract()
+                    .result_type()
+                    .child_at(0)
+                    .unwrap()
+                    .logical_type(),
                 logical
             );
-            assert_eq!(field.data_type(), &item.data_type);
-            assert!(p.contract().result_type().nullable);
+            assert_eq!(field.data_type(), item.data_type());
+            assert!(p.contract().result_type().nullable());
             assert!(field.is_nullable());
             assert_eq!(
                 p.contract().effects().own_row_error,
@@ -178,10 +187,11 @@ fn map_parts_actual_generic_declarations_freeze_logical_child_and_real_result_fi
             else {
                 unreachable!()
             };
-            let DataType::Map(actual, sorted) = &selected.data_type else {
+            let DataType::Map(actual, sorted) = selected.data_type() else {
                 unreachable!()
             };
-            assert!(Arc::ptr_eq(actual, &entries));
+            assert!(actual.metadata().is_empty());
+            assert!(matches!(actual.data_type(), DataType::Struct(fields) if fields.len() == 2));
             assert!(*sorted);
         }
     }

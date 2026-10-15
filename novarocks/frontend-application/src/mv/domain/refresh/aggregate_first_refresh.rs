@@ -356,7 +356,7 @@ fn append_branch_id_to_chunks(chunks: Vec<Chunk>, branch_id: i32) -> Result<Vec<
 )]
 fn append_branch_id_to_chunk(chunk: Chunk, branch_id: i32) -> Result<Chunk, String> {
     let mut fields = chunk
-        .batch
+        .record_batch()
         .schema()
         .fields()
         .iter()
@@ -367,11 +367,11 @@ fn append_branch_id_to_chunk(chunk: Chunk, branch_id: i32) -> Result<Chunk, Stri
         arrow::datatypes::DataType::Int32,
         false,
     )));
-    let mut columns = chunk.batch.columns().to_vec();
+    let mut columns = chunk.record_batch().columns().to_vec();
     columns.push(Arc::new(arrow::array::Int32Array::from(vec![
         branch_id;
         chunk
-            .batch
+            .record_batch()
             .num_rows(
             )
     ])));
@@ -441,12 +441,7 @@ fn normalize_and_materialize_aggregate_read(
         .zip(target_names.iter())
         .map(|(source_index, target_name)| {
             let column = &old_columns[*source_index];
-            QueryResultColumn::new(
-                target_name.as_str(),
-                column.data_type().clone(),
-                column.nullable(),
-                column.logical_type().cloned(),
-            )
+            QueryResultColumn::new(target_name.as_str(), column.value_type().clone())
         })
         .collect();
 
@@ -790,24 +785,24 @@ fn reorder_and_rename_chunk_columns(
     names: &[String],
     permutation: &[usize],
 ) -> Result<Chunk, String> {
-    if chunk.batch.num_columns() != names.len() || permutation.len() != names.len() {
+    if chunk.record_batch().num_columns() != names.len() || permutation.len() != names.len() {
         return Err(format!(
             "aggregate MV state result chunk column count mismatch: columns={} names={} permutation={}",
-            chunk.batch.num_columns(),
+            chunk.record_batch().num_columns(),
             names.len(),
             permutation.len()
         ));
     }
     if permutation
         .iter()
-        .any(|source_index| *source_index >= chunk.batch.num_columns())
+        .any(|source_index| *source_index >= chunk.record_batch().num_columns())
     {
         return Err(format!(
             "aggregate MV state result column permutation out of range: columns={} permutation={permutation:?}",
-            chunk.batch.num_columns()
+            chunk.record_batch().num_columns()
         ));
     }
-    let source_schema = chunk.batch.schema();
+    let source_schema = chunk.record_batch().schema();
     let fields = permutation
         .iter()
         .zip(names.iter())
@@ -822,7 +817,7 @@ fn reorder_and_rename_chunk_columns(
         .collect::<Vec<_>>();
     let columns = permutation
         .iter()
-        .map(|source_index| chunk.batch.column(*source_index).clone())
+        .map(|source_index| chunk.record_batch().column(*source_index).clone())
         .collect::<Vec<_>>();
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|error| format!("reorder aggregate MV state result columns failed: {error}"))?;
@@ -855,7 +850,6 @@ mod tests {
     use novarocks_sql::planning::mv::SqlMvAggregateLayoutFacts;
     use novarocks_sql::planning::mv::SqlMvOutputColumnFacts;
     use novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout;
-    use novarocks_types::schema::SqlType;
 
     fn parse_calls(sql: &str) -> AggregateSqlCalls {
         let query = parse_stored_select_query(sql).expect("parse aggregate select");
@@ -913,11 +907,12 @@ mod tests {
             columns: vec![
                 QueryResultColumn::new(
                     "__agg_state_c",
-                    DataType::Binary,
-                    false,
-                    Some(SqlType::Binary),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Binary, false),
                 ),
-                QueryResultColumn::new(group_key, DataType::Utf8, true, Some(SqlType::String)),
+                QueryResultColumn::new(
+                    group_key,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+                ),
             ],
             batches: vec![batch],
         }
@@ -980,11 +975,17 @@ mod tests {
 
         assert_eq!(reads, 1);
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].batch.num_rows(), 1);
-        assert_eq!(chunks[0].batch.schema().field(0).name(), "__row_id__");
-        assert_eq!(chunks[0].batch.schema().field(1).name(), "region");
-        assert_eq!(chunks[0].batch.schema().field(2).name(), "c");
-        assert_eq!(chunks[0].batch.schema().field(3).name(), "__agg_state_c");
+        assert_eq!(chunks[0].record_batch().num_rows(), 1);
+        assert_eq!(
+            chunks[0].record_batch().schema().field(0).name(),
+            "__row_id__"
+        );
+        assert_eq!(chunks[0].record_batch().schema().field(1).name(), "region");
+        assert_eq!(chunks[0].record_batch().schema().field(2).name(), "c");
+        assert_eq!(
+            chunks[0].record_batch().schema().field(3).name(),
+            "__agg_state_c"
+        );
     }
 
     #[test]
@@ -1014,7 +1015,7 @@ mod tests {
         )
         .expect("prepare qualified aggregate first refresh");
 
-        assert_eq!(chunks[0].batch.schema().field(1).name(), "region");
+        assert_eq!(chunks[0].record_batch().schema().field(1).name(), "region");
     }
 
     fn prepare_with_result(result: QueryResult) -> Result<Vec<Chunk>, String> {
@@ -1053,12 +1054,7 @@ mod tests {
         for names in [["unexpected", "region"], ["region", "region"]] {
             let mut result = reordered_count_result();
             for (column, name) in result.columns.iter_mut().zip(names) {
-                *column = QueryResultColumn::new(
-                    name,
-                    column.data_type().clone(),
-                    column.nullable(),
-                    column.logical_type().cloned(),
-                );
+                *column = QueryResultColumn::new(name, column.value_type().clone());
             }
 
             let error = prepare_with_result(result).expect_err("metadata names must be exact");
@@ -1150,10 +1146,10 @@ mod tests {
         assert_eq!(reads, 2);
         assert_eq!(chunks.len(), 2);
         for (branch_id, chunk) in chunks.iter().enumerate() {
-            assert_eq!(chunk.batch.schema().field(1).name(), "region");
+            assert_eq!(chunk.record_batch().schema().field(1).name(), "region");
             let branch = chunk
-                .batch
-                .column(chunk.batch.num_columns() - 1)
+                .record_batch()
+                .column(chunk.record_batch().num_columns() - 1)
                 .as_any()
                 .downcast_ref::<arrow::array::Int32Array>()
                 .expect("branch id");

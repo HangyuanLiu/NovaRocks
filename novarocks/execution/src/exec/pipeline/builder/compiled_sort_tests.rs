@@ -256,6 +256,14 @@ fn compiled_topn_pruning_keeps_exactly_the_rows_a_full_sort_would() {
     .unwrap()
     .with_prune_rows(2);
     let mut operator = factory.create(1, 0);
+    let tracker = crate::runtime::mem_tracker::MemTracker::new_root("original TopN construction");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    operator.set_mem_tracker(tracker.clone());
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker,
+        Arc::new(RuntimeErrorState::default()),
+    ));
+    operator.prepare().unwrap();
     let processor = operator.as_processor_mut().unwrap();
     let state = RuntimeState::default();
     let layout = program.graph().nodes()[0].output_layout();

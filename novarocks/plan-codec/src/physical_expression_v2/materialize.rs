@@ -464,9 +464,12 @@ fn preflight(
                 }
             }
             K::Cast(_) => {
-                // The borrowed receiver proved header carrier == independent
-                // target. Clone the actual proved header carrier a second time.
-                type_root_preflight(expressions.types(), id, &mut model, bl, refs, admission, w)?;
+                // The explicit value binding owns a normalized layout: all
+                // descendants are shared Field/Fields/timezone references,
+                // without Dictionary/REE Box allocations. The resulting
+                // ExprNode keeps that same binding as its creation lifetime.
+                model.add_work(2)?;
+                check_model(&mut model, refs, bl, admission)?;
             }
             K::FunctionCall(v) => {
                 let id = required(v.function_binding_id, "owned call binding is absent", w)?;
@@ -673,6 +676,17 @@ fn clone_type(
     w.flush()?;
     Ok(copied)
 }
+fn copy_value_projection(
+    source: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<arrow::datatypes::DataType, Error> {
+    work.flush()?;
+    work.step()?;
+    let projection = source.data_type().clone();
+    work.step()?;
+    work.flush()?;
+    Ok(projection)
+}
 fn ids(input: &[u32], w: &mut CompileCheckpoints<'_>) -> Result<Box<[p::ExprId]>, Error> {
     let mut out = reserve(input.len(), w)?;
     for id in input {
@@ -757,7 +771,7 @@ fn owned_kind(
             }
             K::Cast(v) => p::ExprKind::Cast {
                 expr: expr(v.expr_id, "cast operand is absent", w)?,
-                target: clone_type(ty, w)?.data_type,
+                target: copy_value_projection(ty, w)?,
                 decimal_overflow_policy: completed(
                     decode_decimal_policy(v.decimal_overflow_policy).map_err(Error::from),
                     w,

@@ -116,7 +116,7 @@ fn assert_bound_coerced_inputs(left: ArrayRef, right: ArrayRef, seed: u64) {
         let DiffArgument::Column { values, .. } = argument else {
             unreachable!();
         };
-        let coerced = arrow::compute::cast(values.as_ref(), &value_type.data_type).unwrap();
+        let coerced = arrow::compute::cast(values.as_ref(), &value_type.data_type()).unwrap();
         spec = spec.typed_column(value_type.clone(), coerced);
     }
     assert_scalar_matches_v1(spec);

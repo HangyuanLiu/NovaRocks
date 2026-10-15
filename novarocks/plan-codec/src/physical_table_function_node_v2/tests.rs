@@ -193,7 +193,8 @@ impl Fixture {
             Field::new("preserved", DataType::Utf8, true)
                 .with_metadata([("unknown.tag".into(), "original".into())].into()),
         );
-        let structure = FunctionValueType::new(DataType::Struct(vec![field].into()), true);
+        let structure = FunctionValueType::new(DataType::Struct(vec![field.clone()].into()), true);
+        assert_eq!(field.metadata()["unknown.tag"], "original");
         let json =
             FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
                 .unwrap();
@@ -207,7 +208,9 @@ impl Fixture {
         let mut arguments = vec![ArgumentTypeIds::Value(0); count];
         let results = if complex {
             argument_types.push(FunctionArgumentType::Lambda {
-                parameter_types: Box::from([dict.clone(), structure.clone()]),
+                parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    Box::from([dict.clone(), structure.clone()]),
+                ),
                 result_type: json.clone(),
             });
             arguments.push(ArgumentTypeIds::Lambda {
@@ -221,8 +224,10 @@ impl Fixture {
         let function = p::BoundTableFunction::from_exact_signature(
             FunctionId::try_new("test/table").unwrap(),
             FunctionOverloadId::try_new("test/table/profile").unwrap(),
-            argument_types.into_boxed_slice(),
-            results,
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                argument_types.into_boxed_slice(),
+            ),
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(results),
         );
         let node = p::PhysicalNode {
             id: p::NodeId::new(u32::MAX),
@@ -330,7 +335,9 @@ impl Fixture {
             FunctionId::try_new("test/scalar").unwrap(),
             FunctionOverloadId::try_new("test/scalar/profile").unwrap(),
             FunctionKind::Scalar,
-            Box::from([FunctionArgumentType::Value(self.roots[0].1.clone())]),
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                FunctionArgumentType::Value(self.roots[0].1.clone()),
+            ])),
             self.roots[0].1.clone(),
         );
         // Intentional aliases retain the same original pointer; the original
@@ -517,15 +524,17 @@ fn full_relation_signature_preserves_lambda_dictionary_metadata_and_nominal_type
             BindingSource::Table(v) => v,
             _ => panic!(),
         };
-        let DataType::Struct(fields) = &a.result_types[1].data_type else {
+        let DataType::Struct(fields) = &a.result_types[1].data_type() else {
             panic!()
         };
-        let DataType::Struct(original_fields) = &original.result_types[1].data_type else {
+        let DataType::Struct(original_fields) = &original.result_types[1].data_type() else {
             panic!()
         };
         assert!(Arc::ptr_eq(&fields[0], &original_fields[0]));
-        assert_eq!(fields[0].metadata().get("unknown.tag").unwrap(), "original");
-        assert_eq!(a.result_types[2].logical_type, ValueLogicalType::Json);
+        assert_eq!(fields[0].metadata().capacity(), 0);
+        assert_eq!(fields[0].name(), "preserved");
+        assert!(fields[0].is_nullable());
+        assert_eq!(a.result_types[2].logical_type(), ValueLogicalType::Json);
         let FunctionArgumentType::Lambda {
             parameter_types,
             result_type,
@@ -534,7 +543,7 @@ fn full_relation_signature_preserves_lambda_dictionary_metadata_and_nominal_type
             panic!()
         };
         assert_eq!(parameter_types.len(), 2);
-        assert_eq!(result_type.logical_type, ValueLogicalType::Json);
+        assert_eq!(result_type.logical_type(), ValueLogicalType::Json);
     });
 }
 #[test]
@@ -621,17 +630,15 @@ fn independent_request_layout_golden_and_every_node_axis_exact_or_one_under() {
         assert_eq!(sent.allocation_requests_upper_bound, 5);
         assert_eq!(sent.allocation_request_bytes_upper_bound, sent_bytes);
         assert_eq!(sent.value_reference_count, 6);
+        // Only the five physical node collections are newly constructed.
+        // Argument/results and identity holders retain the original signature.
         let receiver_bytes = 2
             * (Layout::array::<p::NodeId>(1).unwrap().size()
                 + Layout::array::<p::PhysicalProperties>(1).unwrap().size()
                 + Layout::array::<p::ValueId>(3).unwrap().size()
                 + Layout::array::<p::ExprId>(1).unwrap().size()
-                + Layout::array::<p::TableFunctionOutput>(3).unwrap().size()
-                + Layout::array::<FunctionArgumentType>(1).unwrap().size()
-                + Layout::array::<FunctionValueType>(1).unwrap().size())
-            + "test/table".len()
-            + "test/table/profile".len();
-        assert_eq!(received.allocation_requests_upper_bound, 16);
+                + Layout::array::<p::TableFunctionOutput>(3).unwrap().size());
+        assert_eq!(received.allocation_requests_upper_bound, 10);
         assert_eq!(
             received.allocation_request_bytes_upper_bound,
             receiver_bytes
@@ -863,7 +870,7 @@ fn table_caller_owned_full_lambda_dictionary_relation_seals_prefixes_and_replays
         let (owned,rf)=caller_table_decode(&wire,read,functions,node_limits(),&control,&mut |f|{received.push(*f);Ok(())}).unwrap();
         assert_node(&owned,&f.node);
         assert_eq!(physical(&owned).unwrap().function.result_types.len(),3);
-        assert!(matches!(&physical(&owned).unwrap().function.argument_types[1],FunctionArgumentType::Lambda{parameter_types,result_type} if parameter_types.len()==2 && result_type.logical_type==ValueLogicalType::Json));
+        assert!(matches!(&physical(&owned).unwrap().function.argument_types[1],FunctionArgumentType::Lambda{parameter_types,result_type} if parameter_types.len()==2 && result_type.logical_type()==ValueLogicalType::Json));
         for (prefixes,final_facts) in [(&sent,sf),(&received,rf)] {
             assert!(!prefixes.is_empty());
             for prefix in prefixes {

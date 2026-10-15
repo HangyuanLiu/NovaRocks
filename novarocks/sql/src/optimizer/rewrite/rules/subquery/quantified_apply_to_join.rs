@@ -141,7 +141,7 @@ fn apply_expr(
         })?;
     let inner_col_ref = scalar_utils::column_ref(arena, inner_col_oc, control)?;
 
-    let either_nullable = arena.nullable(lhs) || inner_col_oc.value_type.nullable;
+    let either_nullable = arena.nullable(lhs) || inner_col_oc.value_type.nullable();
     let join_type = if negated {
         if either_nullable {
             JoinKind::NullAwareLeftAnti
@@ -514,7 +514,7 @@ mod tests {
             args[1].kind,
             ExprKind::Literal(LiteralValue::Bool(false))
         ));
-        assert!(!condition.value_type.nullable);
+        assert!(!condition.value_type.nullable());
     }
 
     fn contains_apply(plan: &LogicalPlanNode) -> bool {

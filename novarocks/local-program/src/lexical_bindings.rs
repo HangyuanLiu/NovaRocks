@@ -23,6 +23,7 @@
 //! This proves local closure correspondence, not that physical lowering retained
 //! original binding identity, and supplies no runtime evaluation or hoist grant.
 
+use crate::creation::{ProgramCreation, ProgramCreationFailure};
 use crate::{
     LocalProgramGraph, ProgramCallSite, ProgramChannelLayoutRole, ProgramChannelSite,
     ProgramExprId, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
@@ -31,8 +32,8 @@ use crate::{
 use novarocks_functions::{FunctionArgumentType, FunctionValueType, PreparedPureKernel};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape,
-    MAX_CONTROL_USE_REFERENCES, PureCompileControl, ValueTypeError,
-    arrow_data_types_exact_observed,
+    MAX_CONTROL_USE_REFERENCES, PureCompileControl, ValueSchemaCreationScope, ValueTypeError,
+    ValueTypeStorageLifetime,
 };
 use novarocks_types::SlotId;
 use std::{
@@ -78,9 +79,22 @@ pub struct ProgramSlotBinding {
 #[derive(Clone, Debug)]
 pub struct ProgramLexicalBindings {
     channels: ProgramTypedChannels,
-    lambdas: Arc<BTreeMap<ProgramUseRef, ProgramLambdaBinding>>,
-    slots: Arc<BTreeMap<ProgramUseRef, ProgramLexicalSource>>,
+    lambdas: Arc<LexicalMap<ProgramUseRef, ProgramLambdaBinding>>,
+    slots: Arc<LexicalMap<ProgramUseRef, ProgramLexicalSource>>,
 }
+#[derive(Debug)]
+struct LexicalMap<K, V> {
+    entries: BTreeMap<K, V>,
+    _storage: ValueTypeStorageLifetime,
+    _source: ValueTypeStorageLifetime,
+}
+impl<K, V> std::ops::Deref for LexicalMap<K, V> {
+    type Target = BTreeMap<K, V>;
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProgramLexicalBindingError {
     Control(CompileControlError),
@@ -114,6 +128,67 @@ impl fmt::Display for ProgramLexicalBindingError {
     }
 }
 impl std::error::Error for ProgramLexicalBindingError {}
+impl<H> From<ProgramLexicalBindingError> for ProgramCreationFailure<ProgramLexicalBindingError, H> {
+    fn from(error: ProgramLexicalBindingError) -> Self {
+        match error {
+            ProgramLexicalBindingError::Control(error) => Self::Control(error),
+            error => Self::Owner(error),
+        }
+    }
+}
+fn pure_lexical_failure(
+    error: ProgramCreationFailure<ProgramLexicalBindingError, std::convert::Infallible>,
+) -> ProgramLexicalBindingError {
+    match error {
+        ProgramCreationFailure::Control(error) => ProgramLexicalBindingError::Control(error),
+        ProgramCreationFailure::Owner(error) => error,
+        ProgramCreationFailure::Resource(_) | ProgramCreationFailure::Capacity(_) => {
+            ProgramLexicalBindingError::Control(CompileControlError::ResourceExhausted)
+        }
+        ProgramCreationFailure::Creator(never) => match never {},
+    }
+}
+fn before_scratch_insert<K: Ord, V, H>(
+    map: &BTreeMap<K, V>,
+    creation: &mut ProgramCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ProgramCreationFailure<ProgramLexicalBindingError, H>> {
+    creation.before_tree_insert::<ProgramLexicalBindingError, K, V>(map.len(), work)
+}
+fn push_scratch<T, H>(
+    values: &mut Vec<T>,
+    value: T,
+    creation: &mut ProgramCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ProgramCreationFailure<ProgramLexicalBindingError, H>> {
+    if creation.creator.is_some() && values.len() == values.capacity() {
+        let required = values.len().checked_add(1).ok_or(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        )?;
+        // This is an explicit amortized constructor request, not a prediction
+        // of std's private growth branch or an invoice from observed capacity.
+        let next = values
+            .capacity()
+            .max(1)
+            .checked_mul(2)
+            .ok_or(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            )?
+            .max(required);
+        creation.request(
+            std::alloc::Layout::array::<T>(next).map_err(|_| {
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic
+            })?,
+            work,
+        )?;
+        values
+            .try_reserve_exact(next - values.len())
+            .map_err(ProgramCreationFailure::Capacity)?;
+    }
+    values.push(value);
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct Scope {
     root: ProgramExpressionRootSite,
@@ -144,6 +219,47 @@ impl ProgramLexicalBindings {
         slot_bindings: Vec<ProgramSlotBinding>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ProgramLexicalBindingError> {
+        Self::try_new_core::<std::convert::Infallible>(
+            channels,
+            bindings,
+            slot_bindings,
+            ValueTypeStorageLifetime::pure(),
+            None,
+            None,
+            control,
+        )
+        .map_err(pure_lexical_failure)
+    }
+    pub fn try_new_with_creator_in<H>(
+        channels: ProgramTypedChannels,
+        bindings: Vec<ProgramLambdaBinding>,
+        slot_bindings: Vec<ProgramSlotBinding>,
+        original_capture_storage: ValueTypeStorageLifetime,
+        temporary: &mut dyn ValueSchemaCreationScope<H>,
+        retained: &mut dyn ValueSchemaCreationScope<H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ProgramCreationFailure<ProgramLexicalBindingError, H>> {
+        Self::try_new_core(
+            channels,
+            bindings,
+            slot_bindings,
+            original_capture_storage,
+            Some(temporary),
+            Some(retained),
+            control,
+        )
+    }
+    fn try_new_core<H>(
+        channels: ProgramTypedChannels,
+        bindings: Vec<ProgramLambdaBinding>,
+        slot_bindings: Vec<ProgramSlotBinding>,
+        original_capture_storage: ValueTypeStorageLifetime,
+        temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
+        retained: Option<&mut dyn ValueSchemaCreationScope<H>>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ProgramCreationFailure<ProgramLexicalBindingError, H>> {
+        let mut temporary = ProgramCreation { creator: temporary };
+        let mut retained = ProgramCreation { creator: retained };
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
         // These limits bound new closure records, not schema width or a runtime
         // allocation wallet. Existing control references retain their own bound.
@@ -162,21 +278,23 @@ impl ProgramLexicalBindings {
             for _ in &binding.captures {
                 work.step()?;
             }
+            retained.before_tree_insert::<ProgramLexicalBindingError, ProgramUseRef, ProgramLambdaBinding>(lambdas.len(), &mut work)?;
             if lambdas.insert(binding.edge, binding).is_some() {
-                return Err(ProgramLexicalBindingError::DuplicateBinding);
+                return Err(ProgramLexicalBindingError::DuplicateBinding.into());
             }
         }
         let mut slots = BTreeMap::new();
         for binding in slot_bindings {
             work.step()?;
+            retained.before_tree_insert::<ProgramLexicalBindingError, ProgramUseRef, ProgramLexicalSource>(slots.len(), &mut work)?;
             if slots.insert(binding.occurrence, binding.source).is_some() {
-                return Err(ProgramLexicalBindingError::DuplicateBinding);
+                return Err(ProgramLexicalBindingError::DuplicateBinding.into());
             }
         }
         let typed = channels.expressions();
         let resolved = typed.resolved_calls();
         let snapshot = resolved.snapshot();
-        let projected = ProjectedSources::try_new(&channels, &mut work)?;
+        let projected = ProjectedSources::try_new(&channels, &mut temporary, &mut work)?;
         let mut kernels = BTreeMap::new();
         for (site, call) in resolved.calls() {
             work.step()?;
@@ -189,8 +307,9 @@ impl ProgramLexicalBindings {
                 arena: occurrence.arena,
                 use_id: kernel.contract().body_edge_use(),
             };
+            before_scratch_insert(&kernels, &mut temporary, &mut work)?;
             if kernels.insert(edge, kernel).is_some() {
-                return Err(ProgramLexicalBindingError::InvalidLambda);
+                return Err(ProgramLexicalBindingError::InvalidLambda.into());
             }
         }
         // Walk each real occurrence once, retaining its actual enclosing frame.
@@ -204,19 +323,27 @@ impl ProgramLexicalBindings {
             let arena = root.arena();
             let flow = &snapshot.flows()[&arena];
             let definitions = &snapshot.roots().arenas()[&arena];
-            let mut stack = vec![(
+            let first = (
                 *use_id,
                 Scope {
                     root: *root,
                     lambda: None,
                     common_before: None,
                 },
-            )];
+            );
+            let mut stack = if temporary.creator.is_none() {
+                vec![first]
+            } else {
+                let mut stack = Vec::new();
+                push_scratch(&mut stack, first, &mut temporary, &mut work)?;
+                stack
+            };
             while let Some((use_id, scope)) = stack.pop() {
                 work.step()?;
                 let occurrence = ProgramUseRef { arena, use_id };
+                before_scratch_insert(&scopes, &mut temporary, &mut work)?;
                 if scopes.insert(occurrence, scope).is_some() {
-                    return Err(ProgramLexicalBindingError::InvalidOccurrence);
+                    return Err(ProgramLexicalBindingError::InvalidOccurrence.into());
                 }
                 let invocation = &flow.uses()[&use_id];
                 if matches!(
@@ -226,7 +353,7 @@ impl ProgramLexicalBindings {
                     Some(StaticExprKind::LambdaFunction { .. })
                 ) && invocation.control != ControlShape::LambdaBody
                 {
-                    return Err(ProgramLexicalBindingError::InvalidLambda);
+                    return Err(ProgramLexicalBindingError::InvalidLambda.into());
                 }
                 if invocation.control == ControlShape::LambdaBody {
                     let Some(StaticExprKind::LambdaFunction {
@@ -238,20 +365,20 @@ impl ProgramLexicalBindings {
                         .node(invocation.definition)
                         .map(|value| value.kind())
                     else {
-                        return Err(ProgramLexicalBindingError::InvalidLambda);
+                        return Err(ProgramLexicalBindingError::InvalidLambda.into());
                     };
                     let Some(FunctionArgumentType::Lambda {
                         parameter_types, ..
                     }) = typed.definition_type(arena, invocation.definition)
                     else {
-                        return Err(ProgramLexicalBindingError::InvalidLambda);
+                        return Err(ProgramLexicalBindingError::InvalidLambda.into());
                     };
                     if arg_slots.len() != parameter_types.len()
                         || invocation.arguments.len() != common_sub_exprs.len() + 1
                         || !kernels.contains_key(&occurrence)
                         || !lambdas.contains_key(&occurrence)
                     {
-                        return Err(ProgramLexicalBindingError::InvalidLambda);
+                        return Err(ProgramLexicalBindingError::InvalidLambda.into());
                     }
                     let key = (arena, invocation.definition);
                     let locals = if let Some(locals) = declarations.get(&key) {
@@ -262,37 +389,42 @@ impl ProgramLexicalBindings {
                             work.step()?;
                             let ordinal = u32::try_from(ordinal)
                                 .map_err(|_| ProgramLexicalBindingError::TooManyItems)?;
+                            before_scratch_insert(&locals, &mut temporary, &mut work)?;
                             if locals
                                 .insert(*slot, DeclaredLocal::Parameter(ordinal))
                                 .is_some()
                             {
-                                return Err(ProgramLexicalBindingError::InvalidLambda);
+                                return Err(ProgramLexicalBindingError::InvalidLambda.into());
                             }
                         }
                         for (ordinal, (slot, _)) in common_sub_exprs.iter().enumerate() {
                             work.step()?;
                             let ordinal = u32::try_from(ordinal)
                                 .map_err(|_| ProgramLexicalBindingError::TooManyItems)?;
+                            before_scratch_insert(&locals, &mut temporary, &mut work)?;
                             if locals
                                 .insert(*slot, DeclaredLocal::Common(ordinal))
                                 .is_some()
                             {
-                                return Err(ProgramLexicalBindingError::InvalidLambda);
+                                return Err(ProgramLexicalBindingError::InvalidLambda.into());
                             }
                         }
+                        temporary.before_arc::<ProgramLexicalBindingError, BTreeMap<SlotId, DeclaredLocal>>(&mut work)?;
                         let locals = Arc::new(locals);
+                        before_scratch_insert(&declarations, &mut temporary, &mut work)?;
                         declarations.insert(key, locals.clone());
                         locals
                     };
                     for (ordinal, (_, definition)) in common_sub_exprs.iter().enumerate() {
                         work.step()?;
                         if flow.uses()[&invocation.arguments[ordinal]].definition != *definition {
-                            return Err(ProgramLexicalBindingError::InvalidLambda);
+                            return Err(ProgramLexicalBindingError::InvalidLambda.into());
                         }
                     }
                     if flow.uses()[invocation.arguments.last().unwrap()].definition != *body {
-                        return Err(ProgramLexicalBindingError::InvalidLambda);
+                        return Err(ProgramLexicalBindingError::InvalidLambda.into());
                     }
+                    before_scratch_insert(&infos, &mut temporary, &mut work)?;
                     infos.insert(
                         occurrence,
                         LambdaInfo {
@@ -301,32 +433,37 @@ impl ProgramLexicalBindings {
                             locals,
                         },
                     );
-                    order.push(occurrence);
+                    push_scratch(&mut order, occurrence, &mut temporary, &mut work)?;
                     for (ordinal, child) in invocation.arguments.iter().enumerate().rev() {
                         work.step()?;
-                        stack.push((
-                            *child,
-                            Scope {
-                                root: *root,
-                                lambda: Some(occurrence),
-                                common_before: if ordinal == common_sub_exprs.len() {
-                                    None
-                                } else {
-                                    Some(ordinal)
+                        push_scratch(
+                            &mut stack,
+                            (
+                                *child,
+                                Scope {
+                                    root: *root,
+                                    lambda: Some(occurrence),
+                                    common_before: if ordinal == common_sub_exprs.len() {
+                                        None
+                                    } else {
+                                        Some(ordinal)
+                                    },
                                 },
-                            },
-                        ));
+                            ),
+                            &mut temporary,
+                            &mut work,
+                        )?;
                     }
                 } else {
                     for child in invocation.arguments.iter().rev() {
                         work.step()?;
-                        stack.push((*child, scope));
+                        push_scratch(&mut stack, (*child, scope), &mut temporary, &mut work)?;
                     }
                 }
             }
         }
         if infos.len() != lambdas.len() || infos.len() != kernels.len() {
-            return Err(ProgramLexicalBindingError::IncompleteCoverage);
+            return Err(ProgramLexicalBindingError::IncompleteCoverage.into());
         }
         // Outer frames precede their nested frames, so captures never require
         // recursive source resolution or a forward reference to mutable state.
@@ -338,7 +475,7 @@ impl ProgramLexicalBindings {
             let binding = &lambdas[&edge];
             let expected = kernels[&edge].body_contract().capture_types();
             if binding.captures.len() != expected.len() {
-                return Err(ProgramLexicalBindingError::IncompleteCoverage);
+                return Err(ProgramLexicalBindingError::IncompleteCoverage.into());
             }
             for (ordinal, (source, expected)) in binding.captures.iter().zip(expected).enumerate() {
                 work.step()?;
@@ -348,9 +485,11 @@ impl ProgramLexicalBindings {
                     infos: &infos,
                     captures: &capture_facts,
                     used: &mut used,
+                    temporary: &mut temporary,
                 }
                 .fact(*source, info.enclosing, &mut work)?;
                 exact_type(fact.ty, expected, &mut work)?;
+                before_scratch_insert(&capture_facts, &mut temporary, &mut work)?;
                 capture_facts.insert((edge, ordinal as u32), fact);
             }
         }
@@ -375,34 +514,46 @@ impl ProgramLexicalBindings {
                 infos: &infos,
                 captures: &capture_facts,
                 used: &mut used,
+                temporary: &mut temporary,
             }
             .fact(*source, *scope, &mut work)?;
             if fact.slot != *slot {
-                return Err(ProgramLexicalBindingError::WrongSlot);
+                return Err(ProgramLexicalBindingError::WrongSlot.into());
             }
             let Some(FunctionArgumentType::Value(actual)) =
                 typed.definition_type(occurrence.arena, invocation.definition)
             else {
-                return Err(ProgramLexicalBindingError::TypeMismatch);
+                return Err(ProgramLexicalBindingError::TypeMismatch.into());
             };
             exact_type(actual, fact.ty, &mut work)?;
         }
         if actual_slots != slots.len() {
-            return Err(ProgramLexicalBindingError::IncompleteCoverage);
+            return Err(ProgramLexicalBindingError::IncompleteCoverage.into());
         }
         for (edge, binding) in &lambdas {
             for ordinal in 0..binding.captures.len() {
                 work.step()?;
                 if !used.contains(&(*edge, ordinal as u32)) {
-                    return Err(ProgramLexicalBindingError::UnusedCapture);
+                    return Err(ProgramLexicalBindingError::UnusedCapture.into());
                 }
             }
         }
+        retained.before_arc::<ProgramLexicalBindingError, LexicalMap<ProgramUseRef, ProgramLambdaBinding>>(&mut work)?;
+        retained.before_arc::<ProgramLexicalBindingError, LexicalMap<ProgramUseRef, ProgramLexicalSource>>(&mut work)?;
+        let storage = retained.storage();
         work.finish()?;
         Ok(Self {
             channels,
-            lambdas: Arc::new(lambdas),
-            slots: Arc::new(slots),
+            lambdas: Arc::new(LexicalMap {
+                entries: lambdas,
+                _storage: storage.clone(),
+                _source: original_capture_storage,
+            }),
+            slots: Arc::new(LexicalMap {
+                entries: slots,
+                _storage: storage,
+                _source: ValueTypeStorageLifetime::pure(),
+            }),
         })
     }
     pub const fn channels(&self) -> &ProgramTypedChannels {
@@ -430,10 +581,11 @@ struct ProjectedSources {
     by_position: BTreeMap<(ProjectionOwner, u32), (SlotId, ProgramExprId)>,
 }
 impl ProjectedSources {
-    fn try_new(
+    fn try_new<H>(
         channels: &ProgramTypedChannels,
+        temporary: &mut ProgramCreation<'_, H>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<Self, ProgramLexicalBindingError> {
+    ) -> Result<Self, ProgramCreationFailure<ProgramLexicalBindingError, H>> {
         let mut checked = Self {
             by_slot: BTreeMap::new(),
             by_position: BTreeMap::new(),
@@ -467,17 +619,19 @@ impl ProjectedSources {
                 _ => continue,
             };
             if expressions.len() != slots.len() {
-                return Err(ProgramLexicalBindingError::InvalidSource);
+                return Err(ProgramLexicalBindingError::InvalidSource.into());
             }
             for (ordinal, (definition, slot)) in expressions.iter().zip(slots).enumerate() {
                 work.step()?;
                 let expression =
                     u32::try_from(ordinal).map_err(|_| ProgramLexicalBindingError::TooManyItems)?;
-                checked
-                    .by_slot
-                    .entry((owner, *slot))
-                    .or_default()
-                    .push(ProjectedPosition { expression });
+                let key = (owner, *slot);
+                if !checked.by_slot.contains_key(&key) {
+                    before_scratch_insert(&checked.by_slot, temporary, work)?;
+                }
+                let positions = checked.by_slot.entry(key).or_default();
+                push_scratch(positions, ProjectedPosition { expression }, temporary, work)?;
+                before_scratch_insert(&checked.by_position, temporary, work)?;
                 checked
                     .by_position
                     .insert((owner, expression), (*slot, *definition));
@@ -571,20 +725,21 @@ impl ProjectedSources {
     }
 }
 
-struct SourceProof<'a, 'proof> {
+struct SourceProof<'a, 'proof, 'creation, H> {
     channels: &'a ProgramTypedChannels,
     projected: &'proof ProjectedSources,
     infos: &'proof BTreeMap<ProgramUseRef, LambdaInfo>,
     captures: &'proof BTreeMap<(ProgramUseRef, u32), Fact<'a>>,
     used: &'proof mut BTreeSet<(ProgramUseRef, u32)>,
+    temporary: &'proof mut ProgramCreation<'creation, H>,
 }
-impl<'a> SourceProof<'a, '_> {
+impl<'a, H> SourceProof<'a, '_, '_, H> {
     fn fact(
         &mut self,
         source: ProgramLexicalSource,
         scope: Scope,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<Fact<'a>, ProgramLexicalBindingError> {
+    ) -> Result<Fact<'a>, ProgramCreationFailure<ProgramLexicalBindingError, H>> {
         let channels = self.channels;
         let projected = self.projected;
         let infos = self.infos;
@@ -596,7 +751,7 @@ impl<'a> SourceProof<'a, '_> {
         let fact = match source {
             ProgramLexicalSource::Parameter { lambda, ordinal } => {
                 if scope.lambda != Some(lambda) {
-                    return Err(ProgramLexicalBindingError::WrongScope);
+                    return Err(ProgramLexicalBindingError::WrongScope.into());
                 }
                 let info = infos
                     .get(&lambda)
@@ -606,13 +761,13 @@ impl<'a> SourceProof<'a, '_> {
                     .unwrap()
                     .kind()
                 else {
-                    return Err(ProgramLexicalBindingError::InvalidLambda);
+                    return Err(ProgramLexicalBindingError::InvalidLambda.into());
                 };
                 let Some(FunctionArgumentType::Lambda {
                     parameter_types, ..
                 }) = typed.definition_type(lambda.arena, info.definition)
                 else {
-                    return Err(ProgramLexicalBindingError::InvalidLambda);
+                    return Err(ProgramLexicalBindingError::InvalidLambda.into());
                 };
                 Fact {
                     slot: *arg_slots
@@ -625,13 +780,13 @@ impl<'a> SourceProof<'a, '_> {
             }
             ProgramLexicalSource::Common { lambda, ordinal } => {
                 if scope.lambda != Some(lambda) {
-                    return Err(ProgramLexicalBindingError::WrongScope);
+                    return Err(ProgramLexicalBindingError::WrongScope.into());
                 }
                 if scope
                     .common_before
                     .is_some_and(|limit| ordinal as usize >= limit)
                 {
-                    return Err(ProgramLexicalBindingError::ForwardCommon);
+                    return Err(ProgramLexicalBindingError::ForwardCommon.into());
                 }
                 let info = infos
                     .get(&lambda)
@@ -643,7 +798,7 @@ impl<'a> SourceProof<'a, '_> {
                     .unwrap()
                     .kind()
                 else {
-                    return Err(ProgramLexicalBindingError::InvalidLambda);
+                    return Err(ProgramLexicalBindingError::InvalidLambda.into());
                 };
                 let (slot, definition) = common_sub_exprs
                     .get(ordinal as usize)
@@ -651,26 +806,33 @@ impl<'a> SourceProof<'a, '_> {
                 let Some(FunctionArgumentType::Value(ty)) =
                     typed.definition_type(lambda.arena, *definition)
                 else {
-                    return Err(ProgramLexicalBindingError::TypeMismatch);
+                    return Err(ProgramLexicalBindingError::TypeMismatch.into());
                 };
                 Fact { slot: *slot, ty }
             }
             ProgramLexicalSource::Capture { lambda, ordinal } => {
                 if scope.lambda != Some(lambda) {
-                    return Err(ProgramLexicalBindingError::WrongScope);
+                    return Err(ProgramLexicalBindingError::WrongScope.into());
                 }
                 let fact = *captures
                     .get(&(lambda, ordinal))
                     .ok_or(ProgramLexicalBindingError::InvalidSource)?;
+                if !used.contains(&(lambda, ordinal)) {
+                    self.temporary
+                        .before_tree_insert::<ProgramLexicalBindingError, (ProgramUseRef, u32), ()>(
+                            used.len(),
+                            work,
+                        )?;
+                }
                 used.insert((lambda, ordinal));
                 fact
             }
             ProgramLexicalSource::Input(site) => {
                 if scope.lambda.is_some() {
-                    return Err(ProgramLexicalBindingError::WrongScope);
+                    return Err(ProgramLexicalBindingError::WrongScope.into());
                 }
                 if !input_scope(channels, scope.root, site)? {
-                    return Err(ProgramLexicalBindingError::WrongScope);
+                    return Err(ProgramLexicalBindingError::WrongScope.into());
                 }
                 Fact {
                     slot: channels
@@ -684,7 +846,7 @@ impl<'a> SourceProof<'a, '_> {
             ProgramLexicalSource::Projected { .. }
             | ProgramLexicalSource::WriterProjected { .. } => {
                 if scope.lambda.is_some() {
-                    return Err(ProgramLexicalBindingError::WrongScope);
+                    return Err(ProgramLexicalBindingError::WrongScope.into());
                 }
                 projected.fact(source, scope.root, channels, work)?
             }
@@ -693,7 +855,7 @@ impl<'a> SourceProof<'a, '_> {
             && let Some(latest) = projected.latest(scope.root, fact.slot, work)?
             && latest != source
         {
-            return Err(ProgramLexicalBindingError::ShadowedSource);
+            return Err(ProgramLexicalBindingError::ShadowedSource.into());
         }
         if let Some(lambda) = scope.lambda
             && let Some(local) = infos[&lambda].locals.get(&fact.slot)
@@ -710,7 +872,7 @@ impl<'a> SourceProof<'a, '_> {
                 ),
             };
             if visible && nearest != source {
-                return Err(ProgramLexicalBindingError::ShadowedSource);
+                return Err(ProgramLexicalBindingError::ShadowedSource.into());
             }
         }
         Ok(fact)
@@ -722,17 +884,12 @@ fn exact_type(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProgramLexicalBindingError> {
     work.step()?;
-    if actual.nullable != expected.nullable
-        || actual.logical_type != expected.logical_type
-        || !arrow_data_types_exact_observed::<ProgramLexicalBindingError>(
-            &actual.data_type,
-            &expected.data_type,
-            || work.step().map_err(Into::into),
-        )?
-    {
-        Err(ProgramLexicalBindingError::TypeMismatch)
-    } else {
+    if actual.exactly_equals_observed(expected, || {
+        work.step().map_err(ProgramLexicalBindingError::from)
+    })? {
         Ok(())
+    } else {
+        Err(ProgramLexicalBindingError::TypeMismatch)
     }
 }
 fn input_scope(

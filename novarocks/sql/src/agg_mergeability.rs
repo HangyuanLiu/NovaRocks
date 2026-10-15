@@ -100,12 +100,12 @@ mod tests {
         };
         let argument_types = args
             .iter()
-            .map(|arg| arg.value_type.data_type.clone())
+            .map(|arg| arg.value_type.data_type().clone())
             .collect::<Vec<_>>();
         AggregateCall {
             name: name.into(),
             distinct,
-            result_type: DataType::Float64,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
             source: crate::binding::AggregateArgumentSource::uncertified(
                 args,
                 if ordered {

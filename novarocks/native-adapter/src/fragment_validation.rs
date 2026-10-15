@@ -20,17 +20,23 @@
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 
-use crate::fragment_expression::validate_proto_expr_shape_at;
+use crate::fragment_error::NativeFragmentDecodeError;
+use crate::fragment_expression::validate_proto_expr_shape_at_with_types;
+use crate::fragment_type_decode::NativeTypeDecoder;
 
-pub fn validate_fragment_expressions(fragment: &plan::PlanFragment) -> Result<(), ProtocolError> {
+pub(crate) fn validate_fragment_expressions_with_types(
+    fragment: &plan::PlanFragment,
+    type_decoder: &mut NativeTypeDecoder<'_, '_, '_>,
+) -> Result<(), NativeFragmentDecodeError> {
     for (index, expression) in fragment.output_exprs.iter().enumerate() {
-        validate_proto_expr_shape_at(
+        validate_proto_expr_shape_at_with_types(
             expression,
             FieldPath::root("plan_fragment")
                 .field("output_exprs")
                 .index(index),
+            type_decoder,
         )
-        .map_err(|error| error.into_protocol())?;
+        .map_err(|error| error.into_native())?;
     }
     let Some(table) = fragment.runtime_filter_bindings.as_ref() else {
         return Ok(());
@@ -48,15 +54,17 @@ pub fn validate_fragment_expressions(fragment: &plan::PlanFragment) -> Result<()
                 "native runtime-filter binding requires expression",
             )
         })?;
-        validate_proto_expr_shape_at(expression, path).map_err(|error| error.into_protocol())?;
+        validate_proto_expr_shape_at_with_types(expression, path, type_decoder)
+            .map_err(|error| error.into_native())?;
     }
     Ok(())
 }
 
-pub fn validate_node_required_fields(
+pub(crate) fn validate_node_required_fields_with_types(
     node: &plan::DistributedNode,
     path: FieldPath,
-) -> Result<(), ProtocolError> {
+    type_decoder: &mut NativeTypeDecoder<'_, '_, '_>,
+) -> Result<(), NativeFragmentDecodeError> {
     let payload = node.payload.as_ref().ok_or_else(|| {
         ProtocolError::new(
             path.clone().field("payload"),
@@ -78,7 +86,7 @@ pub fn validate_node_required_fields(
         if let plan::plan_node::Kind::Values(values) = kind {
             for (row_index, row) in values.rows.iter().enumerate() {
                 for (value_index, value) in row.values.iter().enumerate() {
-                    validate_proto_expr_shape_at(
+                    validate_proto_expr_shape_at_with_types(
                         value,
                         path.clone()
                             .field("payload")
@@ -88,16 +96,40 @@ pub fn validate_node_required_fields(
                             .index(row_index)
                             .field("values")
                             .index(value_index),
+                        type_decoder,
                     )
-                    .map_err(|error| error.into_protocol())?;
+                    .map_err(|error| error.into_native())?;
                 }
             }
         }
     }
     for (index, child) in node.children.iter().enumerate() {
-        validate_node_required_fields(child, path.clone().field("children").index(index))?;
+        validate_node_required_fields_with_types(
+            child,
+            path.clone().field("children").index(index),
+            type_decoder,
+        )?;
     }
     Ok(())
+}
+
+/// Test convenience over the actual typed table owner.
+#[cfg(test)]
+pub fn validate_fragment_expressions(
+    fragment: &plan::PlanFragment,
+) -> Result<(), NativeFragmentDecodeError> {
+    crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+        validate_fragment_expressions_with_types(fragment, decoder)
+    })
+}
+#[cfg(test)]
+pub fn validate_node_required_fields(
+    node: &plan::DistributedNode,
+    path: FieldPath,
+) -> Result<(), NativeFragmentDecodeError> {
+    crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+        validate_node_required_fields_with_types(node, path, decoder)
+    })
 }
 
 #[cfg(test)]

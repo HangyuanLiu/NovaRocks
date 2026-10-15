@@ -38,8 +38,8 @@ use novarocks_types::SlotId;
 use crate::{
     BindingRequirement, BindingRequirements, CompileProfile, DiagnosticSourceNodeId,
     ImmutableExpressions, LayoutCompileError, ProgramExprId, ProgramNodeId, ScanSourceKind,
-    SinkCompileError, StaticConnectorScan, StaticFieldSchema, StaticFilterConsumer,
-    StaticFilterProducer, StaticLayout, StaticSinkProgram, StaticValues,
+    SinkCompileError, StaticConnectorScan, StaticFilterConsumer, StaticFilterProducer,
+    StaticLayout, StaticSinkProgram, StaticValues,
 };
 
 /// Matches the native task-codec preflight, which runs before protobuf decode.
@@ -78,9 +78,61 @@ pub enum AssertRowsMode {
 pub struct ProjectExpressionSlot {
     pub slot_id: SlotId,
     pub field: FieldRef,
-    pub metadata_origins: Option<novarocks_types::arrow_metadata_owner::FieldMetadataOrigins>,
-    pub field_schema: StaticFieldSchema,
+    /// The complete immutable expression purpose; Field is only its label/encoding.
+    pub binding: novarocks_type_contract::TypedValueBinding,
+    /// The finite creator responsibility for the independently shared Field.
+    pub storage: novarocks_type_contract::ValueTypeStorageLifetime,
     pub unique_id: Option<i32>,
+}
+
+/// Only complete immutable purpose facts can inhabit this shared source.
+/// The collection's own creation storage does not retain a whole program.
+#[derive(Clone, Debug)]
+pub struct ProjectExpressionSlots(Option<Arc<ProjectExpressionSlotBacking>>);
+#[derive(Debug)]
+struct ProjectExpressionSlotBacking {
+    slots: Box<[ProjectExpressionSlot]>,
+    storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl ProjectExpressionSlots {
+    pub fn storage_allocation_layout() -> Result<
+        std::alloc::Layout,
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    > {
+        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            ProjectExpressionSlotBacking,
+        >())
+    }
+    /// The caller created this Box through its original creator. No owned
+    /// unguarded collection is returned, and refusal precedes the Arc header.
+    pub fn try_from_boxed_observed<
+        E: From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+    >(
+        slots: Box<[ProjectExpressionSlot]>,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+        mut request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
+    ) -> Result<Self, E> {
+        if slots.is_empty() {
+            return Ok(Self(None));
+        }
+        request(Self::storage_allocation_layout()?)?;
+        Ok(Self(Some(Arc::new(ProjectExpressionSlotBacking {
+            slots,
+            storage,
+        }))))
+    }
+    pub fn storage_lifetime(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+        self.0.as_ref().map_or_else(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure,
+            |source| source.storage.clone(),
+        )
+    }
+}
+impl std::ops::Deref for ProjectExpressionSlots {
+    type Target = [ProjectExpressionSlot];
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().map_or(&[], |source| source.slots.as_ref())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +208,7 @@ pub struct StaticAggregateOrder {
 
 #[derive(Clone, Debug)]
 pub struct StaticAggregateCall {
+    pub frozen: Option<Arc<crate::FrozenAggregateSelection>>,
     pub state_interpretation: Option<novarocks_type_contract::AggregateStateInterpretation>,
     pub name: Arc<str>,
     pub inputs: Vec<ProgramExprId>,
@@ -285,6 +338,7 @@ impl WindowFunctionKind {
 /// `Prepared` call always carries the explicit frame its compiler froze.
 #[derive(Clone, Debug)]
 pub struct StaticWindowFunction {
+    pub frozen_aggregate: Option<Arc<crate::FrozenAggregateSelection>>,
     pub kind: WindowFunctionKind,
     pub args: Vec<ProgramExprId>,
     pub return_type: DataType,
@@ -301,6 +355,7 @@ pub enum AnalyticOutputColumn {
 
 #[derive(Clone, Debug)]
 pub struct WriterPartialAggregateCall {
+    pub frozen: Option<Arc<crate::FrozenAggregateSelection>>,
     pub input_slot_id: SlotId,
     pub function_name: Arc<str>,
     pub resolved: ResolvedAggregateSignature,
@@ -309,6 +364,7 @@ pub struct WriterPartialAggregateCall {
 
 #[derive(Clone, Debug)]
 pub struct WriterFinalAggregateCall {
+    pub frozen: Option<Arc<crate::FrozenAggregateSelection>>,
     pub function_name: Arc<str>,
     pub resolved: ResolvedAggregateSignature,
     pub intermediate_input_slot_id: SlotId,
@@ -336,6 +392,7 @@ pub struct WriterGroupedUnpivotPlan {
 
 #[derive(Clone, Debug)]
 pub struct WriterFinalAggregatePlan {
+    pub prepared: Option<crate::PreparedWriterAggregateCalls>,
     pub calls: Vec<WriterFinalAggregateCall>,
     pub unpivot: Option<WriterGroupedUnpivotPlan>,
 }
@@ -405,7 +462,7 @@ pub enum ProgramNodeKind {
         validate_final_result_input: bool,
         exprs: Vec<ProgramExprId>,
         expr_slot_ids: Vec<SlotId>,
-        expr_slot_schemas: Option<Vec<ProjectExpressionSlot>>,
+        expr_slot_schemas: Option<ProjectExpressionSlots>,
         output_indices: Option<Vec<usize>>,
     },
     Unpivot {
@@ -504,6 +561,7 @@ pub enum ProgramNodeKind {
         projection: StaticWriterProjection,
         writer_multiplex_layout: StaticLayout,
         partial_aggregates: Vec<WriterPartialAggregateCall>,
+        partial_preparation: Option<crate::PreparedWriterAggregateCalls>,
     },
     TableFinish {
         inputs: Vec<ProgramNodeId>,
@@ -954,31 +1012,76 @@ impl ProgramWork<'_> {
         self.flush()?;
         result
     }
-    fn project(
+    fn writer_projection_matches(
         &mut self,
-        layout: &StaticLayout,
-        columns: &[SlotId],
-    ) -> Result<StaticLayout, ProgramCompileError> {
+        execution: &StaticLayout,
+        provider: &StaticLayout,
+    ) -> Result<bool, ProgramCompileError> {
+        if !execution.is_typed() || !provider.is_typed() {
+            // Explicit expansion fixtures retain their original exact law.
+            return Ok(self.identity(execution, LocalProgramError::LayoutMismatch)?
+                == self.identity(provider, LocalProgramError::LayoutMismatch)?);
+        }
         self.flush()?;
         let result = if let Some(work) = &self.0 {
-            layout
-                .project_by_slots_for_compile(columns, work.control())
+            execution
+                .writer_projection_matches_for_compile(provider, work.control())
                 .map_err(|error| match error {
                     LayoutCompileError::Control(cause) => ProgramCompileError::Control(cause),
-                    LayoutCompileError::Layout(_) => {
-                        ProgramCompileError::Program(LocalProgramError::InvalidSink)
-                    }
+                    LayoutCompileError::Layout(_) => LocalProgramError::InvalidNodeShape.into(),
                 })
         } else {
-            layout
-                .project_by_slots(columns)
-                .map_err(|_| LocalProgramError::InvalidSink.into())
+            execution
+                .writer_projection_matches(provider)
+                .map_err(|_| LocalProgramError::InvalidNodeShape.into())
         };
         if matches!(&result, Err(ProgramCompileError::Control(_))) {
             return result;
         }
         self.flush()?;
         result
+    }
+    fn projection_matches(
+        &mut self,
+        layout: &StaticLayout,
+        columns: &[SlotId],
+        expected: &StaticLayout,
+    ) -> Result<bool, ProgramCompileError> {
+        self.flush()?;
+        if layout.is_typed() {
+            let result = if let Some(work) = &self.0 {
+                layout
+                    .typed_projection_matches_for_compile(columns, expected, work.control())
+                    .map_err(|error| match error {
+                        LayoutCompileError::Control(cause) => ProgramCompileError::Control(cause),
+                        LayoutCompileError::Layout(_) => LocalProgramError::InvalidSink.into(),
+                    })
+            } else {
+                layout
+                    .typed_projection_matches(columns, expected)
+                    .map_err(|_| LocalProgramError::InvalidSink.into())
+            };
+            if matches!(&result, Err(ProgramCompileError::Control(_))) {
+                return result;
+            }
+            self.flush()?;
+            return result;
+        }
+        let projected = if let Some(work) = &self.0 {
+            layout
+                .project_by_slots_for_compile(columns, work.control())
+                .map_err(|error| match error {
+                    LayoutCompileError::Control(cause) => ProgramCompileError::Control(cause),
+                    LayoutCompileError::Layout(_) => LocalProgramError::InvalidSink.into(),
+                })?
+        } else {
+            layout
+                .project_by_slots(columns)
+                .map_err(|_| LocalProgramError::InvalidSink)?
+        };
+        self.flush()?;
+        Ok(self.identity(&projected, LocalProgramError::InvalidSink)?
+            == self.identity(expected, LocalProgramError::InvalidSink)?)
     }
     fn sink(&mut self, sink: &StaticSinkProgram) -> Result<(), ProgramCompileError> {
         self.flush()?;
@@ -1384,14 +1487,15 @@ impl LocalProgramGraph {
                 schema
                     .validate_native_slots(&[slot.as_u32()])
                     .map_err(|_| LocalProgramError::InvalidSink)?;
-                let [field] = layout.schema().fields().as_ref() else {
+                if layout.schema().fields().len() != 1 {
                     return Err(LocalProgramError::InvalidSink.into());
-                };
-                if !novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
-                    schema.field(),
-                    field.data_type(),
-                    field.is_nullable(),
-                ) {
+                }
+                let binding = layout
+                    .value_binding(*slot)
+                    .ok_or(LocalProgramError::InvalidSink)?;
+                if !novarocks_type_contract::result_scalar_type::scalar_field_matches_binding_observed(
+                    schema.field(), binding, &mut || work.step(),
+                )? {
                     return Err(LocalProgramError::InvalidSink.into());
                 }
             }
@@ -1402,11 +1506,11 @@ impl LocalProgramGraph {
                     let branch = sink.branches().get(*branch);
                     work.step()?;
                     let branch = branch.ok_or(LocalProgramError::InvalidSink)?;
-                    let projected =
-                        work.project(&nodes[root.index()].output_layout, branch.output_columns())?;
-                    if work.identity(&projected, LocalProgramError::InvalidSink)?
-                        != work.identity(layout, LocalProgramError::InvalidSink)?
-                    {
+                    if !work.projection_matches(
+                        &nodes[root.index()].output_layout,
+                        branch.output_columns(),
+                        layout,
+                    )? {
                         return Err(LocalProgramError::InvalidSink.into());
                     }
                 }
@@ -1811,9 +1915,7 @@ fn validate_shape(
                     return Err(LocalProgramError::InvalidNodeShape.into());
                 }
             }
-            if work.identity(&projection.layout, LocalProgramError::LayoutMismatch)?
-                != work.identity(expected_layout, LocalProgramError::LayoutMismatch)?
-            {
+            if !work.writer_projection_matches(&projection.layout, expected_layout)? {
                 return Err(LocalProgramError::InvalidNodeShape.into());
             }
         }
@@ -1935,6 +2037,7 @@ mod tests {
                             writer_multiplex_layout: layout.clone(),
                             root_result_layout: layout.clone(),
                             final_aggregates: WriterFinalAggregatePlan {
+                                prepared: None, // Explicit legacy fixture; no runtime preparation source.
                                 calls: vec![],
                                 unpivot: Some(unpivot),
                             },

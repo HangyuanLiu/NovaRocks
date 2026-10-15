@@ -147,7 +147,7 @@ fn legacy_any_value_empty_and_all_null_keep_nullable_result_for_nonnullable_inpu
         panic!("scalar aggregate result")
     };
     assert!(
-        output.nullable,
+        output.nullable(),
         "the resolver overrides result nullability after copying the input type"
     );
 }

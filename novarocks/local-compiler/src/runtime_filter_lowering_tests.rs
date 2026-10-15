@@ -254,16 +254,11 @@ fn frozen_read_columns(
     )
     .unwrap();
     let schema = public_schema();
-    let public = ConnectorReadPublicFacts::try_new(
+    let public = crate::scan_lowering_tests::typed_public_schema(
         source,
         None,
-        arrow_schema::Schema::new_with_metadata(
-            schema.fields()[..width].to_vec(),
-            schema.metadata().clone(),
-        ),
-        vec![ValueLogicalType::Physical; width],
-    )
-    .unwrap();
+        arrow_schema::Schema::new(schema.fields()[..width].to_vec()),
+    );
     FrozenConnectorRead::try_new(scan, public).unwrap()
 }
 
@@ -452,14 +447,14 @@ enum Consumer {
 }
 
 #[derive(Clone, Copy)]
-struct Rf {
+pub(super) struct Rf {
     null_safe: bool,
     consumer: Consumer,
     /// An ordered-hull domain instead of a membership domain.
     ordered: bool,
 }
 impl Rf {
-    const fn blocking() -> Self {
+    pub(super) const fn blocking() -> Self {
         Self {
             null_safe: false,
             consumer: Consumer::BlockingScan,
@@ -663,7 +658,7 @@ fn dynamic_filter() -> StaticScanDynamicFilter {
 /// `SELECT v0, v1 FROM t JOIN broadcast(VALUES (7), (8), (20)) ON v0 = c0`
 /// in one fragment that streams to a gather. The join produces the filter
 /// and, unless `rf` names another consumer, its probe scan consumes it.
-fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
+pub(super) fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
     let mut builder = FragmentBuilder::new(PROBE);
     let scan = add_scan(&mut builder, Distribution::Unconstrained);
     let (build, build_column) = build_fragment(BUILD_EDGE, rf.null_safe);
@@ -927,7 +922,11 @@ fn filter_requirements(program: &LocalProgram) -> Vec<i32> {
 }
 
 fn membership(null_semantics: FilterNullSemantics) -> StaticFilterContract {
-    StaticFilterContract::membership(&DataType::Int64, null_semantics).unwrap()
+    StaticFilterContract::membership(
+        &nullable_int64(matches!(null_semantics, FilterNullSemantics::NullSafeEqual)),
+        null_semantics,
+    )
+    .unwrap()
 }
 
 /// The join's one membership producer: binding `binding`, channel FILTER,
@@ -1767,6 +1766,7 @@ fn freeze_counts(
             )
             .unwrap_or_else(|error| panic!("COUNT(*) prepares: {error}"));
         frozen.push(FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,

@@ -440,6 +440,8 @@ fn materialize_channels(
         let logical_domain = filter::RuntimeFilterLogicalDomain {
             value_type: Some(encoded_domain.value_type()),
             contract: Some(encoded_domain.contract()),
+
+            execution_types: Some(encoded_domain.execution_types()),
         };
         let lifecycle = match fact.lifecycle() {
             RuntimeFilterDeploymentLifecycleFacts::CompleteOnce => {
@@ -844,8 +846,8 @@ fn compile_feedback_declaration(
                     fragment_id: binding.fragment_id,
                     plan_node_id: binding.node_id,
                     binding_id: binding.binding_id,
-                    data_type: value_type.data_type.clone(),
-                    nullable: value_type.nullable,
+                    data_type: value_type.data_type().clone(),
+                    nullable: value_type.nullable(),
                 }),
                 BindingRole::Consumer {
                     feedback_scan_type: None,
@@ -2052,10 +2054,13 @@ mod tests {
             logical_domain: filter::RuntimeFilterLogicalDomain {
                 value_type: None,
                 contract: Some(plan::RuntimeFilterContract {
+                    logical_domain: None,
                     kind: Some(plan::runtime_filter_contract::Kind::Membership(
                         plan::RuntimeFilterMembershipContract::default(),
                     )),
                 }),
+
+                execution_types: None,
             },
             membership_schema_digest,
             lifecycle: filter::RuntimeFilterLifecycle::CompleteOnce as i32,

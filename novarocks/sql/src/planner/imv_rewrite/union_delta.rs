@@ -415,10 +415,9 @@ fn normalize_top_level_union_branch_output(
                 target: arrow::datatypes::DataType::Int32,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            value_type: novarocks_type_contract::FunctionValueType {
-                nullable: false,
-                ..branch_output.value_type.clone()
-            },
+            value_type: (branch_output.value_type.clone())
+                .with_nullable(false)
+                .expect("valid value root nullability transform"),
         },
         output_name: branch_output.name.clone(),
         output_column_id: branch_output.column_id,
@@ -607,8 +606,8 @@ mod tests {
                 .map(|column| (
                     column.column_id,
                     column.name.as_str(),
-                    column.value_type.data_type.clone(),
-                    column.value_type.nullable,
+                    column.value_type.data_type().clone(),
+                    column.value_type.nullable(),
                     column.is_internal
                 ))
                 .collect::<Vec<_>>(),
@@ -1053,8 +1052,8 @@ mod tests {
             .find(|item| item.output_name.eq_ignore_ascii_case("__branch_id__"))
             .expect("branch Project must expose branch id column");
         assert_eq!(branch.output_column_id, branch_column);
-        assert_eq!(branch.expr.value_type.data_type, DataType::Int32);
-        assert!(!branch.expr.value_type.nullable);
+        assert_eq!(branch.expr.value_type.data_type().clone(), DataType::Int32);
+        assert!(!branch.expr.value_type.nullable());
         assert!(matches!(
             &branch.expr.kind,
             ExprKind::Cast { expr, target , .. }

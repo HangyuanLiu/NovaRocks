@@ -128,6 +128,8 @@ mod tests {
     #[test]
     fn aggregate_signature_accepts_local_intermediate_output() {
         let func = AggFunction {
+            // Explicit legacy carrier fixture; this is not frozen-binding admission.
+            frozen: None,
             name: "avg".to_string(),
             inputs: vec![],
             input_is_intermediate: false,
@@ -149,6 +151,8 @@ mod tests {
     #[test]
     fn aggregate_signature_rejects_decimal_precision_drift() {
         let func = AggFunction {
+            // Explicit legacy carrier fixture; this is not frozen-binding admission.
+            frozen: None,
             name: "sum".to_string(),
             inputs: vec![],
             input_is_intermediate: false,

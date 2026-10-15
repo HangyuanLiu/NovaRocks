@@ -79,7 +79,7 @@ pub(super) fn validate_profile(contract: &ScalarCallContract) -> Result<(), Kern
         return Err(invalid("nullif requires two exact checked value arguments"));
     };
     let target = contract.result_type();
-    let admitted = match &target.data_type {
+    let admitted = match target.data_type() {
         DataType::Int8
         | DataType::Int16
         | DataType::Int32
@@ -97,12 +97,12 @@ pub(super) fn validate_profile(contract: &ScalarCallContract) -> Result<(), Kern
         _ => false,
     };
     if !admitted
-        || !target.nullable
-        || target.logical_type != ValueLogicalType::Physical
-        || left.logical_type != ValueLogicalType::Physical
-        || right.logical_type != ValueLogicalType::Physical
-        || left.data_type != target.data_type
-        || right.data_type != target.data_type
+        || !target.nullable()
+        || target.logical_type() != ValueLogicalType::Physical
+        || left.logical_type() != ValueLogicalType::Physical
+        || right.logical_type() != ValueLogicalType::Physical
+        || left.data_type() != target.data_type()
+        || right.data_type() != target.data_type()
     {
         return Err(invalid(
             "nullif requires its exact admitted nullable flat result profile",
@@ -125,7 +125,7 @@ pub(super) fn evaluate<'a>(
         let output = evaluate_values(*left, *right, input.selection(), &mut work, None)?;
         SelectedValues::try_new_observed(
             input.selection(),
-            &input.contract().result_type().data_type,
+            input.contract().result_type().data_type(),
             output,
             Box::default(),
             || work.step(),

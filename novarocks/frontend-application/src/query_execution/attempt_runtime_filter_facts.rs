@@ -22,7 +22,6 @@
 //! close before a producer is done. Both plan representations state them, so
 //! deployment stops depending on which one built the execution.
 
-use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
     EdgeId, FragmentId as PhysicalFragmentId, PhysicalPlan, RuntimeFilter,
     RuntimeFilterApplyPoint as PhysicalApplyPoint, RuntimeFilterCoverage,
@@ -42,7 +41,7 @@ pub(crate) enum AttemptRuntimeFilterApplyPoint {
 #[derive(Clone, Debug)]
 pub(crate) enum AttemptRuntimeFilterLogicalDomainFacts {
     Membership {
-        value_type: DataType,
+        value_type: novarocks_physical_plan::ValueType,
         null_semantics: AttemptRuntimeFilterNullSemantics,
     },
     Ordered {
@@ -53,7 +52,7 @@ pub(crate) enum AttemptRuntimeFilterLogicalDomainFacts {
 }
 #[derive(Clone, Debug)]
 pub(crate) struct AttemptRuntimeFilterOrderKeyFacts {
-    pub data_type: DataType,
+    pub value_type: novarocks_physical_plan::ValueType,
     pub direction: AttemptRuntimeFilterSortDirection,
     pub null_order: AttemptRuntimeFilterNullOrder,
 }
@@ -309,7 +308,7 @@ fn completed_channel(filter: &RuntimeFilter) -> Result<AttemptRuntimeFilterChann
     let logical_domain = match &filter.domain {
         RuntimeFilterDomain::Membership { ty, null_semantics } => {
             AttemptRuntimeFilterLogicalDomainFacts::Membership {
-                value_type: ty.data_type.clone(),
+                value_type: ty.clone(),
                 null_semantics: match null_semantics {
                     RuntimeFilterNullSemantics::NeverMatches => {
                         AttemptRuntimeFilterNullSemantics::NeverMatches
@@ -330,7 +329,7 @@ fn completed_channel(filter: &RuntimeFilter) -> Result<AttemptRuntimeFilterChann
                 })?;
             AttemptRuntimeFilterLogicalDomainFacts::Ordered {
                 keys: vec![AttemptRuntimeFilterOrderKeyFacts {
-                    data_type: key.ty.data_type.clone(),
+                    value_type: key.ty.clone(),
                     direction: match key.direction {
                         novarocks_physical_plan::SortDirection::Ascending => {
                             AttemptRuntimeFilterSortDirection::Ascending

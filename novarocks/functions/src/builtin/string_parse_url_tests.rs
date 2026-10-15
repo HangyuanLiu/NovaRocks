@@ -101,7 +101,7 @@ fn output(result: &SelectedValues<'_>) -> Vec<Option<String>> {
         .collect()
 }
 fn pool(array: ArrayRef) -> ConstantPool {
-    let ty = FunctionValueType::new(array.data_type().clone(), true);
+    let ty = FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true);
     ConstantPool::try_new(
         Arc::new(
             ty.try_to_field("original")

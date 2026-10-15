@@ -1543,6 +1543,7 @@ mod tests {
             &self,
             _: &novarocks_execution_contract::task_execution::descriptor::TaskDescriptor,
             _: novarocks_execution_contract::task_execution::creation::TaskCreationInput,
+            _preparation_stop: novarocks_worker::TaskPreparationStopView,
         ) -> Result<novarocks_worker::PreparedTaskInstallation, novarocks_worker::HostRejection>
         {
             panic!("metrics fixture must not install a task")

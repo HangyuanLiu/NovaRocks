@@ -118,7 +118,7 @@ impl<'a> UnaryArgument<'a> {
                     "numeric unary selected row is outside its checked carrier",
                 ));
             }
-            if !source.nullable && self.array().is_null(row) {
+            if !source.nullable() && self.array().is_null(row) {
                 return Err(internal(
                     "numeric unary non-null input contains selected SQL NULL",
                 ));
@@ -135,12 +135,12 @@ fn checked_view<'a>(
     array: &'a ArrayRef,
     source: &FunctionValueType,
 ) -> Result<NumericArrayView<'a>, KernelFailure> {
-    if array.data_type() != &source.data_type {
+    if array.data_type() != source.data_type() {
         return Err(internal(
             "numeric unary carrier differs from its checked argument",
         ));
     }
-    match &source.data_type {
+    match source.data_type() {
         DataType::Int8
         | DataType::Int16
         | DataType::Int32
@@ -158,7 +158,7 @@ fn checked_view<'a>(
         }
     }
     NumericArrayView::new(array).map_err(|_| {
-        if matches!(source.data_type, DataType::Decimal128(..)) {
+        if matches!(source.data_type(), DataType::Decimal128(..)) {
             internal("numeric unary selected decimal cannot be downcast")
         } else {
             internal("numeric unary selected carrier cannot be downcast")
@@ -287,9 +287,9 @@ pub(super) fn evaluate_numeric_unary<'a>(
     } else {
         DataType::Float64
     };
-    if source.logical_type != ValueLogicalType::Physical
-        || target.logical_type != ValueLogicalType::Physical
-        || target.data_type != expected
+    if source.logical_type() != ValueLogicalType::Physical
+        || target.logical_type() != ValueLogicalType::Physical
+        || *target.data_type() != expected
     {
         return Err(invalid(
             "numeric unary logical or result type differs from its exact profile",
@@ -306,8 +306,8 @@ pub(super) fn evaluate_numeric_unary<'a>(
         UnaryArgument::Selected(*argument, source),
         Some(view),
         input.selection(),
-        Some(&target.data_type),
-        Some(target.nullable),
+        Some(target.data_type()),
+        Some(target.nullable()),
         Some(control),
     )
     .map_err(|error| match error {
@@ -316,8 +316,13 @@ pub(super) fn evaluate_numeric_unary<'a>(
             KernelFailure::Operational(KernelDiagnostic::new(&message))
         }
     })?;
-    SelectedValues::try_new(input.selection(), &target.data_type, values, Box::default())
-        .map_err(|_| internal("numeric unary compact output violates its selected contract"))
+    SelectedValues::try_new(
+        input.selection(),
+        target.data_type(),
+        values,
+        Box::default(),
+    )
+    .map_err(|_| internal("numeric unary compact output violates its selected contract"))
 }
 /// v1 already evaluated its child and supplies actual carrier / batch facts.
 pub fn evaluate_legacy_numeric_unary(
@@ -653,7 +658,8 @@ mod tests {
             ),
         ];
         for array in profiles {
-            let source = FunctionValueType::new(array.data_type().clone(), true);
+            let source =
+                FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true);
             let result = dense("atan", source, array);
             assert_floats(&result, &[Some(-1.1071487177940904), None]);
         }
@@ -674,7 +680,10 @@ mod tests {
             );
             let result = dense(
                 "positive",
-                FunctionValueType::new(array.data_type().clone(), false),
+                FunctionValueType::from_legacy_declared_projection(
+                    array.data_type().clone(),
+                    false,
+                ),
                 array,
             );
             assert_eq!(
@@ -745,10 +754,13 @@ mod tests {
             Arc::new(Float32Array::from(vec![f32::NAN, f32::INFINITY, -0.0])) as ArrayRef,
             Arc::new(Float64Array::from(vec![f64::NAN, f64::NEG_INFINITY, -0.0])) as ArrayRef,
         ] {
-            let source = FunctionValueType::new(array.data_type().clone(), false);
+            let source = FunctionValueType::from_legacy_declared_projection(
+                array.data_type().clone(),
+                false,
+            );
             let mut instance = instance("positive", source);
             assert!(
-                instance.contract().result_type().nullable,
+                instance.contract().result_type().nullable(),
                 "the exact float owner must admit its existing sanitized NULL result"
             );
             let arguments = [EvaluatedArgument::Column(&array)];

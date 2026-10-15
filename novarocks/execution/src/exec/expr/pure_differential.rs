@@ -118,7 +118,7 @@ use novarocks_type_contract::{
 use novarocks_types::SlotId;
 
 use self::generate::InputGenerator;
-use crate::exec::chunk::{Chunk, ChunkSchema};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::expr::function::{FunctionKind as LegacyKind, lookup_function};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::runtime::runtime_state::RuntimeErrorState;
@@ -172,11 +172,13 @@ pub(crate) fn constant_policy() -> ConstantPolicy {
 /// Admit one SQL constant from a one-row array of exactly `value_type`.
 pub(crate) fn constant(value_type: FunctionValueType, single_row: ArrayRef) -> ConstantValue {
     assert_eq!(single_row.len(), 1, "a constant is authored from one row");
-    let field = Arc::new(
-        value_type
-            .try_to_field("constant")
-            .expect("constant value type is valid"),
-    );
+    let single_row = crate::exec::chunk::normalize_execution_array(&single_row)
+        .expect("constant source has a valid canonical representation");
+    let field = Arc::new(arrow::datatypes::Field::new(
+        "constant",
+        single_row.data_type().clone(),
+        value_type.nullable(),
+    ));
     ConstantPool::try_new(
         field,
         value_type,
@@ -399,14 +401,18 @@ impl ScalarDiffSpec {
     }
 
     pub(crate) fn typed_column(mut self, value_type: FunctionValueType, values: ArrayRef) -> Self {
+        // This scalar fixture supplies the plain form required by its current
+        // installed input interface, after checking the complete value layout.
+        let values = aggregate::plain_value_array(&values, &value_type)
+            .expect("scalar differential source has a valid prepared value representation");
         assert!(
             novarocks_type_contract::arrow_data_types_exact(
                 values.data_type(),
-                &value_type.data_type
+                &value_type.data_type()
             ),
             "column carrier {:?} differs from its declared type {:?}",
             values.data_type(),
-            value_type.data_type
+            value_type.data_type()
         );
         self.arguments
             .push(DiffArgument::Column { value_type, values });
@@ -1271,6 +1277,7 @@ impl ScalarCall<'_> {
         let mut fields = Vec::new();
         let mut columns = Vec::new();
         let mut slots = Vec::new();
+        let mut source_types = Vec::new();
         let mut arguments = Vec::with_capacity(spec.arguments.len());
         for (index, argument) in spec.arguments.iter().enumerate() {
             let argument = if index == 0 {
@@ -1300,14 +1307,15 @@ impl ScalarCall<'_> {
                         (Some(_), None) => unreachable!("selection indices authored above"),
                     };
                     let slot = SlotId::new(index as u32 + 1);
-                    fields.push(
-                        value_type
-                            .try_to_field(format!("arg{index}"))
-                            .map_err(|error| error.to_string())?,
-                    );
+                    fields.push(arrow::datatypes::Field::new(
+                        format!("arg{index}"),
+                        values.data_type().clone(),
+                        value_type.nullable(),
+                    ));
                     columns.push(values);
                     slots.push(slot);
-                    arena.push_typed(ExprNode::SlotId(slot), value_type.data_type.clone())
+                    source_types.push(value_type.clone());
+                    arena.push_value_typed(ExprNode::SlotId(slot), value_type.clone())
                 }
                 DiffArgument::Constant(value) => {
                     legacy_constant(&mut arena, value, spec.legacy_constants)
@@ -1328,12 +1336,31 @@ impl ScalarCall<'_> {
             ));
             columns.push(Arc::new(Int8Array::from(vec![0; num_rows])) as ArrayRef);
             slots.push(SlotId::new(ANCHOR_SLOT));
+            source_types.push(FunctionValueType::new(DataType::Int8, false));
         }
-        let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
-            .map_err(|error| format!("harness batch failed: {error}"))?;
-        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &slots)?;
-        let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+        let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+        let slots = fields
+            .into_iter()
+            .zip(slots)
+            .zip(source_types)
+            .map(|((field, slot), value_type)| {
+                ChunkSlotSchema::try_new_typed(
+                    slot,
+                    Arc::new(field),
+                    value_type.typed_binding().clone(),
+                    None,
+                    storage.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let chunk_schema = Arc::new(ChunkSchema::try_new_typed(slots, storage)?);
+        let chunk = Chunk::try_new_typed_with_columns_observed::<String, _>(
+            chunk_schema,
+            columns,
+            num_rows,
+            |_| Ok(()),
+        )
+        .map_err(|error| format!("harness batch failed: {error}"))?;
         let node = match self.legacy_kind {
             ScalarLegacyImplementation::Function(kind) => ExprNode::FunctionCall {
                 kind,
@@ -1343,7 +1370,7 @@ impl ScalarCall<'_> {
                 elements: arguments,
             },
         };
-        let call = arena.push_typed(node, self.result_type.data_type.clone());
+        let call = arena.push_value_typed(node, self.result_type.clone());
         arena.eval(call, &chunk)
     }
 }
@@ -1363,13 +1390,15 @@ fn legacy_constant(
     value: &ConstantValue,
     form: LegacyConstantForm,
 ) -> ExprId {
-    let data_type = value.value_type().data_type.clone();
     if form == LegacyConstantForm::Literal
         && let Some(literal) = legacy_literal(value)
     {
-        return arena.push_typed(ExprNode::Literal(literal), data_type);
+        return arena.push_value_typed(ExprNode::Literal(literal), value.value_type().clone());
     }
-    arena.push_typed(ExprNode::Constant(value.clone()), data_type)
+    arena.push_value_typed(
+        ExprNode::Constant(value.clone()),
+        value.value_type().clone(),
+    )
 }
 
 /// The literal the native adapter would author for this constant, if any.
@@ -1379,57 +1408,59 @@ pub(crate) fn legacy_literal(value: &ConstantValue) -> Option<LiteralValue> {
     if array.is_null(row) {
         return Some(LiteralValue::Null);
     }
-    Some(match (array.data_type(), value.value_type().logical_type) {
-        (DataType::Int8, ValueLogicalType::Physical) => {
-            LiteralValue::Int8(array.as_primitive::<Int8Type>().value(row))
-        }
-        (DataType::Int16, ValueLogicalType::Physical) => {
-            LiteralValue::Int16(array.as_primitive::<Int16Type>().value(row))
-        }
-        (DataType::Int32, ValueLogicalType::Physical) => {
-            LiteralValue::Int32(array.as_primitive::<Int32Type>().value(row))
-        }
-        (DataType::Int64, ValueLogicalType::Physical) => {
-            LiteralValue::Int64(array.as_primitive::<Int64Type>().value(row))
-        }
-        (DataType::Float32, ValueLogicalType::Physical) => {
-            LiteralValue::Float32(array.as_primitive::<Float32Type>().value(row))
-        }
-        (DataType::Float64, ValueLogicalType::Physical) => {
-            LiteralValue::Float64(array.as_primitive::<Float64Type>().value(row))
-        }
-        (DataType::Boolean, ValueLogicalType::Physical) => {
-            LiteralValue::Bool(array.as_boolean().value(row))
-        }
-        (DataType::Utf8, ValueLogicalType::Physical) => {
-            LiteralValue::Utf8(array.as_string::<i32>().value(row).to_string())
-        }
-        (DataType::Binary, ValueLogicalType::Physical) => {
-            LiteralValue::Binary(array.as_binary::<i32>().value(row).to_vec())
-        }
-        (DataType::Date32, ValueLogicalType::Physical) => {
-            LiteralValue::Date32(array.as_primitive::<Date32Type>().value(row))
-        }
-        (DataType::Decimal128(precision, scale), ValueLogicalType::Physical) => {
-            LiteralValue::Decimal128 {
-                value: array.as_primitive::<Decimal128Type>().value(row),
-                precision: *precision,
-                scale: *scale,
+    Some(
+        match (array.data_type(), value.value_type().logical_type()) {
+            (DataType::Int8, ValueLogicalType::Physical) => {
+                LiteralValue::Int8(array.as_primitive::<Int8Type>().value(row))
             }
-        }
-        (DataType::Decimal256(precision, scale), ValueLogicalType::Physical) => {
-            LiteralValue::Decimal256 {
-                value: array.as_primitive::<Decimal256Type>().value(row),
-                precision: *precision,
-                scale: *scale,
+            (DataType::Int16, ValueLogicalType::Physical) => {
+                LiteralValue::Int16(array.as_primitive::<Int16Type>().value(row))
             }
-        }
-        (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt) => {
-            let bytes: [u8; 16] = array.as_fixed_size_binary().value(row).try_into().ok()?;
-            LiteralValue::LargeInt(i128::from_be_bytes(bytes))
-        }
-        _ => return None,
-    })
+            (DataType::Int32, ValueLogicalType::Physical) => {
+                LiteralValue::Int32(array.as_primitive::<Int32Type>().value(row))
+            }
+            (DataType::Int64, ValueLogicalType::Physical) => {
+                LiteralValue::Int64(array.as_primitive::<Int64Type>().value(row))
+            }
+            (DataType::Float32, ValueLogicalType::Physical) => {
+                LiteralValue::Float32(array.as_primitive::<Float32Type>().value(row))
+            }
+            (DataType::Float64, ValueLogicalType::Physical) => {
+                LiteralValue::Float64(array.as_primitive::<Float64Type>().value(row))
+            }
+            (DataType::Boolean, ValueLogicalType::Physical) => {
+                LiteralValue::Bool(array.as_boolean().value(row))
+            }
+            (DataType::Utf8, ValueLogicalType::Physical) => {
+                LiteralValue::Utf8(array.as_string::<i32>().value(row).to_string())
+            }
+            (DataType::Binary, ValueLogicalType::Physical) => {
+                LiteralValue::Binary(array.as_binary::<i32>().value(row).to_vec())
+            }
+            (DataType::Date32, ValueLogicalType::Physical) => {
+                LiteralValue::Date32(array.as_primitive::<Date32Type>().value(row))
+            }
+            (DataType::Decimal128(precision, scale), ValueLogicalType::Physical) => {
+                LiteralValue::Decimal128 {
+                    value: array.as_primitive::<Decimal128Type>().value(row),
+                    precision: *precision,
+                    scale: *scale,
+                }
+            }
+            (DataType::Decimal256(precision, scale), ValueLogicalType::Physical) => {
+                LiteralValue::Decimal256 {
+                    value: array.as_primitive::<Decimal256Type>().value(row),
+                    precision: *precision,
+                    scale: *scale,
+                }
+            }
+            (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt) => {
+                let bytes: [u8; 16] = array.as_fixed_size_binary().value(row).try_into().ok()?;
+                LiteralValue::LargeInt(i128::from_be_bytes(bytes))
+            }
+            _ => return None,
+        },
+    )
 }
 
 /// Facts shared by every row of one selection comparison.
@@ -1583,11 +1614,12 @@ fn check_types(
     found: &mut Vec<String>,
 ) -> bool {
     let mut equal = true;
-    if !novarocks_type_contract::arrow_data_types_exact(pure.data_type(), &result_type.data_type) {
+    if !novarocks_type_contract::arrow_data_types_exact(pure.data_type(), &result_type.data_type())
+    {
         found.push(format!(
             "pure carrier {:?} differs from the selected result {:?}",
             pure.data_type(),
-            result_type.data_type
+            result_type.data_type()
         ));
         equal = false;
     }
@@ -1599,7 +1631,7 @@ fn check_types(
         ));
         equal = false;
     }
-    if !result_type.nullable && legacy.null_count() > 0 {
+    if !result_type.nullable() && legacy.null_count() > 0 {
         found.push(format!(
             "legacy produced {} NULLs for a non-nullable selected result",
             legacy.null_count()
@@ -1966,3 +1998,7 @@ mod approx_top_k_full_any_error_tests;
 #[cfg(test)]
 #[path = "pure_differential_parse_json_tests.rs"]
 mod parse_json_tests;
+
+#[path = "pure_differential/view_input_fixture.rs"]
+mod view_input_fixture;
+use view_input_fixture::assert_scalar_matches_v1_with_plain_views;

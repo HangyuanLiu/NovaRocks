@@ -342,7 +342,7 @@ impl<K: InlineAggregateWindowKernel> WindowKernelPartition for AggregateWindowPa
             };
             SelectedValues::try_new_observed::<KernelFailure>(
                 selection,
-                &self.prepared.contract.result_type().data_type,
+                self.prepared.contract.result_type().data_type(),
                 output,
                 Box::default(),
                 || work.step(),

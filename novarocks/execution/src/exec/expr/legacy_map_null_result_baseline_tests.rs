@@ -71,7 +71,7 @@ fn array(
 }
 fn map(keys: ArrayRef, values: ArrayRef, offsets: Vec<i32>, valid: Option<Vec<bool>>) -> ArrayRef {
     let fs = vec![
-        Arc::new(Field::new("key", keys.data_type().clone(), true)),
+        Arc::new(Field::new("key", keys.data_type().clone(), false)),
         Arc::new(Field::new("value", values.data_type().clone(), true)),
     ];
     let entries = StructArray::new(fs.into(), vec![keys, values], None);

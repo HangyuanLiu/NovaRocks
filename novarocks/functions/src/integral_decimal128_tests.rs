@@ -86,7 +86,7 @@ fn recipe(
 ) -> PreparedCastRecipe {
     PreparedCastRecipe::try_new(
         CastOperation::Carrier,
-        &FunctionValueType::new(dtype.clone(), true),
+        &FunctionValueType::from_legacy_declared_projection(dtype.clone(), true),
         &FunctionValueType::new(DataType::Decimal128(p, s), true),
         policy,
         allow,
@@ -102,13 +102,13 @@ fn compare(
     row: usize,
     physical: usize,
 ) {
-    let DataType::Decimal128(p, s) = recipe.result_type().data_type else {
+    let DataType::Decimal128(p, s) = recipe.result_type().data_type() else {
         unreachable!()
     };
     let expected = evaluate_legacy(
         &array.slice(physical, 1),
-        p,
-        s,
+        *p,
+        *s,
         recipe.policy(),
         recipe.allow_throw_exception(),
     );
@@ -202,7 +202,7 @@ fn integral_decimal128_recipe_exact_column_slice_selected_scalar_and_pool_ordina
         let scalar = input(&dtype, vec![Some(71)]);
         compare(&r, &scalar, EvaluatedArgument::Scalar(&scalar), 8, 777, 0);
         let backing = input(&dtype, vec![None, Some(71), Some(99)]);
-        let ty = FunctionValueType::new(dtype.clone(), true);
+        let ty = FunctionValueType::from_legacy_declared_projection(dtype.clone(), true);
         let pool = ConstantPool::try_new(
             Arc::new(ty.try_to_field("original-integral-pool").unwrap()),
             ty,
@@ -250,7 +250,8 @@ fn integral_decimal128_recipe_own_null_exact_policy_effects_and_named_error_only
             DecimalOverflowPolicy::ReportError,
         ] {
             for allow in [false, true] {
-                let source = FunctionValueType::new(dtype.clone(), false);
+                let source =
+                    FunctionValueType::from_legacy_declared_projection(dtype.clone(), false);
                 let target = FunctionValueType::new(DataType::Decimal128(4, 0), false);
                 let out = PreparedCastRecipe::try_new(
                     CastOperation::Carrier,
@@ -280,7 +281,7 @@ fn integral_decimal128_recipe_own_null_exact_policy_effects_and_named_error_only
                 assert_eq!(
                     crate::carrier_cast_can_produce_null_with_policy(
                         &dtype,
-                        &target.data_type,
+                        target.data_type(),
                         policy,
                         allow
                     ),
@@ -292,7 +293,7 @@ fn integral_decimal128_recipe_own_null_exact_policy_effects_and_named_error_only
             assert!(matches!(
                 PreparedCastRecipe::try_new(
                     CastOperation::Carrier,
-                    &FunctionValueType::new(dtype.clone(), true),
+                    &FunctionValueType::from_legacy_declared_projection(dtype.clone(), true),
                     &FunctionValueType::new(DataType::Decimal128(38, scale), true),
                     DecimalOverflowPolicy::OutputNull,
                     false,
@@ -416,7 +417,7 @@ fn integral_decimal128_preparation_every_callback_preserves_three_compile_causes
         DataType::Int32,
         DataType::Int64,
     ] {
-        let source = FunctionValueType::new(dtype, true);
+        let source = FunctionValueType::from_legacy_declared_projection(dtype, true);
         let target = FunctionValueType::new(DataType::Decimal128(4, 0), true);
         let prepare = |control: &CompileRefusal| {
             PreparedCastRecipe::try_new(

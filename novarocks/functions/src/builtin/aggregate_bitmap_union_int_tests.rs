@@ -177,7 +177,12 @@ fn kernel(name: &str, source: FunctionValueType, phase: AggregateKernelPhase) ->
     };
     let parameters = SemanticParameters::try_new([]).unwrap();
     let uses = [Some(ExpressionUseId::new(332))];
-    let state_type = FunctionValueType::new(DataType::Binary, true);
+    let state_type = FunctionValueType::try_with_logical_type(
+        DataType::Binary,
+        true,
+        novarocks_type_contract::ValueLogicalType::Bitmap,
+    )
+    .unwrap();
     let state_context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(333),
         domain: EvaluationDomainId::new(20),
@@ -227,10 +232,10 @@ fn kernel(name: &str, source: FunctionValueType, phase: AggregateKernelPhase) ->
     BitmapKernel {
         contract: handle.contract().clone(),
         projection: match &handle.contract().call().selected().result_type {
-            FunctionResultType::Scalar(ty) if ty.data_type == DataType::Int64 => {
+            FunctionResultType::Scalar(ty) if ty.data_type() == &DataType::Int64 => {
                 BitmapResult::Cardinality
             }
-            FunctionResultType::Scalar(ty) if ty.data_type == DataType::Binary => {
+            FunctionResultType::Scalar(ty) if ty.data_type() == &DataType::Binary => {
                 BitmapResult::Encoded
             }
             _ => panic!("original bitmap result author"),
@@ -379,7 +384,7 @@ fn bitmap_union_int_owner_full_carriers_nominals_and_null_group_contract() {
     macro_rules! integers {
         ($array:ty,$dtype:expr) => {
             sources.push((
-                FunctionValueType::new($dtype, true),
+                FunctionValueType::from_legacy_declared_projection($dtype, true),
                 Arc::new(<$array>::from(vec![Some(1), None, Some(1), Some(7)])),
             ));
         };
@@ -432,7 +437,12 @@ fn bitmap_union_int_owner_full_carriers_nominals_and_null_group_contract() {
         Some(b"7".as_slice()),
     ])) as ArrayRef;
     sources.push((
-        FunctionValueType::new(DataType::Binary, true),
+        FunctionValueType::try_with_logical_type(
+            DataType::Binary,
+            true,
+            novarocks_type_contract::ValueLogicalType::Bitmap,
+        )
+        .unwrap(),
         small.clone(),
     ));
     sources.push((
@@ -543,7 +553,12 @@ fn control_run(control: &Control) -> Result<(), EvaluationFailure> {
     let host = Arc::new(Host::default());
     let mut c = make(
         AggregateKernelPhase::Single,
-        FunctionValueType::new(DataType::Binary, true),
+        FunctionValueType::try_with_logical_type(
+            DataType::Binary,
+            true,
+            novarocks_type_contract::ValueLogicalType::Bitmap,
+        )
+        .unwrap(),
         host.clone(),
         1,
     );
@@ -599,7 +614,12 @@ fn bitmap_union_int_owner_all_tracked_and_opaque_host_refusals_preserve_origin_a
             let host = Arc::new(Host::default());
             let mut c = make(
                 AggregateKernelPhase::Single,
-                FunctionValueType::new(DataType::Binary, true),
+                FunctionValueType::try_with_logical_type(
+                    DataType::Binary,
+                    true,
+                    novarocks_type_contract::ValueLogicalType::Bitmap,
+                )
+                .unwrap(),
                 host.clone(),
                 1,
             );
@@ -720,7 +740,7 @@ fn bitmap_union_int_owner_original_profile_admission_and_compile_three_causes() 
         ),
     ] {
         let args = [FunctionArgument::Value {
-            value_type: FunctionValueType::new(dtype, true),
+            value_type: FunctionValueType::from_legacy_declared_projection(dtype, true),
             constant: None,
         }];
         let request = FunctionBindingRequest {
@@ -780,7 +800,12 @@ fn bitmap_union_int_owner_nonnull_empty_bitmap_is_zero_count_and_one_byte_state(
     let host = Arc::new(Host::default());
     let mut c = make(
         AggregateKernelPhase::Partial,
-        FunctionValueType::new(DataType::Binary, true),
+        FunctionValueType::try_with_logical_type(
+            DataType::Binary,
+            true,
+            novarocks_type_contract::ValueLogicalType::Bitmap,
+        )
+        .unwrap(),
         host.clone(),
         2,
     );
@@ -805,7 +830,12 @@ fn bitmap_union_int_owner_nonnull_empty_bitmap_is_zero_count_and_one_byte_state(
     );
     let mut f = make(
         AggregateKernelPhase::Final,
-        FunctionValueType::new(DataType::Binary, true),
+        FunctionValueType::try_with_logical_type(
+            DataType::Binary,
+            true,
+            novarocks_type_contract::ValueLogicalType::Bitmap,
+        )
+        .unwrap(),
         host.clone(),
         2,
     );
@@ -1148,7 +1178,7 @@ fn bitmap_agg_owner_original_profile_admission_and_compile_three_causes() {
         ),
     ] {
         let args = [FunctionArgument::Value {
-            value_type: FunctionValueType::new(dtype, true),
+            value_type: FunctionValueType::from_legacy_declared_projection(dtype, true),
             constant: None,
         }];
         let request = FunctionBindingRequest {

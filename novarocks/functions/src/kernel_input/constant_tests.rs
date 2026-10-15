@@ -91,7 +91,24 @@ fn policy() -> ConstantPolicy {
 fn pool(array: ArrayRef, nullable: bool, logical: ValueLogicalType) -> ConstantPool {
     let ty = FunctionValueType::try_with_logical_type(array.data_type().clone(), nullable, logical)
         .unwrap();
-    let field = Arc::new(ty.try_to_field("constant-input").unwrap());
+    pool_for_binding(array, ty)
+}
+fn pool_for_binding(array: ArrayRef, ty: FunctionValueType) -> ConstantPool {
+    let array = if matches!(
+        array.data_type(),
+        DataType::Dictionary(_, _) | DataType::RunEndEncoded(_, _)
+    ) {
+        // Pure constant backing can be encoded; generic kernels still require
+        // an explicit installed access path before consuming this carrier.
+        array
+    } else {
+        crate::test_value_ingress::array_for_binding(&array, &ty).unwrap()
+    };
+    let field = Arc::new(
+        ty.try_to_field("constant-input")
+            .unwrap()
+            .with_data_type(array.data_type().clone()),
+    );
     ConstantPool::try_new(
         field,
         ty,
@@ -156,10 +173,10 @@ fn constant_nullability_widens_only_from_the_checked_source() {
     );
     let value = p.value(2).unwrap();
     let nonnull = p.value_type().clone();
-    let nullable = FunctionValueType {
-        nullable: true,
-        ..nonnull.clone()
-    };
+    let nullable = nonnull
+        .clone()
+        .with_nullable(true)
+        .expect("valid function nullability declaration");
     for expected in [&nonnull, &nullable] {
         validate(&value, Selection::all(4), expected, &Control::default()).unwrap();
     }
@@ -196,7 +213,7 @@ fn typed_null_and_empty_selection_keep_the_complete_logical_identity() {
         ValueLogicalType::Json,
     );
     let value = p.value(1).unwrap();
-    assert_eq!(value.value_type().logical_type, ValueLogicalType::Json);
+    assert_eq!(value.value_type().logical_type(), ValueLogicalType::Json);
     assert_eq!(value.try_utf8().unwrap(), None);
     validate(
         &value,
@@ -262,8 +279,8 @@ fn equal_arrow_carriers_do_not_exchange_json_variant_and_physical_roots() {
                 Err(KernelFailure::InvalidProgram(_))
             ));
             assert_eq!(
-                value.value_type().logical_type,
-                source.value_type().logical_type
+                value.value_type().logical_type(),
+                source.value_type().logical_type()
             );
         }
     }
@@ -287,7 +304,30 @@ fn nested_field_metadata_logical_identity_and_nullability_are_exact() {
         ]))],
         None,
     );
-    let p = pool(Arc::new(array), false, ValueLogicalType::Physical);
+    let array: ArrayRef = Arc::new(array);
+    let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+    let nominal =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+            .unwrap();
+    let semantic = novarocks_type_contract::ValueTypeRef::try_new(
+        novarocks_type_contract::ValueKind::Struct(
+            vec![novarocks_type_contract::ValueField::new(
+                "payload",
+                nominal.value_type().clone(),
+                storage.clone(),
+            )]
+            .into(),
+        ),
+        false,
+        storage.clone(),
+    )
+    .unwrap();
+    let binding = FunctionValueType::try_from_value(
+        semantic,
+        novarocks_type_contract::ValueLayout::try_new(array.data_type(), storage).unwrap(),
+    )
+    .unwrap();
+    let p = pool_for_binding(array, binding);
     let value = p.value(2).unwrap();
     validate(
         &value,
@@ -300,13 +340,25 @@ fn nested_field_metadata_logical_identity_and_nullability_are_exact() {
     metadata.insert("provider.field-id".into(), "18".into());
     let mut physical_metadata = child.metadata().clone();
     physical_metadata.remove("nr_logical_type");
+    let same_semantics = FunctionValueType::from_legacy_declared_projection(
+        DataType::Struct(vec![Arc::new(child.clone().with_metadata(metadata))].into()),
+        false,
+    );
+    validate(
+        &value,
+        Selection::all(2),
+        &same_semantics,
+        &Control::default(),
+    )
+    .unwrap();
     for wrong_child in [
-        child.clone().with_metadata(metadata),
         child.clone().with_metadata(physical_metadata),
         child.with_nullable(true),
     ] {
-        let wrong =
-            FunctionValueType::new(DataType::Struct(vec![Arc::new(wrong_child)].into()), false);
+        let wrong = FunctionValueType::from_legacy_declared_projection(
+            DataType::Struct(vec![Arc::new(wrong_child)].into()),
+            false,
+        );
         assert!(matches!(
             validate(&value, Selection::all(2), &wrong, &Control::default()),
             Err(KernelFailure::InvalidProgram(_))
@@ -332,7 +384,13 @@ fn dictionary_ordinal_is_a_pool_row_and_keeps_encoded_backing() {
         .unwrap();
     assert_eq!(dictionary.key(argument.value_row(2, 10)), Some(1));
     assert!(Arc::ptr_eq(argument.array(), p.array()));
-    validate(&value, selection, p.value_type(), &Control::default()).unwrap();
+    assert!(
+        matches!(
+            validate(&value, selection, p.value_type(), &Control::default()),
+            Err(KernelFailure::InvalidProgram(_))
+        ),
+        "constant backing does not mint installed dictionary access"
+    );
     let wrong = FunctionValueType::new(DataType::Utf8, false);
     assert!(matches!(
         validate(&value, selection, &wrong, &Control::default()),
@@ -367,14 +425,16 @@ fn run_end_ordinal_uses_logical_address_without_slicing_or_expanding() {
         77
     );
     assert!(Arc::ptr_eq(argument.array(), p.array()));
-    validate(
-        &value,
-        Selection::all(3),
-        p.value_type(),
-        &Control::default(),
-    )
-    .unwrap();
-    let DataType::RunEndEncoded(ends, values) = &p.value_type().data_type else {
+    assert!(matches!(
+        validate(
+            &value,
+            Selection::all(3),
+            p.value_type(),
+            &Control::default(),
+        ),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
+    let DataType::RunEndEncoded(ends, values) = p.array().data_type() else {
         panic!("run carrier");
     };
     let wrong = FunctionValueType::new(
@@ -413,7 +473,7 @@ fn constant_string_and_integer_reads_keep_seed_carriers_without_numeric_casts() 
     .value(1)
     .unwrap();
     assert_eq!(signed.try_i64().unwrap(), Some(-7));
-    assert_eq!(signed.value_type().data_type, DataType::Int8);
+    assert_eq!(signed.value_type().data_type().clone(), DataType::Int8);
     assert!(signed.try_utf8().is_err());
     let unsigned = pool(
         Arc::new(UInt64Array::from(vec![0, u64::MAX, 3])),
@@ -426,16 +486,11 @@ fn constant_string_and_integer_reads_keep_seed_carriers_without_numeric_casts() 
     assert!(unsigned.try_i64().is_err());
 }
 
-fn wide_metadata_value() -> ConstantValue {
-    let fields = (0..20)
-        .map(|index| {
-            Arc::new(
-                Field::new(format!("field-{index}"), DataType::Int32, false)
-                    .with_metadata([("provider.payload".into(), "m".repeat(16 * 1024))].into()),
-            )
-        })
+fn wide_immutable_binding_value() -> ConstantValue {
+    let fields = (0..320)
+        .map(|index| Arc::new(Field::new(format!("field-{index}"), DataType::Int32, false)))
         .collect::<Vec<_>>();
-    let columns = (0..20)
+    let columns = (0..320)
         .map(|index| Arc::new(Int32Array::from(vec![index])) as ArrayRef)
         .collect();
     pool(
@@ -448,8 +503,8 @@ fn wide_metadata_value() -> ConstantValue {
 }
 
 #[test]
-fn actual_nested_metadata_walk_observes_256_work_and_success_completion() {
-    let value = wide_metadata_value();
+fn actual_complete_binding_walk_observes_256_work_and_success_completion() {
+    let value = wide_immutable_binding_value();
     let control = Control::default();
     validate(&value, Selection::all(1), value.value_type(), &control).unwrap();
     let checks = control.checks();
@@ -461,7 +516,7 @@ fn actual_nested_metadata_walk_observes_256_work_and_success_completion() {
 
 #[test]
 fn entry_256_and_final_failures_keep_all_three_outer_control_categories() {
-    let value = wide_metadata_value();
+    let value = wide_immutable_binding_value();
     let good = Control::default();
     validate(&value, Selection::all(1), value.value_type(), &good).unwrap();
     let checks = good.checks();
@@ -480,7 +535,10 @@ fn entry_256_and_final_failures_keep_all_three_outer_control_categories() {
                 Err(error.clone())
             );
             assert_eq!(control.checks(), checks[..=failure_at]);
-            assert_eq!(value.value_type().logical_type, ValueLogicalType::Physical);
+            assert_eq!(
+                value.value_type().logical_type(),
+                ValueLogicalType::Physical
+            );
         }
     }
 }

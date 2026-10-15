@@ -22,14 +22,46 @@ use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::pure_differential::aggregate_count_generic_diff_tests::{arrays, pool};
 use crate::exec::expr::{ExprArena, ExprNode};
 use arrow::array::Int64Array;
+use arrow::datatypes::{Field, TimeUnit, UnionFields};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use novarocks_functions as f;
+use novarocks_type_contract::FunctionValueType;
+// Complete independent declarations for the original generator's ordered
+// physical profiles. No observed value, Field metadata or Array dtype authors
+// a nominal domain. The run-end input has the same declared Int64 value type.
+fn physical_count_declarations() -> Vec<FunctionValueType> {
+    vec![
+        DataType::Boolean,
+        DataType::UInt64,
+        DataType::Float64,
+        DataType::Decimal128(30, 4),
+        DataType::Date32,
+        DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("a-long-unknown-count-timezone".into()),
+        ),
+        DataType::Binary,
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        DataType::Struct(vec![Arc::new(Field::new("v", DataType::Int64, true))].into()),
+        DataType::Union(
+            UnionFields::try_new([0], [Field::new("v", DataType::Int64, true)]).unwrap(),
+            arrow::datatypes::UnionMode::Sparse,
+        ),
+        DataType::Int64,
+    ]
+    .into_iter()
+    .map(|layout| FunctionValueType::new(layout, true))
+    .collect()
+}
 #[test]
 fn pure_differential_count_over_original_any_generic_physical_carriers() {
-    for array in arrays() {
+    let declarations = physical_count_declarations();
+    let sources = arrays();
+    assert_eq!(declarations.len(), sources.len());
+    for (array, declaration) in sources.into_iter().zip(declarations) {
         for source in [array.clone(), array.slice(1, 3), array.slice(2, 0)] {
             let n = source.len();
-            compare(Some(source), n);
+            compare(Some(source), Some(declaration.clone()), n);
         }
     }
 }
@@ -40,9 +72,9 @@ fn pure_differential_count_over_original_any_nonzero_constant_pool_ordinal() {
             let value = pool(source.clone(), ordinal);
             for n in [0, 1, 5, 319] {
                 let mut arena = ExprArena::default();
-                let id = arena.push_typed(
+                let id = arena.push_value_typed(
                     ExprNode::Constant(value.clone()),
-                    value.value_type().data_type.clone(),
+                    value.value_type().clone(),
                 );
                 let batch = RecordBatch::try_new_with_options(
                     Arc::new(arrow::datatypes::Schema::empty()),
@@ -66,7 +98,7 @@ fn pure_differential_count_over_original_any_nonzero_constant_pool_ordinal() {
                         PartitionWindowContext::new(&partitions, &[], window.as_ref()).unwrap();
                     let old = compute_count(&[materialized.clone()], &ctx, n).unwrap();
                     let old = old.as_any().downcast_ref::<Int64Array>().unwrap();
-                    let prepared = prepare(Some(&materialized), running, false);
+                    let prepared = prepare(Some(value.value_type()), running, false);
                     if n == 0 {
                         continue;
                     }

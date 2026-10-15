@@ -1018,8 +1018,8 @@ mod data_stream_sink_hash_partition {
                 let indices = arrow::array::UInt32Array::from(rows.clone());
                 let indices_ref = Arc::new(indices) as arrow::array::ArrayRef;
 
-                let mut new_columns = Vec::with_capacity(chunk.batch.num_columns());
-                for col in chunk.batch.columns() {
+                let mut new_columns = Vec::with_capacity(chunk.record_batch().num_columns());
+                for col in chunk.record_batch().columns() {
                     let taken = take(col.as_ref(), &indices_ref, None)
                         .map_err(|e| format!("Arrow take failed: {}", e))?;
                     new_columns.push(taken);
@@ -1265,6 +1265,8 @@ impl OperatorFactory for DataStreamSinkFactory {
             end_of_stream_sent: AtomicBool::new(false),
             send_tracker: ExchangeSendTracker::new(),
             send_observable,
+            construction_factory: None,
+            prepared: false,
             error_state: None,
             finish_state: Arc::clone(&self.finish_state),
             profile_initialized: false,
@@ -1363,9 +1365,22 @@ struct DataStreamSinkOperator {
     exchange_queue: Option<Arc<crate::runtime::fragment::io::exchange_queue::ExchangeSendQueue>>,
     edge_gates: Option<Arc<ExchangeEdgeGates>>,
     compiled_partition: Option<CompiledPartitionState>,
+    construction_factory:
+        Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    prepared: bool,
 }
 
 impl Operator for DataStreamSinkOperator {
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.construction_factory = Some(factory);
+    }
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -1430,6 +1445,13 @@ impl Operator for DataStreamSinkOperator {
     }
 
     fn prepare(&mut self) -> ExecutionResult<()> {
+        if self.prepared {
+            return Ok(());
+        }
+        self.construction_factory
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        self.prepared = true;
         // Align with StarRocks: count actual sink drivers prepared, not planned DOP.
         self.finish_state.register_driver();
         // The edge opening is the only event that can unpark this driver once
@@ -1842,7 +1864,7 @@ impl DataStreamSinkOperator {
             .ok_or("compiled partition key instances are absent")?;
         let mut arrays = Vec::with_capacity(instances.len());
         for (instance, site) in instances.iter_mut().zip(&state.keys.sites) {
-            let array = evaluate_all(instance, *site, &chunk.batch, &control)?;
+            let array = evaluate_all(instance, *site, &chunk.record_batch(), &control)?;
             // Same refusal as the legacy sink's partition-key type check.
             if matches!(array.data_type(), DataType::LargeBinary) {
                 return Err(
@@ -1902,8 +1924,9 @@ impl DataStreamSinkOperator {
                         let indices = arrow::array::UInt32Array::from(row_indices.clone());
                         let indices_ref = Arc::new(indices) as arrow::array::ArrayRef;
 
-                        let mut new_columns = Vec::with_capacity(chunk.batch.num_columns());
-                        for col in chunk.batch.columns() {
+                        let mut new_columns =
+                            Vec::with_capacity(chunk.record_batch().num_columns());
+                        for col in chunk.record_batch().columns() {
                             let taken = arrow::compute::take(col.as_ref(), &indices_ref, None)
                                 .map_err(|e| format!("Arrow take failed: {}", e))?;
                             new_columns.push(taken);
@@ -2073,7 +2096,7 @@ impl DataStreamSinkOperator {
         chunks: &[Chunk],
         eos: bool,
         allow_overflow: bool,
-    ) -> Result<PayloadEnqueue, String> {
+    ) -> ExecutionResult<PayloadEnqueue> {
         use tracing::debug;
 
         self.init_profile_if_needed();
@@ -2093,24 +2116,48 @@ impl DataStreamSinkOperator {
             sequence
         );
 
+        let factory = self
+            .construction_factory
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        let projection_owner;
         let projected_storage;
         let chunks = if self.input.output_columns.is_empty() || chunks.is_empty() {
+            projection_owner = None;
             chunks
         } else {
-            projected_storage = chunks
-                .iter()
-                .map(|c| project_chunk_by_slot_ids(c, &self.input.output_columns))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
+            let source = chunks.first().expect("nonempty branch checked");
+            let owner = factory.begin_input_construction(source)?;
+            owner.request(std::alloc::Layout::array::<Chunk>(chunks.len()).map_err(|_| crate::exec::pipeline::operator::ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
+            let mut projected = Vec::with_capacity(chunks.len());
+            for chunk in chunks {
+                projected.push(project_chunk_by_slot_ids_with_creation(
+                    chunk,
+                    &self.input.output_columns,
+                    factory.as_ref(),
+                )?);
+            }
+            projection_owner = Some(owner);
+            projected_storage = projected;
             projected_storage.as_slice()
         };
 
+        let _projection_owner = projection_owner.as_ref();
         let be_number = self.be_number;
         // Delivery is asynchronous, so every data payload must be self-describing.
         let include_slot_ids = Self::should_include_wire_meta(chunks.is_empty());
         let encode_start = std::time::Instant::now();
-        let payload = exchange::encode_chunks(chunks, include_slot_ids)
-            .map_err(|e| format!("failed to encode chunks: {e}"))?;
+        let error_state = self
+            .error_state
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        let control = RuntimeKernelControl::new(error_state.clone());
+        let payload = exchange::encode_chunks_with_creation(
+            chunks,
+            include_slot_ids,
+            factory.as_ref(),
+            &control,
+        )?;
         let encode_ns = encode_start.elapsed().as_nanos();
         let payload_bytes = payload.len();
         let payload_capacity_bytes = payload.capacity().max(payload_bytes);
@@ -2185,7 +2232,7 @@ impl DataStreamSinkOperator {
         self.pending_payloads_per_dest = (0..dest_count).map(|_| None).collect();
     }
 
-    fn buffer_chunk(&mut self, chunk: Chunk) -> Result<(), String> {
+    fn buffer_chunk(&mut self, chunk: Chunk) -> ExecutionResult<()> {
         self.buffer_chunk_with_keys(chunk, None)
     }
 
@@ -2193,7 +2240,7 @@ impl DataStreamSinkOperator {
         &mut self,
         chunk: Chunk,
         compiled_keys: Option<Vec<ArrayRef>>,
-    ) -> Result<(), String> {
+    ) -> ExecutionResult<()> {
         self.ensure_pending_buffers_initialized();
         let dests = self.destinations().to_vec();
         let per_dest_chunks = self.partition_chunk(&chunk, compiled_keys.as_deref())?;
@@ -2212,7 +2259,13 @@ impl DataStreamSinkOperator {
             // back together up to `max_transmit_batched_bytes` per gRPC
             // payload, so the slice size is a hard upper bound only.
             let max_chunk_bytes = OVERSIZED_CHUNK_SPLIT_TARGET_BYTES;
-            let mut chunks = split_oversized_chunks(chunks, max_chunk_bytes);
+            let factory = self
+                .construction_factory
+                .as_ref()
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+            let split =
+                split_oversized_chunks_with_creation(chunks, max_chunk_bytes, factory.as_ref())?;
+            let mut chunks = split.chunks;
             if let Some(tracker) = self.pending_chunks_mem_tracker.as_ref() {
                 for chunk in chunks.iter_mut() {
                     chunk.transfer_to(tracker);
@@ -2220,7 +2273,7 @@ impl DataStreamSinkOperator {
             }
             let bytes = chunks
                 .iter()
-                .map(|c| c.batch.get_array_memory_size())
+                .map(|c| c.record_batch().get_array_memory_size())
                 .sum::<usize>();
             self.pending_per_dest[i].extend(chunks);
             self.pending_bytes_per_dest[i] = self.pending_bytes_per_dest[i].saturating_add(bytes);
@@ -2242,7 +2295,7 @@ impl DataStreamSinkOperator {
         let mut batch_bytes = 0usize;
         let mut first_schema: Option<crate::exec::chunk::ChunkSchemaRef> = None;
         while let Some(front) = pending.front() {
-            let chunk_bytes = front.batch.get_array_memory_size();
+            let chunk_bytes = front.record_batch().get_array_memory_size();
             if let Some(schema) = first_schema.as_ref()
                 && front.chunk_schema() != schema.as_ref()
             {
@@ -2274,7 +2327,7 @@ impl DataStreamSinkOperator {
         Ok((batch, batch_bytes))
     }
 
-    fn flush_pending(&mut self, force: bool, allow_overflow: bool) -> Result<(), String> {
+    fn flush_pending(&mut self, force: bool, allow_overflow: bool) -> ExecutionResult<()> {
         self.ensure_pending_buffers_initialized();
         let dests: Vec<FragmentDestination> = self.destinations().to_vec();
         for (i, dest) in dests.iter().enumerate() {
@@ -2353,7 +2406,7 @@ impl DataStreamSinkOperator {
     /// skipped here is skipped for a reason that is permanent (it is a pruned
     /// pseudo destination, or it withdrew), never because it is not ready yet.
     /// That is what makes it sound to latch "the seal is sent" on return.
-    fn send_eos(&mut self) -> Result<(), String> {
+    fn send_eos(&mut self) -> ExecutionResult<()> {
         self.ensure_pending_buffers_initialized();
         let dests: Vec<FragmentDestination> = self.destinations().to_vec();
         let mut sealed = 0_usize;
@@ -2384,14 +2437,15 @@ impl DataStreamSinkOperator {
                         "exchange send EOS reached destination {} whose edge is still awaiting \
                          permission",
                         dest.finst_id()
-                    ));
+                    )
+                    .into());
                 }
                 None | Some(EdgeSendState::Open) => {}
             }
             match self.transmit_partition(i, dest, &[], true, true)? {
                 PayloadEnqueue::Enqueued | PayloadEnqueue::Discarded => sealed += 1,
                 PayloadEnqueue::NoCapacity(_) => {
-                    return Err("exchange send EOS unexpectedly blocked".to_string());
+                    return Err("exchange send EOS unexpectedly blocked".to_string().into());
                 }
             }
         }
@@ -2483,6 +2537,9 @@ impl ProcessorOperator for DataStreamSinkOperator {
     }
 
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+        if !self.prepared {
+            return Err(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into());
+        }
         if self.aborting.load(Ordering::Acquire) {
             return Err("exchange sink was cancelled".to_string().into());
         }
@@ -2694,13 +2751,21 @@ const OVERSIZED_CHUNK_SPLIT_TARGET_BYTES: usize = 16 * 1024 * 1024;
 /// target. The split row count is derived from the chunk's average per-row
 /// memory footprint, so wide rows yield smaller slices and narrow rows yield
 /// larger ones. Chunks already under the target are returned untouched.
-fn split_oversized_chunks(chunks: Vec<Chunk>, target_bytes: usize) -> Vec<Chunk> {
+fn split_oversized_chunks_core<E>(
+    chunks: Vec<Chunk>,
+    target_bytes: usize,
+    mut initial: impl FnMut(usize) -> Result<(), E>,
+    mut before_push: impl FnMut(&Vec<Chunk>) -> Result<(), E>,
+    mut measure: impl FnMut(&Chunk) -> Result<(usize, usize), E>,
+    mut slice: impl FnMut(&Chunk, usize, usize) -> Result<Chunk, E>,
+) -> Result<Vec<Chunk>, E> {
     let target_bytes = target_bytes.max(1);
+    initial(chunks.len())?;
     let mut out = Vec::with_capacity(chunks.len());
     for chunk in chunks {
-        let bytes = chunk.batch.get_array_memory_size();
-        let rows = chunk.batch.num_rows();
+        let (bytes, rows) = measure(&chunk)?;
         if rows <= 1 || bytes <= target_bytes {
+            before_push(&out)?;
             out.push(chunk);
             continue;
         }
@@ -2713,13 +2778,166 @@ fn split_oversized_chunks(chunks: Vec<Chunk>, target_bytes: usize) -> Vec<Chunk>
         let mut offset = 0;
         while offset < rows {
             let len = rows_per_slice.min(rows - offset);
-            out.push(chunk.slice(offset, len));
+            let value = slice(&chunk, offset, len)?;
+            before_push(&out)?;
+            out.push(value);
             offset += len;
         }
     }
-    out
+    Ok(out)
 }
 
+fn project_chunk_by_slot_ids_with_creation(
+    chunk: &Chunk,
+    slot_ids: &[SlotId],
+    factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+) -> ExecutionResult<Chunk> {
+    use crate::exec::chunk::{ArrayNormalizationStep, ChunkSchema, ChunkSlotSchema};
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
+    if slot_ids.is_empty() {
+        return Ok(chunk.clone());
+    }
+    let owner = factory.begin_input_construction(chunk)?;
+    let storage = chunk.source_storage_lifetime_observed(owner.storage_lifetime(), |layout| {
+        owner.request(layout)
+    })?;
+    owner.request(
+        std::alloc::Layout::array::<ChunkSlotSchema>(slot_ids.len())
+            .map_err(|_| LayoutResourceError::Arithmetic)
+            .map_err(ConstructionFailure::from)?,
+    )?;
+    let mut slots = Vec::with_capacity(slot_ids.len());
+    owner.request(
+        std::alloc::Layout::array::<ArrayRef>(slot_ids.len())
+            .map_err(|_| LayoutResourceError::Arithmetic)
+            .map_err(ConstructionFailure::from)?,
+    )?;
+    let mut columns = Vec::with_capacity(slot_ids.len());
+    for slot_id in slot_ids {
+        owner.observe(
+            0,
+            &[],
+            ArrayNormalizationStep::InspectConstructionWork { units: 1 },
+        )?;
+        let index = chunk
+            .chunk_schema()
+            .index_of(*slot_id)
+            .ok_or_else(|| format!("output_columns slot id {slot_id} missing from chunk schema"))?;
+        slots.push(chunk.chunk_schema().slots()[index].clone());
+        columns.push(chunk.columns()[index].clone());
+    }
+    let schema = ChunkSchema::try_new_typed_observed::<ConstructionFailure>(
+        slots,
+        storage.clone(),
+        |layout| owner.request(layout),
+        |units| {
+            owner.observe(
+                0,
+                &[],
+                ArrayNormalizationStep::InspectConstructionWork { units },
+            )
+        },
+    )?;
+    owner.request(
+        arc_layout(std::alloc::Layout::new::<ChunkSchema>()).map_err(ConstructionFailure::from)?,
+    )?;
+    Ok(Chunk::try_new_typed_with_columns_owned_observed::<
+        ConstructionFailure,
+        _,
+    >(
+        Arc::new(schema),
+        columns,
+        chunk.len(),
+        storage,
+        |step| owner.observe(0, &[], step),
+    )?)
+}
+
+#[cfg(test)]
+fn split_oversized_chunks(chunks: Vec<Chunk>, target_bytes: usize) -> Vec<Chunk> {
+    // Genuine legacy algorithm reference, not a production creator fallback.
+    split_oversized_chunks_core::<std::convert::Infallible>(
+        chunks,
+        target_bytes,
+        |_| Ok(()),
+        |_| Ok(()),
+        |chunk| Ok((chunk.record_batch().get_array_memory_size(), chunk.len())),
+        |chunk, offset, length| Ok(chunk.slice(offset, length)),
+    )
+    .unwrap()
+}
+struct SplitChunkHeaders {
+    chunks: Vec<Chunk>,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+fn split_oversized_chunks_with_creation(
+    chunks: Vec<Chunk>,
+    target_bytes: usize,
+    factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+) -> ExecutionResult<SplitChunkHeaders> {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+    use novarocks_type_contract::{ControlResourceError, ValueTypeStorageLifetime};
+    let Some(first) = chunks.first() else {
+        return Ok(SplitChunkHeaders {
+            chunks,
+            _storage: ValueTypeStorageLifetime::pure(),
+        });
+    };
+    let headers = factory.begin_input_construction(first)?;
+    let result =
+        split_oversized_chunks_core::<ExecutionFailure>(
+            chunks,
+            target_bytes,
+            |count| {
+                headers.request(std::alloc::Layout::array::<Chunk>(count).map_err(|_| {
+                    ConstructionFailure::Resource(LayoutResourceError::Arithmetic)
+                })?)?;
+                Ok(())
+            },
+            |out| {
+                let growth = novarocks_type_contract::owned_resources::vec::push_growth(out)
+                    .map_err(|error| -> ExecutionFailure {
+                        match error {
+                            ControlResourceError::Control(cause) => {
+                                ConstructionFailure::Control(cause).into()
+                            }
+                            ControlResourceError::SourceModel(message) => {
+                                ConstructionFailure::InvalidSource(message.into()).into()
+                            }
+                        }
+                    })?;
+                if let Some(layout) = growth.requested_backing {
+                    headers.request(layout)?;
+                }
+                Ok(())
+            },
+            |chunk| {
+                factory.observe_input_work(0)?;
+                // Existing estimate selects the original row split; it is never an
+                // allocation invoice, payload grant or retained-byte measurement.
+                let shape = (chunk.record_batch().get_array_memory_size(), chunk.len());
+                factory.observe_input_work(0)?;
+                Ok(shape)
+            },
+            |chunk, offset, length| {
+                let owner = factory.begin_input_construction(chunk)?;
+                Ok(chunk.slice_typed_observed::<ConstructionFailure, _>(
+                    offset,
+                    length,
+                    owner.storage_lifetime(),
+                    |step| owner.observe(0, &[], step),
+                )?)
+            },
+        )?;
+    Ok(SplitChunkHeaders {
+        chunks: result,
+        _storage: headers.storage_lifetime(),
+    })
+}
+
+#[cfg(test)]
 fn project_chunk_by_slot_ids(chunk: &Chunk, slot_ids: &[SlotId]) -> Result<Chunk, String> {
     if slot_ids.is_empty() || chunk.is_empty() {
         return Ok(chunk.clone());
@@ -2780,7 +2998,6 @@ mod tests {
         Array, ArrayRef, BinaryArray, DictionaryArray, Int32Array, LargeStringArray, StringArray,
     };
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
-    use arrow::record_batch::RecordBatchOptions;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -2835,7 +3052,57 @@ mod tests {
             )),
             edge_gates: None,
             compiled_partition: None,
+            construction_factory: None,
+            prepared: false,
         }
+    }
+
+    fn prepare_test_operator(op: &mut DataStreamSinkOperator) {
+        let error = op
+            .error_state
+            .get_or_insert_with(|| Arc::new(RuntimeErrorState::default()))
+            .clone();
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("prepared exchange sink fixture"),
+            error,
+        ).expect("actual sink creator");
+        op.set_construction_factory(factory);
+        op.prepare().expect("actual sink preparation");
+    }
+
+    fn typed_int64_chunk(rows: usize) -> Chunk {
+        use novarocks_type_contract::{
+            TypedValueBinding, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+        };
+        let pure = ValueTypeStorageLifetime::pure();
+        let value =
+            ValueTypeRef::try_new(ValueKind::Scalar(DataType::Int64), false, pure.clone()).unwrap();
+        let binding = TypedValueBinding::try_new(
+            value,
+            ValueLayout::try_new(&DataType::Int64, pure.clone()).unwrap(),
+        )
+        .unwrap();
+        let slot = ChunkSlotSchema::try_new_typed(
+            SlotId::new(1),
+            Arc::new(Field::new("v", DataType::Int64, false)),
+            binding,
+            None,
+            pure.clone(),
+        )
+        .unwrap();
+        let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap());
+        // Explicit pure frozen source author; the runtime sender derives new
+        // headers only through its genuinely installed creator above.
+        Chunk::try_new_typed_with_columns_observed::<String, _>(
+            schema,
+            vec![Arc::new(arrow::array::Int64Array::from_iter_values(
+                0..rows as i64,
+            ))],
+            rows,
+            |_| Ok(()),
+        )
+        .unwrap()
     }
 
     struct BlockingEosTransmitter {
@@ -2874,7 +3141,7 @@ mod tests {
         sink.transmitter = Arc::clone(&transmitter) as Arc<dyn ExchangeFrameTransmitter>;
         sink.input.destinations = vec![make_test_destination()];
         sink.error_state = Some(Arc::new(RuntimeErrorState::default()));
-        sink.finish_state.register_driver();
+        prepare_test_operator(&mut sink);
         (sink, transmitter, entered_rx, release_tx)
     }
 
@@ -3069,14 +3336,20 @@ mod tests {
     }
 
     fn zero_column_chunk_with_rows(row_count: usize) -> Chunk {
-        let options = RecordBatchOptions::new().with_row_count(Some(row_count));
-        let batch = arrow::array::RecordBatch::try_new_with_options(
-            Arc::new(arrow::datatypes::Schema::empty()),
-            vec![],
-            &options,
+        let schema = Arc::new(
+            ChunkSchema::try_new_typed(
+                Vec::new(),
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+        );
+        Chunk::try_new_typed_with_columns_observed::<String, _>(
+            schema,
+            Vec::new(),
+            row_count,
+            |_| Ok(()),
         )
-        .expect("zero-column batch");
-        Chunk::new_with_chunk_schema(batch, Arc::new(crate::exec::chunk::ChunkSchema::empty()))
+        .expect("explicit count-only source")
     }
 
     #[test]
@@ -3127,6 +3400,7 @@ mod tests {
         let mut op = make_test_operator();
         op.input.destinations = vec![make_test_destination()];
 
+        prepare_test_operator(&mut op);
         op.buffer_chunk(zero_column_chunk_with_rows(1))
             .expect("buffer chunk");
 
@@ -3236,9 +3510,10 @@ mod tests {
         let dest = make_test_destination();
         gate_destinations(&mut op, vec![dest.clone()]);
         op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        prepare_test_operator(&mut op);
         open_edges(&op, &[edge_id(1)]);
 
-        op.buffer_chunk(int64_chunk(8)).expect("buffer chunk");
+        op.buffer_chunk(typed_int64_chunk(8)).expect("buffer chunk");
         assert!(op.has_pending_chunks());
 
         cancel_edge(&op, edge_id(1));
@@ -3270,9 +3545,10 @@ mod tests {
         let healthy = destination_with_finst(2);
         gate_destinations(&mut op, vec![abandoned.clone(), healthy.clone()]);
         op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        prepare_test_operator(&mut op);
         open_edges(&op, &[edge_id(1), edge_id(2)]);
 
-        op.buffer_chunk(int64_chunk(8)).expect("buffer chunk");
+        op.buffer_chunk(typed_int64_chunk(8)).expect("buffer chunk");
         assert_eq!(op.pending_per_dest.len(), 2);
         assert!(!op.pending_per_dest[0].is_empty() && !op.pending_per_dest[1].is_empty());
 
@@ -3310,9 +3586,10 @@ mod tests {
         let open = destination_with_finst(2);
         gate_destinations(&mut op, vec![closed, open]);
         op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        prepare_test_operator(&mut op);
         open_edges(&op, &[edge_id(2)]);
 
-        op.buffer_chunk(int64_chunk(8)).expect("buffer chunk");
+        op.buffer_chunk(typed_int64_chunk(8)).expect("buffer chunk");
         op.flush_pending(true, false).expect("flush pending");
 
         assert!(
@@ -3351,9 +3628,11 @@ mod tests {
         op.max_transmit_batched_bytes = 1;
         let state = RuntimeState::default();
 
+        prepare_test_operator(&mut op);
         let mut pushed = 0;
         while ProcessorOperator::need_input(&op) && pushed < 8 {
-            ProcessorOperator::push_chunk(&mut op, &state, int64_chunk(8)).expect("push chunk");
+            ProcessorOperator::push_chunk(&mut op, &state, typed_int64_chunk(8))
+                .expect("push chunk");
             pushed += 1;
         }
 
@@ -3398,7 +3677,8 @@ mod tests {
         let dest = make_test_destination();
         gate_destinations(&mut op, vec![dest]);
         op.error_state = Some(Arc::new(RuntimeErrorState::default()));
-        op.buffer_chunk(int64_chunk(8)).expect("buffer chunk");
+        prepare_test_operator(&mut op);
+        op.buffer_chunk(typed_int64_chunk(8)).expect("buffer chunk");
 
         op.flush_pending(true, true)
             .expect("the finishing drain parks a closed edge rather than failing");
@@ -3448,6 +3728,7 @@ mod tests {
         let dest = make_test_destination();
         gate_destinations(&mut op, vec![dest]);
         op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        prepare_test_operator(&mut op);
 
         assert!(
             !op.has_pending_data(),
@@ -3492,8 +3773,8 @@ mod tests {
         op.error_state = Some(Arc::new(RuntimeErrorState::default()));
         // One driver, so this operator is the one that completes the set and
         // therefore the one that owes the marker.
-        op.finish_state.register_driver();
         gate_destinations(&mut op, vec![make_test_destination()]);
+        prepare_test_operator(&mut op);
 
         // Nothing buffered: this producer's input drained before the frontend
         // decided the edge, which is the ordinary shape for a fragment
@@ -3551,8 +3832,8 @@ mod tests {
         let runtime = RuntimeState::default();
         let mut op = make_test_operator();
         op.error_state = Some(Arc::new(RuntimeErrorState::default()));
-        op.finish_state.register_driver();
         gate_destinations(&mut op, vec![make_test_destination()]);
+        prepare_test_operator(&mut op);
         open_edges(&op, &[edge_id(1)]);
 
         // Model the instant after a previously parked buffer drains, before
@@ -3586,8 +3867,6 @@ mod tests {
     fn retrying_set_finishing_while_an_edge_is_closed_does_not_consume_the_driver_set() {
         let state = Arc::new(DataStreamSinkFinishState::default());
         // Two drivers on one sink, both sharing the frozen finish state.
-        state.register_driver();
-        state.register_driver();
         let runtime = RuntimeState::default();
 
         let mut first = make_test_operator();
@@ -3600,6 +3879,8 @@ mod tests {
         second.finish_state = Arc::clone(&state);
         second.error_state = Some(Arc::new(RuntimeErrorState::default()));
         gate_destinations(&mut second, vec![make_test_destination()]);
+        prepare_test_operator(&mut first);
+        prepare_test_operator(&mut second);
 
         // The first driver drains while the edge is still closed and is
         // retried, exactly as the pipeline driver retries a pending finish.
@@ -3649,8 +3930,6 @@ mod tests {
     fn a_driver_still_holding_rows_is_not_counted_against_the_driver_set() {
         let state = Arc::new(DataStreamSinkFinishState::default());
         // Two drivers on one sink, both sharing the frozen finish state.
-        state.register_driver();
-        state.register_driver();
         let runtime = RuntimeState::default();
 
         let mut holder = make_test_operator();
@@ -3663,9 +3942,13 @@ mod tests {
         sibling.finish_state = Arc::clone(&state);
         sibling.error_state = Some(Arc::new(RuntimeErrorState::default()));
         gate_destinations(&mut sibling, vec![make_test_destination()]);
+        prepare_test_operator(&mut holder);
+        prepare_test_operator(&mut sibling);
 
         // One driver finishes holding rows it has not been able to hand over.
-        holder.buffer_chunk(int64_chunk(8)).expect("buffer chunk");
+        holder
+            .buffer_chunk(typed_int64_chunk(8))
+            .expect("buffer chunk");
         assert!(holder.has_pending_chunks());
         ProcessorOperator::set_finishing(&mut holder, &runtime)
             .expect("a closed edge parks the drain rather than failing");
@@ -3729,7 +4012,7 @@ mod tests {
         assert_eq!(
             partitions
                 .iter()
-                .map(|chunk| chunk.batch.num_rows())
+                .map(|chunk| chunk.record_batch().num_rows())
                 .sum::<usize>(),
             3
         );
@@ -3907,7 +4190,7 @@ mod tests {
         let chunks = vec![int64_chunk(8)];
         let out = split_oversized_chunks(chunks, 1024 * 1024);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].batch.num_rows(), 8);
+        assert_eq!(out[0].record_batch().num_rows(), 8);
     }
 
     #[test]
@@ -3923,10 +4206,13 @@ mod tests {
         let chunks = vec![int64_chunk(rows)];
         let out = split_oversized_chunks(chunks, target_bytes);
         assert!(out.len() > 1, "expected multiple slices, got {}", out.len());
-        let total_rows: usize = out.iter().map(|c| c.batch.num_rows()).sum();
+        let total_rows: usize = out.iter().map(|c| c.record_batch().num_rows()).sum();
         assert_eq!(total_rows, rows);
         for piece in &out {
-            assert!(piece.batch.num_rows() > 0, "slice produced zero-row chunk");
+            assert!(
+                piece.record_batch().num_rows() > 0,
+                "slice produced zero-row chunk"
+            );
         }
     }
 
@@ -3938,6 +4224,363 @@ mod tests {
         let chunks = vec![int64_chunk(1)];
         let out = split_oversized_chunks(chunks, 1);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].batch.num_rows(), 1);
+        assert_eq!(out[0].record_batch().num_rows(), 1);
+    }
+
+    mod typed_sender_header_tests {
+        use super::*;
+        use crate::exec::chunk::{ArrayNormalizationStep, ArrayPathStep};
+        use crate::exec::pipeline::operator::{
+            ConstructionFailure, InputConstructionFactory, InputConstructionOwner,
+        };
+        use crate::runtime::fragment::ExecutionFailureCause;
+        use crate::runtime::mem_tracker::MemTracker;
+        use arrow::array::ListArray;
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        use novarocks_type_contract::{
+            TypedValueBinding, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+            ValueTypeStorageLifetime,
+        };
+
+        fn actual_factory(tracker: Arc<MemTracker>) -> Arc<dyn InputConstructionFactory> {
+            crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                tracker, Arc::new(RuntimeErrorState::default()),
+            ).unwrap()
+        }
+        fn source(
+            array: ArrayRef,
+            value: ValueTypeRef,
+            rows: usize,
+            factory: &dyn InputConstructionFactory,
+        ) -> Chunk {
+            let pure = ValueTypeStorageLifetime::pure();
+            let binding = TypedValueBinding::try_new(
+                value,
+                ValueLayout::try_new(array.data_type(), pure.clone()).unwrap(),
+            )
+            .unwrap();
+            let slot = ChunkSlotSchema::try_new_typed(
+                SlotId::new(91),
+                Arc::new(Field::new("value", array.data_type().clone(), false)),
+                binding,
+                None,
+                pure.clone(),
+            )
+            .unwrap();
+            let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap());
+            let owner = factory.begin_typed_construction(&schema).unwrap();
+            owner
+                .observe(
+                    0,
+                    &[],
+                    ArrayNormalizationStep::CreateChunkColumns { channels: 1 },
+                )
+                .unwrap();
+            Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+                schema,
+                vec![array],
+                rows,
+                owner.storage_lifetime(),
+                |step| owner.observe(0, &[], step),
+            )
+            .unwrap()
+        }
+        fn plain(factory: &dyn InputConstructionFactory) -> Chunk {
+            let value = ValueTypeRef::try_new(
+                ValueKind::Scalar(DataType::Int32),
+                false,
+                ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap();
+            source(
+                Arc::new(Int32Array::from((0..8).collect::<Vec<_>>())),
+                value,
+                8,
+                factory,
+            )
+        }
+        fn nested_dictionary(factory: &dyn InputConstructionFactory) -> Chunk {
+            // The unused NULL value is legal: only valid keys 0 and 2 are selected.
+            let values = Arc::new(StringArray::from(vec![Some("{}"), None, Some("[]")]));
+            let dictionary: ArrayRef = Arc::new(
+                DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0, 2, 0, 2]), values)
+                    .unwrap(),
+            );
+            #[allow(deprecated)]
+            let item = Arc::new(Field::new_dict(
+                "item",
+                dictionary.data_type().clone(),
+                true,
+                291,
+                false,
+            ));
+            let list: ArrayRef = Arc::new(
+                ListArray::try_new(
+                    item,
+                    OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2, 3, 4])),
+                    dictionary,
+                    None,
+                )
+                .unwrap(),
+            );
+            let pure = ValueTypeStorageLifetime::pure();
+            let json = ValueTypeRef::try_new(
+                ValueKind::Nominal(ValueLogicalType::Json),
+                true,
+                pure.clone(),
+            )
+            .unwrap();
+            let value = ValueTypeRef::try_new(ValueKind::List(json), false, pure).unwrap();
+            source(list, value, 4, factory)
+        }
+        fn install_and_prepare(
+            factory: Arc<dyn InputConstructionFactory>,
+        ) -> DataStreamSinkOperator {
+            let mut sink = make_test_operator();
+            sink.set_construction_factory(factory);
+            sink.prepare().unwrap();
+            sink
+        }
+        #[test]
+        fn oversized_typed_plain_keeps_original_values_and_last_header_hold() {
+            let tracker = MemTracker::new_root("sender typed plain slice");
+            let factory = actual_factory(tracker.clone());
+            let source = plain(factory.as_ref());
+            let sink = install_and_prepare(factory.clone());
+            let out = split_oversized_chunks_with_creation(
+                vec![source.clone()],
+                1,
+                sink.construction_factory.as_ref().unwrap().as_ref(),
+            )
+            .unwrap();
+            assert_eq!(out.chunks.len(), 8);
+            for (row, piece) in out.chunks.iter().enumerate() {
+                assert_eq!(piece.len(), 1);
+                assert!(std::ptr::eq(piece.chunk_schema(), source.chunk_schema()));
+                let values = piece.columns()[0]
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                assert_eq!(values.value(0), row as i32);
+                assert_eq!(values.null_count(), 0);
+            }
+            let retained = out.chunks[3].clone();
+            drop(out);
+            drop(source);
+            drop(sink);
+            drop(factory);
+            assert!(
+                tracker.current() > 0,
+                "the actual independent slice header/source holds remain"
+            );
+            assert_eq!(retained.len(), 1);
+            drop(retained);
+            assert_eq!(tracker.current(), 0);
+        }
+        #[test]
+        fn oversized_typed_nested_dictionary_keeps_json_null_and_encoding_contract() {
+            let tracker = MemTracker::new_root("sender typed nested dictionary slice");
+            let factory = actual_factory(tracker.clone());
+            let source = nested_dictionary(factory.as_ref());
+            let sink = install_and_prepare(factory.clone());
+            let out = split_oversized_chunks_with_creation(
+                vec![source.clone()],
+                1,
+                sink.construction_factory.as_ref().unwrap().as_ref(),
+            )
+            .unwrap();
+            assert_eq!(out.chunks.len(), 4);
+            for (row, piece) in out.chunks.iter().enumerate() {
+                assert_eq!(piece.len(), 1);
+                let value = piece.chunk_schema().slots()[0].typed_binding().value_type();
+                assert!(!value.nullable());
+                let ValueKind::List(item) = value.kind() else {
+                    panic!("complete List declaration")
+                };
+                assert!(matches!(
+                    item.kind(),
+                    ValueKind::Nominal(ValueLogicalType::Json)
+                ));
+                assert!(
+                    item.nullable(),
+                    "the genuine Arrow child declaration permits the retained dictionary NULL"
+                );
+                let list = piece.columns()[0]
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .unwrap();
+                let dictionary = list
+                    .values()
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()
+                    .unwrap();
+                let child = dictionary
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let index = list.value_offsets()[0] as usize;
+                assert_eq!(
+                    child.value(dictionary.keys().value(index) as usize),
+                    if row % 2 == 0 { "{}" } else { "[]" }
+                );
+                assert_eq!(
+                    child.null_count(),
+                    1,
+                    "the genuine unreferenced dictionary NULL is retained"
+                );
+                let DataType::List(field) = piece.columns()[0].data_type() else {
+                    panic!("actual List carrier")
+                };
+                #[allow(deprecated)]
+                {
+                    assert_eq!(field.dict_id(), Some(291));
+                    assert_eq!(field.dict_is_ordered(), Some(false));
+                }
+            }
+            drop(out);
+            drop(source);
+            drop(sink);
+            drop(factory);
+            assert_eq!(tracker.current(), 0);
+        }
+
+        // Test instrumentation delegates every request and lifetime to the real
+        // installed tracker factory; it supplies no grant or replacement model.
+        struct FirstHeaderRefusalFactory {
+            inner: Arc<dyn InputConstructionFactory>,
+            tracker: Arc<MemTracker>,
+            requests: Arc<AtomicUsize>,
+            later: Arc<AtomicUsize>,
+        }
+        struct FirstHeaderRefusalOwner {
+            inner: Box<dyn InputConstructionOwner>,
+            tracker: Arc<MemTracker>,
+            requests: Arc<AtomicUsize>,
+            later: Arc<AtomicUsize>,
+        }
+        impl InputConstructionOwner for FirstHeaderRefusalOwner {
+            fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+                self.inner.storage_lifetime()
+            }
+            fn request(&self, layout: std::alloc::Layout) -> Result<(), ConstructionFailure> {
+                if self.requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.tracker
+                        .install_limit_once(self.tracker.current() + 1)
+                        .unwrap();
+                }
+                self.inner.request(layout)
+            }
+            fn observe_opaque_upper_bound(&self, bytes: usize) -> Result<(), ConstructionFailure> {
+                self.later.fetch_add(1, Ordering::SeqCst);
+                self.inner.observe_opaque_upper_bound(bytes)
+            }
+            fn observe(
+                &self,
+                ordinal: usize,
+                path: &[ArrayPathStep],
+                step: ArrayNormalizationStep<'_>,
+            ) -> Result<(), ConstructionFailure> {
+                self.later.fetch_add(1, Ordering::SeqCst);
+                self.inner.observe(ordinal, path, step)
+            }
+        }
+        impl InputConstructionFactory for FirstHeaderRefusalFactory {
+            fn observe_input_work(&self, units: usize) -> Result<(), ConstructionFailure> {
+                self.later.fetch_add(1, Ordering::SeqCst);
+                self.inner.observe_input_work(units)
+            }
+            fn begin_typed_construction(
+                &self,
+                schema: &ChunkSchema,
+            ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
+                Ok(Box::new(FirstHeaderRefusalOwner {
+                    inner: self.inner.begin_typed_construction(schema)?,
+                    tracker: self.tracker.clone(),
+                    requests: self.requests.clone(),
+                    later: self.later.clone(),
+                }))
+            }
+            fn begin_compiled_layout_construction(
+                &self,
+                layout: &novarocks_local_program::StaticLayout,
+            ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
+                self.inner.begin_compiled_layout_construction(layout)
+            }
+        }
+        #[test]
+        fn oversized_typed_first_header_refusal_is_original_memory_and_no_tail() {
+            let tracker = MemTracker::new_root("sender first split header refusal");
+            let factory = actual_factory(tracker.clone());
+            let source = plain(factory.as_ref());
+            let requests = Arc::new(AtomicUsize::new(0));
+            let later = Arc::new(AtomicUsize::new(0));
+            let refusing = Arc::new(FirstHeaderRefusalFactory {
+                inner: factory.clone(),
+                tracker: tracker.clone(),
+                requests: requests.clone(),
+                later: later.clone(),
+            });
+            let sink = install_and_prepare(refusing);
+            let baseline = tracker.current();
+            let refusal = split_oversized_chunks_with_creation(
+                vec![source.clone()],
+                1,
+                sink.construction_factory.as_ref().unwrap().as_ref(),
+            )
+            .err()
+            .expect("original first Vec header request refused");
+            assert!(matches!(
+                refusal.cause(),
+                ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
+            ));
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                later.load(Ordering::SeqCst),
+                0,
+                "no measurement, slicing, completion or opaque tail after refusal"
+            );
+            assert_eq!(tracker.current(), baseline);
+            assert_eq!(source.len(), 8);
+            assert_eq!(
+                source.columns()[0]
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(7),
+                7
+            );
+            drop(source);
+            drop(sink);
+            drop(factory);
+            assert_eq!(tracker.current(), 0);
+        }
+        #[test]
+        fn sender_missing_actual_factory_refuses_before_input_consumption() {
+            let tracker = MemTracker::new_root("sender missing factory source");
+            let factory = actual_factory(tracker.clone());
+            let source = plain(factory.as_ref());
+            let mut sink = make_test_operator();
+            let refusal = sink.prepare().unwrap_err();
+            assert!(matches!(
+                refusal.cause(),
+                ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
+            ));
+            assert!(!sink.prepared);
+            let state = RuntimeState::new(None, None, None, None, None, None, None);
+            let refusal = sink.push_chunk(&state, source.clone()).unwrap_err();
+            assert!(matches!(
+                refusal.cause(),
+                ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
+            ));
+            assert_eq!(sink.pending_chunk_count_total(), 0);
+            assert_eq!(sink.shared_sequence.load(Ordering::SeqCst), 0);
+            assert!(sink.send_tracker.is_idle());
+            assert_eq!(source.len(), 8);
+            drop(source);
+            drop(factory);
+            assert_eq!(tracker.current(), 0);
+        }
     }
 }

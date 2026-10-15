@@ -228,7 +228,7 @@ fn ndv_actual_column_all_null_and_supported_inputs_allocate_no_diagnostic() {
         let mut column = column(
             kernel(
                 "ndv",
-                FunctionValueType::new(source.clone(), true),
+                FunctionValueType::from_legacy_declared_projection(source.clone(), true),
                 AggregateKernelPhase::Single,
             ),
             host.clone(),
@@ -274,6 +274,11 @@ fn ndv_actual_column_long_actual_metadata_diagnostic_keeps_full_bytes_and_last_l
             .collect(),
         Some(arrow_buffer::NullBuffer::from(vec![false, true, true])),
     ));
+    let values = crate::test_value_ingress::array_for_binding(
+        &values,
+        &FunctionValueType::new(values.data_type().clone(), true),
+    )
+    .unwrap();
     let original_core = format!(
         "hll_raw does not support input type {:?}",
         values.data_type()
@@ -286,7 +291,7 @@ fn ndv_actual_column_long_actual_metadata_diagnostic_keeps_full_bytes_and_last_l
     let mut column = column(
         kernel(
             "ndv",
-            FunctionValueType::new(values.data_type().clone(), true),
+            FunctionValueType::from_legacy_declared_projection(values.data_type().clone(), true),
             AggregateKernelPhase::Partial,
         ),
         host.clone(),

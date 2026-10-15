@@ -105,11 +105,11 @@ pub(super) fn evaluate_string_initcap<'a>(
             return Err(invalid("initcap requires one checked value argument"));
         };
         let target = input.contract().result_type();
-        if source.logical_type != ValueLogicalType::Physical
-            || source.data_type != DataType::Utf8
-            || target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
+        if source.logical_type() != ValueLogicalType::Physical
+            || source.data_type() != &DataType::Utf8
+            || target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Utf8
+            || !target.nullable()
         {
             return Err(invalid("initcap differs from its exact installed profile"));
         }
@@ -128,7 +128,7 @@ pub(super) fn evaluate_string_initcap<'a>(
                 return Err(internal("initcap selected row is outside its carrier"));
             }
             if values.is_null(row) {
-                if !source.nullable {
+                if !source.nullable() {
                     return Err(internal(
                         "initcap non-null source contains selected SQL NULL",
                     ));
@@ -198,7 +198,7 @@ pub(super) fn evaluate_string_initcap<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

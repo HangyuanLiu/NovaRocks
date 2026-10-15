@@ -109,8 +109,14 @@ pub(crate) fn arrays() -> Vec<ArrayRef> {
 }
 pub(crate) fn pool(array: ArrayRef, ordinal: usize) -> novarocks_functions::ConstantValue {
     let ty = novarocks_type_contract::FunctionValueType::new(array.data_type().clone(), true);
+    let array = super::aggregate::plain_value_array(&array, &ty)
+        .expect("constant fixture prepares the installed kernel's plain value carrier");
     let pool = novarocks_functions::ConstantPool::try_new(
-        Arc::new(ty.try_to_field("original-count-pool").unwrap()),
+        Arc::new(Field::new(
+            "original-count-pool",
+            array.data_type().clone(),
+            ty.nullable(),
+        )),
         ty,
         array.to_data(),
         super::constant_policy(),

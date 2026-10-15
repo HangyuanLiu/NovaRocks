@@ -29,9 +29,8 @@ fn pool() -> DescriptorPool {
 
 #[test]
 fn aggregate_state_argument_contract_has_explicit_nonzero_values_and_tag_seven() {
-    use novarocks_proto_models::physical_package_v2::{
-        AggregateBindingDefinition, AggregateStateArgumentContract,
-    };
+    use novarocks_proto_models::common::AggregateStateArgumentContract;
+    use novarocks_proto_models::physical_package_v2::AggregateBindingDefinition;
     assert_eq!(AggregateStateArgumentContract::ExactSignature as i32, 1);
     assert_eq!(
         AggregateStateArgumentContract::ValueRootNullabilityIndependent as i32,
@@ -160,6 +159,34 @@ fn singular_numeric_references_preserve_zero_maximum_and_absence() {
         }
     }
     assert!(references > 0);
+    let public = pool
+        .get_message_by_name("novarocks.physical_package_v2.ConnectorReadPublicFacts")
+        .unwrap();
+    for (number, name) in [(3, "schema_id"), (4, "logical_types")] {
+        assert!(public.get_field(number).is_none());
+        assert!(public.get_field_by_name(name).is_none());
+        assert!(
+            public
+                .reserved_ranges()
+                .any(|range| range.contains(&number))
+        );
+        assert!(public.reserved_names().any(|reserved| reserved == name));
+    }
+    for (number, name) in [(5, "execution_schema_id"), (6, "source_schema_id")] {
+        let field = public.get_field_by_name(name).unwrap();
+        assert_eq!(field.number(), number);
+        assert!(field.supports_presence());
+    }
+    use novarocks_proto_models::physical_package_v2::ConnectorReadPublicFacts;
+    // Retired tags cannot create an implicit zero or author meaning. The typed
+    // codec separately rejects the missing pair; this is representation only.
+    let retired = ConnectorReadPublicFacts::decode(&[0x18, 1, 0x22, 1, 0][..]).unwrap();
+    assert!(retired.execution_schema_id.is_none() && retired.source_schema_id.is_none());
+    assert_eq!(retired, ConnectorReadPublicFacts::default());
+    let explicit = ConnectorReadPublicFacts::decode(&[0x28, 0, 0x30, 0][..]).unwrap();
+    assert_eq!(explicit.execution_schema_id, Some(0));
+    assert_eq!(explicit.source_schema_id, Some(0));
+    assert_eq!(explicit.encode_to_vec(), [0x28, 0, 0x30, 0]);
 }
 
 #[test]
@@ -231,7 +258,7 @@ fn typed_pool_references_preserve_sharing_order_and_zero_ordinals() {
     let pool = v2::IpcConstantPool {
         id: u32::MAX,
         value_type_id: Some(0),
-        field_id: Some(u32::MAX),
+        source_field_id: Some(u32::MAX),
         compression: v2::IpcCompression::Uncompressed as i32,
         arrow_ipc: vec![0, 255, 0, 128],
     };
@@ -252,11 +279,25 @@ fn typed_pool_references_preserve_sharing_order_and_zero_ordinals() {
     let package = v2::FragmentPackage {
         constants: vec![pool.clone()],
         types: Some(ty::TypeTable {
+            logical_types: vec![novarocks_proto_models::value_type::LogicalTypeDefinition {
+                id: Some(0),
+                nullable: true,
+                kind: Some(
+                    novarocks_proto_models::value_type::logical_type_definition::Kind::Nominal(
+                        novarocks_proto_models::value_type::NominalValue::Json as i32,
+                    ),
+                ),
+            }],
+            carriers: vec![ty::CarrierTypeDefinition {
+                id: 0,
+                kind: Some(ty::carrier_type_definition::Kind::Primitive(
+                    novarocks_proto_models::plan::ArrowPrimitiveType::Utf8 as i32,
+                )),
+            }],
             value_types: vec![ty::ValueTypeDefinition {
                 id: 0,
                 carrier_type_id: Some(0),
-                nullable: true,
-                logical_type: ty::LogicalType::Json as i32,
+                logical_type_id: Some(0),
             }],
             ..Default::default()
         }),
@@ -282,10 +323,13 @@ fn typed_pool_references_preserve_sharing_order_and_zero_ordinals() {
 #[test]
 fn intrinsic_allow_throw_references_use_dedicated_v2_messages_and_presence() {
     let pool = pool();
-    for (name, number) in [("BinaryExpression", 5), ("CastExpression", 4)] {
-        let descriptor = pool
-            .get_message_by_name(&format!("novarocks.physical_package_v2.{name}"))
-            .unwrap();
+    for (name, number) in [
+        ("novarocks.physical_package_v2.BinaryExpression", 5),
+        ("novarocks.physical_package_v2.CastExpression", 4),
+        ("novarocks.expr.BinaryOpExpr", 5),
+        ("novarocks.expr.CastExpr", 4),
+    ] {
+        let descriptor = pool.get_message_by_name(name).unwrap();
         let field = descriptor
             .get_field_by_name("allow_throw_exception")
             .unwrap();
@@ -308,17 +352,6 @@ fn intrinsic_allow_throw_references_use_dedicated_v2_messages_and_presence() {
                 .get_field_by_name("id")
                 .unwrap()
                 .supports_presence()
-        );
-    }
-    // Published legacy expression messages retain their original vocabulary.
-    for name in ["BinaryOpExpr", "CastExpr"] {
-        let descriptor = pool
-            .get_message_by_name(&format!("novarocks.expr.{name}"))
-            .unwrap();
-        assert!(
-            descriptor
-                .get_field_by_name("allow_throw_exception")
-                .is_none()
         );
     }
 }

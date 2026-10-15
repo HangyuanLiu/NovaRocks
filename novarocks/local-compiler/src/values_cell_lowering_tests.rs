@@ -412,8 +412,8 @@ fn values_cast_cells_compile_as_dynamic_roots_beside_constant_backing() {
                 use_id,
             })
             .expect("prepared cast recipe");
-        assert_eq!(recipe.result_type().data_type, DataType::Int64);
-        assert_eq!(recipe.result_type().nullable, cell.column == 0);
+        assert_eq!(recipe.result_type().data_type(), &DataType::Int64);
+        assert_eq!(recipe.result_type().nullable(), cell.column == 0);
         // The operand is the constant at its analyzed type.
         let operand = &flow.uses()[&invocation.arguments[0]];
         assert!(matches!(

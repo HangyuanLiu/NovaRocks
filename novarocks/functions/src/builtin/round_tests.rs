@@ -71,7 +71,7 @@ fn dense(arrays: Vec<ArrayRef>) -> ArrayRef {
     let rows = arrays[0].len();
     let types = arrays
         .iter()
-        .map(|a| FunctionValueType::new(a.data_type().clone(), true))
+        .map(|a| FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true))
         .collect::<Vec<_>>();
     let mut instance = instance(&types, DecimalOverflowPolicy::OutputNull);
     let arguments = arrays
@@ -273,7 +273,7 @@ fn decimal_final_scale_adjustment_rounds_real_wrapped_constant_digits_twice() {
     );
     let digit = signed(vec![Some(257)]);
     let types = [
-        FunctionValueType::new(source.data_type().clone(), true),
+        FunctionValueType::from_legacy_declared_projection(source.data_type().clone(), true),
         FunctionValueType::new(DataType::Int64, true),
     ];
     let prepared = super::super::round_owner::prepared_for_test(
@@ -283,7 +283,7 @@ fn decimal_final_scale_adjustment_rounds_real_wrapped_constant_digits_twice() {
     )
     .unwrap();
     assert_eq!(
-        prepared.contract().result_type().data_type,
+        prepared.contract().result_type().data_type().clone(),
         DataType::Decimal128(38, 1)
     );
     let mut call = ScalarEvaluationInstance::instantiate(prepared).unwrap();
@@ -311,7 +311,7 @@ fn decimal_binary_exact_rescale_and_precision_overflow_keep_selected_error_ordin
     let source = decimals(vec![Some(11), Some(0), None, Some(12), Some(max)], 0);
     let digits = signed(vec![Some(0), Some(0), None, Some(0), Some(-1)]);
     let types = [
-        FunctionValueType::new(source.data_type().clone(), true),
+        FunctionValueType::from_legacy_declared_projection(source.data_type().clone(), true),
         FunctionValueType::new(DataType::Int64, true),
     ];
     let rows = [1, 4];
@@ -368,7 +368,7 @@ fn decimal_digits_native_overflow_uses_policy_only_for_checked_wide_carriers() {
         let source = floats(vec![Some(1.25); 2]);
         let types = [
             FunctionValueType::new(DataType::Float64, true),
-            FunctionValueType::new(digits.data_type().clone(), true),
+            FunctionValueType::from_legacy_declared_projection(digits.data_type().clone(), true),
         ];
         for policy in [
             DecimalOverflowPolicy::OutputNull,
@@ -426,7 +426,7 @@ fn static_decimal_factor_and_interval_failures_remain_outer_and_poison_instance(
     for digits in digits {
         let types = [
             FunctionValueType::new(DataType::Float64, true),
-            FunctionValueType::new(digits.data_type().clone(), true),
+            FunctionValueType::from_legacy_declared_projection(digits.data_type().clone(), true),
         ];
         let arguments = [
             EvaluatedArgument::Scalar(&source),
@@ -568,14 +568,15 @@ fn constant_pool_nonzero_ordinals_broadcast_only_the_selected_scalar() {
     );
 }
 #[test]
-fn dictionary_and_sliced_run_end_follow_selected_values_and_logical_nulls() {
+fn explicit_dictionary_plain_ingress_preserves_values_and_raw_run_end_is_refused() {
     let dictionary = DictionaryArray::<Int8Type>::try_new(
         Int8Array::from(vec![Some(2), Some(0), Some(1), None, Some(2)]),
         floats(vec![Some(1.25), None, Some(-2.5)]),
     )
     .unwrap();
     let source: ArrayRef = Arc::new(dictionary.slice(1, 4));
-    assert_integers(&dense(vec![source]), &[Some(1), None, None, Some(-3)]);
+    let plain = arrow_cast::cast(source.as_ref(), &DataType::Float64).unwrap();
+    assert_integers(&dense(vec![plain]), &[Some(1), None, None, Some(-3)]);
     let run_ends = Int16Array::from(vec![2, 4, 6]);
     let values = Float64Array::from(vec![Some(1.25), None, Some(-2.5)]);
     let source: ArrayRef = Arc::new(
@@ -583,16 +584,21 @@ fn dictionary_and_sliced_run_end_follow_selected_values_and_logical_nulls() {
             .unwrap()
             .slice(1, 4),
     );
-    let types = [FunctionValueType::new(source.data_type().clone(), true)];
+    let types = [FunctionValueType::from_legacy_declared_projection(
+        source.data_type().clone(),
+        true,
+    )];
     let rows = [0, 2, 3];
     let selection = Selection::try_sparse(4, &rows).unwrap();
     let mut call = instance(&types, DecimalOverflowPolicy::OutputNull);
     let arguments = [EvaluatedArgument::Column(&source)];
-    let output = call
-        .evaluate(selection, &arguments, &Control::default())
-        .unwrap();
-    assert_integers(output.values(), &[Some(1), None, Some(-3)]);
-    assert_eq!(output.selection().iter().collect::<Vec<_>>(), rows);
+    assert!(
+        matches!(
+            call.evaluate(selection, &arguments, &Control::default()),
+            Err(KernelFailure::InvalidProgram(_))
+        ),
+        "unsupported raw run-end encoding cannot enter the installed ROUND consumer"
+    );
 }
 #[test]
 fn fixed_size_list_parent_null_and_dense_union_selected_tag_survive_slices() {
@@ -674,7 +680,7 @@ fn control_fixture(arity: usize) -> (Vec<FunctionValueType>, Vec<ArrayRef>) {
     }
     let types = arrays
         .iter()
-        .map(|a| FunctionValueType::new(a.data_type().clone(), true))
+        .map(|a| FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true))
         .collect();
     (types, arrays)
 }
@@ -895,7 +901,12 @@ fn long_selected_text_is_observed_mid_parse_and_control_failure_never_replays() 
             };
             let types = arrays
                 .iter()
-                .map(|array| FunctionValueType::new(array.data_type().clone(), true))
+                .map(|array| {
+                    FunctionValueType::from_legacy_declared_projection(
+                        array.data_type().clone(),
+                        true,
+                    )
+                })
                 .collect::<Vec<_>>();
             let arguments = arrays
                 .iter()

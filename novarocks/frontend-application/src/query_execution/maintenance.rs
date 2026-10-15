@@ -1726,14 +1726,14 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             let source_binding =
                 crate::query_execution::distributed_rewrite::admit_pinned_rewrite_scan_binding(
                     table_bindings.as_ref(),
-                    cohort.scan_schema(),
+                    cohort.scan_execution_schema(),
                     read.clone(),
                 )?;
             let physical_plan =
                 crate::query_execution::distributed_rewrite::pinned_rewrite_scan_physical_plan(
-                    cohort.scan_schema(),
+                    cohort.scan_execution_schema(),
                     source_binding,
-                );
+                )?;
             (
                 crate::catalog_application::query_bindings::QueryFrozenCohortRead::PinnedFileSet(
                     read,
@@ -1752,14 +1752,14 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             let source_binding =
                 crate::query_execution::distributed_rewrite::admit_rewrite_group_scan_binding(
                     table_bindings.as_ref(),
-                    cohort.scan_schema(),
+                    cohort.scan_execution_schema(),
                     read.clone(),
                 )?;
             let physical_plan =
                 crate::query_execution::distributed_rewrite::rewrite_group_scan_physical_plan(
-                    cohort.scan_schema(),
+                    cohort.scan_execution_schema(),
                     source_binding,
-                );
+                )?;
             (
                 crate::catalog_application::query_bindings::QueryFrozenCohortRead::TableExecute(
                     read,
@@ -1800,7 +1800,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
     // so the plan and what performs its read are accounted for together.
     let need = crate::query_execution::distributed_rewrite::rewrite_cohort_provider_read_need(
         source_binding,
-        cohort.scan_schema(),
+        cohort.scan_execution_schema(),
         &cohort_read,
     )?;
     let connector_session = crate::query_execution::compiler::typed_connector_session()?;
@@ -2020,7 +2020,13 @@ mod maintenance_attempt_context_tests {
             fn load_table(
                 &self,
                 _: ConnectorTableRequest,
-            ) -> Result<ConnectorTableMetadata, ConnectorError> {
+                _creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<
+                    '_,
+                >,
+            ) -> Result<
+                ConnectorTableMetadata,
+                novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+            > {
                 panic!("unexpected load")
             }
             fn admit_table_job(
@@ -2041,19 +2047,28 @@ mod maintenance_attempt_context_tests {
                 Ok(ConnectorTableObjectBinding {
                     object_id: ConnectorTableObjectId::try_new(Bytes::from(vec![self.marker]))
                         .unwrap(),
-                    metadata: ConnectorTableMetadata {
-                        identity: request.table,
-                        schema: Arc::new(arrow::datatypes::Schema::empty()),
-                        planning_facts: ConnectorTablePlanningFacts::default(),
-                        definition_facts: ConnectorTableDefinitionFacts::default(),
-                        version: None,
-                        statistics_data_version: None,
-                        table: ConnectorTableHandle::try_new(
-                            self.instance.clone(),
-                            Bytes::from(vec![self.marker]),
+                    metadata: crate::connector::schema_creation::with_schema_creation(&request.context, |creation| {
+                        let schema = creation.arc(arrow::datatypes::Schema::empty())?;
+                        let storage = creation.storage();
+                        let execution = {
+                            let (allocation, work) = creation.observers();
+                            novarocks_connector_contract::ConnectorReadExecutionSchema::try_new_observed(
+                                schema.clone(), Vec::new().into_boxed_slice(), storage,
+                                |layout| allocation(layout).map_err(novarocks_connector_contract::PureProviderCompileError::Control),
+                                |units| work(units).map_err(novarocks_connector_contract::PureProviderCompileError::Control),
+                            )?
+                        };
+                        ConnectorTableMetadata::try_new_typed(
+                            ConnectorTableMetadataHeader {
+                                identity: request.table,
+                                planning_facts: ConnectorTablePlanningFacts::default(),
+                                definition_facts: ConnectorTableDefinitionFacts::default(),
+                                version: None,
+                                statistics_data_version: None,
+                                table: ConnectorTableHandle::try_new(self.instance.clone(), Bytes::from(vec![self.marker]))?,
+                            }, schema, execution, creation,
                         )
-                        .unwrap(),
-                    },
+                    }).map_err(crate::connector::schema_creation::connector_schema_error)?,
                 })
             }
             fn read_reference_facts(

@@ -18,6 +18,7 @@
 use super::*;
 use crate::{KernelDiagnostic, KernelEvaluationControl};
 use arrow_array::{ArrayRef, Float64Array, builder::FixedSizeBinaryBuilder};
+use novarocks_type_contract::arithmetic_result_value_type_with_op;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{
     sync::{Arc, Mutex},
@@ -66,7 +67,7 @@ impl KernelEvaluationControl for EvaluationControl {
     }
 }
 fn ty(data_type: DataType) -> FunctionValueType {
-    FunctionValueType::new(data_type, true)
+    FunctionValueType::from_legacy_declared_projection(data_type, true)
 }
 fn largeint_type() -> FunctionValueType {
     FunctionValueType::try_with_logical_type(
@@ -86,8 +87,15 @@ fn prepare_controlled(
     control: &CompileControl,
 ) -> Result<Option<DecimalArithmetic>, ArithmeticPrepareError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-    let outcome =
-        DecimalArithmetic::prepare(operator, left, right, result, policy, allow, &mut work);
+    let outcome = DecimalArithmetic::prepare(
+        operator,
+        left,
+        right,
+        (result.data_type(), result.logical_type(), result.nullable()),
+        policy,
+        allow,
+        &mut work,
+    );
     if outcome
         .as_ref()
         .err()
@@ -539,7 +547,9 @@ fn decimal_recipe_rejects_unlicensed_pairs_and_foreign_standard_classes() {
     let mut wrong =
         arithmetic_result_value_type_with_op(&d128, &ty(DataType::Int64), ArithmeticOperator::Add)
             .unwrap();
-    wrong.nullable = false;
+    wrong = wrong
+        .with_nullable(false)
+        .expect("valid function nullability declaration");
     assert!(
         prepare_controlled(
             ArithmeticOperator::Add,
@@ -575,7 +585,9 @@ fn original_prepare_and_row_controls_keep_all_primary_prefixes_including_ordinar
         arithmetic_result_value_type_with_op(&left, &right, ArithmeticOperator::Add).unwrap();
     for nullable in [true, false] {
         let mut result = result.clone();
-        result.nullable = nullable;
+        result = result
+            .with_nullable(nullable)
+            .expect("valid function nullability declaration");
         let control = CompileControl::default();
         let _ = prepare_controlled(
             ArithmeticOperator::Add,

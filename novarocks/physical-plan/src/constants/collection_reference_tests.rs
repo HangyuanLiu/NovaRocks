@@ -247,7 +247,7 @@ fn collection_gate_preserves_complete_domains_and_rejects_wrong_nullable_profile
     let constant = UnpivotConstant::Int32List(reference(0, 1));
     let (fragment, literal) = collection_fragment(&[constant], backing.value_type());
     let mut widened = backing.value_type().clone();
-    widened.nullable = true;
+    widened = widened.with_nullable(true).unwrap();
     gate(
         &changed_output(&fragment, literal, widened),
         &pools,
@@ -283,8 +283,8 @@ fn collection_gate_preserves_complete_domains_and_rejects_wrong_nullable_profile
     }
     let decorated = FunctionValueType::new(DataType::List(child(true, false)), false);
     let decorated_output = changed_output(&fragment, literal, decorated.clone());
-    // Nonlogical annotations do not alter the original semantic value domain.
-    // The complete static Unpivot carrier author separately rejects them.
+    // Provider annotations are discarded by the declared value author; they
+    // neither change semantics nor survive in the normalized value layout.
     gate(
         &decorated_output,
         &pools,
@@ -292,23 +292,22 @@ fn collection_gate_preserves_complete_domains_and_rejects_wrong_nullable_profile
         &Control::good(),
     )
     .unwrap();
-    let structure = crate::validation::validate_fragment_definition(&decorated_output).unwrap_err();
-    assert!(
-        structure
-            .to_string()
-            .contains("constant type differs from its literal output")
-    );
+    crate::validation::validate_fragment_definition(&decorated_output).unwrap();
     // The same decoration on an actual admitted source is rejected by the
     // special source profile, even when the generic constant owner admits it.
     let field = Arc::new(Field::new(
         "decorated_source",
-        decorated.data_type.clone(),
+        DataType::List(child(true, false)),
         false,
     ));
-    let decorated_value = novarocks_constant_contract::ConstantValue::from_int32_list(
+    let mut builder = ListBuilder::new(Int32Builder::new()).with_field(child(true, false));
+    builder.values().append_slice(&[7, 8]);
+    builder.append(true);
+    let array = builder.finish();
+    let decorated_pool = ConstantPool::try_new(
         field,
         decorated,
-        &[7, 8],
+        array.to_data(),
         policy(),
         CompilePhase::Validate,
         &Control::good(),
@@ -321,7 +320,7 @@ fn collection_gate_preserves_complete_domains_and_rejects_wrong_nullable_profile
     assert_eq!(
         gate(
             &decorated_source_fragment,
-            &table(decorated_value.pool(), &[0]),
+            &table(&decorated_pool, &[0]),
             PlanLimits::FROZEN,
             &Control::good()
         ),
@@ -329,8 +328,8 @@ fn collection_gate_preserves_complete_domains_and_rejects_wrong_nullable_profile
             "Unpivot collection source differs from its exact non-null special type"
         ))
     );
-    let nullable = FunctionValueType::new(backing.value_type().data_type.clone(), true);
-    let null_pool = plain(new_null_array(&nullable.data_type, 1), true);
+    let nullable = FunctionValueType::new(backing.value_type().data_type().clone(), true);
+    let null_pool = plain(new_null_array(&nullable.data_type(), 1), true);
     let nulls = table(&null_pool, &[0]);
     let (null_fragment, _) = collection_fragment(
         &[UnpivotConstant::Int32List(reference(0, 0))],
@@ -369,8 +368,8 @@ fn collection_gate_preserves_complete_domains_and_rejects_wrong_nullable_profile
             "Unpivot collection source differs from its exact non-null special type"
         ))
     );
-    // Encoded nested constants remain exact in the direct expression-reference
-    // namespace, even though encoded collections are not this Unpivot profile.
+    // Dictionary namespace/order belong to actual encoding. Normalized static
+    // value bindings do not acquire that source identity.
     let encoded = |id, ordered| {
         FunctionValueType::new(
             DataType::List(Arc::new(Field::new_dict(
@@ -384,22 +383,17 @@ fn collection_gate_preserves_complete_domains_and_rejects_wrong_nullable_profile
         )
     };
     let exact = encoded(73, true);
-    let encoded_pool = plain(new_null_array(&exact.data_type, 2), true);
+    let encoded_pool = plain(new_null_array(&exact.data_type(), 2), true);
     let encoded_pools = table(&encoded_pool, &[u32::MAX]);
-    for bad in [encoded(74, true), encoded(73, false)] {
-        let bad_fragment = constant_fragment(92, &[(reference(u32::MAX, 1), bad)]);
-        assert_eq!(
-            gate(
-                &bad_fragment,
-                &encoded_pools,
-                PlanLimits::FROZEN,
-                &Control::good()
-            ),
-            Err(ConstantReferenceError::SourceTypeMismatch(reference(
-                u32::MAX,
-                1
-            )))
-        );
+    for equivalent in [encoded(74, true), encoded(73, false)] {
+        let fragment = constant_fragment(92, &[(reference(u32::MAX, 1), equivalent)]);
+        gate(
+            &fragment,
+            &encoded_pools,
+            PlanLimits::FROZEN,
+            &Control::good(),
+        )
+        .unwrap();
     }
     let exact_fragment = constant_fragment(92, &[(reference(u32::MAX, 1), exact)]);
     gate(

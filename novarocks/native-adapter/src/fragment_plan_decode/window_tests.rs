@@ -8,16 +8,16 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
-    use super::super::{NativePlanDecodeContext, decode_node};
+    use super::super::NativePlanDecodeContext;
+    use super::super::tests::{FixturePlan, aggregate_source, decode_node};
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::exec::node::analytic::WindowFunctionKind;
-    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
-        encode_type(data_type).expect("encode type")
+        crate::fragment_expression::fixture_sources::type_desc(data_type)
     }
 
     fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
@@ -32,25 +32,49 @@ mod tests {
 
     fn int_literal(value: i64) -> expr::Expr {
         expr::Expr {
-            r#type: Some(type_desc(&DataType::Int64)),
+            original_definition_id: None,
+            r#type: Some(
+                crate::fragment_expression::fixture_sources::type_desc_with_nullable(
+                    &DataType::Int64,
+                    false,
+                ),
+            ),
             nullable: false,
-            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-                value: Some(common::LiteralValue {
-                    value: Some(common::literal_value::Value::IntValue(value)),
-                }),
-            })),
+            kind: Some(expr::expr::Kind::ConstantReference(
+                crate::fragment_expression::fixture_sources::constant_reference(
+                    &DataType::Int64,
+                    &expr::LiteralExpr {
+                        value: Some(common::LiteralValue {
+                            value: Some(common::literal_value::Value::IntValue(value)),
+                        }),
+                    },
+                ),
+            )),
         }
     }
 
     fn string_literal(value: &str) -> expr::Expr {
         expr::Expr {
-            r#type: Some(type_desc(&DataType::Utf8)),
+            original_definition_id: None,
+            r#type: Some(
+                crate::fragment_expression::fixture_sources::type_desc_with_nullable(
+                    &DataType::Utf8,
+                    false,
+                ),
+            ),
             nullable: false,
-            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-                value: Some(common::LiteralValue {
-                    value: Some(common::literal_value::Value::StringValue(value.to_string())),
-                }),
-            })),
+            kind: Some(expr::expr::Kind::ConstantReference(
+                crate::fragment_expression::fixture_sources::constant_reference(
+                    &DataType::Utf8,
+                    &expr::LiteralExpr {
+                        value: Some(common::LiteralValue {
+                            value: Some(common::literal_value::Value::StringValue(
+                                value.to_string(),
+                            )),
+                        }),
+                    },
+                ),
+            )),
         }
     }
 
@@ -63,39 +87,20 @@ mod tests {
 
     fn aggregate_binding(
         name: &str,
-        argument_types: &[DataType],
+        arguments: &[DataType],
     ) -> Option<plan::ResolvedAggregateSignature> {
-        let selected = function_catalog()
-            .resolve_aggregate_trusted(name, argument_types)
-            .expect("resolved aggregate binding");
-        Some(plan::ResolvedAggregateSignature {
-            overload_identity: selected.overload.as_str().to_string(),
-            argument_types: selected.argument_types.iter().map(type_desc).collect(),
-            intermediate_type: Some(type_desc(&selected.intermediate_type)),
-            output_type: Some(type_desc(&selected.output_type)),
-            state_format_identity: selected.state_format.as_str().to_string(),
-        })
+        Some(aggregate_source(name, arguments, arguments).signature(0))
     }
-
     fn aggregate_update_binding(
         name: &str,
-        logical_argument_types: &[DataType],
-        update_argument_types: &[DataType],
+        logical: &[DataType],
+        update: &[DataType],
     ) -> Option<plan::ResolvedAggregateSignature> {
-        let selected = function_catalog()
-            .resolve_aggregate_update_trusted(name, logical_argument_types, update_argument_types)
-            .expect("resolved aggregate update binding");
-        Some(plan::ResolvedAggregateSignature {
-            overload_identity: selected.overload.as_str().to_string(),
-            argument_types: selected.argument_types.iter().map(type_desc).collect(),
-            intermediate_type: Some(type_desc(&selected.intermediate_type)),
-            output_type: Some(type_desc(&selected.output_type)),
-            state_format_identity: selected.state_format.as_str().to_string(),
-        })
+        Some(aggregate_source(name, logical, update).signature(0))
     }
-
     fn column_ref(column_id: u32, data_type: DataType) -> expr::Expr {
         expr::Expr {
+            original_definition_id: None,
             r#type: Some(type_desc(&data_type)),
             nullable: true,
             kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
@@ -118,24 +123,11 @@ mod tests {
         node_id: i32,
         kind: plan::plan_node::Kind,
         output_columns: Vec<common::OutputColumn>,
-        children: Vec<plan::DistributedNode>,
-    ) -> plan::DistributedNode {
-        plan::DistributedNode {
-            node_id,
-            fragment_id: 1,
-            tuple_ids: Vec::new(),
-            nullable_tuple_ids: Vec::new(),
-            limit: -1,
-            runtime_filter_binding_ids: Vec::new(),
-            children,
-            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-                output_columns,
-                kind: Some(kind),
-            })),
-        }
+        children: Vec<FixturePlan>,
+    ) -> FixturePlan {
+        super::super::tests::physical_node(node_id, kind, output_columns, children)
     }
-
-    fn one_col_values_node(node_id: i32) -> plan::DistributedNode {
+    fn one_col_values_node(node_id: i32) -> FixturePlan {
         let columns = vec![output_column(1, "id", DataType::Int64)];
         physical_node(
             node_id,
@@ -150,7 +142,7 @@ mod tests {
         )
     }
 
-    fn value_key_values_node(node_id: i32) -> plan::DistributedNode {
+    fn value_key_values_node(node_id: i32) -> FixturePlan {
         let columns = vec![
             output_column(1, "value", DataType::Utf8),
             output_column(2, "key", DataType::Int64),
@@ -168,14 +160,17 @@ mod tests {
         )
     }
 
-    fn lower(node: &plan::DistributedNode) -> super::super::DecodedNode {
+    fn lower(node: &FixturePlan) -> super::super::DecodedNode {
         let mut arena = ExprArena::default();
         decode_node(node, &mut arena, &NativePlanDecodeContext::default()).expect("lower node")
     }
 
     fn lower_aggregate_window(
-        node: &plan::DistributedNode,
-    ) -> Result<(super::super::DecodedNode, ExprArena), String> {
+        node: &FixturePlan,
+    ) -> Result<
+        (super::super::DecodedNode, ExprArena),
+        crate::fragment_error::NativeFragmentDecodeError,
+    > {
         let mut arena = ExprArena::default();
         decode_node(
             node,
@@ -183,7 +178,6 @@ mod tests {
             &NativePlanDecodeContext::default().with_function_catalog(function_catalog()),
         )
         .map(|decoded| (decoded, arena))
-        .map_err(|error| error.to_string())
     }
 
     fn aggregate_window_node(
@@ -191,16 +185,18 @@ mod tests {
         args: Vec<expr::Expr>,
         result_type: DataType,
         binding: Option<plan::ResolvedAggregateSignature>,
-    ) -> plan::DistributedNode {
+    ) -> FixturePlan {
         let output_columns = vec![
             output_column(1, "value", DataType::Utf8),
             output_column(2, "key", DataType::Int64),
             output_column(3, "window_value", result_type.clone()),
         ];
-        physical_node(
+        let has_binding = binding.is_some();
+        let node = physical_node(
             90,
             plan::plan_node::Kind::Window(plan::WindowNode {
                 window_exprs: vec![plan::WindowExpr {
+                    original_expression_definition_id: None, // Legacy expansion has no original-request namespace.
                     name: name.to_string(),
                     args,
                     distinct: false,
@@ -218,7 +214,22 @@ mod tests {
             }),
             output_columns,
             vec![value_key_values_node(89)],
-        )
+        );
+        if has_binding {
+            let source = match name {
+                "sum" => aggregate_source("sum", &[DataType::Int64], &[DataType::Int64]),
+                "max_by" | "min_by" => aggregate_source(
+                    name,
+                    &[DataType::Utf8, DataType::Int64],
+                    &[DataType::Utf8, DataType::Int64],
+                ),
+                "row_number" => aggregate_source("count", &[], &[]),
+                _ => panic!("explicit original Window request source"),
+            };
+            node.with_original_window(0, 900, source)
+        } else {
+            node
+        }
     }
 
     #[test]
@@ -231,6 +242,7 @@ mod tests {
             80,
             plan::plan_node::Kind::Window(plan::WindowNode {
                 window_exprs: vec![plan::WindowExpr {
+                    original_expression_definition_id: None, // Legacy expansion has no original-request namespace.
                     name: "row_number".to_string(),
                     args: Vec::new(),
                     distinct: false,
@@ -290,6 +302,7 @@ mod tests {
             plan::plan_node::Kind::Window(plan::WindowNode {
                 window_exprs: vec![
                     plan::WindowExpr {
+                        original_expression_definition_id: None, // Legacy expansion has no original-request namespace.
                         name: "row_number".to_string(),
                         args: Vec::new(),
                         distinct: false,
@@ -312,6 +325,7 @@ mod tests {
                         ignore_nulls: false,
                     },
                     plan::WindowExpr {
+                        original_expression_definition_id: None, // Legacy expansion has no original-request namespace.
                         name: "rank".to_string(),
                         args: Vec::new(),
                         distinct: false,
@@ -394,7 +408,7 @@ mod tests {
         );
         let error = lower_aggregate_window(&missing).expect_err("binding must be mandatory");
         assert!(
-            error.contains("exact resolved signature missing"),
+            error.contains("aggregate frozen signature is absent"),
             "{error}"
         );
 
@@ -421,7 +435,10 @@ mod tests {
             aggregate_binding("sum", &[DataType::Int32]),
         );
         let error = lower_aggregate_window(&drift).expect_err("logical arg drift must fail");
-        assert!(error.contains("argument type drift"), "{error}");
+        assert!(
+            error.contains("frozen argument types differ from the already-coerced expressions"),
+            "{error}"
+        );
 
         let mut forged_binding = aggregate_binding("sum", &[DataType::Int64]);
         forged_binding
@@ -435,7 +452,23 @@ mod tests {
             forged_binding,
         );
         let error = lower_aggregate_window(&forged).expect_err("catalog drift must fail");
-        assert!(error.contains("resolved signature drift"), "{error}");
+        let protocol = error
+            .protocol()
+            .expect("frozen state identity is a protocol refusal");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.original_call_requests"
+        );
+        assert_eq!(
+            protocol.kind(),
+            novarocks_proto_codec::ProtocolErrorKind::InvalidValue
+        );
+        assert!(
+            error.contains(
+                "aggregate state format or argument contract differs from its declaration"
+            ),
+            "{error}"
+        );
 
         let v2 = aggregate_window_node(
             "max_by_v2",
@@ -511,6 +544,7 @@ mod tests {
             92,
             plan::plan_node::Kind::Window(plan::WindowNode {
                 window_exprs: vec![plan::WindowExpr {
+                    original_expression_definition_id: None, // Legacy expansion has no original-request namespace.
                     name: "array_agg".to_string(),
                     args: vec![column_ref(1, DataType::Utf8)],
                     distinct: false,
@@ -532,6 +566,15 @@ mod tests {
             }),
             output_columns,
             vec![value_key_values_node(91)],
+        )
+        .with_original_window(
+            0,
+            920,
+            aggregate_source(
+                "array_agg",
+                &[DataType::Utf8],
+                &[DataType::Utf8, DataType::Int64],
+            ),
         );
 
         let (decoded, arena) = lower_aggregate_window(&node).expect("lower ordered array_agg");

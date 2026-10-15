@@ -364,7 +364,10 @@ fn build_query_result(
 }
 
 fn column(name: &str, nullable: bool) -> QueryResultColumn {
-    QueryResultColumn::new(name, DataType::Utf8, nullable, None)
+    QueryResultColumn::new(
+        name,
+        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, nullable),
+    )
 }
 
 #[cfg(test)]

@@ -88,7 +88,9 @@ fn aggregate_binding(phase: AggregatePhase, drift: BindingDrift) -> AggregateBin
             function_id: FunctionId::try_new(function_id).unwrap(),
             overload: FunctionOverloadId::try_new(overload).unwrap(),
             kind: FunctionKind::Aggregate,
-            argument_types: Box::from([FunctionArgumentType::Value(ty(DataType::Int64, false))]),
+            argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                FunctionArgumentType::Value(ty(DataType::Int64, false)),
+            ])),
             result_type: ty(DataType::Int64, false),
         },
         phase,

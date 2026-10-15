@@ -331,7 +331,7 @@ impl ChangeEventExpandProcessorOperator {
         for column_idx in 0..self.output_chunk_schema.slots().len() {
             let parts = event_chunks
                 .iter()
-                .map(|chunk| chunk.batch.column(column_idx).as_ref())
+                .map(|chunk| chunk.record_batch().column(column_idx).as_ref())
                 .collect::<Vec<&dyn Array>>();
             columns.push(concat(&parts).map_err(|err| {
                 format!("change event expand concat output column {column_idx} failed: {err}")

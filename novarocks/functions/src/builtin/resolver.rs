@@ -37,16 +37,14 @@
 //! 4. **Polymorphic widening.** Signatures that opt in to widening can
 //!    merge repeated `Any(name)` bindings through `wider_type`.
 
-use super::binding_control;
+use super::binding_control::{self, ScalarCarriers, ScalarTypes};
 use crate::{FunctionResolutionError, FunctionValueType, ResolvedFunctionSignature};
 use arrow_schema::DataType;
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
 use super::registry;
-use super::signature::{
-    BindMode, Bindings, Signature, TypeSpec, anchor_matches, realize, realize_value, unify,
-    unify_value,
-};
+use super::scalar_construction::{ResolutionFailure, borrow_creator, with_resolution_creation};
+use super::signature::{BindMode, Bindings, Signature, TypeSpec, anchor_matches, realize, unify};
 
 pub type ResolvedScalarFunction = ResolvedFunctionSignature;
 
@@ -185,9 +183,60 @@ pub struct ResolvedScalarValueSignature {
     pub enforce_argument_binding: bool,
 }
 
+/// One accepted original pass. Argument authorization and its temporary
+/// realization/Bindings retain their original algorithm and remain outside
+/// this partial publication migration. The result is a borrowed recipe.
+pub(super) struct ScalarValueSignatureDecision<'a> {
+    pub(super) argument_types: Vec<FunctionValueType>,
+    signature: &'a Signature,
+    bindings: Bindings,
+    // The original pass's return legality/physical hard-bound check still
+    // constructs this temporary. It is not a borrowed source or new proof.
+    // Removing it requires the sole layout preflight to support a borrowed
+    // template; this partial checkpoint does not guess physical depth.
+    checked_return_type: FunctionValueType,
+}
+impl ScalarValueSignatureDecision<'_> {
+    pub(super) fn result_recipe(
+        &self,
+        nullable: bool,
+    ) -> super::scalar_type_recipe::ScalarTypeRecipe<'_> {
+        super::scalar_type_recipe::ScalarTypeRecipe::new(
+            &self.signature.ret,
+            &self.bindings,
+            nullable,
+        )
+    }
+    pub(super) fn diagnostic_return_type(&self) -> FunctionValueType {
+        self.checked_return_type.clone()
+    }
+    fn materialize(
+        self,
+        _work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ResolvedScalarValueSignature, ResolveError> {
+        Ok(ResolvedScalarValueSignature {
+            argument_types: self.argument_types,
+            return_type: self.checked_return_type,
+            enforce_argument_binding: self.signature.argument_binding.is_enforced(),
+        })
+    }
+}
+
 pub fn resolve_scalar_value_signature_with_overload(
     name: &str,
     arguments: &[FunctionValueType],
+    control: &dyn PureCompileControl,
+) -> Result<(usize, ResolvedScalarValueSignature), ResolveError> {
+    resolve_scalar_value_signature_view_with_overload(
+        name,
+        ScalarTypes::from_values(arguments),
+        control,
+    )
+}
+
+pub(super) fn resolve_scalar_value_signature_view_with_overload(
+    name: &str,
+    arguments: ScalarTypes<'_>,
     control: &dyn PureCompileControl,
 ) -> Result<(usize, ResolvedScalarValueSignature), ResolveError> {
     value_resolution_scope(control, |work| {
@@ -198,7 +247,7 @@ pub fn resolve_scalar_value_signature_with_overload(
             for (index, signature) in candidates.iter().enumerate() {
                 work.step()?;
                 if let Some(resolved) =
-                    value_signature_in_pass(signature, arguments, &carriers, pass, work)?
+                    value_signature_in_pass(signature, arguments, carriers, pass, work)?
                 {
                     return Ok((index, resolved));
                 }
@@ -228,7 +277,91 @@ pub fn resolve_scalar_value_signature_at_overload(
     arguments: &[FunctionValueType],
     control: &dyn PureCompileControl,
 ) -> Result<ResolvedScalarValueSignature, ResolveError> {
-    value_resolution_scope(control, |work| {
+    resolve_scalar_value_signature_view_at_overload(
+        name,
+        overload_index,
+        ScalarTypes::from_values(arguments),
+        control,
+    )
+}
+
+pub(super) fn resolve_scalar_value_signature_view_at_overload(
+    name: &str,
+    overload_index: usize,
+    arguments: ScalarTypes<'_>,
+    control: &dyn PureCompileControl,
+) -> Result<ResolvedScalarValueSignature, ResolveError> {
+    decide_scalar_value_signature_at_overload(
+        name,
+        overload_index,
+        arguments,
+        control,
+        |decision, work| decision.materialize(work),
+    )
+}
+pub(super) fn scalar_value_decision_at_overload(
+    name: &str,
+    overload_index: usize,
+    arguments: ScalarTypes<'_>,
+    control: &dyn PureCompileControl,
+) -> Result<ScalarValueSignatureDecision<'static>, ResolveError> {
+    decide_scalar_value_signature_at_overload(
+        name,
+        overload_index,
+        arguments,
+        control,
+        |decision, _| Ok(decision),
+    )
+}
+
+fn decide_scalar_value_signature_at_overload<T>(
+    name: &str,
+    overload_index: usize,
+    arguments: ScalarTypes<'_>,
+    control: &dyn PureCompileControl,
+    consume: impl FnOnce(
+        ScalarValueSignatureDecision<'static>,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<T, ResolveError>,
+) -> Result<T, ResolveError> {
+    decide_scalar_value_signature_with_creation::<T, std::convert::Infallible>(
+        name,
+        overload_index,
+        arguments,
+        control,
+        None,
+        |decision, work| consume(decision, work).map_err(Into::into),
+    )
+    .map_err(ResolutionFailure::into_pure)
+}
+pub(super) fn scalar_value_decision_at_overload_with_creator_in<H>(
+    name: &str,
+    overload_index: usize,
+    arguments: ScalarTypes<'_>,
+    creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+    control: &dyn PureCompileControl,
+) -> Result<ScalarValueSignatureDecision<'static>, ResolutionFailure<H>> {
+    decide_scalar_value_signature_with_creation(
+        name,
+        overload_index,
+        arguments,
+        control,
+        Some(creation),
+        |decision, _| Ok(decision),
+    )
+}
+fn decide_scalar_value_signature_with_creation<T, H>(
+    name: &str,
+    overload_index: usize,
+    arguments: ScalarTypes<'_>,
+    control: &dyn PureCompileControl,
+    mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    consume: impl FnOnce(
+        ScalarValueSignatureDecision<'static>,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<T, ResolutionFailure<H>>,
+) -> Result<T, ResolutionFailure<H>> {
+    value_resolution_scope_with_creation(control, |work| {
         let candidates = registry::scalar_signatures(name).ok_or(ResolveError::UnknownFunction)?;
         let signature = candidates.get(overload_index).ok_or_else(|| {
             ResolveError::BadSignature("selected overload index is unknown".into())
@@ -236,16 +369,22 @@ pub fn resolve_scalar_value_signature_at_overload(
         let carriers = value_carriers(arguments, work)?;
         for pass in 0..5 {
             work.step()?;
-            if let Some(resolved) =
-                value_signature_in_pass(signature, arguments, &carriers, pass, work)?
-            {
-                return Ok(resolved);
+            if let Some(resolved) = value_signature_decision_with_creation(
+                signature,
+                arguments,
+                carriers,
+                pass,
+                work,
+                borrow_creator(&mut creation),
+            )? {
+                return consume(resolved, work);
             }
         }
         Err(ResolveError::NoMatchingSignature {
             candidates: 1,
             binding_enforced: signature.argument_binding.is_enforced(),
-        })
+        }
+        .into())
     })
 }
 
@@ -260,34 +399,56 @@ fn value_resolution_scope<T>(
     control: &dyn PureCompileControl,
     body: impl FnOnce(&mut CompileCheckpoints<'_>) -> Result<T, ResolveError>,
 ) -> Result<T, ResolveError> {
+    value_resolution_scope_with_creation::<T, std::convert::Infallible>(control, |work| {
+        body(work).map_err(Into::into)
+    })
+    .map_err(ResolutionFailure::into_pure)
+}
+fn value_resolution_scope_with_creation<T, H>(
+    control: &dyn PureCompileControl,
+    body: impl FnOnce(&mut CompileCheckpoints<'_>) -> Result<T, ResolutionFailure<H>>,
+) -> Result<T, ResolutionFailure<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
     let result = body(&mut work);
-    if matches!(result, Err(ResolveError::Control(_))) {
+    if matches!(
+        result,
+        Err(ResolutionFailure::Resolution(ResolveError::Control(_))
+            | ResolutionFailure::Creator(_)
+            | ResolutionFailure::Resource(_))
+    ) {
         return result;
     }
     work.finish()?;
     result
 }
 
-fn value_carriers(
-    arguments: &[FunctionValueType],
+fn value_carriers<'a>(
+    arguments: ScalarTypes<'a>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<DataType>, ResolveError> {
-    let mut carriers = Vec::with_capacity(arguments.len());
-    for argument in arguments {
+) -> Result<ScalarCarriers<'a>, ResolveError> {
+    for argument in arguments.iter() {
         work.step()?;
         binding_control::value_type(argument, work).map_err(binding_to_resolution)?;
-        carriers.push(argument.data_type.clone());
     }
-    Ok(carriers)
+    Ok(ScalarCarriers::from_values(arguments))
 }
 
 fn carrier_matches_observed(
     sig: &Signature,
-    args: &[DataType],
+    args: ScalarCarriers<'_>,
     pass: u8,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<bool, ResolveError> {
+    carrier_matches_with_creation::<std::convert::Infallible>(sig, args, pass, work, None)
+        .map_err(ResolutionFailure::into_pure)
+}
+fn carrier_matches_with_creation<H>(
+    sig: &Signature,
+    args: ScalarCarriers<'_>,
+    pass: u8,
+    work: &mut CompileCheckpoints<'_>,
+    mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<bool, ResolutionFailure<H>> {
     if !check_arity(sig, args.len())
         || (pass == 3 && !sig.argument_binding.is_enforced())
         || (pass == 4 && !sig.widening)
@@ -304,7 +465,15 @@ fn carrier_matches_observed(
         work.flush()?;
         let matched = match pass {
             0 => anchor_matches(spec, actual),
-            1 => unify(spec, actual, &mut bindings, BindMode::Strict),
+            1 => with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
+                super::signature::unify_with_construction(
+                    spec,
+                    actual,
+                    &mut bindings,
+                    BindMode::Strict,
+                    creation,
+                )
+            })?,
             2 => {
                 if anchor_matches(spec, actual) {
                     true
@@ -318,7 +487,15 @@ fn carrier_matches_observed(
             3 => {
                 anchor_matches(spec, actual) || implicit_anchor_cast_target(spec, actual).is_some()
             }
-            4 => unify(spec, actual, &mut bindings, BindMode::Widening),
+            4 => with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
+                super::signature::unify_with_construction(
+                    spec,
+                    actual,
+                    &mut bindings,
+                    BindMode::Widening,
+                    creation,
+                )
+            })?,
             _ => unreachable!("closed resolver pass"),
         };
         work.step()?;
@@ -331,12 +508,43 @@ fn carrier_matches_observed(
 
 fn value_signature_in_pass(
     signature: &Signature,
-    arguments: &[FunctionValueType],
-    carriers: &[DataType],
+    arguments: ScalarTypes<'_>,
+    carriers: ScalarCarriers<'_>,
     pass: u8,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Option<ResolvedScalarValueSignature>, ResolveError> {
-    let carrier_match = carrier_matches_observed(signature, carriers, pass, work)?;
+    value_signature_decision_in_pass(signature, arguments, carriers, pass, work)?
+        .map(|decision| decision.materialize(work))
+        .transpose()
+}
+
+fn value_signature_decision_in_pass<'a>(
+    signature: &'a Signature,
+    arguments: ScalarTypes<'_>,
+    carriers: ScalarCarriers<'_>,
+    pass: u8,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<ScalarValueSignatureDecision<'a>>, ResolveError> {
+    value_signature_decision_with_creation::<std::convert::Infallible>(
+        signature, arguments, carriers, pass, work, None,
+    )
+    .map_err(ResolutionFailure::into_pure)
+}
+fn value_signature_decision_with_creation<'a, H>(
+    signature: &'a Signature,
+    arguments: ScalarTypes<'_>,
+    carriers: ScalarCarriers<'_>,
+    pass: u8,
+    work: &mut CompileCheckpoints<'_>,
+    mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<Option<ScalarValueSignatureDecision<'a>>, ResolutionFailure<H>> {
+    let carrier_match = carrier_matches_with_creation(
+        signature,
+        carriers,
+        pass,
+        work,
+        borrow_creator(&mut creation),
+    )?;
     if !carrier_match {
         return Ok(None);
     }
@@ -349,17 +557,23 @@ fn value_signature_in_pass(
     for (index, actual) in arguments.iter().enumerate() {
         work.step()?;
         work.flush()?;
-        let matched = unify_value(
-            signature_spec_at(signature, index),
-            actual,
-            &mut bindings,
-            mode,
-        );
+        let matched = with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
+            super::signature::unify_value_with_construction(
+                signature_spec_at(signature, index),
+                actual,
+                &mut bindings,
+                mode,
+                creation,
+            )
+        })?;
         work.step()?;
         if !matched {
             return Ok(None);
         }
     }
+    with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
+        creation.array::<FunctionValueType>(arguments.len())
+    })?;
     let mut argument_types = Vec::with_capacity(arguments.len());
     for (index, actual) in arguments.iter().enumerate() {
         work.step()?;
@@ -368,12 +582,23 @@ fn value_signature_in_pass(
         work.flush()?;
         let target = match signature_spec_at(signature, index) {
             TypeSpec::AnyType | TypeSpec::AnyDecimal128 => actual.clone(),
-            spec => realize_value(spec, &bindings, actual.nullable)
-                .map_err(ResolveError::BadSignature)?,
+            spec => with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
+                super::signature::realize_value_with_construction(
+                    spec,
+                    &bindings,
+                    actual.nullable(),
+                    creation,
+                )
+            })?,
         };
         binding_control::value_type(&target, work).map_err(binding_to_resolution)?;
         work.flush()?;
-        let authorized = super::value_conversion::assignment_domains_authorized(actual, &target);
+        let authorized =
+            with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
+                super::value_conversion::assignment_domains_authorized_with_construction(
+                    actual, &target, creation,
+                )
+            })?;
         work.step()?;
         if !authorized {
             return Ok(None);
@@ -381,13 +606,17 @@ fn value_signature_in_pass(
         argument_types.push(target);
     }
     work.flush()?;
-    let return_type =
-        realize_value(&signature.ret, &bindings, true).map_err(ResolveError::BadSignature)?;
-    binding_control::value_type(&return_type, work).map_err(binding_to_resolution)?;
-    Ok(Some(ResolvedScalarValueSignature {
+    let checked_return_type =
+        with_resolution_creation(borrow_creator(&mut creation), work, |creation| {
+            super::scalar_type_recipe::ScalarTypeRecipe::new(&signature.ret, &bindings, true)
+                .materialize_with_construction(creation)
+        })?;
+    binding_control::value_type(&checked_return_type, work).map_err(binding_to_resolution)?;
+    Ok(Some(ScalarValueSignatureDecision {
         argument_types,
-        return_type,
-        enforce_argument_binding: signature.argument_binding.is_enforced(),
+        signature,
+        bindings,
+        checked_return_type,
     }))
 }
 
@@ -607,6 +836,62 @@ mod tests {
 
     fn list_of(item: DataType) -> DataType {
         DataType::List(Arc::new(Field::new("item", item, true)))
+    }
+
+    #[test]
+    fn json_producers_declare_their_value_domain_before_public_output_projection() {
+        struct Control;
+        impl PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                _: CompilePhase,
+                _: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                Ok(())
+            }
+        }
+        let text = FunctionValueType::new(DataType::Utf8, false);
+        let integer = FunctionValueType::new(DataType::Int64, false);
+        for (name, arguments) in [
+            ("parse_json", vec![text.clone()]),
+            ("json_object", vec![text.clone(), integer.clone()]),
+            ("json_array", vec![integer]),
+        ] {
+            let (overload, resolved) =
+                resolve_scalar_value_signature_with_overload(name, &arguments, &Control).unwrap();
+            assert_eq!(resolved.return_type.data_type(), &DataType::Utf8);
+            assert_eq!(
+                resolved.return_type.logical_type(),
+                novarocks_type_contract::ValueLogicalType::Json,
+                "the installed function declaration owns its nominal result"
+            );
+            assert_eq!(
+                resolve_scalar_value_signature_at_overload(name, overload, &arguments, &Control)
+                    .unwrap(),
+                resolved,
+                "selected-overload replay preserves the same complete declaration"
+            );
+            let (_, coalesce) = resolve_scalar_value_signature_with_overload(
+                "coalesce",
+                &[
+                    resolved.return_type,
+                    FunctionValueType::new(DataType::Null, true),
+                ],
+                &Control,
+            )
+            .unwrap();
+            assert_eq!(
+                coalesce.return_type.logical_type(),
+                novarocks_type_contract::ValueLogicalType::Json
+            );
+        }
+        let (_, upper) =
+            resolve_scalar_value_signature_with_overload("upper", &[text], &Control).unwrap();
+        assert_eq!(
+            upper.return_type.logical_type(),
+            novarocks_type_contract::ValueLogicalType::Physical,
+            "the same Utf8 carrier does not turn a text producer into JSON"
+        );
     }
 
     #[test]

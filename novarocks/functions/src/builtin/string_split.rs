@@ -24,7 +24,7 @@ use crate::{
 };
 use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::{Array, ArrayRef, StringArray};
-use arrow_schema::{DataType, Field};
+use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 use std::sync::Arc;
 #[derive(Clone, Copy, Debug)]
@@ -174,17 +174,46 @@ pub(super) fn validate_profile(
         let FunctionArgumentType::Value(source) = ty else {
             return Err(invalid("split requires value arguments"));
         };
-        if source.logical_type != ValueLogicalType::Physical || source.data_type != DataType::Utf8 {
+        if source.logical_type() != ValueLogicalType::Physical
+            || source.data_type() != &DataType::Utf8
+        {
             return Err(invalid("split requires its exact Physical Utf8 arguments"));
         }
-        nullable |= source.nullable;
+        nullable |= source.nullable();
     }
     let target = contract.result_type();
     step()?;
-    if target.logical_type != ValueLogicalType::Physical
-        || target.data_type != DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
-        || (nullable && !target.nullable)
-    {
+    // Both sources were checked above against the original Physical Utf8
+    // profile. Borrow that complete declaration for the canonical item; do
+    // not allocate a Field/name only to compare the result's immutable layout.
+    let FunctionArgumentType::Value(source) = &types[0] else {
+        unreachable!("checked split value argument")
+    };
+    let item_matches = if target.logical_type() != ValueLogicalType::Physical {
+        false
+    } else {
+        match (target.value_type().kind(), target.data_type()) {
+            (novarocks_type_contract::ValueKind::List(_), DataType::List(item)) => {
+                step()?;
+                if item.name() != "item" || !item.is_nullable() {
+                    false
+                } else if let Some(child) = target.typed_binding().borrowed().child_at(0) {
+                    step()?;
+                    child.value_type().nullable()
+                        && source
+                            .typed_binding()
+                            .borrowed()
+                            .same_physical_binding_ignoring_root_nullability_observed(
+                                child, &mut step,
+                            )?
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    };
+    if !item_matches || (nullable && !target.nullable()) {
         return Err(invalid(
             "split differs from its exact List Utf8 result contract",
         ));
@@ -220,7 +249,7 @@ pub(super) fn evaluate<'a>(
                 if row >= arg.array().len() {
                     return Err(internal("split selected address is out of bounds"));
                 }
-                if !source.nullable && nulls.as_ref().is_some_and(|n| n.is_null(row)) {
+                if !source.nullable() && nulls.as_ref().is_some_and(|n| n.is_null(row)) {
                     return Err(internal("split non-null selected source contains SQL NULL"));
                 }
             }
@@ -246,7 +275,7 @@ pub(super) fn evaluate<'a>(
         })?;
         SelectedValues::try_new_observed(
             selection,
-            &input.contract().result_type().data_type,
+            input.contract().result_type().data_type(),
             out,
             Box::default(),
             || work.step(),

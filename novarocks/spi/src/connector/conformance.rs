@@ -165,18 +165,42 @@ mod tests {
             object_id: ConnectorTableObjectId,
         ) -> ConnectorTableObjectBinding {
             ConnectorTableObjectBinding {
-                metadata: ConnectorTableMetadata {
-                    table: ConnectorTableHandle::try_new(
-                        table.instance_id.clone(),
-                        Bytes::from_static(b"table-handle"),
+                metadata: {
+                    let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+                    let schema = Arc::new(Schema::empty());
+                    let execution =
+                        novarocks_connector_contract::ConnectorReadExecutionSchema::try_new(
+                            schema.clone(),
+                            Box::default(),
+                            storage.clone(),
+                        )
+                        .unwrap();
+                    let mut request = |_: std::alloc::Layout| Ok(());
+                    let mut work = |_: usize| Ok(());
+                    let mut creation =
+                        crate::connector::read_stack::ConnectorReadSchemaCreation::new(
+                            storage,
+                            &mut request,
+                            &mut work,
+                        );
+                    ConnectorTableMetadata::try_new_typed(
+                        crate::connector::ConnectorTableMetadataHeader {
+                            table: ConnectorTableHandle::try_new(
+                                table.instance_id.clone(),
+                                Bytes::from_static(b"table-handle"),
+                            )
+                            .expect("test handle"),
+                            identity: table,
+                            planning_facts: ConnectorTablePlanningFacts::empty(),
+                            definition_facts: ConnectorTableDefinitionFacts::empty(),
+                            version: None,
+                            statistics_data_version: None,
+                        },
+                        schema,
+                        execution,
+                        &mut creation,
                     )
-                    .expect("test handle"),
-                    identity: table,
-                    schema: Arc::new(Schema::empty()),
-                    planning_facts: ConnectorTablePlanningFacts::empty(),
-                    definition_facts: ConnectorTableDefinitionFacts::empty(),
-                    version: None,
-                    statistics_data_version: None,
+                    .unwrap()
                 },
                 object_id,
             }
@@ -245,7 +269,11 @@ mod tests {
         fn load_table(
             &self,
             request: ConnectorTableRequest,
-        ) -> Result<ConnectorTableMetadata, ConnectorError> {
+            _creation: &mut crate::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
             Ok(Self::binding(request.table, Self::object_id()).metadata)
         }
     }

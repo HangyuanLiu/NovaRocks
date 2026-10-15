@@ -59,6 +59,16 @@ pub trait PureHigherOrderImplementation:
         body: Arc<LambdaBodyContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedHigherOrderKernel>, KernelFailure>;
+    fn prepare_higher_order_checked(
+        &self,
+        _input: CallEffectInput<'_>,
+        _checked: &crate::CheckedCallEffectInput<'_>,
+        _contract: Arc<HigherOrderCallContract>,
+        _body: Arc<LambdaBodyContract>,
+        _control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedHigherOrderKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        Err(crate::CheckedOwnerFailure::UnconvertedOwner)
+    }
 }
 
 /// Shared preparation owns no body instance, expansion frame or live service.
@@ -120,6 +130,83 @@ fn specialize_once<O: PureHigherOrderImplementation + ?Sized>(
     options: HigherOrderPreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<HigherOrderSpecialization, FunctionSpecializationFailure> {
+    specialize_once_core(
+        owner,
+        input,
+        selected,
+        frozen,
+        options,
+        control,
+        |arguments| {
+            crate::specialization::refine_once_for_specialization(
+                owner, input, frozen, arguments, control,
+            )
+        },
+        |contract, body| {
+            owner
+                .prepare_higher_order(input, contract, body, control)
+                .map_err(FunctionSpecializationFailure::Kernel)
+        },
+    )
+}
+
+pub(crate) fn specialize_once_checked<O: PureHigherOrderImplementation + ?Sized>(
+    owner: &O,
+    checked: &crate::CheckedCallEffectInput<'_>,
+    input: CallEffectInput<'_>,
+    selected: Arc<FunctionBindingSelection>,
+    frozen: Option<&CallEffects>,
+    options: HigherOrderPreparationOptions,
+    control: &dyn PureCompileControl,
+) -> Result<HigherOrderSpecialization, crate::CheckedOwnerFailure<FunctionSpecializationFailure>> {
+    specialize_once_core(
+        owner,
+        input,
+        selected,
+        frozen,
+        options,
+        control,
+        |arguments| {
+            crate::specialization::refine_once_checked(
+                owner, checked, input, frozen, arguments, control,
+            )
+        },
+        |contract, body| {
+            owner
+                .prepare_higher_order_checked(input, checked, contract, body, control)
+                .map_err(|error| match error {
+                    crate::CheckedOwnerFailure::Original(error) => {
+                        crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::Kernel(
+                            error,
+                        ))
+                    }
+                    crate::CheckedOwnerFailure::UnconvertedOwner => {
+                        crate::CheckedOwnerFailure::UnconvertedOwner
+                    }
+                })
+        },
+    )
+}
+
+fn specialize_once_core<
+    'a,
+    O: PureHigherOrderImplementation + ?Sized,
+    E: From<FunctionSpecializationFailure>,
+>(
+    _owner: &O,
+    input: CallEffectInput<'a>,
+    selected: Arc<FunctionBindingSelection>,
+    _frozen: Option<&CallEffects>,
+    options: HigherOrderPreparationOptions,
+    control: &dyn PureCompileControl,
+    refine: impl FnOnce(
+        ScopedExpressionEffects,
+    ) -> Result<(crate::RefinedCallEffects<'a>, ScopedExpressionEffects), E>,
+    prepare: impl FnOnce(
+        Arc<HigherOrderCallContract>,
+        Arc<LambdaBodyContract>,
+    ) -> Result<Arc<dyn PreparedHigherOrderKernel>, E>,
+) -> Result<HigherOrderSpecialization, E> {
     control
         .checkpoint(
             novarocks_type_contract::CompilePhase::FunctionSpecialization,
@@ -135,9 +222,7 @@ fn specialize_once<O: PureHigherOrderImplementation + ?Sized>(
         .for_use(options.body_context)
         .map_err(FunctionSpecializationFailure::Effects)?;
     let children = ScopedExpressionEffects::primitive(input.context, ordinary.join(body_effects));
-    let (receipt, effects) = crate::specialization::refine_once_for_specialization(
-        owner, input, frozen, children, control,
-    )?;
+    let (receipt, effects) = refine(children)?;
     let contract = Arc::new(
         HigherOrderCallContract::from_refined(input, &receipt, selected, control)
             .map_err(FunctionSpecializationFailure::Kernel)?,
@@ -152,14 +237,13 @@ fn specialize_once<O: PureHigherOrderImplementation + ?Sized>(
         )
         .map_err(FunctionSpecializationFailure::Kernel)?,
     );
-    let prepared = owner
-        .prepare_higher_order(input, contract.clone(), body.clone(), control)
-        .map_err(FunctionSpecializationFailure::Kernel)?;
+    let prepared = prepare(contract.clone(), body.clone())?;
     if !Arc::ptr_eq(prepared.contract(), &contract) || !Arc::ptr_eq(prepared.body_contract(), &body)
     {
         return Err(FunctionSpecializationFailure::Kernel(internal(
             "higher-order preparation replaced its exact call or body contract",
-        )));
+        ))
+        .into());
     }
     control
         .checkpoint(
@@ -412,8 +496,8 @@ impl HigherOrderEvaluationInstance {
         if selection.is_empty() {
             return SelectedValues::try_new(
                 selection,
-                &self.contract.result_type().data_type,
-                new_empty_array(&self.contract.result_type().data_type),
+                self.contract.result_type().data_type(),
+                new_empty_array(self.contract.result_type().data_type()),
                 Box::default(),
             )
             .map_err(|_| internal("empty higher-order result violates its exact type"));
@@ -489,7 +573,7 @@ fn validate_output(
         .same_rows_observed(selection, || work.step())?
         || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
             values.values().data_type(),
-            &contract.result_type().data_type,
+            contract.result_type().data_type(),
             || work.step(),
         )?
     {
@@ -545,7 +629,7 @@ fn validate_output(
             "required lambda evidence has no matching parent row error",
         ));
     }
-    if !contract.result_type().nullable {
+    if !contract.result_type().nullable() {
         let mut errors = values.errors().iter().peekable();
         for ordinal in 0..values.values().len() {
             if errors

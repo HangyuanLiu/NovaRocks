@@ -1805,7 +1805,7 @@ mod tests {
             Arc::new(Field::new(
                 "entries",
                 DataType::Struct(Fields::from(vec![
-                    Arc::new(Field::new("key", DataType::Int32, true)),
+                    Arc::new(Field::new("key", DataType::Int32, false)),
                     Arc::new(Field::new("value", DataType::Int32, true)),
                 ])),
                 false,
@@ -2529,8 +2529,8 @@ mod tests {
                     (
                         column.column_id,
                         column.name.as_str(),
-                        column.value_type.data_type.clone(),
-                        column.value_type.nullable,
+                        column.value_type.data_type().clone(),
+                        column.value_type.nullable(),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -3946,11 +3946,12 @@ mod tests {
     fn cse_replacement_and_passthrough_keep_complete_source_value_domain() {
         use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
         let mut arena = ScalarArena::new();
-        let source_type = FunctionValueType {
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: ValueLogicalType::Json,
-        };
+        let source_type = FunctionValueType::try_from_legacy_declared_projection(
+            DataType::Utf8,
+            true,
+            ValueLogicalType::Json,
+        )
+        .expect("valid temporary legacy value projection");
         let source = arena.intern(ScalarNode::ColumnRef(ColumnId(41)), source_type.clone());
         let nested = arena.intern(ScalarNode::Nested(source), source_type.clone());
         let mut factory = ColumnRefFactory::new();
@@ -4043,7 +4044,10 @@ mod intrinsic_eligibility_tests {
                     ),
                     volatility,
                 },
-                novarocks_type_contract::FunctionValueType::new(output.data_type, output.nullable),
+                novarocks_type_contract::FunctionValueType::new(
+                    output.data_type().clone(),
+                    output.nullable(),
+                ),
             );
             assert_eq!(eligible(&arena, call), expected, "{name}");
             if !expected {

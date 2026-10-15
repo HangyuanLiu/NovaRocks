@@ -1864,6 +1864,9 @@ fn write_statistics_contract(
             &arrow_schema,
             field,
             data_recipe.row_lineage(),
+            binding.execution_type().ok_or_else(|| {
+                invalid("Iceberg statistics writer input has no complete declaration")
+            })?,
         )?
         else {
             continue;
@@ -1894,6 +1897,7 @@ fn resolve_statistics_field(
     arrow_schema: &arrow::datatypes::Schema,
     field: &arrow::datatypes::Field,
     row_lineage: bool,
+    value_type: &novarocks_type_contract::FunctionValueType,
 ) -> Result<Option<(i32, novarocks_type_contract::FunctionValueType)>, ConnectorError> {
     let candidates = iceberg_schema
         .as_struct()
@@ -1933,13 +1937,9 @@ fn resolve_statistics_field(
             field.name()
         )));
     }
-    let value_type = crate::statistics_value_type::statistics_input_value_type(
-        iceberg_field,
-        arrow_schema.field(schema_ordinal),
-        field,
-    )
-    .map_err(invalid)?;
-    Ok(Some((iceberg_field.id, value_type)))
+    // Provider preparation has already paired this immutable declaration with
+    // the source field. Statistics pins reuse it; attributes never re-sign it.
+    Ok(Some((iceberg_field.id, value_type.clone())))
 }
 
 /// COW retains the already-loaded immutable generation. No capacity is minted.
@@ -2361,7 +2361,17 @@ impl IcebergWriteSessionControl {
                 ConnectorWriteSessionFlavor::CopyOnWrite { .. }
             ),
         )?;
-        let signed = sign_input_shape(&facts, &request.input)?;
+        let authored_input = crate::commit::write_preparation::freeze_write_input_request(
+            writer_metadata,
+            &request.input,
+            &request.context,
+        )?;
+        crate::commit::write_preparation::validate_session_write_input_request(
+            &request.input,
+            &authored_input,
+            &request.context,
+        )?;
+        let signed = sign_input_shape(&facts, &authored_input)?;
         let material = IcebergSessionMaterial {
             data_output: IcebergWriterOutput::try_new(
                 crate::delete_file::IcebergFileFormat::Parquet,
@@ -3105,38 +3115,47 @@ fn sign_input_shape(
                 hasher.update(format!("{:?}", field.field().data_type()).as_bytes());
                 hasher.update([u8::from(field.field().is_nullable())]);
                 let token = ConnectorWriteFieldToken::from_bytes(hasher.finalize().into());
-                ConnectorWriteFieldBinding::new(token, field.field().clone())
+                ConnectorWriteFieldBinding::try_new_typed(
+                    token,
+                    field.field().clone(),
+                    field
+                        .execution_type()
+                        .ok_or_else(|| {
+                            invalid("Iceberg session field has no frozen complete declaration")
+                        })?
+                        .clone(),
+                )
             })
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, ConnectorError>>()
     };
     let shape = match request {
         ConnectorWriteInputRequest::Data { fields } => ConnectorWriteInputShape::Data {
-            fields: sign("data", fields),
+            fields: sign("data", fields)?,
         },
         ConnectorWriteInputRequest::RowLineage {
             data_fields,
             row_identity_fields,
         } => ConnectorWriteInputShape::RowLineage {
-            data_fields: sign("row-lineage-data", data_fields),
-            row_identity_fields: sign("row-lineage-identity", row_identity_fields),
+            data_fields: sign("row-lineage-data", data_fields)?,
+            row_identity_fields: sign("row-lineage-identity", row_identity_fields)?,
         },
         ConnectorWriteInputRequest::PositionDelete {
             identity_fields,
             partition_source_fields,
         } => ConnectorWriteInputShape::PositionDelete {
-            identity_fields: sign("position-delete-identity", identity_fields),
-            partition_source_fields: sign("position-delete-partition", partition_source_fields),
+            identity_fields: sign("position-delete-identity", identity_fields)?,
+            partition_source_fields: sign("position-delete-partition", partition_source_fields)?,
         },
         ConnectorWriteInputRequest::DeletionVector {
             identity_fields,
             partition_source_fields,
         } => ConnectorWriteInputShape::DeletionVector {
-            identity_fields: sign("deletion-vector-identity", identity_fields),
-            partition_source_fields: sign("deletion-vector-partition", partition_source_fields),
+            identity_fields: sign("deletion-vector-identity", identity_fields)?,
+            partition_source_fields: sign("deletion-vector-partition", partition_source_fields)?,
         },
         ConnectorWriteInputRequest::EqualityDelete { equality_fields } => {
             ConnectorWriteInputShape::EqualityDelete {
-                equality_fields: sign("equality-delete", equality_fields),
+                equality_fields: sign("equality-delete", equality_fields)?,
             }
         }
     };
@@ -3464,6 +3483,7 @@ mod statistics_contract_tests {
                 &arrow,
                 &Field::new("FOO", DataType::Int64, false),
                 false,
+                &novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             )
             .expect_err("ambiguous casing")
             .message()
@@ -3484,7 +3504,16 @@ mod statistics_contract_tests {
             Field::new("v", DataType::Int32, false),
             Field::new("v", DataType::Int64, true),
         ] {
-            assert!(resolve_statistics_field(&iceberg, &arrow, &field, false).is_err());
+            assert!(
+                resolve_statistics_field(
+                    &iceberg,
+                    &arrow,
+                    &field,
+                    false,
+                    &novarocks_type_contract::FunctionValueType::new(DataType::Int64, false)
+                )
+                .is_err()
+            );
         }
     }
 
@@ -3509,32 +3538,39 @@ mod statistics_contract_tests {
             &arrow,
             &Field::new("U", DataType::FixedSizeBinary(16), true),
             false,
+            &novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                true,
+                novarocks_type_contract::ValueLogicalType::Uuid,
+            )
+            .unwrap(),
         )
         .expect("UUID source")
         .expect("UUID field");
         assert_eq!(uuid_id, 7);
         assert_eq!(
-            uuid.logical_type,
+            uuid.logical_type(),
             novarocks_type_contract::ValueLogicalType::Uuid
         );
-        assert_eq!(uuid.data_type, DataType::FixedSizeBinary(16));
+        assert_eq!(uuid.data_type(), &DataType::FixedSizeBinary(16));
         let (fixed_id, fixed) = resolve_statistics_field(
             &iceberg,
             &arrow,
             &Field::new("fixed", DataType::FixedSizeBinary(16), false),
             false,
+            &novarocks_type_contract::FunctionValueType::new(DataType::FixedSizeBinary(16), false),
         )
         .expect("fixed source")
         .expect("fixed field");
         assert_eq!(fixed_id, 8);
         assert_eq!(
-            fixed.logical_type,
+            fixed.logical_type(),
             novarocks_type_contract::ValueLogicalType::Physical
         );
     }
 
     #[test]
-    fn write_statistics_keeps_authoritative_property_domains_and_rejects_retagging() {
+    fn write_statistics_keeps_frozen_domains_independently_of_source_tags() {
         let iceberg = schema(vec![
             Arc::new(NestedField::optional(
                 1,
@@ -3575,11 +3611,18 @@ mod statistics_contract_tests {
         .enumerate()
         {
             let field = arrow.field(ordinal);
-            let (field_id, actual) = resolve_statistics_field(&iceberg, &arrow, field, false)
-                .unwrap()
-                .unwrap();
+            let frozen = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                field.data_type().clone(),
+                true,
+                logical,
+            )
+            .unwrap();
+            let (field_id, actual) =
+                resolve_statistics_field(&iceberg, &arrow, field, false, &frozen)
+                    .unwrap()
+                    .unwrap();
             assert_eq!(field_id, ordinal as i32 + 1);
-            assert_eq!(actual.logical_type, logical);
+            assert_eq!(actual.logical_type(), logical);
             let wrong_tag = if logical == ValueLogicalType::Hll {
                 "bitmap"
             } else {
@@ -3588,7 +3631,11 @@ mod statistics_contract_tests {
             let forged = field
                 .clone()
                 .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), wrong_tag.into())].into());
-            assert!(resolve_statistics_field(&iceberg, &arrow, &forged, false).is_err());
+            let (_, actual) = resolve_statistics_field(&iceberg, &arrow, &forged, false, &frozen)
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual, frozen);
+            assert_eq!(forged.metadata()[NR_LOGICAL_TYPE_KEY], wrong_tag);
         }
     }
 
@@ -3605,20 +3652,27 @@ mod statistics_contract_tests {
             Field::new("u", DataType::Utf8, true),
             Field::new("u", DataType::FixedSizeBinary(15), true),
             Field::new("u", DataType::FixedSizeBinary(16), false),
-            Field::new("u", DataType::FixedSizeBinary(16), true).with_metadata(
-                [(
-                    novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
-                    "largeint".into(),
-                )]
-                .into(),
-            ),
         ] {
-            assert!(resolve_statistics_field(&iceberg, &arrow, &field, false).is_err());
+            assert!(
+                resolve_statistics_field(
+                    &iceberg,
+                    &arrow,
+                    &field,
+                    false,
+                    &novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                        DataType::FixedSizeBinary(16),
+                        true,
+                        novarocks_type_contract::ValueLogicalType::Uuid
+                    )
+                    .unwrap()
+                )
+                .is_err()
+            );
         }
     }
 
     #[test]
-    fn write_statistics_preserves_variant_storage_identity_and_rejects_opaque_conflict() {
+    fn write_statistics_preserves_frozen_variant_and_rejects_source_carrier_conflict() {
         let iceberg = schema(vec![Arc::new(NestedField::optional(
             9,
             "v",
@@ -3627,15 +3681,21 @@ mod statistics_contract_tests {
         let arrow = crate::schema_mapping::sql_read_schema_from_iceberg(&iceberg)
             .expect("SQL read carrier");
         let field = Field::new("v", DataType::LargeBinary, true);
-        let (id, value_type) = resolve_statistics_field(&iceberg, &arrow, &field, false)
+        let frozen = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            novarocks_type_contract::ValueLogicalType::Variant,
+        )
+        .unwrap();
+        let (id, value_type) = resolve_statistics_field(&iceberg, &arrow, &field, false, &frozen)
             .expect("VARIANT input")
             .expect("VARIANT field");
         assert_eq!(id, 9);
         assert_eq!(
-            value_type.logical_type,
+            value_type.logical_type(),
             novarocks_type_contract::ValueLogicalType::Variant
         );
-        assert_eq!(value_type.data_type, DataType::LargeBinary);
+        assert_eq!(value_type.data_type(), &DataType::LargeBinary);
         let conflicting = field.with_metadata(
             [(
                 novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
@@ -3643,13 +3703,20 @@ mod statistics_contract_tests {
             )]
             .into(),
         );
-        assert!(resolve_statistics_field(&iceberg, &arrow, &conflicting, false).is_err());
+        assert_eq!(
+            resolve_statistics_field(&iceberg, &arrow, &conflicting, false, &frozen)
+                .unwrap()
+                .unwrap()
+                .1,
+            frozen
+        );
         assert!(
             resolve_statistics_field(
                 &iceberg,
                 &arrow,
                 &Field::new("v", DataType::Binary, true),
                 false,
+                &frozen,
             )
             .is_err()
         );

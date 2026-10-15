@@ -121,7 +121,16 @@ impl OwnedLocalResult {
             size_of::<ClientRenderSchema>() + fields.len() * size_of::<RenderColumn>();
         let mut wire = 0usize;
         for field in fields {
-            kind(field.data_type(), field.logical_type().is_some())?;
+            match field.value_type().value_type().kind() {
+                novarocks_type_contract::ValueKind::String => {}
+                novarocks_type_contract::ValueKind::Scalar(
+                    arrow::datatypes::DataType::Boolean
+                    | arrow::datatypes::DataType::Int32
+                    | arrow::datatypes::DataType::Int64,
+                ) => {}
+                _ => return Err("Local result field is outside its closed value contract".into()),
+            }
+            kind(field.data_type(), false)?;
             if field.name().is_empty() || field.name().len() > RootProfileV1::MAX_NAME_BYTES {
                 return Err("Local result name exceeds its schema bound".into());
             }
@@ -467,10 +476,25 @@ mod tests {
             .produce(|| {
                 build_arrow_query_result(
                     vec![
-                        ResultField::new("active", DataType::Boolean, false, None),
-                        ResultField::new("small", DataType::Int32, false, None),
-                        ResultField::new("large", DataType::Int64, false, None),
-                        ResultField::new("text", DataType::Utf8, true, None),
+                        ResultField::new(
+                            "active",
+                            novarocks_type_contract::FunctionValueType::new(
+                                DataType::Boolean,
+                                false,
+                            ),
+                        ),
+                        ResultField::new(
+                            "small",
+                            novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+                        ),
+                        ResultField::new(
+                            "large",
+                            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                        ),
+                        ResultField::new(
+                            "text",
+                            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+                        ),
                     ],
                     vec![
                         Arc::new(BooleanArray::from(vec![true])),
@@ -558,14 +582,23 @@ mod tests {
             let result = source.produce(|| {
                 if mismatch {
                     let mut result = build_arrow_query_result(
-                        vec![ResultField::new("value", DataType::Int64, false, None)],
+                        vec![ResultField::new(
+                            "value",
+                            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                        )],
                         vec![Arc::new(Int64Array::from(vec![1]))],
                     )?;
-                    result.columns = vec![ResultField::new("value", DataType::Utf8, false, None)];
+                    result.columns = vec![ResultField::new(
+                        "value",
+                        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+                    )];
                     Ok(result)
                 } else {
                     build_arrow_query_result(
-                        vec![ResultField::new("value", DataType::Int16, false, None)],
+                        vec![ResultField::new(
+                            "value",
+                            novarocks_type_contract::FunctionValueType::new(DataType::Int16, false),
+                        )],
                         vec![Arc::new(Int16Array::from(vec![1]))],
                     )
                 }

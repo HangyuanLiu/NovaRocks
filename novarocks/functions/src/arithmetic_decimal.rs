@@ -27,7 +27,7 @@ use arrow_buffer::i256;
 use arrow_schema::DataType;
 use novarocks_type_contract::{
     ArithmeticOperator, CompileCheckpoints, DecimalOverflowPolicy, ExpressionEffects,
-    FunctionValueType, ValueLogicalType, arithmetic_result_value_type_with_op,
+    FunctionValueType, ValueLogicalType, arithmetic_result_value_shape_with_op,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,7 +42,7 @@ enum Reader {
 }
 impl Reader {
     fn from_type(value: &FunctionValueType) -> Option<Self> {
-        match (&value.logical_type, &value.data_type) {
+        match (&value.logical_type(), value.data_type()) {
             (ValueLogicalType::Physical, DataType::Int8) => Some(Self::I8),
             (ValueLogicalType::Physical, DataType::Int16) => Some(Self::I16),
             (ValueLogicalType::Physical, DataType::Int32) => Some(Self::I32),
@@ -156,23 +156,23 @@ impl DecimalArithmetic {
         operator: ArithmeticOperator,
         left: &FunctionValueType,
         right: &FunctionValueType,
-        result: &FunctionValueType,
+        result: (&DataType, ValueLogicalType, bool),
         policy: DecimalOverflowPolicy,
         allow: bool,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<Self>, ArithmeticPrepareError> {
         if !matches!(
-            result.data_type,
+            result.0,
             DataType::Decimal128(..) | DataType::Decimal256(..)
         ) {
             return Ok(None);
         }
-        let expected = arithmetic_result_value_type_with_op(left, right, operator);
-        let matches = expected.as_ref().is_some_and(|expected| {
-            result.logical_type == expected.logical_type
-                && result.data_type == expected.data_type
-                && result.nullable
-        });
+        let expected = arithmetic_result_value_shape_with_op(left, right, operator);
+        // The caller supplies the same original result decision with the
+        // executable nullable law. No second expected FVT is published here.
+        let matches = expected
+            .as_ref()
+            .is_some_and(|expected| result.1 == expected.1 && result.0 == &expected.0 && result.2);
         work.step()?;
         if !matches {
             return Err(ArithmeticPrepareError::TypeMismatch);
@@ -182,13 +182,13 @@ impl DecimalArithmetic {
         else {
             return Err(ArithmeticPrepareError::Unsupported);
         };
-        let scale = |ty: &FunctionValueType| match ty.data_type {
-            DataType::Decimal128(_, scale) | DataType::Decimal256(_, scale) => i32::from(scale),
+        let scale = |ty: &FunctionValueType| match ty.data_type() {
+            DataType::Decimal128(_, scale) | DataType::Decimal256(_, scale) => i32::from(*scale),
             _ => 0,
         };
         let ls = scale(left);
         let rs = scale(right);
-        let algorithm = match result.data_type {
+        let algorithm = match result.0 {
             DataType::Decimal128(precision, out_scale) => {
                 if matches!(left_reader, Reader::Decimal256 | Reader::LargeInt)
                     || matches!(right_reader, Reader::Decimal256 | Reader::LargeInt)
@@ -199,7 +199,7 @@ impl DecimalArithmetic {
                 {
                     return Err(ArithmeticPrepareError::Unsupported);
                 }
-                let os = i32::from(out_scale);
+                let os = i32::from(*out_scale);
                 let product_diff = os - ls - rs;
                 let division_diff = os + rs - ls;
                 Algorithm::Decimal128 {
@@ -209,7 +209,7 @@ impl DecimalArithmetic {
                     product_diff,
                     division_factor: power128(division_diff.unsigned_abs(), work)?,
                     division_diff,
-                    precision_limit: power128(u32::from(precision), work)?
+                    precision_limit: power128(u32::from(*precision), work)?
                         .ok_or(ArithmeticPrepareError::TypeMismatch)?
                         as u128,
                 }
@@ -228,11 +228,11 @@ impl DecimalArithmetic {
                 {
                     return Err(ArithmeticPrepareError::Unsupported);
                 }
-                let os = i32::from(out_scale);
+                let os = i32::from(*out_scale);
                 Algorithm::Mixed256 {
                     left_factor: power256((os - ls).unsigned_abs(), work)?,
                     right_factor: power256((os - rs).unsigned_abs(), work)?,
-                    precision_limit: power256(u32::from(precision), work)?
+                    precision_limit: power256(u32::from(*precision), work)?
                         .ok_or(ArithmeticPrepareError::TypeMismatch)?,
                 }
             }

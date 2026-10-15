@@ -68,6 +68,7 @@ fn test_avg_decimal_round_half_up_positive() {
             input_arg_type: None,
         }),
         order: Default::default(),
+        frozen: None,
     };
 
     let arrays = [Some(input.clone())];
@@ -117,6 +118,7 @@ fn test_avg_decimal_round_half_up_negative() {
             input_arg_type: None,
         }),
         order: Default::default(),
+        frozen: None,
     };
 
     let arrays = [Some(input.clone())];
@@ -159,6 +161,7 @@ fn test_avg_intermediate_binary_requires_type_signature() {
             input_arg_type: None,
         }),
         order: Default::default(),
+        frozen: None,
     };
 
     let err = build_builtin_kernel_set(
@@ -186,6 +189,7 @@ fn test_avg_intermediate_utf8_with_exact_catalog_signature_builds() {
             input_arg_type: Some(DataType::Decimal128(10, 2)),
         }),
         order: Default::default(),
+        frozen: None,
     };
 
     let kernels = build_builtin_kernel_set(

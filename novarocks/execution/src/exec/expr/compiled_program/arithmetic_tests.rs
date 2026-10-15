@@ -167,6 +167,7 @@ fn compile_arithmetic(
                 )
                 .unwrap();
             frozen.push(FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -304,7 +305,9 @@ fn build_program(
     };
     let mut result_type =
         arithmetic_result_value_type_with_op(&left_type, &right_type, operation(op)).unwrap();
-    result_type.nullable = true;
+    result_type = result_type
+        .with_nullable(true)
+        .expect("valid test root nullability");
     let computed = arithmetic(&mut builder, op, left, right, &result_type);
     let mut authors = BTreeMap::new();
     let root = match wrap {
@@ -555,8 +558,8 @@ fn five_signed_operators_keep_frozen_mixed_widths_and_sparse_selected_addresses(
             };
             let recipe = program.arithmetic_recipe(occurrence).unwrap();
             assert_eq!(recipe.operator(), operation(op));
-            assert_eq!(recipe.left_type().data_type, left);
-            assert_eq!(recipe.right_type().data_type, right);
+            assert_eq!(recipe.left_type().data_type().clone(), left);
+            assert_eq!(recipe.right_type().data_type().clone(), right);
             assert!(recipe.allow_throw_exception());
             assert_eq!(
                 recipe.decimal_overflow_policy(),

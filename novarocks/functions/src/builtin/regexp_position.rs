@@ -103,9 +103,9 @@ pub(super) fn validate_profile(
             return Err(invalid("regexp_position requires value arguments"));
         };
         let supported = if i < 2 {
-            ty.data_type == DataType::Utf8 && ty.logical_type == ValueLogicalType::Physical
+            ty.data_type() == &DataType::Utf8 && ty.logical_type() == ValueLogicalType::Physical
         } else {
-            ty.data_type == DataType::Int64 && ty.logical_type == ValueLogicalType::Physical
+            ty.data_type() == &DataType::Int64 && ty.logical_type() == ValueLogicalType::Physical
         };
         if !supported {
             return Err(invalid(
@@ -115,7 +115,8 @@ pub(super) fn validate_profile(
     }
     step()?;
     let target = contract.result_type();
-    if target.data_type != DataType::Int32 || target.logical_type != ValueLogicalType::Physical {
+    if target.data_type() != &DataType::Int32 || target.logical_type() != ValueLogicalType::Physical
+    {
         return Err(invalid(
             "regexp_position has no exact installed result profile",
         ));

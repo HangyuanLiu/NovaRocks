@@ -121,10 +121,10 @@ pub(crate) fn prepared_with_control(
 #[test]
 fn map_lookup_real_public_arity_and_nullable_result_match_original_binding() {
     let fields = vec![
-        Arc::new(Field::new("key", DataType::Int32, true)),
+        Arc::new(Field::new("key", DataType::Int32, false)),
         Arc::new(Field::new("value", DataType::Utf8, true)),
     ];
-    let map = FunctionValueType::new(
+    let map = FunctionValueType::from_legacy_declared_projection(
         DataType::Map(
             Arc::new(Field::new(
                 "entries",
@@ -162,10 +162,10 @@ fn map_lookup_real_public_arity_and_nullable_result_match_original_binding() {
 fn map_lookup_null_result_profile_is_named_refusal_for_both_source_nullabilities() {
     for nullable in [false, true] {
         let fields = vec![
-            Arc::new(Field::new("key", DataType::Int32, true)),
+            Arc::new(Field::new("key", DataType::Int32, false)),
             Arc::new(Field::new("value", DataType::Null, true)),
         ];
-        let map = FunctionValueType::new(
+        let map = FunctionValueType::from_legacy_declared_projection(
             DataType::Map(
                 Arc::new(Field::new(
                     "entries",

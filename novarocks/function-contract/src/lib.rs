@@ -41,7 +41,7 @@ pub enum FunctionArgument<C = ConstantValue> {
         constant: Option<C>,
     },
     Lambda {
-        parameter_types: Box<[FunctionValueType]>,
+        parameter_types: novarocks_type_contract::FunctionParameterTypes,
         result_type: FunctionValueType,
     },
 }
@@ -138,16 +138,9 @@ impl<C> FunctionArgument<C> {
         match (self, expected) {
             (Self::Value { value_type, .. }, FunctionArgumentType::Value(expected)) => {
                 work.step()?;
-                if value_type.logical_type != expected.logical_type
-                    || (value_type.nullable && !expected.nullable)
-                {
-                    return Ok(false);
-                }
-                novarocks_type_contract::fits_nested_nullability_observed(
-                    &value_type.data_type,
-                    &expected.data_type,
-                    || work.step().map_err(FunctionBindingError::from),
-                )
+                value_type.fits_physical_binding_observed(expected, || {
+                    work.step().map_err(FunctionBindingError::from)
+                })
             }
             (
                 Self::Lambda {

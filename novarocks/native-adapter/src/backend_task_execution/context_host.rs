@@ -19,7 +19,10 @@
 //!
 //! One establish installs four shared facts on this backend — query options,
 //! catalog runtimes, a runtime-filter participant, and the query's vended
-//! credentials — and one release takes all four back. This is the only place that owns that
+//! credentials — and establishes their native execution resources under the
+//! same query options. One release takes the shared facts back and retires idle
+//! resources; live fragments and independent type holders retain their own
+//! actual responsibilities. This is the only place that owns that
 //! pairing, and it owns nothing else: the owner in [`super::registry`] decides
 //! *whether* a context establishes, advances, or retires, and this host only
 //! carries out the decision it was handed.
@@ -57,8 +60,8 @@ use novarocks_execution_contract::task_execution::domain::ContentFingerprint;
 use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
 use novarocks_execution_contract::task_execution::operation::QueryContextDomainUpdate;
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
+use novarocks_proto_codec::lifecycle::QueryTerminationReason;
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
-use novarocks_proto_codec::lifecycle::{QueryTerminationReason, RuntimeFilterContribution};
 use novarocks_proto_models::novarocks as proto;
 use novarocks_spi::connector::ConnectorMaterializationErrorClass;
 use novarocks_spi::connector::{
@@ -74,7 +77,7 @@ use crate::{
     BackendDataRuntime,
     runtime_filter_feedback::TaskRuntimeFilterFeedbackEgress,
     runtime_filter_install::{
-        DecodedRuntimeFilterContribution, decode_runtime_filter_contribution,
+        DecodedRuntimeFilterContribution, decode_runtime_filter_contribution_with_type_creator,
     },
     runtime_filter_participant::RuntimeFilterParticipant,
     runtime_filter_terminal::{
@@ -131,6 +134,23 @@ struct ContextFacts {
 struct InstalledContext {
     credentials: Arc<QueryContextCredentialSlot>,
     facts: Mutex<ContextFacts>,
+}
+
+/// Observe the same release decision as in-flight shared-fact installation.
+/// Only the decode frame borrows this context; returned type storage does not.
+struct ContextTypeConstructionControl<'a>(&'a InstalledContext);
+impl novarocks_type_contract::PureCompileControl for ContextTypeConstructionControl<'_> {
+    fn checkpoint(
+        &self,
+        _: novarocks_type_contract::CompilePhase,
+        _: u32,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        if self.0.is_released() {
+            Err(novarocks_type_contract::CompileControlError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl InstalledContext {
@@ -223,6 +243,7 @@ impl HostContexts {
 
 /// The backend's real [`QueryContextHost`].
 pub struct NativeQueryContextHost {
+    queries: crate::native_fragment_query::NativeFragmentQueryRuntime,
     catalog_manager: Arc<CatalogManager<ConnectorExecutionRoleBinding>>,
     execution_role_binding_factories: Arc<ConnectorExecutionRoleBindingFactorySet>,
     runtime_filter_installer: Arc<RuntimeFilterParticipantInstaller>,
@@ -268,12 +289,14 @@ impl NativeQueryContextHost {
     /// Crate-private because only this process's composition can install a
     /// Native runtime-filter participant around a Worker participant.
     pub(crate) fn new(
+        queries: crate::native_fragment_query::NativeFragmentQueryRuntime,
         catalog_manager: Arc<CatalogManager<ConnectorExecutionRoleBinding>>,
         execution_role_binding_factories: Arc<ConnectorExecutionRoleBindingFactorySet>,
         runtime_filter_installer: Arc<RuntimeFilterParticipantInstaller>,
         catalog_install_runtime: BackendDataRuntime,
     ) -> Self {
         Self {
+            queries,
             catalog_manager,
             execution_role_binding_factories,
             runtime_filter_installer,
@@ -513,6 +536,12 @@ impl NativeQueryContextHost {
         // still unwinding, and releasing a query that holds none is a no-op.
         self.catalog_manager
             .release_query(context.query_execution_id());
+        if self
+            .queries
+            .retire_idle_execution(context.query_execution_id())
+        {
+            self.queries.publish_resource_snapshot();
+        }
         self.publish_catalog_lease_metrics();
         evidence
     }
@@ -568,6 +597,23 @@ impl NativeQueryContextHost {
         installed.credentials.install(material.leases())?;
         self.still_establishing(installed)?;
 
+        let (delivery_expire, query_expire) =
+            novarocks_execution::runtime::query_options::query_expire_durations(Some(&options));
+        let resources = self.queries.establish_query_resources(
+            execution_id,
+            delivery_expire,
+            query_expire,
+            options.exec_mem_limit(),
+        );
+        self.queries.publish_resource_snapshot();
+        resources.map_err(|error| {
+            HostRejection::new(
+                TaskFailureCategory::ResourceExhausted,
+                format!("query context could not establish execution resources: {error}"),
+            )
+        })?;
+        self.still_establishing(installed)?;
+
         {
             let mut facts = installed
                 .facts
@@ -582,7 +628,7 @@ impl NativeQueryContextHost {
             ));
         }
 
-        if let Some(decoded) = decoded_contribution(execution_id, contribution)? {
+        if let Some(decoded) = self.decode_contribution(context, installed, contribution)? {
             let participant = (self.runtime_filter_installer)(execution_id, decoded)
                 .map_err(runtime_filter_rejection)?;
             self.adopt_participant(context, installed, participant)?;
@@ -594,6 +640,46 @@ impl NativeQueryContextHost {
         // time this runs, so a release that arrives from here on finds all of
         // them, and one that already ran is seen here and unwound by the caller.
         self.still_establishing(installed)
+    }
+
+    fn decode_contribution(
+        &self,
+        context: QueryContextRef,
+        installed: &InstalledContext,
+        contribution: &proto::RuntimeFilterContribution,
+    ) -> Result<Option<DecodedRuntimeFilterContribution>, HostRejection> {
+        if contribution.participant_id == 0 {
+            if contribution.lifecycle.is_some() || contribution.install.is_some() {
+                return Err(protocol(
+                    "runtime filter contribution names no participant but carries an install",
+                ));
+            }
+            return Ok(None);
+        }
+        let control = ContextTypeConstructionControl(installed);
+        novarocks_type_contract::PureCompileControl::checkpoint(
+            &control,
+            novarocks_type_contract::CompilePhase::LowerProgram,
+            0,
+        )
+        .map_err(|_| cancelled_establish())?;
+        // The original query options already installed this policy while the
+        // context established. This is only an exact-owner lookup.
+        let tracker = self
+            .queries
+            .type_construction_tracker(context.query_execution_id(), None)
+            .map_err(|error| {
+                if installed.is_released() {
+                    cancelled_establish()
+                } else {
+                    internal(&format!("established query resources are absent: {error}"))
+                }
+            })?;
+        let creator = crate::native_type_construction::NativeTypeConstruction::try_with_control(
+            tracker, &control,
+        )
+        .map_err(|cause| context_type_construction_rejection(&cause))?;
+        decoded_contribution(context.query_execution_id(), contribution, &creator)
     }
 
     /// Publishes a freshly installed participant, or closes it if it lost.
@@ -943,8 +1029,7 @@ impl QueryContextHost for NativeQueryContextHost {
             )),
             QueryContextDomainUpdate::SharedDynamicFilter { payload, .. } => {
                 let contribution = runtime_filter_install(payload.as_ref())?;
-                let Some(decoded) =
-                    decoded_contribution(context.query_execution_id(), contribution)?
+                let Some(decoded) = self.decode_contribution(context, &installed, contribution)?
                 else {
                     // An advance exists to carry a change. "Install nothing"
                     // either says the participant should be removed, which a
@@ -994,6 +1079,7 @@ impl QueryContextHost for NativeQueryContextHost {
 fn decoded_contribution(
     execution_id: QueryExecutionId,
     contribution: &proto::RuntimeFilterContribution,
+    creator: &crate::native_type_construction::NativeTypeConstruction<'_>,
 ) -> Result<Option<DecodedRuntimeFilterContribution>, HostRejection> {
     if contribution.participant_id == 0 {
         if contribution.lifecycle.is_some() || contribution.install.is_some() {
@@ -1003,11 +1089,31 @@ fn decoded_contribution(
         }
         return Ok(None);
     }
-    let parsed = RuntimeFilterContribution::parse(contribution.clone())
-        .map_err(|error| protocol(&format!("runtime filter contribution is invalid: {error}")))?;
-    decode_runtime_filter_contribution(execution_id, &parsed)
+    decode_runtime_filter_contribution_with_type_creator(execution_id, contribution, creator)
         .map(Some)
-        .map_err(runtime_filter_rejection)
+        .map_err(|cause| match cause.construction_cause() {
+            Some(cause) => context_type_construction_rejection(cause),
+            None => protocol(&format!("runtime filter contribution is invalid: {cause}")),
+        })
+}
+
+fn context_type_construction_rejection(
+    cause: &crate::native_type_construction::NativeTypeConstructionError,
+) -> HostRejection {
+    use crate::native_type_construction::NativeTypeConstructionError as E;
+    use novarocks_type_contract::CompileControlError as C;
+    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+    let category = match cause {
+        E::Control(C::Cancelled | C::DeadlineExceeded) => TaskFailureCategory::Execution,
+        E::Resource(LayoutResourceError::SourceModel) => TaskFailureCategory::Internal,
+        E::Control(C::ResourceExhausted) | E::Capacity(_) | E::Resource(_) => {
+            TaskFailureCategory::ResourceExhausted
+        }
+    };
+    HostRejection::new(
+        category,
+        format!("runtime filter type construction failed: {cause}"),
+    )
 }
 
 /// Closes one participant, recording a close that did not complete.
@@ -1552,6 +1658,10 @@ mod tests {
             );
             let filter_installer = Arc::clone(&filter_factory);
             let host = Arc::new(NativeQueryContextHost::new(
+                crate::native_fragment_query::NativeFragmentQueryRuntime::new_for_test(
+                    novarocks_worker::query_context::QueryContextManager::new_for_test(),
+                    crate::backend_test_support::test_memory_authority(),
+                ),
                 Arc::clone(&catalog_manager),
                 factories,
                 Arc::new(move |execution_id, contribution| {
@@ -1610,6 +1720,68 @@ mod tests {
     }
 
     // ----------------------------------------------------------------- tests
+
+    #[test]
+    fn an_admitted_context_has_its_original_resources_before_its_first_task() {
+        let fixture = Fixture::new();
+        let context = context(81_001);
+        assert!(
+            fixture
+                .host
+                .queries
+                .type_construction_tracker(context.query_execution_id(), None,)
+                .is_err()
+        );
+        fixture
+            .establish_with_options(
+                context,
+                Vec::new(),
+                no_contribution(),
+                proto::QueryOptions {
+                    query_mem_limit: 4096,
+                    ..Default::default()
+                },
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
+            )
+            .expect("admitted context initializes its real execution resources");
+        let tracker = fixture
+            .host
+            .queries
+            .type_construction_tracker(context.query_execution_id(), Some(4096))
+            .expect("the first task can borrow the already-established tracker");
+        let installed = fixture.host.active_context(context).unwrap();
+        let control = super::ContextTypeConstructionControl(&installed);
+        let creator = crate::native_type_construction::NativeTypeConstruction::try_with_control(
+            tracker.clone(),
+            &control,
+        )
+        .unwrap();
+        let held = tracker.current();
+        assert!(held > 0);
+        fixture.host.release(context);
+        assert!(matches!(
+            creator.request_layout(std::alloc::Layout::new::<u64>()),
+            Err(
+                crate::native_type_construction::NativeTypeConstructionError::Control(
+                    novarocks_type_contract::CompileControlError::Cancelled,
+                )
+            )
+        ));
+        assert_eq!(
+            tracker.current(),
+            held,
+            "release does not manufacture construction exit"
+        );
+        drop(creator);
+        assert_eq!(tracker.current(), 0);
+        assert!(
+            fixture
+                .host
+                .queries
+                .type_construction_tracker(context.query_execution_id(), None,)
+                .is_err()
+        );
+    }
 
     /// One establish installs all three shared facts, or it is not an establish.
     #[test]

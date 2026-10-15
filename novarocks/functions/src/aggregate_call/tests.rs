@@ -78,10 +78,12 @@ impl Fixture {
             selected: Arc::new(FunctionBindingSelection {
                 overload: FunctionOverloadId::try_new("fixture/aggregate/exact-logical-signature")
                     .unwrap(),
-                argument_types: arguments
-                    .iter()
-                    .map(FunctionArgument::argument_type)
-                    .collect(),
+                argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                    arguments
+                        .iter()
+                        .map(FunctionArgument::argument_type)
+                        .collect::<Box<[_]>>(),
+                ),
                 result_type: FunctionResultType::Scalar(i64_type(false)),
                 aggregate: Some(AggregateBindingSelection {
                     state_argument_contract:
@@ -515,10 +517,13 @@ fn merge_nested_semantic_domain_ignores_annotations_but_preserves_input_carrier_
             arrow_schema::Field::new("payload", DataType::Utf8, nullable).with_metadata(metadata);
         let nested =
             arrow_schema::Field::new("nested", DataType::Struct(vec![payload].into()), false);
-        FunctionValueType::new(DataType::Struct(vec![nested].into()), false)
+        FunctionValueType::from_legacy_declared_projection(
+            DataType::Struct(vec![nested].into()),
+            false,
+        )
     }
     fn array(layout: &FunctionValueType) -> ArrayRef {
-        let DataType::Struct(outer) = &layout.data_type else {
+        let DataType::Struct(outer) = layout.data_type() else {
             unreachable!();
         };
         let DataType::Struct(inner) = outer[0].data_type() else {
@@ -539,9 +544,9 @@ fn merge_nested_semantic_domain_ignores_annotations_but_preserves_input_carrier_
     let emitted = state("emission annotation", true, ValueLogicalType::Json);
     let input = state("input annotation", true, ValueLogicalType::Json);
     assert!(emitted.same_value_domain(&input));
-    assert!(!novarocks_type_contract::arrow_data_types_exact(
-        &emitted.data_type,
-        &input.data_type
+    assert!(novarocks_type_contract::arrow_data_types_exact(
+        emitted.data_type(),
+        input.data_type()
     ));
     let call = Fixture::new(&[], &[], emitted.clone()).call();
     let input_array = array(&input);
@@ -567,14 +572,14 @@ fn merge_nested_semantic_domain_ignores_annotations_but_preserves_input_carrier_
             &EvaluationControl(None),
         )
         .unwrap();
-        // Semantic compatibility does not authorize substituting the emission
-        // schema for the exact checked input carrier's annotation metadata.
-        invalid_program(SelectedAggregateMergeInput::try_new(
+        // External annotations have been removed before the value port.
+        SelectedAggregateMergeInput::try_new(
             &contract,
             Selection::all(2),
             EvaluatedArgument::Column(&emitted_array),
             &EvaluationControl(None),
-        ));
+        )
+        .unwrap();
         for (emission, incompatible_input) in [
             (
                 state("same", false, ValueLogicalType::Json),
@@ -958,7 +963,7 @@ impl PureCompileControl for ThresholdCompileControl {
 
 #[test]
 fn wide_merge_semantic_comparison_preserves_mid_work_control_failures() {
-    let state = FunctionValueType::new(
+    let state = FunctionValueType::from_legacy_declared_projection(
         DataType::Struct(
             (0..300)
                 .map(|ordinal| {
@@ -971,7 +976,7 @@ fn wide_merge_semantic_comparison_preserves_mid_work_control_failures() {
     );
     let mut validation_units = 0u32;
     novarocks_type_contract::validate_value_type_structure_observed::<KernelFailure>(
-        &state.data_type,
+        state.data_type(),
         |_| {
             validation_units += 1;
             Ok(())
@@ -1033,142 +1038,56 @@ fn wide_merge_semantic_comparison_preserves_mid_work_control_failures() {
 }
 
 #[test]
-fn call_preparation_bounds_frozen_field_and_timezone_facts_at_exact_limits() {
+fn call_preparation_bounds_typed_names_and_timezones_at_checked_author() {
     use novarocks_type_contract::{
-        MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_METADATA_ENTRIES,
-        MAX_ARROW_FIELD_METADATA_KEY_BYTES, MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
-        MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES,
+        MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, ValueLogicalType,
     };
-    fn field(
-        name: String,
-        metadata: std::collections::HashMap<String, String>,
-    ) -> FunctionValueType {
-        FunctionValueType::new(
+    for (boundary, oversized) in [
+        (
             DataType::Struct(
-                vec![
-                    arrow_schema::Field::new(name, DataType::Int64, false).with_metadata(metadata),
-                ]
+                vec![arrow_schema::Field::new(
+                    "n".repeat(MAX_ARROW_FIELD_NAME_BYTES),
+                    DataType::Int64,
+                    false,
+                )]
                 .into(),
             ),
-            false,
-        )
-    }
-    fn prepare(state: FunctionValueType) -> Result<FunctionCallContract, KernelFailure> {
+            DataType::Struct(
+                vec![arrow_schema::Field::new(
+                    "n".repeat(MAX_ARROW_FIELD_NAME_BYTES + 1),
+                    DataType::Int64,
+                    false,
+                )]
+                .into(),
+            ),
+        ),
+        (
+            DataType::Timestamp(
+                arrow_schema::TimeUnit::Nanosecond,
+                Some("z".repeat(MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES).into()),
+            ),
+            DataType::Timestamp(
+                arrow_schema::TimeUnit::Nanosecond,
+                Some("z".repeat(MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES + 1).into()),
+            ),
+        ),
+    ] {
+        let state =
+            FunctionValueType::try_with_logical_type(boundary, false, ValueLogicalType::Physical)
+                .unwrap();
         let fixture = Fixture::new(&[], &[], state);
         let input = fixture.input();
-        let receipt = refine_call_effects(&fixture, input, &CompileControl(None)).map_err(
-            |error| match error {
-                crate::CallEffectRefinementError::Control(error) => {
-                    crate::kernel_control::compile_failure(error)
-                }
-                other => panic!("unexpected state refinement failure: {other}"),
-            },
-        )?;
+        let receipt = refine_call_effects(&fixture, input, &CompileControl(None)).unwrap();
         FunctionCallContract::from_refined(
             input,
             &receipt,
             fixture.selected.clone(),
             &CompileControl(None),
         )
-    }
-    fn metadata_count(count: usize) -> std::collections::HashMap<String, String> {
-        (0..count)
-            .map(|ordinal| (format!("key_{ordinal}"), String::new()))
-            .collect()
-    }
-    fn metadata_bytes(over: bool) -> std::collections::HashMap<String, String> {
-        let mut entries = (0..4)
-            .map(|ordinal| {
-                (
-                    ordinal.to_string(),
-                    "v".repeat(MAX_ARROW_FIELD_METADATA_BYTES / 4 - 1),
-                )
-            })
-            .collect::<std::collections::HashMap<_, _>>();
-        if over {
-            entries.get_mut("0").unwrap().push('v');
-        }
-        entries
-    }
-    for (boundary, over_limit) in [
-        (
-            field("n".repeat(MAX_ARROW_FIELD_NAME_BYTES), Default::default()),
-            field(
-                "n".repeat(MAX_ARROW_FIELD_NAME_BYTES + 1),
-                Default::default(),
-            ),
-        ),
-        (
-            field(
-                "field".into(),
-                [(
-                    "key".into(),
-                    "v".repeat(MAX_ARROW_FIELD_METADATA_VALUE_BYTES),
-                )]
-                .into(),
-            ),
-            field(
-                "field".into(),
-                [(
-                    "key".into(),
-                    "v".repeat(MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1),
-                )]
-                .into(),
-            ),
-        ),
-        (
-            field(
-                "field".into(),
-                [(
-                    "k".repeat(MAX_ARROW_FIELD_METADATA_KEY_BYTES),
-                    String::new(),
-                )]
-                .into(),
-            ),
-            field(
-                "field".into(),
-                [(
-                    "k".repeat(MAX_ARROW_FIELD_METADATA_KEY_BYTES + 1),
-                    String::new(),
-                )]
-                .into(),
-            ),
-        ),
-        (
-            field(
-                "field".into(),
-                metadata_count(MAX_ARROW_FIELD_METADATA_ENTRIES),
-            ),
-            field(
-                "field".into(),
-                metadata_count(MAX_ARROW_FIELD_METADATA_ENTRIES + 1),
-            ),
-        ),
-        (
-            field("field".into(), metadata_bytes(false)),
-            field("field".into(), metadata_bytes(true)),
-        ),
-        (
-            FunctionValueType::new(
-                DataType::Timestamp(
-                    arrow_schema::TimeUnit::Nanosecond,
-                    Some("z".repeat(MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES).into()),
-                ),
-                false,
-            ),
-            FunctionValueType::new(
-                DataType::Timestamp(
-                    arrow_schema::TimeUnit::Nanosecond,
-                    Some("z".repeat(MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES + 1).into()),
-                ),
-                false,
-            ),
-        ),
-    ] {
-        prepare(boundary).unwrap();
-        assert_eq!(
-            prepare(over_limit).unwrap_err(),
-            KernelFailure::ResourceExhausted
+        .unwrap();
+        assert!(
+            FunctionValueType::try_with_logical_type(oversized, false, ValueLogicalType::Physical)
+                .is_err()
         );
     }
 }

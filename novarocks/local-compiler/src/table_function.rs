@@ -41,7 +41,7 @@ use crate::{
     lowering::FragmentCompileError,
     union_flow::UnionRoot,
 };
-use arrow_schema::{DataType, Schema};
+use arrow_schema::DataType;
 use novarocks_functions::{
     CallEffectInput, FunctionBindingSelection, FunctionResultType, PureCallPreparation,
     PureCallSpecialization, PureEngineFunctionCatalog, PureKernelAbi, ScopedExpressionEffects,
@@ -310,7 +310,7 @@ pub(crate) struct LoweredTableFunction {
 /// TableFunction. `pass_through_definitions` are the Project's synthesized
 /// slot-read definitions, in planned pass-through order.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn lower_table_function(
+pub(crate) fn lower_table_function_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     planned: &PlannedTableFunction,
@@ -319,9 +319,10 @@ pub(crate) fn lower_table_function(
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     pass_through_definitions: &[ProgramExprId],
     control: &dyn PureCompileControl,
-) -> Result<LoweredTableFunction, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<LoweredTableFunction, crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(
+    let result = lower_core_with_creation(
         package,
         node,
         planned,
@@ -330,16 +331,13 @@ pub(crate) fn lower_table_function(
         expressions,
         pass_through_definitions,
         &mut work,
+        creation,
     );
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    crate::creation::finish_attempt(result, work)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_core(
+fn lower_core_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     planned: &PlannedTableFunction,
@@ -348,7 +346,8 @@ fn lower_core(
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     pass_through_definitions: &[ProgramExprId],
     work: &mut CompileCheckpoints<'_>,
-) -> Result<LoweredTableFunction, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<LoweredTableFunction, crate::FragmentCreationError<H>> {
     let fragment = package.fragment();
     let NodeKind::TableFunction {
         function,
@@ -357,9 +356,10 @@ fn lower_core(
         left_outer,
     } = &node.kind
     else {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "table function lowering for another node family",
-        ));
+        ))
+        .into());
     };
     let pass = planned.pass_through.len();
     if pass_through_definitions.len() != pass
@@ -369,9 +369,10 @@ fn lower_core(
         || published.len() != node.output.columns.len()
         || function.argument_types.len() != arguments.len()
     {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "table function planned width differs from its occurrence",
-        ));
+        ))
+        .into());
     }
     // The argument Project: pass-through reads, then the argument roots.
     let mut exprs = Vec::new();
@@ -415,10 +416,11 @@ fn lower_core(
                     "missing table function argument definition",
                 ))?;
         let FunctionArgumentType::Value(bound) = bound else {
-            return Err(FragmentCompileError::Unsupported {
+            return Err((FragmentCompileError::Unsupported {
                 node: Some(node.id),
                 feature: "table function with a lambda argument",
-            });
+            })
+            .into());
         };
         exprs.push(
             *expressions
@@ -428,10 +430,10 @@ fn lower_core(
                 ))?,
         );
         project_types.push(definition.ty.clone());
-        param_types.push(bound.data_type.clone());
+        param_types.push(bound.data_type().clone());
         work.step()?;
     }
-    let project_layout = layout(
+    let project_layout = layout_with_creation(
         package,
         node,
         planned.project,
@@ -439,6 +441,7 @@ fn lower_core(
         &planned.project_slots,
         false,
         work,
+        creation,
     )?;
     let mut channels = Vec::new();
     let channel_count = project_types
@@ -502,7 +505,7 @@ fn lower_core(
         output_slot_sources.push(source);
         work.step()?;
     }
-    let output_layout = layout(
+    let output_layout = layout_with_creation(
         package,
         node,
         planned.node,
@@ -510,6 +513,7 @@ fn lower_core(
         published,
         true,
         work,
+        creation,
     )?;
     for (ordinal, ty) in output_types.into_iter().enumerate() {
         channels.push((
@@ -528,7 +532,7 @@ fn lower_core(
     let mut ret_types: Vec<DataType> = Vec::new();
     reserve_vec(&mut ret_types, function.result_types.len(), work)?;
     for (ordinal, ty) in function.result_types.iter().enumerate() {
-        ret_types.push(ty.data_type.clone());
+        ret_types.push(ty.data_type().clone());
         channels.push((
             ProgramChannelSite::TableResult {
                 node: planned.node,
@@ -614,7 +618,7 @@ fn operator_id(node: ProgramNodeId) -> Result<LocalOperatorId, FragmentCompileEr
 
 /// A layout named with the result labels only when `labels` is set and the
 /// entire ordered physical output is the result port's.
-fn layout(
+fn layout_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     local: ProgramNodeId,
@@ -622,22 +626,13 @@ fn layout(
     slots: &[SlotId],
     labels: bool,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<StaticLayout, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<StaticLayout, crate::FragmentCreationError<H>> {
     let result = package
         .result()
         .filter(|result| labels && result.output.columns == node.output.columns);
-    let mut fields = Vec::new();
-    if package.original_metadata_namespace().is_none() {
-        reserve_vec(&mut fields, types.len(), work)?;
-    }
-    let mut original_fields = match package.original_metadata_namespace() {
-        Some(_) => {
-            let mut original_fields = Vec::new();
-            reserve_vec(&mut original_fields, types.len(), work)?;
-            Some(original_fields)
-        }
-        None => None,
-    };
+    let mut typed_layout =
+        crate::typed_layout::TypedLayoutBuilder::new_with_creation(types.len(), work, creation)?;
     for (ordinal, ty) in types.iter().enumerate() {
         let name = match result {
             Some(result) => {
@@ -647,38 +642,26 @@ fn layout(
                     .ok_or(FragmentCompileError::Invalid(
                         "missing table function result label",
                     ))?;
-                field.alias.as_deref().unwrap_or(&field.name).to_owned()
+                crate::typed_layout::copy_name_with_creation(
+                    field.alias.as_deref().unwrap_or(&field.name),
+                    work,
+                    creation,
+                )?
             }
-            None => format!("local_{}_{}", local.index(), ordinal),
+            None => crate::typed_layout::local_name_with_creation(
+                "local",
+                local.index(),
+                ordinal,
+                work,
+                creation,
+            )?,
         };
         work.flush()?;
-        if let Some(original_fields) = original_fields.as_mut() {
-            let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(ty, name);
-            work.flush()?;
-            original_fields.push(field?);
-        } else {
-            let field = ty.try_to_field(name);
-            work.flush()?;
-            fields.push(field?);
-        }
+        typed_layout.push_with_creation(ty, name, work, creation)?;
         work.step()?;
     }
     work.flush()?;
-    let layout = match (original_fields, package.original_metadata_namespace()) {
-        (Some(fields), Some(namespace)) => {
-            let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema();
-            StaticLayout::try_new_materialized_for_compile(
-                source,
-                Arc::from(slots),
-                work.control(),
-            )?
-        }
-        _ => StaticLayout::try_new_for_compile(
-            Arc::new(Schema::new(fields)),
-            Arc::from(slots),
-            work.control(),
-        )?,
-    };
+    let layout = typed_layout.finish_with_creation(slots, work, creation)?;
     work.flush()?;
     Ok(layout)
 }
@@ -711,14 +694,15 @@ pub(crate) fn argument_root(
 /// installed owner. `effects` holds the prepared effects of every expression
 /// occurrence, so each argument root contributes its actual effects; `nodes`
 /// names the local node each physical node lowers to.
-pub(crate) fn prepare_table_calls(
+pub(crate) fn prepare_table_calls<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     functions: &PureEngineFunctionCatalog,
     effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     nodes: &BTreeMap<NodeId, ProgramNodeId>,
     tokens: &mut BTreeMap<ProgramCallSite, PureCallSpecialization>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), ExpressionLoweringError> {
+    creation: crate::expressions::CallCreation<'_, F>,
+) -> Result<(), crate::expressions::ExpressionCreationFailure<H>> {
     let mut prepared = 0usize;
     for node in package.fragment().nodes().values() {
         work.step()?;
@@ -728,14 +712,14 @@ pub(crate) fn prepare_table_calls(
         let local = *nodes.get(&node.id).ok_or(ExpressionLoweringError::Invalid(
             "table function node has no local node",
         ))?;
-        let token = prepare_call(package, functions, effects, node, work)?;
+        let token = prepare_call(package, functions, effects, node, work, creation)?;
         if tokens
             .insert(ProgramCallSite::Table { node: local }, token)
             .is_some()
         {
-            return Err(ExpressionLoweringError::Invalid(
-                "table call site is prepared twice",
-            ));
+            return Err(
+                ExpressionLoweringError::Invalid("table call site is prepared twice").into(),
+            );
         }
         prepared += 1;
         work.step()?;
@@ -751,18 +735,20 @@ pub(crate) fn prepare_table_calls(
     if frozen != prepared {
         return Err(ExpressionLoweringError::Invalid(
             "frozen table calls differ from the actual table functions",
-        ));
+        )
+        .into());
     }
     Ok(())
 }
 
-fn prepare_call(
+fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     functions: &PureEngineFunctionCatalog,
     effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     node: &PhysicalNode,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<PureCallSpecialization, ExpressionLoweringError> {
+    creation: crate::expressions::CallCreation<'_, F>,
+) -> Result<PureCallSpecialization, crate::expressions::ExpressionCreationFailure<H>> {
     let NodeKind::TableFunction {
         function,
         arguments,
@@ -771,7 +757,8 @@ fn prepare_call(
     else {
         return Err(ExpressionLoweringError::Invalid(
             "table call preparation for another node family",
-        ));
+        )
+        .into());
     };
     let site = PhysicalCallSite::Table { node: node.id };
     let frozen = package
@@ -789,10 +776,11 @@ fn prepare_call(
     let source_request = source_request.ok_or(ExpressionLoweringError::Invalid(
         "missing original table call request",
     ))?;
-    let request = crate::original_requests::materialize_call_request_observed(
+    let request = crate::original_requests::materialize_call_request_created(
         source_request,
         package.constants(),
         work,
+        creation,
     )?;
     work.flush()?;
     // The selection is the frozen binding itself, never a re-resolution.
@@ -803,12 +791,14 @@ fn prepare_call(
         aggregate: None,
     });
     work.flush()?;
-    functions.metadata().validate_frozen_selection(
+    crate::expressions::validate_call_created(
+        functions.metadata(),
         &function.function_id,
         FunctionKind::Table,
         selection.as_ref(),
         request.request(),
         work.control(),
+        creation,
     )?;
     work.flush()?;
     let roots = package.expression_uses();
@@ -846,7 +836,8 @@ fn prepare_call(
         if !exact {
             return Err(ExpressionLoweringError::Invalid(
                 "table argument root differs from its actual call argument",
-            ));
+            )
+            .into());
         }
         let summary = effects
             .get(&use_id)
@@ -870,7 +861,8 @@ fn prepare_call(
         decimal_overflow_policy: frozen.decimal_overflow_policy,
         proof_scope: frozen.effects.proof_scope,
     };
-    let token = functions.prepare_frozen(
+    let token = crate::expressions::prepare_call_created(
+        functions,
         input,
         Arc::clone(&selection),
         &frozen.effects,
@@ -878,6 +870,7 @@ fn prepare_call(
             arguments: ScopedExpressionEffects::primitive(frozen.context, children),
         },
         work.control(),
+        creation,
     )?;
     work.flush()?;
     Ok(token)

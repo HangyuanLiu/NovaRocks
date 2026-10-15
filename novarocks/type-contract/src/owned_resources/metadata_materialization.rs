@@ -305,6 +305,7 @@ impl MaterializedMetadataMap {
         MaterializedSchema {
             schema: Schema::new_with_metadata(fields, self.values),
             metadata: MetadataCloneOrigin { facts: self.facts },
+            storage: crate::ValueTypeStorageLifetime::pure(),
         }
     }
     pub fn into_field(self, field: Field) -> MaterializedField {
@@ -437,8 +438,18 @@ impl SharedMaterializedField {
 pub struct MaterializedSchema {
     schema: Schema,
     metadata: MetadataCloneOrigin,
+    // Original Fields/root-map payload exits before its finite responsibility.
+    storage: crate::ValueTypeStorageLifetime,
 }
 impl MaterializedSchema {
+    /// Attach the actual completed finite Schema/Field loan, never authority.
+    pub fn with_storage_lifetime(mut self, storage: crate::ValueTypeStorageLifetime) -> Self {
+        self.storage = storage;
+        self
+    }
+    pub fn storage_lifetime(&self) -> crate::ValueTypeStorageLifetime {
+        self.storage.clone()
+    }
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -449,6 +460,7 @@ impl MaterializedSchema {
         SharedMaterializedSchema {
             schema: Arc::new(self.schema),
             metadata: self.metadata,
+            storage: self.storage,
         }
     }
     pub fn into_original_schema(self) -> Schema {
@@ -459,8 +471,12 @@ impl MaterializedSchema {
 pub struct SharedMaterializedSchema {
     schema: SchemaRef,
     metadata: MetadataCloneOrigin,
+    storage: crate::ValueTypeStorageLifetime,
 }
 impl SharedMaterializedSchema {
+    pub fn storage_lifetime(&self) -> crate::ValueTypeStorageLifetime {
+        self.storage.clone()
+    }
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
     }
@@ -474,6 +490,7 @@ impl SharedMaterializedSchema {
         MaterializedSchema {
             schema: self.schema.as_ref().clone(),
             metadata: self.metadata,
+            storage: self.storage.clone(),
         }
     }
     /// Clone the original table before its caller's existing slot/index loop.
@@ -508,14 +525,14 @@ impl SharedMaterializedSchema {
 /// Call the ONE original FVT materializer, then record its explicit root-map
 /// construction branch. No metadata iteration, capacity inversion, root type
 /// inference or reconstructed Field substitutes for that source occurrence.
-/// The root map is new/empty, or made from the original one-entry array; its
+/// The legacy root map is new/empty, or made from the original one-entry array; its
 /// nested DataType FieldRefs remain the original source's independent owners.
 pub fn materialize_value_field(
     value: &crate::FunctionValueType,
     name: impl Into<String>,
 ) -> Result<MaterializedField, crate::ValueTypeError> {
     let field = value.try_to_field(name)?;
-    let original_entries = usize::from(value.logical_type.metadata_value().is_some());
+    let original_entries = usize::from(value.logical_type().metadata_value().is_some());
     Ok(MaterializedField {
         field,
         metadata: MetadataCloneOrigin {
@@ -523,6 +540,51 @@ pub fn materialize_value_field(
                 .map_err(MetadataMaterializationError::Model),
         },
     })
+}
+
+#[cfg(test)]
+mod value_field_author_tests {
+    use super::materialize_value_field;
+    use crate::{FunctionValueType, ValueLogicalType};
+    use arrow_schema::DataType;
+
+    #[test]
+    fn legacy_value_field_receipt_matches_the_actual_source_author() {
+        for domain in [ValueLogicalType::Json, ValueLogicalType::Hll] {
+            let carrier = if domain == ValueLogicalType::Json {
+                DataType::Utf8
+            } else {
+                DataType::Binary
+            };
+            let value = FunctionValueType::try_with_logical_type(carrier, true, domain).unwrap();
+            let field = materialize_value_field(&value, "source").unwrap();
+            assert_eq!(field.field().metadata().len(), 1);
+            assert_eq!(
+                field
+                    .field()
+                    .metadata()
+                    .get(crate::NR_LOGICAL_TYPE_KEY)
+                    .map(String::as_str),
+                domain.metadata_value(),
+            );
+            assert_eq!(value.logical_type(), domain);
+            let original = field.metadata_origin().table_request().unwrap();
+            assert!(original.layout.is_some());
+            assert_eq!(original.allocation_requests_upper_bound, 1);
+            assert!(original.request_bytes_upper_bound > 0);
+            assert_eq!(
+                field.clone_original().metadata_origin(),
+                field.metadata_origin()
+            );
+        }
+        let physical = FunctionValueType::new(DataType::Utf8, true);
+        let field = materialize_value_field(&physical, "source").unwrap();
+        assert!(field.field().metadata().is_empty());
+        assert_eq!(
+            field.metadata_origin().table_request().unwrap().layout,
+            None
+        );
+    }
 }
 
 /// ONE original Chunk field reconstruction. Dictionary attributes retain its
@@ -583,6 +645,7 @@ impl SchemaMetadataMaterializations {
     pub fn field_namespace(&self) -> MaterializedFieldNamespace {
         MaterializedFieldNamespace {
             fields: self.fields.clone(),
+            _storage: crate::ValueTypeStorageLifetime::pure(),
         }
     }
     pub fn field_origin(&self, field: &FieldRef) -> Option<MetadataCloneOrigin> {
@@ -825,6 +888,7 @@ impl SchemaMetadataMaterializations {
             schema: SharedMaterializedSchema {
                 schema,
                 metadata: self.schema.metadata,
+                storage: self.schema.storage.clone(),
             },
             fields: index_original_loans(loans.into()),
         }
@@ -844,6 +908,7 @@ impl OriginalMetadataClone {
         MaterializedSchema {
             schema: Schema::new_with_metadata(fields, self.values),
             metadata: self.metadata,
+            storage: crate::ValueTypeStorageLifetime::pure(),
         }
     }
 }
@@ -1203,6 +1268,9 @@ impl MetadataSidecarRequest {
 #[derive(Clone, Debug)]
 pub struct MaterializedFieldNamespace {
     fields: Arc<[MetadataFieldLoan]>,
+    // Only the actual receipt-buffer owner; this is not a Field/type table,
+    // semantic authority or source invoice used as a capacity grant.
+    _storage: crate::ValueTypeStorageLifetime,
 }
 impl MaterializedFieldNamespace {
     /// Concatenate these two actual source namespaces, never electing a
@@ -1239,7 +1307,14 @@ impl MaterializedFieldNamespace {
     pub fn from_original_loans(fields: Arc<[MetadataFieldLoan]>) -> Self {
         Self {
             fields: index_original_loans(fields),
+            _storage: crate::ValueTypeStorageLifetime::pure(),
         }
+    }
+    /// Couple an already-observed receipt publication to its actual finite
+    /// owner. Moving this inline marker creates no allocation or authority.
+    pub fn with_storage_lifetime(mut self, storage: crate::ValueTypeStorageLifetime) -> Self {
+        self._storage = storage;
+        self
     }
     pub fn fields(&self) -> &[MetadataFieldLoan] {
         &self.fields

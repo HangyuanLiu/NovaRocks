@@ -84,6 +84,48 @@ pub enum ResultWriteAdmission {
     Blocked,
 }
 
+/// The original host I/O failure or the actual typed-construction failure.
+/// This is specific to result writes; it adds no transport/status category.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResultWriteFailure {
+    Io(FragmentIoError),
+    Execution(crate::runtime::fragment::ExecutionFailure),
+}
+impl ResultWriteFailure {
+    pub fn into_execution(self) -> crate::runtime::fragment::ExecutionFailure {
+        match self {
+            Self::Io(error) => error.to_string().into(),
+            Self::Execution(error) => error,
+        }
+    }
+}
+impl From<FragmentIoError> for ResultWriteFailure {
+    fn from(error: FragmentIoError) -> Self {
+        Self::Io(error)
+    }
+}
+impl From<crate::runtime::fragment::ExecutionFailure> for ResultWriteFailure {
+    fn from(error: crate::runtime::fragment::ExecutionFailure) -> Self {
+        Self::Execution(error)
+    }
+}
+impl std::fmt::Display for ResultWriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => error.fmt(f),
+            Self::Execution(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for ResultWriteFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Execution(error) => Some(error),
+        }
+    }
+}
+
 /// An opened host result stream. Encoding and presentation remain with the
 /// host; the execution kernel only writes Arrow chunks and terminal state.
 pub trait FragmentResultSession: Send + Sync + 'static {
@@ -108,7 +150,9 @@ pub trait FragmentResultSession: Send + Sync + 'static {
         &self,
         chunk: Chunk,
         credit: ResultWriteCredit,
-    ) -> Result<(), FragmentIoError>;
+        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+        control: &dyn novarocks_functions::KernelEvaluationControl,
+    ) -> Result<(), ResultWriteFailure>;
 
     fn finish(&self) -> Result<(), FragmentIoError>;
     fn abort(&self, reason: ResultAbort);
@@ -547,7 +591,9 @@ impl FragmentResultSession for DiscardResultSession {
         &self,
         chunk: Chunk,
         credit: ResultWriteCredit,
-    ) -> Result<(), FragmentIoError> {
+        _factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+        _control: &dyn novarocks_functions::KernelEvaluationControl,
+    ) -> Result<(), ResultWriteFailure> {
         debug_assert_eq!(credit.bytes(), chunk.logical_bytes());
         Ok(())
     }

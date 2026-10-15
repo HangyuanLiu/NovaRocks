@@ -65,9 +65,9 @@ pub(super) fn evaluate_to_date<'a>(
         let reader = DateInput::date_for_input(source, array.as_ref(), input)?;
         work.step()?;
         let target = input.target;
-        if target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Date32
-            || !target.nullable
+        if target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Date32
+            || !target.nullable()
         {
             return Err(invalid(
                 "date differs from its installed nullable Date32 result",
@@ -91,7 +91,7 @@ pub(super) fn evaluate_to_date<'a>(
                 return Err(internal("date selected row is out of bounds"));
             }
             let date = if array.is_null(row) {
-                if !source.nullable {
+                if !source.nullable() {
                     return Err(internal("date non-null source contains selected SQL NULL"));
                 }
                 None
@@ -116,7 +116,7 @@ pub(super) fn evaluate_to_date<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),
@@ -148,10 +148,14 @@ impl KernelEvaluationControl for LegacyControl {
 pub fn evaluate_legacy_to_date(array: &ArrayRef) -> Result<ArrayRef, String> {
     use super::calendar_extended::CalendarCarrierError;
     use crate::{EvaluatedArgument, FunctionValueType, Selection};
-    let types = [FunctionArgumentType::Value(FunctionValueType::new(
-        array.data_type().clone(),
-        true,
-    ))];
+    let types = [FunctionArgumentType::Value(
+        FunctionValueType::try_with_logical_type(
+            array.data_type().clone(),
+            true,
+            novarocks_type_contract::ValueLogicalType::Physical,
+        )
+        .map_err(|error| error.to_string())?,
+    )];
     let arguments = [EvaluatedArgument::Column(array)];
     let target = FunctionValueType::new(DataType::Date32, true);
     let failure = std::cell::RefCell::new(None);

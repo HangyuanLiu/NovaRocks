@@ -95,7 +95,9 @@ fn contract_with_argument_nullability(
     let argument_type = FunctionValueType::new(DataType::Int64, argument_nullable);
     let selected = Arc::new(FunctionBindingSelection {
         overload: FunctionOverloadId::try_new("fixture/i64").unwrap(),
-        argument_types: vec![FunctionArgumentType::Value(argument_type.clone())].into_boxed_slice(),
+        argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+            vec![FunctionArgumentType::Value(argument_type.clone())].into_boxed_slice(),
+        ),
         result_type: FunctionResultType::Scalar(FunctionValueType::new(DataType::Int64, nullable)),
         aggregate: None,
     });

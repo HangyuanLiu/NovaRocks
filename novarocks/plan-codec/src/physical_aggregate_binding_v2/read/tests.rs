@@ -141,7 +141,8 @@ fn definition(id: u32, phase: wire::aggregate_phase::Kind) -> wire::AggregateBin
         logical_argument_count: u32::MAX,
         intermediate_value_type_id: Some(0),
         state_format: "aggregate/state-v1".into(),
-        state_argument_contract: wire::AggregateStateArgumentContract::ExactSignature as i32,
+        state_argument_contract:
+            novarocks_proto_models::common::AggregateStateArgumentContract::ExactSignature as i32,
     }
 }
 fn definitions() -> Vec<wire::AggregateBindingDefinition> {
@@ -227,16 +228,18 @@ fn receiving_aggregate_headers_borrow_all_phases_sparse_ids_and_exact_type_owner
         }
         assert!(token.definition(123).unwrap().is_none());
         let root = functions.type_table().value_type(0).unwrap();
-        let DataType::Struct(fields) = &root.data_type else {
+        let DataType::Struct(fields) = &root.data_type() else {
             panic!("original nested type");
         };
-        assert_eq!(fields[0].metadata()["original"], "retained");
+        assert_eq!(fields[0].metadata().capacity(), 0);
+        assert_eq!(fields[0].name(), "nested");
+        assert!(!fields[0].is_nullable());
         assert_eq!(
             functions
                 .type_table()
                 .value_type(u32::MAX)
                 .unwrap()
-                .logical_type,
+                .logical_type(),
             ValueLogicalType::Json
         );
     });

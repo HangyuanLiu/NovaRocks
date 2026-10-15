@@ -734,7 +734,7 @@ mod tests {
         let aggregate_calls = vec![AggregateCall {
             name: "max".to_string(),
             distinct: false,
-            result_type: DataType::Int32,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
             output_column_id: aggregate_output_id,
             source: crate::binding::AggregateArgumentSource::uncertified(
                 vec![column_ref(ColumnId::new_for_test(1), "a")],
@@ -873,7 +873,7 @@ mod tests {
         let aggregate_calls = vec![AggregateCall {
             name: "max".to_string(),
             distinct: false,
-            result_type: DataType::Int32,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
             output_column_id: aggregate_output_id,
             source: crate::binding::AggregateArgumentSource::uncertified(
                 vec![column_ref(input_id, "a")],

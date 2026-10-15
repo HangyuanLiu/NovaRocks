@@ -69,13 +69,14 @@ fn field(id: u32, ty: Option<u32>) -> wire::FieldDefinition {
         name: format!("field{id}"),
         nullable: false,
         carrier_type_id: ty,
-        metadata: vec![],
-        dictionary_id: None,
-        dictionary_is_ordered: None,
+        logical_type_id: None,
+
+        value_binding_id: None,
     }
 }
 fn small() -> wire::TypeTable {
     wire::TypeTable {
+        logical_types: Vec::new(),
         carriers: vec![
             carrier(
                 u32::MAX,
@@ -90,8 +91,8 @@ fn small() -> wire::TypeTable {
         value_types: vec![wire::ValueTypeDefinition {
             id: u32::MAX,
             carrier_type_id: Some(u32::MAX),
-            nullable: true,
-            logical_type: 1,
+
+            logical_type_id: None,
         }],
     }
 }
@@ -382,6 +383,7 @@ fn graph_request_upper_has_independent_layout_and_zero_definition_oracles() {
         independent_insert_work(3, node) + independent_insert_work(2, node) + 128 + 5 * 64
     );
     let table = wire::TypeTable {
+        logical_types: Vec::new(),
         carriers: vec![],
         fields: vec![],
         value_types: vec![],
@@ -545,6 +547,7 @@ fn graph_duplicate_insertions_charge_the_completed_mutation_before_the_ordinary_
 #[test]
 fn graph_wide_320_real_sparse_insertions_have_finer_opaque_observation_and_sampled_prefixes() {
     let table = wire::TypeTable {
+        logical_types: Vec::new(),
         carriers: (0..320)
             .map(|n| carrier(if n == 319 { u32::MAX } else { n }, Kind::Primitive(5)))
             .collect(),

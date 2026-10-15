@@ -81,8 +81,8 @@ pub(super) fn definition(
     )
 }
 
-pub(super) struct StringFieldOwner {
-    resolver: BuiltinScalarResolver,
+pub(crate) struct StringFieldOwner {
+    resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
@@ -122,7 +122,7 @@ impl StringFieldOwner {
             })
             .collect();
         Ok(Self {
-            resolver,
+            resolver: Arc::new(resolver),
             declaration,
             implementations,
         })
@@ -144,6 +144,20 @@ impl StringFieldOwner {
     }
 }
 
+impl StringFieldOwner {
+    pub(crate) fn validate_selected_with_creator_in<H>(
+        &self,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), crate::FunctionBindingCreationFailure<H>> {
+        control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+        check_pure_arity(request.logical_argument_count)?;
+        self.resolver
+            .validate_selected_with_creator_in(selected, request, creation, control)
+    }
+}
 impl FunctionBindingResolver for StringFieldOwner {
     fn resolve(
         &self,
@@ -180,6 +194,11 @@ impl FunctionBindingResolver for StringFieldOwner {
 }
 
 impl PureFunctionMetadataOwner for StringFieldOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        // Retain this actual owner's entry checkpoint and arity gate.
+        crate::FunctionBindingResolverOwner::string_field(self)
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -208,39 +227,23 @@ impl FunctionEffectOwner for StringFieldOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        let result = (|| {
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if input.function_id != self.declaration.function_id()
-                || input.kind != FunctionKind::Scalar
-            {
-                return Err(FunctionBindingError::UnknownFunction.into());
-            }
-            if !input.environment.is_empty()
-                || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                    && input.proof_scope != CallProofScope::Domain(input.context.domain)
-            {
-                return Err(FunctionBindingError::InvalidBinding(
-                "field extraction has no environment dependencies and requires an exact proof scope".into(),
-            )
-            .into());
-            }
-            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        self.refine_selected_core(input, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => {
-                        FunctionEffectOwnerError::Control(error)
-                    }
-                    other => FunctionEffectOwnerError::Owner(other),
-                })?;
-            Ok(self.call_effects(input.proof_scope))
-        })();
-        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
-            return result;
-        }
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        result
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_selected_core(input, control, || {
+            control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+            check_pure_arity(input.request.logical_argument_count)?;
+            checked.require_binding_author(self, input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -251,48 +254,23 @@ impl PureScalarImplementation for StringFieldOwner {
         contract: Arc<ScalarCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        let result: Result<Arc<dyn PreparedScalarKernel>, KernelFailure> = (|| {
-            work.step().map_err(compile_failure)?;
-            check_pure_arity(input.request.logical_argument_count)
-                .map_err(|error| invalid(&error.to_string()))?;
-            if input.function_id != self.declaration.function_id()
-                || input.kind != FunctionKind::Scalar
-                || contract.function_id() != input.function_id
-                || !std::ptr::eq(contract.selected(), input.selected)
-                || contract.context() != input.context
-                || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-                || contract.effects() != &self.call_effects(input.proof_scope)
-                || !input.environment.is_empty()
-            {
-                return Err(invalid(
-                    "field extraction preparation differs from its exact checked call",
-                ));
-            }
-            work.flush().map_err(compile_failure)?;
+        self.prepare_selected_core(input, contract, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => compile_failure(error),
-                    _ => invalid("field extraction preparation has a stale selected binding"),
-                })?;
-            super::string_field::validate_profile(&contract, || {
-                work.step().map_err(compile_failure)
-            })?;
-            // The prepared object retains the same canonical contract. Its body is
-            // a static pure implementation and needs no live resolver or authority.
-            Ok(Arc::new(PreparedStringField { contract }) as Arc<dyn PreparedScalarKernel>)
-        })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
-            return result;
-        }
-        work.finish().map_err(compile_failure)?;
-        result
+        })
+    }
+    fn prepare_scalar_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_selected_core(input, contract, control, || {
+            control.checkpoint(CompilePhase::FunctionSpecialization, 0)?;
+            check_pure_arity(input.request.logical_argument_count)?;
+            checked.require_binding_author(self, input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -412,4 +390,93 @@ pub(super) fn prepared_for_test_with_control(
         control,
     )
     .map(|specialization| specialization.into_prepared())
+}
+
+impl StringFieldOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        let result = (|| {
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if input.function_id != self.declaration.function_id()
+                || input.kind != FunctionKind::Scalar
+            {
+                return Err(FunctionBindingError::UnknownFunction.into());
+            }
+            if !input.environment.is_empty()
+                || !matches!(input.proof_scope, CallProofScope::Unconditional)
+                    && input.proof_scope != CallProofScope::Domain(input.context.domain)
+            {
+                return Err(FunctionBindingError::InvalidBinding(
+                "field extraction has no environment dependencies and requires an exact proof scope".into(),
+            )
+            .into());
+            }
+            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+                other => FunctionEffectOwnerError::Owner(other),
+            })?;
+            Ok(self.call_effects(input.proof_scope))
+        })();
+        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
+            return result;
+        }
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        result
+    }
+    fn prepare_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        let result: Result<Arc<dyn PreparedScalarKernel>, KernelFailure> = (|| {
+            work.step().map_err(compile_failure)?;
+            check_pure_arity(input.request.logical_argument_count)
+                .map_err(|error| invalid(&error.to_string()))?;
+            if input.function_id != self.declaration.function_id()
+                || input.kind != FunctionKind::Scalar
+                || contract.function_id() != input.function_id
+                || !std::ptr::eq(contract.selected(), input.selected)
+                || contract.context() != input.context
+                || contract.decimal_overflow_policy() != input.decimal_overflow_policy
+                || contract.effects() != &self.call_effects(input.proof_scope)
+                || !input.environment.is_empty()
+            {
+                return Err(invalid(
+                    "field extraction preparation differs from its exact checked call",
+                ));
+            }
+            work.flush().map_err(compile_failure)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => compile_failure(error),
+                _ => invalid("field extraction preparation has a stale selected binding"),
+            })?;
+            super::string_field::validate_profile(&contract, || {
+                work.step().map_err(compile_failure)
+            })?;
+            // The prepared object retains the same canonical contract. Its body is
+            // a static pure implementation and needs no live resolver or authority.
+            Ok(Arc::new(PreparedStringField { contract }) as Arc<dyn PreparedScalarKernel>)
+        })();
+        if matches!(
+            &result,
+            Err(KernelFailure::Cancelled
+                | KernelFailure::DeadlineExceeded
+                | KernelFailure::ResourceExhausted)
+        ) {
+            return result;
+        }
+        work.finish().map_err(compile_failure)?;
+        result
+    }
 }

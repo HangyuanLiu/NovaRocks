@@ -98,12 +98,12 @@ fn numeric_unary_narrow_source_raw_cast_negate_widen_null_and_recipe_metadata() 
     );
     let narrow_type = FunctionValueType::new(DataType::Int8, false);
     let computed = native_negate_computed_result_type(&narrow_type, &Control).unwrap();
-    assert_eq!(computed.data_type, DataType::Int8);
-    assert!(computed.nullable);
+    assert_eq!(computed.data_type().clone(), DataType::Int8);
+    assert!(computed.nullable());
     assert!(
         !native_negate_computed_result_type(&source_type, &Control)
             .unwrap()
-            .nullable,
+            .nullable(),
         "Int64 has row overflow, not successful own NULL"
     );
     let recipe = PreparedNativeNegateRecipe::try_new(&narrow_type, &computed, &Control).unwrap();

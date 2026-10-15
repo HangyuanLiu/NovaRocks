@@ -37,7 +37,7 @@ use crate::{
     ScalarCallContract, ScalarCallInput, ScalarKernelInstance, SelectedValues,
 };
 
-/// The original single Binary call uses its ordinary eager lifecycle.
+/// The plain and nominal bitmap declarations share the original eager lifecycle.
 pub(super) fn effects() -> FunctionEffectDeclaration {
     FunctionEffectDeclaration {
         value_stability: FunctionVolatility::Immutable,
@@ -64,7 +64,7 @@ pub(super) fn definition(
 }
 
 struct BitmapToStringOwner {
-    resolver: BuiltinScalarResolver,
+    resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
@@ -77,10 +77,21 @@ impl BitmapToStringOwner {
         let expected = effects();
         if declaration.function_id().as_str() != function
             || declaration.kind() != FunctionKind::Scalar
-            || declaration.overloads().len() != 1
-            || declaration.overloads().iter().any(|overload| {
-                overload.aggregate.is_some() || overload.effects.as_ref() != Some(&expected)
-            })
+            || declaration.overloads().len() != 2
+            || declaration
+                .overloads()
+                .iter()
+                .enumerate()
+                .any(|(index, overload)| {
+                    let identity = match index {
+                        0 => "builtin.scalar/bitmap_to_string/(binary)->utf8;strict;legacy",
+                        1 => "builtin.scalar/bitmap_to_string/(bitmap)->utf8;strict;legacy",
+                        _ => return true,
+                    };
+                    overload.identity.as_str() != identity
+                        || overload.aggregate.is_some()
+                        || overload.effects.as_ref() != Some(&expected)
+                })
         {
             return Err(FunctionCatalogError::InvalidStableIdentity {
                 subject: "builtin bitmap_to_string pure declaration",
@@ -99,7 +110,7 @@ impl BitmapToStringOwner {
             })
             .collect();
         Ok(Self {
-            resolver,
+            resolver: Arc::new(resolver),
             declaration,
             implementations,
         })
@@ -151,6 +162,10 @@ impl FunctionBindingResolver for BitmapToStringOwner {
 }
 
 impl PureFunctionMetadataOwner for BitmapToStringOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -201,41 +216,21 @@ impl FunctionEffectOwner for BitmapToStringOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        work.step().map_err(FunctionEffectOwnerError::Control)?;
-        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
-        {
-            return Err(FunctionBindingError::UnknownFunction.into());
-        }
-        if !input.environment.is_empty()
-            || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
-        {
-            return Err(FunctionBindingError::InvalidBinding(
-                "bitmap_to_string has no environment dependencies and requires an exact proof scope"
-                    .into(),
-            )
-            .into());
-        }
-        work.flush().map_err(FunctionEffectOwnerError::Control)?;
-        self.validate_selected(input.selected, input.request, control)
-            .map_err(|error| match error {
-                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
-                other => FunctionEffectOwnerError::Owner(other),
-            })?;
-        self.admit_selected_profile_observed(
-            input.selected,
-            input.request.logical_argument_count,
-            control,
-        )
-        .map_err(|error| match error {
-            FunctionBindingError::Control(cause) => FunctionEffectOwnerError::Control(cause),
-            other => FunctionEffectOwnerError::Owner(other),
-        })?;
-        let result = self.call_effects(input.proof_scope);
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        Ok(result)
+        self.refine_selected_core(input, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_selected_core(input, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -246,35 +241,21 @@ impl PureScalarImplementation for BitmapToStringOwner {
         contract: Arc<ScalarCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        work.step().map_err(compile_failure)?;
-        if input.function_id != self.declaration.function_id()
-            || input.kind != FunctionKind::Scalar
-            || contract.function_id() != input.function_id
-            || !std::ptr::eq(contract.selected(), input.selected)
-            || contract.context() != input.context
-            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-            || contract.effects() != &self.call_effects(input.proof_scope)
-            || !input.environment.is_empty()
-        {
-            return Err(invalid(
-                "bitmap_to_string preparation differs from its exact checked call",
-            ));
-        }
-        work.flush().map_err(compile_failure)?;
-        self.validate_selected(input.selected, input.request, control)
-            .map_err(|error| match error {
-                FunctionBindingError::Control(error) => compile_failure(error),
-                _ => invalid("bitmap_to_string preparation has a stale selected binding"),
-            })?;
-        super::bitmap_to_string_selected::validate_profile(&contract, || {
-            work.step().map_err(compile_failure)
-        })?;
-        work.finish().map_err(compile_failure)?;
-        // The prepared object retains the same canonical contract. Its body is
-        // a static pure implementation and needs no live resolver or authority.
-        Ok(Arc::new(PreparedBitmapToString { contract }))
+        self.prepare_selected_core(input, contract, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn prepare_scalar_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_selected_core(input, contract, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -349,3 +330,83 @@ impl ScalarKernelInstance for BitmapToStringInstance {
 #[cfg(test)]
 #[path = "bitmap_to_string_owner_tests.rs"]
 mod tests;
+
+impl BitmapToStringOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        work.step().map_err(FunctionEffectOwnerError::Control)?;
+        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
+        {
+            return Err(FunctionBindingError::UnknownFunction.into());
+        }
+        if !input.environment.is_empty()
+            || !matches!(input.proof_scope, CallProofScope::Unconditional)
+                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+        {
+            return Err(FunctionBindingError::InvalidBinding(
+                "bitmap_to_string has no environment dependencies and requires an exact proof scope"
+                    .into(),
+            )
+            .into());
+        }
+        work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+            other => FunctionEffectOwnerError::Owner(other),
+        })?;
+        self.admit_selected_profile_observed(
+            input.selected,
+            input.request.logical_argument_count,
+            control,
+        )
+        .map_err(|error| match error {
+            FunctionBindingError::Control(cause) => FunctionEffectOwnerError::Control(cause),
+            other => FunctionEffectOwnerError::Owner(other),
+        })?;
+        let result = self.call_effects(input.proof_scope);
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        Ok(result)
+    }
+    fn prepare_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        work.step().map_err(compile_failure)?;
+        if input.function_id != self.declaration.function_id()
+            || input.kind != FunctionKind::Scalar
+            || contract.function_id() != input.function_id
+            || !std::ptr::eq(contract.selected(), input.selected)
+            || contract.context() != input.context
+            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
+            || contract.effects() != &self.call_effects(input.proof_scope)
+            || !input.environment.is_empty()
+        {
+            return Err(invalid(
+                "bitmap_to_string preparation differs from its exact checked call",
+            ));
+        }
+        work.flush().map_err(compile_failure)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => compile_failure(error),
+            _ => invalid("bitmap_to_string preparation has a stale selected binding"),
+        })?;
+        super::bitmap_to_string_selected::validate_profile(&contract, || {
+            work.step().map_err(compile_failure)
+        })?;
+        work.finish().map_err(compile_failure)?;
+        // The prepared object retains the same canonical contract. Its body is
+        // a static pure implementation and needs no live resolver or authority.
+        Ok(Arc::new(PreparedBitmapToString { contract }))
+    }
+}

@@ -1207,8 +1207,8 @@ mod tests {
                     .iter()
                     .map(|c| ColumnDef {
                         name: c.name.clone(),
-                        data_type: c.value_type.data_type.clone(),
-                        nullable: c.value_type.nullable,
+                        data_type: c.value_type.data_type().clone(),
+                        nullable: c.value_type.nullable(),
                         write_default: None,
                         logical_type: None,
                     })
@@ -1643,7 +1643,10 @@ mod tests {
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                     output_column_id: sum_out.column_id,
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![col_ref(&v)],
@@ -1867,7 +1870,10 @@ mod tests {
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                     output_column_id: sum_out.column_id,
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![col_ref(&v)],
@@ -1939,7 +1945,7 @@ mod tests {
             &[AggregateCall {
                 name: "sum".to_string(),
                 distinct: false,
-                result_type: DataType::Int64,
+                result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
                 output_column_id: sum_out.column_id,
                 source: crate::binding::AggregateArgumentSource::uncertified(
                     vec![col_ref(&v)],

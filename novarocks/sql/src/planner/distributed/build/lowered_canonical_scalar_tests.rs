@@ -57,7 +57,7 @@ pub(in crate::planner::distributed::build) fn repeat_plan(nested: bool) -> Physi
     let source = column(1, "source_text", DataType::Utf8, false);
     let grouping = column(2, "grouping", DataType::Int64, false);
     let mut repeated = source.clone();
-    repeated.value_type.nullable = true;
+    repeated.value_type = repeated.value_type.with_nullable(true).unwrap();
     let repeat = PhysicalPlanNode {
         kind: PhysicalPlanKind::Repeat(PlanRepeatNode {
             repeat_column_ref_list: vec![vec![source.name.clone()], vec![]],
@@ -229,7 +229,7 @@ fn canonical_scalar_repeat_child_nullable_is_authored_before_parent_and_result_p
     let ValueOrigin::NullExtended { node, of } = value.origin else {
         panic!("real Repeat NullExtended owner")
     };
-    assert!(!fragment.values().get(&of).unwrap().ty.nullable);
+    assert!(!fragment.values().get(&of).unwrap().ty.nullable());
     assert!(matches!(
         fragment.nodes().get(&node).unwrap().kind,
         NodeKind::Repeat { .. }
@@ -349,7 +349,7 @@ fn canonical_scalar_cv_null_and_real_sql_keep_original_source_distinct_from_sele
     let receipt = loan(&owner, fragment, source, &Control::default()).unwrap();
     let original = receipt.captured().request();
     let original_cv = constant(&original.arguments[0]).unwrap();
-    assert_eq!(original_cv.value_type().data_type, DataType::Null);
+    assert_eq!(original_cv.value_type().data_type().clone(), DataType::Null);
     let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
     let typed_cv = constant(&operational[0]).unwrap();
     assert_eq!(typed_cv.value_type(), &ty);

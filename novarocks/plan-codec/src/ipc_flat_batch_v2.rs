@@ -23,7 +23,7 @@
 //! must separately check schema identity, framing/EOS, Field/FVT correspondence,
 //! and reader/schema/header/alignment/validation allocation and work bounds.
 
-use crate::ipc_flat_stream_v2::progress::Admission;
+use crate::ipc_flat_stream_v2::progress::{Admission, ReaderGeometryFailure};
 use crate::{
     ipc_schema_v2::verified_message_observed,
     physical_type_v2::{TypeCodecError, validate_field, validate_type},
@@ -117,10 +117,10 @@ fn numeric_parent<T>(parent: bool, result: Result<T, TypeCodecError>) -> Result<
         result
     }
 }
-fn parent_step(
-    admission: &mut Option<&mut Admission<'_, '_>>,
+fn parent_step<E: ReaderGeometryFailure>(
+    admission: &mut Option<&mut Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), TypeCodecError> {
+) -> Result<(), E> {
     if let Some(a) = admission.as_deref_mut() {
         a.batch_step(work)?;
     } else {
@@ -128,25 +128,25 @@ fn parent_step(
     }
     Ok(())
 }
-fn require_parent(
+fn require_parent<E: ReaderGeometryFailure>(
     condition: bool,
     message: &'static str,
-    mut admission: Option<&mut Admission<'_, '_>>,
+    mut admission: Option<&mut Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), TypeCodecError> {
+) -> Result<(), E> {
     parent_step(&mut admission, work)?;
     if condition {
         Ok(())
     } else {
-        Err(TypeCodecError::InvalidShape(message))
+        Err((TypeCodecError::InvalidShape(message)).into())
     }
 }
-fn limit_parent(
+fn limit_parent<E: ReaderGeometryFailure>(
     condition: bool,
     message: &'static str,
-    admission: Option<&mut Admission<'_, '_>>,
+    admission: Option<&mut Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), TypeCodecError> {
+) -> Result<(), E> {
     if admission.is_some() && !condition {
         return Err(CompileControlError::ResourceExhausted.into());
     }
@@ -225,11 +225,11 @@ fn source_layout(
 ) -> Result<Layout, TypeCodecError> {
     source_layout_core(expected, None, work)
 }
-fn source_layout_core(
+fn source_layout_core<E: ReaderGeometryFailure>(
     expected: &Field,
-    mut admission: Option<&mut Admission<'_, '_>>,
+    mut admission: Option<&mut Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Layout, TypeCodecError> {
+) -> Result<Layout, E> {
     if let Some(a) = admission.as_deref_mut() {
         a.batch_work_add(
             a.source()
@@ -238,12 +238,11 @@ fn source_layout_core(
         )?;
     }
     validate_field(expected, work)?;
-    novarocks_type_contract::field_logical_type(expected)?;
     if let Some(a) = admission.as_deref_mut() {
         let shared = std::cell::RefCell::new(a);
-        let mut scratch =
+        let scratch =
             |layout: std::alloc::Layout| shared.borrow_mut().batch_work_add(layout.size());
-        let mut capture = |visit| {
+        let capture = |visit| {
             let mut a = shared.borrow_mut();
             let upper = if matches!(visit, novarocks_type_contract::ValueTypeVisit::Field(_)) {
                 a.source()
@@ -254,12 +253,18 @@ fn source_layout_core(
             };
             a.batch_work_add(upper)
         };
-        crate::physical_type_v2::validate_type_with_scratch_observed(
+        crate::physical_type_v2::validate_type_with_scratch_host_observed(
             expected.data_type(),
-            &mut scratch,
-            &mut capture,
+            &mut |layout| {
+                scratch(layout).map_err(crate::host_projection_v2::ProjectionFailure::Host)
+            },
+            &mut |visit| capture(visit).map_err(crate::host_projection_v2::ProjectionFailure::Host),
             work,
-        )?;
+        )
+        .map_err(|error| match error {
+            crate::host_projection_v2::ProjectionFailure::Host(error) => error,
+            crate::host_projection_v2::ProjectionFailure::Codec(error) => E::from(error),
+        })?;
     } else {
         validate_type(expected.data_type(), work)?;
     }
@@ -279,14 +284,14 @@ pub(crate) fn preflight_verified_flat_record_batch(
 ) -> Result<FlatBatchGeometry, TypeCodecError> {
     preflight_verified_flat_record_batch_core(message, body, expected, limits, None, work)
 }
-pub(crate) fn preflight_verified_flat_record_batch_in(
+pub(crate) fn preflight_verified_flat_record_batch_in<E: ReaderGeometryFailure>(
     message: arrow::ipc::Message<'_>,
     body: &[u8],
     expected: &Field,
     limits: FlatBatchProjectionLimits,
-    admission: &mut Admission<'_, '_>,
+    admission: &mut Admission<'_, '_, E>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<FlatBatchGeometry, TypeCodecError> {
+) -> Result<FlatBatchGeometry, E> {
     preflight_verified_flat_record_batch_core(
         message,
         body,
@@ -296,16 +301,34 @@ pub(crate) fn preflight_verified_flat_record_batch_in(
         work,
     )
 }
-fn preflight_verified_flat_record_batch_core(
+fn preflight_verified_flat_record_batch_core<E: ReaderGeometryFailure>(
     message: arrow::ipc::Message<'_>,
     body: &[u8],
     expected: &Field,
     limits: FlatBatchProjectionLimits,
-    mut admission: Option<&mut Admission<'_, '_>>,
+    admission: Option<&mut Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<FlatBatchGeometry, TypeCodecError> {
+) -> Result<FlatBatchGeometry, E> {
+    preflight_verified_flat_record_batch_profile(
+        message,
+        body,
+        expected,
+        Some(limits),
+        admission,
+        work,
+    )
+}
+/// Same geometry body; None derives this input's finite checked extents.
+pub(crate) fn preflight_verified_flat_record_batch_profile<E: ReaderGeometryFailure>(
+    message: arrow::ipc::Message<'_>,
+    body: &[u8],
+    expected: &Field,
+    limits: Option<FlatBatchProjectionLimits>,
+    mut admission: Option<&mut Admission<'_, '_, E>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatBatchGeometry, E> {
     limit_parent(
-        body.len() <= limits.max_body_bytes,
+        limits.is_none_or(|limits| body.len() <= limits.max_body_bytes),
         "IPC batch body envelope exceeded",
         admission.as_deref_mut(),
         work,
@@ -321,16 +344,16 @@ fn preflight_message(
     layout: Layout,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<FlatBatchGeometry, TypeCodecError> {
-    preflight_message_core(message, body, limits, layout, None, work)
+    preflight_message_core(message, body, Some(limits), layout, None, work)
 }
-fn preflight_message_core(
+fn preflight_message_core<E: ReaderGeometryFailure>(
     message: arrow::ipc::Message<'_>,
     body: &[u8],
-    limits: FlatBatchProjectionLimits,
+    limits: Option<FlatBatchProjectionLimits>,
     layout: Layout,
-    mut admission: Option<&mut Admission<'_, '_>>,
+    mut admission: Option<&mut Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<FlatBatchGeometry, TypeCodecError> {
+) -> Result<FlatBatchGeometry, E> {
     let parent = admission.is_some();
     require_parent(
         message.version() == arrow::ipc::MetadataVersion::V5
@@ -361,7 +384,7 @@ fn preflight_message_core(
     )?;
     let rows = length(batch.length())?;
     limit_parent(
-        rows <= limits.max_rows,
+        limits.is_none_or(|limits| rows <= limits.max_rows),
         "IPC batch row envelope exceeded",
         admission.as_deref_mut(),
         work,
@@ -393,7 +416,7 @@ fn preflight_message_core(
         "IPC batch buffer descriptors are missing",
     ))?;
     limit_parent(
-        buffers.len() <= limits.max_buffer_descriptors,
+        limits.is_none_or(|limits| buffers.len() <= limits.max_buffer_descriptors),
         "IPC batch buffer envelope exceeded",
         admission.as_deref_mut(),
         work,
@@ -456,7 +479,7 @@ fn preflight_message_core(
 
 /// Inspect one already paired leaf occurrence in a larger recursive batch.
 /// Shared layout and buffer rules remain the flat owner's sole author.
-pub(crate) fn inspect_leaf_at_core(
+pub(crate) fn inspect_leaf_at_core<E: ReaderGeometryFailure>(
     batch: arrow::ipc::RecordBatch<'_>,
     body: &[u8],
     layout: Layout,
@@ -464,10 +487,10 @@ pub(crate) fn inspect_leaf_at_core(
     null_count: usize,
     buffer_start: usize,
     variadic_buffers: usize,
-    limits: FlatBatchProjectionLimits,
-    mut admission: Option<&mut Admission<'_, '_>>,
+    limits: Option<FlatBatchProjectionLimits>,
+    mut admission: Option<&mut Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<FlatBatchGeometry, TypeCodecError> {
+) -> Result<FlatBatchGeometry, E> {
     let parent = admission.is_some();
     let count = match layout {
         Layout::Null => 0,
@@ -582,7 +605,9 @@ pub(crate) fn inspect_leaf_at_core(
                 })?;
                 view_validation_bytes = numeric_parent(parent, add(view_validation_bytes, bytes))?;
                 limit_parent(
-                    view_validation_bytes <= limits.max_view_validation_bytes,
+                    limits.is_none_or(|limits| {
+                        view_validation_bytes <= limits.max_view_validation_bytes
+                    }),
                     "IPC view validation byte envelope exceeded",
                     admission.as_deref_mut(),
                     work,

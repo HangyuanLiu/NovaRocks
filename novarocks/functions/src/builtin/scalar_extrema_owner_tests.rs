@@ -124,7 +124,8 @@ fn extrema_owner_all_supported_exact_profiles_are_nullable_eager() {
     for name in ["greatest", "least"] {
         for ty in &profiles {
             for nullable in [false, true] {
-                let source = FunctionValueType::new(ty.clone(), nullable);
+                let source =
+                    FunctionValueType::from_legacy_declared_projection(ty.clone(), nullable);
                 let prepared = prepared_for_test(name, &[source.clone(), source]).unwrap();
                 let result = prepared.contract().result_type();
                 let expected = if *ty == DataType::Date32 {
@@ -132,8 +133,8 @@ fn extrema_owner_all_supported_exact_profiles_are_nullable_eager() {
                 } else {
                     ty.clone()
                 };
-                assert_eq!(result.data_type, expected);
-                assert!(result.nullable);
+                assert_eq!(result.data_type().clone(), expected);
+                assert!(result.nullable());
                 assert_eq!(
                     prepared.contract().effects().argument_control,
                     ArgumentControl::Eager
@@ -153,7 +154,7 @@ fn extrema_owner_all_supported_exact_profiles_are_nullable_eager() {
         )
         .unwrap();
         assert_eq!(
-            prepared.contract().result_type().data_type,
+            prepared.contract().result_type().data_type().clone(),
             DataType::Decimal256(39, 1)
         );
     }
@@ -170,7 +171,7 @@ fn extrema_owner_rejects_actual_unsupported_numeric_and_json_result_domain() {
             DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
             DataType::Struct(vec![Field::new("item", DataType::Int64, true)].into()),
         ] {
-            let source = FunctionValueType::new(ty, true);
+            let source = FunctionValueType::from_legacy_declared_projection(ty, true);
             assert!(prepared_for_test(name, &[source.clone(), source]).is_err());
         }
         let json =
@@ -200,10 +201,13 @@ fn extrema_owner_json_source_with_declared_physical_utf8_result_is_supported() {
         ] {
             let prepared = prepared_for_test(name, &sources).unwrap();
             assert_eq!(
-                prepared.contract().result_type().logical_type,
+                prepared.contract().result_type().logical_type(),
                 ValueLogicalType::Physical
             );
-            assert_eq!(prepared.contract().result_type().data_type, DataType::Utf8);
+            assert_eq!(
+                prepared.contract().result_type().data_type().clone(),
+                DataType::Utf8
+            );
         }
     }
 }

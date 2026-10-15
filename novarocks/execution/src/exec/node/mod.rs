@@ -39,7 +39,10 @@ pub mod union_all;
 pub mod unpivot;
 pub mod values;
 
-pub use lowering::{ExternalSinkRequirement, LocalProgramLoweringError, LocalRuntimeBindings};
+pub use lowering::{
+    ExternalSinkRequirement, LocalLayoutCreation, LocalProgramCreationFailure,
+    LocalProgramLoweringError, LocalRuntimeBindings,
+};
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;

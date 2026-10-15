@@ -101,12 +101,12 @@ pub(crate) fn freeze_completed_fragments(
                     branch_edges,
                 )?;
             } else if let Some(cte_id) = facts.cte_id() {
-                let consumers = cte_consumers.get(&cte_id).cloned().unwrap_or_default();
-                assembly::patch_native_cte_multicast_sink(
-                    &mut native_fragment,
+                let consumers = cte_consumers.get(&cte_id).map(Vec::as_slice).unwrap_or(&[]);
+                assembly::validate_native_cte_multicast_sink(
+                    &native_fragment,
                     fragment_id,
                     cte_id,
-                    &consumers,
+                    consumers,
                 )?;
             }
         }

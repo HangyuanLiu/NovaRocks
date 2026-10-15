@@ -56,14 +56,14 @@ pub(super) fn bindings(mode: SqlPhysicalEmissionMode) -> Vec<ResolvedFunctionBin
                 let FunctionArgumentType::Value(ty) = ty else {
                     panic!("actual original value source")
                 };
-                assert_eq!(ty.data_type, DataType::Utf8);
-                assert_eq!(ty.logical_type, ValueLogicalType::Physical);
+                assert_eq!(ty.data_type().clone(), DataType::Utf8);
+                assert_eq!(ty.logical_type(), ValueLogicalType::Physical);
             }
             let FunctionResultType::Scalar(output) = &binding.selected.result_type else {
                 panic!("actual original scalar result")
             };
-            assert_eq!(output.data_type, DataType::Utf8);
-            assert!(output.nullable);
+            assert_eq!(output.data_type().clone(), DataType::Utf8);
+            assert!(output.nullable());
             eprintln!(
                 "append static original journal mode={mode:?} fragment={:?} source={:?} binding={binding:?}",
                 fragment.id(),
@@ -92,7 +92,9 @@ fn e08s1_append_original_static_actual_corpus_journal_and_deferred_suffix_remain
         let FunctionResultType::Scalar(output) = &mut stale.selected.result_type else {
             unreachable!()
         };
-        output.nullable = false;
+        *output = output
+            .with_nullable(false)
+            .expect("valid test root nullability");
         // Original mode does not acquire new candidate support authority.
         original
             .admit_bound_lifecycle_observed(&stale, PureCallLifecycle::Scalar, &control)

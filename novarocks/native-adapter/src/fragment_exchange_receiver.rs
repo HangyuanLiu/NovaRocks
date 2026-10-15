@@ -19,8 +19,8 @@
 
 use crate::fragment_decode_context::NativePlanDecodeContext;
 use crate::fragment_error::NativeFragmentDecodeError;
-use crate::fragment_expression::decode_expr_for_slot_layout;
-use crate::fragment_layout::decode_fragment_output_layout;
+use crate::fragment_expression::decode_expr_for_slot_layout_with_types;
+
 use crate::fragment_plan_node::NativeLoweredPlanNode as DecodedNode;
 use crate::fragment_plan_node::{lower_sort_items_for_layout, parse_optional_nonnegative_i64};
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
@@ -32,13 +32,15 @@ use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
-pub fn lower_exchange_receiver(
+pub(crate) fn lower_exchange_receiver(
     node: &plan::DistributedNode,
     exchange: &plan::ExchangeReceiver,
     path: FieldPath,
     _children: Vec<DecodedNode>,
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let flavor = exchange
         .flavor
@@ -67,7 +69,7 @@ pub fn lower_exchange_receiver(
     // The instance-scoped ExchangeKey and sender count are materialized into the
     // per-node ExchangeBinding at execution time, not baked into the static node.
     NativeFragmentDecodeError::map_invalid(path.clone(), ctx.exchange_input(node.node_id))?;
-    let output_layout = decode_fragment_output_layout(
+    let output_layout = type_decoder.output_layout(
         &exchange.output_columns,
         path.clone().field("output_columns"),
     )?;
@@ -83,6 +85,7 @@ pub fn lower_exchange_receiver(
         path.clone().field("partition_exprs"),
         arena,
         &layout,
+        type_decoder,
     )?;
     let mut lowered = DecodedNode {
         node: ExecNode {
@@ -145,6 +148,7 @@ pub fn lower_exchange_receiver(
                     .field("items"),
                 arena,
                 &lowered.layout,
+                type_decoder,
             )?;
             let limit = NativeFragmentDecodeError::map_invalid(
                 path.clone()
@@ -195,6 +199,8 @@ fn decode_hash_partition_exprs(
     path: FieldPath,
     arena: &mut ExprArena,
     layout: &Layout,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<Vec<ExprId>, NativeFragmentDecodeError> {
     if !matches!(
         plan::PartitionType::try_from(exchange.partition_type),
@@ -207,7 +213,13 @@ fn decode_hash_partition_exprs(
         .iter()
         .enumerate()
         .map(|(index, expr)| {
-            decode_expr_for_slot_layout(expr, path.clone().index(index), arena, layout)
+            decode_expr_for_slot_layout_with_types(
+                expr,
+                path.clone().index(index),
+                arena,
+                layout,
+                type_decoder,
+            )
         })
         .collect()
 }
@@ -228,28 +240,105 @@ mod tests {
         else {
             panic!("fixture node carries an exchange payload");
         };
-        super::lower_exchange_receiver(
-            node,
-            exchange,
-            FieldPath::root("plan_fragment")
-                .field("root")
-                .field("payload")
-                .field("exchange"),
-            Vec::new(),
-            arena,
-            ctx,
-        )
+        let declared = novarocks_type_contract::FunctionValueType::new(DataType::Int64, true);
+        with_exchange_types(&declared, |decoder| {
+            super::lower_exchange_receiver(
+                node,
+                exchange,
+                FieldPath::root("plan_fragment")
+                    .field("root")
+                    .field("payload")
+                    .field("exchange"),
+                Vec::new(),
+                arena,
+                ctx,
+                decoder,
+            )
+        })
     }
 
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::runtime::exchange::ExchangeKey;
-    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
-        encode_type(data_type).expect("encode type")
+        assert_eq!(
+            data_type,
+            &DataType::Int64,
+            "this fixture declares an Int64 exchange"
+        );
+        common::TypeDesc {
+            value_binding_id: Some(0),
+        }
+    }
+
+    fn with_exchange_types<T>(
+        declared: &novarocks_type_contract::FunctionValueType,
+        operation: impl FnOnce(
+            &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
+        ) -> Result<T, crate::fragment_error::NativeFragmentDecodeError>,
+    ) -> Result<T, crate::fragment_error::NativeFragmentDecodeError> {
+        use crate::fragment_type_decode::{
+            NativeDecodeResources, NativeTypeDecoder, table_failure,
+        };
+        use crate::native_type_construction::{NativeTypeConstruction, NativeTypeFactory};
+        use novarocks_plan_codec::execution_type_table::{
+            ExecutionTypeRoot, ExecutionTypeTableBuilder, ExecutionTypeTableLimits,
+            decode_execution_type_table_with_factory_in,
+        };
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+        struct Control;
+        impl PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                _: CompilePhase,
+                _: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                Ok(())
+            }
+        }
+        let control = Control;
+        let creation = NativeTypeConstruction::try_with_control(
+            novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+                "exchange fixture types",
+            ),
+            &control,
+        )?;
+        let roots = [ExecutionTypeRoot {
+            id: 0,
+            value: declared,
+        }];
+        let limits = ExecutionTypeTableLimits::for_validated_root_count(roots.len()).unwrap();
+        let mut source_work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let source = ExecutionTypeTableBuilder::new(&roots)
+            .encode_observed(
+                limits,
+                &mut |layout| creation.request(layout),
+                &mut source_work,
+            )
+            .map_err(|error| table_failure(error, FieldPath::root("fixture_source_types")))?
+            .into_wire();
+        source_work.finish().unwrap();
+        let mut resources = NativeDecodeResources::try_new(&creation)?;
+        let factory = NativeTypeFactory::new(&creation);
+        let types = decode_execution_type_table_with_factory_in(
+            &source,
+            limits,
+            &factory,
+            &mut resources.work,
+        )
+        .map_err(|error| table_failure(error, FieldPath::root("execution_types")))?;
+        let mut decoder = NativeTypeDecoder::Strong {
+            types: &types,
+            original_requests: None,
+            resources: &mut resources,
+        };
+        let result = operation(&mut decoder)?;
+        drop(decoder);
+        resources.finish()?;
+        Ok(result)
     }
 
     fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
@@ -264,6 +353,7 @@ mod tests {
 
     fn column_ref(column_id: u32, data_type: DataType) -> expr::Expr {
         expr::Expr {
+            original_definition_id: None,
             r#type: Some(type_desc(&data_type)),
             nullable: true,
             kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
@@ -293,6 +383,7 @@ mod tests {
             children: Vec::new(),
             payload: Some(plan::distributed_node::Payload::Exchange(
                 plan::ExchangeReceiver {
+                    original_edge_id: None,
                     partition_type: plan::PartitionType::Hash as i32,
                     partition_exprs: Vec::new(),
                     source_fragment_id: 7,
@@ -327,6 +418,7 @@ mod tests {
             children: Vec::new(),
             payload: Some(plan::distributed_node::Payload::Exchange(
                 plan::ExchangeReceiver {
+                    original_edge_id: None,
                     partition_type: plan::PartitionType::Unpartitioned as i32,
                     partition_exprs: Vec::new(),
                     source_fragment_id: 7,
@@ -353,6 +445,7 @@ mod tests {
             children: Vec::new(),
             payload: Some(plan::distributed_node::Payload::Exchange(
                 plan::ExchangeReceiver {
+                    original_edge_id: None,
                     partition_type: plan::PartitionType::Unpartitioned as i32,
                     partition_exprs: Vec::new(),
                     source_fragment_id: 7,
@@ -383,6 +476,7 @@ mod tests {
             children: Vec::new(),
             payload: Some(plan::distributed_node::Payload::Exchange(
                 plan::ExchangeReceiver {
+                    original_edge_id: None,
                     partition_type: plan::PartitionType::Hash as i32,
                     partition_exprs: Vec::new(),
                     source_fragment_id: 7,
@@ -436,6 +530,7 @@ mod tests {
             children: Vec::new(),
             payload: Some(plan::distributed_node::Payload::Exchange(
                 plan::ExchangeReceiver {
+                    original_edge_id: None,
                     partition_type: partition_type as i32,
                     partition_exprs,
                     source_fragment_id: 7,

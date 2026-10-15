@@ -85,8 +85,8 @@ fn conversion_pair() -> (FunctionValueType, FunctionValueType) {
         .map(|i| Arc::new(Field::new(format!("c{i}"), DataType::Utf8, true)))
         .collect::<Vec<_>>();
     (
-        FunctionValueType::new(DataType::Struct(source.into()), true),
-        FunctionValueType::new(DataType::Struct(target.into()), true),
+        FunctionValueType::from_legacy_declared_projection(DataType::Struct(source.into()), true),
+        FunctionValueType::from_legacy_declared_projection(DataType::Struct(target.into()), true),
     )
 }
 
@@ -102,7 +102,7 @@ fn actual_scalar_dynamic_aggregate_table_families_preserve_original_controls() {
             FunctionKind::Table,
             (0..320)
                 .map(|_| {
-                    value(FunctionValueType::new(
+                    value(FunctionValueType::from_legacy_declared_projection(
                         DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
                         false,
                     ))
@@ -287,35 +287,25 @@ fn source_type_resource_failure_is_typed_and_domain_is_never_inferred() {
     let catalog = builtin_engine_function_catalog();
     let field = Field::new("item", DataType::Int64, true)
         .with_metadata((0..257).map(|i| (format!("k{i}"), "v".into())).collect());
-    let args = [value(FunctionValueType::new(
+    let args = [value(FunctionValueType::from_legacy_declared_projection(
         DataType::List(Arc::new(field)),
         false,
     ))];
-    assert!(matches!(
-        catalog.resolve_bound_user(
-            "coalesce",
-            FunctionKind::Scalar,
-            request(&args),
-            crate::binding_test_control()
-        ),
-        Err(FunctionBindingError::Control(
-            CompileControlError::ResourceExhausted
-        ))
-    ));
-    let args = [value(FunctionValueType {
-        data_type: DataType::Int64,
-        nullable: false,
-        logical_type: ValueLogicalType::Json,
-    })];
-    assert!(matches!(
-        catalog.resolve_bound_user(
-            "coalesce",
-            FunctionKind::Scalar,
-            request(&args),
-            crate::binding_test_control()
-        ),
-        Err(FunctionBindingError::InvalidBinding(_))
-    ));
+    assert!(
+        catalog
+            .resolve_bound_user(
+                "coalesce",
+                FunctionKind::Scalar,
+                request(&args),
+                crate::binding_test_control()
+            )
+            .is_ok(),
+        "source annotation resources are checked by source ingress"
+    );
+    assert!(
+        FunctionValueType::try_with_logical_type(DataType::Int64, false, ValueLogicalType::Json,)
+            .is_err()
+    );
     let args = [value(FunctionValueType::new(
         DataType::FixedSizeBinary(16),
         false,
@@ -329,4 +319,44 @@ fn source_type_resource_failure_is_typed_and_domain_is_never_inferred() {
         ),
         Err(FunctionBindingError::NoMatchingOverload)
     ));
+}
+
+#[test]
+fn scalar_request_value_lambda_gate_preserves_original_refusal_and_control_prefix() {
+    let catalog = builtin_engine_function_catalog();
+    // The scalar request gate reads Value and Lambda channels in source order.
+    // Every request profile is validated first; a Lambda is never projected
+    // into a value carrier or silently skipped by the borrowed view.
+    for ordinal in [0, 160, 319] {
+        let mut args = wide_values();
+        args[ordinal] = FunctionArgument::Lambda {
+            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                Box::new([]),
+            ),
+            result_type: FunctionValueType::new(DataType::Int64, false),
+        };
+        let bind = |control: &dyn PureCompileControl| {
+            catalog.resolve_bound_user("coalesce", FunctionKind::Scalar, request(&args), control)
+        };
+        let baseline = Control::new(None, CompileControlError::Cancelled);
+        assert!(matches!(
+            bind(&baseline),
+            Err(FunctionBindingError::NoMatchingOverload)
+        ));
+        let seen = baseline.seen();
+        let interior = seen.iter().position(|(_, units)| *units == 256).unwrap() + 1;
+        for stop in [1, interior, seen.len()] {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = Control::new(Some(stop), cause);
+                assert!(
+                    matches!(bind(&control), Err(FunctionBindingError::Control(actual)) if actual == cause)
+                );
+                assert_eq!(control.seen(), seen[..stop]);
+            }
+        }
+    }
 }

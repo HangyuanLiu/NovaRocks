@@ -47,7 +47,7 @@ fn sql_fold_dependency_ds_scalar_actual_literal_three_arity_exact_source() {
             Some(novarocks_sql::binding::SqlResultConstraintOrigin::Unconstrained)
         );
         assert_eq!(
-            receipt.request_result.data_type,
+            receipt.request_result.data_type().clone(),
             arrow::datatypes::DataType::Binary
         );
         assert_eq!(

@@ -43,12 +43,12 @@ fn local(name: &str, args: Vec<TypedExpr>) -> PhysicalPlanNode {
     let mut state = column(
         91,
         "state",
-        intermediate.data_type.clone(),
-        intermediate.nullable,
+        intermediate.data_type().clone(),
+        intermediate.nullable(),
     );
     state.value_type = intermediate;
     spec.mode = AggMode::Local;
-    spec.aggregates[0].result_type = state.value_type.data_type.clone();
+    spec.aggregates[0].result_type = state.value_type.clone();
     spec.output_layout = AggregateOutputLayout::new(vec![], vec![state.clone()]);
     spec.output_columns = vec![state.clone()];
     result.output_columns = vec![state];
@@ -80,9 +80,14 @@ fn merge(
             .unwrap()
             .intermediate_type
             .clone();
-        let mut state = column(91, "intermediate_state", ty.data_type.clone(), ty.nullable);
+        let mut state = column(
+            91,
+            "intermediate_state",
+            ty.data_type().clone(),
+            ty.nullable(),
+        );
         state.value_type = ty;
-        spec.aggregates[0].result_type = state.value_type.data_type.clone();
+        spec.aggregates[0].result_type = state.value_type.clone();
         spec.output_layout = AggregateOutputLayout::new(vec![], vec![state.clone()]);
         spec.output_columns = vec![state.clone()];
         result.output_columns = vec![state];
@@ -274,10 +279,48 @@ fn check_merge(
             })?;
         let request = author_physical_aggregate_merge_request_observed(entry, &mut work)?;
         assert_eq!(request.state_inputs().root(), graph.root());
+        let canonical = entry.canonical().unwrap();
+        assert!(canonical.belongs_to(entry.captured()));
         assert!(std::ptr::eq(
             request.request().arguments,
-            entry.captured().request().arguments
+            canonical.request().arguments
         ));
+        assert!(Arc::ptr_eq(request.selected(), canonical.selected()));
+        assert_eq!(
+            canonical.selected().argument_types.as_ref(),
+            entry.source().binding.function.argument_types.as_ref()
+        );
+        assert_eq!(
+            canonical.request().logical_argument_count,
+            entry.captured().request().logical_argument_count
+        );
+        assert_eq!(
+            canonical.request().arguments.len(),
+            entry.captured().request().arguments.len()
+        );
+        for (original, current) in entry
+            .captured()
+            .request()
+            .arguments
+            .iter()
+            .zip(canonical.request().arguments)
+        {
+            let (original, original_cv) = value(original);
+            let (current, current_cv) = value(current);
+            // These independent-source cases do not revise their logical type
+            // or lend another contributor's constant/backing to the consumer.
+            assert_eq!(original, current);
+            match (original_cv, current_cv) {
+                (None, None) => {}
+                (Some(a), Some(b)) => {
+                    assert_eq!(a.ordinal(), b.ordinal());
+                    assert!(Arc::ptr_eq(a.pool().array(), b.pool().array()));
+                    assert_eq!(a.pool().backing_identity(), b.pool().backing_identity());
+                    assert_eq!(a.value_type(), b.value_type());
+                }
+                _ => panic!("the consumer keeps its own constant presence"),
+            }
+        }
         assert!(std::ptr::eq(request.source(), entry.source()));
         assert!(std::ptr::eq(request.node(), entry.node()));
         assert_eq!(request.site(), entry.site());
@@ -322,10 +365,10 @@ fn state_sources_count_star_stream_loans_exact_actual_partial_and_final_own_requ
     let wire = owner.plan().edges().get(edge).unwrap();
     assert_eq!(wire.source.fragment, actual.emissions[0].0.fragment);
     assert_eq!(links.as_slice(), &[(0, 0, actual.emissions[0].0)]);
-    assert!(
-        entry.canonical().is_none(),
-        "Final still owns its own logical capture"
-    );
+    let canonical = entry.canonical().unwrap();
+    assert!(canonical.belongs_to(entry.captured()));
+    assert_eq!(canonical.request().logical_argument_count, 0);
+    assert!(canonical.request().arguments.is_empty());
     check_merge(&entry, &Control::default()).unwrap();
 }
 

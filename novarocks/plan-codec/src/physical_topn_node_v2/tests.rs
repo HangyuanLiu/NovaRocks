@@ -220,7 +220,9 @@ fn aggregate(phase: p::AggregatePhase) -> p::AggregateBinding {
             FunctionId::try_new("test/f").unwrap(),
             FunctionOverloadId::try_new("test/o").unwrap(),
             FunctionKind::Aggregate,
-            Box::from([FunctionArgumentType::Value(dictionary())]),
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                FunctionArgumentType::Value(dictionary()),
+            ])),
             nested(),
         ),
         phase,
@@ -529,7 +531,7 @@ impl Fixture {
                             parameter_types, ..
                         } => parameter_types
                             .iter()
-                            .map(|ty| match &ty.data_type {
+                            .map(|ty| match &ty.data_type() {
                                 DataType::Struct(_) => 2,
                                 DataType::Int64 => 0,
                                 _ => panic!("fixture has an unauthored Lambda parameter type"),
@@ -830,13 +832,16 @@ fn topn_grouped_states_preserve_complete_independent_wire_and_owned_payloads() {
 #[test]
 fn topn_owned_signatures_keep_lambda_nominal_metadata_and_original_aliases() {
     let mut n = node();
-    calls(&mut n)[0].binding.function.argument_types = Box::from([
-        FunctionArgumentType::Value(dictionary()),
-        FunctionArgumentType::Lambda {
-            parameter_types: Box::from([nested(), FunctionValueType::new(DataType::Int64, true)]),
-            result_type: nominal(),
-        },
-    ]);
+    calls(&mut n)[0].binding.function.argument_types =
+        novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+            FunctionArgumentType::Value(dictionary()),
+            FunctionArgumentType::Lambda {
+                parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    Box::from([nested(), FunctionValueType::new(DataType::Int64, true)]),
+                ),
+                result_type: nominal(),
+            },
+        ]));
     Fixture::new().with(&n, &Control::default(), |v, e, d, a| {
         let actual = encode_topn_node(&n, v, e, SOURCE, limits()).unwrap().0;
         // Alias 9 and ID0 point to the same original binding; original sparse
@@ -863,20 +868,19 @@ fn topn_owned_signatures_keep_lambda_nominal_metadata_and_original_aliases() {
                     [nested(), FunctionValueType::new(DataType::Int64, true)]
                 );
                 assert_eq!(result_type, &nominal());
-                if let DataType::Struct(fields) = &parameter_types[0].data_type {
+                if let DataType::Struct(fields) = &parameter_types[0].data_type() {
                     assert_eq!(fields[0].name(), "original-child");
-                    assert_eq!(
-                        fields[0].metadata().get("unknown").map(String::as_str),
-                        Some("unchanged")
-                    );
+                    assert_eq!(fields[0].metadata().capacity(), 0);
+                    assert!(fields[0].is_nullable());
                 } else {
                     panic!("original Lambda Struct was lost");
                 }
             }
             _ => panic!("Lambda shape was lost"),
         }
-        if let DataType::Struct(fields) = &first.function.result_type.data_type {
-            if let DataType::Struct(original) = &a.definitions()[0].1.function.result_type.data_type
+        if let DataType::Struct(fields) = &first.function.result_type.data_type() {
+            if let DataType::Struct(original) =
+                &a.definitions()[0].1.function.result_type.data_type()
             {
                 assert!(Arc::ptr_eq(&fields[0], &original[0]));
             } else {
@@ -1002,15 +1006,15 @@ fn topn_independent_layout_and_exact_seven_axes_cover_rows_and_inline_states() {
             } else {
                 0
             };
-            let child =
-                2 * layout::<FunctionArgumentType>(1) + 6 + 6 + 8 + 4 * layout::<DataType>(1);
+            // Grouped inline state/function signatures share their original
+            // immutable owners; only physical node collections allocate.
             assert_eq!(
                 sf.allocation_requests_upper_bound,
                 if grouped_mode { 8 } else { 4 }
             );
             assert_eq!(
                 rf.allocation_requests_upper_bound,
-                if grouped_mode { 34 } else { 8 }
+                if grouped_mode { 16 } else { 8 }
             );
             assert_eq!(
                 sf.allocation_request_bytes_upper_bound,
@@ -1018,7 +1022,7 @@ fn topn_independent_layout_and_exact_seven_axes_cover_rows_and_inline_states() {
             );
             assert_eq!(
                 rf.allocation_request_bytes_upper_bound,
-                receiver_header + receiver_extra + if grouped_mode { 2 * child } else { 0 }
+                receiver_header + receiver_extra
             );
             assert_eq!(sf.value_reference_count, if grouped_mode { 8 } else { 3 });
             assert_eq!(rf.value_reference_count, sf.value_reference_count);

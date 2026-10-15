@@ -80,10 +80,10 @@ impl ReaderDiagnosticRequests {
 /// length <= L, cumulative requests are <= 8+4L. Check a possible individual
 /// capacity separately from the cumulative sum. Aggregate requests need not
 /// themselves describe one allocation Layout.
-pub(crate) fn string_requests(
+pub(crate) fn string_requests<W: ResourceWork>(
     length: usize,
-    work: &mut impl ResourceWork,
-) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<ReaderDiagnosticRequests, W::Error> {
     if length == 0 {
         work.step()?;
         return Ok(ReaderDiagnosticRequests::default());
@@ -110,11 +110,11 @@ pub(crate) fn string_requests(
     })
 }
 
-fn length(
+fn length<W: ResourceWork>(
     literal: &'static str,
     arguments: &[usize],
-    work: &mut impl ResourceWork,
-) -> Result<usize, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<usize, W::Error> {
     let mut result = literal.len();
     for &argument in arguments {
         result = work.numeric(add(result, argument))?;
@@ -122,10 +122,10 @@ fn length(
     }
     Ok(result)
 }
-pub(crate) fn arrow_error(
+pub(crate) fn arrow_error<W: ResourceWork>(
     description: usize,
-    work: &mut impl ResourceWork,
-) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<ReaderDiagnosticRequests, W::Error> {
     let original = string_requests(description, work)?;
     // ArrowError::InvalidArgumentError Display, followed by the actual
     // caller's to_string. Both requests occur, even though the original drops.
@@ -133,14 +133,14 @@ pub(crate) fn arrow_error(
         work.numeric(add("Invalid argument error: ".len(), description))?,
         work,
     )?;
-    original.plus(converted)
+    Ok(original.plus(converted)?)
 }
-fn candidate(
+fn candidate<W: ResourceWork>(
     largest: &mut ReaderDiagnosticRequests,
     literal: &'static str,
     arguments: &[usize],
-    work: &mut impl ResourceWork,
-) -> Result<(), FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<(), W::Error> {
     let description = length(literal, arguments, work)?;
     *largest = largest.maximum(arrow_error(description, work)?);
     work.requests(
@@ -150,10 +150,10 @@ fn candidate(
     work.step()?;
     Ok(())
 }
-pub(crate) fn decimal_digits(
+pub(crate) fn decimal_digits<W: ResourceWork>(
     mut value: usize,
-    work: &mut impl ResourceWork,
-) -> Result<usize, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<usize, W::Error> {
     let mut digits = 1;
     while value >= 10 {
         value /= 10;
@@ -162,10 +162,10 @@ pub(crate) fn decimal_digits(
     }
     Ok(digits)
 }
-fn utf8_error_length(
+fn utf8_error_length<W: ResourceWork>(
     index_digits: usize,
-    work: &mut impl ResourceWork,
-) -> Result<usize, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<usize, W::Error> {
     // Utf8Error::error_len is u8; its valid_up_to is usize. The two original
     // Display alternatives write directly into the containing String.
     let invalid = length(
@@ -198,9 +198,9 @@ fn scaled_length(coefficient: usize, scale: i8) -> Result<usize, FlatPoolResourc
 /// The radix10 Vec starts at ceil(bits/log2(10)) <= 256; any later growth is
 /// conservatively covered by the same u8 RawVec rule for <=78 decimal digits.
 /// The >=64-limb big-number branch cannot be entered by this 256-bit source.
-fn bigint_display_requests(
-    work: &mut impl ResourceWork,
-) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
+fn bigint_display_requests<W: ResourceWork>(
+    work: &mut W,
+) -> Result<ReaderDiagnosticRequests, W::Error> {
     let representation_bytes = 256usize / 8;
     let maximum_limbs = 256usize / 32;
     work.numeric(byte_layout(representation_bytes))?;
@@ -222,14 +222,14 @@ fn bigint_display_requests(
     work.step()?;
     Ok(result)
 }
-fn decimal_error(
+fn decimal_error<W: ResourceWork>(
     width: &'static str,
     coefficient_length: usize,
     precision: u8,
     scale: i8,
     bigint: bool,
-    work: &mut impl ResourceWork,
-) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<ReaderDiagnosticRequests, W::Error> {
     let bound_length = work.numeric(add(usize::from(precision), 1))?; // includes a possible minus
     let coefficient_scaled = scaled_length(coefficient_length, scale)?;
     let bound_scaled = scaled_length(bound_length, scale)?;
@@ -256,18 +256,18 @@ fn decimal_error(
     Ok(requests)
 }
 
-pub(super) fn preflight(
+pub(super) fn preflight<W: ResourceWork>(
     stream: &FlatConstantStream<'_, '_>,
-    work: &mut impl ResourceWork,
-) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<ReaderDiagnosticRequests, W::Error> {
     preflight_field(stream.field(), work)
 }
 
 /// Shared per-field leaf diagnostic author; container wrapping is additional.
-pub(crate) fn preflight_field(
+pub(crate) fn preflight_field<W: ResourceWork>(
     field: &Field,
-    work: &mut impl ResourceWork,
-) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<ReaderDiagnosticRequests, W::Error> {
     let ty = field.data_type();
     let digits = decimal_digits(usize::MAX, work)?;
     let mut largest = ReaderDiagnosticRequests::default();

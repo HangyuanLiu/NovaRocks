@@ -124,7 +124,7 @@ pub(crate) struct MvFirstRefreshWriteRequest {
     current_database: String,
     expected_target_snapshot_id: Option<i64>,
     target_table: ConnectorTableHandle,
-    write_input_fields: Arc<[arrow::datatypes::Field]>,
+    write_input_fields: Arc<[novarocks_spi::connector::ConnectorWriteFieldRequest]>,
     observed_binding: ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
 }
@@ -140,7 +140,7 @@ impl MvFirstRefreshWriteRequest {
         current_database: String,
         expected_target_snapshot_id: Option<i64>,
         target_table: ConnectorTableHandle,
-        write_input_fields: Arc<[arrow::datatypes::Field]>,
+        write_input_fields: Arc<[novarocks_spi::connector::ConnectorWriteFieldRequest]>,
         observed_binding: ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
     ) -> Result<Self, String> {
@@ -201,9 +201,11 @@ impl MvFirstRefreshWriteRequest {
         &self.target_table
     }
 
-    /// Immutable Arrow field facts copied from the validated target before
-    /// write admission. This contains no SQL planner or provider handle.
-    pub(crate) fn write_input_fields(&self) -> &[arrow::datatypes::Field] {
+    /// Independent source fields and complete declarations from the validated
+    /// target before admission, without a SQL planner or provider handle.
+    pub(crate) fn write_input_fields(
+        &self,
+    ) -> &[novarocks_spi::connector::ConnectorWriteFieldRequest] {
         &self.write_input_fields
     }
 
@@ -242,7 +244,9 @@ impl PreparedMvFirstRefreshWrite {
         self.request.target_table()
     }
 
-    pub(crate) fn write_input_fields(&self) -> &[arrow::datatypes::Field] {
+    pub(crate) fn write_input_fields(
+        &self,
+    ) -> &[novarocks_spi::connector::ConnectorWriteFieldRequest] {
         self.request.write_input_fields()
     }
 
@@ -543,7 +547,7 @@ impl MvIncrementalWritePreparer {
 pub struct PreparedMvMetadataOnlyWrite {
     intent: MvRefreshPublicationIntent,
     target_table: ConnectorTableHandle,
-    write_input_fields: Arc<[arrow::datatypes::Field]>,
+    write_input_fields: Arc<[novarocks_spi::connector::ConnectorWriteFieldRequest]>,
     observed_binding: ConnectorProviderBindingKey,
 }
 
@@ -551,7 +555,7 @@ impl PreparedMvMetadataOnlyWrite {
     pub(crate) fn try_new(
         intent: MvRefreshPublicationIntent,
         target_table: ConnectorTableHandle,
-        write_input_fields: Arc<[arrow::datatypes::Field]>,
+        write_input_fields: Arc<[novarocks_spi::connector::ConnectorWriteFieldRequest]>,
         observed_binding: ConnectorProviderBindingKey,
     ) -> Result<Self, String> {
         if write_input_fields.is_empty() || target_table.owner() != &observed_binding.instance_id {
@@ -573,7 +577,9 @@ impl PreparedMvMetadataOnlyWrite {
         &self.target_table
     }
 
-    pub(crate) fn write_input_fields(&self) -> &[arrow::datatypes::Field] {
+    pub(crate) fn write_input_fields(
+        &self,
+    ) -> &[novarocks_spi::connector::ConnectorWriteFieldRequest] {
         &self.write_input_fields
     }
 

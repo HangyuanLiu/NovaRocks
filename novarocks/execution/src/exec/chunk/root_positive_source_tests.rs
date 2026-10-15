@@ -54,7 +54,30 @@ fn root_positive_source_structural_local_compiler_unknown_owner_and_materialized
     assert!(structural.metadata_materializations().is_none());
     assert!(structural.field_metadata_origins().is_none());
     assert!(structural.schema_metadata_origin().is_none());
-    let unknown = ChunkSchema::from_compiled_layout(structural).unwrap();
+    let canonical = ChunkSchema::from_compiled_layout(structural).unwrap();
+    assert!(canonical.is_typed());
+    // The immutable typed author has no retained annotation table. Its actual
+    // zero-capacity representation is a distinct bounded source; it claims no
+    // provider/M07 construction receipt or capacity grant.
+    assert!(borrowed_root_chunk_schema_storage(&canonical, limits()).is_ok());
+    // An explicitly legacy field import does not elect that typed source just
+    // because its visible Arrow representation is equal and empty.
+    let legacy_slots = structural
+        .schema()
+        .fields()
+        .iter()
+        .zip(structural.slots())
+        .map(|(field, slot)| {
+            crate::exec::chunk::ChunkSlotSchema::new_with_field(
+                *slot,
+                field.as_ref().clone(),
+                None,
+                None,
+            )
+        })
+        .collect();
+    let unknown = ChunkSchema::try_new(legacy_slots).unwrap();
+    assert!(!unknown.is_typed());
     assert_eq!(
         borrowed_root_chunk_schema_storage(&unknown, limits()),
         Err(RootArrayStorageError::UnknownMetadataOwner)
@@ -69,7 +92,10 @@ fn root_positive_source_structural_local_compiler_unknown_owner_and_materialized
         .iter()
         .map(|field| {
             let ty = novarocks_type_contract::FunctionValueType::try_from_field(field).unwrap();
-            assert!(matches!(ty.data_type, DataType::Int64 | DataType::Float64));
+            assert!(matches!(
+                ty.data_type(),
+                DataType::Int64 | DataType::Float64
+            ));
             materialize_value_field(&ty, field.name().clone()).unwrap()
         })
         .collect();
@@ -99,9 +125,10 @@ fn root_positive_source_structural_local_compiler_unknown_owner_and_materialized
     assert!(borrowed_root_chunk_storage(&chunk, limits()).is_ok());
     assert!(borrowed_root_chunk_schema_storage(chunk.chunk_schema(), limits()).is_ok());
     // Structural equality never substitutes for the actual published SchemaArc.
-    let foreign = Arc::new(chunk.batch.schema().as_ref().clone());
+    let foreign = Arc::new(chunk.record_batch().schema().as_ref().clone());
     let batch =
-        arrow::record_batch::RecordBatch::try_new(foreign, chunk.batch.columns().to_vec()).unwrap();
+        arrow::record_batch::RecordBatch::try_new(foreign, chunk.record_batch().columns().to_vec())
+            .unwrap();
     let foreign = Chunk::try_new_with_chunk_schema(batch, chunk.chunk_schema_ref()).unwrap();
     assert_eq!(
         borrowed_root_chunk_storage(&foreign, limits()),

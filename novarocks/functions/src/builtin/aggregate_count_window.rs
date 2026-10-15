@@ -169,7 +169,7 @@ impl PreparedWindowKernel for PreparedCountWindow {
             let full = input.full_input();
             let rows = full.partition_rows();
             self.partition_retained_upper_bound(rows)?;
-            // The value core owns the original physical-root prefix arithmetic;
+            // The value core owns the logical-value prefix arithmetic;
             // the host supplies exact partition-relative evaluated addresses.
             let mut counts = reserve(rows, work)?;
             let argument = full.logical_arguments().first();
@@ -194,7 +194,11 @@ impl PreparedWindowKernel for PreparedCountWindow {
                     CountObservation::Step => work.step(),
                     CountObservation::OpaqueBoundary => work.flush(),
                 },
-            )?;
+            )
+            .map_err(|error| match error {
+                core::CountVisitError::Control(cause) => cause,
+                core::CountVisitError::Invalid(message) => internal(message),
+            })?;
             work.flush()?;
             let counts = counts.into_boxed_slice();
             work.flush()?;
@@ -240,7 +244,7 @@ impl WindowKernelPartition for CountPartition {
                 .build_final(states.iter(), control)?;
             SelectedValues::try_new_observed::<KernelFailure>(
                 selection,
-                &self.prepared.contract.result_type().data_type,
+                self.prepared.contract.result_type().data_type(),
                 output,
                 Box::default(),
                 || work.step(),

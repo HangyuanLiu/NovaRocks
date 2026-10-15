@@ -19,6 +19,7 @@ use super::*;
 use crate::physical_connector_payload_v2::ConnectorPayloadCodecError;
 use crate::physical_provider_binding_v2::ProviderBindingCodecError;
 use crate::physical_provider_read_v2::ProviderReadCodecError;
+use crate::physical_public_source_schema_v2::PublicSourceSchemaCodecError;
 use crate::physical_read_scan_v2::ReadScanCodecError;
 use crate::physical_relation_v2::RelationCodecError;
 use crate::physical_schema_v2::SchemaCodecError;
@@ -297,12 +298,67 @@ pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::Fragmen
         ],
         HashMap::from([("schema".into(), "read\0metadata".into())]),
     );
-    let public = c::ConnectorReadPublicFacts::try_new(
+    // Actual explicit execution declaration; generic format attributes belong
+    // only to the independent source-facts namespace.
+    let pure = ValueTypeStorageLifetime::pure();
+    let execution = c::ConnectorReadExecutionSchema::try_new(
+        Arc::new(Schema::new(vec![Field::new("v0", DataType::Int64, false)])),
+        vec![ty()].into_boxed_slice(),
+        pure.clone(),
+    )
+    .unwrap();
+    let shape = c::ConnectorSourceSchemaShape::try_new(
+        Arc::new(Schema::new(vec![Field::new("v0", DataType::Int64, false)])),
+        pure.clone(),
+    )
+    .unwrap();
+    let attrs = |original: &HashMap<String, String>| {
+        let table = novarocks_type_contract::owned_resources::hashmap::fresh_table_layout::<
+            String,
+            String,
+        >(original.len())
+        .unwrap();
+        let mut copied = HashMap::with_capacity(original.len());
+        let mut invoice = table.request_bytes_upper_bound;
+        for (key, value) in original {
+            let key = key.clone();
+            let value = value.clone();
+            invoice += key.capacity() + value.capacity();
+            copied.insert(key, value);
+        }
+        (copied, invoice)
+    };
+    let (field_attrs, field_invoice) = attrs(schema.field(0).metadata());
+    let field_fact = c::ConnectorSourceFieldFacts::try_new_observed(
+        vec![0].into(),
+        None,
+        None,
+        field_attrs,
+        &[],
+        pure.clone(),
+        field_invoice,
+        |_| Ok::<_, c::ConnectorError>(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let (schema_attrs, schema_invoice) = attrs(schema.metadata());
+    let source_facts = c::ConnectorSourceSchemaFacts::try_new_observed_with_source_invoice(
+        shape,
+        schema_attrs,
+        vec![field_fact].into_boxed_slice(),
+        pure,
+        schema_invoice,
+        |_| Ok::<_, c::ConnectorError>(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let public = c::ConnectorReadPublicFacts::try_new_typed_with_control(
         facts,
         metadata
             .then(|| c::ConnectorReadMetadataKind::try_new("iceberg.manifest.entries").unwrap()),
-        schema,
-        vec![ValueLogicalType::Physical],
+        &execution,
+        &source_facts,
+        &Setup,
     )
     .unwrap();
     let frozen = c::FrozenConnectorRead::try_new(scan_owner, public).unwrap();
@@ -369,13 +425,17 @@ pub(in crate::physical_package_v2) fn checked_writer() -> p::FragmentPackage {
         binding,
         payload,
         c::ConnectorWriteInputShape::Data {
-            fields: vec![c::ConnectorWriteFieldBinding::new(
-                c::ConnectorWriteFieldToken::from_bytes([1; 32]),
-                Field::new("v", DataType::Int64, false).with_metadata(HashMap::from([
-                    ("large".into(), "雪".repeat(6826) + "ab"),
-                    ("embedded".into(), "a\0b".into()),
-                ])),
-            )],
+            fields: vec![
+                c::ConnectorWriteFieldBinding::try_new_typed(
+                    c::ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    Field::new("v", DataType::Int64, false).with_metadata(HashMap::from([
+                        ("large".into(), "雪".repeat(6826) + "ab"),
+                        ("embedded".into(), "a\0b".into()),
+                    ])),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                )
+                .unwrap(),
+            ],
         },
     )
     .unwrap();
@@ -551,6 +611,7 @@ error_from!(
     SchemaCodecError,
     NodeCodecError,
     ReadScanCodecError,
+    PublicSourceSchemaCodecError,
     WriterRecipeCodecError
 );
 fn finish<T>(result: Result<T, Failure>, work: CompileCheckpoints<'_>) -> Result<T, Failure> {
@@ -667,9 +728,10 @@ fn project(
         )?;
         let prepared = sources.prepare_inputs_in(&mut budget, &mut work)?;
         let type_bytes = std::cell::Cell::new(0usize);
-        let types = physical_type_v2::encode_borrowed_type_table_writer_sources_in(
+        let types = physical_type_v2::encode_borrowed_type_namespaces_sources_in(
             views.values(),
             views.fields(),
+            views.source_fields(),
             &writer_types,
             SOURCE,
             type_limits(),
@@ -824,7 +886,7 @@ fn project(
                     prepared.scans().len(),
                     prepared.writers().len()
                 ),
-                (1, 1, 1, 0)
+                (1, 2, 1, 0)
             );
             let p::NodeKind::Scan {
                 relation,
@@ -914,6 +976,7 @@ fn project(
                         bindings: &providers,
                         payloads: &payloads,
                         schemas: &schemas,
+                        source_schemas: prepared.source_schemas(),
                     },
                     terminal_source,
                     ReadScanProjectionLimits {
@@ -1009,18 +1072,34 @@ fn project(
                 }
                 other => panic!("actual relation kind: {other:?}"),
             }
+            let execution_field = types
+                .as_wire()
+                .fields
+                .iter()
+                .find(|field| field.id == field_id)
+                .unwrap();
+            assert!(execution_field.carrier_type_id.is_some());
+            // Reserved shape slots cannot carry source attributes; the original
+            // attributes remain in the independent source facts asserted below.
+            let public = scan_wire[0].public_facts.as_ref().unwrap();
             assert_eq!(
-                types
-                    .as_wire()
-                    .fields
-                    .iter()
-                    .find(|f| f.id == field_id)
-                    .unwrap()
-                    .metadata[0]
-                    .value,
+                public.execution_schema_id,
+                Some(prepared.scans()[0].schema_id)
+            );
+            assert_eq!(
+                public.source_schema_id,
+                Some(prepared.scans()[0].source_schema_id)
+            );
+            let source_wire =
+                crate::physical_public_source_schema_v2::encode_public_source_schemas_pure_in(
+                    prepared.source_schemas(),
+                    &mut work,
+                )?;
+            assert_eq!(source_wire[0].schema_attributes[0].value, "read\0metadata");
+            assert_eq!(
+                source_wire[0].field_facts[0].attributes[0].value,
                 "original\0field"
             );
-            assert_eq!(schemas.as_wire()[0].metadata[0].value, "read\0metadata");
         } else {
             let (node, recipe) = package.writes().iter().next().unwrap();
             let p::NodeKind::TableWriter { target } = &package.fragment().nodes()[node].kind else {
@@ -1065,7 +1144,9 @@ fn project(
             let original = recipe.input().fields_iter().next().unwrap().field();
             let field_id = prepared.writers()[0].field_ids[0];
             assert!(std::ptr::eq(
-                types.field_source_observed(field_id, &mut work)?.unwrap(),
+                types
+                    .source_field_source_observed(field_id, &mut work)?
+                    .unwrap(),
                 original
             ));
             let (writer_wire, _) = physical_writer_recipe_v2::encode_writer_recipes_observed(
@@ -1100,15 +1181,39 @@ fn project(
             else {
                 panic!("checked original Data role")
             };
-            assert_eq!(data.fields[0].field_id, Some(field_id));
+            assert_eq!(data.fields[0].source_field_id, Some(field_id));
             assert_eq!(data.fields[0].field_token, vec![1; 32]);
-            let field = types
-                .as_wire()
+            let source_table = types.as_source_wire().unwrap();
+            let field = source_table
+                .shape
+                .as_ref()
+                .unwrap()
                 .fields
                 .iter()
                 .find(|field| field.id == field_id)
                 .unwrap();
             assert_eq!(field.name, "v");
+            assert!(field.logical_type_id.is_none() && field.value_binding_id.is_none());
+            let value_id = types
+                .source_field_value_type_id_observed(field_id, &mut work)?
+                .unwrap();
+            assert_eq!(data.fields[0].value_type_id, Some(value_id));
+            assert!(std::ptr::eq(
+                types.value_type_observed(value_id, &mut work)?.unwrap(),
+                recipe
+                    .input()
+                    .fields_iter()
+                    .next()
+                    .unwrap()
+                    .execution_type()
+                    .unwrap()
+            ));
+            let field = source_table
+                .field_facts
+                .iter()
+                .find(|facts| facts.field_id == Some(field_id))
+                .unwrap();
+
             assert_eq!(
                 field
                     .metadata
@@ -1257,9 +1362,9 @@ fn reject_source_loan(
             views
                 .fields()
                 .iter()
-                .find(|(id, _)| *id == real_id)
+                .find(|root| root.id == real_id)
                 .unwrap()
-                .1,
+                .field,
             field
         ));
         match mode {

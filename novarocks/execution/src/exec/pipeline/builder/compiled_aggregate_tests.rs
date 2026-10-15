@@ -603,14 +603,14 @@ fn group_keys_equate_null_every_nan_and_signed_zero_as_the_key_table_owns_them()
     let mut groups = Vec::new();
     for chunk in &chunks {
         let key = chunk
-            .batch
+            .record_batch()
             .column(0)
             .as_any()
             .downcast_ref::<Float64Array>()
             .expect("DOUBLE key")
             .clone();
         let count = chunk
-            .batch
+            .record_batch()
             .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()

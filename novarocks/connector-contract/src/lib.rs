@@ -38,6 +38,7 @@ mod read_public;
 mod recipe;
 mod scan;
 mod schema;
+mod source_schema_facts;
 mod type_projection;
 mod value;
 mod write;
@@ -55,7 +56,7 @@ pub use identity::{
     ConnectorIdentityError, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
 };
 pub use mutation::{ConnectorRowMutationEffect, ConnectorWriteRouteId};
-pub use owned_copy::WriterOwnedResourceFacts;
+pub use owned_copy::{WriterOwnedCreationFailure, WriterOwnedResourceFacts};
 pub use predicate::{
     Bound, ConnectorExpression, ConnectorFunctionName, Constraint, Domain,
     MAX_CONNECTOR_EXPRESSION_DEPTH, MAX_CONNECTOR_EXPRESSION_NODES, MAX_CONNECTOR_VALUE_BYTES,
@@ -75,7 +76,7 @@ pub use read_program::{
     ConnectorReadProgramCompileError, ConnectorReadProgramCompiler, ConnectorReadProgramRecipe,
     FrozenConnectorRead,
 };
-pub use read_public::ConnectorReadPublicFacts;
+pub use read_public::{ConnectorReadPublicFacts, TypedReadCreationFailure};
 pub use recipe::{
     ConnectorReadRecipeSplit, ConnectorReadRecipeSplitDraft, ConnectorReadRecipeSplitFacts,
     ConnectorReadRecipeSplitKind, ConnectorReadRelationRecipe,
@@ -85,6 +86,10 @@ pub use recipe::{
     MAX_CONNECTOR_RECIPE_BYTES, MAX_CONNECTOR_RECIPE_COLUMNS, MAX_CONNECTOR_RECIPE_PAYLOAD_BYTES,
     MAX_CONNECTOR_RECIPE_SPLIT_WEIGHT, ReadRecipeOwnedError,
 };
+pub use source_schema_facts::{
+    ConnectorReadExecutionSchema, ConnectorSourceFieldFacts, ConnectorSourceInitialDefault,
+    ConnectorSourceSchemaFacts, ConnectorSourceSchemaShape,
+};
 pub use type_projection::{
     connector_type_accepts_arrow, connector_type_accepts_value_type, connector_type_for_arrow,
     connector_type_for_value_type,
@@ -93,7 +98,7 @@ pub use value::{ConnectorValue, ConnectorValueType, MAX_CONNECTOR_DECIMAL_PRECIS
 pub use write::{ConnectorWriteFieldToken, MAX_CONNECTOR_WRITE_TARGETS, WriteTargetOrdinal};
 pub use write_input::{
     ConnectorWriteBinding, ConnectorWriteFieldBinding, ConnectorWriteFieldRef,
-    ConnectorWriteInputRef, ConnectorWriteInputShape,
+    ConnectorWriteInputRef, ConnectorWriteInputShape, write_field_matches_execution_type_observed,
 };
 pub use write_recipe::{
     ConnectorWriteRecipe, ConnectorWriteRecipeCompileError, ConnectorWriteRecipeCompiler,

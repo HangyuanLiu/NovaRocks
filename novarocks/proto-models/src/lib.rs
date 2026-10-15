@@ -44,6 +44,21 @@ pub mod filter {
     include!(concat!(env!("OUT_DIR"), "/novarocks.filter.rs"));
 }
 
+/// Sole Arrow field, layout and source-attribute vocabulary.
+pub mod arrow_type {
+    include!(concat!(env!("OUT_DIR"), "/novarocks.arrow_type.rs"));
+}
+
+/// Original binding requests and IPC constants shared by explicit plan owners.
+pub mod call_request {
+    include!(concat!(env!("OUT_DIR"), "/novarocks.call_request.rs"));
+}
+
+/// Shared logical value definitions for both static plan carriers.
+pub mod value_type {
+    include!(concat!(env!("OUT_DIR"), "/novarocks.value_type.rs"));
+}
+
 /// Flat type-table component of the v2 physical package vocabulary.
 pub mod physical_type_v2 {
     include!(concat!(env!("OUT_DIR"), "/novarocks.physical_type_v2.rs"));
@@ -68,6 +83,13 @@ pub mod physical_semantics_v2 {
 /// Complete flat fragment carrier. Generated DTOs remain codec-owned;
 /// structural and installed-capability validation precede local compilation.
 pub mod physical_package_v2 {
+    // Expansion aliases; the shared generated vocabulary is the sole owner.
+    pub use super::call_request::{
+        CallRequestDefinition, ConstantReference, FragmentCallRequests, IpcCompression,
+        IpcConstantPool, LambdaArgumentType, OriginalCallRequest, OriginalFunctionArgument,
+        OriginalValueArgument, SourceConstantPolicy, call_request_definition,
+        original_function_argument,
+    };
     include!(concat!(
         env!("OUT_DIR"),
         "/novarocks.physical_package_v2.rs"
@@ -76,6 +98,14 @@ pub mod physical_package_v2 {
 
 #[allow(clippy::large_enum_variant)]
 pub mod plan {
+    // Expansion aliases; physical Arrow descriptors have one generated owner.
+    pub use super::arrow_type::{
+        ArrowDecimalType, ArrowDictionaryType, ArrowFieldMetadataEntry, ArrowFixedSizeListType,
+        ArrowIntervalUnit, ArrowMapType, ArrowPhysicalColumn, ArrowPhysicalField,
+        ArrowPhysicalSchema, ArrowPhysicalType, ArrowPrimitiveType, ArrowRunEndEncodedType,
+        ArrowStructType, ArrowTimeType, ArrowTimeUnit, ArrowTimestampType, ArrowUnionField,
+        ArrowUnionMode, ArrowUnionType, arrow_physical_type,
+    };
     include!(concat!(env!("OUT_DIR"), "/novarocks.plan.rs"));
 }
 

@@ -122,7 +122,7 @@ fn binary_text_recipe_exact_type_root_null_obligation_and_refuses_other_routes()
         assert_eq!(
             PreparedCastRecipe::try_new(
                 CastOperation::Carrier,
-                &FunctionValueType::new(ty, true),
+                &FunctionValueType::from_legacy_declared_projection(ty, true),
                 &FunctionValueType::new(DataType::Utf8, true),
                 DecimalOverflowPolicy::OutputNull,
                 false,

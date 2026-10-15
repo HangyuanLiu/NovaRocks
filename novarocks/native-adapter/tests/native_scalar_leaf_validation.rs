@@ -136,7 +136,7 @@ fn no_allocation<T>(operation: impl FnOnce() -> T) -> T {
 }
 
 fn fixture(wrong_last_byte: bool) -> (Chunk, Arc<ScalarSchema>) {
-    let zone = "z".repeat(64 * 1024);
+    let zone = "z".repeat(novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES);
     let array =
         Arc::new(TimestampNanosecondArray::from(vec![-7]).with_timezone(zone.clone())) as ArrayRef;
     let field = Field::new("value", array.data_type().clone(), true);
@@ -236,20 +236,38 @@ fn returned(budget: &Arc<ResultRetainedBudget>) {
 }
 #[test]
 fn constructor_and_all_turns_fit_original_scratch_without_extra_allocation() {
+    let oversized = Field::new(
+        "value",
+        arrow::datatypes::DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Nanosecond,
+            Some(
+                "z".repeat(novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES + 1)
+                    .into(),
+            ),
+        ),
+        true,
+    );
+    let refusal = ChunkSlotSchema::try_new_with_field(SlotId::new(7), oversized, None, None)
+        .err()
+        .expect("execution timezone keeps its original type bound");
+    assert!(refusal.contains("timezone exceeds the byte limit"));
     let (input, schema) = fixture(false);
     let (budget, credit) = budget_and_credit();
     let mut owned = begin(&input, schema, credit);
     assert_eq!(owned.cursor.encoded_len(), None);
     held(&budget);
-    for index in 0..6 {
+    for index in 0..1 {
         let mut untouched = [0xa5; 32];
         let turn = no_allocation(|| owned.cursor.step(&mut untouched).unwrap());
         assert_eq!(untouched, [0xa5; 32]);
         assert_eq!((turn.emitted_bytes, turn.completed_rows), (0, 0));
-        assert_eq!(turn.examined_bytes, 64 * 1024);
+        assert_eq!(
+            turn.examined_bytes,
+            6 * novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES
+        );
         assert!(turn.visited_cells <= 1024);
         assert_eq!(turn.status, RenderTurnStatus::Yielded);
-        assert_eq!(owned.cursor.encoded_len().is_some(), index == 5);
+        assert_eq!(owned.cursor.encoded_len().is_some(), index == 0);
     }
     let mut output = [0; 32];
     let turn = no_allocation(|| owned.cursor.step(&mut output).unwrap());
@@ -302,7 +320,6 @@ fn failed_validation_keeps_original_scratch_until_physical_cursor_exit() {
     let (budget, credit) = budget_and_credit();
     let mut owned = begin(&input, schema, credit);
     let mut output = [0xa5; 32];
-    no_allocation(|| owned.cursor.step(&mut output).unwrap());
     assert!(matches!(
         no_allocation(|| owned.cursor.step(&mut output)),
         Err(NativeScalarLeafError::Type)
@@ -321,18 +338,17 @@ fn failed_validation_keeps_original_scratch_until_physical_cursor_exit() {
 fn cancellation_in_each_phase_frees_cursor_backings_before_original_credit() {
     for validation_complete in [false, true] {
         let (input, schema) = fixture(false);
-        let weak_array = Arc::downgrade(input.batch.column(0));
+        let weak_array = Arc::downgrade(input.record_batch().column(0));
         let weak_field = Arc::downgrade(input.chunk_schema().slots()[0].field_ref());
         let (budget, credit) = budget_and_credit();
         let mut owned = begin(&input, schema, credit);
         drop(input);
         if validation_complete {
-            for _ in 0..6 {
+            for _ in 0..1 {
                 no_allocation(|| owned.cursor.step(&mut []).unwrap());
             }
             assert_eq!(owned.cursor.encoded_len(), Some(32));
         } else {
-            no_allocation(|| owned.cursor.step(&mut []).unwrap());
             assert_eq!(owned.cursor.encoded_len(), None);
         }
         assert!(weak_array.upgrade().is_some());
@@ -350,8 +366,8 @@ fn empty_fixture(wrong_last_byte: bool) -> (Chunk, Arc<ScalarSchema>) {
     // Slice preserves the actual timestamp carrier and timezone owners, while
     // making every selected-cell read invalid. Source fixtures are unmeasured.
     let batch = RecordBatch::try_new(
-        Arc::clone(input.batch.schema_ref()),
-        vec![input.batch.column(0).slice(0, 0)],
+        Arc::clone(input.record_batch().schema_ref()),
+        vec![input.record_batch().column(0).slice(0, 0)],
     )
     .unwrap();
     let empty = Chunk::try_new_with_chunk_schema(batch, input.chunk_schema_ref()).unwrap();
@@ -393,7 +409,7 @@ fn empty_schema_witness_emits_neither_value_nor_absent_record() {
     let mut owned = begin_empty(&input, schema, credit);
     assert_eq!(owned.cursor.encoded_len(), None);
     let mut untouched = [0xa5; 32];
-    for index in 0..6 {
+    for index in 0..1 {
         let output = if index % 2 == 0 {
             &mut untouched[..]
         } else {
@@ -402,11 +418,14 @@ fn empty_schema_witness_emits_neither_value_nor_absent_record() {
         let turn = no_allocation(|| owned.cursor.step(output).unwrap());
         assert_eq!(untouched, [0xa5; 32]);
         assert_eq!((turn.emitted_bytes, turn.completed_rows), (0, 0));
-        assert_eq!(turn.examined_bytes, 64 * 1024);
+        assert_eq!(
+            turn.examined_bytes,
+            6 * novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES
+        );
         assert!(turn.visited_cells <= 1024);
         assert_eq!(
             turn.status,
-            if index == 5 {
+            if index == 0 {
                 RenderTurnStatus::InputComplete
             } else {
                 RenderTurnStatus::Yielded
@@ -414,7 +433,7 @@ fn empty_schema_witness_emits_neither_value_nor_absent_record() {
         );
         assert_eq!(
             owned.cursor.encoded_len(),
-            if index == 5 { Some(0) } else { None }
+            if index == 0 { Some(0) } else { None }
         );
         held(&budget);
     }
@@ -539,9 +558,6 @@ fn empty_zone_mismatch_latches_failure_without_emission_or_credit_return() {
     let (budget, credit) = budget_and_credit();
     let mut owned = begin_empty(&input, schema, credit);
     let mut untouched = [0xa5; 32];
-    let first = no_allocation(|| owned.cursor.step(&mut untouched).unwrap());
-    assert_eq!((first.emitted_bytes, first.completed_rows), (0, 0));
-    assert_eq!(first.examined_bytes, 64 * 1024);
     assert!(matches!(
         no_allocation(|| owned.cursor.step(&mut untouched)),
         Err(NativeScalarLeafError::Type)
@@ -561,12 +577,12 @@ fn empty_zone_mismatch_latches_failure_without_emission_or_credit_return() {
 fn empty_cancellation_before_and_after_witness_frees_backing_before_credit() {
     for validated in [false, true] {
         let (input, schema) = empty_fixture(false);
-        let weak_array = Arc::downgrade(input.batch.column(0));
+        let weak_array = Arc::downgrade(input.record_batch().column(0));
         let weak_field = Arc::downgrade(input.chunk_schema().slots()[0].field_ref());
         let (budget, credit) = budget_and_credit();
         let mut owned = begin_empty(&input, schema, credit);
         drop(input);
-        for _ in 0..if validated { 6 } else { 1 } {
+        for _ in 0..if validated { 1 } else { 0 } {
             no_allocation(|| owned.cursor.step(&mut []).unwrap());
         }
         assert_eq!(

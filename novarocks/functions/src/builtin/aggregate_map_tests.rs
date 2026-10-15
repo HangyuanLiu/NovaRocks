@@ -221,9 +221,13 @@ fn update_selected(
     mapping: &[usize],
     control: &dyn KernelEvaluationControl,
 ) -> Result<(), EvaluationFailure> {
+    let mut types = kernel.contract.logical_argument_types();
+    let values =
+        crate::test_value_ingress::array_for_binding(values, types.next().unwrap()).unwrap();
+    let rates = crate::test_value_ingress::array_for_binding(rates, types.next().unwrap()).unwrap();
     let args = [
-        EvaluatedArgument::Column(values),
-        EvaluatedArgument::Column(rates),
+        EvaluatedArgument::Column(&values),
+        EvaluatedArgument::Column(&rates),
     ];
     let setup = Control::default();
     let input =
@@ -237,7 +241,7 @@ fn update_selected(
 }
 
 fn source(array: &ArrayRef) -> FunctionValueType {
-    FunctionValueType::new(array.data_type().clone(), true)
+    FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true)
 }
 fn make_kernel(keys: &ArrayRef, values: &ArrayRef, phase: AggregateKernelPhase) -> MapKernel {
     kernel("map_agg", source(keys), source(values), phase)
@@ -343,7 +347,7 @@ fn map_owner_four_phases_exact_metadata_first_wins_and_drop() {
         .unwrap();
         let actual = emit(&kernel, &state, host.clone(), &Control::default()).unwrap();
         assert_eq!(actual.to_data(), expected.to_data());
-        assert_eq!(actual.data_type(), &kernel.contract.final_type().data_type);
+        assert_eq!(actual.data_type(), kernel.contract.final_type().data_type());
     }
     assert_eq!(
         single.retained_bytes(&direct) + partial.retained_bytes(&first),
@@ -494,16 +498,17 @@ fn map_owner_final_lazy_unsupported_output_has_actual_emission_domain() {
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
 }
 fn long_bad() -> (ArrayRef, ArrayRef) {
-    let child = Arc::new(Field::new("x".repeat(700), DataType::Int64, true));
-    let values = Arc::new(
-        arrow_array::FixedSizeListArray::try_new(
-            child,
-            1,
-            Arc::new(arrow_array::Int64Array::from(vec![1])),
-            None,
-        )
-        .unwrap(),
-    ) as ArrayRef;
+    let child_fields: arrow_schema::Fields =
+        vec![Field::new("x".repeat(700), DataType::Int64, true)].into();
+    let child_values: ArrayRef = Arc::new(arrow_array::StructArray::new(
+        child_fields,
+        vec![Arc::new(arrow_array::Int64Array::from(vec![1]))],
+        None,
+    ));
+    let child = Arc::new(Field::new("item", child_values.data_type().clone(), true));
+    let values =
+        Arc::new(arrow_array::FixedSizeListArray::try_new(child, 1, child_values, None).unwrap())
+            as ArrayRef;
     (Arc::new(StringArray::from(vec!["a"])) as ArrayRef, values)
 }
 #[test]
@@ -981,7 +986,7 @@ fn map_owner_merge_null_root_skips_bad_value_and_nonnull_row_reports_full_data()
     let keys = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
     let values = Arc::new(arrow_array::UInt32Array::from(vec![1, 2])) as ArrayRef;
     let kernel = make_kernel(&keys, &values, AggregateKernelPhase::Final);
-    let DataType::Map(field, ordered) = &kernel.contract.intermediate_type().data_type else {
+    let DataType::Map(field, ordered) = kernel.contract.intermediate_type().data_type() else {
         panic!("original Map state")
     };
     let DataType::Struct(fields) = field.data_type() else {
@@ -1127,10 +1132,12 @@ fn map_owner_real_merge_and_emission_allocation_frontiers_keep_seven_causes() {
 #[test]
 fn map_owner_nominal_largeint_four_phases_keep_exact_child_metadata() {
     for nullable in [false, true] {
-        let source_type = FunctionValueType {
-            logical_type: novarocks_type_contract::ValueLogicalType::LargeInt,
-            ..FunctionValueType::new(DataType::FixedSizeBinary(16), nullable)
-        };
+        let source_type = FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            nullable,
+            novarocks_type_contract::ValueLogicalType::LargeInt,
+        )
+        .unwrap();
         let input: ArrayRef = crate::largeint::array_from_i128(&[
             Some(i128::MIN),
             Some(i128::MAX),
@@ -1179,10 +1186,16 @@ fn map_owner_nominal_largeint_four_phases_keep_exact_child_metadata() {
         let DataType::Struct(fields) = entries.data_type() else {
             panic!("exact entries");
         };
-        for field in fields {
+        let crate::FunctionResultType::Scalar(result_binding) =
+            &single.contract.call().selected().result_type
+        else {
+            unreachable!()
+        };
+        for (index, field) in fields.iter().enumerate() {
+            assert!(field.metadata().is_empty());
             assert_eq!(
-                field.metadata().get("nr_logical_type").map(String::as_str),
-                Some("largeint")
+                result_binding.child_at(index).unwrap().logical_type(),
+                novarocks_type_contract::ValueLogicalType::LargeInt
             );
         }
         for phase in [

@@ -27,7 +27,10 @@ use arrow::record_batch::RecordBatch;
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use novarocks_types::SlotId;
 use std::{collections::HashMap, sync::Arc};
-fn setup(mut columns: Vec<ArrayRef>, rows: usize) -> (ExprArena, Vec<ExprId>, Chunk) {
+fn setup(
+    mut columns: Vec<ArrayRef>,
+    rows: usize,
+) -> Result<(ExprArena, Vec<ExprId>, Chunk), String> {
     if columns.is_empty() {
         columns.push(Arc::new(Int32Array::from(vec![0; rows])))
     }
@@ -46,9 +49,8 @@ fn setup(mut columns: Vec<ArrayRef>, rows: usize) -> (ExprArena, Vec<ExprId>, Ch
         .map(|(i, a)| arena.push_typed(ExprNode::SlotId(slots[i]), a.data_type().clone()))
         .collect();
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
-    let schema =
-        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
-    (arena, ids, Chunk::new_with_chunk_schema(batch, schema))
+    let schema = ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots)?;
+    Ok((arena, ids, Chunk::new_with_chunk_schema(batch, schema)))
 }
 fn array(
     columns: Vec<ArrayRef>,
@@ -56,7 +58,7 @@ fn array(
     output: Option<DataType>,
 ) -> Result<ArrayRef, String> {
     let empty = columns.is_empty();
-    let (mut arena, mut ids, chunk) = setup(columns, rows);
+    let (mut arena, mut ids, chunk) = setup(columns, rows)?;
     if empty {
         ids.clear()
     }
@@ -71,7 +73,11 @@ fn array(
 }
 fn map(keys: ArrayRef, values: ArrayRef, offsets: Vec<i32>, valid: Option<Vec<bool>>) -> ArrayRef {
     let fs = vec![
-        Arc::new(Field::new("key", keys.data_type().clone(), true)),
+        Arc::new(Field::new(
+            "key",
+            keys.data_type().clone(),
+            keys.logical_null_count() > 0,
+        )),
         Arc::new(Field::new("value", values.data_type().clone(), true)),
     ];
     let entries = StructArray::new(fs.into(), vec![keys, values], None);
@@ -85,7 +91,7 @@ fn map(keys: ArrayRef, values: ArrayRef, offsets: Vec<i32>, valid: Option<Vec<bo
 }
 fn lookup(columns: Vec<ArrayRef>, output: Option<DataType>) -> Result<ArrayRef, String> {
     let rows = columns[0].len();
-    let (mut arena, ids, chunk) = setup(columns, rows);
+    let (mut arena, ids, chunk) = setup(columns, rows)?;
     let id = match output {
         Some(t) => arena.push_typed(ExprNode::SlotId(SlotId::new(999)), t),
         None => ExprId(usize::MAX),
@@ -159,7 +165,7 @@ fn original_array_literal_inferred_null_output_errors_precede_child_eval() {
         "array_expr output type must be List, got Int32"
     );
     // ExprArena::push infers Null; that output is read before the invalid child id.
-    let (mut arena, _, chunk) = setup(vec![], 2);
+    let (mut arena, _, chunk) = setup(vec![], 2).unwrap();
     let ids = vec![ExprId(usize::MAX)];
     let id = arena.push(ExprNode::ArrayExpr {
         elements: ids.clone(),
@@ -170,7 +176,7 @@ fn original_array_literal_inferred_null_output_errors_precede_child_eval() {
     );
 }
 #[test]
-fn original_map_null_probe_last_null_duplicate_key_and_parent_null() {
+fn map_null_probe_duplicate_key_parent_null_and_invalid_key_refusal() {
     let m = map(
         Arc::new(Int32Array::from(vec![
             Some(1),
@@ -183,12 +189,26 @@ fn original_map_null_probe_last_null_duplicate_key_and_parent_null() {
         vec![0, 3, 5, 5],
         Some(vec![true, true, false]),
     );
+    assert_eq!(
+        lookup(
+            vec![m, Arc::new(Int32Array::from(vec![None, Some(2), None]))],
+            None,
+        )
+        .unwrap_err(),
+        "map key type is nullable"
+    );
+    let valid = map(
+        Arc::new(Int32Array::from(vec![1, 1, 1, 2, 2])),
+        Arc::new(Int32Array::from(vec![10, 11, 12, 20, 21])),
+        vec![0, 3, 5, 5],
+        Some(vec![true, true, false]),
+    );
     let out = lookup(
-        vec![m, Arc::new(Int32Array::from(vec![None, Some(2), None]))],
+        vec![valid, Arc::new(Int32Array::from(vec![None, Some(2), None]))],
         None,
     )
     .unwrap();
-    assert_eq!(ints(&out), vec![Some(12), Some(21), None]);
+    assert_eq!(ints(&out), vec![None, Some(21), None]);
 }
 #[test]
 fn original_map_ieee_equality_nan_does_not_match_signed_zero_last_wins() {
@@ -287,7 +307,7 @@ fn original_map_raw_third_flag_and_full_carrier_errors() {
     );
 }
 #[test]
-fn original_map_nullarray_and_unsupported_key_are_exact_errors_not_missing() {
+fn map_null_keys_are_rejected_and_value_key_type_mismatch_remains_explicit() {
     let m = map(
         Arc::new(NullArray::new(1)),
         Arc::new(Int32Array::from(vec![7])),
@@ -296,7 +316,7 @@ fn original_map_nullarray_and_unsupported_key_are_exact_errors_not_missing() {
     );
     assert_eq!(
         lookup(vec![m, Arc::new(NullArray::new(1))], None).unwrap_err(),
-        "map key compare unsupported type: Null"
+        "map key type is nullable"
     );
     let m = map(
         Arc::new(StringArray::from(vec!["k"])),

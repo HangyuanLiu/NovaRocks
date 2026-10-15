@@ -291,19 +291,22 @@ fn transfer_projection_provenance(
             // source fact to transfer from an unset identity.
             continue;
         }
-        if value_type.data_type != item.expr.value_type.data_type {
+        if value_type.data_type() != item.expr.value_type.data_type() {
             return Err("same-value projection rewrite changed its declared carrier".into());
         }
-        if value_type.logical_type != item.expr.value_type.logical_type {
-            return Err(
-                "same-value projection rewrite changed its declared logical identity".into(),
-            );
+        if !value_type
+            .same_physical_binding_ignoring_root_nullability_observed(&item.expr.value_type, || {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .expect("infallible checked type comparison")
+        {
+            return Err("same-value projection rewrite changed its complete declared type".into());
         }
         // A symbol can be nullable at an outer-join boundary while its
         // producing expression is non-null (for example a match indicator).
         // Compare the expressions at this rewrite boundary; symbol transfer
         // and output adaptation separately check their declared contracts.
-        if value_type.nullable && !item.expr.value_type.nullable {
+        if value_type.nullable() && !item.expr.value_type.nullable() {
             return Err("same-value projection rewrite narrowed its declared nullability".into());
         }
         if let Some(previous) = sources_by_target.insert(item.output_column_id, source)

@@ -15,68 +15,42 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! CTAS schema derivation: turn a produced Arrow schema into declared table
-//! columns. Frontend DML owns CTAS routing and the durable staged-publication
-//! saga. The per-type Arrow -> SqlType mapping itself is owned by
-//! `novarocks_sql::literal`, next to its `sql_type_to_arrow_type` inverse.
+//! CTAS target and writer projections borrow the complete SQL source declaration.
+//! Frontend DML owns routing and the durable staged-publication saga; the shared
+//! typed renderer owns the SQL declaration vocabulary.
 
-use novarocks_sql::literal::arrow_data_type_to_sql_type;
+use novarocks_sql::planning::dml::DmlSourceColumn;
 use novarocks_sql::semantic::TableColumnDef;
 
-/// The physical Arrow inverse cannot establish or erase private producer domains.
-/// Refuse unsupported persistence before constructing the target's public types.
-pub(crate) fn validate_source_domains(
-    columns: &[novarocks_sql::planning::dml::DmlSourceColumn],
-) -> Result<(), String> {
-    use arrow::datatypes::{DataType, Field};
+/// Refuse private persistence before constructing the target's public types.
+pub(crate) fn validate_source_domains(columns: &[DmlSourceColumn]) -> Result<(), String> {
     use novarocks_physical_plan::ResultValueDomain;
-    use novarocks_types::logical::NR_LOGICAL_TYPE_KEY;
-
-    fn private_field(field: &Field) -> bool {
-        field
-            .metadata()
-            .get(NR_LOGICAL_TYPE_KEY)
-            .is_some_and(|marker| {
-                let marker = marker.trim();
-                marker.eq_ignore_ascii_case("object") || marker.eq_ignore_ascii_case("percentile")
-            })
-            || private_type(field.data_type())
-    }
-    fn private_type(data_type: &DataType) -> bool {
-        match data_type {
-            DataType::List(field)
-            | DataType::LargeList(field)
-            | DataType::FixedSizeList(field, _)
-            | DataType::Map(field, _) => private_field(field),
-            DataType::Struct(fields) => fields.iter().any(|field| private_field(field)),
-            _ => false,
-        }
-    }
     if columns.iter().any(|column| {
-        !column.domain.matches_storage(&column.data_type)
+        !column.domain.matches_storage(column.value_type.data_type())
             || matches!(
                 column.domain,
                 ResultValueDomain::Object | ResultValueDomain::Percentile
             )
-            || private_type(&column.data_type)
+            || column.has_private_persistence_domain()
     }) {
         return Err("CTAS source contains an unsupported internal opaque value domain".into());
     }
     Ok(())
 }
 
-pub(crate) fn arrow_schema_to_table_column_defs(
-    schema: &arrow::datatypes::Schema,
+pub(crate) fn source_columns_to_table_column_defs(
+    columns: &[DmlSourceColumn],
 ) -> Result<Vec<TableColumnDef>, String> {
-    schema
-        .fields()
+    validate_source_domains(columns)?;
+    columns
         .iter()
-        .map(|field| {
-            let data_type = arrow_data_type_to_sql_type(field.data_type())?;
+        .map(|column| {
+            let data_type = novarocks_types::sql_type_from_value_type(&column.value_type)
+                .map_err(|error| format!("CTAS: source type not supported: {error}"))?;
             Ok(TableColumnDef {
-                name: field.name().clone(),
+                name: column.name.clone(),
                 data_type,
-                nullable: field.is_nullable(),
+                nullable: column.value_type.nullable(),
                 aggregation: None,
                 default: None,
             })
@@ -84,191 +58,250 @@ pub(crate) fn arrow_schema_to_table_column_defs(
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+pub(crate) fn source_columns_to_write_fields(
+    columns: &[DmlSourceColumn],
+) -> Result<
+    Vec<novarocks_spi::connector::ConnectorWriteFieldRequest>,
+    novarocks_spi::connector::ConnectorError,
+> {
+    columns
+        .iter()
+        .map(|column| {
+            novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                arrow::datatypes::Field::new(
+                    &column.name,
+                    column.value_type.data_type().clone(),
+                    column.value_type.nullable(),
+                ),
+                column.value_type.clone(),
+            )
+        })
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        DmlSourceColumn, source_columns_to_table_column_defs, source_columns_to_write_fields,
+    };
+    use arrow::datatypes::{DataType, Field, TimeUnit};
+    use novarocks_physical_plan::ResultValueDomain as Domain;
+    use novarocks_type_contract::{
+        FunctionValueType, ValueField, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        ValueTypeStorageLifetime as Storage,
+    };
+    use novarocks_types::schema::SqlType;
     use std::sync::Arc;
 
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    fn plain(name: &str, carrier: DataType, nullable: bool) -> DmlSourceColumn {
+        DmlSourceColumn {
+            domain: Domain::Plain,
+            name: name.into(),
+            value_type: FunctionValueType::new(carrier, nullable),
+        }
+    }
 
-    use super::arrow_schema_to_table_column_defs;
-    use novarocks_types::schema::SqlType;
+    fn typed(
+        name: &str,
+        kind: ValueKind,
+        carrier: DataType,
+        nullable: bool,
+        domain: Domain,
+    ) -> DmlSourceColumn {
+        DmlSourceColumn {
+            domain,
+            name: name.into(),
+            value_type: FunctionValueType::try_from_value(
+                ValueTypeRef::try_new(kind, nullable, Storage::pure()).unwrap(),
+                ValueLayout::try_new(&carrier, Storage::pure()).unwrap(),
+            )
+            .unwrap(),
+        }
+    }
+
+    fn nominal(domain: ValueLogicalType, nullable: bool) -> ValueTypeRef {
+        ValueTypeRef::try_new(ValueKind::Nominal(domain), nullable, Storage::pure()).unwrap()
+    }
 
     #[test]
     fn m07_ctas_refuses_private_domains_before_the_arrow_inverse_can_erase_them() {
-        use novarocks_physical_plan::ResultValueDomain as Domain;
-        use novarocks_sql::planning::dml::DmlSourceColumn;
-        use novarocks_types::logical::{LogicalType, field_with_logical_type};
         for (domain, logical) in [
-            (Domain::Object, LogicalType::Object),
-            (Domain::Percentile, LogicalType::Percentile),
+            (Domain::Object, ValueLogicalType::Object),
+            (Domain::Percentile, ValueLogicalType::Percentile),
         ] {
-            for data_type in [
-                DataType::Binary,
-                DataType::List(Arc::new(field_with_logical_type(
-                    Field::new("item", DataType::Binary, true),
-                    logical,
-                ))),
-                DataType::Struct(
-                    vec![Arc::new(field_with_logical_type(
-                        Field::new("v", DataType::Binary, false),
-                        logical,
-                    ))]
-                    .into(),
+            let child = nominal(logical, true);
+            let required_child = nominal(logical, false);
+            let key = FunctionValueType::new(DataType::Utf8, false)
+                .value_type()
+                .clone();
+            let sources = [
+                typed(
+                    "v",
+                    ValueKind::Nominal(logical),
+                    DataType::Binary,
+                    true,
+                    domain,
                 ),
-                DataType::Map(
-                    Arc::new(Field::new(
-                        "entries",
-                        DataType::Struct(
-                            vec![
-                                Arc::new(Field::new("key", DataType::Utf8, false)),
-                                Arc::new(field_with_logical_type(
+                typed(
+                    "v",
+                    ValueKind::List(child.clone()),
+                    DataType::List(Arc::new(Field::new("item", DataType::Binary, true))),
+                    true,
+                    Domain::Plain,
+                ),
+                typed(
+                    "v",
+                    ValueKind::Struct(
+                        vec![ValueField::new("v", required_child, Storage::pure())]
+                            .into_boxed_slice(),
+                    ),
+                    DataType::Struct(vec![Field::new("v", DataType::Binary, false)].into()),
+                    true,
+                    Domain::Plain,
+                ),
+                typed(
+                    "v",
+                    ValueKind::Map { key, value: child },
+                    DataType::Map(
+                        Arc::new(Field::new(
+                            "entries",
+                            DataType::Struct(
+                                vec![
+                                    Field::new("key", DataType::Utf8, false),
                                     Field::new("value", DataType::Binary, true),
-                                    logical,
-                                )),
-                            ]
-                            .into(),
-                        ),
+                                ]
+                                .into(),
+                            ),
+                            false,
+                        )),
                         false,
-                    )),
-                    false,
+                    ),
+                    true,
+                    Domain::Plain,
                 ),
-            ] {
-                let top_domain = if data_type == DataType::Binary {
-                    domain
-                } else {
-                    Domain::Plain
-                };
-                let source = DmlSourceColumn {
-                    name: "v".into(),
-                    data_type: data_type.clone(),
-                    nullable: true,
-                    domain: top_domain,
-                };
-                // This old physical conversion is exactly why the preceding guard is required.
-                assert!(
-                    arrow_schema_to_table_column_defs(&Schema::new(vec![Field::new(
-                        "v", data_type, true
-                    )]))
-                    .is_ok()
+            ];
+            for source in sources {
+                assert_eq!(
+                    source.value_type.data_type().clone(),
+                    source_columns_to_write_fields(std::slice::from_ref(&source)).unwrap()[0]
+                        .field()
+                        .data_type()
+                        .clone()
                 );
-                assert!(super::validate_source_domains(&[source]).is_err());
+                assert!(source.has_private_persistence_domain());
+                assert_eq!(
+                    super::validate_source_domains(std::slice::from_ref(&source)).unwrap_err(),
+                    "CTAS source contains an unsupported internal opaque value domain"
+                );
+                assert!(source_columns_to_table_column_defs(&[source]).is_err());
             }
         }
-        assert!(
-            super::validate_source_domains(&[DmlSourceColumn {
-                name: "plain".into(),
-                data_type: DataType::Binary,
-                nullable: true,
-                domain: Domain::Plain,
-            }])
-            .is_ok()
-        );
+        assert!(super::validate_source_domains(&[plain("plain", DataType::Binary, true)]).is_ok());
     }
-
-    // ---------- basic scalar types ----------
 
     #[test]
     fn arrow_schema_to_table_column_defs_basic() {
-        let schema = Schema::new(vec![
+        let source = [
+            plain("id", DataType::Int32, true),
+            plain("name", DataType::Utf8, true),
+            plain("amount", DataType::Decimal128(10, 2), true),
+        ];
+        let cols = source_columns_to_table_column_defs(&source).unwrap();
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0].name, "id");
+        assert_eq!(cols[0].data_type, SqlType::Int);
+        assert!(cols[0].nullable);
+        assert!(cols[0].aggregation.is_none());
+        assert!(cols[0].default.is_none());
+        assert_eq!(cols[1].name, "name");
+        assert_eq!(cols[1].data_type, SqlType::String);
+        assert_eq!(
+            cols[2].data_type,
+            SqlType::Decimal {
+                precision: 10,
+                scale: 2
+            }
+        );
+        let original_schema = arrow::datatypes::Schema::new(vec![
             Field::new("id", DataType::Int32, true),
             Field::new("name", DataType::Utf8, true),
             Field::new("amount", DataType::Decimal128(10, 2), true),
         ]);
-        let cols = arrow_schema_to_table_column_defs(&schema).unwrap();
-        assert_eq!(cols.len(), 3);
-
-        assert_eq!(cols[0].name, "id");
-        assert!(
-            matches!(cols[0].data_type, SqlType::Int),
-            "expected Int, got {:?}",
-            cols[0].data_type
+        let projected_schema = arrow::datatypes::Schema::new(
+            source_columns_to_write_fields(&source)
+                .unwrap()
+                .iter()
+                .map(|field| field.field().clone())
+                .collect::<Vec<_>>(),
         );
-        assert!(cols[0].nullable);
-        assert!(cols[0].aggregation.is_none());
-        assert!(cols[0].default.is_none());
-
-        assert_eq!(cols[1].name, "name");
-        assert!(
-            matches!(cols[1].data_type, SqlType::String),
-            "expected String, got {:?}",
-            cols[1].data_type
-        );
-
-        assert_eq!(cols[2].name, "amount");
-        assert!(
-            matches!(
-                cols[2].data_type,
-                SqlType::Decimal {
-                    precision: 10,
-                    scale: 2
-                }
-            ),
-            "expected Decimal(10,2), got {:?}",
-            cols[2].data_type
+        assert_eq!(
+            format!("{:?}", Arc::new(original_schema)),
+            format!("{:?}", Arc::new(projected_schema)),
+            "plain CTAS schema digest material remains unchanged"
         );
     }
 
     #[test]
     fn arrow_schema_to_table_column_defs_nullability_propagated() {
-        let schema = Schema::new(vec![
-            Field::new("required_col", DataType::Int64, false),
-            Field::new("optional_col", DataType::Utf8, true),
-        ]);
-        let cols = arrow_schema_to_table_column_defs(&schema).unwrap();
+        let source = [
+            plain("required_col", DataType::Int64, false),
+            plain("optional_col", DataType::Utf8, true),
+        ];
+        let cols = source_columns_to_table_column_defs(&source).unwrap();
         assert!(
             !cols[0].nullable,
             "Int64 NOT NULL field should not be nullable"
         );
         assert!(cols[1].nullable, "Utf8 NULL field should be nullable");
+        let fields = source_columns_to_write_fields(&source).unwrap();
+        for (column, field) in source.iter().zip(&fields) {
+            assert_eq!(field.execution_type(), Some(&column.value_type));
+            assert_eq!(field.field().is_nullable(), column.value_type.nullable());
+            assert_eq!(field.field().metadata().capacity(), 0);
+        }
     }
 
     #[test]
     fn arrow_schema_to_table_column_defs_all_primitive_types() {
-        let schema = Schema::new(vec![
-            Field::new("b", DataType::Boolean, true),
-            Field::new("i8", DataType::Int8, true),
-            Field::new("i16", DataType::Int16, true),
-            Field::new("i32", DataType::Int32, true),
-            Field::new("i64", DataType::Int64, true),
-            Field::new("f32", DataType::Float32, true),
-            Field::new("f64", DataType::Float64, true),
-            Field::new("s", DataType::Utf8, true),
-            Field::new("ls", DataType::LargeUtf8, true),
-            Field::new("bin", DataType::Binary, true),
-            Field::new("lbin", DataType::LargeBinary, true),
-            Field::new("d", DataType::Date32, true),
-            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
-            Field::new("t", DataType::Time64(TimeUnit::Microsecond), true),
-        ]);
-        let cols = arrow_schema_to_table_column_defs(&schema).unwrap();
-        assert!(matches!(cols[0].data_type, SqlType::Boolean));
-        assert!(matches!(cols[1].data_type, SqlType::TinyInt));
-        assert!(matches!(cols[2].data_type, SqlType::SmallInt));
-        assert!(matches!(cols[3].data_type, SqlType::Int));
-        assert!(matches!(cols[4].data_type, SqlType::BigInt));
-        assert!(matches!(cols[5].data_type, SqlType::Float));
-        assert!(matches!(cols[6].data_type, SqlType::Double));
-        assert!(matches!(cols[7].data_type, SqlType::String));
-        assert!(matches!(cols[8].data_type, SqlType::String)); // LargeUtf8
-        assert!(matches!(cols[9].data_type, SqlType::Binary));
-        assert!(matches!(cols[10].data_type, SqlType::Binary)); // LargeBinary
-        assert!(matches!(cols[11].data_type, SqlType::Date));
-        assert!(matches!(cols[12].data_type, SqlType::DateTime));
-        assert!(matches!(cols[13].data_type, SqlType::Time));
+        let declarations = [
+            ("b", DataType::Boolean, SqlType::Boolean),
+            ("i8", DataType::Int8, SqlType::TinyInt),
+            ("i16", DataType::Int16, SqlType::SmallInt),
+            ("i32", DataType::Int32, SqlType::Int),
+            ("i64", DataType::Int64, SqlType::BigInt),
+            ("f32", DataType::Float32, SqlType::Float),
+            ("f64", DataType::Float64, SqlType::Double),
+            ("s", DataType::Utf8, SqlType::String),
+            ("ls", DataType::LargeUtf8, SqlType::String),
+            ("bin", DataType::Binary, SqlType::Binary),
+            ("lbin", DataType::LargeBinary, SqlType::Binary),
+            ("d", DataType::Date32, SqlType::Date),
+            (
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                SqlType::DateTime,
+            ),
+            ("t", DataType::Time64(TimeUnit::Microsecond), SqlType::Time),
+            (
+                "ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                SqlType::DateTimeNs,
+            ),
+        ];
+        let source = declarations
+            .iter()
+            .map(|(name, carrier, _)| plain(name, carrier.clone(), true))
+            .collect::<Vec<_>>();
+        let cols = source_columns_to_table_column_defs(&source).unwrap();
+        for (column, (_, _, expected)) in cols.iter().zip(&declarations) {
+            assert_eq!(&column.data_type, expected);
+        }
     }
-
-    // ---------- unsupported types ----------
 
     #[test]
     fn arrow_schema_to_table_column_defs_rejects_unsupported() {
-        let schema = Schema::new(vec![
-            Field::new("e", DataType::Float16, true), // unsupported
-        ]);
-        let err = arrow_schema_to_table_column_defs(&schema).unwrap_err();
+        let err = source_columns_to_table_column_defs(&[plain("e", DataType::Float16, true)])
+            .unwrap_err();
         assert!(
             err.to_lowercase().contains("not supported"),
             "expected 'not supported' in error, got: {err}"
@@ -277,77 +310,134 @@ mod tests {
 
     #[test]
     fn arrow_schema_to_table_column_defs_rejects_interval() {
-        use arrow::datatypes::IntervalUnit;
-        let schema = Schema::new(vec![Field::new(
+        let err = source_columns_to_table_column_defs(&[plain(
             "iv",
-            DataType::Interval(IntervalUnit::DayTime),
+            DataType::Interval(arrow::datatypes::IntervalUnit::DayTime),
             true,
-        )]);
-        let err = arrow_schema_to_table_column_defs(&schema).unwrap_err();
+        )])
+        .unwrap_err();
         assert!(
             err.to_lowercase().contains("not supported"),
             "expected 'not supported' in error, got: {err}"
         );
     }
 
-    // ---------- nested types ----------
-
     #[test]
     fn arrow_schema_to_table_column_defs_recurses_list() {
-        let elem = Field::new("item", DataType::Int64, true);
-        let schema = Schema::new(vec![Field::new(
+        let source = [plain(
             "ids",
-            DataType::List(Arc::new(elem)),
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
             true,
-        )]);
-        let cols = arrow_schema_to_table_column_defs(&schema).unwrap();
+        )];
+        let cols = source_columns_to_table_column_defs(&source).unwrap();
         assert_eq!(cols.len(), 1);
-        assert!(
-            matches!(&cols[0].data_type, SqlType::Array(inner) if matches!(inner.as_ref(), SqlType::BigInt)),
-            "expected Array(BigInt), got {:?}",
-            cols[0].data_type
-        );
+        assert_eq!(cols[0].data_type, SqlType::Array(Box::new(SqlType::BigInt)));
     }
 
     #[test]
     fn arrow_schema_to_table_column_defs_recurses_struct_and_list() {
-        // Struct{a: Int32, b: Utf8}
-        let struct_field = Field::new(
-            "meta",
-            DataType::Struct(
-                vec![
-                    Field::new("a", DataType::Int32, true),
-                    Field::new("b", DataType::Utf8, true),
-                ]
-                .into(),
+        let source = [
+            plain(
+                "meta",
+                DataType::Struct(
+                    vec![
+                        Field::new("a", DataType::Int32, true),
+                        Field::new("b", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
             ),
-            true,
-        );
-        // List<Int64>
-        let list_field = Field::new(
-            "tags",
-            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
-            true,
-        );
-        let schema = Schema::new(vec![struct_field, list_field]);
-        let cols = arrow_schema_to_table_column_defs(&schema).unwrap();
+            plain(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            ),
+        ];
+        let cols = source_columns_to_table_column_defs(&source).unwrap();
         assert_eq!(cols.len(), 2);
+        assert_eq!(
+            cols[0].data_type,
+            SqlType::Struct(vec![
+                ("a".into(), SqlType::Int),
+                ("b".into(), SqlType::String)
+            ])
+        );
+        assert_eq!(cols[1].data_type, SqlType::Array(Box::new(SqlType::BigInt)));
+    }
 
-        // Verify struct
-        let SqlType::Struct(fields) = &cols[0].data_type else {
-            panic!("expected Struct, got {:?}", cols[0].data_type);
+    #[test]
+    fn ctas_complete_nominal_declarations_reach_ddl_and_writer_separately() {
+        let declarations = [
+            (ValueLogicalType::Json, DataType::Utf8, SqlType::Json),
+            (
+                ValueLogicalType::Variant,
+                DataType::LargeBinary,
+                SqlType::Variant,
+            ),
+            (
+                ValueLogicalType::LargeInt,
+                DataType::FixedSizeBinary(16),
+                SqlType::LargeInt,
+            ),
+            (
+                ValueLogicalType::Uuid,
+                DataType::FixedSizeBinary(16),
+                SqlType::Uuid,
+            ),
+        ];
+        for (logical, carrier, expected) in declarations {
+            // Domain summaries are not the semantic type author, including nested Plain summaries.
+            let source = typed(
+                "semantic",
+                ValueKind::Nominal(logical),
+                carrier.clone(),
+                false,
+                Domain::Plain,
+            );
+            let ddl = source_columns_to_table_column_defs(std::slice::from_ref(&source)).unwrap();
+            assert_eq!(ddl[0].data_type, expected);
+            assert!(!ddl[0].nullable);
+            let requests = source_columns_to_write_fields(std::slice::from_ref(&source)).unwrap();
+            assert_eq!(requests[0].execution_type(), Some(&source.value_type));
+            assert_eq!(requests[0].field().data_type(), &carrier);
+            assert_eq!(requests[0].field().metadata().capacity(), 0);
+        }
+        let nominal = typed(
+            "v",
+            ValueKind::List(nominal(ValueLogicalType::Json, false)),
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+            true,
+            Domain::Plain,
+        );
+        assert_eq!(
+            source_columns_to_table_column_defs(std::slice::from_ref(&nominal)).unwrap()[0]
+                .data_type,
+            SqlType::Array(Box::new(SqlType::Json))
+        );
+        let fields = source_columns_to_write_fields(std::slice::from_ref(&nominal)).unwrap();
+        assert_eq!(fields[0].execution_type(), Some(&nominal.value_type));
+        let ValueKind::List(child) = fields[0].execution_type().unwrap().value_type().kind() else {
+            panic!("expected declared list");
         };
-        assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0].0, "a");
-        assert!(matches!(fields[0].1, SqlType::Int));
-        assert_eq!(fields[1].0, "b");
-        assert!(matches!(fields[1].1, SqlType::String));
-
-        // Verify list
-        let SqlType::Array(inner) = &cols[1].data_type else {
-            panic!("expected Array, got {:?}", cols[1].data_type);
+        assert_eq!(child.kind(), &ValueKind::Nominal(ValueLogicalType::Json));
+        assert!(!child.nullable());
+        assert!(fields[0].field().is_nullable());
+        let DataType::List(field) = fields[0].field().data_type() else {
+            panic!("expected list layout");
         };
-        assert!(matches!(inner.as_ref(), SqlType::BigInt));
+        assert_eq!(field.metadata().capacity(), 0);
+        assert!(!field.is_nullable());
+        assert_eq!(
+            source_columns_to_table_column_defs(&[plain(
+                "bytes",
+                DataType::FixedSizeBinary(16),
+                false
+            )])
+            .unwrap()[0]
+                .data_type,
+            SqlType::Binary
+        );
     }
 
     // ---------- IF NOT EXISTS parser test ----------

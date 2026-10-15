@@ -249,6 +249,7 @@ impl OperatorFactory for StreamScanSourceFactory {
             ),
             output_tracker: None,
             downstream_paused: false,
+            construction: None,
         })
     }
 
@@ -289,6 +290,7 @@ struct StreamScanSourceOperator {
     /// Charges every chunk this source hands downstream to the fragment.
     output_tracker: Option<Arc<MemTracker>>,
     downstream_paused: bool,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
 }
 
 impl StreamScanSourceOperator {
@@ -317,6 +319,16 @@ impl StreamScanSourceOperator {
 }
 
 impl Operator for StreamScanSourceOperator {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.construction = Some(factory);
+    }
+
     fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
         self.filter.bind_mem_tracker(tracker);
     }
@@ -433,7 +445,15 @@ impl ProcessorOperator for StreamScanSourceOperator {
                 .profiles
                 .as_ref()
                 .map(|profiles| profiles.unique.clone());
-            self.stage = StreamStage::Open(self.source.claim(self.budget.clone(), profile)?);
+            let construction = self
+                .construction
+                .as_ref()
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+            self.stage = StreamStage::Open(self.source.claim(
+                self.budget.clone(),
+                profile,
+                Arc::clone(construction),
+            )?);
         }
         let waker = self.readiness.waker();
         let mut context = Context::from_waker(&waker);
@@ -609,7 +629,7 @@ mod tests {
     }
 
     impl Stream for ScriptedStream {
-        type Item = Result<Chunk, String>;
+        type Item = ExecutionResult<Chunk>;
 
         fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             let this = self.get_mut();
@@ -652,6 +672,14 @@ mod tests {
         }
     }
 
+    fn actual_test_factory() -> Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory> {
+        crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            MemTracker::new_root("scan stream fixture creator"),
+            Arc::new(RuntimeErrorState::default()),
+        )
+        .unwrap()
+    }
     struct ScriptedSource {
         control: Arc<StreamControl>,
         claims: AtomicUsize,
@@ -662,9 +690,10 @@ mod tests {
             &self,
             budget: ConnectorPollBudget,
             _profile: Option<crate::runtime::profile::RuntimeProfile>,
-        ) -> Result<ScanOutputStream, String> {
+            _construction: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+        ) -> ExecutionResult<ScanOutputStream> {
             if self.claims.fetch_add(1, Ordering::AcqRel) > 0 {
-                return Err("scan stream already claimed".to_string());
+                return Err("scan stream already claimed".to_string().into());
             }
             Ok(Box::pin(ScriptedStream {
                 control: Arc::clone(&self.control),
@@ -795,6 +824,7 @@ mod tests {
         let factory = StreamScanSourceFactory::new_native(scan, op, Arc::new(ExprArena::default()))
             .expect("stream scan factory");
         let mut operator = factory.create(1, 0);
+        operator.set_construction_factory(actual_test_factory());
         operator
             .bind_runtime_state(state)
             .expect("bind stream scan");
@@ -1014,6 +1044,7 @@ mod tests {
             factory.name()
         );
         let mut scan = factory.create(1, 0);
+        scan.set_construction_factory(actual_test_factory());
         scan.bind_runtime_state(&RuntimeState::default())
             .expect("bind compiled stream scan");
         let values = Arc::new(Mutex::new(Vec::new()));

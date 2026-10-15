@@ -28,6 +28,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use super::join_hash_map::build_store::BuildStoreChunkProjection;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -121,7 +122,7 @@ pub(crate) struct HashJoinProbeCore {
     build_loaded: bool,
     build_requirements: Option<BuildComponentRequirements>,
     build_view: Option<BuildView>,
-    build_chunk: Option<Arc<Chunk>>,
+    build_chunk: Option<BuildStoreChunkProjection>,
     build_null_key_rows: Option<Arc<Vec<u32>>>,
     build_table: Option<Arc<JoinHashMap>>,
     output_schema: Option<SchemaRef>,
@@ -279,7 +280,10 @@ impl HashJoinProbeCore {
             .ok_or_else(|| "hash join build artifact not loaded".to_string())
     }
 
-    fn require_build_chunk(&self, context: &'static str) -> Result<Option<Arc<Chunk>>, String> {
+    fn require_build_chunk(
+        &self,
+        context: &'static str,
+    ) -> Result<Option<BuildStoreChunkProjection>, String> {
         if self.build_partition_row_count == 0 {
             return Ok(None);
         }
@@ -930,7 +934,8 @@ impl HashJoinProbeCore {
             .collect::<Vec<_>>();
         let mask = BooleanArray::from(mask);
         let output_start = std::time::Instant::now();
-        let filtered = filter_record_batch(&build_chunk.batch, &mask).map_err(|e| e.to_string())?;
+        let filtered =
+            filter_record_batch(&build_chunk.record_batch(), &mask).map_err(|e| e.to_string())?;
         self.record_out_build_ns(output_start);
         if filtered.num_rows() == 0 {
             return Ok(None);
@@ -968,7 +973,7 @@ impl HashJoinProbeCore {
                 if right_batch.num_rows() == 0 {
                     return Ok(Some(left_chunk));
                 }
-                let batches = vec![left_chunk.batch, right_batch];
+                let batches = vec![left_chunk.record_batch().clone(), right_batch];
                 let output_schema = batch_chunk_schema.arrow_schema_ref();
                 let batch = concat_compatible_batches(&output_schema, &batches, "join merge")?;
                 Ok(Some(Chunk::try_new_with_chunk_schema(
@@ -1071,7 +1076,7 @@ impl HashJoinProbeCore {
                     .ok_or_else(|| {
                         "join residual predicate must return boolean array".to_string()
                     })?;
-                let filtered_batch = filter_record_batch(&chunk.batch, mask)
+                let filtered_batch = filter_record_batch(&chunk.record_batch(), mask)
                     .map_err(|e| format!("join residual filter failed: {e}"))?;
                 if filtered_batch.num_rows() > 0 {
                     filtered.push(filtered_batch);
@@ -1252,7 +1257,10 @@ impl HashJoinProbeCore {
 
         let Some(table) = self.build_table.clone() else {
             if is_anti {
-                let batches: Vec<_> = probe_chunks.into_iter().map(|c| c.batch).collect();
+                let batches: Vec<_> = probe_chunks
+                    .iter()
+                    .map(|c| c.record_batch().clone())
+                    .collect();
                 if batches.is_empty() {
                     return Ok(None);
                 }
@@ -1273,7 +1281,10 @@ impl HashJoinProbeCore {
         };
         if table.is_empty() {
             if is_anti {
-                let batches: Vec<_> = probe_chunks.into_iter().map(|c| c.batch).collect();
+                let batches: Vec<_> = probe_chunks
+                    .iter()
+                    .map(|c| c.record_batch().clone())
+                    .collect();
                 if batches.is_empty() {
                     return Ok(None);
                 }
@@ -1361,7 +1372,7 @@ impl HashJoinProbeCore {
                     .collect::<Vec<bool>>();
                 let output_start = std::time::Instant::now();
                 let mask = BooleanArray::from(keep);
-                let filtered_batch = filter_record_batch(&probe.batch, &mask)
+                let filtered_batch = filter_record_batch(&probe.record_batch(), &mask)
                     .map_err(|e| format!("semi/anti filter failed: {e}"))?;
                 self.record_out_probe_ns(output_start);
                 if filtered_batch.num_rows() > 0 {
@@ -1425,7 +1436,7 @@ impl HashJoinProbeCore {
                 .collect::<Vec<bool>>();
             let output_start = std::time::Instant::now();
             let mask = BooleanArray::from(keep);
-            let filtered_batch = filter_record_batch(&probe.batch, &mask)
+            let filtered_batch = filter_record_batch(&probe.record_batch(), &mask)
                 .map_err(|e| format!("semi/anti membership filter failed: {e}"))?;
             self.record_out_probe_ns(output_start);
             if filtered_batch.num_rows() > 0 {
@@ -1462,7 +1473,10 @@ impl HashJoinProbeCore {
         }
         if self.global_build_row_count == 0 {
             let output_schema = probe_chunks[0].schema();
-            let batches: Vec<_> = probe_chunks.into_iter().map(|c| c.batch).collect();
+            let batches: Vec<_> = probe_chunks
+                .iter()
+                .map(|c| c.record_batch().clone())
+                .collect();
             if batches.is_empty() {
                 return Ok(None);
             }
@@ -1638,7 +1652,7 @@ impl HashJoinProbeCore {
 
             let output_start = std::time::Instant::now();
             let mask = BooleanArray::from(keep);
-            let filtered_batch = filter_record_batch(&probe.batch, &mask)
+            let filtered_batch = filter_record_batch(&probe.record_batch(), &mask)
                 .map_err(|e| format!("null-aware anti filter failed: {e}"))?;
             self.record_out_probe_ns(output_start);
             if filtered_batch.num_rows() > 0 {

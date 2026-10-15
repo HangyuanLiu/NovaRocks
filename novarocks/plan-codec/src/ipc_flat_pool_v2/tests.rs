@@ -148,7 +148,11 @@ fn verifier() -> VerifierOptions {
 }
 fn pool(array: ArrayRef) -> ConstantPool {
     let ty = FunctionValueType::new(array.data_type().clone(), true);
-    let field = Arc::new(Field::new("original", ty.data_type.clone(), ty.nullable));
+    let field = Arc::new(Field::new(
+        "original",
+        ty.data_type().clone(),
+        ty.nullable(),
+    ));
     pool_with(array, field, ty)
 }
 fn pool_with(array: ArrayRef, field: Arc<Field>, ty: FunctionValueType) -> ConstantPool {
@@ -714,7 +718,7 @@ fn actual_flat_writer_exact_timezone_and_nominal_metadata_use_original_source() 
         );
         assert_eq!(batch.schema().field(0).name(), "original");
         let decoded = materialize(&bytes, &original);
-        assert_eq!(decoded.value_type().logical_type, ValueLogicalType::Json);
+        assert_eq!(decoded.value_type().logical_type(), ValueLogicalType::Json);
         assert_eq!(
             decoded.field().metadata().contains_key(NR_LOGICAL_TYPE_KEY),
             labelled
@@ -1059,3 +1063,72 @@ mod prepared_tests;
 
 #[path = "owned_tests.rs"]
 mod owned_tests;
+
+#[test]
+fn pure_writer_without_source_invoice_uses_the_same_stream_body() {
+    let pool = pool(Arc::new(StringArray::from(vec![
+        Some("a"),
+        None,
+        Some("λ"),
+    ])));
+    assert!(pool.source_retained_bytes().is_none());
+    let control = Control::good(CompilePhase::Encode);
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    let pure = prepare_flat_pool_write_pure_in(&pool, &mut work)
+        .unwrap()
+        .emit_in(&mut work)
+        .unwrap();
+    work.finish().unwrap();
+    let observed = encode_flat_pool(
+        &pool,
+        invoice(&pool),
+        limits(),
+        &Control::good(CompilePhase::Encode),
+    )
+    .unwrap();
+    assert_eq!(pure, observed);
+    let mut reader = StreamReader::try_new(Cursor::new(pure), None).unwrap();
+    let batch = reader.next().unwrap().unwrap();
+    assert_eq!(batch.column(0).as_ref(), pool.array().as_ref());
+}
+
+#[test]
+fn pure_writer_preserves_each_original_control_refusal() {
+    let pool = pool(Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])));
+    let control = Control::good(CompilePhase::Encode);
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    prepare_flat_pool_write_pure_in(&pool, &mut work)
+        .unwrap()
+        .emit_in(&mut work)
+        .unwrap();
+    work.finish().unwrap();
+    for at in 0..control.trace().len() {
+        for cause in CAUSES {
+            let refusal = Control::refusing(at, cause);
+            let result = (|| {
+                let mut work = CompileCheckpoints::try_new(&refusal, CompilePhase::Encode)?;
+                let bytes =
+                    prepare_flat_pool_write_pure_in(&pool, &mut work)?.emit_in(&mut work)?;
+                work.finish()?;
+                Ok::<_, TypeCodecError>(bytes)
+            })();
+            assert!(matches!(result, Err(TypeCodecError::Control(actual)) if actual == cause));
+        }
+    }
+}
+
+#[test]
+fn pure_writer_refuses_nonempty_source_attributes_without_real_custody() {
+    let array: ArrayRef = Arc::new(StringArray::from(vec!["text"]));
+    let field = Arc::new(
+        Field::new("source", DataType::Utf8, true).with_metadata(HashMap::from([(
+            "provider.attribute".to_owned(),
+            "actual source".to_owned(),
+        )])),
+    );
+    let pool = pool_with(array, field, FunctionValueType::new(DataType::Utf8, true));
+    let control = Control::good(CompilePhase::Encode);
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    assert!(prepare_flat_pool_write_pure_in(&pool, &mut work).is_err());
+    assert!(pool.source_owner().is_none());
+}

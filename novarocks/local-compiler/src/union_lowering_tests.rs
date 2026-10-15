@@ -662,14 +662,11 @@ fn union_all_root_nullable_widening_preserves_source_full_types_and_nested_field
                     Some(&FunctionArgumentType::Value(original.clone()))
                 );
                 if case.nested {
-                    let DataType::Struct(fields) = &original.data_type else {
+                    let DataType::Struct(fields) = &original.data_type() else {
                         panic!("source Struct")
                     };
                     assert_eq!(fields[0].name(), "original-nested");
-                    assert_eq!(
-                        fields[0].metadata().get("owner").map(String::as_str),
-                        Some("kept")
-                    );
+                    assert!(fields[0].metadata().is_empty());
                     let FunctionArgumentType::Value(actual) = program
                         .checked()
                         .channels()
@@ -679,12 +676,12 @@ fn union_all_root_nullable_widening_preserves_source_full_types_and_nested_field
                     else {
                         unreachable!()
                     };
-                    let DataType::Struct(actual_fields) = &actual.data_type else {
+                    let DataType::Struct(actual_fields) = &actual.data_type() else {
                         unreachable!()
                     };
                     assert!(Arc::ptr_eq(&actual_fields[0], &fields[0]));
                 } else {
-                    assert_eq!(original.nullable, branch == 1);
+                    assert_eq!(original.nullable(), branch == 1);
                 }
                 assert!(
                     program.graph().nodes()[normalizer.index()]

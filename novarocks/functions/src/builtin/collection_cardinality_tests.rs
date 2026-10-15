@@ -119,7 +119,7 @@ fn target() -> FunctionValueType {
     FunctionValueType::new(DataType::Int32, true)
 }
 fn ty(array: &ArrayRef, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(array.data_type().clone(), nullable)
+    FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), nullable)
 }
 fn instance(source: &FunctionValueType) -> ScalarEvaluationInstance {
     ScalarEvaluationInstance::instantiate(
@@ -144,11 +144,15 @@ fn output(result: &SelectedValues<'_>) -> Vec<Option<i32>> {
 }
 fn pool(array: &ArrayRef, nullable: bool) -> ConstantPool {
     let source = ty(array, nullable);
+    pool_with_type(array, source)
+}
+fn pool_with_type(array: &ArrayRef, source: FunctionValueType) -> ConstantPool {
     ConstantPool::try_new(
         Arc::new(
             source
                 .try_to_field("original-collection")
                 .unwrap()
+                .with_data_type(array.data_type().clone())
                 .with_metadata(
                     [(
                         "source-note".into(),
@@ -174,7 +178,7 @@ fn list(nullable: bool) -> ArrayRef {
         None,
         Some(9),
     ]));
-    Arc::new(
+    let raw: ArrayRef = Arc::new(
         ListArray::try_new(
             Arc::new(
                 Field::new("authored-item", DataType::Int32, true)
@@ -185,7 +189,12 @@ fn list(nullable: bool) -> ArrayRef {
             nullable.then(|| NullBuffer::from(vec![true, true, false, true])),
         )
         .unwrap(),
+    );
+    crate::test_value_ingress::array_for_binding(
+        &raw,
+        &FunctionValueType::new(raw.data_type().clone(), nullable),
     )
+    .unwrap()
 }
 fn map(nullable: bool, sorted: bool) -> ArrayRef {
     let keys: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]));
@@ -199,7 +208,7 @@ fn map(nullable: bool, sorted: bool) -> ArrayRef {
     ]
     .into();
     let entries = StructArray::new(fields, vec![keys, values], None);
-    Arc::new(
+    let raw: ArrayRef = Arc::new(
         MapArray::try_new(
             Arc::new(
                 Field::new("actual-entries", entries.data_type().clone(), false)
@@ -211,7 +220,12 @@ fn map(nullable: bool, sorted: bool) -> ArrayRef {
             sorted,
         )
         .unwrap(),
+    );
+    crate::test_value_ingress::array_for_binding(
+        &raw,
+        &FunctionValueType::new(raw.data_type().clone(), nullable),
     )
+    .unwrap()
 }
 fn fixed(values: &[i128]) -> ArrayRef {
     let mut builder = FixedSizeBinaryBuilder::with_capacity(values.len(), 16);
@@ -328,13 +342,13 @@ fn cardinality_two_actual_records_keep_selected_fresh_frozen_complete_sources_an
                     .unwrap(),
             );
             assert!(
-                matches!(&selected.argument_types[0], FunctionArgumentType::Value(actual) if novarocks_type_contract::arrow_data_types_exact(&actual.data_type, &source.data_type) && actual.nullable == source.nullable && actual.logical_type == source.logical_type)
+                matches!(&selected.argument_types[0], FunctionArgumentType::Value(actual) if novarocks_type_contract::arrow_data_types_exact(actual.data_type(), source.data_type()) && actual.nullable() == source.nullable() && actual.logical_type() == source.logical_type())
             );
             assert_eq!(selected.result_type, FunctionResultType::Scalar(target()));
             let FunctionArgumentType::Value(selected_source) = &selected.argument_types[0] else {
                 panic!("cardinality requires a value source")
             };
-            match (&source.data_type, &selected_source.data_type) {
+            match (source.data_type(), selected_source.data_type()) {
                 (DataType::List(original), DataType::List(selected_field))
                 | (DataType::Map(original, _), DataType::Map(selected_field, _)) => {
                     assert!(
@@ -548,10 +562,15 @@ fn cardinality_hand_counts_keep_empty_null_children_and_nested_payloads_untouche
         }
     }
     let rich = rich_list(17, true);
+    let rich_type = ty(&rich, false);
+    // This fixture deliberately owns Dictionary decoding before entering a
+    // Plain kernel. Raw encoded children are not an installed capability.
+    let decoded = arrow_cast::cast(rich.as_ref(), rich_type.data_type()).unwrap();
+    let rich = crate::test_value_ingress::array_for_binding(&decoded, &rich_type).unwrap();
     let original = rich.to_data();
     assert_eq!(
         output(
-            &instance(&ty(&rich, false))
+            &instance(&rich_type)
                 .evaluate(
                     Selection::all(3),
                     &[EvaluatedArgument::Column(&rich)],
@@ -563,9 +582,9 @@ fn cardinality_hand_counts_keep_empty_null_children_and_nested_payloads_untouche
     );
     assert_eq!(rich.to_data(), original);
     // Full ConstantValue validation is the actual nested grammar author.
-    let checked = pool(&rich, false);
+    let checked = pool_with_type(&rich, rich_type);
     assert!(novarocks_type_contract::arrow_data_types_exact(
-        &checked.value_type().data_type,
+        checked.value_type().data_type(),
         rich.data_type()
     ));
     assert_eq!(checked.value(2).unwrap().ordinal(), 2);
@@ -669,6 +688,7 @@ fn cardinality_complete_dictionary_field_identity_and_unknown_metadata_are_not_a
         foreign_header.data_type()
     ));
     let source = ty(&source_array, false);
+    assert!(source.same_value_domain(&ty(&foreign_header, false)));
     assert!(matches!(
         instance(&source).evaluate(
             Selection::all(3),
@@ -700,15 +720,20 @@ fn cardinality_complete_dictionary_field_identity_and_unknown_metadata_are_not_a
         .with_metadata(item.metadata().clone()),
         Field::new(item.name(), item.data_type().clone(), item.is_nullable()),
     ] {
-        let changed = FunctionValueType::new(DataType::List(Arc::new(changed_item)), false);
-        assert!(matches!(
-            instance(&changed).evaluate(
-                Selection::all(4),
-                &[EvaluatedArgument::Column(&plain)],
-                &Control::default()
-            ),
-            Err(KernelFailure::InvalidProgram(_))
-        ));
+        let changed = FunctionValueType::from_legacy_declared_projection(
+            DataType::List(Arc::new(changed_item)),
+            false,
+        );
+        assert!(
+            instance(&changed)
+                .evaluate(
+                    Selection::all(4),
+                    &[EvaluatedArgument::Column(&plain)],
+                    &Control::default()
+                )
+                .is_ok(),
+            "anonymous role names and source annotations do not author identity"
+        );
     }
     let DataType::List(item) = source_array.data_type() else {
         unreachable!()
@@ -719,8 +744,11 @@ fn cardinality_complete_dictionary_field_identity_and_unknown_metadata_are_not_a
     // Only the unknown outer item metadata changes. All descendants, including
     // the dictionary ID/order and nominal tags, remain the same borrowed Fields.
     let changed_item_metadata = item.as_ref().clone().with_metadata(Default::default());
-    let lost_unknown =
-        FunctionValueType::new(DataType::List(Arc::new(changed_item_metadata)), false);
+    let lost_unknown = FunctionValueType::from_legacy_declared_projection(
+        DataType::List(Arc::new(changed_item_metadata)),
+        false,
+    );
+    assert_eq!(lost_unknown, source);
     assert!(matches!(
         instance(&lost_unknown).evaluate(
             Selection::all(3),
@@ -738,7 +766,11 @@ fn cardinality_complete_dictionary_field_identity_and_unknown_metadata_are_not_a
         .as_ref()
         .clone()
         .with_data_type(DataType::Struct(changed_fields.into()));
-    let lost_json = FunctionValueType::new(DataType::List(Arc::new(changed_item)), false);
+    let lost_json = FunctionValueType::from_legacy_declared_projection(
+        DataType::List(Arc::new(changed_item)),
+        false,
+    );
+    assert!(!lost_json.same_semantics(&source));
     assert!(matches!(
         instance(&lost_json).evaluate(
             Selection::all(3),
@@ -766,7 +798,7 @@ fn cardinality_large_list_is_a_binding_coercion_not_a_raw_prepared_profile() {
         DataType::List(field) => field.clone(),
         _ => unreachable!(),
     };
-    let raw = FunctionValueType::new(DataType::LargeList(item), false);
+    let raw = FunctionValueType::from_legacy_declared_projection(DataType::LargeList(item), false);
     let owner = owner_for_test("cardinality");
     let arguments = [FunctionArgument::Value {
         value_type: raw.clone(),
@@ -781,7 +813,7 @@ fn cardinality_large_list_is_a_binding_coercion_not_a_raw_prepared_profile() {
         .resolve(request, crate::binding_test_control())
         .unwrap();
     assert!(
-        matches!(&selected.argument_types[0], FunctionArgumentType::Value(actual) if matches!(actual.data_type, DataType::List(_)))
+        matches!(&selected.argument_types[0], FunctionArgumentType::Value(actual) if matches!(actual.data_type(), DataType::List(_)))
     );
     assert!(
         prepared_for_test_with_policy("cardinality", &[raw], DecimalOverflowPolicy::OutputNull)
@@ -936,7 +968,7 @@ fn cardinality_every_compile_callback_keeps_three_causes_and_ordinary_tail() {
         vec![FunctionValueType::new(DataType::Int32, true)],
     ] {
         let good = CompileControl::default();
-        let success = sources.len() == 1 && matches!(sources[0].data_type, DataType::List(_));
+        let success = sources.len() == 1 && matches!(sources[0].data_type(), DataType::List(_));
         assert_eq!(
             prepared_for_test_with_control(
                 "cardinality",
@@ -1049,6 +1081,7 @@ fn cardinality_actual_offset_and_null_loops_reach_quantum_with_sampled_first_cau
             .unwrap(),
         );
         let source = ty(&array, root_null);
+        let array = crate::test_value_ingress::array_for_binding(&array, &source).unwrap();
         let args = [EvaluatedArgument::Column(&array)];
         let good = Control::default();
         let result = instance(&source)

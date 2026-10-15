@@ -1146,8 +1146,8 @@ fn provider_columns(
                 work.step().map_err(ProviderColumnProjectionError::Control)
             })
             .map_err(ProviderColumnProjectionError::into_compile_error)?;
-        // The exact walk hashes metadata lookup keys. Admit all three actual
-        // types under the existing frozen field bounds before that operation.
+        // Validate the three complete execution types before comparing them.
+        // Independent provider attributes do not establish execution identity.
         for value_type in [&source_value_type, &logical.value_type, &output.value_type] {
             preflight_provider_value_type(value_type, work)?;
         }
@@ -1469,12 +1469,17 @@ mod tests {
                     .unwrap();
             assert_eq!(needs[0].columns()[0].engine_type(), &value_type);
             let mut forged = plan;
-            forged.output_columns[0].value_type.logical_type = if logical == ValueLogicalType::Uuid
-            {
-                ValueLogicalType::Physical
-            } else {
-                ValueLogicalType::Uuid
-            };
+            forged.output_columns[0].value_type =
+                novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                    forged.output_columns[0].value_type.data_type().clone(),
+                    forged.output_columns[0].value_type.nullable(),
+                    if logical == ValueLogicalType::Uuid {
+                        ValueLogicalType::Physical
+                    } else {
+                        ValueLogicalType::Uuid
+                    },
+                )
+                .unwrap();
             assert!(matches!(
                 collect_provider_needs(forged, 7, false, &SqlCompileControl::unbounded()),
                 Err(SqlCompileError::Compilation(_))
@@ -1639,56 +1644,62 @@ mod tests {
     }
 
     #[test]
-    fn provider_completion_preflights_metadata_before_exact_comparison() {
-        use novarocks_type_contract::{
-            MAX_ARROW_FIELD_METADATA_KEY_BYTES, MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
-        };
-        let value_type = |key_bytes, value_bytes| {
-            ValueType::new(
-                DataType::Struct(
-                    vec![
-                        arrow::datatypes::Field::new("nested", DataType::Int32, false)
-                            .with_metadata(
-                                [("k".repeat(key_bytes), "v".repeat(value_bytes))].into(),
-                            ),
-                    ]
-                    .into(),
-                ),
-                false,
-            )
-        };
-        let near = value_type(
-            MAX_ARROW_FIELD_METADATA_KEY_BYTES,
-            MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
-        );
-        let (_, needs) = collect_provider_needs(
-            provider_type_scan(near.clone(), 1),
-            0,
+    fn provider_completion_uses_complete_types_without_source_attribute_identity() {
+        let near = ValueType::new(
+            DataType::Struct(
+                vec![arrow::datatypes::Field::new(
+                    "nested",
+                    DataType::Int32,
+                    false,
+                )]
+                .into(),
+            ),
             false,
-            &SqlCompileControl::unbounded(),
-        )
-        .unwrap();
-        assert_eq!(needs[0].columns()[0].engine_type(), &near);
-        for over in [
-            value_type(MAX_ARROW_FIELD_METADATA_KEY_BYTES + 1, 1),
-            value_type(1, MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1),
+        );
+        for length in [
+            1,
+            novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1,
         ] {
-            for position in 0..3 {
-                let mut plan = provider_type_scan(near.clone(), 1);
-                let crate::planner::physical::PhysicalPlanKind::Scan(scan) = &mut plan.kind else {
-                    panic!("scan fixture")
-                };
-                match position {
-                    0 => scan.table.columns[0].data_type = over.data_type.clone(),
-                    1 => scan.columns[0].value_type = over.clone(),
-                    2 => plan.output_columns[0].value_type = over.clone(),
-                    _ => unreachable!(),
-                }
-                assert!(matches!(
-                    collect_provider_needs(plan, 0, false, &SqlCompileControl::unbounded()),
-                    Err(SqlCompileError::ResourceExhausted)
-                ));
+            let source = arrow::datatypes::Field::new("nested", DataType::Int32, false)
+                .with_metadata([("provider.attribute".into(), "v".repeat(length))].into());
+            let same = ValueType::new(DataType::Struct(vec![source.clone()].into()), false);
+            assert_eq!(same, near);
+            assert_eq!(source.metadata()["provider.attribute"].len(), length);
+            let (_, needs) = collect_provider_needs(
+                provider_type_scan(same, 1),
+                0,
+                false,
+                &SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            assert_eq!(needs[0].columns()[0].engine_type(), &near);
+        }
+        let changed = ValueType::new(
+            DataType::Struct(
+                vec![arrow::datatypes::Field::new(
+                    "different",
+                    DataType::Int32,
+                    false,
+                )]
+                .into(),
+            ),
+            false,
+        );
+        for position in 0..3 {
+            let mut plan = provider_type_scan(near.clone(), 1);
+            let crate::planner::physical::PhysicalPlanKind::Scan(scan) = &mut plan.kind else {
+                panic!("scan fixture")
+            };
+            match position {
+                0 => scan.table.columns[0].data_type = changed.data_type().clone(),
+                1 => scan.columns[0].value_type = changed.clone(),
+                2 => plan.output_columns[0].value_type = changed.clone(),
+                _ => unreachable!(),
             }
+            assert!(matches!(
+                collect_provider_needs(plan, 0, false, &SqlCompileControl::unbounded()),
+                Err(SqlCompileError::Compilation(_))
+            ));
         }
     }
 
@@ -2996,6 +3007,175 @@ mod tests {
         assert!(frozen_table_statistics(values.plan()).is_empty());
     }
 
+    #[test]
+    fn cow_merge_unchanged_variant_case_keeps_complete_type_through_final_lowering() {
+        struct MergeCatalog;
+        impl crate::catalog::PlannerTableProvider for MergeCatalog {
+            fn resolve_table_for_analysis(
+                &self,
+                catalog: Option<&str>,
+                database: &str,
+                table: &str,
+            ) -> Result<ResolvedAnalyzerTable, String> {
+                use novarocks_types::schema::{ColumnDef, SqlType};
+                let plain = |name: &str| ColumnDef {
+                    name: name.into(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: Some(SqlType::BigInt),
+                };
+                let (binding, columns, metadata_columns) = match table {
+                    "s_v3_variant_mut" => (42, vec![plain("id"), plain("new_id")], Vec::new()),
+                    "t_v3_variant_mut" => (
+                        41,
+                        vec![
+                            plain("id"),
+                            ColumnDef {
+                                name: "v".into(),
+                                data_type: DataType::LargeBinary,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: Some(SqlType::Variant),
+                            },
+                        ],
+                        vec![plain("_row_id")],
+                    ),
+                    other => return Err(format!("unexpected MERGE source {other}")),
+                };
+                Ok(ResolvedAnalyzerTable::from_planner(
+                    catalog,
+                    database,
+                    TableDef {
+                        name: table.into(),
+                        columns,
+                        iceberg_row_lineage_metadata_columns: metadata_columns,
+                        source: ScanSource::Sql(SqlScanSource::new(
+                            SqlTableBindingId::new_for_test(binding),
+                            SqlTableIdentity::try_new(
+                                "iceberg".into(),
+                                database.into(),
+                                table.into(),
+                            )?,
+                            SqlScanKind::Data {
+                                version: SqlTableVersionSelector::Current,
+                            },
+                        )),
+                    },
+                ))
+            }
+        }
+        impl crate::compiler::SqlCatalogSnapshot for MergeCatalog {
+            fn planner_table_provider(&self) -> &dyn crate::catalog::PlannerTableProvider {
+                self
+            }
+        }
+        // The original SQL step only SETs id=s.new_id. Both original COW
+        // selection roles must keep t.v, including the outer-join NULL side.
+        let sql = "SELECT \
+            CASE WHEN t._row_id IS NOT NULL THEN t.v ELSE NULL END AS before_v, \
+            CASE WHEN t._row_id IS NOT NULL THEN (t.v) ELSE (NULL) END AS after_v, \
+            CASE WHEN t._row_id IS NOT NULL THEN (s.new_id) ELSE (NULL) END AS after_id \
+            FROM s_v3_variant_mut s LEFT JOIN t_v3_variant_mut t ON t.id=s.id \
+            WHERE t._row_id IS NOT NULL";
+        let control = SqlCompileControl::unbounded();
+        let catalog = MergeCatalog;
+        let functions = builtin_sql_function_catalog();
+        let analyzed = SqlCompiler::analyze(crate::compiler::SqlAnalyzeRequest::new(
+            SqlStatementInput::sql(sql),
+            SqlCompileIntent::DmlInternalRead,
+            request("SELECT 1", SqlCompileIntent::Query).session,
+            SqlPlanningEnvironment::Distributed,
+            &catalog,
+            functions,
+            noop_constant_evaluator(),
+            None,
+            crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+            control.clone(),
+        ))
+        .expect("actual COW MERGE selection analysis")
+        .into_pending()
+        .unwrap();
+        let statistics = DmlStatisticsSnapshot::from_evidence(
+            [("t_v3_variant_mut", 2), ("s_v3_variant_mut", 1)].map(|(name, rows)| {
+                let resolved = crate::catalog::PlannerTableProvider::resolve_table_for_analysis(
+                    &catalog,
+                    Some("iceberg"),
+                    "db",
+                    name,
+                )
+                .expect("the same frozen MERGE source declaration");
+                let ScanSource::Sql(source) = resolved.planner.source;
+                let DmlStatisticsEvidence::Available { evidence, .. } =
+                    available_statistics_evidence(rows)
+                else {
+                    unreachable!("existing exact row-count fixture")
+                };
+                DmlStatisticsEvidence::Available {
+                    binding: source.binding,
+                    label: format!("iceberg.db.{name}"),
+                    columns: resolved.planner.columns,
+                    evidence,
+                }
+            }),
+        );
+        let (completion, needs) = crate::planning::dml::begin_final_dml_read_plan(
+            crate::compiler::SqlOptimizeRequest::new(analyzed, &statistics, control.clone()),
+            &SessionOptimizerSettings::default(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+        )
+        .expect("actual COW MERGE selection optimization");
+        let reads =
+            crate::planning::dml::DmlFinalizedProviderReadSet::try_new(needs.iter().map(|need| {
+                crate::planning::dml::DmlFinalizedProviderRead {
+                    fact: ProviderReadFact::negotiated(need, provider_contract(need)).unwrap(),
+                    read_budget: ScanReadBudget {
+                        max_batch_rows: MAX_SCAN_BATCH_ROWS,
+                        max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+                    },
+                }
+            }))
+            .unwrap();
+        let owner = completion
+            .finish(
+                PlanVersionId::try_new([73; 16]).unwrap(),
+                PipelineDopDomain {
+                    min: 1,
+                    max: 8,
+                    requires_power_of_two: true,
+                },
+                reads,
+                &control,
+            )
+            .expect("actual COW MERGE selection final lowering must not invent Binary-to-Variant");
+        let result = owner.plan().result_port().expect("selection result");
+        assert_eq!(result.fields.len(), 3);
+        let variant = ValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            true,
+            novarocks_type_contract::ValueLogicalType::Variant,
+        )
+        .unwrap();
+        for field in &result.fields[..2] {
+            assert_eq!(
+                field.ty, variant,
+                "COW unchanged Variant CASE output {}",
+                field.name
+            );
+        }
+        assert_eq!(result.fields[2].ty, ValueType::new(DataType::Int64, true));
+        assert!(
+            novarocks_functions::builtin::value_conversion::conversion_intermediate_type(
+                &ValueType::new(DataType::LargeBinary, true),
+                &variant,
+            )
+            .is_err(),
+            "ordinary bytes still cannot establish a Variant domain"
+        );
+        novarocks_physical_plan::validate_plan(owner.plan()).unwrap();
+    }
+
     pub(super) struct FrozenOrdersCatalog;
 
     impl crate::catalog::PlannerTableProvider for FrozenOrdersCatalog {
@@ -3404,7 +3584,7 @@ mod tests {
             assert_eq!(schema.field().value_type, value, "{sql}");
             assert_eq!(
                 schema.field().nullable,
-                result.fields[0].ty.nullable,
+                result.fields[0].ty.nullable(),
                 "{sql}"
             );
             assert_eq!(schema.source_slot(), None);

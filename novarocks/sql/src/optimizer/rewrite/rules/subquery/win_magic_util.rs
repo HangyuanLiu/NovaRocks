@@ -626,6 +626,21 @@ mod tests {
             .unwrap();
         assert_eq!(a, same);
         assert!(super::expr_phys_eq(&arena, a, same, &HashMap::new()));
-        assert!(!super::expr_phys_eq(&arena, a, other, &HashMap::new()));
+        assert_eq!(a, other);
+        assert!(super::expr_phys_eq(&arena, a, other, &HashMap::new()));
+        let changed_type = FunctionValueType::new(DataType::Int64, false);
+        let changed_value = ConstantValue::from_i64(
+            Arc::new(changed_type.try_to_field("literal").unwrap()),
+            changed_type.clone(),
+            8,
+            crate::constant::test_constant_policy(),
+            CompilePhase::Validate,
+            control,
+        )
+        .unwrap();
+        let changed = arena
+            .intern_observed(ScalarNode::Constant(changed_value), changed_type, control)
+            .unwrap();
+        assert!(!super::expr_phys_eq(&arena, a, changed, &HashMap::new()));
     }
 }

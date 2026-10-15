@@ -68,7 +68,9 @@ impl FragmentResultSession for CollectingSession {
         &self,
         chunk: Chunk,
         _credit: ResultWriteCredit,
-    ) -> Result<(), FragmentIoError> {
+        _factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+        _control: &dyn novarocks_functions::KernelEvaluationControl,
+    ) -> Result<(), crate::runtime::fragment::io::ResultWriteFailure> {
         self.chunks.lock().unwrap().push(chunk);
         Ok(())
     }
@@ -149,7 +151,11 @@ fn compiled_submission_prepares_and_runs_into_the_result_session() {
     let chunks = session.chunks.lock().unwrap();
     let rows: usize = chunks.iter().map(Chunk::len).sum();
     assert_eq!(rows, 1);
-    let batch = &chunks.iter().find(|chunk| chunk.len() == 1).unwrap().batch;
+    let batch = chunks
+        .iter()
+        .find(|chunk| chunk.len() == 1)
+        .unwrap()
+        .record_batch();
     let sample = batch
         .column(0)
         .as_any()

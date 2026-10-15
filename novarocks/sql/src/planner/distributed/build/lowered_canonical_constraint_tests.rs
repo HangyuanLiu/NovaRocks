@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+use novarocks_type_contract::ValueLogicalType;
 
 const CONVERSION: &str =
     novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID;
@@ -171,32 +171,31 @@ fn canonical_constraint_actual_json_text_and_nested_conversion_keep_explicit_tar
                 panic!("original computed JSON source must remain None");
             };
             let target = receipt.captured().binding().result_constraint().unwrap();
-            assert_eq!(target.logical_type, ValueLogicalType::Physical);
+            assert_eq!(target.logical_type(), ValueLogicalType::Physical);
             if nested {
-                let DataType::List(before) = &value_type.data_type else {
+                let DataType::List(before) = &value_type.data_type() else {
                     panic!("JSON list input");
                 };
-                let DataType::List(after) = &target.data_type else {
+                let DataType::List(after) = &target.data_type() else {
                     panic!("text list target");
                 };
                 assert_eq!(
-                    novarocks_type_contract::field_logical_type(before).unwrap(),
+                    value_type.child_at(0).unwrap().logical_type(),
                     ValueLogicalType::Json
                 );
                 assert_eq!(
-                    novarocks_type_contract::field_logical_type(after).unwrap(),
+                    target.child_at(0).unwrap().logical_type(),
                     ValueLogicalType::Physical
                 );
                 assert_eq!(before.name(), after.name());
                 assert_eq!(before.is_nullable(), after.is_nullable());
                 assert_eq!(before.data_type(), &DataType::Utf8);
                 assert_eq!(after.data_type(), &DataType::Utf8);
-                let mut metadata = before.metadata().clone();
-                metadata.remove(NR_LOGICAL_TYPE_KEY);
-                assert_eq!(&metadata, after.metadata());
+                assert!(before.metadata().is_empty());
+                assert!(after.metadata().is_empty());
             } else {
-                assert_eq!(value_type.logical_type, ValueLogicalType::Json);
-                assert_eq!(target.data_type, DataType::Utf8);
+                assert_eq!(value_type.logical_type(), ValueLogicalType::Json);
+                assert_eq!(target.data_type().clone(), DataType::Utf8);
             }
             let operational = operational_arguments(&owner, &receipt, &Control::default()).unwrap();
             assert!(constant(&operational[0]).is_none());
@@ -204,12 +203,19 @@ fn canonical_constraint_actual_json_text_and_nested_conversion_keep_explicit_tar
         }
         assert_public_result_fields(&owner);
         let result = owner.plan().result_port().unwrap();
-        let DataType::List(item) = &result.fields.last().unwrap().ty.data_type else {
+        let DataType::List(item) = &result.fields.last().unwrap().ty.data_type() else {
             panic!("independent final ARRAY<VARCHAR> schema");
         };
         assert_eq!(item.data_type(), &DataType::Utf8);
         assert_eq!(
-            novarocks_type_contract::field_logical_type(item).unwrap(),
+            result
+                .fields
+                .last()
+                .unwrap()
+                .ty
+                .child_at(0)
+                .unwrap()
+                .logical_type(),
             ValueLogicalType::Physical
         );
     }
@@ -244,29 +250,26 @@ fn canonical_constraint_actual_typed_empty_array_retains_full_json_item_target()
     assert!(receipt.captured().request().arguments.is_empty());
     assert_eq!(receipt.captured().request().logical_argument_count, 0);
     let target = receipt.captured().binding().result_constraint().unwrap();
-    assert!(!target.nullable);
-    assert_eq!(target.logical_type, ValueLogicalType::Physical);
-    let DataType::List(item) = &target.data_type else {
+    assert!(!target.nullable());
+    assert_eq!(target.logical_type(), ValueLogicalType::Physical);
+    let DataType::List(item) = &target.data_type() else {
         panic!("typed ARRAY target");
     };
     assert_eq!(item.name(), "item");
     assert_eq!(item.data_type(), &DataType::Utf8);
     assert_eq!(
-        novarocks_type_contract::field_logical_type(item).unwrap(),
+        target.child_at(0).unwrap().logical_type(),
         ValueLogicalType::Json
     );
-    assert_eq!(
-        item.metadata().get(NR_LOGICAL_TYPE_KEY).map(String::as_str),
-        Some(ValueLogicalType::Json.metadata_value().unwrap())
-    );
+    assert!(item.metadata().is_empty());
     let FunctionResultType::Scalar(selected) = &receipt.canonical_selection().unwrap().result_type
     else {
         panic!("array scalar selection");
     };
-    let DataType::List(selected_item) = &selected.data_type else {
+    let DataType::List(selected_item) = &selected.data_type() else {
         unreachable!();
     };
-    assert!(Arc::ptr_eq(item, selected_item));
+    assert!(Arc::ptr_eq(&item, &selected_item));
     assert_public_result_fields(&owner);
     let result = owner.plan().result_port().unwrap();
     assert_eq!(result.fields.len(), 1);

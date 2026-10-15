@@ -23,8 +23,8 @@
 //! facts come from:
 //!
 //! * the writer's projection evaluates the program's `WriterProjection` roots,
-//!   one compiled instance per root and driver, and builds each page under the
-//!   provider recipe's exact input schema. There is no expression arena, no
+//!   one compiled instance per root and driver, and builds each page under its
+//!   complete execution projection. There is no expression arena, no
 //!   name dispatch and no `arrow::cast`: the provider-link law already proved
 //!   every carrier equal. A nullable value feeding a NOT NULL provider field
 //!   is the writer's row obligation, checked here before any provider I/O;
@@ -39,18 +39,17 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef};
-use arrow::datatypes::{Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use novarocks_local_program::{
     LocalProgram, ProgramChannelLayoutRole, ProgramExpressionRootSite, ProgramNodeId,
     ProgramNodeKind, ProgramRootInput, root_input_layout,
 };
 
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::node::table_finish::TableFinishRuntimeBinding;
 use crate::exec::node::table_write_relation::{
-    RootWriteResultRelationSchema, WriterMultiplexRelationSchema,
+    RootWriteResultRelationTemplate, WriterMultiplexRelationTemplate,
 };
 use crate::exec::node::table_writer::TableWriterRuntimeBinding;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
@@ -89,9 +88,8 @@ pub(crate) fn compiled_table_writer_factory(
         CompiledWriterPartialFactory::try_new(program, id, Arc::clone(error))?
             .map(|factory| Arc::new(factory) as Arc<dyn OperatorFactory>);
     let projection = CompiledWriterProjection::try_new(Arc::clone(program), id, Arc::clone(error))?;
-    let relation =
-        WriterMultiplexRelationSchema::try_from_compiled_layout(writer_multiplex_layout)?;
-    if relation.chunk_schema().slot_ids() != node.output_layout().slots() {
+    let relation = WriterMultiplexRelationTemplate::try_new(writer_multiplex_layout)?;
+    if relation.slots() != node.output_layout().slots() {
         return Err(format!(
             "compiled table writer at local node {} does not publish its multiplex relation",
             id.index()
@@ -164,8 +162,8 @@ pub(crate) fn compiled_table_finish_factory(
     TableFinishOperatorFactory::new_compiled(
         display_id,
         expected_targets.clone(),
-        WriterMultiplexRelationSchema::try_from_compiled_layout(writer_multiplex_layout)?,
-        RootWriteResultRelationSchema::try_from_compiled_layout(root_result_layout)?,
+        WriterMultiplexRelationTemplate::try_new(writer_multiplex_layout)?,
+        RootWriteResultRelationTemplate::try_new(root_result_layout)?,
         statistics,
         binding,
     )
@@ -176,12 +174,11 @@ pub(crate) fn compiled_table_finish_factory(
 pub(crate) struct CompiledWriterProjection {
     program: Arc<LocalProgram>,
     sites: Arc<[ProgramExpressionRootSite]>,
-    /// The provider recipe's exact input schema, provider nullability
-    /// included.
+    /// The complete execution projection. Provider requiredness remains an
+    /// independent per-row obligation below.
     schema: SchemaRef,
-    chunk_schema: ChunkSchemaRef,
+    layout: novarocks_local_program::StaticLayout,
     /// Ordinals of NOT NULL provider fields: each is a row obligation.
-    obligations: Arc<[usize]>,
     error: Arc<RuntimeErrorState>,
 }
 
@@ -247,21 +244,13 @@ impl CompiledWriterProjection {
             }
             sites.push(site);
         }
-        let obligations = fields
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| !field.is_nullable())
-            .map(|(ordinal, _)| ordinal)
-            .collect::<Vec<_>>();
-        let schema = Arc::new(Schema::new(fields));
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(&schema, projection.layout.slots())?;
+        let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+        let layout = projection.layout.clone();
         Ok(Self {
             program,
             sites: Arc::from(sites),
             schema,
-            chunk_schema,
-            obligations: Arc::from(obligations),
+            layout,
             error,
         })
     }
@@ -273,8 +262,9 @@ impl WriterProjectionFactory for CompiledWriterProjection {
             program: Arc::clone(&self.program),
             sites: Arc::clone(&self.sites),
             schema: Arc::clone(&self.schema),
-            chunk_schema: Arc::clone(&self.chunk_schema),
-            obligations: Arc::clone(&self.obligations),
+            layout: self.layout.clone(),
+            chunk_schema: None,
+            construction: None,
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             instances: None,
         })
@@ -286,13 +276,24 @@ struct CompiledWriterProjector {
     program: Arc<LocalProgram>,
     sites: Arc<[ProgramExpressionRootSite]>,
     schema: SchemaRef,
-    chunk_schema: ChunkSchemaRef,
-    obligations: Arc<[usize]>,
+    layout: novarocks_local_program::StaticLayout,
+    chunk_schema: Option<ChunkSchemaRef>,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     control: RuntimeKernelControl,
     instances: Option<Vec<CompiledExpressionInstance>>,
 }
 
 impl WriterPageProjection for CompiledWriterProjector {
+    fn prepare(
+        &mut self,
+        factory: Option<&Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    ) -> ExecutionResult<()> {
+        let factory =
+            factory.ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        self.chunk_schema = Some(factory.create_compiled_chunk_schema(&self.layout)?);
+        self.construction = Some(factory.clone());
+        Ok(())
+    }
     fn bind_runtime_state(
         &mut self,
         state: &crate::runtime::runtime_state::RuntimeState,
@@ -311,27 +312,41 @@ impl WriterPageProjection for CompiledWriterProjector {
             &self.control,
         )?;
         let instances = self.instances.as_mut().expect("instances were created");
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        let schema = self
+            .chunk_schema
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let owner = factory.begin_typed_construction(schema)?;
+        owner.request(std::alloc::Layout::array::<ArrayRef>(self.sites.len())
+            .map_err(|_| ConstructionFailure::from(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.sites.len());
         for (instance, site) in instances.iter_mut().zip(self.sites.iter()) {
-            columns.push(evaluate_all(instance, *site, &chunk.batch, &self.control)?);
+            columns.push(evaluate_all(
+                instance,
+                *site,
+                chunk.record_batch(),
+                &self.control,
+            )?);
         }
-        // The row obligation: a NOT NULL provider field fed a NULL refuses the
-        // page before any provider write, at the same failure point and with
-        // the same text as the projection-built page of the plan-tree writer.
-        for &ordinal in self.obligations.iter() {
-            if columns[ordinal].null_count() > 0 {
-                return Err(format!(
-                    "build table writer projected batch: Invalid argument error: Column '{}' is declared as non-nullable but contains null values",
-                    self.schema.field(ordinal).name()
-                )
-                .into());
-            }
-        }
-        let batch = RecordBatch::try_new(Arc::clone(&self.schema), columns)
-            .map_err(|error| format!("build table writer projected batch: {error}"))?;
-        Ok(Chunk::try_new_with_chunk_schema(
-            batch,
-            Arc::clone(&self.chunk_schema),
+        crate::exec::node::table_writer::validate_writer_projection_requiredness(
+            &self.schema,
+            &columns,
+        )?;
+        let rows = columns.first().map_or(chunk.len(), |array| array.len());
+        Ok(Chunk::try_new_typed_with_columns_owned_observed::<
+            ConstructionFailure,
+            _,
+        >(
+            Arc::clone(schema),
+            columns,
+            rows,
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
         )?)
     }
 }

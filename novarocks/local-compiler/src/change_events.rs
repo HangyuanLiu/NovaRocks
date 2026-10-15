@@ -19,7 +19,6 @@
 //! Allocations remain subject to the caller's formal preparation scope.
 
 use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
-use arrow_schema::Schema;
 use novarocks_local_program::{
     ChangeEventOutputExpr, ChangeEventSpec, ProgramExprId, ProgramNodeId, ProgramNodeKind,
     StaticLayout,
@@ -27,9 +26,9 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{ExprId, FragmentPackage, NodeKind, PhysicalNode};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 use novarocks_types::SlotId;
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
-pub(crate) fn lower_change_events(
+pub(crate) fn lower_change_events_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     local: ProgramNodeId,
@@ -37,64 +36,57 @@ pub(crate) fn lower_change_events(
     slots: &[SlotId],
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     control: &dyn PureCompileControl,
-) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(package, node, local, (child, expressions), slots, &mut work);
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    let result = lower_core_with_creation(
+        package,
+        node,
+        local,
+        (child, expressions),
+        slots,
+        &mut work,
+        creation,
+    );
+    crate::creation::finish_attempt(result, work)
 }
 
-fn lower_core(
+fn lower_core_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     local: ProgramNodeId,
     input: (ProgramNodeId, &BTreeMap<ExprId, ProgramExprId>),
     slots: &[SlotId],
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
     let (child, expressions) = input;
     let NodeKind::ChangeEventExpand {
         events,
         effect_output,
     } = &node.kind
     else {
-        return Err(FragmentCompileError::Invalid(
-            "change-event source kind differs",
-        ));
+        return Err((FragmentCompileError::Invalid("change-event source kind differs")).into());
     };
     if slots.len() != node.output.columns.len() {
-        return Err(FragmentCompileError::Invalid(
-            "change-event output width differs",
-        ));
+        return Err((FragmentCompileError::Invalid("change-event output width differs")).into());
     }
     let mut output_slots = Vec::new();
-    let mut fields = Vec::new();
     let mut addresses = BTreeMap::new();
     let mut effect_slot = None;
     reserve_vec(&mut output_slots, slots.len(), work)?;
-    if package.original_metadata_namespace().is_none() {
-        reserve_vec(&mut fields, slots.len(), work)?;
-    }
-    let mut original_fields = match package.original_metadata_namespace() {
-        Some(_) => {
-            let mut original_fields = Vec::new();
-            reserve_vec(&mut original_fields, slots.len(), work)?;
-            Some(original_fields)
-        }
-        None => None,
-    };
+    let mut typed_layout =
+        crate::typed_layout::TypedLayoutBuilder::new_with_creation(slots.len(), work, creation)?;
     let result_port = package.result().filter(|r| r.output == node.output);
     for (ordinal, (&value, &slot)) in node.output.columns.iter().zip(slots).enumerate() {
         let fresh = addresses.insert(value, slot).is_none();
         work.step()?;
         if !fresh {
-            return Err(FragmentCompileError::Unsupported {
+            return Err((FragmentCompileError::Unsupported {
                 node: Some(node.id),
                 feature: "repeated change-event output occurrences",
-            });
+            })
+            .into());
         }
         if value == *effect_output {
             effect_slot = Some(slot);
@@ -116,20 +108,22 @@ fn lower_core(
                     .ok_or(FragmentCompileError::Invalid(
                         "missing change-event result field",
                     ))?;
-                field.alias.as_deref().unwrap_or(&field.name).to_owned()
+                crate::typed_layout::copy_name_with_creation(
+                    field.alias.as_deref().unwrap_or(&field.name),
+                    work,
+                    creation,
+                )?
             }
-            None => format!("local_{}_{}", local.index(), ordinal),
+            None => crate::typed_layout::local_name_with_creation(
+                "local",
+                local.index(),
+                ordinal,
+                work,
+                creation,
+            )?,
         };
         work.flush()?;
-        if let Some(original_fields) = original_fields.as_mut() {
-            let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(ty, name)?;
-            work.flush()?;
-            original_fields.push(field);
-        } else {
-            let field = ty.try_to_field(name)?;
-            work.flush()?;
-            fields.push(field);
-        }
+        typed_layout.push_with_creation(ty, name, work, creation)?;
         output_slots.push(slot);
         work.step()?;
     }
@@ -176,25 +170,7 @@ fn lower_core(
         work.step()?;
     }
     work.flush()?;
-    let materialized = match (original_fields, package.original_metadata_namespace()) {
-        (Some(fields), Some(namespace)) => Some(novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema()),
-        _ => None,
-    };
-    let schema = if let Some(source) = &materialized {
-        source.schema_owner().schema().clone()
-    } else {
-        Arc::new(Schema::new(fields))
-    };
-    let output_layout_slots: Arc<[SlotId]> = Arc::from(slots);
-    work.flush()?;
-    let layout = match materialized {
-        Some(source) => StaticLayout::try_new_materialized_for_compile(
-            source,
-            output_layout_slots,
-            work.control(),
-        )?,
-        None => StaticLayout::try_new_for_compile(schema, output_layout_slots, work.control())?,
-    };
+    let layout = typed_layout.finish_with_creation(slots, work, creation)?;
     Ok((
         ProgramNodeKind::ChangeEventExpand {
             input: child,

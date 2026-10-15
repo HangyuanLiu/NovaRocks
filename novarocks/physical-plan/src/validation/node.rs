@@ -70,7 +70,7 @@ pub(crate) fn change_event_source(
     effect: ValueId,
 ) -> Option<&[crate::ChangeEventSpec]> {
     let value = fragment.values().get(&effect)?;
-    if value.ty.data_type != DataType::Int8 || value.ty.nullable {
+    if *value.ty.data_type() != DataType::Int8 || value.ty.nullable() {
         return None;
     }
     let ValueOrigin::NodeOutput {
@@ -126,8 +126,8 @@ pub(crate) fn validate_value(
                 // The value names what the expression produces, and may admit
                 // null where the expression does not: an exact value standing
                 // where null is admitted is sound. The reverse is not.
-                if !expression.ty.same_value_domain(&value.ty)
-                    || (expression.ty.nullable && !value.ty.nullable)
+                if !super::value_bindings_match_ignoring_root_nullability(&expression.ty, &value.ty)
+                    || (expression.ty.nullable() && !value.ty.nullable())
                 {
                     errors.push(ValidationError::new(
                         &path,
@@ -157,7 +157,9 @@ pub(crate) fn validate_value(
                 None => require_node(fragment, *node, &path, errors),
             }
             if let Some(source) = fragment.values().get(of) {
-                if !source.ty.same_value_domain(&value.ty) || !value.ty.nullable {
+                if !super::value_bindings_match_ignoring_root_nullability(&source.ty, &value.ty)
+                    || !value.ty.nullable()
+                {
                     errors.push(ValidationError::new(
                         &path,
                         "null-extended value must preserve the data type and be nullable",
@@ -872,7 +874,7 @@ pub(crate) fn validate_node_semantics(
                 if let (Some(left), Some(right)) = (
                     fragment.expressions().get(key.left),
                     fragment.expressions().get(key.right),
-                ) && !left.ty.same_value_domain(&right.ty)
+                ) && !super::value_bindings_match_ignoring_root_nullability(&left.ty, &right.ty)
                 {
                     errors.push(ValidationError::new(
                         path,
@@ -1197,8 +1199,10 @@ pub(crate) fn validate_node_semantics(
                             fragment.values().get(input_value),
                             fragment.values().get(output_value),
                         )
-                        && (!input_value.ty.same_value_domain(&output_value.ty)
-                            || (input_value.ty.nullable && !output_value.ty.nullable))
+                        && (!super::value_bindings_match_ignoring_root_nullability(
+                            &input_value.ty,
+                            &output_value.ty,
+                        ) || (input_value.ty.nullable() && !output_value.ty.nullable()))
                     {
                         // A set operation's column admits null when any branch
                         // it reads does, so a branch that never writes null
@@ -1362,7 +1366,11 @@ pub(crate) fn validate_node_semantics(
                     // value it reads must have that data type. Either side
                     // may admit more nulls; whether this row can be written
                     // is the target's answer when the row reaches it.
-                    Some(value) if !value.ty.same_value_domain(&field.ty) => {
+                    Some(value)
+                        if !super::value_bindings_match_ignoring_root_nullability(
+                            &value.ty, &field.ty,
+                        ) =>
+                    {
                         errors.push(ValidationError::new(
                             path,
                             format!(
@@ -1565,8 +1573,11 @@ pub(crate) fn validate_node_semantics(
                             continue;
                         };
                         if let Some(definition) = fragment.values().get(&value) {
-                            let mut expected = expected.clone();
-                            expected.nullable |= *left_outer;
+                            let expected = expected
+                                .with_nullable(expected.nullable() || *left_outer)
+                                .expect(
+                                    "nullable widening preserves a valid table-function result",
+                                );
                             if definition.ty != expected {
                                 errors.push(ValidationError::new(
                                     path,
@@ -1831,8 +1842,8 @@ pub(crate) fn validate_node_semantics(
         } => {
             require_value(fragment, *effect_output, path, errors);
             let effect_is_exact = fragment.values().get(effect_output).is_some_and(|value| {
-                value.ty.data_type == DataType::Int8
-                    && !value.ty.nullable
+                *value.ty.data_type() == DataType::Int8
+                    && !value.ty.nullable()
                     && matches!(
                         value.origin,
                         ValueOrigin::NodeOutput {
@@ -1893,8 +1904,10 @@ pub(crate) fn validate_node_semantics(
                             fragment.values().get(output),
                             fragment.expressions().get(*expression),
                         )
-                        && (!output.ty.same_value_domain(&expression.ty)
-                            || (expression.ty.nullable && !output.ty.nullable))
+                        && (!super::value_bindings_match_ignoring_root_nullability(
+                            &output.ty,
+                            &expression.ty,
+                        ) || (expression.ty.nullable() && !output.ty.nullable()))
                     {
                         errors.push(ValidationError::new(
                             path,
@@ -1917,7 +1930,7 @@ pub(crate) fn validate_node_semantics(
                         && fragment
                             .values()
                             .get(&output)
-                            .is_some_and(|value| !value.ty.nullable)
+                            .is_some_and(|value| !value.ty.nullable())
                     {
                         errors.push(ValidationError::new(
                             path,
@@ -2091,8 +2104,8 @@ pub(crate) fn writer_relation_field_matches(
             crate::WriterRelationFieldRole::Auxiliary => {
                 return actual_ordinal >= 4
                     && field_count > 4
-                    && field.ty.nullable
-                    && field.ty.data_type != DataType::Null;
+                    && field.ty.nullable()
+                    && *field.ty.data_type() != DataType::Null;
             }
         },
         WriterRelationContract::RootResult => match field.role {
@@ -2116,47 +2129,47 @@ pub(crate) fn writer_relation_field_matches(
         (_, 0) => {
             field.name.as_ref() == "kind"
                 && field.role == crate::WriterRelationFieldRole::Kind
-                && field.ty == crate::ValueType::new(DataType::Int8, false)
+                && super::value_binding_is_primitive(&field.ty, &DataType::Int8, false)
         }
         (WriterRelationContract::Multiplex, 1) => {
             field.name.as_ref() == "write_target_ordinal"
                 && field.role == crate::WriterRelationFieldRole::TargetOrdinal
-                && field.ty == crate::ValueType::new(DataType::Int32, false)
+                && super::value_binding_is_primitive(&field.ty, &DataType::Int32, false)
         }
         (WriterRelationContract::RootResult, 1) => {
             field.name.as_ref() == "write_target_ordinal"
                 && field.role == crate::WriterRelationFieldRole::TargetOrdinal
-                && field.ty == crate::ValueType::new(DataType::Int32, true)
+                && super::value_binding_is_primitive(&field.ty, &DataType::Int32, true)
         }
         (_, 2) => {
             field.name.as_ref() == "row_count"
                 && field.role == crate::WriterRelationFieldRole::RowCount
-                && field.ty == crate::ValueType::new(DataType::Int64, true)
+                && super::value_binding_is_primitive(&field.ty, &DataType::Int64, true)
         }
         (_, 3) => {
             field.name.as_ref() == "commit_fragment"
                 && field.role == crate::WriterRelationFieldRole::CommitFragment
-                && field.ty == crate::ValueType::new(DataType::Binary, true)
+                && super::value_binding_is_primitive(&field.ty, &DataType::Binary, true)
         }
         (WriterRelationContract::RootResult, 4) => {
             matches!(
-                &field.ty.data_type,
+                &field.ty.data_type(),
                 DataType::List(item)
                     if item.name() == "item"
                         && item.data_type() == &DataType::Int32
                         && !item.is_nullable()
                         && item.metadata().is_empty()
-            ) && field.ty.nullable
+            ) && field.ty.nullable()
         }
         (WriterRelationContract::RootResult, 5) => {
-            field.ty == crate::ValueType::new(DataType::Utf8, true)
+            super::value_binding_is_primitive(&field.ty, &DataType::Utf8, true)
         }
         (WriterRelationContract::RootResult, 6) => {
-            field.ty == crate::ValueType::new(DataType::Binary, true)
+            super::value_binding_is_primitive(&field.ty, &DataType::Binary, true)
         }
         (WriterRelationContract::RootResult, 7) => {
             matches!(
-                &field.ty.data_type,
+                &field.ty.data_type(),
                 DataType::Map(entries, false)
                     if entries.name() == "entries"
                         && !entries.is_nullable()
@@ -2171,7 +2184,8 @@ pub(crate) fn writer_relation_field_matches(
                                 && fields[1].data_type() == &DataType::Utf8
                                 && !fields[1].is_nullable()
                                 && fields[1].metadata().is_empty())
-            ) && field.ty.nullable
+            ) && field.ty.nullable()
+                && super::value_has_plain_string_map_semantics(&field.ty)
         }
         _ => false,
     }
@@ -2225,7 +2239,7 @@ pub(crate) fn validate_writer_aggregates(
         // nothing in it. What the aggregate is, is its type; whether a given
         // row may be written is the target's own answer.
         if let (Some(expected), Some(actual)) = (expected_input, fragment.values().get(&call.input))
-            && !expected.same_value_domain(&actual.ty)
+            && !super::value_bindings_match_ignoring_root_nullability(&expected, &actual.ty)
         {
             errors.push(ValidationError::new(
                 path,
@@ -2250,8 +2264,10 @@ pub(crate) fn validate_writer_aggregates(
         // non-null while the phase can produce a null would be read as a value
         // that was never written.
         if let Some(actual) = fragment.values().get(&call.output)
-            && (!actual.ty.same_value_domain(expected_output)
-                || (expected_output.nullable && !actual.ty.nullable))
+            && (!super::value_bindings_match_ignoring_root_nullability(
+                &actual.ty,
+                &expected_output,
+            ) || (expected_output.nullable() && !actual.ty.nullable()))
         {
             errors.push(ValidationError::new(
                 path,
@@ -2387,13 +2403,13 @@ pub(crate) fn validate_unpivot(
             fragment.values().get(&mapping.input),
             fragment.values().get(&spec.value_output),
         ) {
-            if !input.ty.same_value_domain(&output.ty) {
+            if !super::value_bindings_match_ignoring_root_nullability(&input.ty, &output.ty) {
                 errors.push(ValidationError::new(
                     path,
                     "unpivot mapping input type differs from its value output",
                 ));
             }
-            value_nullable |= input.ty.nullable;
+            value_nullable |= input.ty.nullable();
         }
         if mapping.constants.len() != spec.literal_outputs.len() {
             errors.push(ValidationError::new(
@@ -2417,7 +2433,7 @@ pub(crate) fn validate_unpivot(
     if fragment
         .values()
         .get(&spec.value_output)
-        .is_some_and(|output| output.ty.nullable != value_nullable)
+        .is_some_and(|output| output.ty.nullable() != value_nullable)
     {
         errors.push(ValidationError::new(
             path,
@@ -2428,7 +2444,7 @@ pub(crate) fn validate_unpivot(
         if fragment
             .values()
             .get(output)
-            .is_some_and(|output| output.ty.nullable != nullable)
+            .is_some_and(|output| output.ty.nullable() != nullable)
         {
             errors.push(ValidationError::new(
                 path,
@@ -2535,7 +2551,8 @@ pub(crate) fn validate_writer_grouped_unpivot(
         ("grouping output", spec.grouping_output),
     ] {
         match fragment.values().get(&value) {
-            Some(definition) if definition.ty == crate::ValueType::new(DataType::Int32, false) => {}
+            Some(definition)
+                if super::value_binding_is_primitive(&definition.ty, &DataType::Int32, false) => {}
             Some(_) => errors.push(ValidationError::new(
                 path,
                 format!("writer grouped Unpivot {label} must be non-null Int32"),
@@ -2544,7 +2561,7 @@ pub(crate) fn validate_writer_grouped_unpivot(
         }
     }
     match fragment.values().get(&spec.passthrough_output) {
-        Some(definition) if definition.ty.data_type == DataType::Int32 => {}
+        Some(definition) if *definition.ty.data_type() == DataType::Int32 => {}
         Some(_) => errors.push(ValidationError::new(
             path,
             "writer grouped Unpivot passthrough output must be Int32",
@@ -2659,7 +2676,7 @@ pub(crate) fn validate_writer_grouped_unpivot(
         if let (Some(input), Some(output)) = (
             fragment.values().get(&mapping.input),
             fragment.values().get(&spec.value_output),
-        ) && !input.ty.same_value_domain(&output.ty)
+        ) && !super::value_bindings_match_ignoring_root_nullability(&input.ty, &output.ty)
         {
             errors.push(ValidationError::new(
                 path,
@@ -2795,6 +2812,24 @@ pub(crate) fn unpivot_scalar_literal_bytes(fragment: &Fragment, expression: Expr
     }
 }
 
+pub(crate) fn unpivot_collection_binding_matches(
+    constant: &crate::UnpivotConstant,
+    value: &crate::ValueType,
+) -> bool {
+    use novarocks_type_contract::ValueKind;
+    unpivot_collection_carrier_matches(constant, value.data_type())
+        && match constant {
+            crate::UnpivotConstant::Int32List(_) => {
+                matches!(value.value_type().kind(),ValueKind::List(item)
+            if matches!(item.kind(),ValueKind::Scalar(DataType::Int32)))
+            }
+            crate::UnpivotConstant::Utf8Map(_) => {
+                super::value_has_plain_string_map_semantics(value)
+            }
+            crate::UnpivotConstant::Scalar(_) => false,
+        }
+}
+
 pub(crate) fn unpivot_collection_carrier_matches(
     constant: &crate::UnpivotConstant,
     data_type: &DataType,
@@ -2845,8 +2880,11 @@ pub(crate) fn validate_unpivot_constant(
                 matches!(
                     expression.kind,
                     ExprKind::Literal(_) | ExprKind::Constant(_)
-                ) && expression.ty.same_value_domain(output_type),
-                expression.ty.nullable,
+                ) && super::value_bindings_match_ignoring_root_nullability(
+                    &expression.ty,
+                    &output_type,
+                ),
+                expression.ty.nullable(),
             ),
             None => {
                 errors.push(ValidationError::new(
@@ -2857,7 +2895,7 @@ pub(crate) fn validate_unpivot_constant(
             }
         },
         crate::UnpivotConstant::Int32List(_) | crate::UnpivotConstant::Utf8Map(_) => (
-            unpivot_collection_carrier_matches(constant, &output_type.data_type),
+            unpivot_collection_binding_matches(constant, output_type),
             false,
         ),
     };
@@ -3133,7 +3171,7 @@ pub(crate) fn require_boolean_expression(
     errors: &mut ValidationContext,
 ) {
     match fragment.expressions().get(expression) {
-        Some(expression) if expression.ty.data_type == DataType::Boolean => {}
+        Some(expression) if *expression.ty.data_type() == DataType::Boolean => {}
         Some(_) => errors.push(ValidationError::new(
             path,
             "predicate expression is not Boolean",
@@ -3316,7 +3354,7 @@ fn validate_grouped_topn(
             matches!(expr.kind, ExprKind::Value(source) if source == *output)
                 && comparator.supports_value_type(&expr.ty)
                 && novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
-                    .supports_partition_key(&expr.ty.data_type)
+                    .supports_partition_key(&expr.ty.data_type())
         });
         if !valid || !keys.insert(*output) {
             errors.push(ValidationError::new(

@@ -21,11 +21,9 @@ use arrow::datatypes::{DataType, Field};
 use novarocks_physical_plan::LegacyBindingMetadata;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionArgumentEvaluation, FunctionFailureBehavior,
-    FunctionIntrinsicRowError, FunctionVolatility, MAX_VALUE_TYPE_NODES, PureCompileControl,
-    ValueLogicalType,
+    FunctionIntrinsicRowError, FunctionVolatility, PureCompileControl, ValueLogicalType,
 };
 use std::{
-    alloc::Layout,
     collections::HashMap,
     sync::{Arc, Mutex},
 };
@@ -88,26 +86,31 @@ fn fixture(kind: FunctionKind) -> BoundFunction {
         FunctionId::try_new("test/f").unwrap(),
         FunctionOverloadId::try_new("test/o").unwrap(),
         kind,
-        vec![
-            FunctionArgumentType::Value(FunctionValueType::new(
-                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
-                true,
-            )),
-            FunctionArgumentType::Lambda {
-                parameter_types: vec![
-                    FunctionValueType::new(DataType::Int64, false),
-                    FunctionValueType::new(DataType::Struct(vec![field].into()), true),
-                ]
-                .into_boxed_slice(),
-                result_type: FunctionValueType::try_with_logical_type(
-                    DataType::FixedSizeBinary(16),
-                    false,
-                    ValueLogicalType::LargeInt,
-                )
-                .unwrap(),
-            },
-        ]
-        .into_boxed_slice(),
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+            vec![
+                FunctionArgumentType::Value(FunctionValueType::new(
+                    DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                    true,
+                )),
+                FunctionArgumentType::Lambda {
+                    parameter_types:
+                        novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                            vec![
+                                FunctionValueType::new(DataType::Int64, false),
+                                FunctionValueType::new(DataType::Struct(vec![field].into()), true),
+                            ]
+                            .into_boxed_slice(),
+                        ),
+                    result_type: FunctionValueType::try_with_logical_type(
+                        DataType::FixedSizeBinary(16),
+                        false,
+                        ValueLogicalType::LargeInt,
+                    )
+                    .unwrap(),
+                },
+            ]
+            .into_boxed_slice(),
+        ),
         FunctionValueType::new(DataType::Int64, true),
     )
 }
@@ -148,18 +151,12 @@ fn exact_signature_copy_preserves_all_scalar_result_kinds_and_full_types() {
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
         let mut model = MaterializationModel::for_composition(1, 0, 4096, 4096);
         preflight_scalar_signature_copy(&source, &mut model, limits(), &mut work).unwrap();
-        // Two identity Boxes, args Vec+Box, Lambda params Vec+Box, two
-        // Dictionary Boxes. Five owned roots; no mirrored datatype walker.
-        let bytes = 12
-            + 2 * Layout::array::<FunctionArgumentType>(2).unwrap().size()
-            + 2 * Layout::array::<FunctionValueType>(2).unwrap().size()
-            + 2 * Layout::new::<DataType>().size();
-        let retained = 12
-            + Layout::array::<FunctionArgumentType>(2).unwrap().size()
-            + Layout::array::<FunctionValueType>(2).unwrap().size()
-            + 2 * Layout::new::<DataType>().size();
+        // Cloning immutable identities and guarded argument backing retains
+        // their original holds; it allocates no new Box or holder.
+        let bytes = 0;
+        let retained = 0;
         assert_eq!(model.facts.type_reference_count, 5);
-        assert_eq!(model.facts.allocation_requests_upper_bound, 8);
+        assert_eq!(model.facts.allocation_requests_upper_bound, 0);
         assert_eq!(model.facts.request_bytes_upper_bound, bytes);
         assert_eq!(model.retained, retained);
         assert_eq!(
@@ -168,7 +165,7 @@ fn exact_signature_copy_preserves_all_scalar_result_kinds_and_full_types() {
         );
         assert_eq!(
             model.facts.cumulative_work_upper_bound,
-            128 + 32 * 5 + 5 * (16 + 8 * MAX_VALUE_TYPE_NODES) + 4 * bytes + 8
+            128 + 32 * 5 + 5 * 2
         );
         let copied = copy_scalar_signature_observed(&source, &mut work).unwrap();
         finish(work, Ok::<_, BindingCodecError>(())).unwrap();
@@ -183,27 +180,13 @@ fn exact_signature_copy_preserves_all_scalar_result_kinds_and_full_types() {
         let FunctionArgumentType::Value(dictionary) = &copied.argument_types[0] else {
             panic!("Value")
         };
-        assert!(dictionary.nullable);
-        assert_eq!(dictionary.logical_type, ValueLogicalType::Physical);
+        assert!(dictionary.nullable());
+        assert_eq!(dictionary.logical_type(), ValueLogicalType::Physical);
         let FunctionArgumentType::Value(original_dictionary) = &source.argument_types[0] else {
             panic!("source Value")
         };
-        let DataType::Dictionary(original_key, original_value) = &original_dictionary.data_type
-        else {
-            panic!("source Dictionary")
-        };
-        let DataType::Dictionary(copied_key, copied_value) = &dictionary.data_type else {
-            panic!("copied Dictionary")
-        };
-        assert!(!std::ptr::eq(original_key.as_ref(), copied_key.as_ref()));
-        assert!(!std::ptr::eq(
-            original_value.as_ref(),
-            copied_value.as_ref()
-        ));
-        assert_eq!(
-            dictionary.data_type,
-            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
-        );
+        assert_eq!(dictionary, original_dictionary);
+        assert_eq!(dictionary.data_type(), &DataType::Utf8);
         let FunctionArgumentType::Lambda {
             parameter_types,
             result_type,
@@ -216,18 +199,15 @@ fn exact_signature_copy_preserves_all_scalar_result_kinds_and_full_types() {
             parameter_types[0],
             FunctionValueType::new(DataType::Int64, false)
         );
-        assert!(parameter_types[1].nullable);
-        assert_eq!(result_type.logical_type, ValueLogicalType::LargeInt);
-        assert_eq!(result_type.data_type, DataType::FixedSizeBinary(16));
-        assert!(!result_type.nullable);
-        let DataType::Struct(fields) = &parameter_types[1].data_type else {
+        assert!(parameter_types[1].nullable());
+        assert_eq!(result_type.logical_type(), ValueLogicalType::LargeInt);
+        assert_eq!(result_type.data_type(), &DataType::FixedSizeBinary(16));
+        assert!(!result_type.nullable());
+        let DataType::Struct(fields) = &parameter_types[1].data_type() else {
             panic!("Struct")
         };
         assert_eq!(fields[0].name(), "original");
-        assert_eq!(
-            fields[0].metadata().get("unrecognized").unwrap(),
-            "preserved"
-        );
+        assert!(fields[0].metadata().is_empty());
         let FunctionArgumentType::Lambda {
             parameter_types: original,
             ..
@@ -235,15 +215,15 @@ fn exact_signature_copy_preserves_all_scalar_result_kinds_and_full_types() {
         else {
             panic!("source Lambda")
         };
-        let DataType::Struct(original_fields) = &original[1].data_type else {
+        let DataType::Struct(original_fields) = &original[1].data_type() else {
             panic!("source Struct")
         };
         assert!(Arc::ptr_eq(&fields[0], &original_fields[0]));
-        assert!(!std::ptr::eq(
+        assert!(std::ptr::eq(
             source.argument_types.as_ptr(),
             copied.argument_types.as_ptr()
         ));
-        assert!(!std::ptr::eq(original.as_ptr(), parameter_types.as_ptr()));
+        assert!(std::ptr::eq(original.as_ptr(), parameter_types.as_ptr()));
     }
 }
 
@@ -259,7 +239,7 @@ fn repeated_signature_occurrences_share_one_cumulative_model_and_numeric_first_c
     preflight_scalar_signature_copy(&source, &mut model, limits(), &mut work).unwrap();
     assert_eq!(model.facts.definition_count, 2);
     assert_eq!(model.facts.type_reference_count, 10);
-    assert_eq!(model.facts.allocation_requests_upper_bound, 16);
+    assert_eq!(model.facts.allocation_requests_upper_bound, 0);
     assert_eq!(model.facts.request_bytes_upper_bound, 2 * once_bytes);
     assert_eq!(model.retained, 2 * once_retained);
     assert_eq!(
@@ -278,7 +258,11 @@ fn repeated_signature_occurrences_share_one_cumulative_model_and_numeric_first_c
         max_work: facts.cumulative_work_upper_bound,
     };
     model.check(tight).unwrap();
-    for axis in 0..6 {
+    // Zero allocation axes accept zero; only nonzero work/source/count axes
+    // have a meaningful one-under boundary for this cheap-clone operation.
+    assert_eq!(tight.max_allocation_requests, 0);
+    assert_eq!(tight.max_request_bytes, 0);
+    for axis in [0, 1, 4, 5] {
         let mut under = tight;
         match axis {
             0 => under.max_definitions -= 1,
@@ -355,13 +339,17 @@ fn wide_lambda_reference_gate_precedes_clone_and_keeps_ordered_full_parameters()
         FunctionId::try_new("test/wide").unwrap(),
         FunctionOverloadId::try_new("test/wide/o").unwrap(),
         FunctionKind::Scalar,
-        vec![FunctionArgumentType::Lambda {
-            parameter_types: (0..320)
-                .map(|ordinal| FunctionValueType::new(DataType::Int64, ordinal % 2 == 1))
-                .collect(),
-            result_type: FunctionValueType::new(DataType::Utf8, true),
-        }]
-        .into_boxed_slice(),
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+            vec![FunctionArgumentType::Lambda {
+                parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                    (0..320)
+                        .map(|ordinal| FunctionValueType::new(DataType::Int64, ordinal % 2 == 1))
+                        .collect::<Box<[_]>>(),
+                ),
+                result_type: FunctionValueType::new(DataType::Utf8, true),
+            }]
+            .into_boxed_slice(),
+        ),
         FunctionValueType::new(DataType::Utf8, false),
     );
     let mut under = limits();
@@ -417,19 +405,21 @@ fn table_fixture() -> BoundTableFunction {
         scalar.function_id,
         scalar.overload,
         scalar.argument_types,
-        vec![
-            FunctionValueType::new(
-                DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
-                true,
-            ),
-            FunctionValueType::try_with_logical_type(
-                DataType::FixedSizeBinary(16),
-                false,
-                ValueLogicalType::LargeInt,
-            )
-            .unwrap(),
-        ]
-        .into_boxed_slice(),
+        novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+            vec![
+                FunctionValueType::new(
+                    DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+                    true,
+                ),
+                FunctionValueType::try_with_logical_type(
+                    DataType::FixedSizeBinary(16),
+                    false,
+                    ValueLogicalType::LargeInt,
+                )
+                .unwrap(),
+            ]
+            .into_boxed_slice(),
+        ),
     )
 }
 fn run_table(
@@ -452,16 +442,10 @@ fn table_signature_copy_preserves_relation_roots_with_independent_layout_invoice
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let mut model = MaterializationModel::for_composition(1, 0, 4096, 4096);
     preflight_table_signature_copy(&source, &mut model, limits(), &mut work).unwrap();
-    let bytes = 12
-        + 2 * Layout::array::<FunctionArgumentType>(2).unwrap().size()
-        + 4 * Layout::array::<FunctionValueType>(2).unwrap().size()
-        + 4 * Layout::new::<DataType>().size();
-    let retained = 12
-        + Layout::array::<FunctionArgumentType>(2).unwrap().size()
-        + 2 * Layout::array::<FunctionValueType>(2).unwrap().size()
-        + 4 * Layout::new::<DataType>().size();
+    let bytes = 0;
+    let retained = 0;
     assert_eq!(model.facts.type_reference_count, 6);
-    assert_eq!(model.facts.allocation_requests_upper_bound, 12);
+    assert_eq!(model.facts.allocation_requests_upper_bound, 0);
     assert_eq!(model.facts.request_bytes_upper_bound, bytes);
     assert_eq!(model.retained, retained);
     assert_eq!(
@@ -470,7 +454,7 @@ fn table_signature_copy_preserves_relation_roots_with_independent_layout_invoice
     );
     assert_eq!(
         model.facts.cumulative_work_upper_bound,
-        128 + 32 * 7 + 6 * (16 + 8 * MAX_VALUE_TYPE_NODES) + 4 * bytes + 12
+        128 + 32 * 7 + 6 * 2
     );
     let copied = copy_table_signature_observed(&source, &mut work).unwrap();
     finish(work, Ok::<_, BindingCodecError>(())).unwrap();
@@ -486,27 +470,21 @@ fn table_signature_copy_preserves_relation_roots_with_independent_layout_invoice
         )
     );
     assert_eq!(
-        copied.result_types[1].logical_type,
+        copied.result_types[1].logical_type(),
         ValueLogicalType::LargeInt
     );
     assert_eq!(
-        copied.result_types[1].data_type,
-        DataType::FixedSizeBinary(16)
+        copied.result_types[1].data_type(),
+        &DataType::FixedSizeBinary(16)
     );
-    assert!(!copied.result_types[1].nullable);
+    assert!(!copied.result_types[1].nullable());
     assert_eq!(copied.argument_types, source.argument_types);
-    assert!(!std::ptr::eq(
+    assert!(std::ptr::eq(
         copied.result_types.as_ptr(),
         source.result_types.as_ptr()
     ));
-    let DataType::Dictionary(source_key, source_value) = &source.result_types[0].data_type else {
-        panic!("source dictionary")
-    };
-    let DataType::Dictionary(copied_key, copied_value) = &copied.result_types[0].data_type else {
-        panic!("copied dictionary")
-    };
-    assert!(!std::ptr::eq(source_key.as_ref(), copied_key.as_ref()));
-    assert!(!std::ptr::eq(source_value.as_ref(), copied_value.as_ref()));
+    assert_eq!(source.result_types[0].data_type(), &DataType::Utf8);
+    assert_eq!(copied.result_types[0], source.result_types[0]);
 }
 
 #[test]
@@ -515,17 +493,17 @@ fn table_signature_copy_empty_roots_and_all_actual_refusal_prefixes() {
     let empty = BoundTableFunction::from_exact_signature(
         FunctionId::try_new("test/f").unwrap(),
         FunctionOverloadId::try_new("test/o").unwrap(),
-        Box::new([]),
-        Box::new([]),
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::new([])),
+        novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(Box::new([])),
     );
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let mut model = MaterializationModel::for_composition(1, 0, 4096, 4096);
     preflight_table_signature_copy(&empty, &mut model, limits(), &mut work).unwrap();
     assert_eq!(model.facts.type_reference_count, 0);
-    assert_eq!(model.facts.allocation_requests_upper_bound, 2);
-    assert_eq!(model.facts.request_bytes_upper_bound, 12);
-    assert_eq!(model.retained, 12);
+    assert_eq!(model.facts.allocation_requests_upper_bound, 0);
+    assert_eq!(model.facts.request_bytes_upper_bound, 0);
+    assert_eq!(model.retained, 0);
     finish(work, Ok::<_, BindingCodecError>(())).unwrap();
     for source in [&full, &empty] {
         let control = Control::default();
@@ -568,25 +546,19 @@ fn table_signature_copy_empty_roots_and_all_actual_refusal_prefixes() {
 }
 
 #[test]
-fn staged_scalar_counts_admit_all_roots_before_owned_dictionary_walk() {
+fn staged_scalar_counts_admit_all_roots_before_shared_type_clones() {
     let source = fixture(FunctionKind::Aggregate);
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let mut model = MaterializationModel::for_composition(1, 0, 4096, 4096);
     preflight_scalar_signature_copy_counts(&source, &mut model, limits(), &mut work).unwrap();
-    let prefix_bytes = 12
-        + 2 * Layout::array::<FunctionArgumentType>(2).unwrap().size()
-        + 2 * Layout::array::<FunctionValueType>(2).unwrap().size();
     assert_eq!(model.facts.type_reference_count, 5);
-    assert_eq!(model.facts.allocation_requests_upper_bound, 6);
-    assert_eq!(model.facts.request_bytes_upper_bound, prefix_bytes);
+    assert_eq!(model.facts.allocation_requests_upper_bound, 0);
+    assert_eq!(model.facts.request_bytes_upper_bound, 0);
     assert_eq!(model.items, 4);
     preflight_scalar_signature_copy_types(&source, &mut model, limits(), &mut work).unwrap();
-    assert_eq!(model.facts.allocation_requests_upper_bound, 8);
-    assert_eq!(
-        model.facts.request_bytes_upper_bound,
-        prefix_bytes + 2 * Layout::new::<DataType>().size()
-    );
+    assert_eq!(model.facts.allocation_requests_upper_bound, 0);
+    assert_eq!(model.facts.request_bytes_upper_bound, 0);
     work.finish().unwrap();
     let full = Control::default();
     let mut work = CompileCheckpoints::try_new(&full, CompilePhase::Decode).unwrap();
@@ -650,7 +622,7 @@ fn table_signature_parent_port_preserves_full_relation_and_independent_layouts()
         )
         .unwrap();
         assert_eq!(model.facts.type_reference_count, 6);
-        assert_eq!(model.facts.allocation_requests_upper_bound, 8);
+        assert_eq!(model.facts.allocation_requests_upper_bound, 0);
         preflight_table_signature_copy_types_in(
             &source,
             &mut model,
@@ -659,16 +631,13 @@ fn table_signature_parent_port_preserves_full_relation_and_independent_layouts()
             &mut work,
         )
         .unwrap();
-        let request_bytes = 12
-            + 2 * Layout::array::<FunctionArgumentType>(2).unwrap().size()
-            + 4 * Layout::array::<FunctionValueType>(2).unwrap().size()
-            + 4 * Layout::new::<DataType>().size();
-        assert_eq!(model.facts.allocation_requests_upper_bound, 12);
+        let request_bytes = 0;
+        assert_eq!(model.facts.allocation_requests_upper_bound, 0);
         assert_eq!(model.facts.request_bytes_upper_bound, request_bytes);
         let final_facts = model
             .node_facts(2 * model.facts.cumulative_work_upper_bound, &mut work)
             .unwrap();
-        assert_eq!(final_facts.allocation_requests_upper_bound, 13);
+        assert_eq!(final_facts.allocation_requests_upper_bound, 1);
         assert_eq!(
             final_facts.allocation_request_bytes_upper_bound,
             9 + request_bytes
@@ -687,88 +656,39 @@ fn table_signature_parent_port_preserves_full_relation_and_independent_layouts()
 }
 
 #[test]
-fn table_signature_parent_dictionary_known_boxes_precede_pending255_callback() {
-    use crate::physical_node_v2::{Model as NodeModel, NodeProjectionFacts, NodeProjectionLimits};
-    use crate::physical_properties_v2::PhysicalPropertyProjectionLimits;
+fn table_signature_shared_clone_parent_refusal_precedes_pending255_callback() {
     let source = table_fixture();
-    let node_limits = NodeProjectionLimits {
-        max_input_nodes: 8,
-        max_value_references: 4096,
-        max_list_items: 4096,
-        max_allocation_requests: 8192,
-        max_allocation_request_bytes: 4 << 20,
-        max_coexisting_source_and_request_bytes: 8 << 20,
-        max_work: 1 << 30,
-        properties: PhysicalPropertyProjectionLimits {
-            max_value_references: 4096,
-            max_allocation_requests: 8192,
-            max_allocation_request_bytes: 4 << 20,
-            max_coexisting_source_and_request_bytes: 8 << 20,
-            max_work: 1 << 30,
-        },
-    };
-    // Eight requests are the argument/result Vec-to-Box pairs, two identity
-    // strings and the actual Lambda parameter pair. The first Dictionary adds
-    // two DataType boxes through the sole clone preflight, before its flush.
-    let run = |control: &Control, reject: bool| -> Result<usize, BindingCodecError> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
-        let mut marker = None;
-        let mut parent = |facts: &NodeProjectionFacts| {
-            if facts.allocation_requests_upper_bound > 8 {
-                marker.get_or_insert_with(|| control.trace().len());
-                if reject {
-                    return Err(CompileControlError::ResourceExhausted);
-                }
-            }
-            Ok(())
-        };
-        {
-            let mut model = MaterializationModel::for_composition(1, 0, 4096, 4096);
-            model.compose_in_node_in(
-                NodeModel::default(),
-                1,
-                node_limits,
-                limits(),
-                &mut parent,
-            )?;
-            preflight_table_signature_copy_counts_in(
-                &source,
-                &mut model,
-                limits(),
-                &mut |_| Ok(()),
-                &mut work,
-            )?;
-            work.flush()?;
-            for _ in 0..255 {
-                work.step()?;
-            }
-            let result = preflight_table_signature_copy_types_in(
-                &source,
-                &mut model,
-                limits(),
-                &mut |_| Ok(()),
-                &mut work,
-            );
-            if matches!(result, Err(BindingCodecError::Control(_))) {
-                return result.map(|_| 0);
-            }
-            result?;
-            work.finish()?;
-        }
-        Ok(marker.unwrap())
-    };
-    let success = Control::default();
-    let marker = run(&success, false).unwrap();
-    let trace = success.trace();
-    assert_eq!(trace[marker], 255);
     for cause in CAUSES {
-        let control = Control::rejecting(marker, cause);
+        let control = Control::rejecting(1, cause);
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let mut model = MaterializationModel::for_composition(1, 0, 4096, 4096);
+        // Count construction is already admitted; the clone lends actual
+        // immutable backing to the same parent before any completed work.
+        let setup = Control::default();
+        let mut setup_work = CompileCheckpoints::try_new(&setup, CompilePhase::Decode).unwrap();
+        preflight_table_signature_copy_counts(&source, &mut model, limits(), &mut setup_work)
+            .unwrap();
+        setup_work.finish().unwrap();
+        for _ in 0..255 {
+            work.step().unwrap();
+        }
+        let result = preflight_table_signature_copy_types_in(
+            &source,
+            &mut model,
+            limits(),
+            &mut |facts| {
+                assert_eq!(facts.allocation_requests_upper_bound, 0);
+                assert_eq!(facts.request_bytes_upper_bound, 0);
+                Err(CompileControlError::ResourceExhausted)
+            },
+            &mut work,
+        );
         assert!(matches!(
-            run(&control, true),
+            result,
             Err(BindingCodecError::Control(
                 CompileControlError::ResourceExhausted
             ))
         ));
-        assert_eq!(control.trace(), trace[..marker]);
+        assert_eq!(control.trace(), [0]);
     }
 }

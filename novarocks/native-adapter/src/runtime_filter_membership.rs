@@ -45,6 +45,17 @@ pub fn decode_membership_contract(
     context_data_type: &DataType,
     wire: &plan::RuntimeFilterMembershipContract,
 ) -> Result<RuntimeFilterMembershipSchema, MembershipContractDecodeError> {
+    let null_semantics = decode_membership_null_semantics(wire)?;
+    RuntimeFilterMembershipSchema::new(context_data_type, null_semantics).map_err(|error| {
+        MembershipContractDecodeError::InvalidExecutionSchema {
+            detail: error.to_string(),
+        }
+    })
+}
+
+pub(crate) fn decode_membership_null_semantics(
+    wire: &plan::RuntimeFilterMembershipContract,
+) -> Result<RuntimeFilterNullSemantics, MembershipContractDecodeError> {
     let null_semantics =
         match plan::RuntimeFilterMembershipNullSemantics::try_from(wire.null_semantics) {
             Ok(plan::RuntimeFilterMembershipNullSemantics::NeverMatches) => {
@@ -62,11 +73,7 @@ pub fn decode_membership_contract(
                 });
             }
         };
-    RuntimeFilterMembershipSchema::new(context_data_type, null_semantics).map_err(|error| {
-        MembershipContractDecodeError::InvalidExecutionSchema {
-            detail: error.to_string(),
-        }
-    })
+    Ok(null_semantics)
 }
 
 #[cfg(test)]

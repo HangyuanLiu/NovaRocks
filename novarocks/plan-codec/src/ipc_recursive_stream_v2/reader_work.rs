@@ -61,13 +61,13 @@ pub(super) fn metadata_comparison_work(
     add(mul(source_retained_bytes, weight)?, candidates)
 }
 
-fn compare_names(
+fn compare_names<W: ResourceWork>(
     left: &[u8],
     right: &[u8],
     model_work: &mut usize,
     original: usize,
-    work: &mut impl ResourceWork,
-) -> Result<Ordering, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<Ordering, W::Error> {
     for (left, right) in left.chunks(1024).zip(right.chunks(1024)) {
         let ordering = left.cmp(right);
         *model_work = work.numeric(add(
@@ -87,14 +87,14 @@ fn compare_names(
     Ok(ordering)
 }
 
-fn sift_down(
+fn sift_down<W: ResourceWork>(
     indices: &mut [usize],
     mut root: usize,
     nodes: &[RecursiveNodeGeometry<'_>],
     model_work: &mut usize,
     original: usize,
-    work: &mut impl ResourceWork,
-) -> Result<(), FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<(), W::Error> {
     loop {
         let left = work.numeric(add(work.numeric(mul(2, root))?, 1))?;
         *model_work = work.numeric(add(*model_work, 1))?;
@@ -134,13 +134,13 @@ fn sift_down(
     }
 }
 
-fn sort_indices(
+fn sort_indices<W: ResourceWork>(
     indices: &mut [usize],
     nodes: &[RecursiveNodeGeometry<'_>],
     model_work: &mut usize,
     original: usize,
-    work: &mut impl ResourceWork,
-) -> Result<(), FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<(), W::Error> {
     // In-place heapsort is O(N log N) and its comparator remains fallible.
     // A refusing comparison immediately returns the original error; there is
     // no standard-sort comparator fallback or retry with a fabricated order.
@@ -174,11 +174,11 @@ pub(super) fn native_metadata_frequency(
     )
 }
 
-pub(super) fn source_metadata_work(
+pub(super) fn source_metadata_work<W: ResourceWork>(
     nodes: &[RecursiveNodeGeometry<'_>],
     source_retained_bytes: usize,
-    work: &mut impl ResourceWork,
-) -> Result<SourceMetadataWork, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<SourceMetadataWork, W::Error> {
     // The invoice includes both original Field and supplied FVT backing,
     // including strings and every HashMap bucket/control byte (also deleted
     // buckets). Source walks and nominal-key probes keep their original term.
@@ -201,9 +201,7 @@ pub(super) fn source_metadata_work(
     // or a grant. Initializing the fixed array is an opaque bounded operation
     // bracketed on the same meter, with all initialized bytes in model work.
     if nodes.len() > MAX_VALUE_TYPE_NODES {
-        return Err(invalid(
-            "recursive reader geometry exceeds admitted type nodes",
-        ));
+        return Err(invalid("recursive reader geometry exceeds admitted type nodes").into());
     }
     let mut model_work = 1;
     let mut candidates = 0;
@@ -330,15 +328,15 @@ fn extent(n: u64) -> Result<usize, FlatPoolResourceError> {
     usize::try_from(n).map_err(|_| invalid("recursive reader work extent"))
 }
 
-pub(super) fn preflight(
+pub(super) fn preflight<W: ResourceWork>(
     input: &ReaderInput<'_, '_>,
     payload: &PayloadRequests,
     pool: &ConstantResourceFacts,
     structures: &ReaderAllocationRequests,
     diagnostics: &ReaderDiagnosticRequests,
     source: &SourceMetadataWork,
-    work: &mut impl ResourceWork,
-) -> Result<usize, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<usize, W::Error> {
     let source_retained_bytes = source.source_retained_bytes;
     // The shared recursive envelope covers full descendant type/NULL/value
     // validation, including unused storage, whole UTF8 fallback and repeated

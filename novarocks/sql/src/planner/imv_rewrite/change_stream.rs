@@ -619,7 +619,10 @@ mod tests {
                 aggregates: vec![AggregateCall {
                     name: "sum_state_signed".to_string(),
                     distinct: false,
-                    result_type: DataType::Binary,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Binary,
+                        true,
+                    ),
                     output_column_id: ColumnId::new_for_test(20),
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![TypedExpr {

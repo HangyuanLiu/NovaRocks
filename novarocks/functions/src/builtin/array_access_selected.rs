@@ -45,27 +45,33 @@ pub(super) fn validate_profile(
         ));
     };
     observe()?;
-    if list.logical_type != ValueLogicalType::Physical
-        || index.logical_type != ValueLogicalType::Physical
-        || !matches!(index.data_type, DataType::Int32 | DataType::Int64)
+    if list.logical_type() != ValueLogicalType::Physical
+        || index.logical_type() != ValueLogicalType::Physical
+        || !matches!(index.data_type(), DataType::Int32 | DataType::Int64)
     {
         return Err(invalid(
             "array element access requires a Physical List and the selected Int32/Int64 index profile",
         ));
     }
-    let DataType::List(field) = &list.data_type else {
+    let DataType::List(field) = list.data_type() else {
         return Err(invalid(
             "array element access requires its frozen List input",
         ));
     };
-    let item = FunctionValueType::try_from_field(field)
-        .map_err(|_| invalid("array element access has an invalid frozen child identity"))?;
+    let item = list
+        .value_type()
+        .child_type_at(0)
+        .ok_or_else(|| invalid("array element access has an invalid frozen child identity"))?;
     let target = contract.result_type();
-    if !target.nullable
-        || target.logical_type != item.logical_type
+    if !target.nullable()
+        || !FunctionValueType::borrowed_value_domains_equal_observed(
+            target.value_type(),
+            item,
+            &mut observe,
+        )?
         || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-            &target.data_type,
-            &item.data_type,
+            target.data_type(),
+            field.data_type(),
             &mut observe,
         )?
     {
@@ -73,7 +79,7 @@ pub(super) fn validate_profile(
             "array element access result differs from its real item field",
         ));
     }
-    nullable_take_type(&item.data_type, &mut observe)
+    nullable_take_type(field.data_type(), &mut observe)
 }
 pub(super) fn evaluate<'a>(
     input: ScalarCallInput<'_, 'a>,
@@ -119,7 +125,7 @@ pub(super) fn evaluate<'a>(
                     check: None,
                 })
             },
-            Some(&target.data_type),
+            Some(target.data_type()),
             |values, indices| {
                 let mut exact = reserve::<Option<u64>>(indices.len(), &work)?;
                 for index in indices {
@@ -141,7 +147,7 @@ pub(super) fn evaluate<'a>(
             AccessFailure::Control(cause) => cause,
             AccessFailure::Data(message) => internal(&message),
         })?;
-        SelectedValues::try_new(selection, &target.data_type, values, Box::default())
+        SelectedValues::try_new(selection, target.data_type(), values, Box::default())
             .map_err(|_| internal("array element compact output violates its frozen contract"))
     })();
     work.into_inner().finish_result(result)

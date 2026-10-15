@@ -106,7 +106,7 @@ fn null_or_empty_owner_stable_exact_profiles_and_called_on_null_effects() {
     let mut types = vec![
         FunctionValueType::new(DataType::Null, true),
         FunctionValueType::new(DataType::Utf8, false),
-        FunctionValueType::new(
+        FunctionValueType::from_legacy_declared_projection(
             DataType::List(Arc::new(Field::new(
                 "payload",
                 DataType::Struct(vec![Arc::new(Field::new("v", DataType::Int64, true))].into()),
@@ -126,11 +126,11 @@ fn null_or_empty_owner_stable_exact_profiles_and_called_on_null_effects() {
             &[crate::FunctionArgumentType::Value(ty)]
         );
         assert_eq!(
-            prepared.contract().result_type().data_type,
+            prepared.contract().result_type().data_type().clone(),
             DataType::Boolean
         );
         assert_eq!(
-            prepared.contract().result_type().logical_type,
+            prepared.contract().result_type().logical_type(),
             ValueLogicalType::Physical
         );
         assert_eq!(
@@ -157,7 +157,13 @@ fn null_or_empty_owner_does_not_infer_unsupported_whole_array_null_fact() {
         DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, true))),
         DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Utf8, true)), 2),
     ] {
-        assert!(prepared_for_test("null_or_empty", &[FunctionValueType::new(ty, true)]).is_err());
+        assert!(
+            prepared_for_test(
+                "null_or_empty",
+                &[FunctionValueType::from_legacy_declared_projection(ty, true)]
+            )
+            .is_err()
+        );
     }
     assert!(
         prepared_for_test(

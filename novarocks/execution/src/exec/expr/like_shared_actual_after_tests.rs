@@ -146,9 +146,9 @@ fn like_actual_source_original_ordered_definitions_exact_recipe_and_negation() {
                 use_id: snapshot.bindings()[&site],
             })
             .unwrap();
-        assert_eq!(recipe.text_type().data_type, DataType::Utf8);
-        assert_eq!(recipe.pattern_type().data_type, DataType::Utf8);
-        assert!(recipe.result_type().nullable);
+        assert_eq!(recipe.text_type().data_type().clone(), DataType::Utf8);
+        assert_eq!(recipe.pattern_type().data_type().clone(), DataType::Utf8);
+        assert!(recipe.result_type().nullable());
         assert_eq!(recipe.negated(), negated);
     }
 }

@@ -295,7 +295,10 @@ fn join_output_columns(
 
 fn nullable_output_columns(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
     for column in &mut columns {
-        column.value_type.nullable = true;
+        column.value_type = column
+            .value_type
+            .with_nullable(true)
+            .expect("validated root NULL contract");
     }
     columns
 }
@@ -360,8 +363,8 @@ fn project_output_columns(
 }
 
 fn same_value_metadata(left: &OutputColumn, right: &OutputColumn) -> bool {
-    left.value_type.data_type == right.value_type.data_type
-        && left.value_type.nullable == right.value_type.nullable
+    left.value_type.data_type() == right.value_type.data_type()
+        && left.value_type.nullable() == right.value_type.nullable()
         && left.is_internal == right.is_internal
 }
 
@@ -591,8 +594,11 @@ mod tests {
             for (output, expected) in outputs.iter().zip(&columns) {
                 assert_eq!(output.column_id, expected.column_id);
                 assert_eq!(output.name, expected.name);
-                assert_eq!(output.value_type.data_type, expected.value_type.data_type);
-                assert_eq!(output.value_type.nullable, expected.value_type.nullable);
+                assert_eq!(
+                    output.value_type.data_type(),
+                    expected.value_type.data_type()
+                );
+                assert_eq!(output.value_type.nullable(), expected.value_type.nullable());
                 assert_eq!(output.is_internal, expected.is_internal);
             }
         }
@@ -601,8 +607,19 @@ mod tests {
             let mut conflicting = columns.clone();
             match mutation {
                 0 => conflicting[1].is_internal = false,
-                1 => conflicting[1].value_type.nullable = false,
-                _ => conflicting[1].value_type.data_type = DataType::Int64,
+                1 => {
+                    conflicting[1].value_type =
+                        conflicting[1].value_type.with_nullable(false).unwrap()
+                }
+                _ => {
+                    conflicting[1].value_type =
+                        novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                            DataType::Int64,
+                            conflicting[1].value_type.nullable(),
+                            conflicting[1].value_type.logical_type(),
+                        )
+                        .unwrap()
+                }
             }
             assert!(project_output_columns(&project, &scalars, &conflicting, &[]).is_err());
             let mut conflicting_child = child.clone();
@@ -705,8 +722,11 @@ mod tests {
         assert_eq!(plan.output_columns.len(), 1);
         assert_eq!(plan.output_columns[0].column_id, output_id);
         assert_eq!(plan.output_columns[0].name, "__change_op");
-        assert_eq!(plan.output_columns[0].value_type.data_type, DataType::Int8);
-        assert!(!plan.output_columns[0].value_type.nullable);
+        assert_eq!(
+            plan.output_columns[0].value_type.data_type().clone(),
+            DataType::Int8
+        );
+        assert!(!plan.output_columns[0].value_type.nullable());
         assert!(plan.output_columns[0].is_internal);
     }
 
@@ -884,20 +904,20 @@ mod tests {
         let left_outer =
             join_output_columns(JoinKind::LeftOuter, &children).expect("left outer outputs");
         assert_eq!(left_outer.len(), 2);
-        assert!(!left_outer[0].value_type.nullable);
-        assert!(left_outer[1].value_type.nullable);
+        assert!(!left_outer[0].value_type.nullable());
+        assert!(left_outer[1].value_type.nullable());
 
         let right_outer =
             join_output_columns(JoinKind::RightOuter, &children).expect("right outer outputs");
         assert_eq!(right_outer.len(), 2);
-        assert!(right_outer[0].value_type.nullable);
-        assert!(!right_outer[1].value_type.nullable);
+        assert!(right_outer[0].value_type.nullable());
+        assert!(!right_outer[1].value_type.nullable());
 
         let full_outer =
             join_output_columns(JoinKind::FullOuter, &children).expect("full outer outputs");
         assert_eq!(full_outer.len(), 2);
-        assert!(full_outer[0].value_type.nullable);
-        assert!(full_outer[1].value_type.nullable);
+        assert!(full_outer[0].value_type.nullable());
+        assert!(full_outer[1].value_type.nullable());
     }
 
     #[test]
@@ -1383,10 +1403,10 @@ mod tests {
                 crate::optimizer::memo::LogicalProperties::new(vec![right_column.clone()], 0.0),
             );
             let mut output_left = left_column;
-            output_left.value_type.nullable = true;
+            output_left.value_type = output_left.value_type.with_nullable(true).unwrap();
             let mut output_right = right_column;
             if join_type == JoinKind::FullOuter {
-                output_right.value_type.nullable = true;
+                output_right.value_type = output_right.value_type.with_nullable(true).unwrap();
             }
             memo.groups[root].logical_props = Some(crate::optimizer::memo::LogicalProperties::new(
                 vec![output_left, output_right],
@@ -1746,11 +1766,12 @@ mod tests {
         let column = OutputColumn {
             column_id: ColumnId(77),
             name: "json_source".to_string(),
-            value_type: FunctionValueType {
-                data_type: DataType::Utf8,
-                nullable: true,
-                logical_type: ValueLogicalType::Json,
-            },
+            value_type: FunctionValueType::try_from_legacy_declared_projection(
+                DataType::Utf8,
+                true,
+                ValueLogicalType::Json,
+            )
+            .expect("valid temporary legacy value projection"),
             is_internal: false,
         };
         let ordering = OrderingSpec::Required(vec![crate::optimizer::property::SortKey {

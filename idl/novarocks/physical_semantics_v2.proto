@@ -70,6 +70,9 @@ message FrozenCall {
   optional RegexpCountPatternSource regexp_count_pattern_source = 6;
   // Required positive source receipt only for exact TO_BASE64 calls.
   optional ToBase64ByteSource to_base64_byte_source = 7;
+  // Exact original writer Value scope. Required only for WriterPartial/Final;
+  // its root domain is retained, while it is not an expression invocation.
+  EffectContext materialized_writer_input = 8;
 }
 
 // One shared semantic policy for actual function calls and Binary/Cast nodes.

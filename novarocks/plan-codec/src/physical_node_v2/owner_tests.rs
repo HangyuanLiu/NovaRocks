@@ -178,7 +178,7 @@ fn accepted_parent_preserves_plain_completed_trace_and_first_refusal() {
     }
 }
 #[test]
-fn delegated_dictionary_prefix_uses_the_same_containing_parent_before_flush() {
+fn delegated_shared_type_preserves_the_same_containing_parent_before_flush() {
     use crate::physical_binding_v2::{
         BindingCodecError, BindingProjectionLimits, MaterializationModel,
     };
@@ -187,8 +187,10 @@ fn delegated_dictionary_prefix_uses_the_same_containing_parent_before_flush() {
         DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
         false,
     );
-    let requested = 2 * Layout::new::<DataType>().size();
-    assert!(requested > 1);
+    assert_eq!(ty.data_type(), &DataType::Utf8);
+    // Logical FVT cloning is allocation-free. The containing parent's actual
+    // input count remains an admission axis before the next control flush.
+    let requested = 0;
     let binding_limits = BindingProjectionLimits {
         max_definitions: usize::MAX,
         max_type_references: usize::MAX,
@@ -205,10 +207,11 @@ fn delegated_dictionary_prefix_uses_the_same_containing_parent_before_flush() {
             for _ in 0..pending {
                 work.step().unwrap();
             }
+            let armed = std::sync::atomic::AtomicBool::new(false);
             let mut seen = Vec::new();
             let mut parent = |facts: &NodeProjectionFacts| {
                 seen.push(*facts);
-                if facts.allocation_request_bytes_upper_bound > requested - 1 {
+                if armed.load(std::sync::atomic::Ordering::Relaxed) && facts.input_node_count > 0 {
                     Err(CompileControlError::ResourceExhausted)
                 } else {
                     Ok(())
@@ -231,6 +234,7 @@ fn delegated_dictionary_prefix_uses_the_same_containing_parent_before_flush() {
                         binding_limits,
                     )
                     .unwrap();
+                armed.store(true, std::sync::atomic::Ordering::Relaxed);
                 let result = child.count_owned_type_clone_in(
                     &ty,
                     binding_limits,
@@ -246,7 +250,7 @@ fn delegated_dictionary_prefix_uses_the_same_containing_parent_before_flush() {
             }
             let last = seen.last().unwrap();
             assert_eq!(last.input_node_count, 1);
-            assert_eq!(last.allocation_requests_upper_bound, 2);
+            assert_eq!(last.allocation_requests_upper_bound, 0);
             assert_eq!(last.allocation_request_bytes_upper_bound, requested);
             assert_eq!(
                 last.coexisting_source_and_request_bytes_upper_bound,

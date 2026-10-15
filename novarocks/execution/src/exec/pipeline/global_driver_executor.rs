@@ -415,10 +415,24 @@ impl DriverTask {
         }
     }
 
-    pub(crate) fn driver_finished(&self) {
-        if self.completion.driver_finished() {
-            self.fragment_ctx.event_scheduler().shutdown();
+    pub(crate) fn driver_finished(self) {
+        let Self {
+            driver,
+            completion,
+            fragment_ctx,
+            lease,
+            ..
+        } = self;
+        let scheduler = fragment_ctx.event_scheduler();
+        // Stop proves that the driver-owned operators and their retained
+        // resources have exited, so destroy them before publishing that fact.
+        drop(driver);
+        drop(fragment_ctx);
+        if completion.driver_finished() {
+            scheduler.shutdown();
         }
+        // The executor still owns the completion callback until it returns.
+        drop(lease);
     }
 
     pub(crate) fn blocked_observable_snapshot(
@@ -1145,6 +1159,64 @@ mod tests {
         fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn stopped_observer_sees_driver_owned_backing_already_released() {
+        use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
+        struct OwnedBufferOperator {
+            _buffer: Vec<u8>,
+            _responsibility: TrackedBytes,
+        }
+        impl Operator for OwnedBufferOperator {
+            fn name(&self) -> &str {
+                "owned_buffer"
+            }
+        }
+        let tracker = MemTracker::new_root("driver actual stop backing");
+        let responsibility = TrackedBytes::try_new(512, tracker.clone()).unwrap();
+        let operator = OwnedBufferOperator {
+            _buffer: Vec::with_capacity(512),
+            _responsibility: responsibility,
+        };
+        let runtime_state = Arc::new(RuntimeState::default());
+        let fragment_ctx = Arc::new(FragmentContext::new(
+            None,
+            Arc::clone(&runtime_state),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let completion = FragmentCompletion::new(1);
+        let observed_bytes = Arc::new(std::sync::atomic::AtomicI64::new(-1));
+        let observed = Arc::clone(&observed_bytes);
+        let original_tracker = tracker.clone();
+        completion.subscribe_stopped(Box::new(move |_| {
+            observed.store(original_tracker.current(), Ordering::Release);
+        }));
+        let task = DriverTask::new(
+            PipelineDriver::new(
+                1,
+                vec![Box::new(operator)],
+                None,
+                Vec::new(),
+                runtime_state,
+                None,
+            ),
+            Arc::clone(&completion),
+            fragment_ctx,
+            Duration::from_millis(1),
+        );
+        assert_eq!(tracker.current(), 512);
+        task.driver_finished();
+        assert!(completion.stopped_fact().is_some());
+        assert_eq!(
+            observed_bytes.load(Ordering::Acquire),
+            0,
+            "actual-stop callbacks must observe destruction of the driver's real backing"
+        );
+        assert_eq!(tracker.current(), 0);
     }
 
     #[test]

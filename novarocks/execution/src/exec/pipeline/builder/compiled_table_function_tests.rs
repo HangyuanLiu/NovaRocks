@@ -313,7 +313,9 @@ fn add_table_function(
             Out::Key => TableFunctionOutput::PassThrough(key),
             Out::Result(result) => {
                 let mut ty = results[*result as usize].clone();
-                ty.nullable |= spec.left_outer;
+                ty = ty
+                    .with_nullable(ty.nullable() || spec.left_outer)
+                    .expect("valid test root nullability");
                 let value = builder
                     .add_value(
                         ty,
@@ -387,7 +389,9 @@ fn faulty_argument(
         novarocks_type_contract::ArithmeticOperator::Add,
     )
     .unwrap();
-    sum_type.nullable = true;
+    sum_type = sum_type
+        .with_nullable(true)
+        .expect("valid test root nullability");
     let left = builder
         .add_expression(node, operand.clone(), ExprKind::Value(key))
         .unwrap();
@@ -685,6 +689,7 @@ fn freeze(
             )
             .unwrap_or_else(|error| panic!("fixture table call prepares: {error}"));
         frozen.push(FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
@@ -835,7 +840,9 @@ fn try_run_single(program: &Arc<LocalProgram>, batch_size: i32) -> Result<Vec<Ch
         None,
         None,
         None,
-        None,
+        Some(crate::runtime::mem_tracker::MemTracker::new_root(
+            "compiled table function tests",
+        )),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ));
     let output = ResultSinkHandle::new();
@@ -1222,3 +1229,127 @@ fn unnest_at_four_drivers_keeps_every_row_and_each_parent_in_order() {
 
 #[path = "compiled_all_definition_source_tests.rs"]
 mod all_definition_source_tests;
+
+#[test]
+fn compiled_table_schema_prepare_and_output_last_reference_use_real_owner() {
+    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::operators::compiled_table_function::CompiledTableFunctionProcessorFactory;
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::runtime::fragment::ExecutionFailureCause;
+    use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    use arrow::array::builder::{Int64Builder, ListBuilder};
+    use arrow::array::{ArrayRef, Int64Array};
+    let program = single_program(&rows(), &Spec::unnest(false), false).unwrap();
+    let weak = Arc::downgrade(&program);
+    let root = program.graph().root();
+    let factory = CompiledTableFunctionProcessorFactory::try_new(
+        program.clone(),
+        root,
+        Arc::new(RuntimeErrorState::default()),
+    )
+    .unwrap();
+    let mut missing = factory.create(1, 0);
+    assert!(matches!(
+        missing.prepare().unwrap_err().cause(),
+        ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
+    ));
+    drop(missing);
+    let tracker = MemTracker::new_root("table actual schema and output creator");
+    let mut operator = factory.create(1, 0);
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        Arc::new(RuntimeErrorState::default()),
+    ));
+    operator.prepare().unwrap();
+    let ProgramNodeKind::TableFunction { input, .. } = program.graph().nodes()[root.index()].kind()
+    else {
+        panic!("table root");
+    };
+    let layout = program.graph().nodes()[input.index()].output_layout();
+    // Actual input author: one key and one canonical List<Int64> channel.
+    let columns = layout
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| match field.data_type() {
+            DataType::Int64 => Arc::new(Int64Array::from(vec![7])) as ArrayRef,
+            DataType::List(_) => {
+                let mut values = ListBuilder::new(Int64Builder::new());
+                values.values().append_value(10);
+                values.values().append_value(20);
+                values.append(true);
+                Arc::new(values.finish()) as ArrayRef
+            }
+            ty => panic!("unexpected actual UNNEST input {ty:?}"),
+        })
+        .collect();
+    let input = Chunk::try_new_with_chunk_schema(
+        arrow::record_batch::RecordBatch::try_new(layout.schema().clone(), columns).unwrap(),
+        ChunkSchema::from_compiled_layout(layout).unwrap(),
+    )
+    .unwrap();
+    drop(factory);
+    drop(program);
+    assert!(weak.upgrade().is_none());
+    let state = RuntimeState::default();
+    let processor = operator.as_processor_mut().unwrap();
+    processor.push_chunk(&state, input).unwrap();
+    let output = processor.pull_chunk(&state).unwrap().unwrap();
+    assert_eq!(
+        int64_rows(std::slice::from_ref(&output)),
+        vec![vec![Some(7), Some(10)], vec![Some(7), Some(20)]]
+    );
+    let schema = output.chunk_schema_ref();
+    assert!(schema.is_typed());
+    assert!(
+        schema
+            .slots()
+            .iter()
+            .all(|slot| slot.field_ref().metadata().capacity() == 0)
+    );
+    drop(operator);
+    drop(output);
+    assert!(tracker.current() > 0);
+    drop(schema);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn compiled_table_prepare_preserves_real_memory_refusal_before_input() {
+    use crate::exec::operators::compiled_table_function::CompiledTableFunctionProcessorFactory;
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::runtime::fragment::ExecutionFailureCause;
+    use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    let program = single_program(&rows(), &Spec::unnest(false), false).unwrap();
+    let factory = CompiledTableFunctionProcessorFactory::try_new(
+        program.clone(),
+        program.graph().root(),
+        Arc::new(RuntimeErrorState::default()),
+    )
+    .unwrap();
+    let tracker = MemTracker::new_root("table actual prepare refusal");
+    let mut operator = factory.create(1, 0);
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        Arc::new(RuntimeErrorState::default()),
+    ));
+    let baseline = tracker.current();
+    assert!(baseline > 0);
+    tracker.install_limit_once(baseline + 1).unwrap();
+    assert!(matches!(
+        operator.prepare().unwrap_err().cause(),
+        ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
+    ));
+    assert!(matches!(
+        operator.prepare().unwrap_err().cause(),
+        ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::InstanceFailed)
+    ));
+    assert!(operator.is_finished());
+    assert_eq!(tracker.current(), baseline);
+    drop(operator);
+    assert_eq!(tracker.current(), 0);
+}

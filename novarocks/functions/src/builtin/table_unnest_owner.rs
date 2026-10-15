@@ -76,10 +76,27 @@ pub(super) fn definition(
         value: error.to_string().into(),
     })
 }
-struct Owner {
+pub(crate) struct Owner {
     declaration: FunctionBindingDeclaration,
     resolver: BuiltinUnnestResolver,
     implementations: Box<[PureImplementationDeclaration]>,
+}
+impl Owner {
+    pub(crate) fn validate_selected_with_creator_in<H>(
+        &self,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), crate::FunctionBindingCreationFailure<H>> {
+        self.resolver.validate_selected_with_creator_in(
+            selected,
+            request,
+            &self.declaration.overloads()[0].identity,
+            creation,
+            control,
+        )
+    }
 }
 impl FunctionBindingResolver for Owner {
     fn resolve(
@@ -109,6 +126,9 @@ impl FunctionBindingResolver for Owner {
     }
 }
 impl PureFunctionMetadataOwner for Owner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::unnest(self)
+    }
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -133,51 +153,21 @@ impl FunctionEffectOwner for Owner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        let result = (|| {
-            let header = input.function_id == self.declaration.function_id()
-                && input.kind == FunctionKind::Table;
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if !header {
-                return Err(FunctionBindingError::UnknownFunction.into());
-            }
-            let scope = input.environment.is_empty()
-                && (input.proof_scope == CallProofScope::Unconditional
-                    || input.proof_scope == CallProofScope::Domain(input.context.domain));
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if !scope {
-                return Err(FunctionBindingError::InvalidBinding(
-                    "UNNEST requires its exact environment-free scope".into(),
-                )
-                .into());
-            }
-            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        self.refine_selected_core(input, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(cause) => {
-                        FunctionEffectOwnerError::Control(cause)
-                    }
-                    error => FunctionEffectOwnerError::Owner(error),
-                })?;
-            let base = effects();
-            Ok(CallEffects {
-                value_stability: base.value_stability,
-                own_row_error: base.own_row_error,
-                failure_behavior: base.failure_behavior,
-                null_behavior: base.null_behavior,
-                argument_control: base.argument_control,
-                instance_state: base.instance_state,
-                observable_effects: base.observable_effects,
-                environment: Box::default(),
-                proof_scope: input.proof_scope,
-            })
-        })();
-        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
-            return result;
-        }
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        result
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_selected_core(input, control, || {
+            checked.require_binding_author(self, input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 impl PureTableImplementation for Owner {
@@ -214,6 +204,79 @@ impl PureTableImplementation for Owner {
             return result;
         }
         work.finish().map_err(compile_failure)?;
+        result
+    }
+    fn prepare_table_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<TableCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedTableKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        checked.require_binding_author(self, input).map_err(|_| {
+            crate::CheckedOwnerFailure::Original(invalid(
+                "UNNEST preparation borrows a different checked author",
+            ))
+        })?;
+        // The original table preparation validates its exact immutable call;
+        // it never reconstructs an expected selected type.
+        self.prepare_table(input, contract, control)
+            .map_err(crate::CheckedOwnerFailure::Original)
+    }
+}
+
+#[cfg(test)]
+#[path = "table_unnest_created_tests.rs"]
+mod created_tests;
+
+impl Owner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        let result = (|| {
+            let header = input.function_id == self.declaration.function_id()
+                && input.kind == FunctionKind::Table;
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if !header {
+                return Err(FunctionBindingError::UnknownFunction.into());
+            }
+            let scope = input.environment.is_empty()
+                && (input.proof_scope == CallProofScope::Unconditional
+                    || input.proof_scope == CallProofScope::Domain(input.context.domain));
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if !scope {
+                return Err(FunctionBindingError::InvalidBinding(
+                    "UNNEST requires its exact environment-free scope".into(),
+                )
+                .into());
+            }
+            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(cause) => FunctionEffectOwnerError::Control(cause),
+                error => FunctionEffectOwnerError::Owner(error),
+            })?;
+            let base = effects();
+            Ok(CallEffects {
+                value_stability: base.value_stability,
+                own_row_error: base.own_row_error,
+                failure_behavior: base.failure_behavior,
+                null_behavior: base.null_behavior,
+                argument_control: base.argument_control,
+                instance_state: base.instance_state,
+                observable_effects: base.observable_effects,
+                environment: Box::default(),
+                proof_scope: input.proof_scope,
+            })
+        })();
+        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
+            return result;
+        }
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
         result
     }
 }

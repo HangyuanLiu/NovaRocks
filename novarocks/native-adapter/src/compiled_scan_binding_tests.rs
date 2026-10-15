@@ -43,7 +43,7 @@ use novarocks_execution::exec::node::scan::BoundScanRanges;
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_spi::connector::ConnectorStopOwner;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
 use novarocks_types::SlotId;
 
@@ -159,6 +159,39 @@ fn public_schema() -> Schema {
     )
 }
 
+// This fixture owns a fresh, single-reserve map. Its original backing
+// invoice bounds source inspection; it never grants construction capacity.
+fn bounded_source_attributes(entries: Vec<(String, String)>) -> (HashMap<String, String>, usize) {
+    let facts = novarocks_type_contract::owned_resources::hashmap::fresh_table_layout::<
+        String,
+        String,
+    >(entries.len())
+    .expect("the locked fresh source map model");
+    let mut source_bytes = std::mem::size_of::<HashMap<String, String>>()
+        .checked_add(facts.request_bytes_upper_bound)
+        .expect("source map extent");
+    let mut attributes = HashMap::with_capacity(entries.len());
+    for (key, value) in entries {
+        source_bytes = source_bytes
+            .checked_add(key.capacity())
+            .unwrap()
+            .checked_add(value.capacity())
+            .unwrap();
+        assert!(attributes.insert(key, value).is_none());
+    }
+    (attributes, source_bytes)
+}
+
+fn source_fixture_work(
+    work: &mut CompileCheckpoints<'_>,
+    units: usize,
+) -> Result<(), PureProviderCompileError<ConnectorError>> {
+    for _ in 0..units {
+        work.step()?;
+    }
+    Ok(())
+}
+
 /// One complete frozen read of `v0, v1` owned by `provider`.
 fn frozen_read(
     provider: &str,
@@ -195,13 +228,98 @@ fn frozen_read(
         vec![],
     )
     .unwrap();
-    let public = ConnectorReadPublicFacts::try_new(
-        source,
-        None,
-        public_schema(),
-        vec![ValueLogicalType::Physical; 2],
+    // Complete execution semantics and original provider attributes have
+    // independent authors, even where their physical shapes agree.
+    let original = public_schema();
+    let shape_schema = Arc::new(Schema::new(
+        ["v0", "v1"]
+            .into_iter()
+            .map(|name| Field::new(name, DataType::Int64, false))
+            .collect::<Vec<_>>(),
+    ));
+    let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+    let execution = novarocks_connector_contract::ConnectorReadExecutionSchema::try_new(
+        shape_schema.clone(),
+        ["v0", "v1"]
+            .into_iter()
+            .map(|_| novarocks_type_contract::FunctionValueType::new(DataType::Int64, false))
+            .collect::<Box<[_]>>(),
+        storage.clone(),
     )
     .unwrap();
+    let shape = novarocks_connector_contract::ConnectorSourceSchemaShape::try_new(
+        shape_schema,
+        storage.clone(),
+    )
+    .unwrap();
+    let fields = original
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, field)| {
+            let (attributes, source_bytes) = bounded_source_attributes(vec![(
+                "provider.field-id".into(),
+                (ordinal + 1).to_string(),
+            )]);
+            assert_eq!(&attributes, field.metadata());
+            let mut work =
+                CompileCheckpoints::try_new(&Unbounded, CompilePhase::ProviderValidation).unwrap();
+            let facts = novarocks_connector_contract::ConnectorSourceFieldFacts::try_new_observed(
+                Box::from([ordinal as u32]),
+                None,
+                None,
+                attributes,
+                &[],
+                storage.clone(),
+                source_bytes,
+                |_| {
+                    Unbounded
+                        .checkpoint(CompilePhase::ProviderValidation, 0)
+                        .map_err(PureProviderCompileError::<ConnectorError>::Control)
+                },
+                |units| source_fixture_work(&mut work, units),
+            )
+            .unwrap();
+            work.finish().unwrap();
+            facts
+        })
+        .collect::<Box<[_]>>();
+    let (schema_attributes, schema_source_bytes) =
+        bounded_source_attributes(vec![("provider.schema".into(), "generation-1".into())]);
+    assert_eq!(&schema_attributes, original.metadata());
+    let mut work =
+        CompileCheckpoints::try_new(&Unbounded, CompilePhase::ProviderValidation).unwrap();
+    let source_facts = novarocks_connector_contract::ConnectorSourceSchemaFacts::try_new_observed_with_source_invoice(
+        shape,
+        schema_attributes,
+        fields,
+        storage,
+        schema_source_bytes,
+        |_| Unbounded.checkpoint(CompilePhase::ProviderValidation, 0)
+            .map_err(PureProviderCompileError::<ConnectorError>::Control),
+        |units| source_fixture_work(&mut work, units),
+    ).unwrap();
+    work.finish().unwrap();
+    let public = ConnectorReadPublicFacts::try_new_typed_with_control(
+        source,
+        None,
+        &execution,
+        &source_facts,
+        &Unbounded,
+    )
+    .unwrap();
+    assert!(
+        public
+            .execution_schema()
+            .unwrap()
+            .schema()
+            .metadata()
+            .is_empty()
+    );
+    assert_eq!(
+        public.source_schema_facts().unwrap().schema_attributes(),
+        original.metadata()
+    );
     FrozenConnectorRead::try_new(scan, public).unwrap()
 }
 
@@ -211,11 +329,28 @@ fn recipe(read: &FrozenConnectorRead) -> ConnectorReadProgramRecipe {
 }
 
 fn layout() -> StaticLayout {
-    StaticLayout::try_new(
-        Arc::new(public_schema()),
+    let value = novarocks_type_contract::FunctionValueType::new(DataType::Int64, false);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("v0", DataType::Int64, false),
+        Field::new("v1", DataType::Int64, false),
+    ]));
+    let layout = StaticLayout::try_new_typed_for_compile(
+        schema,
         Arc::from([SlotId::new(1), SlotId::new(2)]),
+        vec![
+            (value.typed_binding().clone(), None),
+            (value.typed_binding().clone(), None),
+        ],
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        &mut |_| {
+            Unbounded
+                .checkpoint(CompilePhase::LowerProgram, 0)
+                .map_err(novarocks_local_program::LayoutCompileError::Control)
+        },
+        &Unbounded,
     )
-    .unwrap()
+    .unwrap();
+    layout
 }
 
 fn bind(
@@ -271,8 +406,11 @@ fn consumer(binding_id: u32) -> FilterConsumerAtExpr {
             binding_id,
             7,
             FilterConsumerActivation::BlockingSnapshot,
-            StaticFilterContract::membership(&DataType::Int64, FilterNullSemantics::NeverMatches)
-                .expect("membership contract"),
+            StaticFilterContract::membership(
+                &novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                FilterNullSemantics::NeverMatches,
+            )
+            .expect("membership contract"),
             FilterReduction::SetUnion,
         )
         .expect("blocking membership consumer"),

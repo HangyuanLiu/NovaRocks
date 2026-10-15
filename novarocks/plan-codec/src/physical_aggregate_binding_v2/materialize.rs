@@ -26,8 +26,8 @@ use crate::physical_binding_v2::owner_admission::{Admit, Policy};
 use crate::{
     physical_binding_v2::{
         MaterializationModel, MaterializedFunctionBinding, MaterializedFunctionBindings, add,
-        boxed, completed, copy_scalar_signature_observed, finish, mul,
-        preflight_scalar_signature_copy, preflight_scalar_signature_copy_in, reserve,
+        completed, finish, mul, preflight_scalar_signature_copy,
+        preflight_scalar_signature_copy_in,
     },
     physical_type_v2::{DecodedTypeTable, clone_value_type_observed},
     physical_value_origin_v2::decode_phase_with,
@@ -54,10 +54,18 @@ pub struct MaterializedAggregateBindings<'loan, 'headers, 'source> {
     source_invoice: usize,
     retained_bytes: usize,
     facts: BindingProjectionFacts,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
+    construction_request_upper: Option<usize>,
 }
 impl<'loan, 'headers, 'source> MaterializedAggregateBindings<'loan, 'headers, 'source> {
     pub fn definitions(&self) -> &[(u32, AggregateBinding)] {
         &self.definitions
+    }
+    /// Completed original-author construction upper, including temporary
+    /// requests. Pure authors have no supplied construction provenance.
+    /// This is not precise retained bytes, a capacity grant or a MEM ledger.
+    pub fn creation_request_bytes_upper_bound(&self) -> Option<usize> {
+        self.construction_request_upper
     }
     pub fn facts(&self) -> &BindingProjectionFacts {
         &self.facts
@@ -257,11 +265,23 @@ fn preflight(
     }
     for raw in headers.as_wire() {
         model.request::<u8>(raw.state_format.len(), 1)?;
+        model.request_layouts(
+            AggregateStateFormatId::storage_allocation_layout()
+                .map_err(|_| CompileControlError::ResourceExhausted)?,
+            1,
+        )?;
         if let Some(receipt) = &raw.state_interpretation {
             model.request::<novarocks_type_contract::AggregateStateOrderKey>(
                 receipt.order_keys.len(),
                 2,
             )?;
+            if !receipt.order_keys.is_empty() {
+                model.request_layouts(
+                    novarocks_type_contract::AggregateStateOrderKeys::storage_allocation_layout()
+                        .map_err(Error::Resource)?,
+                    1,
+                )?;
+            }
         }
         if observed {
             model.check_admitted(limits, admit)?;
@@ -365,9 +385,27 @@ fn materialize_core<'loan, 'headers, 'source>(
     prepared: PreparedAggregateBindingsMaterialization<'loan, 'headers, 'source>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<MaterializedAggregateBindings<'loan, 'headers, 'source>, Error> {
+    materialize_created_core::<std::convert::Infallible>(prepared, None, work)
+        .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+}
+fn materialize_created_core<'loan, 'headers, 'source, H>(
+    prepared: PreparedAggregateBindingsMaterialization<'loan, 'headers, 'source>,
+    creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    MaterializedAggregateBindings<'loan, 'headers, 'source>,
+    crate::physical_binding_v2::creation::Failure<H>,
+> {
+    let mut construction = crate::physical_binding_v2::creation::Construction { creator: creation };
+    let storage = construction.storage();
+    let construction_request_upper = construction
+        .creator
+        .as_ref()
+        .map(|_| prepared.facts.request_bytes_upper_bound);
+    work.step()?;
     (|| {
         let types = prepared.headers.functions().type_table();
-        let mut definitions = reserve(prepared.headers.as_wire().len(), work)?;
+        let mut definitions = construction.reserve(prepared.headers.as_wire().len(), work)?;
         for raw in prepared.headers.as_wire() {
             let function_id = completed(
                 raw.function_binding_id
@@ -375,7 +413,11 @@ fn materialize_core<'loan, 'headers, 'source>(
                 work,
             )?;
             let source = function(prepared.functions, function_id, work)?;
-            let function = copy_scalar_signature_observed(source, work)?;
+            let function = crate::physical_binding_v2::copy_scalar_signature_with_creator_observed(
+                source,
+                construction.creator_reborrow(),
+                work,
+            )?;
             let intermediate_id = completed(
                 raw.intermediate_value_type_id.ok_or_else(|| {
                     shape("materialized aggregate intermediate reference is absent")
@@ -398,22 +440,20 @@ fn materialize_core<'loan, 'headers, 'source>(
                 decode_state_argument_contract(raw.state_argument_contract),
                 work,
             )?;
-            // Original identity construction owns its bounded (<=1024-byte)
-            // grammar and Box allocation. No copied state-format grammar.
-            work.flush()?;
-            let state_format = completed(
-                AggregateStateFormatId::try_new(&raw.state_format)
-                    .map_err(|_| shape("materialized aggregate state format is invalid")),
-                work,
-            )?;
-            work.flush()?;
+            let state_format = construction.state(&raw.state_format, work)?;
             definitions.push((
                 raw.id,
                 AggregateBinding {
                     state_interpretation: raw
                         .state_interpretation
                         .as_ref()
-                        .map(|value| super::decode_state_interpretation(value, work))
+                        .map(|value| {
+                            super::decode_state_interpretation_created(
+                                value,
+                                &mut construction,
+                                work,
+                            )
+                        })
                         .transpose()?,
                     state_argument_contract,
                     function,
@@ -426,12 +466,14 @@ fn materialize_core<'loan, 'headers, 'source>(
             work.step()?;
         }
         Ok(MaterializedAggregateBindings {
-            definitions: boxed(definitions, work)?,
+            definitions: construction.boxed(definitions, work)?,
             headers: prepared.headers,
             functions: prepared.functions,
             source_invoice: prepared.source_invoice,
             retained_bytes: prepared.retained_bytes,
             facts: prepared.facts,
+            _storage: storage,
+            construction_request_upper,
         })
     })()
 }
@@ -481,3 +523,20 @@ pub fn materialize_aggregate_bindings_in<'loan, 'headers, 'source>(
 #[cfg(test)]
 #[path = "materialize_tests.rs"]
 mod tests;
+
+/// Create the already validated aggregate table under the original host.
+pub fn materialize_aggregate_bindings_with_creator_in<'loan, 'headers, 'source, H>(
+    prepared: PreparedAggregateBindingsMaterialization<'loan, 'headers, 'source>,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    MaterializedAggregateBindings<'loan, 'headers, 'source>,
+    crate::physical_binding_v2::creation::Failure<H>,
+> {
+    let same = std::ptr::addr_eq(work.control(), prepared.headers.original_control());
+    work.step()?;
+    if !same {
+        return Err(shape("aggregate materialization has a different original control").into());
+    }
+    materialize_created_core(prepared, Some(creation), work)
+}

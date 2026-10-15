@@ -313,11 +313,44 @@ pub enum ConnectorWriteAdmissionPurpose {
 #[derive(Clone, Debug)]
 pub struct ConnectorWriteFieldRequest {
     field: Field,
+    execution_type: Option<novarocks_type_contract::FunctionValueType>,
 }
 
 impl ConnectorWriteFieldRequest {
     pub fn new(field: Field) -> Self {
-        Self { field }
+        Self {
+            field,
+            execution_type: None,
+        }
+    }
+
+    /// Carry the SQL/provider author's complete value binding separately from
+    /// the original provider field. The legacy constructor remains only while
+    /// production request authors migrate to this explicit projection.
+    pub fn try_new_typed(
+        field: Field,
+        execution_type: novarocks_type_contract::FunctionValueType,
+    ) -> Result<Self, ConnectorError> {
+        let matches = novarocks_connector_contract::write_field_matches_execution_type_observed::<
+            novarocks_type_contract::ValueTypeError,
+        >(&field, &execution_type, |_| Ok(()))
+        .map_err(|error| {
+            ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+        })?;
+        if !matches {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "writer request source field conflicts with its explicit execution projection",
+            ));
+        }
+        Ok(Self {
+            field,
+            execution_type: Some(execution_type),
+        })
+    }
+
+    pub fn execution_type(&self) -> Option<&novarocks_type_contract::FunctionValueType> {
+        self.execution_type.as_ref()
     }
 
     pub fn field(&self) -> &Field {
@@ -2482,14 +2515,18 @@ impl ConnectorWriteLease {
     pub fn load_table(
         &self,
         request: super::ConnectorTableRequest,
-    ) -> Result<super::ConnectorTableMetadata, ConnectorError> {
+        creation: &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        super::ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         let metadata = self.metadata.as_ref().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
                 "connector write lease has no exact-generation metadata capability",
             )
         })?;
-        metadata.load_table(request)
+        metadata.load_table(request, creation)
     }
 
     /// Materialize a declaration only through the exact generation held by

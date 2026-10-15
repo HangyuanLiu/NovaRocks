@@ -127,14 +127,155 @@ pub const fn root_write_result_column_id(index: usize) -> u32 {
     ROOT_WRITE_RESULT_FIRST_COLUMN_ID + index as u32
 }
 
-/// One typed auxiliary channel frozen into a writer plan.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WriterAuxiliaryChannel {
+/// Errors preserve the first original creator or control refusal.
+#[derive(Debug)]
+pub enum WriterSchemaCreationFailure<H> {
+    Contract(ConnectorError),
+    Layout(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+    HashMap(novarocks_type_contract::owned_resources::hashmap::HashMapResourceError),
+    Control(novarocks_type_contract::CompileControlError),
+    Creator(H),
+}
+fn pure_writer_failure(
+    error: WriterSchemaCreationFailure<std::convert::Infallible>,
+) -> ConnectorError {
+    match error {
+        WriterSchemaCreationFailure::Contract(error) => error,
+        WriterSchemaCreationFailure::Creator(never) => match never {},
+        WriterSchemaCreationFailure::Layout(error) => ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            format!("writer schema layout: {error:?}"),
+        ),
+        WriterSchemaCreationFailure::HashMap(error) => ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            format!("writer schema table: {error:?}"),
+        ),
+        WriterSchemaCreationFailure::Control(error) => ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            format!("writer schema construction: {error}"),
+        ),
+    }
+}
+enum WriterSchemaWork<'a, 'control, H> {
+    Checkpoints(&'a mut novarocks_type_contract::CompileCheckpoints<'control>),
+    Caller(&'a mut dyn FnMut(usize) -> Result<(), H>),
+}
+impl<H> WriterSchemaWork<'_, '_, H> {
+    fn observe(&mut self, units: usize) -> Result<(), WriterSchemaCreationFailure<H>> {
+        match self {
+            Self::Checkpoints(work) => {
+                if units == 0 {
+                    work.flush().map_err(WriterSchemaCreationFailure::Control)?;
+                }
+                for _ in 0..units {
+                    work.step().map_err(WriterSchemaCreationFailure::Control)?;
+                }
+                Ok(())
+            }
+            Self::Caller(work) => work(units).map_err(WriterSchemaCreationFailure::Creator),
+        }
+    }
+}
+struct WriterSchemaConstruction<'creator, 'port, 'work, 'control, H> {
+    creation: Option<&'creator mut novarocks_type_contract::ValueSchemaCreation<'port, H>>,
+    work: Option<WriterSchemaWork<'work, 'control, H>>,
+}
+impl<H> WriterSchemaConstruction<'_, '_, '_, '_, H> {
+    fn check(&mut self) -> Result<(), WriterSchemaCreationFailure<H>> {
+        if let Some(work) = self.work.as_mut() {
+            work.observe(0)?;
+        }
+        Ok(())
+    }
+    fn step(&mut self) -> Result<(), WriterSchemaCreationFailure<H>> {
+        if let Some(work) = self.work.as_mut() {
+            work.observe(1)?;
+        }
+        Ok(())
+    }
+    fn request(
+        &mut self,
+        layout: std::alloc::Layout,
+    ) -> Result<(), WriterSchemaCreationFailure<H>> {
+        self.check()?;
+        if layout.size() != 0 {
+            if let Some(creation) = self.creation.as_deref_mut() {
+                creation
+                    .request_layout(layout)
+                    .map_err(WriterSchemaCreationFailure::Creator)?;
+            }
+        }
+        Ok(())
+    }
+    fn arc<T>(&mut self) -> Result<(), WriterSchemaCreationFailure<H>> {
+        self.request(
+            novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::new::<T>(),
+            )
+            .map_err(WriterSchemaCreationFailure::Layout)?,
+        )
+    }
+    fn array<T>(&mut self, len: usize) -> Result<(), WriterSchemaCreationFailure<H>> {
+        self.request(std::alloc::Layout::array::<T>(len).map_err(|_| {
+            WriterSchemaCreationFailure::Control(
+                novarocks_type_contract::CompileControlError::ResourceExhausted,
+            )
+        })?)
+    }
+    fn storage(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+        self.creation.as_ref().map_or_else(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure,
+            |creation| creation.storage_lifetime(),
+        )
+    }
+    fn field(
+        &mut self,
+        name: &str,
+        ty: &DataType,
+        nullable: bool,
+    ) -> Result<Field, WriterSchemaCreationFailure<H>> {
+        self.array::<u8>(name.len())?;
+        // Canonical value layout clones share every nested field/parameter Arc.
+        Ok(Field::new(name.to_owned(), ty.clone(), nullable))
+    }
+    fn set<K: std::hash::Hash + Eq>(
+        &mut self,
+        count: usize,
+    ) -> Result<HashSet<K>, WriterSchemaCreationFailure<H>> {
+        let facts =
+            novarocks_type_contract::owned_resources::hashmap::fresh_table_layout::<K, ()>(count)
+                .map_err(WriterSchemaCreationFailure::HashMap)?;
+        if let Some(layout) = facts.layout {
+            self.request(layout)?;
+        }
+        let mut set = HashSet::new();
+        set.try_reserve(count).map_err(|_| {
+            WriterSchemaCreationFailure::Control(
+                novarocks_type_contract::CompileControlError::ResourceExhausted,
+            )
+        })?;
+        Ok(set)
+    }
+}
+/// One immutable typed auxiliary channel. Cloning shares its original name,
+/// complete value binding and finite creation responsibility.
+#[derive(Clone, Debug)]
+pub struct WriterAuxiliaryChannel(Arc<WriterAuxiliaryChannelStorage>);
+#[derive(Debug)]
+struct WriterAuxiliaryChannelStorage {
     slot_id: u32,
     name: String,
     value_type: novarocks_type_contract::FunctionValueType,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
-
+impl PartialEq for WriterAuxiliaryChannel {
+    fn eq(&self, other: &Self) -> bool {
+        self.slot_id() == other.slot_id()
+            && self.name() == other.name()
+            && self.value_type() == other.value_type()
+    }
+}
+impl Eq for WriterAuxiliaryChannel {}
 impl WriterAuxiliaryChannel {
     pub fn try_new(
         slot_id: u32,
@@ -142,138 +283,302 @@ impl WriterAuxiliaryChannel {
         value_type: novarocks_type_contract::FunctionValueType,
     ) -> Result<Self, ConnectorError> {
         let name = name.into();
-        if slot_id >= ROOT_WRITE_RESULT_FIRST_COLUMN_ID {
-            return Err(corrupt(
-                "writer auxiliary slot id collides with a reserved write relation range",
-            ));
-        }
-        if name.is_empty() {
-            return Err(corrupt("writer auxiliary channel name is empty"));
-        }
-        validate_field_name(&name)?;
-        if value_type.data_type == DataType::Null {
-            return Err(corrupt("writer auxiliary channel cannot have Null type"));
-        }
-        if !value_type.nullable {
-            return Err(corrupt(
-                "writer auxiliary transport type must admit sparse NULL padding",
-            ));
-        }
-        let field = value_type.try_to_field(name.clone()).map_err(|error| {
-            ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
-        })?;
-        let mut decoded_bytes = 0;
-        novarocks_connector_contract::validate_write_field_schema(&field, 1, &mut decoded_bytes)?;
-        Ok(Self {
+        Self::try_new_with_creator_in::<std::convert::Infallible>(
+            slot_id, &name, value_type, None, None,
+        )
+        .map_err(pure_writer_failure)
+    }
+    pub fn try_new_with_creator_in<H>(
+        slot_id: u32,
+        name: &str,
+        value_type: novarocks_type_contract::FunctionValueType,
+        creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, H>>,
+        work: Option<&mut novarocks_type_contract::CompileCheckpoints<'_>>,
+    ) -> Result<Self, WriterSchemaCreationFailure<H>> {
+        Self::try_new_core(
             slot_id,
             name,
             value_type,
-        })
+            creation,
+            work.map(WriterSchemaWork::Checkpoints),
+        )
     }
-
-    pub const fn slot_id(&self) -> u32 {
-        self.slot_id
+    pub fn try_new_with_creator_work_in<H>(
+        slot_id: u32,
+        name: &str,
+        value_type: novarocks_type_contract::FunctionValueType,
+        creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, H>>,
+        work: &mut dyn FnMut(usize) -> Result<(), H>,
+    ) -> Result<Self, WriterSchemaCreationFailure<H>> {
+        Self::try_new_core(
+            slot_id,
+            name,
+            value_type,
+            creation,
+            Some(WriterSchemaWork::Caller(work)),
+        )
     }
-
+    fn try_new_core<H>(
+        slot_id: u32,
+        name: &str,
+        value_type: novarocks_type_contract::FunctionValueType,
+        creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, H>>,
+        work: Option<WriterSchemaWork<'_, '_, H>>,
+    ) -> Result<Self, WriterSchemaCreationFailure<H>> {
+        let mut construction = WriterSchemaConstruction { creation, work };
+        construction.check()?;
+        if slot_id >= ROOT_WRITE_RESULT_FIRST_COLUMN_ID {
+            return Err(WriterSchemaCreationFailure::Contract(corrupt(
+                "writer auxiliary slot id collides with a reserved write relation range",
+            )));
+        }
+        if name.is_empty() {
+            return Err(WriterSchemaCreationFailure::Contract(corrupt(
+                "writer auxiliary channel name is empty",
+            )));
+        }
+        validate_field_name(name).map_err(WriterSchemaCreationFailure::Contract)?;
+        if *value_type.data_type() == DataType::Null {
+            return Err(WriterSchemaCreationFailure::Contract(corrupt(
+                "writer auxiliary channel cannot have Null type",
+            )));
+        }
+        if !value_type.nullable() {
+            return Err(WriterSchemaCreationFailure::Contract(corrupt(
+                "writer auxiliary transport type must admit sparse NULL padding",
+            )));
+        }
+        let field = construction.field(name, value_type.data_type(), value_type.nullable())?;
+        let mut decoded_bytes = 0;
+        construction.check()?;
+        novarocks_connector_contract::validate_write_field_schema(&field, 1, &mut decoded_bytes)
+            .map_err(WriterSchemaCreationFailure::Contract)?;
+        construction.check()?;
+        construction.array::<u8>(name.len())?;
+        let name = name.to_owned();
+        construction.arc::<WriterAuxiliaryChannelStorage>()?;
+        Ok(Self(Arc::new(WriterAuxiliaryChannelStorage {
+            slot_id,
+            name,
+            value_type,
+            _storage: construction.storage(),
+        })))
+    }
+    pub fn slot_id(&self) -> u32 {
+        self.0.slot_id
+    }
     pub fn name(&self) -> &str {
-        &self.name
+        &self.0.name
     }
-
-    pub const fn value_type(&self) -> &novarocks_type_contract::FunctionValueType {
-        &self.value_type
+    pub fn value_type(&self) -> &novarocks_type_contract::FunctionValueType {
+        &self.0.value_type
     }
-
-    pub const fn data_type(&self) -> &DataType {
-        &self.value_type.data_type
+    pub fn data_type(&self) -> &DataType {
+        self.0.value_type.data_type()
     }
 }
-
+/// Independently retained schema projection. Raw Arrow ownership is paired
+/// with its original creator responsibility at every consuming boundary.
+#[derive(Clone, Debug)]
+pub struct WriterSchemaProjection {
+    schema: SchemaRef,
+    storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl WriterSchemaProjection {
+    pub fn schema(&self) -> &Schema {
+        self.schema.as_ref()
+    }
+    pub fn into_parts(self) -> (SchemaRef, novarocks_type_contract::ValueTypeStorageLifetime) {
+        (self.schema, self.storage)
+    }
+    pub fn field(&self, ordinal: usize) -> Option<WriterFieldProjection> {
+        self.schema
+            .fields()
+            .get(ordinal)
+            .map(|field| WriterFieldProjection {
+                field: field.clone(),
+                storage: self.storage.clone(),
+            })
+    }
+}
+#[derive(Clone, Debug)]
+pub struct WriterFieldProjection {
+    field: Arc<Field>,
+    storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl WriterFieldProjection {
+    pub fn field(&self) -> &Field {
+        &self.field
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        Arc<Field>,
+        novarocks_type_contract::ValueTypeStorageLifetime,
+    ) {
+        (self.field, self.storage)
+    }
+}
+struct WriterSchemaCustody {
+    _channels: Arc<Vec<WriterAuxiliaryChannel>>,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl novarocks_type_contract::ValueTypeStorageHold for WriterSchemaCustody {}
 /// Immutable, per-plan writer relation schema.
 #[derive(Clone, Debug)]
 pub struct WriterMultiplexSchema {
     auxiliary_channels: Arc<Vec<WriterAuxiliaryChannel>>,
     arrow_schema: SchemaRef,
+    storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
-
 impl WriterMultiplexSchema {
     pub fn try_new(
         auxiliary_channels: Vec<WriterAuxiliaryChannel>,
     ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_creator_in::<std::convert::Infallible>(auxiliary_channels, None, None)
+            .map_err(pure_writer_failure)
+    }
+    pub fn try_new_with_creator_in<H>(
+        auxiliary_channels: Vec<WriterAuxiliaryChannel>,
+        creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, H>>,
+        work: Option<&mut novarocks_type_contract::CompileCheckpoints<'_>>,
+    ) -> Result<Self, WriterSchemaCreationFailure<H>> {
+        Self::try_new_core(
+            auxiliary_channels,
+            creation,
+            work.map(WriterSchemaWork::Checkpoints),
+        )
+    }
+    pub fn try_new_with_creator_work_in<H>(
+        auxiliary_channels: Vec<WriterAuxiliaryChannel>,
+        creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, H>>,
+        work: &mut dyn FnMut(usize) -> Result<(), H>,
+    ) -> Result<Self, WriterSchemaCreationFailure<H>> {
+        Self::try_new_core(
+            auxiliary_channels,
+            creation,
+            Some(WriterSchemaWork::Caller(work)),
+        )
+    }
+    fn try_new_core<H>(
+        auxiliary_channels: Vec<WriterAuxiliaryChannel>,
+        creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, H>>,
+        work: Option<WriterSchemaWork<'_, '_, H>>,
+    ) -> Result<Self, WriterSchemaCreationFailure<H>> {
+        let mut construction = WriterSchemaConstruction { creation, work };
+        construction.check()?;
         if auxiliary_channels.len() > MAX_WRITER_AUXILIARY_CHANNELS {
-            return Err(resource_exhausted(
+            return Err(WriterSchemaCreationFailure::Contract(resource_exhausted(
                 "writer auxiliary schema exceeds the channel limit",
-            ));
+            )));
         }
-        let mut decoded_bytes = WRITE_RELATION_COLUMN_COUNT * WRITE_FIELD_ALLOCATION_CHARGE;
-        let mut slot_ids = HashSet::with_capacity(auxiliary_channels.len());
-        let mut names =
-            HashSet::with_capacity(auxiliary_channels.len() + WRITE_RELATION_COLUMN_COUNT);
-        names.extend([
+        let total = auxiliary_channels.len() + WRITE_RELATION_COLUMN_COUNT;
+        let mut slot_ids = construction.set::<u32>(auxiliary_channels.len())?;
+        let mut names = construction.set::<&str>(total)?;
+        for name in [
             WRITE_RELATION_KIND_COLUMN,
             WRITE_RELATION_TARGET_COLUMN,
             WRITE_RELATION_ROW_COUNT_COLUMN,
             WRITE_RELATION_FRAGMENT_COLUMN,
-        ]);
+        ] {
+            names.insert(name);
+            construction.step()?;
+        }
+        let mut decoded_bytes = WRITE_RELATION_COLUMN_COUNT * WRITE_FIELD_ALLOCATION_CHARGE;
+        // This is the actual output field vector, not a second validation tree.
+        construction.array::<Arc<Field>>(total)?;
+        let mut fields = Vec::new();
+        fields.try_reserve_exact(total).map_err(|_| {
+            WriterSchemaCreationFailure::Control(
+                novarocks_type_contract::CompileControlError::ResourceExhausted,
+            )
+        })?;
+        for (name, ty, nullable) in writer_prefix_descriptors() {
+            let field = construction.field(name, &ty, nullable)?;
+            construction.arc::<Field>()?;
+            fields.push(Arc::new(field));
+            construction.step()?;
+        }
         for channel in &auxiliary_channels {
-            let field = channel
-                .value_type()
-                .try_to_field(channel.name())
-                .map_err(|error| {
-                    ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
-                })?;
+            let field = construction.field(
+                channel.name(),
+                channel.data_type(),
+                channel.value_type().nullable(),
+            )?;
+            construction.check()?;
             novarocks_connector_contract::validate_write_field_schema(
                 &field,
                 1,
                 &mut decoded_bytes,
-            )?;
+            )
+            .map_err(WriterSchemaCreationFailure::Contract)?;
+            construction.check()?;
             if !slot_ids.insert(channel.slot_id()) {
-                return Err(corrupt(
+                return Err(WriterSchemaCreationFailure::Contract(corrupt(
                     "writer auxiliary schema contains a duplicate slot id",
-                ));
+                )));
             }
             if !names.insert(channel.name()) {
-                return Err(corrupt(
+                return Err(WriterSchemaCreationFailure::Contract(corrupt(
                     "writer auxiliary schema contains a duplicate column name",
-                ));
+                )));
             }
+            construction.arc::<Field>()?;
+            fields.push(Arc::new(field));
+            construction.step()?;
         }
-
-        let mut fields = writer_prefix_fields();
-        fields.extend(
-            auxiliary_channels
-                .iter()
-                .map(|channel| {
-                    channel
-                        .value_type()
-                        .try_to_field(channel.name())
-                        .map_err(|error| {
-                            ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        );
+        construction.request(
+            novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::array::<Arc<Field>>(total).map_err(|_| {
+                    WriterSchemaCreationFailure::Control(
+                        novarocks_type_contract::CompileControlError::ResourceExhausted,
+                    )
+                })?,
+            )
+            .map_err(WriterSchemaCreationFailure::Layout)?,
+        )?;
+        let fields = Fields::from(fields);
+        construction.arc::<Schema>()?;
+        let arrow_schema = Arc::new(Schema::new(fields));
+        construction.arc::<Vec<WriterAuxiliaryChannel>>()?;
+        construction.check()?;
+        let auxiliary_channels = Arc::new(auxiliary_channels);
+        let storage = if construction.creation.is_some() {
+            construction.arc::<WriterSchemaCustody>()?;
+            novarocks_type_contract::ValueTypeStorageLifetime::held(Arc::new(WriterSchemaCustody {
+                _channels: auxiliary_channels.clone(),
+                _storage: construction.storage(),
+            }))
+        } else {
+            novarocks_type_contract::ValueTypeStorageLifetime::pure()
+        };
         Ok(Self {
-            auxiliary_channels: Arc::new(auxiliary_channels),
-            arrow_schema: Arc::new(Schema::new(fields)),
+            auxiliary_channels,
+            arrow_schema,
+            storage,
         })
     }
-
     pub fn empty() -> Self {
         Self::try_new(Vec::new()).expect("the fixed writer prefix is valid")
     }
-
     pub const fn contract_version(&self) -> u32 {
         WRITER_MULTIPLEX_SCHEMA_VERSION
     }
-
     pub fn auxiliary_channels(&self) -> &[WriterAuxiliaryChannel] {
         self.auxiliary_channels.as_slice()
     }
-
-    pub fn arrow_schema(&self) -> &SchemaRef {
-        &self.arrow_schema
+    pub fn arrow_schema(&self) -> &Schema {
+        self.arrow_schema.as_ref()
     }
-
+    pub fn schema_projection(&self) -> WriterSchemaProjection {
+        WriterSchemaProjection {
+            schema: self.arrow_schema.clone(),
+            storage: self.storage.clone(),
+        }
+    }
+    pub fn storage_lifetime(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+        self.storage.clone()
+    }
     pub fn slot_ids(&self) -> Vec<u32> {
         (0..WRITE_RELATION_COLUMN_COUNT)
             .map(write_relation_column_id)
@@ -284,7 +589,6 @@ impl WriterMultiplexSchema {
             )
             .collect()
     }
-
     pub fn validate_exact_arrow_schema(&self, actual: &Schema) -> Result<(), ConnectorError> {
         if arrow_schemas_exact(self.arrow_schema.as_ref(), actual) {
             Ok(())
@@ -298,7 +602,7 @@ impl WriterMultiplexSchema {
 
 impl PartialEq for WriterMultiplexSchema {
     fn eq(&self, other: &Self) -> bool {
-        self.slot_ids() == other.slot_ids()
+        self.auxiliary_channels() == other.auxiliary_channels()
             && arrow_schemas_exact(self.arrow_schema.as_ref(), other.arrow_schema.as_ref())
     }
 }
@@ -327,14 +631,7 @@ impl RootWriteResultSchema {
     }
 
     pub fn validate_exact_arrow_schema(&self, actual: &Schema) -> Result<(), ConnectorError> {
-        let expected = root_write_result_schema();
-        if arrow_schemas_exact(expected.as_ref(), actual) {
-            Ok(())
-        } else {
-            Err(corrupt(
-                "root write result Arrow schema does not match the fixed contract",
-            ))
-        }
+        validate_root_write_result_schema(actual)
     }
 }
 
@@ -425,13 +722,36 @@ impl RootRowKind {
     }
 }
 
-fn writer_prefix_fields() -> Vec<Field> {
-    vec![
-        Field::new(WRITE_RELATION_KIND_COLUMN, DataType::Int8, false),
-        Field::new(WRITE_RELATION_TARGET_COLUMN, DataType::Int32, false),
-        Field::new(WRITE_RELATION_ROW_COUNT_COLUMN, DataType::Int64, true),
-        Field::new(WRITE_RELATION_FRAGMENT_COLUMN, DataType::Binary, true),
+fn writer_prefix_descriptors() -> [(&'static str, DataType, bool); WRITE_RELATION_COLUMN_COUNT] {
+    [
+        (WRITE_RELATION_KIND_COLUMN, DataType::Int8, false),
+        (WRITE_RELATION_TARGET_COLUMN, DataType::Int32, false),
+        (WRITE_RELATION_ROW_COUNT_COLUMN, DataType::Int64, true),
+        (WRITE_RELATION_FRAGMENT_COLUMN, DataType::Binary, true),
     ]
+}
+pub fn validate_writer_prefix_schema(fields: &Fields) -> Result<(), ConnectorError> {
+    if fields.len() < WRITE_RELATION_COLUMN_COUNT {
+        return Err(corrupt("writer multiplex schema lacks fixed prefix"));
+    }
+    for (field, (name, ty, nullable)) in fields.iter().zip(writer_prefix_descriptors()) {
+        if field.name() != name
+            || field.data_type() != &ty
+            || field.is_nullable() != nullable
+            || field.metadata().capacity() != 0
+        {
+            return Err(corrupt(
+                "writer fixed prefix differs from its protocol purpose",
+            ));
+        }
+    }
+    Ok(())
+}
+fn writer_prefix_fields() -> Vec<Field> {
+    writer_prefix_descriptors()
+        .into_iter()
+        .map(|(name, ty, nullable)| Field::new(name, ty, nullable))
+        .collect()
 }
 
 fn relation_schema(target_nullable: bool) -> SchemaRef {
@@ -497,7 +817,10 @@ pub fn target_ordinal_from_wire(
 /// The schema every `TableWriter` operator emits. `write_target_ordinal` is
 /// non-null because a writer always knows which logical target it serves.
 pub fn writer_output_schema() -> SchemaRef {
-    WriterMultiplexSchema::empty().arrow_schema().clone()
+    WriterMultiplexSchema::empty()
+        .schema_projection()
+        .into_parts()
+        .0
 }
 
 /// The schema the single `TableFinish` operator emits. `write_target_ordinal`
@@ -509,34 +832,126 @@ pub fn root_output_schema() -> SchemaRef {
 /// Fixed eight-column Root result relation introduced by NCP-8. The existing
 /// four-column `root_output_schema` remains the currently wired NCP-6 operator
 /// output until TableFinish is migrated in T11.
-pub fn root_write_result_schema() -> SchemaRef {
-    let input_item = Arc::new(Field::new("item", DataType::Int32, false));
-    let property_entries = Arc::new(Field::new(
-        "entries",
-        DataType::Struct(Fields::from(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("value", DataType::Utf8, false),
-        ])),
-        false,
-    ));
-    Arc::new(Schema::new(vec![
-        Field::new(ROOT_WRITE_RESULT_KIND_COLUMN, DataType::Int8, false),
-        Field::new(ROOT_WRITE_RESULT_TARGET_COLUMN, DataType::Int32, true),
-        Field::new(ROOT_WRITE_RESULT_ROW_COUNT_COLUMN, DataType::Int64, true),
-        Field::new(ROOT_WRITE_RESULT_FRAGMENT_COLUMN, DataType::Binary, true),
-        Field::new(
+enum RootColumnShape {
+    Scalar(DataType),
+    InputFields,
+    Properties,
+}
+fn root_column_descriptors()
+-> [(&'static str, RootColumnShape, bool); ROOT_WRITE_RESULT_COLUMN_COUNT] {
+    [
+        (
+            ROOT_WRITE_RESULT_KIND_COLUMN,
+            RootColumnShape::Scalar(DataType::Int8),
+            false,
+        ),
+        (
+            ROOT_WRITE_RESULT_TARGET_COLUMN,
+            RootColumnShape::Scalar(DataType::Int32),
+            true,
+        ),
+        (
+            ROOT_WRITE_RESULT_ROW_COUNT_COLUMN,
+            RootColumnShape::Scalar(DataType::Int64),
+            true,
+        ),
+        (
+            ROOT_WRITE_RESULT_FRAGMENT_COLUMN,
+            RootColumnShape::Scalar(DataType::Binary),
+            true,
+        ),
+        (
             ROOT_WRITE_RESULT_INPUT_FIELDS_COLUMN,
-            DataType::List(input_item),
+            RootColumnShape::InputFields,
             true,
         ),
-        Field::new(ROOT_WRITE_RESULT_BLOB_TYPE_COLUMN, DataType::Utf8, true),
-        Field::new(ROOT_WRITE_RESULT_BODY_COLUMN, DataType::Binary, true),
-        Field::new(
+        (
+            ROOT_WRITE_RESULT_BLOB_TYPE_COLUMN,
+            RootColumnShape::Scalar(DataType::Utf8),
+            true,
+        ),
+        (
+            ROOT_WRITE_RESULT_BODY_COLUMN,
+            RootColumnShape::Scalar(DataType::Binary),
+            true,
+        ),
+        (
             ROOT_WRITE_RESULT_PROPERTIES_COLUMN,
-            DataType::Map(property_entries, false),
+            RootColumnShape::Properties,
             true,
         ),
-    ]))
+    ]
+}
+impl RootColumnShape {
+    fn data_type(self) -> DataType {
+        match self {
+            Self::Scalar(ty) => ty,
+            Self::InputFields => {
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, false)))
+            }
+            Self::Properties => DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", DataType::Utf8, false),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+        }
+    }
+    fn matches(&self, actual: &DataType) -> bool {
+        fn field_matches(field: &Field, name: &str, ty: &DataType) -> bool {
+            field.name() == name
+                && !field.is_nullable()
+                && field.metadata().capacity() == 0
+                && field.data_type() == ty
+        }
+        match (self, actual) {
+            (Self::Scalar(expected), actual) => expected == actual,
+            (Self::InputFields, DataType::List(item)) => {
+                field_matches(item, "item", &DataType::Int32)
+            }
+            (Self::Properties, DataType::Map(entries, false)) => {
+                entries.name() == "entries"
+                    && !entries.is_nullable()
+                    && entries.metadata().capacity() == 0
+                    && matches!(entries.data_type(),DataType::Struct(fields) if fields.len()==2 && field_matches(&fields[0],"key",&DataType::Utf8) && field_matches(&fields[1],"value",&DataType::Utf8))
+            }
+            _ => false,
+        }
+    }
+}
+/// Borrow the fixed purposes without creating another expected Arrow schema.
+pub fn validate_root_write_result_schema(actual: &Schema) -> Result<(), ConnectorError> {
+    if actual.metadata().capacity() != 0 || actual.fields().len() != ROOT_WRITE_RESULT_COLUMN_COUNT
+    {
+        return Err(corrupt(
+            "root write result Arrow schema does not match the fixed contract",
+        ));
+    }
+    for (field, (name, shape, nullable)) in actual.fields().iter().zip(root_column_descriptors()) {
+        if field.name() != name
+            || field.is_nullable() != nullable
+            || field.metadata().capacity() != 0
+            || !shape.matches(field.data_type())
+        {
+            return Err(corrupt(
+                "root write result Arrow schema does not match the fixed contract",
+            ));
+        }
+    }
+    Ok(())
+}
+pub fn root_write_result_schema() -> SchemaRef {
+    Arc::new(Schema::new(
+        root_column_descriptors()
+            .into_iter()
+            .map(|(name, shape, nullable)| Field::new(name, shape.data_type(), nullable))
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// Check one writer row's payload against its kind.
@@ -739,7 +1154,6 @@ impl RootWriteResultMembershipValidator {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::io::Cursor;
 
     use arrow::array::builder::{
@@ -930,10 +1344,7 @@ mod tests {
             WriterAuxiliaryChannel::try_new(
                 9,
                 "dictionary",
-                novarocks_type_contract::FunctionValueType::new(
-                    DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
-                    true,
-                ),
+                novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
             )
             .expect("dictionary channel"),
         ])
@@ -944,25 +1355,55 @@ mod tests {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        #[allow(deprecated)]
-        let drifted_dictionary = Field::new_dict(
+        drifted[WRITE_RELATION_COLUMN_COUNT] = Arc::new(Field::new(
             "dictionary",
             DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
             true,
-            41,
-            true,
-        );
-        drifted[WRITE_RELATION_COLUMN_COUNT] = Arc::new(drifted_dictionary);
-        assert_eq!(
-            dictionary.arrow_schema().as_ref(),
-            &Schema::new(drifted.clone()),
-            "Arrow logical equality deliberately ignores dictionary IPC attributes"
-        );
+        ));
         assert!(
             dictionary
-                .validate_exact_arrow_schema(&Schema::new(drifted))
+                .validate_exact_arrow_schema(&Schema::new(drifted.clone()))
                 .is_err(),
-            "the frozen physical contract must not ignore dictionary IPC attributes"
+            "an actual encoded carrier is not the frozen plain value port"
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn actual_dictionary_source_ipc_identity_is_separate_from_the_normalized_writer_port() {
+        let actual = |id| {
+            Field::new_dict(
+                "dictionary",
+                DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+                true,
+                id,
+                true,
+            )
+        };
+        let first = actual(41);
+        let second = actual(42);
+        assert_eq!(
+            first, second,
+            "Arrow logical equality ignores dictionary IPC identity"
+        );
+        assert!(
+            !novarocks_type_contract::arrow_fields_exact(&first, &second),
+            "actual source descriptor comparison preserves encoding identity"
+        );
+        let first = novarocks_type_contract::ValueLayout::try_new(
+            first.data_type(),
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap();
+        let second = novarocks_type_contract::ValueLayout::try_new(
+            second.data_type(),
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap();
+        assert_eq!(first.data_type(), &DataType::Utf8);
+        assert_eq!(
+            first, second,
+            "normalized values do not inherit source dictionary IPC identity"
         );
     }
 
@@ -982,29 +1423,39 @@ mod tests {
             let schema = WriterMultiplexSchema::try_new(vec![channel.clone()]).unwrap();
             assert_eq!(channel.value_type(), &transport);
             assert_eq!(
-                FunctionValueType::try_from_field(schema.arrow_schema().field(4)).unwrap(),
+                schema.auxiliary_channels()[0].value_type().clone(),
                 transport
             );
             let nonnullable =
                 FunctionValueType::try_with_logical_type(carrier, false, domain).unwrap();
             assert!(WriterAuxiliaryChannel::try_new(77, "exact_state", nonnullable).is_err());
         }
-        let field = Field::new("exact_item", DataType::Utf8, false).with_metadata(
-            [
-                (
-                    novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
-                    "json".into(),
-                ),
-                ("provider.field-id".into(), "91".into()),
-            ]
-            .into(),
-        );
-        let transport = FunctionValueType::new(DataType::LargeList(Arc::new(field)), true);
+        let json = novarocks_type_contract::ValueTypeRef::try_new(
+            novarocks_type_contract::ValueKind::Nominal(ValueLogicalType::Json),
+            false,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap();
+        let list = novarocks_type_contract::ValueTypeRef::try_new(
+            novarocks_type_contract::ValueKind::List(json),
+            true,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap();
+        let layout = novarocks_type_contract::ValueLayout::try_new(
+            &DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, false))),
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap();
+        let transport = FunctionValueType::try_from_typed_binding(
+            novarocks_type_contract::TypedValueBinding::try_new(list, layout).unwrap(),
+        )
+        .unwrap();
         let channel =
             WriterAuxiliaryChannel::try_new(77, "exact_state", transport.clone()).unwrap();
         let schema = WriterMultiplexSchema::try_new(vec![channel]).unwrap();
         assert_eq!(
-            FunctionValueType::try_from_field(schema.arrow_schema().field(4)).unwrap(),
+            schema.auxiliary_channels()[0].value_type().clone(),
             transport
         );
         let mut altered = schema
@@ -1015,7 +1466,7 @@ mod tests {
             .collect::<Vec<_>>();
         altered[4] = Arc::new(Field::new(
             "exact_state",
-            DataType::LargeList(Arc::new(Field::new("exact_item", DataType::Utf8, false))),
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
             true,
         ));
         assert!(
@@ -1452,27 +1903,71 @@ mod tests {
             .expect("allocation boundary");
         assert!(charge_decoded(&mut bytes, 1).is_err());
 
-        let metadata = (0..MAX_WRITE_RELATION_METADATA_ENTRIES_PER_FIELD)
-            .map(|index| {
-                (
-                    format!("k{index:02}"),
-                    "v".repeat(MAX_WRITE_RELATION_METADATA_VALUE_BYTES),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let large_type = DataType::Struct(Fields::from(vec![
-            Field::new("payload", DataType::Int64, false).with_metadata(metadata),
-        ]));
-        let channels = (0..5)
+        // Source annotations are absent from execution value identity. Exercise
+        // the existing frozen descriptor limit with actual fields and names.
+        let large_type = DataType::Struct(Fields::from(
+            (0..256)
+                .map(|index| {
+                    let mut name = format!("payload_{index:04}");
+                    name.push_str(&"n".repeat(MAX_WRITE_RELATION_FIELD_NAME_BYTES - name.len()));
+                    Field::new(name, DataType::Int64, false)
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let value_type = novarocks_type_contract::FunctionValueType::new(large_type, true);
+        let field = value_type.try_to_field("large_0000").unwrap();
+        let mut individual_charge = 0;
+        novarocks_connector_contract::validate_write_field_schema(
+            &field,
+            1,
+            &mut individual_charge,
+        )
+        .unwrap();
+        let prefix_charge = WRITE_RELATION_COLUMN_COUNT * WRITE_FIELD_ALLOCATION_CHARGE;
+        let count = (MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES - prefix_charge) / individual_charge;
+        assert!(count + 1 <= MAX_WRITER_AUXILIARY_CHANNELS);
+        let channels = (0..count + 1)
             .map(|index| {
                 WriterAuxiliaryChannel::try_new(
-                    index,
-                    format!("large_{index}"),
-                    novarocks_type_contract::FunctionValueType::new(large_type.clone(), true),
+                    index as u32,
+                    format!("large_{index:04}"),
+                    value_type.clone(),
                 )
-                .expect("individual channel remains below the schema budget")
+                .expect("individual channel remains below the descriptor limit")
             })
-            .collect();
-        assert!(WriterMultiplexSchema::try_new(channels).is_err());
+            .collect::<Vec<_>>();
+        WriterMultiplexSchema::try_new(channels[..count].to_vec())
+            .expect("combined descriptor boundary");
+        assert_eq!(
+            WriterMultiplexSchema::try_new(channels).unwrap_err().kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+    }
+}
+
+#[cfg(test)]
+mod borrowed_root_descriptor_tests {
+    use super::*;
+    #[test]
+    fn borrowed_root_purposes_match_original_author_and_reject_nested_role_or_metadata_storage() {
+        let original = root_write_result_schema();
+        validate_root_write_result_schema(&original).unwrap();
+        let mut fields = original.fields().iter().cloned().collect::<Vec<_>>();
+        fields[4] = Arc::new(Field::new(
+            ROOT_WRITE_RESULT_INPUT_FIELDS_COLUMN,
+            DataType::List(Arc::new(Field::new("element", DataType::Int32, false))),
+            true,
+        ));
+        assert!(validate_root_write_result_schema(&Schema::new(fields)).is_err());
+        let mut attrs = std::collections::HashMap::with_capacity(1);
+        attrs.insert("opaque".to_owned(), "value".to_owned());
+        attrs.clear();
+        assert!(attrs.capacity() > 0);
+        assert!(
+            validate_root_write_result_schema(
+                &Schema::new(original.fields().clone()).with_metadata(attrs)
+            )
+            .is_err()
+        );
     }
 }

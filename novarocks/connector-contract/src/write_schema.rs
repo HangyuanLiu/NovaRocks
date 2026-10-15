@@ -139,7 +139,35 @@ pub fn validate_write_field_schema_events<E: From<ConnectorError>>(
     decoded_bytes: &mut usize,
     mut observe: impl FnMut(WriteSchemaVisit<'_>) -> Result<(), E>,
 ) -> Result<(), E> {
-    validate_field_core(field, depth, decoded_bytes, &mut observe)
+    validate_field_core(field, depth, decoded_bytes, true, &mut observe)
+}
+
+/// Validate original provider attributes and structural/resource laws beside
+/// an independently supplied complete typed binding. Source attributes confer
+/// no execution semantics; the caller checks the binding/layout correspondence.
+/// Every original name, metadata byte and child occurrence is still observed.
+pub fn validate_write_source_field_schema_events<E: From<ConnectorError>>(
+    field: &Field,
+    depth: usize,
+    decoded_bytes: &mut usize,
+    mut observe: impl FnMut(WriteSchemaVisit<'_>) -> Result<(), E>,
+) -> Result<(), E> {
+    validate_field_core(field, depth, decoded_bytes, false, &mut observe)
+}
+
+pub(crate) fn validate_write_bound_field_schema_events<E: From<ConnectorError>>(
+    binding: crate::ConnectorWriteFieldRef<'_>,
+    depth: usize,
+    decoded_bytes: &mut usize,
+    mut observe: impl FnMut(WriteSchemaVisit<'_>) -> Result<(), E>,
+) -> Result<(), E> {
+    validate_field_core(
+        binding.field(),
+        depth,
+        decoded_bytes,
+        binding.execution_type().is_none(),
+        &mut observe,
+    )
 }
 
 pub fn validate_write_field_schema(
@@ -149,7 +177,7 @@ pub fn validate_write_field_schema(
 ) -> Result<(), ConnectorError> {
     // The existing unobserved contract delegates the same traversal. It does
     // not manufacture a PureCompileControl or certify a preparation budget.
-    validate_field_core(field, depth, decoded_bytes, &mut |_| Ok(()))
+    validate_field_core(field, depth, decoded_bytes, true, &mut |_| Ok(()))
 }
 
 /// Validate the same writer domain on the caller's existing observer. The
@@ -163,7 +191,7 @@ pub fn validate_write_field_schema_observed<E: From<ConnectorError>>(
     decoded_bytes: &mut usize,
     mut observe: impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
-    validate_field_core(field, depth, decoded_bytes, &mut |event| {
+    validate_field_core(field, depth, decoded_bytes, true, &mut |event| {
         if matches!(event, WriteSchemaVisit::Completed) {
             observe()?;
         }
@@ -175,21 +203,30 @@ fn validate_field_core<E: From<ConnectorError>>(
     field: &Field,
     depth: usize,
     decoded_bytes: &mut usize,
+    validate_annotations: bool,
     observe: &mut impl FnMut(WriteSchemaVisit<'_>) -> Result<(), E>,
 ) -> Result<(), E> {
     // Preserve name, logical metadata, entry count and storage diagnostic order.
     observe(WriteSchemaVisit::BeforeField(field))?;
     validate_write_field_name(field.name())?;
-    novarocks_type_contract::field_logical_type(field).map_err(|error| {
-        ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
-    })?;
+    if validate_annotations {
+        novarocks_type_contract::field_logical_type(field).map_err(|error| {
+            ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+        })?;
+    }
     charge_write_field_header(field.name(), field.metadata().len(), decoded_bytes)?;
     observe(WriteSchemaVisit::Completed)?;
     for (key, value) in field.metadata() {
         charge_write_metadata_entry(key, value, decoded_bytes)?;
         observe(WriteSchemaVisit::Completed)?;
     }
-    validate_type_core(field.data_type(), depth, decoded_bytes, observe)
+    validate_type_core(
+        field.data_type(),
+        depth,
+        decoded_bytes,
+        validate_annotations,
+        observe,
+    )
 }
 
 pub fn validate_write_data_type(
@@ -197,7 +234,7 @@ pub fn validate_write_data_type(
     depth: usize,
     decoded_bytes: &mut usize,
 ) -> Result<(), ConnectorError> {
-    validate_type_core(data_type, depth, decoded_bytes, &mut |_| Ok(()))
+    validate_type_core(data_type, depth, decoded_bytes, true, &mut |_| Ok(()))
 }
 
 /// Borrow the caller's observer for the original type traversal. All child
@@ -208,7 +245,7 @@ pub fn validate_write_data_type_observed<E: From<ConnectorError>>(
     decoded_bytes: &mut usize,
     mut observe: impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
-    validate_type_core(data_type, depth, decoded_bytes, &mut |event| {
+    validate_type_core(data_type, depth, decoded_bytes, true, &mut |event| {
         if matches!(event, WriteSchemaVisit::Completed) {
             observe()?;
         }
@@ -220,6 +257,7 @@ fn validate_type_core<E: From<ConnectorError>>(
     data_type: &DataType,
     depth: usize,
     decoded_bytes: &mut usize,
+    validate_annotations: bool,
     observe: &mut impl FnMut(WriteSchemaVisit<'_>) -> Result<(), E>,
 ) -> Result<(), E> {
     observe(WriteSchemaVisit::BeforeType(data_type))?;
@@ -235,24 +273,60 @@ fn validate_type_core<E: From<ConnectorError>>(
         | DataType::FixedSizeList(field, _)
         | DataType::LargeList(field)
         | DataType::LargeListView(field)
-        | DataType::Map(field, _) => validate_field_core(field, depth + 1, decoded_bytes, observe)?,
+        | DataType::Map(field, _) => validate_field_core(
+            field,
+            depth + 1,
+            decoded_bytes,
+            validate_annotations,
+            observe,
+        )?,
         DataType::Struct(fields) => {
             for field in fields {
-                validate_field_core(field, depth + 1, decoded_bytes, observe)?;
+                validate_field_core(
+                    field,
+                    depth + 1,
+                    decoded_bytes,
+                    validate_annotations,
+                    observe,
+                )?;
             }
         }
         DataType::Union(fields, _) => {
             for (_, field) in fields.iter() {
-                validate_field_core(field, depth + 1, decoded_bytes, observe)?;
+                validate_field_core(
+                    field,
+                    depth + 1,
+                    decoded_bytes,
+                    validate_annotations,
+                    observe,
+                )?;
             }
         }
         DataType::Dictionary(key, value) => {
-            validate_type_core(key, depth + 1, decoded_bytes, observe)?;
-            validate_type_core(value, depth + 1, decoded_bytes, observe)?;
+            validate_type_core(key, depth + 1, decoded_bytes, validate_annotations, observe)?;
+            validate_type_core(
+                value,
+                depth + 1,
+                decoded_bytes,
+                validate_annotations,
+                observe,
+            )?;
         }
         DataType::RunEndEncoded(run_ends, values) => {
-            validate_field_core(run_ends, depth + 1, decoded_bytes, observe)?;
-            validate_field_core(values, depth + 1, decoded_bytes, observe)?;
+            validate_field_core(
+                run_ends,
+                depth + 1,
+                decoded_bytes,
+                validate_annotations,
+                observe,
+            )?;
+            validate_field_core(
+                values,
+                depth + 1,
+                decoded_bytes,
+                validate_annotations,
+                observe,
+            )?;
         }
         _ => {}
     }

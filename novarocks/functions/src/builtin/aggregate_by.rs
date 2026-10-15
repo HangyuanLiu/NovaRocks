@@ -19,7 +19,7 @@
 use super::aggregate_by_core::{ByDirection, ByEncodeBuffer, ByState};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_scalar::{self as scalar, ScalarStateError, ScalarWork};
-use crate::kernel_control::{KernelControlObservation, compile_failure, internal, invalid};
+use crate::kernel_control::{KernelControlObservation, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::*;
 use allocator_api2::vec::Vec as HostVec;
@@ -134,7 +134,7 @@ impl ByKernel {
         else {
             unreachable!("validated scalar")
         };
-        &output.data_type
+        output.data_type()
     }
 }
 impl PreparedAggregateKernel for ByKernel {
@@ -379,8 +379,8 @@ pub(super) fn validate_contract(
         ByPreparationDomain::OriginalWindow => false,
     };
     if installed_reader_required
-        && (!super::aggregate_any_value::supported(&value.data_type, work)?
-            || !super::aggregate_any_value::supported(&key.data_type, work)?)
+        && (!super::aggregate_any_value::supported(value.data_type(), work)?
+            || !super::aggregate_any_value::supported(key.data_type(), work)?)
     {
         return Err(invalid(&format!(
             "{} has no installed max_by/min_by input profile for {:?}",
@@ -388,14 +388,8 @@ pub(super) fn validate_contract(
             contract.call().selected().argument_types
         )));
     }
-    let mut expected = value.clone();
-    expected.nullable = true;
-    if !expected
-        .exactly_equals_observed::<KernelFailure>(output, || work.step().map_err(compile_failure))?
-        || !FunctionValueType::new(DataType::Binary, true)
-            .exactly_equals_observed::<KernelFailure>(contract.intermediate_type(), || {
-                work.step().map_err(compile_failure)
-            })?
+    if !super::aggregate_any_value::matches_nullable_source(value, output, work)?
+        || !super::aggregate_any_value::matches_nullable_binary(contract.intermediate_type(), work)?
     {
         return Err(invalid(
             "max_by/min_by selected result or intermediate differs from its exact value and Binary state",

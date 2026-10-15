@@ -21,7 +21,7 @@
 //! the complete fragment and is only an encoding table. It never becomes a
 //! second value identity or a source of plan semantics.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use novarocks_physical_plan::{
@@ -62,702 +62,282 @@ impl WireSlotId {
 /// transparent and pass-through outputs reuse the corresponding child slot.
 /// Expression value references resolve only through the declared input ports
 /// of their owner node.
+#[path = "physical_v1/layout.rs"]
+mod layout;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WireLayout {
     fragment: FragmentId,
-    output_slots: BTreeMap<(NodeId, u32), WireSlotId>,
-    /// Slots for values a node computes but does not publish.
-    ///
-    /// A writer's finish node merges the partial states its writers produced,
-    /// and what that merge produces is consumed inside the same node -- it is
-    /// never a column of the relation the node emits. It still has to live
-    /// somewhere the backend can address, so it gets a slot of its own rather
-    /// than a position in a port it is not in.
-    internal_slots: BTreeMap<(NodeId, ValueId), WireSlotId>,
-    input_slots: BTreeMap<(NodeId, ValueId), Vec<WireSlotId>>,
-    input_edge_slots: BTreeMap<(NodeId, u32, ValueId), Vec<WireSlotId>>,
+    output_slots: Vec<((NodeId, u32), WireSlotId)>,
+    internal_slots: Vec<((NodeId, ValueId), WireSlotId)>,
+    input_slots: Vec<((NodeId, ValueId), (usize, usize))>,
+    input_backing: Vec<WireSlotId>,
+    input_edge_slots: Vec<((NodeId, u32, ValueId), (usize, usize))>,
+    input_edge_backing: Vec<WireSlotId>,
 }
-
-impl WireLayout {
-    pub fn try_new(fragment: &Fragment) -> Result<Self, WireLayoutError> {
-        validate_native_v1_tree_depth(fragment)?;
-        let mut output_slots = BTreeMap::new();
-        let mut next_slot = 1_i32;
-        let mut visiting = BTreeMap::new();
-        let reserved = reserved_write_relation_slots(fragment)?;
-        for node in fragment.nodes().keys().copied() {
-            assign_wire_output(
-                fragment,
-                node,
-                &mut output_slots,
-                &mut next_slot,
-                &mut visiting,
-                &reserved,
-            )?;
-        }
-
-        // Internal values are numbered after every published one, so a plan's
-        // ports keep the slots they would have had without them.
-        let mut internal_slots = BTreeMap::new();
-        for node in fragment.nodes().values() {
-            let NodeKind::TableFinish(spec) = &node.kind else {
-                continue;
-            };
-            let produced = spec.final_aggregates.iter().map(|call| call.output).chain(
-                spec.grouped_unpivot.iter().flat_map(|unpivot| {
-                    [
-                        unpivot.grouping_output,
-                        unpivot.passthrough_output,
-                        unpivot.value_output,
-                    ]
-                    .into_iter()
-                    .chain(unpivot.literal_outputs.iter().copied())
-                }),
-            );
-            for value in produced {
-                if node.output.columns.contains(&value)
-                    || internal_slots.contains_key(&(node.id, value))
-                {
-                    continue;
-                }
-                let slot = WireSlotId(next_slot);
-                next_slot = next_slot.checked_add(1).ok_or(
-                    WireLayoutError::OutputOccurrenceSpaceExhausted {
-                        fragment: fragment.id(),
-                        node: node.id,
-                    },
-                )?;
-                internal_slots.insert((node.id, value), slot);
-            }
-        }
-
-        let mut input_slots = BTreeMap::new();
-        let mut input_edge_slots = BTreeMap::new();
-        for node in fragment.nodes().values() {
-            for (input_ordinal, input) in node.inputs.iter().enumerate() {
-                let input_ordinal = u32::try_from(input_ordinal).map_err(|_| {
-                    WireLayoutError::InputOrdinalSpaceExhausted {
-                        fragment: fragment.id(),
-                        node: node.id,
-                    }
-                })?;
-                let input_node =
-                    fragment
-                        .nodes()
-                        .get(input)
-                        .ok_or(WireLayoutError::MissingInputNode {
-                            fragment: fragment.id(),
-                            node: node.id,
-                            input: *input,
-                        })?;
-                for (ordinal, value) in input_node.output.columns.iter().copied().enumerate() {
-                    let ordinal = u32::try_from(ordinal).map_err(|_| {
-                        WireLayoutError::OutputOccurrenceSpaceExhausted {
-                            fragment: fragment.id(),
-                            node: *input,
-                        }
-                    })?;
-                    let slot = output_slots[&(*input, ordinal)];
-                    input_slots
-                        .entry((node.id, value))
-                        .or_insert_with(Vec::new)
-                        .push(slot);
-                    input_edge_slots
-                        .entry((node.id, input_ordinal, value))
-                        .or_insert_with(Vec::new)
-                        .push(slot);
-                }
-            }
-        }
-
-        Ok(Self {
-            fragment: fragment.id(),
-            output_slots,
-            internal_slots,
-            input_slots,
-            input_edge_slots,
-        })
+struct PureLayoutControl;
+impl novarocks_type_contract::PureCompileControl for PureLayoutControl {
+    fn checkpoint(
+        &self,
+        _: novarocks_type_contract::CompilePhase,
+        _: u32,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        Ok(())
     }
-
+}
+fn pure_layout<T>(
+    body: impl FnOnce(&mut layout::Context<'_, '_, WireLayoutError>) -> Result<T, WireLayoutError>,
+) -> Result<T, WireLayoutError> {
+    let mut request = |_: std::alloc::Layout| Ok(());
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        &PureLayoutControl,
+        novarocks_type_contract::CompilePhase::Validate,
+    )?;
+    let result = body(&mut layout::Context {
+        request: &mut request,
+        work: &mut work,
+    });
+    if matches!(&result, Err(WireLayoutError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+fn find_layout_key<K: Ord, T>(
+    values: &[(K, T)],
+    key: &K,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<Option<usize>, novarocks_type_contract::CompileControlError> {
+    let (mut low, mut high) = (0, values.len());
+    while low < high {
+        work.step()?;
+        let middle = low + (high - low) / 2;
+        match values[middle].0.cmp(key) {
+            std::cmp::Ordering::Equal => return Ok(Some(middle)),
+            std::cmp::Ordering::Less => low = middle + 1,
+            std::cmp::Ordering::Greater => high = middle,
+        }
+    }
+    Ok(None)
+}
+impl WireLayout {
+    /// Pure expansion adapter. Production encoding supplies its actual creator.
+    pub fn try_new(fragment: &Fragment) -> Result<Self, WireLayoutError> {
+        pure_layout(|context| layout::construct(fragment, context))
+    }
+    pub fn try_new_observed<
+        E: From<WireLayoutError> + From<novarocks_type_contract::CompileControlError>,
+    >(
+        fragment: &Fragment,
+        request: &mut impl FnMut(std::alloc::Layout) -> Result<(), E>,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<Self, E> {
+        layout::construct(fragment, &mut layout::Context { request, work })
+    }
     pub const fn fragment(&self) -> FragmentId {
         self.fragment
     }
-
-    /// The slot a node computes one unpublished value in, if it has one.
     pub fn internal_slot(&self, node: NodeId, value: ValueId) -> Option<WireSlotId> {
-        self.internal_slots.get(&(node, value)).copied()
+        self.internal_slots
+            .binary_search_by_key(&(node, value), |entry| entry.0)
+            .ok()
+            .map(|index| self.internal_slots[index].1)
     }
-
+    pub fn internal_slot_observed<E: From<novarocks_type_contract::CompileControlError>>(
+        &self,
+        node: NodeId,
+        value: ValueId,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<Option<WireSlotId>, E> {
+        Ok(find_layout_key(&self.internal_slots, &(node, value), work)?
+            .map(|index| self.internal_slots[index].1))
+    }
     pub fn output_slot(
         &self,
         node: NodeId,
         occurrence: u32,
     ) -> Result<WireSlotId, WireLayoutError> {
-        self.output_slots.get(&(node, occurrence)).copied().ok_or(
+        self.output_slots
+            .binary_search_by_key(&(node, occurrence), |entry| entry.0)
+            .ok()
+            .map(|index| self.output_slots[index].1)
+            .ok_or(WireLayoutError::MissingOutputOccurrence {
+                fragment: self.fragment,
+                node,
+                occurrence,
+            })
+    }
+    pub fn output_slot_observed<
+        E: From<WireLayoutError> + From<novarocks_type_contract::CompileControlError>,
+    >(
+        &self,
+        node: NodeId,
+        occurrence: u32,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<WireSlotId, E> {
+        let index = find_layout_key(&self.output_slots, &(node, occurrence), work)?.ok_or(
             WireLayoutError::MissingOutputOccurrence {
                 fragment: self.fragment,
                 node,
                 occurrence,
             },
-        )
+        )?;
+        Ok(self.output_slots[index].1)
     }
-
-    pub fn input_value_slot(
-        &self,
-        node: NodeId,
-        value: ValueId,
-    ) -> Result<WireSlotId, WireLayoutError> {
-        self.input_slots
-            .get(&(node, value))
-            .and_then(|slots| slots.first())
-            .copied()
-            .ok_or(WireLayoutError::ValueOutsideInputPort {
-                fragment: self.fragment,
-                node,
-                value,
-            })
-    }
-
-    /// Every direct-input occurrence for one semantic value, in child/column order.
     pub fn input_value_slots(
         &self,
         node: NodeId,
         value: ValueId,
     ) -> Result<&[WireSlotId], WireLayoutError> {
-        self.input_slots
-            .get(&(node, value))
-            .map(Vec::as_slice)
-            .ok_or(WireLayoutError::ValueOutsideInputPort {
+        let index = self
+            .input_slots
+            .binary_search_by_key(&(node, value), |entry| entry.0)
+            .map_err(|_| WireLayoutError::ValueOutsideInputPort {
                 fragment: self.fragment,
                 node,
                 value,
+            })?;
+        let (start, len) = self.input_slots[index].1;
+        Ok(&self.input_backing[start..start + len])
+    }
+    pub fn input_value_slot(
+        &self,
+        node: NodeId,
+        value: ValueId,
+    ) -> Result<WireSlotId, WireLayoutError> {
+        self.input_value_slots(node, value)?.first().copied().ok_or(
+            WireLayoutError::ValueOutsideInputPort {
+                fragment: self.fragment,
+                node,
+                value,
+            },
+        )
+    }
+    pub fn input_value_slots_observed<
+        E: From<WireLayoutError> + From<novarocks_type_contract::CompileControlError>,
+    >(
+        &self,
+        node: NodeId,
+        value: ValueId,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<&[WireSlotId], E> {
+        let index = find_layout_key(&self.input_slots, &(node, value), work)?.ok_or(
+            WireLayoutError::ValueOutsideInputPort {
+                fragment: self.fragment,
+                node,
+                value,
+            },
+        )?;
+        let (start, len) = self.input_slots[index].1;
+        Ok(&self.input_backing[start..start + len])
+    }
+    pub fn input_value_slot_observed<
+        E: From<WireLayoutError> + From<novarocks_type_contract::CompileControlError>,
+    >(
+        &self,
+        node: NodeId,
+        value: ValueId,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<WireSlotId, E> {
+        self.input_value_slots_observed::<E>(node, value, work)?
+            .first()
+            .copied()
+            .ok_or_else(|| {
+                WireLayoutError::ValueOutsideInputPort {
+                    fragment: self.fragment,
+                    node,
+                    value,
+                }
+                .into()
             })
     }
-
-    /// Resolve a semantic value within one exact direct-child input port.
     pub fn input_value_slot_at(
         &self,
         node: NodeId,
         input_ordinal: u32,
         value: ValueId,
     ) -> Result<WireSlotId, WireLayoutError> {
-        self.input_edge_slots
-            .get(&(node, input_ordinal, value))
-            .and_then(|slots| slots.first())
-            .copied()
-            .ok_or(WireLayoutError::ValueOutsideInputOccurrence {
+        let index = self
+            .input_edge_slots
+            .binary_search_by_key(&(node, input_ordinal, value), |entry| entry.0)
+            .map_err(|_| WireLayoutError::ValueOutsideInputOccurrence {
                 fragment: self.fragment,
                 node,
                 input_ordinal,
                 value,
-            })
+            })?;
+        let (start, _) = self.input_edge_slots[index].1;
+        Ok(self.input_edge_backing[start])
     }
-
-    /// Translate an ordered value projection through one exact output port.
-    ///
-    /// Repeated values consume repeated occurrences from left to right. A
-    /// projection cannot manufacture another occurrence of a value that the
-    /// source port did not publish.
+    pub fn input_value_slot_at_observed<
+        E: From<WireLayoutError> + From<novarocks_type_contract::CompileControlError>,
+    >(
+        &self,
+        node: NodeId,
+        input_ordinal: u32,
+        value: ValueId,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<WireSlotId, E> {
+        let index = find_layout_key(&self.input_edge_slots, &(node, input_ordinal, value), work)?
+            .ok_or(WireLayoutError::ValueOutsideInputOccurrence {
+            fragment: self.fragment,
+            node,
+            input_ordinal,
+            value,
+        })?;
+        let (start, _) = self.input_edge_slots[index].1;
+        Ok(self.input_edge_backing[start])
+    }
+    /// Pure expansion projection; observed production uses the same body.
     pub fn project_output(
         &self,
         fragment: &Fragment,
         node: NodeId,
         projection: &[ValueId],
     ) -> Result<Vec<WireSlotId>, WireLayoutError> {
-        if fragment.id() != self.fragment {
-            return Err(WireLayoutError::FragmentMismatch {
-                expected: self.fragment,
-                actual: fragment.id(),
-            });
-        }
-        let source = fragment
-            .nodes()
-            .get(&node)
-            .ok_or(WireLayoutError::MissingProjectionNode {
-                fragment: self.fragment,
-                node,
-            })?;
-        let mut available = BTreeMap::<ValueId, VecDeque<WireSlotId>>::new();
-        for (ordinal, value) in source.output.columns.iter().copied().enumerate() {
-            let ordinal = u32::try_from(ordinal).map_err(|_| {
-                WireLayoutError::OutputOccurrenceSpaceExhausted {
-                    fragment: self.fragment,
-                    node,
-                }
-            })?;
-            available
-                .entry(value)
-                .or_default()
-                .push_back(self.output_slot(node, ordinal)?);
-        }
-        projection
-            .iter()
-            .copied()
-            .map(|value| {
-                available
-                    .get_mut(&value)
-                    .and_then(VecDeque::pop_front)
-                    .ok_or(WireLayoutError::ProjectionOccurrenceMissing {
-                        fragment: self.fragment,
-                        node,
-                        value,
-                    })
-            })
-            .collect()
+        pure_layout(|context| layout::project(self, fragment, node, projection, context))
+    }
+    pub fn project_output_observed<
+        E: From<WireLayoutError> + From<novarocks_type_contract::CompileControlError>,
+    >(
+        &self,
+        fragment: &Fragment,
+        node: NodeId,
+        projection: &[ValueId],
+        request: &mut impl FnMut(std::alloc::Layout) -> Result<(), E>,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<Vec<WireSlotId>, E> {
+        layout::project(
+            self,
+            fragment,
+            node,
+            projection,
+            &mut layout::Context { request, work },
+        )
     }
 }
-
-/// Validate native-v1 wire nesting without recursive traversal.
-///
-/// This is deliberately the first operation in both physical-plan preflight
-/// and standalone layout construction, before either recursive encoder pass
-/// can consume the frontend thread stack.
-fn validate_native_v1_tree_depth(fragment: &Fragment) -> Result<(), WireLayoutError> {
-    native_v1_node_wire_depths(fragment).map(|_| ())
+pub(crate) fn native_v1_node_wire_depths_observed<
+    E: From<WireLayoutError> + From<novarocks_type_contract::CompileControlError>,
+>(
+    fragment: &Fragment,
+    request: &mut impl FnMut(std::alloc::Layout) -> Result<(), E>,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<Vec<(NodeId, usize)>, E> {
+    layout::depths(fragment, &mut layout::Context { request, work })
 }
-
+fn validate_native_v1_tree_depth(fragment: &Fragment) -> Result<(), WireLayoutError> {
+    pure_layout(|context| layout::depths(fragment, context).map(|_| ()))
+}
+/// Pure expansion collector; actual creators use the sorted-vector body.
 pub(crate) fn native_v1_node_wire_depths(
     fragment: &Fragment,
 ) -> Result<BTreeMap<NodeId, usize>, WireLayoutError> {
-    let mut remaining_inputs = BTreeMap::new();
-    let mut dependents = BTreeMap::<NodeId, Vec<NodeId>>::new();
-    let mut ready = Vec::new();
-    for (node_id, node) in fragment.nodes() {
-        let unique_inputs = node.inputs.iter().copied().collect::<BTreeSet<_>>();
-        for input in &unique_inputs {
-            if !fragment.nodes().contains_key(input) {
-                return Err(WireLayoutError::MissingInputNode {
-                    fragment: fragment.id(),
-                    node: *node_id,
-                    input: *input,
-                });
-            }
-            dependents.entry(*input).or_default().push(*node_id);
-        }
-        remaining_inputs.insert(*node_id, unique_inputs.len());
-        if unique_inputs.is_empty() {
-            ready.push(*node_id);
-        }
-    }
-
-    let mut depths = BTreeMap::<NodeId, usize>::new();
-    let mut topological = Vec::with_capacity(fragment.nodes().len());
-    while let Some(node_id) = ready.pop() {
-        let node =
-            fragment
-                .nodes()
-                .get(&node_id)
-                .ok_or(WireLayoutError::MissingProjectionNode {
-                    fragment: fragment.id(),
-                    node: node_id,
-                })?;
-        let depth = node
-            .inputs
-            .iter()
-            .filter_map(|input| depths.get(input).copied())
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        if depth > NATIVE_V1_MAX_TREE_DEPTH {
-            return Err(WireLayoutError::TreeDepthExceeded {
-                fragment: fragment.id(),
-                depth,
-                max: NATIVE_V1_MAX_TREE_DEPTH,
-            });
-        }
-        depths.insert(node_id, depth);
-        topological.push(node_id);
-        if let Some(users) = dependents.get(&node_id) {
-            for user in users {
-                let remaining = remaining_inputs.get_mut(user).ok_or(
-                    WireLayoutError::MissingProjectionNode {
-                        fragment: fragment.id(),
-                        node: *user,
-                    },
-                )?;
-                *remaining -= 1;
-                if *remaining == 0 {
-                    ready.push(*user);
-                }
-            }
-        }
-    }
-    if depths.len() != fragment.nodes().len() {
-        return Err(WireLayoutError::MechanicalOutputMismatch {
-            fragment: fragment.id(),
-            node: fragment.root(),
-            reason: "node graph contains a cycle".into(),
-        });
-    }
-    let mut wire_depths = BTreeMap::from([(fragment.root(), 1_usize)]);
-    for node_id in topological.into_iter().rev() {
-        let Some(depth) = wire_depths.get(&node_id).copied() else {
-            continue;
-        };
-        let node = &fragment.nodes()[&node_id];
-        for input in &node.inputs {
-            let candidate = depth.saturating_add(1);
-            wire_depths
-                .entry(*input)
-                .and_modify(|current| *current = (*current).max(candidate))
-                .or_insert(candidate);
-        }
-    }
-    Ok(wire_depths)
-}
-
-/// The slots a fragment's write-relation columns are addressed by.
-///
-/// A write relation's fixed columns have ids its contract reserves, and a
-/// reader finds them by those ids rather than by where this plan happens to
-/// put them -- that is what lets a writer's rows be read by a finish node that
-/// knows only the contract. Everything else in a fragment is numbered from
-/// where its producer puts it, so the two never collide: the reserved ids sit
-/// at the top of the slot space.
-fn reserved_write_relation_slots(
-    fragment: &Fragment,
-) -> Result<BTreeMap<ValueId, WireSlotId>, WireLayoutError> {
-    use novarocks_spi::connector::write_stack::{
-        ROOT_WRITE_RESULT_COLUMN_COUNT, WRITE_RELATION_COLUMN_COUNT, root_write_result_column_id,
-        write_relation_column_id,
-    };
-
-    let mut reserved: BTreeMap<ValueId, WireSlotId> = BTreeMap::new();
-    let mut reserve = |schema: &novarocks_physical_plan::WriterRelationSchema,
-                       count: usize,
-                       id: fn(usize) -> u32,
-                       node: NodeId|
-     -> Result<(), WireLayoutError> {
-        for (ordinal, field) in schema.fields.iter().take(count).enumerate() {
-            let slot = WireSlotId(i32::try_from(id(ordinal)).map_err(|_| {
-                WireLayoutError::MechanicalOutputMismatch {
-                    fragment: fragment.id(),
-                    node,
-                    reason: "write relation column id exceeds the wire slot space".into(),
-                }
-            })?);
-            if reserved
-                .insert(field.value, slot)
-                .is_some_and(|prior| prior != slot)
-            {
-                return Err(WireLayoutError::MechanicalOutputMismatch {
-                    fragment: fragment.id(),
-                    node,
-                    reason: "one value is two different write relation columns".into(),
-                });
-            }
-        }
-        Ok(())
-    };
-
-    for node in fragment.nodes().values() {
-        match &node.kind {
-            NodeKind::TableWriter { target } => reserve(
-                &target.output_schema,
-                WRITE_RELATION_COLUMN_COUNT,
-                write_relation_column_id,
-                node.id,
-            )?,
-            NodeKind::TableFinish(spec) => {
-                reserve(
-                    &spec.input_schema,
-                    WRITE_RELATION_COLUMN_COUNT,
-                    write_relation_column_id,
-                    node.id,
-                )?;
-                reserve(
-                    &spec.output_schema,
-                    ROOT_WRITE_RESULT_COLUMN_COUNT,
-                    root_write_result_column_id,
-                    node.id,
-                )?;
-            }
-            _ => {}
-        }
-    }
-    Ok(reserved)
-}
-
-fn assign_wire_output(
-    fragment: &Fragment,
-    node_id: NodeId,
-    output_slots: &mut BTreeMap<(NodeId, u32), WireSlotId>,
-    next_slot: &mut i32,
-    visiting: &mut BTreeMap<NodeId, bool>,
-    reserved: &BTreeMap<ValueId, WireSlotId>,
-) -> Result<(), WireLayoutError> {
-    if visiting.get(&node_id) == Some(&false) {
-        return Ok(());
-    }
-    if visiting.insert(node_id, true) == Some(true) {
-        return Err(WireLayoutError::MechanicalOutputMismatch {
-            fragment: fragment.id(),
-            node: node_id,
-            reason: "node graph contains a cycle".into(),
-        });
-    }
-    let node = fragment
-        .nodes()
-        .get(&node_id)
-        .ok_or(WireLayoutError::MissingProjectionNode {
-            fragment: fragment.id(),
-            node: node_id,
-        })?;
-    for input in &node.inputs {
-        if !fragment.nodes().contains_key(input) {
-            return Err(WireLayoutError::MissingInputNode {
-                fragment: fragment.id(),
-                node: node.id,
-                input: *input,
-            });
-        }
-        assign_wire_output(
-            fragment,
-            *input,
-            output_slots,
-            next_slot,
-            visiting,
-            reserved,
-        )?;
-    }
-
-    let slots = mechanical_output_slots(fragment, node, output_slots, next_slot)?;
-    if slots.len() != node.output.columns.len() {
-        return Err(WireLayoutError::MechanicalOutputMismatch {
-            fragment: fragment.id(),
-            node: node.id,
-            reason: format!(
-                "wire output width {} differs from final output width {}",
-                slots.len(),
-                node.output.columns.len()
-            ),
-        });
-    }
-    for (ordinal, slot) in slots.into_iter().enumerate() {
-        // A write-relation column keeps the id its contract reserves wherever
-        // it appears, so a node that produces or passes one addresses it by
-        // that id rather than by where this node puts it.
-        let slot = node
-            .output
-            .columns
-            .get(ordinal)
-            .and_then(|value| reserved.get(value))
-            .copied()
-            .unwrap_or(slot);
-        let ordinal = u32::try_from(ordinal).map_err(|_| {
-            WireLayoutError::OutputOccurrenceSpaceExhausted {
-                fragment: fragment.id(),
-                node: node.id,
-            }
-        })?;
-        output_slots.insert((node.id, ordinal), slot);
-    }
-    visiting.insert(node_id, false);
-    Ok(())
-}
-
-fn mechanical_output_slots(
-    fragment: &Fragment,
-    node: &novarocks_physical_plan::PhysicalNode,
-    output_slots: &BTreeMap<(NodeId, u32), WireSlotId>,
-    next_slot: &mut i32,
-) -> Result<Vec<WireSlotId>, WireLayoutError> {
-    use novarocks_physical_plan::{JoinKind, TableFunctionOutput, ValueOrigin};
-
-    let child = |ordinal: usize| -> Result<(&[ValueId], Vec<WireSlotId>), WireLayoutError> {
-        let input =
-            node.inputs
-                .get(ordinal)
-                .ok_or_else(|| WireLayoutError::MechanicalOutputMismatch {
-                    fragment: fragment.id(),
-                    node: node.id,
-                    reason: format!("wire output contract requires child {ordinal}"),
-                })?;
-        let child = &fragment.nodes()[input];
-        let slots = child
-            .output
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(column, _)| {
-                let column = u32::try_from(column).map_err(|_| {
-                    WireLayoutError::OutputOccurrenceSpaceExhausted {
-                        fragment: fragment.id(),
-                        node: *input,
-                    }
-                })?;
-                Ok(output_slots[&(*input, column)])
-            })
-            .collect::<Result<Vec<_>, WireLayoutError>>()?;
-        Ok((&child.output.columns, slots))
-    };
-    let allocate = |count: usize, next_slot: &mut i32| {
-        (0..count)
-            .map(|_| allocate_wire_slot(fragment.id(), next_slot))
-            .collect::<Result<Vec<_>, _>>()
-    };
-    let exact = |expected_values: &[ValueId], slots: Vec<WireSlotId>| {
-        if expected_values != node.output.columns.as_ref() {
-            Err(WireLayoutError::MechanicalOutputMismatch {
-                fragment: fragment.id(),
-                node: node.id,
-                reason: "final output order differs from the backend v1 mechanical output".into(),
-            })
-        } else {
-            Ok(slots)
-        }
-    };
-
-    match &node.kind {
-        NodeKind::Scan { .. }
-        | NodeKind::Project { .. }
-        | NodeKind::Aggregate { .. }
-        | NodeKind::SetOp { .. }
-        | NodeKind::Values { .. }
-        | NodeKind::Unpivot { .. }
-        | NodeKind::GenerateSeries { .. }
-        | NodeKind::ChangeEventExpand { .. }
-        | NodeKind::TableWriter { .. }
-        | NodeKind::TableFinish(_)
-        | NodeKind::ExchangeSource { .. } => allocate(node.output.columns.len(), next_slot),
-        NodeKind::Filter { .. }
-        | NodeKind::Sort { .. }
-        | NodeKind::TopN { .. }
-        | NodeKind::Limit { .. }
-        | NodeKind::AssertOneRow(_) => {
-            let (values, slots) = child(0)?;
-            exact(values, slots)
-        }
-        NodeKind::Window(spec) => {
-            let (values, mut slots) = child(0)?;
-            let expected = values
-                .iter()
-                .copied()
-                .chain(spec.expressions.iter().map(|expression| expression.output))
-                .collect::<Vec<_>>();
-            slots.extend(allocate(spec.expressions.len(), next_slot)?);
-            exact(&expected, slots)
-        }
-        NodeKind::Repeat {
-            grouping_values,
-            grouping_outputs,
-            ..
-        } => {
-            let (values, mut slots) = child(0)?;
-            let replacements = grouping_values.iter().copied().collect::<BTreeMap<_, _>>();
-            let expected = values
-                .iter()
-                .map(|value| replacements.get(value).copied().unwrap_or(*value))
-                .chain(grouping_outputs.iter().map(|output| output.output))
-                .collect::<Vec<_>>();
-            slots.extend(allocate(grouping_outputs.len(), next_slot)?);
-            exact(&expected, slots)
-        }
-        NodeKind::TableFunction { outputs, .. } => {
-            let (values, mut slots) = child(0)?;
-            let mut results = outputs
-                .iter()
-                .filter_map(|output| match output {
-                    TableFunctionOutput::PassThrough(_) => None,
-                    TableFunctionOutput::FunctionResult {
-                        result_ordinal,
-                        value,
-                    } => Some((*result_ordinal, *value)),
-                })
-                .collect::<Vec<_>>();
-            results.sort_by_key(|(ordinal, _)| *ordinal);
-            let expected = values
-                .iter()
-                .copied()
-                .chain(results.iter().map(|(_, value)| *value))
-                .collect::<Vec<_>>();
-            slots.extend(allocate(results.len(), next_slot)?);
-            exact(&expected, slots)
-        }
-        NodeKind::HashJoin {
-            kind,
-            null_extended,
-            ..
-        }
-        | NodeKind::NestLoopJoin {
-            kind,
-            null_extended,
-            ..
-        } => {
-            let (left_values, left_slots) = child(0)?;
-            let (right_values, right_slots) = child(1)?;
-            let (base_values, base_slots) = match kind {
-                JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => {
-                    (left_values.to_vec(), left_slots)
-                }
-                JoinKind::RightSemi | JoinKind::RightAnti => (right_values.to_vec(), right_slots),
-                _ => (
-                    left_values
-                        .iter()
-                        .chain(right_values.iter())
-                        .copied()
-                        .collect(),
-                    left_slots.into_iter().chain(right_slots).collect(),
-                ),
-            };
-            let nulls = null_extended
-                .iter()
-                .filter_map(|value| {
-                    let definition = fragment.values().get(value)?;
-                    match definition.origin {
-                        ValueOrigin::NullExtended { of, .. } => Some((of, *value)),
-                        _ => None,
-                    }
-                })
-                .collect::<BTreeMap<_, _>>();
-            let mut available = BTreeMap::<ValueId, VecDeque<WireSlotId>>::new();
-            for (value, slot) in base_values.into_iter().zip(base_slots) {
-                available.entry(value).or_default().push_back(slot);
-            }
-            node.output
-                .columns
-                .iter()
-                .copied()
-                .map(|value| {
-                    let source = nulls
-                        .iter()
-                        .find_map(|(source, replacement)| {
-                            (*replacement == value).then_some(*source)
-                        })
-                        .unwrap_or(value);
-                    available
-                        .get_mut(&source)
-                        .and_then(VecDeque::pop_front)
-                        .ok_or_else(|| WireLayoutError::MechanicalOutputMismatch {
-                            fragment: fragment.id(),
-                            node: node.id,
-                            reason: format!(
-                                "join output value {} has no remaining v1 source occurrence",
-                                value.get()
-                            ),
-                        })
-                })
-                .collect()
-        }
-    }
-}
-
-fn allocate_wire_slot(
-    fragment: FragmentId,
-    next_slot: &mut i32,
-) -> Result<WireSlotId, WireLayoutError> {
-    if *next_slot <= 0 {
-        return Err(WireLayoutError::SlotSpaceExhausted { fragment });
-    }
-    let slot = WireSlotId(*next_slot);
-    *next_slot = next_slot
-        .checked_add(1)
-        .ok_or(WireLayoutError::SlotSpaceExhausted { fragment })?;
-    Ok(slot)
+    pure_layout(|context| layout::depths(fragment, context))
+        .map(|values| values.into_iter().collect())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WireLayoutError {
+    Control(novarocks_type_contract::CompileControlError),
     TreeDepthExceeded {
         fragment: FragmentId,
         depth: usize,
@@ -818,6 +398,7 @@ pub enum WireLayoutError {
 impl fmt::Display for WireLayoutError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Control(error) => error.fmt(formatter),
             Self::TreeDepthExceeded {
                 fragment,
                 depth,
@@ -928,20 +509,151 @@ impl fmt::Display for WireLayoutError {
 }
 
 impl std::error::Error for WireLayoutError {}
+impl From<novarocks_type_contract::CompileControlError> for WireLayoutError {
+    fn from(error: novarocks_type_contract::CompileControlError) -> Self {
+        Self::Control(error)
+    }
+}
 
 /// Reject final-plan vocabulary that the v1 protobuf cannot carry losslessly.
 ///
 /// This runs before a wire layout or protobuf tree is allocated. It never
 /// patches unsupported semantics into a nearby v1 shape.
 pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1PreflightError> {
-    for fragment in plan.fragments().values() {
+    preflight_physical_plan_inner(plan, false, &mut PurePreflight)
+}
+/// The full execution table preserves recursive semantics and exact layouts.
+/// All original node, expression, function and tree laws remain shared; its
+/// bookkeeping is admitted by the original caller before construction.
+pub(crate) fn preflight_physical_plan_typed<H>(
+    plan: &PhysicalPlan,
+    resources: &mut crate::physical_encode::fragment_type_owner::TypeEncodingResources<'_, H>,
+) -> crate::physical_encode::fragment_type_owner::TypeEncodingResult<(), H> {
+    preflight_physical_plan_inner(plan, true, &mut ObservedPreflight(resources))
+}
+
+trait PreflightPreparation {
+    type Error: From<PhysicalV1PreflightError>;
+    fn step(&mut self) -> Result<(), Self::Error>;
+    fn depth(&mut self, fragment: &Fragment) -> Result<(), Self::Error>;
+    fn repeated_input(&mut self, fragment: &Fragment) -> Result<Option<NodeId>, Self::Error>;
+    fn cast_layout(
+        &mut self,
+        left: &arrow::datatypes::DataType,
+        right: &arrow::datatypes::DataType,
+    ) -> Result<bool, Self::Error>;
+}
+fn preflight_node_identity(
+    fragment: &Fragment,
+    node: &novarocks_physical_plan::PhysicalNode,
+) -> Result<(), PhysicalV1PreflightError> {
+    if node.id.get() > i32::MAX as u32 {
+        return Err(PhysicalV1PreflightError::NodeIdentity {
+            fragment: fragment.id(),
+            node: node.id,
+        });
+    }
+    Ok(())
+}
+struct PurePreflight;
+impl PreflightPreparation for PurePreflight {
+    type Error = PhysicalV1PreflightError;
+    fn step(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn depth(&mut self, fragment: &Fragment) -> Result<(), Self::Error> {
         validate_native_v1_tree_depth(fragment).map_err(|error| {
             PhysicalV1PreflightError::TreeDepth {
                 fragment: fragment.id(),
                 reason: error.to_string().into(),
             }
-        })?;
+        })
+    }
+    fn repeated_input(&mut self, fragment: &Fragment) -> Result<Option<NodeId>, Self::Error> {
+        let mut uses = BTreeSet::new();
+        for node in fragment.nodes().values() {
+            preflight_node_identity(fragment, node)?;
+            for input in &node.inputs {
+                if !uses.insert(*input) {
+                    return Ok(Some(*input));
+                }
+            }
+        }
+        Ok(None)
+    }
+    fn cast_layout(
+        &mut self,
+        left: &arrow::datatypes::DataType,
+        right: &arrow::datatypes::DataType,
+    ) -> Result<bool, Self::Error> {
+        // Legacy expansion never selects this complete-binding branch.
+        Ok(left == right)
+    }
+}
+struct ObservedPreflight<'a, 'c, H>(
+    &'a mut crate::physical_encode::fragment_type_owner::TypeEncodingResources<'c, H>,
+);
+impl<H> PreflightPreparation for ObservedPreflight<'_, '_, H> {
+    type Error = crate::host_projection_v2::ProjectionFailure<crate::PhysicalEncodeError, H>;
+    fn step(&mut self) -> Result<(), Self::Error> {
+        self.0.work.step().map_err(Into::into)
+    }
+    fn depth(&mut self, fragment: &Fragment) -> Result<(), Self::Error> {
+        native_v1_node_wire_depths_observed(
+            fragment,
+            &mut |layout| crate::physical_encode::request_layout(layout, self.0.request),
+            &mut self.0.work,
+        )
+        .map(|_| ())
+    }
+    fn repeated_input(&mut self, fragment: &Fragment) -> Result<Option<NodeId>, Self::Error> {
+        let mut uses = self.0.vector(fragment.nodes().len())?;
+        for node in fragment.nodes().values() {
+            self.step()?;
+            uses.push((node.id, false));
+        }
+        for node in fragment.nodes().values() {
+            self.step()?;
+            preflight_node_identity(fragment, node)?;
+            for input in &node.inputs {
+                let index = find_layout_key(&uses, input, &mut self.0.work)?
+                    .ok_or("native preflight input node is absent")?;
+                if uses[index].1 {
+                    return Ok(Some(*input));
+                }
+                uses[index].1 = true;
+            }
+        }
+        Ok(None)
+    }
+    fn cast_layout(
+        &mut self,
+        left: &arrow::datatypes::DataType,
+        right: &arrow::datatypes::DataType,
+    ) -> Result<bool, Self::Error> {
+        novarocks_type_contract::arrow_data_types_exact_observed(left, right, || {
+            self.0.work.step().map_err(Into::into)
+        })
+    }
+}
+fn preflight_physical_plan_inner<P: PreflightPreparation>(
+    plan: &PhysicalPlan,
+    complete_types: bool,
+    preparation: &mut P,
+) -> Result<(), P::Error> {
+    let validate_type = |ty: &novarocks_physical_plan::ValueType| -> Result<(), String> {
+        if complete_types {
+            ty.validate().map_err(|error| error.to_string())
+        } else {
+            validate_physical_type(ty.data_type())
+        }
+    };
+
+    for fragment in plan.fragments().values() {
+        preparation.step()?;
+        preparation.depth(fragment)?;
         for value in fragment.values().values() {
+            preparation.step()?;
             if matches!(value.origin, ValueOrigin::WriterDerived { .. }) {
                 // Writer relation values are carried by the exact
                 // ArrowPhysicalColumn schema on TableWriter/TableFinish. They
@@ -950,16 +662,15 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
                 // preflight remains authoritative for such a use.
                 continue;
             }
-            validate_physical_type(&value.ty.data_type).map_err(|reason| {
-                PhysicalV1PreflightError::TypeShape {
-                    fragment: fragment.id(),
-                    subject: format!("value {}", value.id.get()).into(),
-                    reason: reason.into(),
-                }
+            validate_type(&value.ty).map_err(|reason| PhysicalV1PreflightError::TypeShape {
+                fragment: fragment.id(),
+                subject: format!("value {}", value.id.get()).into(),
+                reason: reason.into(),
             })?;
         }
         for (expression_id, expression) in fragment.expressions().iter() {
-            validate_physical_type(&expression.ty.data_type).map_err(|reason| {
+            preparation.step()?;
+            validate_type(&expression.ty).map_err(|reason| {
                 PhysicalV1PreflightError::TypeShape {
                     fragment: fragment.id(),
                     subject: format!("expression {}", expression_id.get()).into(),
@@ -967,23 +678,32 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
                 }
             })?;
             if let ExprKind::Cast { target, .. } = &expression.kind {
-                validate_physical_type(target).map_err(|reason| {
-                    PhysicalV1PreflightError::TypeShape {
-                        fragment: fragment.id(),
-                        subject: format!("expression {} cast target", expression_id.get()).into(),
-                        reason: reason.into(),
+                let valid = if complete_types {
+                    if preparation.cast_layout(expression.ty.data_type(), target)? {
+                        Ok(())
+                    } else {
+                        Err("cast target differs from its exact declared binding layout".into())
                     }
+                } else {
+                    validate_physical_type(target)
+                };
+                valid.map_err(|reason| PhysicalV1PreflightError::TypeShape {
+                    fragment: fragment.id(),
+                    subject: format!("expression {} cast target", expression_id.get()).into(),
+                    reason: reason.into(),
                 })?;
             }
         }
         for node in fragment.nodes().values() {
+            preparation.step()?;
             if !matches!(
                 node.kind,
                 NodeKind::TableWriter { .. } | NodeKind::TableFinish(_) | NodeKind::Unpivot { .. }
             ) {
                 for value in &node.output.columns {
+                    preparation.step()?;
                     let definition = &fragment.values()[value];
-                    validate_physical_type(&definition.ty.data_type).map_err(|reason| {
+                    validate_type(&definition.ty).map_err(|reason| {
                         PhysicalV1PreflightError::TypeShape {
                             fragment: fragment.id(),
                             subject: format!(
@@ -999,7 +719,8 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
             }
             if let NodeKind::Scan { relation, .. } = &node.kind {
                 for (field_ordinal, field) in relation.schema().iter().enumerate() {
-                    validate_physical_type(&field.ty.data_type).map_err(|reason| {
+                    preparation.step()?;
+                    validate_type(&field.ty).map_err(|reason| {
                         PhysicalV1PreflightError::TypeShape {
                             fragment: fragment.id(),
                             subject: format!(
@@ -1014,30 +735,19 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
                 }
             }
         }
-        let mut input_uses = BTreeMap::<NodeId, u32>::new();
-        for node in fragment.nodes().values() {
-            if node.id.get() > i32::MAX as u32 {
-                return Err(PhysicalV1PreflightError::NodeIdentity {
-                    fragment: fragment.id(),
-                    node: node.id,
-                });
+        if let Some(node) = preparation.repeated_input(fragment)? {
+            return Err(PhysicalV1PreflightError::SharedNode {
+                fragment: fragment.id(),
+                node,
             }
-            for input in &node.inputs {
-                let uses = input_uses.entry(*input).or_default();
-                *uses = uses.saturating_add(1);
-                if *uses > 1 {
-                    return Err(PhysicalV1PreflightError::SharedNode {
-                        fragment: fragment.id(),
-                        node: *input,
-                    });
-                }
-            }
+            .into());
         }
         match fragment.sink() {
             FragmentSink::Noop => {
                 return Err(PhysicalV1PreflightError::NoopSink {
                     fragment: fragment.id(),
-                });
+                }
+                .into());
             }
             FragmentSink::Result
             | FragmentSink::RootResult(_)
@@ -1046,6 +756,7 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
             | FragmentSink::Router { .. } => {}
         }
         for node in fragment.nodes().values() {
+            preparation.step()?;
             match &node.kind {
                 NodeKind::TableFunction { function, .. } => {
                     validate_v1_function_identity(
@@ -1097,6 +808,7 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
             .iter()
             .map(|(_, expression)| expression)
         {
+            preparation.step()?;
             match &expression.kind {
                 ExprKind::FunctionCall { function, .. } => {
                     validate_v1_function_identity(
@@ -1127,7 +839,8 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
                             fragment: fragment.id(),
                             node: expression.owner,
                             reason: "window frame has no lossless native wire v1 representation",
-                        });
+                        }
+                        .into());
                     }
                 }
                 ExprKind::Unary {
@@ -1138,7 +851,8 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
                         fragment: fragment.id(),
                         node: expression.owner,
                         reason: "unary plus has no native wire v1 representation",
-                    });
+                    }
+                    .into());
                 }
                 ExprKind::Binary {
                     op: BinaryOperator::BitAnd | BinaryOperator::BitOr | BinaryOperator::BitXor,
@@ -1148,7 +862,8 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
                         fragment: fragment.id(),
                         node: expression.owner,
                         reason: "bitwise binary operators have no native wire v1 representation",
-                    });
+                    }
+                    .into());
                 }
                 ExprKind::Literal(
                     LiteralValue::UInt64(_)
@@ -1160,7 +875,8 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
                         fragment: fragment.id(),
                         node: expression.owner,
                         reason: "literal has no lossless native wire v1 representation",
-                    });
+                    }
+                    .into());
                 }
                 _ => {}
             }
@@ -1181,8 +897,8 @@ fn v1_window_bound_is_literal(fragment: &Fragment, bound: &WindowBound) -> bool 
         // The complete encoder validates the source table first, then its
         // original-control window projection checks NULL and nonnegative value.
         ExprKind::Constant(_) => {
-            node.ty.logical_type == novarocks_type_contract::ValueLogicalType::Physical
-                && node.ty.data_type == arrow::datatypes::DataType::Int64
+            node.ty.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+                && node.ty.data_type() == &arrow::datatypes::DataType::Int64
         }
         ExprKind::Literal(LiteralValue::Int64(value)) => *value >= 0,
         _ => false,
@@ -1345,6 +1061,65 @@ mod tests {
     };
 
     use super::{WireLayout, WireLayoutError};
+    mod observed_layout_tests {
+        include!("physical_v1/layout_tests.rs");
+    }
+
+    fn pure_resources<T>(
+        context: crate::physical_expr::ExpressionEncodingContext<'_>,
+        body: impl FnOnce(
+            &mut crate::physical_encode::fragment_type_owner::TypeEncodingResources<
+                '_,
+                std::convert::Infallible,
+            >,
+        ) -> crate::physical_encode::fragment_type_owner::TypeEncodingResult<
+            T,
+            std::convert::Infallible,
+        >,
+    ) -> Result<T, crate::PhysicalEncodeError> {
+        use crate::host_projection_v2::{AdmissionRefusal, ProjectionFailure};
+        use crate::physical_encode::fragment_type_owner::TypeEncodingResources;
+        let mut request =
+            |_: std::alloc::Layout| Ok::<_, AdmissionRefusal<std::convert::Infallible>>(());
+        let mut resources = TypeEncodingResources {
+            request: &mut request,
+            work: novarocks_type_contract::CompileCheckpoints::try_new(
+                context.control,
+                novarocks_type_contract::CompilePhase::Encode,
+            )?,
+            type_policy: crate::physical_encode::fragment_type_owner::ExecutionTypeEncodingPolicy::LegacyInline,
+            storage: novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        };
+        let result = body(&mut resources).map_err(ProjectionFailure::without_host);
+        if matches!(&result, Err(crate::PhysicalEncodeError::Control(_))) {
+            return result;
+        }
+        resources.work.finish()?;
+        result
+    }
+    fn encode_predicate_conjunction_expansion(
+        fragment: &novarocks_physical_plan::Fragment,
+        layout: &WireLayout,
+        owner: novarocks_physical_plan::NodeId,
+        predicates: &[novarocks_physical_plan::ExprId],
+        resolution: crate::physical_expr::ValueResolution<'_>,
+        context: crate::physical_expr::ExpressionEncodingContext<'_>,
+    ) -> Result<novarocks_proto_models::expr::Expr, crate::PhysicalEncodeError> {
+        pure_resources(context, |resources| {
+            crate::physical_expr::encode_predicate_conjunction(
+                fragment, layout, owner, predicates, resolution, context, resources,
+            )
+        })
+    }
+    fn encode_window_frame_expansion(
+        fragment: &novarocks_physical_plan::Fragment,
+        frame: &novarocks_physical_plan::WindowFrame,
+        context: crate::physical_expr::ExpressionEncodingContext<'_>,
+    ) -> Result<novarocks_proto_models::expr::WindowFrame, crate::PhysicalEncodeError> {
+        pure_resources(context, |resources| {
+            crate::physical_expr::encode_window_frame(fragment, frame, context, resources)
+        })
+    }
 
     fn properties() -> PhysicalProperties {
         PhysicalProperties {
@@ -1386,6 +1161,7 @@ mod tests {
         const CONJUNCTS: usize = 512;
         let mut builder = FragmentBuilder::new(FragmentId::new(11));
         let values = builder.reserve_node_id().unwrap();
+        let filter = builder.reserve_node_id().unwrap();
         let boolean = ValueType::new(DataType::Boolean, false);
         struct Control;
         impl novarocks_type_contract::PureCompileControl for Control {
@@ -1466,9 +1242,28 @@ mod tests {
                 },
             })
             .unwrap();
+        // Multi-predicate filtering is the real source of the wire AND's
+        // synthetic Boolean. Freeze that actual node before type preparation.
+        let predicates = (0..CONJUNCTS)
+            .map(|_| {
+                builder
+                    .add_expression(
+                        filter,
+                        boolean.clone(),
+                        ExprKind::Constant(novarocks_physical_plan::ConstantReference {
+                            pool,
+                            ordinal: 0,
+                        }),
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        builder
+            .add_filter(filter, values, predicates.clone().into_boxed_slice())
+            .unwrap();
         let fragment = builder
             .finish_definition(
-                values,
+                filter,
                 FragmentSink::Noop,
                 PipelineDopDomain {
                     min: 1,
@@ -1479,18 +1274,60 @@ mod tests {
             .expect("a wide conjunction is an ordinary fragment");
         let layout = WireLayout::try_new(&fragment).expect("layout");
 
-        let encoded = crate::physical_expr::encode_predicate_conjunction(
+        // The fixture's actual frozen declaration owns every predicate type;
+        // no retired inline emitter is available even for this shape test.
+        use crate::host_projection_v2::AdmissionRefusal;
+        use crate::physical_encode::fragment_type_owner::{
+            ExecutionTypeEncodingPolicy, PreparedFragmentTypes, PreparedSyntheticTypes,
+            TypeEncodingResources,
+        };
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+        let control = Control;
+        let mut request = |_: std::alloc::Layout| {
+            control
+                .checkpoint(CompilePhase::Encode, 0)
+                .map_err(AdmissionRefusal::<std::convert::Infallible>::Control)
+        };
+        let mut resources = TypeEncodingResources {
+            request: &mut request,
+            work: CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap(),
+            type_policy: ExecutionTypeEncodingPolicy::PureGrammar,
+            storage: novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        };
+        let synthetic = PreparedSyntheticTypes::prepare(&fragment, &mut resources).unwrap();
+        let original =
+            crate::physical_encode::fragment_type_owner::original_requests::PreparedOriginalRequests::prepare(
+                &fragment,
+                &constants,
+                &mut resources,
+            )
+            .unwrap();
+        let types = PreparedFragmentTypes::prepare(
+            &fragment,
+            &synthetic,
+            &original,
+            None,
+            &crate::NoPhysicalV1PrivateFacts,
+            resources.type_policy,
+            &mut |layout| (resources.request)(layout),
+            &mut resources.work,
+        )
+        .unwrap();
+        let encoded = encode_predicate_conjunction_expansion(
             &fragment,
             &layout,
-            values,
+            filter,
             &predicates,
             crate::physical_expr::ValueResolution::NodeInput,
             crate::physical_expr::ExpressionEncodingContext {
+                writer_calls: None,
                 constants: &constants,
-                control: &Control,
+                control: &control,
+                types: Some(&types),
             },
         )
         .expect("encode a wide conjunction");
+        resources.work.finish().unwrap();
 
         let depth = wire_expression_depth(&encoded);
         // ceil(log2(512)) + one level for the literal leaves.
@@ -1617,12 +1454,14 @@ mod tests {
             // precise Int64 sources reach the original observed value owner.
             assert!(super::v1_window_bound_is_literal(&fragment, &frame.start));
             let control = Control::default();
-            let result = crate::physical_expr::encode_window_frame(
+            let result = encode_window_frame_expansion(
                 &fragment,
                 &frame,
                 crate::physical_expr::ExpressionEncodingContext {
+                    writer_calls: None,
                     constants: &constants,
                     control: &control,
+                    types: None,
                 },
             );
             if ordinal == 1 {
@@ -1648,12 +1487,14 @@ mod tests {
                         refusal: Some((position, cause)),
                     };
                     assert_eq!(
-                        crate::physical_expr::encode_window_frame(
+                        encode_window_frame_expansion(
                             &fragment,
                             &frame,
                             crate::physical_expr::ExpressionEncodingContext {
+                                writer_calls: None,
                                 constants: &constants,
-                                control: &control
+                                control: &control,
+                                types: None,
                             }
                         ),
                         Err(crate::PhysicalEncodeError::Control(cause))
