@@ -113,7 +113,7 @@ struct HadoopPreparedUpdate {
     client: Arc<HadoopFileSystemCatalog>,
     request: FrozenRequest,
 }
-fn not_dispatched(error: Error) -> DispatchCompletion {
+pub(super) fn not_dispatched(error: Error) -> DispatchCompletion {
     DispatchCompletion::evidence(DispatchEvidence::NotDispatched {
         failure: crate::commit::attempt::before_dispatch_failure(&error),
     })
@@ -128,7 +128,7 @@ fn rejected(stage: &'static str, message: &'static str) -> DispatchCompletion {
         },
     })
 }
-fn unknown(stage: &'static str, message: &'static str) -> DispatchCompletion {
+pub(super) fn unknown(stage: &'static str, message: &'static str) -> DispatchCompletion {
     DispatchCompletion::evidence(DispatchEvidence::Unknown {
         failure: ConnectorMutationFailure::new(ConnectorMutationFailureKind::Unavailable, message),
         observation: ProtocolObservation {

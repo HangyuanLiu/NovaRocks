@@ -208,6 +208,16 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
                     ),
                 )
             })?;
+        if request.operation
+            == CatalogOperation::CreateTable(super::CatalogCreateIntent::EmptyTable)
+        {
+            let (attempt, no_op_if_exists) = request.into_hadoop_create()?;
+            return Arc::clone(&self.client).prepare_conditional_create(
+                attempt,
+                no_op_if_exists,
+                &preparation,
+            );
+        }
         if !matches!(
             request.operation,
             CatalogOperation::CreateNamespace | CatalogOperation::DropNamespace

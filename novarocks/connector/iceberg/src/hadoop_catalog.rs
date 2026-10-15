@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod create_publication;
 /// HadoopFileSystemCatalog — a Hadoop-catalog-compatible implementation of the
 /// iceberg `Catalog` trait.
 ///
@@ -146,6 +147,8 @@ pub(crate) enum HadoopCreateReconciliation {
 enum HadoopCatalogTestFault {
     BeforeConditionalRequest,
     AfterConditionalResponseLoss,
+    AfterExistingConditionalResponseLoss,
+    BeforeConditionalReadEvidenceExpiry,
     BeforeHintWrite,
     AfterMetadataWriteEvidenceExpiry,
     AfterHintWriteResponseLoss,
@@ -1146,13 +1149,10 @@ impl HadoopFileSystemCatalog {
         {
             return Ok(HadoopCreateReconciliation::Foreign);
         }
-        let finalization_failure = self
-            .write_version_hint(&table_location, 1)
-            .await
-            .err()
-            .map(|error| format!("repair committed Hadoop catalog version hint: {error}"));
+        // Observation never repairs hints or acquires a second mutation grant.
+        // A journal-owned finalizer may repair only after retaining this proof.
         Ok(HadoopCreateReconciliation::Committed {
-            finalization_failure,
+            finalization_failure: None,
         })
     }
 }

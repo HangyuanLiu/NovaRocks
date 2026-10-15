@@ -818,6 +818,27 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         self.endpoints.table_exists(&ident).await
     }
 
+    async fn table_exists_for_read(
+        &self,
+        table: CatalogTableName,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<bool, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        let context = binding.request_context().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Table existence requires an admitted request context",
+            )
+        })?;
+        let exists = self
+            .delegate
+            .listing
+            .run(context, self.table_exists(table))
+            .await?;
+        context.check_active()?;
+        Ok(exists)
+    }
+
     async fn load_table(
         &self,
         table: CatalogTableName,
