@@ -139,11 +139,6 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         "hive"
     }
 
-    #[cfg(test)]
-    fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
-        Arc::clone(self.delegate.client())
-    }
-
     fn admit_operation(
         &self,
         operation: &CatalogOperation,

@@ -259,9 +259,6 @@ impl NovaRocksCatalog for AdmittedCatalog {
     fn implementation_name(&self) -> &'static str {
         "admitted-test-owner"
     }
-    fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
-        self.inner.vendored_client()
-    }
     async fn load_commit_base(
         &self,
         table: super::CatalogTableName,
@@ -665,4 +662,48 @@ pub(crate) async fn load_static_fixture_table(
         .0
         .into_static_table()
         .expect("fixture explicitly requires static storage")
+}
+
+/// Build an ordinary local table through frozen namespace/table publication.
+/// The caller supplies the exact creation and generation; no schema is inferred.
+pub(crate) async fn create_static_fixture_table(
+    runtime: &crate::metadata_context::IcebergMetadataContext,
+    generation: novarocks_spi::connector::ProviderBindingEpoch,
+    namespace: super::CatalogNamespaceName,
+    creation: crate::iceberg::TableCreation,
+) -> crate::iceberg::table::Table {
+    use super::catalog_request::CatalogPublicationRequest;
+    let ident = crate::iceberg::TableIdent::new(
+        super::delegate::namespace_ident(&namespace).unwrap(),
+        creation.name.clone(),
+    );
+    let outcome = publish_catalog_fixture(
+        runtime,
+        generation,
+        CatalogPublicationRequest::CreateNamespace {
+            namespace: namespace.clone(),
+            properties: Default::default(),
+            no_op_if_exists: false,
+        },
+    )
+    .await;
+    assert!(
+        matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+        "{outcome:?}"
+    );
+    let outcome = publish_catalog_fixture(
+        runtime,
+        generation,
+        CatalogPublicationRequest::CreateTable {
+            namespace,
+            creation,
+            no_op_if_exists: false,
+        },
+    )
+    .await;
+    assert!(
+        matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+        "{outcome:?}"
+    );
+    load_static_fixture_table(runtime, &ident).await
 }

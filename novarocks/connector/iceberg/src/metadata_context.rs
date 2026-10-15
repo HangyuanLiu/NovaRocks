@@ -133,9 +133,8 @@ impl AttemptMetadataTableCache {
 /// handle and no concrete-kind slot: a generation that held two clients would
 /// have two pieces of in-memory state that disagree about the same lake.
 ///
-/// Callers that need the vendored client -- the commit machinery, which submits
-/// through `Catalog::update_table` -- derive it from the owner rather than from
-/// a field of their own.
+/// Publication callers hand a complete frozen request to this owner; the
+/// journal retains its single dispatch conclusion and independent finalization.
 #[derive(Clone)]
 pub struct IcebergMetadataContext {
     control_state: IcebergCatalogControlState,
@@ -1406,33 +1405,26 @@ mod tests {
             IcebergMetadataResources::new(binding, runtime.handle().clone()),
         )
         .expect("generation");
-        let catalog = context.novarocks_catalog().vendored_client();
-        let created = runtime.block_on(async {
-            let namespace = NamespaceIdent::new("analytics".to_string());
-            catalog
-                .create_namespace(&namespace, HashMap::new())
-                .await
-                .expect("namespace");
-            catalog
-                .create_table(
-                    &namespace,
-                    crate::iceberg::TableCreation::builder()
-                        .name("frozen".to_string())
-                        .schema(
-                            Schema::builder()
-                                .with_fields(vec![Arc::new(NestedField::required(
-                                    1,
-                                    "id",
-                                    Type::Primitive(PrimitiveType::Long),
-                                ))])
-                                .build()
-                                .unwrap(),
-                        )
-                        .build(),
-                )
-                .await
-                .expect("table")
-        });
+        let created = runtime.block_on(
+            crate::catalog::admission_test_support::create_static_fixture_table(
+                &context,
+                novarocks_spi::connector::ProviderBindingEpoch::from_bytes([9; 16]),
+                crate::catalog::CatalogNamespaceName::new("analytics"),
+                crate::iceberg::TableCreation::builder()
+                    .name("frozen".to_string())
+                    .schema(
+                        Schema::builder()
+                            .with_fields(vec![Arc::new(NestedField::required(
+                                1,
+                                "id",
+                                Type::Primitive(PrimitiveType::Long),
+                            ))])
+                            .build()
+                            .unwrap(),
+                    )
+                    .build(),
+            ),
+        );
         let actual_uuid = created.metadata().uuid();
         let stale = scope_retaining_table(
             ConnectorRequestScope::new(),

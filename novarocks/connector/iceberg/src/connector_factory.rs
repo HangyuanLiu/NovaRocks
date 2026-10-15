@@ -656,7 +656,7 @@ mod tests {
                 .iter()
                 .all(|(key, _)| !credential_like_property(key))
         );
-        let client = unpublished.runtime().novarocks_catalog().vendored_client();
+        let client = Arc::clone(unpublished.runtime().novarocks_catalog());
         assert!(Arc::strong_count(&client) >= 1);
     }
 

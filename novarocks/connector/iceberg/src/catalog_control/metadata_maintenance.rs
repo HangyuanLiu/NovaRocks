@@ -1456,53 +1456,58 @@ mod tests {
         ident: &crate::iceberg::TableIdent,
         name: &str,
     ) {
-        use crate::iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+        executor.block_on(append_fixture_file(adapter, ident, name));
+    }
 
-        executor.block_on(async {
-            let table = crate::catalog::admission_test_support::load_static_fixture_table(
-                &adapter.runtime,
-                ident,
-            )
-            .await;
-            let location = format!("{}/data/{name}.parquet", table.metadata().location());
-            table
-                .file_io()
-                .new_output(&location)
-                .expect("data output")
-                .write(Bytes::from_static(b"test data"))
-                .await
-                .expect("write data file");
-            let file = DataFileBuilder::default()
-                .content(DataContentType::Data)
-                .file_path(location)
-                .file_format(DataFileFormat::Parquet)
-                .record_count(1)
-                .file_size_in_bytes(9)
-                .partition(Struct::empty())
-                .build()
-                .expect("synthetic data file");
-            let contents = vec![
-                crate::commit::model::AddedContent::new_logical_data(
-                    file,
-                    table.metadata().default_partition_spec_id(),
-                )
-                .unwrap(),
-            ];
-            let provider = crate::metadata::IcebergMetadata::new(
-                adapter.descriptor.clone(),
-                adapter.key.incarnation,
-                Arc::clone(&adapter.runtime),
-            );
-            crate::commit::run::append_contents_for_test(
-                provider,
-                table,
-                contents,
-                "main".into(),
-                BTreeMap::new(),
-            )
+    async fn append_fixture_file(
+        adapter: &IcebergMetadataMaintenanceAdapter,
+        ident: &crate::iceberg::TableIdent,
+        name: &str,
+    ) {
+        use crate::iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+        let table = crate::catalog::admission_test_support::load_static_fixture_table(
+            &adapter.runtime,
+            ident,
+        )
+        .await;
+        let location = format!("{}/data/{name}.parquet", table.metadata().location());
+        table
+            .file_io()
+            .new_output(&location)
+            .expect("data output")
+            .write(Bytes::from_static(b"test data"))
             .await
-            .expect("publish fixture append through its owner");
-        });
+            .expect("write data file");
+        let file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(location)
+            .file_format(DataFileFormat::Parquet)
+            .record_count(1)
+            .file_size_in_bytes(9)
+            .partition(Struct::empty())
+            .build()
+            .expect("synthetic data file");
+        let contents = vec![
+            crate::commit::model::AddedContent::new_logical_data(
+                file,
+                table.metadata().default_partition_spec_id(),
+            )
+            .unwrap(),
+        ];
+        let provider = crate::metadata::IcebergMetadata::new(
+            adapter.descriptor.clone(),
+            adapter.key.incarnation,
+            Arc::clone(&adapter.runtime),
+        );
+        crate::commit::run::append_contents_for_test(
+            provider,
+            table,
+            contents,
+            "main".into(),
+            BTreeMap::new(),
+        )
+        .await
+        .expect("publish fixture append through its owner");
     }
 
     fn local_planning_request(
@@ -1724,25 +1729,63 @@ mod tests {
         .expect("real metadata and maintenance adapter share the exact generation")
     }
 
+    fn competing_adapter(
+        base: &IcebergMetadataMaintenanceAdapter,
+    ) -> Arc<IcebergMetadataMaintenanceAdapter> {
+        Arc::new(
+            IcebergMetadataMaintenanceAdapter::new(base.key.clone(), Arc::clone(&base.runtime))
+                .unwrap(),
+        )
+    }
+
     fn foreign_properties(
         runtime: crate::resources::IcebergCatalogRuntime,
-        catalog: Arc<dyn crate::iceberg::Catalog>,
+        catalog: Arc<IcebergMetadataMaintenanceAdapter>,
         ident: crate::iceberg::TableIdent,
         properties: HashMap<String, String>,
     ) {
         runtime
             .block_on(async move {
-                let table = catalog.load_table(&ident).await.unwrap();
-                let commit = crate::iceberg::TableCommit::builder()
-                    .ident(ident)
-                    .requirements(vec![crate::iceberg::TableRequirement::UuidMatch {
-                        uuid: table.metadata().uuid(),
-                    }])
-                    .updates(vec![crate::iceberg::TableUpdate::SetProperties {
-                        updates: properties,
-                    }])
-                    .build();
-                catalog.update_table(commit).await.unwrap();
+                let table = crate::catalog::admission_test_support::load_static_fixture_table(
+                    &catalog.runtime,
+                    &ident,
+                )
+                .await;
+                let operation = OperationToken::from_mutation(ConnectorMutationOperationId::new());
+                let preparation = context();
+                let frozen = crate::commit::staging::freeze_existing_change(
+                    ident,
+                    "main",
+                    table.metadata(),
+                    table.metadata_location().unwrap(),
+                    RequestShape::MetadataOnly,
+                    AttemptToken::new(operation, 0),
+                    PreparedChange {
+                        requirements: vec![],
+                        updates: vec![crate::iceberg::TableUpdate::SetProperties {
+                            updates: properties,
+                        }],
+                    },
+                    &preparation,
+                )
+                .unwrap();
+                let outcome = crate::catalog::admission_test_support::publish_frozen(
+                    Arc::clone(catalog.runtime.novarocks_catalog()),
+                    catalog.descriptor.clone(),
+                    catalog.key.incarnation,
+                    frozen,
+                    CatalogOperation::AlterProperties,
+                    preparation,
+                    None,
+                )
+                .await;
+                assert!(
+                    matches!(
+                        outcome,
+                        crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+                    ),
+                    "{outcome:?}"
+                );
             })
             .unwrap();
     }
@@ -1756,7 +1799,7 @@ mod tests {
         append_local_file(&executor, &base, table.identifier(), "second");
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
-        let catalog = base.runtime.novarocks_catalog().vendored_client();
+        let catalog = competing_adapter(&base);
         let runtime = base.runtime.resources().catalog_runtime().clone();
         let ident = table.identifier().clone();
         let adapter = recorded_adapter(
@@ -1813,14 +1856,12 @@ mod tests {
         assert_eq!(plan.intent_digest(), intent);
         assert_eq!(receipt.plan_digest(), plan.plan_digest());
         assert_eq!(receipt.intent_digest(), intent);
-        let loaded = executor
-            .block_on(
-                base.runtime
-                    .novarocks_catalog()
-                    .vendored_client()
-                    .load_table(table.identifier()),
-            )
-            .unwrap();
+        let loaded = executor.block_on(
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                table.identifier(),
+            ),
+        );
         assert_eq!(loaded.metadata().snapshots().len(), 2);
     }
     #[test]
@@ -1834,7 +1875,7 @@ mod tests {
         let seen = calls.clone();
         let captured = Arc::new(Mutex::new(Vec::new()));
         let observed = captured.clone();
-        let catalog = base.runtime.novarocks_catalog().vendored_client();
+        let catalog = competing_adapter(&base);
         let runtime = base.runtime.resources().catalog_runtime().clone();
         let ident = table.identifier().clone();
         let adapter = recorded_adapter(
@@ -1849,40 +1890,7 @@ mod tests {
                     let ident = ident.clone();
                     runtime
                         .block_on(async move {
-                            use crate::iceberg::spec::{
-                                DataContentType, DataFileBuilder, DataFileFormat, Struct,
-                            };
-                            use crate::iceberg::transaction::{
-                                ApplyTransactionAction, Transaction,
-                            };
-                            let table = catalog.load_table(&ident).await.unwrap();
-                            let path =
-                                format!("{}/data/concurrent.parquet", table.metadata().location());
-                            table
-                                .file_io()
-                                .new_output(&path)
-                                .unwrap()
-                                .write(Bytes::from_static(b"test data"))
-                                .await
-                                .unwrap();
-                            let file = DataFileBuilder::default()
-                                .content(DataContentType::Data)
-                                .file_path(path)
-                                .file_format(DataFileFormat::Parquet)
-                                .partition(Struct::empty())
-                                .partition_spec_id(table.metadata().default_partition_spec_id())
-                                .record_count(1)
-                                .file_size_in_bytes(9)
-                                .build()
-                                .unwrap();
-                            let tx = Transaction::new(&table);
-                            tx.fast_append()
-                                .add_data_files([file])
-                                .apply(tx)
-                                .unwrap()
-                                .commit(catalog.as_ref())
-                                .await
-                                .unwrap();
+                            append_fixture_file(&catalog, &ident, "concurrent").await;
                         })
                         .unwrap();
                 }
@@ -1931,14 +1939,12 @@ mod tests {
         assert_eq!(actual["attempt_ordinal"], 1);
         assert_eq!(receipt.intent_digest(), plan.intent_digest());
         assert_eq!(receipt.plan_digest(), plan.plan_digest());
-        let loaded = executor
-            .block_on(
-                base.runtime
-                    .novarocks_catalog()
-                    .vendored_client()
-                    .load_table(table.identifier()),
-            )
-            .unwrap();
+        let loaded = executor.block_on(
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                table.identifier(),
+            ),
+        );
         assert_eq!(loaded.metadata().snapshots().len(), 4);
         let list = executor
             .block_on(crate::manifest::load_manifest_list(
@@ -1993,7 +1999,7 @@ mod tests {
         let seen = calls.clone();
         let installed = Arc::new(Mutex::new(None));
         let observed = installed.clone();
-        let catalog = base.runtime.novarocks_catalog().vendored_client();
+        let catalog = competing_adapter(&base);
         let runtime = base.runtime.resources().catalog_runtime().clone();
         let ident = table.identifier().clone();
         let adapter = recorded_adapter(
@@ -2006,20 +2012,46 @@ mod tests {
                 assert_eq!(seen.fetch_add(1, Ordering::SeqCst), 0);
                 let catalog = catalog.clone();
                 let ident = ident.clone();
-                let installed = runtime.block_on(async move {
-                    let before = catalog.load_table(&ident).await.unwrap();
-                    // A real external rewrite removes both selected source
-                    // manifests from the current root while preserving data.
-                    let merged = crate::commit::snapshot_lifecycle_helpers::rewrite_manifests::run_rewrite_manifests_once_with_marker(
-                        catalog.clone(), before.clone(), before.file_io().clone(), None,
-                    ).await.unwrap();
-                    assert_eq!(merged.rewritten_manifests_count, 2);
-                    assert_eq!(merged.added_manifests_count, 1);
-                    let after = catalog.load_table(&ident).await.unwrap();
-                    let location = after.metadata_location().unwrap().to_owned();
-                    let bytes = after.file_io().new_input(&location).unwrap().read().await.unwrap();
-                    (location, bytes.to_vec(), after.metadata().current_snapshot_id().unwrap())
-                }).unwrap();
+                let installed = runtime
+                    .block_on(async move {
+                        let plan = catalog
+                            .plan_maintenance(local_planning_request(&catalog.key, false))
+                            .unwrap();
+                        let outcome = catalog
+                            .execute(
+                                ConnectorMetadataMaintenanceExecuteRequest::try_new(
+                                    plan,
+                                    context(),
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome
+                        else {
+                            panic!("external rewrite must actually publish")
+                        };
+                        assert_eq!(receipt.summary().rewritten_items, 2);
+                        let after =
+                            crate::catalog::admission_test_support::load_static_fixture_table(
+                                &catalog.runtime,
+                                &ident,
+                            )
+                            .await;
+                        let location = after.metadata_location().unwrap().to_owned();
+                        let bytes = after
+                            .file_io()
+                            .new_input(&location)
+                            .unwrap()
+                            .read()
+                            .await
+                            .unwrap();
+                        (
+                            location,
+                            bytes.to_vec(),
+                            after.metadata().current_snapshot_id().unwrap(),
+                        )
+                    })
+                    .unwrap();
                 *observed.lock().unwrap() = Some(installed);
             }),
         );
@@ -2068,14 +2100,12 @@ mod tests {
             attempt.metadata_location_digest_hex,
             hex_encode(Sha256::digest(&framed_location))
         );
-        let loaded = executor
-            .block_on(
-                base.runtime
-                    .novarocks_catalog()
-                    .vendored_client()
-                    .load_table(table.identifier()),
-            )
-            .unwrap();
+        let loaded = executor.block_on(
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                table.identifier(),
+            ),
+        );
         assert_eq!(loaded.metadata().snapshots().len(), 3);
         assert_eq!(loaded.metadata().current_snapshot_id(), Some(external_head));
         assert_eq!(loaded.metadata_location(), Some(location.as_str()));
@@ -2138,7 +2168,7 @@ mod tests {
         let seen = calls.clone();
         let replacement = Arc::new(Mutex::new(None));
         let observed = replacement.clone();
-        let catalog = base.runtime.novarocks_catalog().vendored_client();
+        let catalog = competing_adapter(&base);
         let runtime = base.runtime.resources().catalog_runtime().clone();
         let ident = table.identifier().clone();
         let adapter = recorded_adapter(
@@ -2154,19 +2184,64 @@ mod tests {
                 let ident = ident.clone();
                 let replaced = runtime
                     .block_on(async move {
-                        let before = catalog.load_table(&ident).await.unwrap();
-                        catalog.drop_table(&ident).await.unwrap();
-                        let after = catalog
-                            .create_table(
-                                ident.namespace(),
-                                crate::iceberg::TableCreation::builder()
-                                    .name(ident.name().to_owned())
-                                    .schema(before.metadata().current_schema().as_ref().clone())
-                                    .format_version(before.metadata().format_version())
-                                    .build(),
+                        use crate::catalog::catalog_request::CatalogPublicationRequest;
+                        let before =
+                            crate::catalog::admission_test_support::load_static_fixture_table(
+                                &catalog.runtime,
+                                &ident,
                             )
-                            .await
-                            .unwrap();
+                            .await;
+                        let outcome =
+                            crate::catalog::admission_test_support::publish_catalog_fixture(
+                                &catalog.runtime,
+                                catalog.key.incarnation,
+                                CatalogPublicationRequest::DropTable {
+                                    table: crate::catalog::CatalogTableName::from_identifier(
+                                        &ident,
+                                    ),
+                                    no_op_if_missing: false,
+                                    purge: false,
+                                    capture: None,
+                                },
+                            )
+                            .await;
+                        assert!(
+                            matches!(
+                                outcome,
+                                crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+                            ),
+                            "{outcome:?}"
+                        );
+                        let outcome =
+                            crate::catalog::admission_test_support::publish_catalog_fixture(
+                                &catalog.runtime,
+                                catalog.key.incarnation,
+                                CatalogPublicationRequest::CreateTable {
+                                    namespace: crate::catalog::CatalogNamespaceName::new(
+                                        ident.namespace().join("."),
+                                    ),
+                                    creation: crate::iceberg::TableCreation::builder()
+                                        .name(ident.name().to_owned())
+                                        .schema(before.metadata().current_schema().as_ref().clone())
+                                        .format_version(before.metadata().format_version())
+                                        .build(),
+                                    no_op_if_exists: false,
+                                },
+                            )
+                            .await;
+                        assert!(
+                            matches!(
+                                outcome,
+                                crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+                            ),
+                            "{outcome:?}"
+                        );
+                        let after =
+                            crate::catalog::admission_test_support::load_static_fixture_table(
+                                &catalog.runtime,
+                                &ident,
+                            )
+                            .await;
                         assert_ne!(after.metadata().uuid(), original_uuid);
                         let location = after.metadata_location().unwrap().to_owned();
                         let bytes = after
@@ -2211,14 +2286,12 @@ mod tests {
         assert_eq!(plan.provider_payload(), &payload);
         assert_eq!(plan.intent_digest(), intent);
         let (replacement_uuid, location, bytes) = replacement.lock().unwrap().clone().unwrap();
-        let after = executor
-            .block_on(
-                base.runtime
-                    .novarocks_catalog()
-                    .vendored_client()
-                    .load_table(table.identifier()),
-            )
-            .unwrap();
+        let after = executor.block_on(
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                table.identifier(),
+            ),
+        );
         assert_eq!(after.metadata().uuid(), replacement_uuid);
         assert!(after.metadata().snapshots().next().is_none());
         assert_eq!(after.metadata_location(), Some(location.as_str()));
@@ -2306,14 +2379,12 @@ mod tests {
             journal.catalog_entry_outcome(entry),
             ExternalMutationOutcome::CommitUnknown { .. }
         ));
-        let loaded = executor
-            .block_on(
-                base.runtime
-                    .novarocks_catalog()
-                    .vendored_client()
-                    .load_table(table.identifier()),
-            )
-            .unwrap();
+        let loaded = executor.block_on(
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &base.runtime,
+                table.identifier(),
+            ),
+        );
         assert_eq!(
             loaded.metadata().snapshots().len(),
             3,
@@ -2440,7 +2511,7 @@ mod tests {
         let table = create_local_table(&executor, &base);
         append_local_file(&executor, &base, table.identifier(), "first");
         append_local_file(&executor, &base, table.identifier(), "second");
-        let catalog = base.runtime.novarocks_catalog().vendored_client();
+        let catalog = competing_adapter(&base);
         let runtime = base.runtime.resources().catalog_runtime().clone();
         foreign_properties(
             runtime.clone(),

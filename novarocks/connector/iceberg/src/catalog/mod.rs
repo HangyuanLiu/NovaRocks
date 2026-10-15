@@ -521,17 +521,6 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         .await
     }
 
-    /// The vendored client this owner wraps.
-    ///
-    /// Migration seam, removed with the last unmigrated caller. It exists so a
-    /// generation holds exactly *one* catalog while the operation families move
-    /// across one at a time. Building a second client for the legacy handle
-    /// instead would give two clients with separate in-memory state that
-    /// disagree about the same lake — a dropped table still visible through the
-    /// other handle, for instance.
-    #[cfg(test)]
-    fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog>;
-
     /// The provider-private REST client that may refresh an already-admitted
     /// vended credential scope. Only the REST implementation owns such a
     /// capability; callers never downcast or construct a second catalog.

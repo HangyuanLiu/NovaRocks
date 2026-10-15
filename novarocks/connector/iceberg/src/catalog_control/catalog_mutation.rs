@@ -5771,15 +5771,7 @@ mod tests {
     }
 
     fn guarded_table(provider: &IcebergMetadata) -> ConnectorTableIdentity {
-        let namespace = NamespaceIdent::new("guarded".to_string());
-        let catalog = provider.runtime().novarocks_catalog().vendored_client();
-        provider
-            .runtime()
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { catalog.create_namespace(&namespace, HashMap::new()).await })
-            .expect("namespace runtime")
-            .expect("create namespace");
+        create_namespace(provider, "guarded");
         let table = ConnectorTableIdentity {
             instance_id: provider.descriptor().instance_id.clone(),
             namespace: "guarded".into(),
@@ -5831,15 +5823,30 @@ mod tests {
     }
 
     fn create_namespace(provider: &IcebergMetadata, name: &str) {
-        let namespace = NamespaceIdent::new(name.to_string());
-        let catalog = provider.runtime().novarocks_catalog().vendored_client();
-        provider
+        let runtime = provider.runtime().clone();
+        let epoch = provider.incarnation();
+        let namespace = crate::catalog::CatalogNamespaceName::new(name);
+        let outcome = provider
             .runtime()
             .resources()
             .catalog_runtime()
-            .block_on(async move { catalog.create_namespace(&namespace, HashMap::new()).await })
-            .expect("namespace runtime")
-            .expect("create namespace");
+            .block_on(async move {
+                crate::catalog::admission_test_support::publish_catalog_fixture(
+                    &runtime,
+                    epoch,
+                    crate::catalog::catalog_request::CatalogPublicationRequest::CreateNamespace {
+                        namespace,
+                        properties: HashMap::new(),
+                        no_op_if_exists: false,
+                    },
+                )
+                .await
+            })
+            .expect("namespace runtime");
+        assert!(
+            matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+            "{outcome:?}"
+        );
     }
 
     /// Create a table for a fixture through the production create path.

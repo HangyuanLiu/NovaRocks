@@ -1245,9 +1245,7 @@ mod tests {
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
-    use crate::iceberg::{
-        NamespaceIdent, TableCommit, TableCreation, TableRequirement, TableUpdate,
-    };
+    use crate::iceberg::{TableCreation, TableUpdate};
     use crate::metadata::IcebergMetadata;
     use crate::resources::IcebergMetadataResources;
 
@@ -1363,13 +1361,7 @@ mod tests {
     #[test]
     fn planned_cleanup_deletes_only_mature_nested_orphans() {
         let (executor, _warehouse, runtime) = local_runtime();
-        let catalog = runtime.novarocks_catalog().vendored_client();
         let table = executor.block_on(async {
-            let namespace = NamespaceIdent::new("orphan_test".to_string());
-            catalog
-                .create_namespace(&namespace, HashMap::new())
-                .await
-                .expect("create namespace");
             let schema = Schema::builder()
                 .with_fields(vec![Arc::new(NestedField::required(
                     1,
@@ -1378,17 +1370,17 @@ mod tests {
                 ))])
                 .build()
                 .expect("schema");
-            catalog
-                .create_table(
-                    &namespace,
-                    TableCreation::builder()
-                        .name("t".to_string())
-                        .schema(schema)
-                        .format_version(FormatVersion::V2)
-                        .build(),
-                )
-                .await
-                .expect("create table")
+            crate::catalog::admission_test_support::create_static_fixture_table(
+                &runtime,
+                ProviderBindingEpoch::from_bytes([4; 16]),
+                crate::catalog::CatalogNamespaceName::new("orphan_test"),
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .schema(schema)
+                    .format_version(FormatVersion::V2)
+                    .build(),
+            )
+            .await
         });
         let location =
             novarocks_fs::FsLocation::parse(table.metadata().location()).expect("table location");
@@ -1451,21 +1443,48 @@ mod tests {
         let encoded_manifest =
             crate::document_storage::codec::encode_document_manifest(&retained_manifest)
                 .expect("encode retained document manifest");
-        let commit = TableCommit::builder()
-            .ident(table.identifier().clone())
-            .requirements(vec![TableRequirement::UuidMatch {
-                uuid: table.metadata().uuid(),
-            }])
-            .updates(vec![TableUpdate::SetProperties {
-                updates: HashMap::from([(
-                    crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
-                    String::from_utf8(encoded_manifest.to_vec()).expect("UTF-8 manifest"),
-                )]),
-            }])
-            .build();
-        executor
-            .block_on(catalog.update_table(commit))
-            .expect("attach retained document to real table metadata");
+        let preparation = context();
+        let operation = crate::commit::model::OperationToken::from_mutation(
+            novarocks_spi::connector::ConnectorMutationOperationId::new(),
+        );
+        let request = crate::commit::staging::freeze_existing_change(
+            table.identifier().clone(),
+            "main",
+            table.metadata(),
+            table.metadata_location().unwrap(),
+            crate::commit::model::RequestShape::MetadataOnly,
+            crate::commit::model::AttemptToken::new(operation, 0),
+            crate::commit::staging::PreparedChange {
+                requirements: Vec::new(),
+                updates: vec![TableUpdate::SetProperties {
+                    updates: HashMap::from([(
+                        crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
+                        String::from_utf8(encoded_manifest.to_vec()).expect("UTF-8 manifest"),
+                    )]),
+                }],
+            },
+            &preparation,
+        )
+        .unwrap();
+        let outcome = executor.block_on(crate::catalog::admission_test_support::publish_frozen(
+            Arc::clone(runtime.novarocks_catalog()),
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                instance_id: ConnectorInstanceId::parse("cleanup-test").unwrap(),
+            },
+            ProviderBindingEpoch::from_bytes([4; 16]),
+            request,
+            crate::catalog::admission::CatalogOperation::AlterProperties,
+            preparation,
+            None,
+        ));
+        assert!(
+            matches!(
+                outcome,
+                crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+            ),
+            "{outcome:?}"
+        );
         let cutoff = SystemTime::now() - Duration::from_secs(60 * 60);
         let older_than_ms = i64::try_from(
             cutoff
@@ -1610,13 +1629,7 @@ mod tests {
         crate::iceberg::table::Table,
         std::path::PathBuf,
     ) {
-        let catalog = runtime.novarocks_catalog().vendored_client();
         let table = executor.block_on(async {
-            let namespace = NamespaceIdent::new("orphan_test".to_string());
-            catalog
-                .create_namespace(&namespace, HashMap::new())
-                .await
-                .unwrap();
             let schema = Schema::builder()
                 .with_fields(vec![Arc::new(NestedField::required(
                     1,
@@ -1625,17 +1638,17 @@ mod tests {
                 ))])
                 .build()
                 .unwrap();
-            catalog
-                .create_table(
-                    &namespace,
-                    TableCreation::builder()
-                        .name("t".to_string())
-                        .schema(schema)
-                        .format_version(FormatVersion::V2)
-                        .build(),
-                )
-                .await
-                .unwrap()
+            crate::catalog::admission_test_support::create_static_fixture_table(
+                &runtime,
+                ProviderBindingEpoch::from_bytes([4; 16]),
+                crate::catalog::CatalogNamespaceName::new("orphan_test"),
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .schema(schema)
+                    .format_version(FormatVersion::V2)
+                    .build(),
+            )
+            .await
         });
         let location = novarocks_fs::FsLocation::parse(table.metadata().location()).unwrap();
         let root = std::path::PathBuf::from(location.path());

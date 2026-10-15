@@ -65,8 +65,6 @@ pub(super) struct NovaRocksRestCatalog {
     listing: Arc<super::listing_admission::ListingAdmission>,
     #[cfg(test)]
     delegate: CatalogDelegate,
-    #[cfg(test)]
-    adapter: Arc<RestTransitionalAdapter>,
     /// NovaRocks requests sharing the upstream client's one session (L27).
     endpoints: Arc<RestEndpoints>,
     warehouse: Option<Arc<str>>,
@@ -94,8 +92,6 @@ impl NovaRocksRestCatalog {
             listing: Default::default(),
             #[cfg(test)]
             delegate: CatalogDelegate::new(adapter.clone()),
-            #[cfg(test)]
-            adapter,
             endpoints,
             warehouse,
             access_delegation,
@@ -554,11 +550,6 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
 
     fn implementation_name(&self) -> &'static str {
         "rest"
-    }
-
-    #[cfg(test)]
-    fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
-        self.adapter.clone()
     }
 
     fn vended_credential_refresh_catalog(&self) -> Option<Arc<RestEndpoints>> {

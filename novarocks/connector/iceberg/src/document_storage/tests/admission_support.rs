@@ -23,7 +23,6 @@ pub(super) struct AdmissionCatalogSpy {
     inner: Arc<dyn NovaRocksCatalog>,
     reads: AtomicUsize,
     mutations: AtomicUsize,
-    client_accesses: AtomicUsize,
 }
 
 impl AdmissionCatalogSpy {
@@ -32,7 +31,6 @@ impl AdmissionCatalogSpy {
             inner,
             reads: AtomicUsize::new(0),
             mutations: AtomicUsize::new(0),
-            client_accesses: AtomicUsize::new(0),
         }
     }
 
@@ -42,11 +40,6 @@ impl AdmissionCatalogSpy {
             self.mutations.load(Ordering::SeqCst),
             0,
             "catalog mutations"
-        );
-        assert_eq!(
-            self.client_accesses.load(Ordering::SeqCst),
-            0,
-            "catalog client access"
         );
     }
 
@@ -135,11 +128,6 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
         request: &crate::catalog::admission::CatalogAdmissionRequest,
     ) -> Result<crate::catalog::admission::CatalogAdmission, CatalogUnsupported> {
         self.inner.admit_initiation(request)
-    }
-
-    fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
-        self.client_accesses.fetch_add(1, Ordering::SeqCst);
-        panic!("unsupported document admission requested the catalog client");
     }
 
     async fn list_namespaces(
