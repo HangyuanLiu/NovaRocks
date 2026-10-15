@@ -49,9 +49,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef};
-use arrow::compute::{concat, concat_batches};
-use arrow::record_batch::RecordBatch;
-use arrow::row::{OwnedRow, RowConverter, Rows, SortField};
+use arrow::compute::{SortOptions, concat};
+use arrow::row::{OwnedRow, Rows};
 use novarocks_functions::{
     AggregateStateAllocator, EvaluatedArgument, FullPartitionWindowInput, KernelEvaluationControl,
     KernelFailure, PreparedWindowKernel, Selection, WindowEvaluationPartition,
@@ -68,20 +67,20 @@ use novarocks_local_program::{
 mod invocation_input;
 use invocation_input::InvocationInputBuffer;
 
-use crate::runtime::preparation_metadata::{CompiledSchemaMetadataScope, CompiledSchemaSite};
-
 use super::analytic_shared::{
     AnalyticOutputValidationFailure, validate_analytic_output_columns_typed,
 };
 use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
 use super::compiled_window_geometry::{admit_frame, frame_table, frame_table_tracked, peer_groups};
-use super::sort::normalize_sort_key_array;
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+use super::sort::creation::{CreatedSortConverter, SortCreation};
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use novarocks_type_contract::ValueTypeStorageLifetime;
 
 fn failure(context: &str, error: impl std::fmt::Display) -> ExecutionFailure {
     ExecutionFailure::from(format!("{context}: {error}"))
@@ -112,20 +111,9 @@ pub struct CompiledWindowProcessorFactory {
     order_keys: usize,
     calls: Vec<CallPlan>,
     columns: Vec<OutputSource>,
-    output: ChunkSchemaRef,
+    output_node: ProgramNodeId,
     error: Arc<RuntimeErrorState>,
     original_function_major: bool,
-}
-
-/// The original Hosted constructor, exported only to isolated allocator tests.
-#[cfg(feature = "test-support")]
-pub fn prepare_window_factory_for_test<H: CompiledSchemaMetadataScope>(
-    program: Arc<LocalProgram>,
-    node: ProgramNodeId,
-    error: Arc<RuntimeErrorState>,
-    host: &mut H,
-) -> ExecutionResult<CompiledWindowProcessorFactory> {
-    CompiledWindowProcessorFactory::try_new_with_metadata_host(program, node, error, host)
 }
 
 impl CompiledWindowProcessorFactory {
@@ -134,38 +122,6 @@ impl CompiledWindowProcessorFactory {
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
     ) -> Result<Self, String> {
-        Self::try_new_in(program, node, error, |_, _, layout| {
-            ChunkSchema::from_compiled_layout(layout)
-        })
-    }
-
-    pub(crate) fn try_new_with_metadata_host<H: CompiledSchemaMetadataScope>(
-        program: Arc<LocalProgram>,
-        node: ProgramNodeId,
-        error: Arc<RuntimeErrorState>,
-        host: &mut H,
-    ) -> ExecutionResult<Self> {
-        Self::try_new_in(program, node, error, |program, site, layout| {
-            host.materialize(program, site, layout, || {
-                ChunkSchema::from_compiled_layout(layout)
-            })
-        })
-    }
-
-    fn try_new_in<E, F>(
-        program: Arc<LocalProgram>,
-        node: ProgramNodeId,
-        error: Arc<RuntimeErrorState>,
-        mut materialize: F,
-    ) -> Result<Self, E>
-    where
-        E: From<String>,
-        F: FnMut(
-            &Arc<LocalProgram>,
-            CompiledSchemaSite,
-            &novarocks_local_program::StaticLayout,
-        ) -> Result<ChunkSchemaRef, E>,
-    {
         let at = node.index();
         let nodes = program.graph().nodes();
         let graph_node = nodes
@@ -179,7 +135,7 @@ impl CompiledWindowProcessorFactory {
             output_columns,
         } = graph_node.kind()
         else {
-            return Err(format!("compiled local node {at} is not an Analytic").into());
+            return Err(format!("compiled local node {at} is not an Analytic"));
         };
         let key = |count: usize, role: fn(u32) -> ProgramNodeExpressionRole| {
             (0..count)
@@ -208,8 +164,7 @@ impl CompiledWindowProcessorFactory {
             if !matches!(function.kind, WindowFunctionKind::Prepared) {
                 return Err(format!(
                     "compiled Analytic call {call} at local node {at} is not a prepared window call"
-                )
-                .into());
+                ));
             }
             let frame = function.frame.ok_or_else(|| {
                 format!("compiled Analytic call {call} at local node {at} has no explicit frame")
@@ -222,22 +177,21 @@ impl CompiledWindowProcessorFactory {
             else {
                 return Err(format!(
                     "compiled Analytic call {call} at local node {at} has no prepared window kernel"
-                )
-                .into());
+                ));
             };
             let kernel = Arc::clone(kernel);
             let contract = kernel.contract();
             if contract.order_argument_types().len() != 0 {
                 return Err(format!(
                     "compiled Analytic call {call} at local node {at} with function ORDER BY is not executable"
-                ).into());
+                ));
             }
             let roots = contract.logical_argument_types().len();
             if function.args.len() != roots {
                 return Err(format!(
                     "compiled Analytic call {call} at local node {at} has {} roots for {roots} channels",
                     function.args.len()
-                ).into());
+                ));
             }
             let first_root = sites.len();
             for argument in 0..roots {
@@ -281,20 +235,14 @@ impl CompiledWindowProcessorFactory {
                 AnalyticOutputColumn::Window(call) => {
                     return Err(format!(
                         "compiled Analytic at local node {at} outputs absent call {call}"
-                    ).into());
+                    ));
                 }
             });
         }
-        let output = materialize(
-            &program,
-            CompiledSchemaSite::AnalyticOutput(node),
-            graph_node.output_layout(),
-        )?;
-        if output.arrow_schema_ref().fields().len() != columns.len() {
+        if graph_node.output_layout().schema().fields().len() != columns.len() {
             return Err(format!(
                 "compiled Analytic at local node {at} output width differs from its columns"
-            )
-            .into());
+            ));
         }
         let (partition_keys, order_keys) = (partition_exprs.len(), order_by_exprs.len());
         // Positive immutable owner capability, never a function-name decision.
@@ -310,7 +258,7 @@ impl CompiledWindowProcessorFactory {
             order_keys,
             calls,
             columns,
-            output,
+            output_node: node,
             error,
             original_function_major,
         })
@@ -324,7 +272,6 @@ impl CompiledWindowProcessorFactory {
         state: &RuntimeState,
     ) -> ExecutionResult<Option<crate::runtime::query_memory::QueryMemoryBinding>> {
         let mut processor = self.create_processor();
-        processor.prepare()?;
         processor.bind_runtime_state(state)?;
         Ok(processor.control.query_memory().cloned())
     }
@@ -337,9 +284,13 @@ impl CompiledWindowProcessorFactory {
             order_keys: self.order_keys,
             calls: self.calls.clone(),
             columns: self.columns.clone(),
-            output: Arc::clone(&self.output),
+            output_node: self.output_node,
+            output: None,
+            construction: None,
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             instances: None,
+            partition_key_types: None,
+            order_key_types: None,
             partition_rows: None,
             order_rows: None,
             last_partition: None,
@@ -367,9 +318,10 @@ impl OperatorFactory for CompiledWindowProcessorFactory {
 
 /// Rows of the open partition with their evaluated order keys and arguments.
 struct Piece {
-    batch: RecordBatch,
+    batch: Chunk,
     order: Vec<ArrayRef>,
     arguments: Vec<ArrayRef>,
+    _key_storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 
 struct CompiledWindowProcessor {
@@ -380,15 +332,19 @@ struct CompiledWindowProcessor {
     order_keys: usize,
     calls: Vec<CallPlan>,
     columns: Vec<OutputSource>,
-    output: ChunkSchemaRef,
+    output_node: ProgramNodeId,
+    output: Option<ChunkSchemaRef>,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     control: RuntimeKernelControl,
     instances: Option<Vec<CompiledExpressionInstance>>,
     /// Row encoders of the normalized partition and order keys, created from
     /// the first evaluated keys; one encoder owns every comparison.
-    partition_rows: Option<RowConverter>,
-    order_rows: Option<RowConverter>,
+    partition_key_types: Option<novarocks_type_contract::ValueTypeStorageLifetime>,
+    order_key_types: Option<novarocks_type_contract::ValueTypeStorageLifetime>,
+    partition_rows: Option<CreatedSortConverter>,
+    order_rows: Option<CreatedSortConverter>,
     /// The partition keys of the last arrived row.
-    last_partition: Option<OwnedRow>,
+    last_partition: Option<CreatedPartitionKey>,
     open: Vec<Piece>,
     pending: VecDeque<Chunk>,
     finishing: bool,
@@ -399,23 +355,93 @@ struct CompiledWindowProcessor {
     partition_ordinal: usize,
 }
 
-/// Row-encode normalized keys with the processor's one encoder for them.
-fn encode(converter: &mut Option<RowConverter>, keys: &[ArrayRef]) -> ExecutionResult<Rows> {
-    if converter.is_none() {
-        let fields = keys
-            .iter()
-            .map(|key| SortField::new(key.data_type().clone()))
-            .collect::<Vec<_>>();
-        *converter = Some(
-            RowConverter::new(fields)
-                .map_err(|error| failure("compiled window key row encoding", error))?,
-        );
+/// The row encoding owns shared converter fields independently of the converter.
+/// Row bytes and offsets remain under the original window payload policy.
+struct CreatedWindowRows {
+    rows: Rows,
+    storage: ValueTypeStorageLifetime,
+}
+impl std::ops::Deref for CreatedWindowRows {
+    type Target = Rows;
+    fn deref(&self) -> &Rows {
+        &self.rows
     }
-    converter
-        .as_mut()
-        .expect("converter was created")
+}
+struct CreatedPartitionKey {
+    row: OwnedRow,
+    _storage: ValueTypeStorageLifetime,
+}
+
+/// Row-encode normalized keys with the processor's one encoder for them.
+fn encode(
+    converter: &mut Option<CreatedSortConverter>,
+    keys: &[ArrayRef],
+    type_storage: ValueTypeStorageLifetime,
+    creation: &SortCreation<'_>,
+) -> ExecutionResult<CreatedWindowRows> {
+    if converter.is_none() {
+        *converter = Some(creation.row_converter(
+            keys,
+            type_storage,
+            std::iter::repeat_n(SortOptions::default(), keys.len()),
+        )?);
+    }
+    let converter = converter.as_ref().expect("converter was created");
+    let rows = converter
+        .converter()
         .convert_columns(keys)
-        .map_err(|error| failure("compiled window key row encoding", error))
+        .map_err(|error| failure("compiled window key row encoding", error))?;
+    Ok(CreatedWindowRows {
+        rows,
+        storage: converter.storage_lifetime(),
+    })
+}
+
+/// Original RecordBatch slice, with its actual wrapper constructors admitted
+/// before construction and finite source custody carried to the new wrapper.
+/// This does not call a new payload transfer or change SchemeS accounting.
+fn slice_body(
+    source: &Chunk,
+    offset: usize,
+    len: usize,
+    factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+) -> ExecutionResult<Chunk> {
+    let owner = factory.begin_input_construction(source)?;
+    owner.observe(
+        0,
+        &[],
+        crate::exec::chunk::ArrayNormalizationStep::CreateChunkColumns {
+            channels: source.columns().len(),
+        },
+    )?;
+    for array in source.columns() {
+        owner.observe(
+            0,
+            &[],
+            crate::exec::chunk::ArrayNormalizationStep::SliceArray {
+                source: array,
+                offset,
+                length: len,
+            },
+        )?;
+    }
+    let storage = source.source_storage_lifetime_observed::<ConstructionFailure>(
+        owner.storage_lifetime(),
+        |layout| owner.request(layout),
+    )?;
+    let batch = source.record_batch().slice(offset, len);
+    Ok(Chunk::try_new_typed_record_batch_owned_observed::<
+        ConstructionFailure,
+        _,
+        _,
+    >(
+        batch,
+        source.chunk_schema_ref(),
+        storage,
+        owner.storage_lifetime(),
+        |layout| owner.request(layout),
+        |step| owner.observe(0, &[], step),
+    )?)
 }
 
 /// Maximal adjacent groups using the ONE original semantic equality author.
@@ -468,6 +494,12 @@ fn original_peer_groups(
 }
 
 impl CompiledWindowProcessor {
+    fn prepared_output(&self) -> ExecutionResult<&ChunkSchemaRef> {
+        self.output.as_ref().ok_or_else(|| {
+            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into()
+        })
+    }
+
     fn failure_result<T>(&mut self, result: ExecutionResult<T>) -> ExecutionResult<T> {
         if let Some(cause) = &self.failed {
             return Err(cause.clone());
@@ -483,6 +515,8 @@ impl CompiledWindowProcessor {
                 self.partition_rows = None;
                 self.order_rows = None;
                 self.last_partition = None;
+                self.partition_key_types = None;
+                self.order_key_types = None;
                 drop(std::mem::take(&mut self.open));
                 drop(std::mem::take(&mut self.pending));
                 Err(self
@@ -558,7 +592,7 @@ impl CompiledWindowProcessor {
                 evaluate_all(
                     &mut instances[root],
                     self.sites[root],
-                    &ordered.batch,
+                    ordered.record_batch(),
                     &self.control,
                 )?,
                 &self.control,
@@ -584,12 +618,12 @@ impl CompiledWindowProcessor {
                 keys.as_mut_slice()[root] = evaluate_all(
                     &mut instances[root],
                     self.sites[root],
-                    &ordered.batch,
+                    ordered.record_batch(),
                     &self.control,
                 )?;
             }
         }
-        let batch = &ordered.batch;
+        let batch = ordered.record_batch();
         // The original adjacency author compares the actual keys directly.
         // It preserves signed zero / NaN bit identity and original supported
         // key errors, without a new normalized-key or RowConverter allocation.
@@ -629,7 +663,7 @@ impl CompiledWindowProcessor {
                     evaluate_all(
                         &mut instances[root],
                         self.sites[root],
-                        &ordered.batch,
+                        ordered.record_batch(),
                         &self.control,
                     )?,
                     &self.control,
@@ -791,20 +825,22 @@ impl CompiledWindowProcessor {
             &columns,
             &self.columns,
             &results,
-            &self.output,
+            self.prepared_output()?,
             rows,
             &self.control,
         )?;
         // Keep original arrival chunk boundaries; changing them would alter
         // batch-sensitive downstream legacy semantics independently of BY.
         let outputs = super::analytic_shared::split_analytic_output_chunks(
-            Arc::clone(&self.output),
+            Arc::clone(self.prepared_output()?),
             &columns,
             input,
         )?;
         self.pending = outputs;
         self.partition_rows = None;
         self.order_rows = None;
+        self.partition_key_types = None;
+        self.order_key_types = None;
         Ok(())
     }
     /// Evaluate every root over the arriving rows, then split them at the
@@ -817,24 +853,78 @@ impl CompiledWindowProcessor {
             &self.control,
         )?;
         let instances = self.instances.as_mut().expect("instances were created");
+        let factory = self
+            .construction
+            .as_ref()
+            .cloned()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let references = factory.begin_input_construction(chunk)?;
+        references.request(std::alloc::Layout::array::<ArrayRef>(self.sites.len())
+            .map_err(|_| ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
         let mut values = Vec::with_capacity(self.sites.len());
         for (instance, site) in instances.iter_mut().zip(&self.sites) {
-            values.push(evaluate_all(instance, *site, &chunk.batch, &self.control)?);
+            values.push(evaluate_all(
+                instance,
+                *site,
+                chunk.record_batch(),
+                &self.control,
+            )?);
         }
         let keys = self.partition_keys + self.order_keys;
-        for key in values.iter_mut().take(keys) {
-            *key = normalize_sort_key_array(key).map_err(ExecutionFailure::from)?;
+        let key_factory = self
+            .construction
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        let input_schema = chunk.chunk_schema_ref();
+        let key_creation =
+            super::sort::creation::SortCreation::new(key_factory.as_ref(), &input_schema);
+        let key_arrays = key_creation.begin(chunk)?;
+        let key_types = key_creation.begin(chunk)?;
+        let mut key_type_storage = key_creation.source_type_storage(chunk, key_types.as_ref())?;
+        for (ordinal, key) in values.iter_mut().take(keys).enumerate() {
+            let declared =
+                super::compiled_expression::root_value_type(&self.program, self.sites[ordinal])?;
+            key_type_storage = key_type_storage.retaining_observed::<ConstructionFailure>(
+                &declared
+                    .typed_binding()
+                    .layout()
+                    .arrow_backing_storage_lifetime(),
+                |layout| key_types.request(layout),
+            )?;
+            *key = key_creation.normalize_key(
+                key,
+                declared.value_type(),
+                key_arrays.as_ref(),
+                key_types.as_ref(),
+            )?;
+        }
+        let key_storage = key_arrays
+            .storage_lifetime()
+            .retaining_observed::<crate::exec::pipeline::operator::ConstructionFailure>(
+            &key_type_storage,
+            |layout| key_arrays.request(layout),
+        )?;
+        if self.partition_key_types.is_none() && self.partition_keys != 0 {
+            self.partition_key_types = Some(key_type_storage.clone());
+        }
+        if self.order_key_types.is_none() && self.order_keys != 0 {
+            self.order_key_types = Some(key_type_storage.clone());
         }
         let rows = chunk.len();
         // Rows at which a new partition starts; without partition keys every
         // row belongs to the one partition.
         let mut starts = Vec::new();
         if self.partition_keys > 0 {
-            let encoded = encode(&mut self.partition_rows, &values[..self.partition_keys])?;
+            let encoded = encode(
+                &mut self.partition_rows,
+                &values[..self.partition_keys],
+                key_type_storage.clone(),
+                &key_creation,
+            )?;
             if self
                 .last_partition
                 .as_ref()
-                .is_none_or(|last| last.row() != encoded.row(0))
+                .is_none_or(|last| last.row.row() != encoded.row(0))
             {
                 starts.push(0);
             }
@@ -843,16 +933,30 @@ impl CompiledWindowProcessor {
                     starts.push(row);
                 }
             }
-            self.last_partition = Some(encoded.row(rows - 1).owned());
+            self.last_partition = Some(CreatedPartitionKey {
+                row: encoded.row(rows - 1).owned(),
+                _storage: encoded.storage.clone(),
+            });
         }
         let mut closed = Vec::new();
         let mut cursor = 0;
         for &start in starts.iter().chain(std::iter::once(&rows)) {
             if start > cursor {
                 self.open.push(Piece {
-                    batch: chunk.batch.slice(cursor, start - cursor),
-                    order: slice(&values[self.partition_keys..keys], cursor, start - cursor),
-                    arguments: slice(&values[keys..], cursor, start - cursor),
+                    _key_storage: key_storage.clone(),
+                    batch: slice_body(chunk, cursor, start - cursor, factory.as_ref())?,
+                    order: slice_observed(
+                        &values[self.partition_keys..keys],
+                        cursor,
+                        start - cursor,
+                        key_arrays.as_ref(),
+                    )?,
+                    arguments: slice_observed(
+                        &values[keys..],
+                        cursor,
+                        start - cursor,
+                        key_arrays.as_ref(),
+                    )?,
                 });
                 cursor = start;
             }
@@ -864,36 +968,58 @@ impl CompiledWindowProcessor {
     }
 
     /// Evaluate the complete open partition and return its output rows.
-    fn close(&mut self) -> ExecutionResult<RecordBatch> {
+    fn close(&mut self) -> ExecutionResult<Chunk> {
         let pieces = std::mem::take(&mut self.open);
-        let schema = pieces[0].batch.schema();
+        let factory = self
+            .construction
+            .as_ref()
+            .cloned()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let source = &pieces[0].batch;
+        let input_schema = source.chunk_schema_ref();
+        let input_creation = SortCreation::new(factory.as_ref(), &input_schema);
+        let temporary = factory.begin_input_construction(source)?;
+        let retained = factory.begin_input_construction(source)?;
         let batch = if pieces.len() == 1 {
-            pieces[0].batch.clone()
+            source.clone()
         } else {
-            concat_batches(&schema, pieces.iter().map(|piece| &piece.batch))
-                .map_err(|error| failure("compiled window partition concat", error))?
+            let mut input = input_creation.vector::<Chunk>(pieces.len(), temporary.as_ref())?;
+            input.extend(pieces.iter().map(|piece| piece.batch.clone()));
+            let batch = input_creation.concat(&input, retained.as_ref())?;
+            input_creation.publish(batch, source, retained.as_ref())?
         };
-        let rows = batch.num_rows();
+        let rows = batch.len();
         let join = |column: &dyn Fn(&Piece) -> &ArrayRef| -> ExecutionResult<ArrayRef> {
             if pieces.len() == 1 {
                 return Ok(Arc::clone(column(&pieces[0])));
             }
-            let parts = pieces
-                .iter()
-                .map(|piece| column(piece).as_ref())
-                .collect::<Vec<&dyn Array>>();
-            concat(&parts).map_err(|error| failure("compiled window partition concat", error))
+            let mut sources =
+                input_creation.vector::<&ArrayRef>(pieces.len(), temporary.as_ref())?;
+            sources.extend(pieces.iter().map(column));
+            input_creation.concat_array(&sources, source, retained.as_ref())
         };
-        let order = (0..self.order_keys)
-            .map(|key| join(&|piece| &piece.order[key]))
-            .collect::<ExecutionResult<Vec<_>>>()?;
-        let arguments = (0..self.sites.len() - self.partition_keys - self.order_keys)
-            .map(|root| join(&|piece| &piece.arguments[root]))
-            .collect::<ExecutionResult<Vec<_>>>()?;
+        let mut order = input_creation.vector::<ArrayRef>(self.order_keys, retained.as_ref())?;
+        for key in 0..self.order_keys {
+            order.push(join(&|piece| &piece.order[key])?);
+        }
+        let arguments_count = self.sites.len() - self.partition_keys - self.order_keys;
+        let mut arguments =
+            input_creation.vector::<ArrayRef>(arguments_count, retained.as_ref())?;
+        for root in 0..arguments_count {
+            arguments.push(join(&|piece| &piece.arguments[root])?);
+        }
         let peers = if self.order_keys == 0 {
             peer_groups(rows, |_| true)
         } else {
-            let encoded = encode(&mut self.order_rows, &order)?;
+            let encoded = encode(
+                &mut self.order_rows,
+                &order,
+                self.order_key_types
+                    .as_ref()
+                    .ok_or(ConstructionFailure::MissingOwner)?
+                    .clone(),
+                &input_creation,
+            )?;
             peer_groups(rows, |row| encoded.row(row) == encoded.row(row - 1))
         };
         let first_argument = self.partition_keys + self.order_keys;
@@ -916,14 +1042,12 @@ impl CompiledWindowProcessor {
                 &self.control,
             )?);
         }
-        let columns = self
-            .columns
-            .iter()
-            .map(|source| match source {
-                OutputSource::Input(ordinal) => Arc::clone(batch.column(*ordinal)),
-                OutputSource::Call(call) => Arc::clone(&results[*call].values),
-            })
-            .collect::<Vec<_>>();
+        let mut columns =
+            input_creation.vector::<ArrayRef>(self.columns.len(), retained.as_ref())?;
+        columns.extend(self.columns.iter().map(|source| match source {
+            OutputSource::Input(ordinal) => Arc::clone(batch.record_batch().column(*ordinal)),
+            OutputSource::Call(call) => Arc::clone(&results[*call].values),
+        }));
         // Only the new complete-carrier route invokes the original final
         // analytic validator. Existing FixedZero rows retain their old route.
         if results.iter().any(|result| result.carrier.is_some()) {
@@ -931,13 +1055,22 @@ impl CompiledWindowProcessor {
                 &columns,
                 &self.columns,
                 &results,
-                &self.output,
+                self.prepared_output()?,
                 rows,
                 &self.control,
             )?;
         }
-        let result = RecordBatch::try_new(self.output.arrow_schema_ref(), columns)
-            .map_err(|error| failure("compiled window output", error))?;
+        let storage = batch.source_storage_lifetime_observed::<ConstructionFailure>(
+            retained.storage_lifetime(),
+            |layout| retained.request(layout),
+        )?;
+        let result = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            self.prepared_output()?.clone(),
+            columns,
+            rows,
+            storage,
+            |step| retained.observe(0, &[], step),
+        )?;
         self.partition_ordinal = self
             .partition_ordinal
             .checked_add(1)
@@ -946,21 +1079,56 @@ impl CompiledWindowProcessor {
     }
 
     /// Emit the partitions one arrival closed as one chunk, in partition order.
-    fn publish(&mut self, closed: Vec<RecordBatch>) -> ExecutionResult<()> {
-        let batch = match closed.len() {
+    fn publish(&mut self, closed: Vec<Chunk>) -> ExecutionResult<()> {
+        let output = match closed.len() {
             0 => return Ok(()),
             1 => closed.into_iter().next().expect("one closed partition"),
-            _ => concat_batches(&self.output.arrow_schema_ref(), &closed)
-                .map_err(|error| failure("compiled window output concat", error))?,
+            _ => {
+                let factory = self
+                    .construction
+                    .as_ref()
+                    .ok_or(ConstructionFailure::MissingOwner)?;
+                let creation = SortCreation::new(factory.as_ref(), self.prepared_output()?);
+                let retained = factory.begin_input_construction(&closed[0])?;
+                let batch = creation.concat(&closed, retained.as_ref())?;
+                creation.publish(batch, &closed[0], retained.as_ref())?
+            }
         };
-        self.pending.push_back(Chunk::try_new_with_chunk_schema(
-            batch,
-            Arc::clone(&self.output),
-        )?);
+        self.pending.push_back(output);
         Ok(())
     }
 }
 
+fn slice_observed(
+    values: &[ArrayRef],
+    offset: usize,
+    len: usize,
+    owner: &dyn InputConstructionOwner,
+) -> ExecutionResult<Vec<ArrayRef>> {
+    owner.request(
+        std::alloc::Layout::array::<ArrayRef>(values.len()).map_err(|_| {
+            ConstructionFailure::Resource(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            )
+        })?,
+    )?;
+    let mut output = Vec::with_capacity(values.len());
+    for value in values {
+        owner.observe(
+            0,
+            &[],
+            crate::exec::chunk::ArrayNormalizationStep::SliceArray {
+                source: value,
+                offset,
+                length: len,
+            },
+        )?;
+        output.push(value.slice(offset, len));
+    }
+    Ok(output)
+}
+
+// The function-major invocation keeps its original payload/scratch author.
 fn slice(values: &[ArrayRef], offset: usize, len: usize) -> Vec<ArrayRef> {
     values
         .iter()
@@ -1123,6 +1291,51 @@ fn validate_complete_output(
 }
 
 impl Operator for CompiledWindowProcessor {
+    #[cfg(any(test, feature = "test-support"))]
+    fn prepared_schema_for_test(&self) -> Option<ChunkSchemaRef> { self.output.clone() }
+    fn compiled_schema_preparation_site(
+        &self,
+    ) -> Option<(
+        &Arc<LocalProgram>,
+        crate::runtime::preparation_metadata::CompiledSchemaSite,
+    )> {
+        Some((
+            &self.program,
+            crate::runtime::preparation_metadata::CompiledSchemaSite::AnalyticOutput(
+                self.output_node,
+            ),
+        ))
+    }
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.control.bind_construction_factory(factory.clone());
+        self.construction = Some(factory);
+    }
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        if let Some(cause) = &self.failed {
+            return Err(cause.clone());
+        }
+        if self.output.is_some() {
+            return Ok(());
+        }
+        let result = (|| {
+            use crate::exec::pipeline::operator::ConstructionFailure;
+            let layout = self.program.graph().nodes()[self.output_node.index()].output_layout();
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?;
+            self.output = Some(factory.create_compiled_chunk_schema(layout)?);
+            Ok(())
+        })();
+        self.failure_result(result)
+    }
+
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.control.bind_runtime_memory(state);
         Ok(())
@@ -1155,7 +1368,9 @@ impl ProcessorOperator for CompiledWindowProcessor {
         if let Some(cause) = &self.failed {
             return Err(cause.clone());
         }
-        let result = if self.finishing || self.finished {
+        let result = if self.output.is_none() {
+            Err(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into())
+        } else if self.finishing || self.finished {
             Err("compiled Analytic received input after finishing".into())
         } else if chunk.is_empty() {
             Ok(())
@@ -1215,9 +1430,58 @@ mod tests {
     use arrow::array::{Float64Array, Int64Array};
     use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
 
+    struct DeclarationControl;
+    impl novarocks_type_contract::PureCompileControl for DeclarationControl {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+
     /// Peers of `keys` after ordering them as the compiled Sort does.
-    fn sorted_peers(keys: ArrayRef) -> Vec<WindowRowRange> {
-        let keys = normalize_sort_key_array(&keys).unwrap();
+    fn sorted_peers(
+        keys: ArrayRef,
+        declared_type: arrow::datatypes::DataType,
+    ) -> Vec<WindowRowRange> {
+        use novarocks_type_contract::{TypedValueBinding, ValueKind, ValueLayout, ValueTypeRef};
+        let storage = ValueTypeStorageLifetime::pure();
+        let binding = TypedValueBinding::try_new(
+            ValueTypeRef::try_new(
+                ValueKind::Scalar(declared_type.clone()),
+                true,
+                storage.clone(),
+            )
+            .unwrap(),
+            ValueLayout::try_new(&declared_type, storage.clone()).unwrap(),
+        )
+        .unwrap();
+        let layout = novarocks_local_program::StaticLayout::try_new_typed_for_compile(
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("key", declared_type, true),
+            ])),
+            Arc::from([novarocks_types::SlotId::new(1)]),
+            vec![(binding.clone(), None)],
+            storage,
+            |_| Ok(()),
+            &DeclarationControl,
+        )
+        .unwrap();
+        let state = RuntimeState::default();
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("window-key-equality-scaffolds"),
+            state.error_state(),
+        ).unwrap();
+        let schema = factory.create_compiled_chunk_schema(&layout).unwrap();
+        let creation = SortCreation::new(factory.as_ref(), &schema);
+        let arrays = factory.begin_typed_construction(&schema).unwrap();
+        let types = factory.begin_typed_construction(&schema).unwrap();
+        let keys = creation
+            .normalize_key(&keys, binding.value_type(), arrays.as_ref(), types.as_ref())
+            .unwrap();
         let indices = lexsort_to_indices(
             &[SortColumn {
                 values: Arc::clone(&keys),
@@ -1230,7 +1494,13 @@ mod tests {
         )
         .unwrap();
         let sorted = take(keys.as_ref(), &indices, None).unwrap();
-        let encoded = encode(&mut None, &[sorted]).unwrap();
+        let encoded = encode(
+            &mut None,
+            &[sorted],
+            binding.layout().storage_lifetime(),
+            &creation,
+        )
+        .unwrap();
         peer_groups(encoded.num_rows(), |row| {
             encoded.row(row) == encoded.row(row - 1)
         })
@@ -1258,7 +1528,7 @@ mod tests {
             Some(-0.0),
         ]));
         assert_eq!(
-            sorted_peers(floats),
+            sorted_peers(floats, arrow::datatypes::DataType::Float64),
             ranges(&[(0, 2), (2, 4), (4, 5), (5, 6), (6, 8)])
         );
         let integers: ArrayRef = Arc::new(Int64Array::from(vec![
@@ -1268,6 +1538,21 @@ mod tests {
             Some(-1),
             None,
         ]));
-        assert_eq!(sorted_peers(integers), ranges(&[(0, 2), (2, 3), (3, 5)]));
+        assert_eq!(
+            sorted_peers(integers, arrow::datatypes::DataType::Int64),
+            ranges(&[(0, 2), (2, 3), (3, 5)])
+        );
     }
+}
+
+/// The real factory retains frozen declarations; prepare owns runtime creation.
+#[cfg(feature = "test-support")]
+pub fn prepare_window_factory_for_test(
+    program: Arc<LocalProgram>,
+    node: ProgramNodeId,
+    error: Arc<RuntimeErrorState>,
+) -> ExecutionResult<CompiledWindowProcessorFactory> {
+    Ok(CompiledWindowProcessorFactory::try_new(
+        program, node, error,
+    )?)
 }

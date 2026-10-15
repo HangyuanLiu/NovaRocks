@@ -587,7 +587,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::num::NonZeroUsize;
 
-    use crate::exec::chunk::Chunk;
     use crate::exec::expr::ExprArena;
     use crate::exec::fragment::program::{
         FragmentContractVersion, FragmentProgram, FragmentProgramOptions, FragmentSinkSpec,
@@ -660,33 +659,27 @@ mod tests {
     }
 
     fn fragment_program(sink: FragmentSinkProgram) -> FragmentProgram {
-        let arrow_schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
-            "v",
-            arrow::datatypes::DataType::Int32,
-            true,
-        )]);
-        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-            &arrow_schema,
+        let chunk = crate::exec::chunk::typed_fixture::columns(
+            &["v"],
             &[SlotId::new(3)],
-        )
-        .unwrap();
-        let chunk = Chunk::try_new_with_columns(
-            chunk_schema,
+            &[novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int32,
+                true,
+            )],
             vec![std::sync::Arc::new(arrow::array::Int32Array::from(Vec::<
                 i32,
             >::new(
             )))],
-        )
-        .unwrap();
+            0,
+        );
         let plan = ExecPlan {
             arena: ExprArena::default(),
             root: ExecNode {
                 kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 99 }),
             },
         };
-        let profile = plan
-            .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
-            .unwrap();
+        let profile =
+            crate::exec::chunk::typed_fixture::profile(&plan, NonZeroUsize::new(1).unwrap(), None);
         let static_sink = sink.into_static().unwrap();
         let requirements = match &static_sink {
             novarocks_local_program::StaticSinkProgram::Result => {
@@ -697,9 +690,8 @@ mod tests {
                 .map(|branch| crate::exec::node::ExternalSinkRequirement::ExchangeOutput { branch })
                 .collect(),
         };
-        let (local, runtime) = plan
-            .into_local_program_and_bindings(profile, BTreeMap::new(), requirements, static_sink)
-            .unwrap();
+        let (local, runtime) =
+            crate::exec::chunk::typed_fixture::lower(plan, profile, requirements, static_sink);
         assert_eq!(runtime.scan_count(), 0);
         FragmentProgram::try_new(
             std::sync::Arc::new(local),

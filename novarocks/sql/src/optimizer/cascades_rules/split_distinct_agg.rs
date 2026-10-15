@@ -284,7 +284,9 @@ fn aggregate_output_columns(
                         }
                     };
                     // Widen only the phase-output root, preserving its full domain.
-                    value_type.nullable = true;
+                    value_type = value_type
+                        .with_nullable(true)
+                        .expect("validated root NULL contract");
                     value_type
                 },
 
@@ -829,7 +831,7 @@ mod tests {
         AggregateCall {
             name: "count".into(),
             distinct: true,
-            result_type: DataType::Int64,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             output_column_id: test_col_id(&format!("count_distinct_{arg_name}")),
             source: crate::binding::AggregateArgumentSource::uncertified(
                 vec![col(arg_name)],
@@ -843,11 +845,14 @@ mod tests {
         AggregateCall {
             name: "array_agg".into(),
             distinct: true,
-            result_type: DataType::List(Arc::new(arrow::datatypes::Field::new(
-                "item",
-                DataType::Int64,
+            result_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::List(Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Int64,
+                    true,
+                ))),
                 true,
-            ))),
+            ),
             output_column_id: test_col_id(&format!("array_agg_distinct_{arg_name}")),
             source: crate::binding::AggregateArgumentSource::uncertified(
                 vec![col(arg_name)],
@@ -861,7 +866,7 @@ mod tests {
         AggregateCall {
             name: "sum".into(),
             distinct: false,
-            result_type: DataType::Int64,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             output_column_id: test_col_id(&format!("sum_{arg_name}")),
             source: crate::binding::AggregateArgumentSource::uncertified(
                 vec![col(arg_name)],
@@ -903,10 +908,7 @@ mod tests {
                     call.output_column_id
                 },
                 name: format!("agg_{idx}"),
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    call.result_type.clone(),
-                    true,
-                ),
+                value_type: call.result_type.clone(),
 
                 is_internal: false,
             });
@@ -1029,7 +1031,7 @@ mod tests {
         let aggregate = AggregateCall {
             name: "count".to_string(),
             distinct: true,
-            result_type: DataType::Int64,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             output_column_id: test_col_id("multi_distinct_count_a_b"),
             source: crate::binding::AggregateArgumentSource::uncertified(
                 vec![col("a"), col("b")],
@@ -1101,11 +1103,14 @@ mod tests {
                     AggregateCall {
                         name: "array_agg".into(),
                         distinct: false,
-                        result_type: DataType::List(Arc::new(arrow::datatypes::Field::new(
-                            "item",
-                            DataType::Int64,
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::List(Arc::new(arrow::datatypes::Field::new(
+                                "item",
+                                DataType::Int64,
+                                true,
+                            ))),
                             true,
-                        ))),
+                        ),
                         output_column_id: fallback_output_id(1),
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![col("name")],
@@ -1154,7 +1159,10 @@ mod tests {
                     AggregateCall {
                         name: "ds_hll_count_distinct".into(),
                         distinct: false,
-                        result_type: DataType::Int64,
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                         output_column_id: fallback_output_id(1),
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![col("x")],
@@ -1196,11 +1204,14 @@ mod tests {
                 vec![AggregateCall {
                     name: "array_agg".into(),
                     distinct: true,
-                    result_type: DataType::List(Arc::new(arrow::datatypes::Field::new(
-                        "item",
-                        DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::List(Arc::new(arrow::datatypes::Field::new(
+                            "item",
+                            DataType::Int64,
+                            true,
+                        ))),
                         true,
-                    ))),
+                    ),
                     output_column_id: fallback_output_id(1),
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![col("name")],
@@ -1238,7 +1249,7 @@ mod tests {
         let sum_distinct_x = AggregateCall {
             name: "sum".into(),
             distinct: true,
-            result_type: DataType::Int64,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             output_column_id: fallback_output_id(1),
             source: crate::binding::AggregateArgumentSource::uncertified(
                 vec![col("x")],
@@ -1471,7 +1482,10 @@ mod tests {
                     AggregateCall {
                         name: "count".into(),
                         distinct: true,
-                        result_type: DataType::Int64,
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                         output_column_id: count_output.column_id,
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![col_with_id("x", 5)],
@@ -1486,7 +1500,10 @@ mod tests {
                     AggregateCall {
                         name: "sum".into(),
                         distinct: false,
-                        result_type: DataType::Int64,
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
                         output_column_id: sum_output.column_id,
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![col_with_id("a", 6)],
@@ -1558,7 +1575,10 @@ mod tests {
                     AggregateCall {
                         name: "count".into(),
                         distinct: true,
-                        result_type: DataType::Int64,
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                         output_column_id: ColumnId::new_for_test(7),
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![x],
@@ -1573,7 +1593,10 @@ mod tests {
                     AggregateCall {
                         name: "sum".into(),
                         distinct: false,
-                        result_type: DataType::Int64,
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
                         output_column_id: ColumnId::new_for_test(8),
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![a],
@@ -1758,11 +1781,11 @@ mod tests {
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             );
             let mut result = crate::functions::aggregate_result_type(&resolved).clone();
-            result.nullable = true;
+            result = result.with_nullable(true).unwrap();
             let mut state = crate::functions::aggregate_selection(&resolved)
                 .intermediate_type
                 .clone();
-            state.nullable = true;
+            state = state.with_nullable(true).unwrap();
             let input = TypedExpr {
                 kind: ExprKind::ColumnRef {
                     column_id: test_col_id("a"),
@@ -1774,7 +1797,7 @@ mod tests {
             let call = AggregateCall {
                 name: name.into(),
                 distinct: false,
-                result_type: result.data_type.clone(),
+                result_type: result.clone(),
                 output_column_id: ColumnId(202),
                 source: crate::binding::AggregateArgumentSource::uncertified(
                     vec![input],
@@ -1975,7 +1998,10 @@ mod tests {
                     AggregateCall {
                         name: "count".into(),
                         distinct: true,
-                        result_type: DataType::Int64,
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                         output_column_id: count_output.column_id,
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![col_with_id("x", 5)],
@@ -1990,7 +2016,10 @@ mod tests {
                     AggregateCall {
                         name: "sum".into(),
                         distinct: false,
-                        result_type: DataType::Int64,
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
                         output_column_id: sum_output.column_id,
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![col_with_id("a", 6)],
@@ -2054,7 +2083,10 @@ mod tests {
                     AggregateCall {
                         name: "sum".into(),
                         distinct: false,
-                        result_type: DataType::Int64,
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
                         output_column_id: sum_output,
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![a],
@@ -2069,7 +2101,10 @@ mod tests {
                     AggregateCall {
                         name: "count".into(),
                         distinct: false,
-                        result_type: DataType::Int64,
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                         output_column_id: count_output,
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![b],
@@ -2084,7 +2119,10 @@ mod tests {
                     AggregateCall {
                         name: "count".into(),
                         distinct: true,
-                        result_type: DataType::Int64,
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                         output_column_id: distinct_output,
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![x],
@@ -2213,7 +2251,10 @@ mod tests {
                 vec![AggregateCall {
                     name: "count".into(),
                     distinct: true,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                     output_column_id: ColumnId::new_for_test(8),
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![x],
@@ -2293,7 +2334,10 @@ mod tests {
                     AggregateCall {
                         name: "count".into(),
                         distinct: true,
-                        result_type: DataType::Int64,
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                         output_column_id: ColumnId::new_for_test(8),
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![x_phase],
@@ -2308,7 +2352,10 @@ mod tests {
                     AggregateCall {
                         name: "sum".into(),
                         distinct: false,
-                        result_type: DataType::Int64,
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
                         output_column_id: ColumnId::new_for_test(9),
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![a],
@@ -2323,7 +2370,10 @@ mod tests {
                     AggregateCall {
                         name: "count".into(),
                         distinct: true,
-                        result_type: DataType::Int64,
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                         output_column_id: ColumnId::new_for_test(10),
                         source: crate::binding::AggregateArgumentSource::uncertified(
                             vec![x_duplicate],

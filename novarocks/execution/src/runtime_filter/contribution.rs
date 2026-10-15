@@ -553,6 +553,7 @@ impl RuntimeFilterContribution {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeOrderKey {
     data_type: DataType,
+    complete_type: Option<novarocks_functions::FunctionValueType>,
     direction: RuntimeOrderSortDirection,
     null_order: RuntimeOrderNullOrder,
 }
@@ -592,9 +593,32 @@ impl RuntimeOrderKey {
     ) -> Self {
         Self {
             data_type,
+            complete_type: None,
             direction,
             null_order,
         }
+    }
+    pub fn with_value_type(
+        value_type: novarocks_functions::FunctionValueType,
+        direction: RuntimeOrderSortDirection,
+        null_order: RuntimeOrderNullOrder,
+    ) -> Self {
+        Self {
+            data_type: value_type.data_type().clone(),
+            complete_type: Some(value_type),
+            direction,
+            null_order,
+        }
+    }
+    pub fn value_type(&self) -> Option<&novarocks_functions::FunctionValueType> {
+        self.complete_type.as_ref()
+    }
+    /// A data frame carries physical key encoding, not a new semantic author.
+    /// Its channel retains and validates the complete execution binding.
+    pub fn same_physical_key(&self, other: &Self) -> bool {
+        self.data_type == other.data_type
+            && self.direction == other.direction
+            && self.null_order == other.null_order
     }
     pub const fn data_type(&self) -> &DataType {
         &self.data_type
@@ -611,6 +635,19 @@ pub struct RuntimeOrderContract {
     keys: Vec<RuntimeOrderKey>,
     comparator_digest: [u8; 32],
     digest: [u8; 32],
+}
+/// Original contract rejection and the caller's work failure remain distinct.
+#[derive(Debug)]
+pub enum RuntimeOrderContractValidationFailure<H> {
+    Contract(RuntimeFilterContractViolation),
+    Work(H),
+}
+impl<H> From<novarocks_local_program::FilterMembershipSchemaError>
+    for RuntimeOrderContractValidationFailure<H>
+{
+    fn from(cause: novarocks_local_program::FilterMembershipSchemaError) -> Self {
+        Self::Contract(super::membership_schema_error(cause))
+    }
 }
 impl RuntimeOrderContract {
     pub fn new(keys: impl IntoIterator<Item = RuntimeOrderKey>, digest: [u8; 32]) -> Self {
@@ -631,6 +668,19 @@ impl RuntimeOrderContract {
         }
     }
 
+    /// Take the already observed, exact key backing without recollecting it.
+    pub fn from_frozen_keys(
+        keys: Vec<RuntimeOrderKey>,
+        comparator_digest: [u8; 32],
+        order_contract_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            keys,
+            comparator_digest,
+            digest: order_contract_digest,
+        }
+    }
+
     /// Strictly reconstruct an ordered contract frozen in the native fragment
     /// envelope.  The digests are verified from the canonical Execution key
     /// sequence rather than trusted from the caller.
@@ -639,59 +689,102 @@ impl RuntimeOrderContract {
         comparator_digest: [u8; 32],
         order_contract_digest: [u8; 32],
     ) -> Result<Self, RuntimeFilterContractViolation> {
-        const COMPARATOR_DOMAIN: &[u8] = b"novarocks.runtime-filter.comparator";
-        const ORDER_CONTRACT_DOMAIN: &[u8] = b"novarocks.runtime-filter.order-contract";
-        const VERSION: u16 = 1;
         let keys: Vec<_> = keys.into_iter().collect();
-        if keys.is_empty() {
-            return Err(fragment_contract_error("ordered contract has no keys"));
-        }
-        let mut canonical_keys = Vec::with_capacity(64);
-        canonical_keys.extend_from_slice(
-            &u32::try_from(keys.len())
-                .map_err(|_| fragment_contract_error("ordered contract key count overflows"))?
-                .to_be_bytes(),
-        );
-        for key in &keys {
-            if !ordered_key_type_supported(key.data_type()) {
-                return Err(fragment_contract_error(
-                    "ordered contract has unsupported key type",
-                ));
-            }
-            super::encode_membership_schema_type(key.data_type(), &mut canonical_keys)?;
-            canonical_keys.push(match key.direction() {
-                RuntimeOrderSortDirection::Ascending => 1,
-                RuntimeOrderSortDirection::Descending => 2,
-            });
-            canonical_keys.push(match key.null_order() {
-                RuntimeOrderNullOrder::First => 1,
-                RuntimeOrderNullOrder::Last => 2,
-            });
-        }
-        let mut comparator = Sha256::new();
-        comparator.update(COMPARATOR_DOMAIN);
-        comparator.update(VERSION.to_be_bytes());
-        comparator.update(&canonical_keys);
-        if <[u8; 32]>::from(comparator.finalize()) != comparator_digest {
-            return Err(fragment_contract_error(
-                "ordered comparator digest mismatch",
-            ));
-        }
-        let mut order = Sha256::new();
-        order.update(ORDER_CONTRACT_DOMAIN);
-        order.update(VERSION.to_be_bytes());
-        order.update(&canonical_keys);
-        order.update([1]); // inclusive bounds are the only frozen v1 contract.
-        order.update(comparator_digest);
-        order.update(VERSION.to_be_bytes());
-        if <[u8; 32]>::from(order.finalize()) != order_contract_digest {
-            return Err(fragment_contract_error("ordered contract digest mismatch"));
-        }
-        Ok(Self::from_frozen(
+        Self::validate_fragment_keys_observed(
+            &keys,
+            comparator_digest,
+            order_contract_digest,
+            |_| Ok::<_, std::convert::Infallible>(()),
+        )
+        .map_err(|failure| match failure {
+            RuntimeOrderContractValidationFailure::Contract(cause) => cause,
+            RuntimeOrderContractValidationFailure::Work(never) => match never {},
+        })?;
+        Ok(Self::from_frozen_keys(
             keys,
             comparator_digest,
             order_contract_digest,
         ))
+    }
+
+    /// Verify the original canonical contract directly from observed key backing.
+    /// Positive units observe actual hash input; zero flushes pending work before
+    /// a digest verdict. No canonical byte buffer or key clone is constructed.
+    pub fn validate_fragment_keys_observed<H>(
+        keys: &[RuntimeOrderKey],
+        comparator_digest: [u8; 32],
+        order_contract_digest: [u8; 32],
+        mut work: impl FnMut(usize) -> Result<(), H>,
+    ) -> Result<(), RuntimeOrderContractValidationFailure<H>> {
+        use RuntimeOrderContractValidationFailure::{Contract, Work};
+        const COMPARATOR_DOMAIN: &[u8] = b"novarocks.runtime-filter.comparator";
+        const ORDER_CONTRACT_DOMAIN: &[u8] = b"novarocks.runtime-filter.order-contract";
+        const VERSION: u16 = 1;
+        if keys.is_empty() {
+            return Err(Contract(fragment_contract_error(
+                "ordered contract has no keys",
+            )));
+        }
+        let count = u32::try_from(keys.len()).map_err(|_| {
+            Contract(fragment_contract_error(
+                "ordered contract key count overflows",
+            ))
+        })?;
+        let mut comparator = Sha256::new();
+        work(COMPARATOR_DOMAIN.len()).map_err(Work)?;
+        comparator.update(COMPARATOR_DOMAIN);
+        work(2).map_err(Work)?;
+        comparator.update(VERSION.to_be_bytes());
+        let mut order = Sha256::new();
+        work(ORDER_CONTRACT_DOMAIN.len()).map_err(Work)?;
+        order.update(ORDER_CONTRACT_DOMAIN);
+        work(2).map_err(Work)?;
+        order.update(VERSION.to_be_bytes());
+        let mut emit = |bytes: &[u8]| {
+            if !bytes.is_empty() {
+                work(bytes.len()).map_err(Work)?;
+                comparator.update(bytes);
+                work(bytes.len()).map_err(Work)?;
+                order.update(bytes);
+            }
+            Ok::<_, RuntimeOrderContractValidationFailure<H>>(())
+        };
+        emit(&count.to_be_bytes())?;
+        for key in keys {
+            if !ordered_key_type_supported(key.data_type()) {
+                return Err(Contract(fragment_contract_error(
+                    "ordered contract has unsupported key type",
+                )));
+            }
+            novarocks_local_program::visit_filter_key_type(key.data_type(), &mut emit)?;
+            emit(&[match key.direction() {
+                RuntimeOrderSortDirection::Ascending => 1,
+                RuntimeOrderSortDirection::Descending => 2,
+            }])?;
+            emit(&[match key.null_order() {
+                RuntimeOrderNullOrder::First => 1,
+                RuntimeOrderNullOrder::Last => 2,
+            }])?;
+        }
+        work(0).map_err(Work)?;
+        if <[u8; 32]>::from(comparator.finalize()) != comparator_digest {
+            return Err(Contract(fragment_contract_error(
+                "ordered comparator digest mismatch",
+            )));
+        }
+        work(1).map_err(Work)?;
+        order.update([1]); // inclusive bounds are the only frozen v1 contract.
+        work(comparator_digest.len()).map_err(Work)?;
+        order.update(comparator_digest);
+        work(2).map_err(Work)?;
+        order.update(VERSION.to_be_bytes());
+        work(0).map_err(Work)?;
+        if <[u8; 32]>::from(order.finalize()) != order_contract_digest {
+            return Err(Contract(fragment_contract_error(
+                "ordered contract digest mismatch",
+            )));
+        }
+        Ok(())
     }
     pub fn keys(&self) -> &[RuntimeOrderKey] {
         &self.keys
@@ -2211,5 +2304,160 @@ mod tests {
         });
         schema.push(2);
         schema
+    }
+
+    // Independent v1 bytes: count2; Int64/ASC/NULLS_LAST; timestamp-us UTC/DESC/NULLS_FIRST.
+    fn original_streaming_order_fixture() -> (Vec<RuntimeOrderKey>, [u8; 32], [u8; 32]) {
+        let keys = vec![
+            RuntimeOrderKey::with_value_type(
+                novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+                RuntimeOrderSortDirection::Ascending,
+                RuntimeOrderNullOrder::Last,
+            ),
+            RuntimeOrderKey::with_value_type(
+                novarocks_functions::FunctionValueType::new(
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    true,
+                ),
+                RuntimeOrderSortDirection::Descending,
+                RuntimeOrderNullOrder::First,
+            ),
+        ];
+        let comparator = [
+            0xdf, 0xe9, 0x6e, 0xae, 0xfe, 0x17, 0x10, 0xfe, 0xde, 0x48, 0x96, 0xe5, 0x52, 0xae,
+            0x59, 0xd6, 0x4a, 0x34, 0x01, 0x34, 0x24, 0x8a, 0x64, 0x87, 0x46, 0xa1, 0x74, 0xc9,
+            0x26, 0x6e, 0x77, 0x34,
+        ];
+        let order = [
+            0x17, 0xb6, 0x73, 0x06, 0x05, 0x19, 0xf1, 0x38, 0xc8, 0x7d, 0xd8, 0xe7, 0x73, 0xff,
+            0x3a, 0x3d, 0x66, 0x51, 0x8e, 0xa5, 0xea, 0x0f, 0x2b, 0xbb, 0x1c, 0x8c, 0x33, 0x62,
+            0x06, 0x2b, 0x60, 0x6a,
+        ];
+        (keys, comparator, order)
+    }
+
+    #[test]
+    fn streaming_fragment_order_preserves_original_bytes_full_keys_and_owned_backing() {
+        let (keys, comparator, order) = original_streaming_order_fixture();
+        let pure = RuntimeOrderContract::from_fragment_contract(keys.clone(), comparator, order)
+            .expect("original strict entry and byte format");
+        let original_backing = keys.as_ptr();
+        let mut work = Vec::new();
+        RuntimeOrderContract::validate_fragment_keys_observed(&keys, comparator, order, |units| {
+            work.push(units);
+            Ok::<_, ()>(())
+        })
+        .expect("observed canonical validation");
+        let observed = RuntimeOrderContract::from_frozen_keys(keys, comparator, order);
+        assert_eq!(observed, pure);
+        assert_eq!(observed.keys().as_ptr(), original_backing);
+        assert_eq!(observed.keys().len(), 2);
+        assert!(!observed.keys()[0].value_type().unwrap().nullable());
+        assert!(observed.keys()[1].value_type().unwrap().nullable());
+        assert_eq!(
+            observed.keys()[1].direction(),
+            RuntimeOrderSortDirection::Descending
+        );
+        assert_eq!(
+            observed.keys()[1].null_order(),
+            RuntimeOrderNullOrder::First
+        );
+        assert_eq!(work.iter().filter(|units| **units == 0).count(), 2);
+    }
+
+    #[test]
+    fn streaming_fragment_order_keeps_comparator_order_and_unsupported_first_causes() {
+        let (keys, comparator, order) = original_streaming_order_fixture();
+        let mut wrong_comparator = comparator;
+        wrong_comparator[0] ^= 1;
+        let mut wrong_order = order;
+        wrong_order[0] ^= 1;
+        let first = RuntimeOrderContract::validate_fragment_keys_observed(
+            &keys,
+            wrong_comparator,
+            wrong_order,
+            |_| Ok::<_, ()>(()),
+        )
+        .expect_err("comparator is checked before order");
+        let RuntimeOrderContractValidationFailure::Contract(first) = first else {
+            panic!("original contract failure");
+        };
+        assert_eq!(first.detail(), "ordered comparator digest mismatch");
+        let second = RuntimeOrderContract::validate_fragment_keys_observed(
+            &keys,
+            comparator,
+            wrong_order,
+            |_| Ok::<_, ()>(()),
+        )
+        .expect_err("wrong order");
+        let RuntimeOrderContractValidationFailure::Contract(second) = second else {
+            panic!("original contract failure");
+        };
+        assert_eq!(second.detail(), "ordered contract digest mismatch");
+        let empty = RuntimeOrderContract::from_fragment_contract([], comparator, order)
+            .expect_err("original empty contract refusal");
+        assert_eq!(empty.detail(), "ordered contract has no keys");
+        let unsupported = RuntimeOrderContract::from_fragment_contract(
+            [RuntimeOrderKey::new(DataType::Float64)],
+            comparator,
+            order,
+        )
+        .expect_err("membership vocabulary does not expand ordered support");
+        assert_eq!(
+            unsupported.detail(),
+            "ordered contract has unsupported key type"
+        );
+    }
+
+    #[test]
+    fn streaming_fragment_order_returns_each_original_work_failure_without_tail() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct Original;
+        let (keys, comparator, order) = original_streaming_order_fixture();
+        let mut successful = Vec::new();
+        RuntimeOrderContract::validate_fragment_keys_observed(&keys, comparator, order, |units| {
+            successful.push(units);
+            Ok::<_, Original>(())
+        })
+        .expect("actual successful observations");
+        for refused in 0..successful.len() {
+            let mut prefix = Vec::new();
+            let result = RuntimeOrderContract::validate_fragment_keys_observed(
+                &keys,
+                comparator,
+                order,
+                |units| {
+                    prefix.push(units);
+                    if prefix.len() == refused + 1 {
+                        Err(Original)
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(RuntimeOrderContractValidationFailure::Work(Original))
+            ));
+            assert_eq!(prefix, successful[..=refused]);
+        }
+        let boundary = successful.iter().position(|units| *units == 0).unwrap();
+        let mut wrong_comparator = comparator;
+        wrong_comparator[0] ^= 1;
+        let mut prefix = Vec::new();
+        let result = RuntimeOrderContract::validate_fragment_keys_observed(
+            &keys,
+            wrong_comparator,
+            order,
+            |units| {
+                prefix.push(units);
+                if units == 0 { Err(Original) } else { Ok(()) }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(RuntimeOrderContractValidationFailure::Work(Original))
+        ));
+        assert_eq!(prefix, successful[..=boundary]);
     }
 }

@@ -49,7 +49,7 @@ impl NKernel {
         else {
             unreachable!("validated scalar")
         };
-        &output.data_type
+        output.data_type()
     }
 }
 impl PreparedAggregateKernel for NKernel {
@@ -338,17 +338,17 @@ pub(super) fn validate_contract(
         return Err(invalid("min_n/max_n requires a scalar result"));
     };
     work.step().map_err(compile_failure)?;
-    if value.logical_type != novarocks_type_contract::ValueLogicalType::Physical {
+    if value.logical_type() != novarocks_type_contract::ValueLogicalType::Physical {
         return Err(invalid(&format!(
             "{} has no installed min_n/max_n logical input profile for {:?}",
             contract.call().function_id().as_str(),
-            value.logical_type
+            value.logical_type()
         )));
     }
     // The installed profile must close the original scalar state codec in
     // every phase; legacy Single-only nested/Binary slices remain outside it.
     let source = matches!(
-        value.data_type,
+        value.data_type(),
         DataType::Null
             | DataType::Boolean
             | DataType::Int8
@@ -364,9 +364,9 @@ pub(super) fn validate_contract(
             | DataType::Decimal256(..)
             | DataType::FixedSizeBinary(16)
     );
-    let integer = limit.logical_type == novarocks_type_contract::ValueLogicalType::Physical
+    let integer = limit.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
         && matches!(
-            limit.data_type,
+            limit.data_type(),
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
         );
     if !source || !integer {
@@ -376,16 +376,26 @@ pub(super) fn validate_contract(
             contract.call().selected().argument_types
         )));
     }
-    let expected = FunctionValueType::new(
-        DataType::List(Arc::new(super::signature::value_field("item", value, true))),
-        true,
-    );
-    if !expected
-        .exactly_equals_observed::<KernelFailure>(output, || work.step().map_err(compile_failure))?
-        || !FunctionValueType::new(DataType::Binary, true)
-            .exactly_equals_observed::<KernelFailure>(contract.intermediate_type(), || {
-                work.step().map_err(compile_failure)
-            })?
+    let DataType::List(item) = output.data_type() else {
+        return Err(invalid("min_n/max_n result must be a List"));
+    };
+    let child = output
+        .value_type()
+        .child_type_at(0)
+        .ok_or_else(|| invalid("min_n/max_n result semantic item is absent"))?;
+    if !output.nullable()
+        || !child.nullable()
+        || !FunctionValueType::borrowed_value_domains_equal_observed::<KernelFailure>(
+            value.value_type(),
+            child,
+            || work.step().map_err(compile_failure),
+        )?
+        || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+            value.data_type(),
+            item.data_type(),
+            || work.step().map_err(compile_failure),
+        )?
+        || !super::aggregate_any_value::matches_nullable_binary(contract.intermediate_type(), work)?
     {
         return Err(invalid(
             "min_n/max_n selected result or intermediate differs from its exact nullable List and Binary state",

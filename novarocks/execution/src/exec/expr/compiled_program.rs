@@ -36,7 +36,7 @@ use novarocks_functions::{
     visit_selected_nulls,
 };
 use novarocks_local_program::{
-    LocalProgram, ProgramCallSite, ProgramChannelLayoutRole, ProgramChannelSite,
+    ExpressionProgram, LocalProgram, ProgramCallSite, ProgramChannelLayoutRole, ProgramChannelSite,
     ProgramExpressionRootSite, ProgramLexicalSource, ProgramNodeId, ProgramRootInput,
     ProgramUseRef, StaticExprKind, root_input_layout,
 };
@@ -53,7 +53,7 @@ use std::{
 /// One operator/driver root owns its instances, even when definitions and
 /// immutable preparation backing are shared with another root or driver.
 pub struct CompiledExpressionInstance {
-    program: Arc<LocalProgram>,
+    program: Arc<ExpressionProgram>,
     root: ProgramExpressionRootSite,
     /// The one input layout this root reads, named by its node and layout
     /// role, from the same authority the lexical bindings were checked
@@ -202,6 +202,13 @@ impl CompiledExpressionInstance {
         root: ProgramExpressionRootSite,
         control: &dyn KernelEvaluationControl,
     ) -> Result<Self, KernelFailure> {
+        Self::try_new_expression_program(Arc::clone(program.expressions()), root, control)
+    }
+    pub fn try_new_expression_program(
+        program: Arc<ExpressionProgram>,
+        root: ProgramExpressionRootSite,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, KernelFailure> {
         let observed = ObservedControl {
             original: control,
             refused: AtomicBool::new(false),
@@ -222,12 +229,25 @@ impl CompiledExpressionInstance {
         control: &dyn KernelEvaluationControl,
         allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     ) -> Result<Self, KernelFailure> {
-        let mut instance = Self::try_new(program, root, control)?;
+        Self::try_new_expression_program_with_allocator(
+            Arc::clone(program.expressions()),
+            root,
+            control,
+            allocator,
+        )
+    }
+    pub fn try_new_expression_program_with_allocator(
+        program: Arc<ExpressionProgram>,
+        root: ProgramExpressionRootSite,
+        control: &dyn KernelEvaluationControl,
+        allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    ) -> Result<Self, KernelFailure> {
+        let mut instance = Self::try_new_expression_program(program, root, control)?;
         instance.allocator = allocator;
         Ok(instance)
     }
     fn prepare(
-        program: Arc<LocalProgram>,
+        program: Arc<ExpressionProgram>,
         root: ProgramExpressionRootSite,
         work: &mut Work<'_, '_>,
     ) -> Result<Self, KernelFailure> {
@@ -833,8 +853,8 @@ impl CompiledExpressionInstance {
         else {
             return Err(invalid("actual root is not a value").into());
         };
-        let result = result.materialize(selection, &ty.data_type, work)?;
-        if !ty.nullable {
+        let result = result.materialize(selection, &ty.data_type(), work)?;
+        if !ty.nullable() {
             let mut errors = result.errors().iter().peekable();
             work.flush()?;
             visit_selected_nulls(
@@ -917,7 +937,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure>(
     {
         work.flush()?;
         let values = new_null_array(
-            &prepared.contract().result_type().data_type,
+            &prepared.contract().result_type().data_type(),
             selection.len(),
         );
         work.flush()?;
@@ -928,7 +948,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure>(
         }
         return SelectedValues::try_new_observed(
             selection,
-            &prepared.contract().result_type().data_type,
+            &prepared.contract().result_type().data_type(),
             values,
             errors.into_boxed_slice(),
             || work.step(),
@@ -1042,7 +1062,7 @@ fn evaluate_scalar<'a, E: scalar_invocation::FrameFailure>(
     work.flush()?;
     SelectedValues::try_new_observed(
         selection,
-        &prepared.contract().result_type().data_type,
+        &prepared.contract().result_type().data_type(),
         array,
         errors.into_boxed_slice(),
         || work.step(),

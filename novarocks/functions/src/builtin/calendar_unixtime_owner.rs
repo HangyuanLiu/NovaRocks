@@ -73,7 +73,7 @@ pub(super) fn definition(
 }
 
 pub(super) struct FromUnixtimeOwner {
-    resolver: BuiltinScalarResolver,
+    resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
@@ -113,7 +113,7 @@ impl FromUnixtimeOwner {
             })
             .collect();
         Ok(Self {
-            resolver,
+            resolver: Arc::new(resolver),
             declaration,
             implementations,
         })
@@ -169,6 +169,10 @@ impl FunctionBindingResolver for FromUnixtimeOwner {
 }
 
 impl PureFunctionMetadataOwner for FromUnixtimeOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -209,39 +213,21 @@ impl FunctionEffectOwner for FromUnixtimeOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        let result = (|| {
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if input.function_id != self.declaration.function_id()
-                || input.kind != FunctionKind::Scalar
-            {
-                return Err(FunctionBindingError::UnknownFunction.into());
-            }
-            if valid_environment(input).is_err()
-                || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                    && input.proof_scope != CallProofScope::Domain(input.context.domain)
-            {
-                return Err(FunctionBindingError::InvalidBinding(
-                "from_unixtime requires its exact original frozen non-Local TimeZone author and proof scope".into(),
-            )
-            .into());
-            }
-            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        self.refine_selected_core(input, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => {
-                        FunctionEffectOwnerError::Control(error)
-                    }
-                    other => FunctionEffectOwnerError::Owner(other),
-                })?;
-            Ok(self.call_effects(input.proof_scope, input.environment))
-        })();
-        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
-            return result;
-        }
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        result
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_selected_core(input, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -252,49 +238,21 @@ impl PureScalarImplementation for FromUnixtimeOwner {
         contract: Arc<ScalarCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        let result: Result<Arc<dyn PreparedScalarKernel>, KernelFailure> = (|| {
-            work.step().map_err(compile_failure)?;
-            if input.function_id != self.declaration.function_id()
-                || input.kind != FunctionKind::Scalar
-                || contract.function_id() != input.function_id
-                || !std::ptr::eq(contract.selected(), input.selected)
-                || contract.context() != input.context
-                || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-                || contract.effects() != &self.call_effects(input.proof_scope, input.environment)
-                || valid_environment(input).is_err()
-            {
-                return Err(invalid(
-                    "from_unixtime original epoch formatting preparation differs from its exact checked call",
-                ));
-            }
-            work.flush().map_err(compile_failure)?;
+        self.prepare_selected_core(input, contract, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => compile_failure(error),
-                    _ => invalid("from_unixtime original epoch formatting preparation has a stale selected binding"),
-                })?;
-            // The prepared object retains the same canonical contract. Its body is
-            // a static pure implementation and needs no live resolver or authority.
-            let zone = valid_environment(input).map_err(|error| invalid(&error.to_string()))?;
-            let format = prepare_profile(input, &contract, &mut work)?;
-            Ok(Arc::new(PreparedFromUnixtime {
-                contract,
-                zone,
-                format,
-            }) as Arc<dyn PreparedScalarKernel>)
-        })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
-            return result;
-        }
-        work.finish().map_err(compile_failure)?;
-        result
+        })
+    }
+    fn prepare_scalar_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_selected_core(input, contract, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -378,16 +336,16 @@ fn prepare_profile(
     use arrow_array::{Array, StringArray};
     use arrow_schema::DataType;
     let ty = contract.result_type();
-    if ty.logical_type != ValueLogicalType::Physical
-        || ty.data_type != DataType::Utf8
-        || !ty.nullable
+    if ty.logical_type() != ValueLogicalType::Physical
+        || ty.data_type() != &DataType::Utf8
+        || !ty.nullable()
     {
         return Err(invalid(
             "from_unixtime requires its original nullable Utf8 result",
         ));
     }
     let types = &contract.selected().argument_types;
-    if matches!(types.first(),Some(FunctionArgumentType::Value(source)) if matches!(source.data_type,DataType::Date32|DataType::Timestamp(_, _)))
+    if matches!(types.first(),Some(FunctionArgumentType::Value(source)) if matches!(source.data_type(),DataType::Date32|DataType::Timestamp(_, _)))
     {
         return Err(invalid(
             "from_unixtime rejects its declared Date32/Timestamp epoch carrier: original integer reader returns from_unixtime expects int",
@@ -395,8 +353,8 @@ fn prepare_profile(
     }
     match (types.as_ref(), input.request.arguments) {
         ([FunctionArgumentType::Value(source)], [_])
-            if source.logical_type == ValueLogicalType::Physical
-                && source.data_type == DataType::Int64 =>
+            if source.logical_type() == ValueLogicalType::Physical
+                && source.data_type() == &DataType::Int64 =>
         {
             Ok(None)
         }
@@ -412,10 +370,10 @@ fn prepare_profile(
                     ..
                 },
             ],
-        ) if source.logical_type == ValueLogicalType::Physical
-            && source.data_type == DataType::Utf8
-            && format.logical_type == ValueLogicalType::Physical
-            && format.data_type == DataType::Utf8 =>
+        ) if source.logical_type() == ValueLogicalType::Physical
+            && source.data_type() == &DataType::Utf8
+            && format.logical_type() == ValueLogicalType::Physical
+            && format.data_type() == &DataType::Utf8 =>
         {
             let array = constant
                 .pool()
@@ -541,4 +499,95 @@ pub(super) fn prepared_for_test(
         control,
     )
     .map(|s| s.into_prepared())
+}
+
+impl FromUnixtimeOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        let result = (|| {
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if input.function_id != self.declaration.function_id()
+                || input.kind != FunctionKind::Scalar
+            {
+                return Err(FunctionBindingError::UnknownFunction.into());
+            }
+            if valid_environment(input).is_err()
+                || !matches!(input.proof_scope, CallProofScope::Unconditional)
+                    && input.proof_scope != CallProofScope::Domain(input.context.domain)
+            {
+                return Err(FunctionBindingError::InvalidBinding(
+                "from_unixtime requires its exact original frozen non-Local TimeZone author and proof scope".into(),
+            )
+            .into());
+            }
+            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+                other => FunctionEffectOwnerError::Owner(other),
+            })?;
+            Ok(self.call_effects(input.proof_scope, input.environment))
+        })();
+        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
+            return result;
+        }
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        result
+    }
+    fn prepare_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        let result: Result<Arc<dyn PreparedScalarKernel>, KernelFailure> = (|| {
+            work.step().map_err(compile_failure)?;
+            if input.function_id != self.declaration.function_id()
+                || input.kind != FunctionKind::Scalar
+                || contract.function_id() != input.function_id
+                || !std::ptr::eq(contract.selected(), input.selected)
+                || contract.context() != input.context
+                || contract.decimal_overflow_policy() != input.decimal_overflow_policy
+                || contract.effects() != &self.call_effects(input.proof_scope, input.environment)
+                || valid_environment(input).is_err()
+            {
+                return Err(invalid(
+                    "from_unixtime original epoch formatting preparation differs from its exact checked call",
+                ));
+            }
+            work.flush().map_err(compile_failure)?;
+            validate()
+                .map_err(|error| match error {
+                    FunctionBindingError::Control(error) => compile_failure(error),
+                    _ => invalid("from_unixtime original epoch formatting preparation has a stale selected binding"),
+                })?;
+            // The prepared object retains the same canonical contract. Its body is
+            // a static pure implementation and needs no live resolver or authority.
+            let zone = valid_environment(input).map_err(|error| invalid(&error.to_string()))?;
+            let format = prepare_profile(input, &contract, &mut work)?;
+            Ok(Arc::new(PreparedFromUnixtime {
+                contract,
+                zone,
+                format,
+            }) as Arc<dyn PreparedScalarKernel>)
+        })();
+        if matches!(
+            &result,
+            Err(KernelFailure::Cancelled
+                | KernelFailure::DeadlineExceeded
+                | KernelFailure::ResourceExhausted)
+        ) {
+            return result;
+        }
+        work.finish().map_err(compile_failure)?;
+        result
+    }
 }

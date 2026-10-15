@@ -149,11 +149,17 @@ impl StaticInput {
             args,
             selected: FunctionBindingSelection {
                 overload: FunctionOverloadId::try_new("test.aggregate/demand/selected").unwrap(),
-                argument_types: (0..logical)
-                    .map(|_| {
-                        FunctionArgumentType::Value(FunctionValueType::new(DataType::Int32, false))
-                    })
-                    .collect(),
+                argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                    (0..logical)
+                        .map(|_| {
+                            FunctionArgumentType::Value(FunctionValueType::new(
+                                DataType::Int32,
+                                false,
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
                 result_type: FunctionResultType::Scalar(ty(false)),
                 aggregate: Some(AggregateBindingSelection {
                     state_argument_contract:
@@ -272,7 +278,10 @@ fn merge_refiner_rejects_phase_kind_context_and_complete_state_domain_before_own
         assert_eq!(owner.calls.load(Ordering::SeqCst), 0);
     }
     let mut wide = StaticInput::new(0, ty(false));
-    wide.state.nullable = true;
+    wide.state = wide
+        .state
+        .with_nullable(true)
+        .expect("valid function nullability declaration");
     assert!(
         refine_call_effects(&Refiner::new(), wide.input(), &Control::default()).is_ok(),
         "actual state root nullability may widen"
@@ -481,7 +490,7 @@ fn installed_count_merge_fresh_and_frozen_keep_static_signature_and_actual_state
             ));
             if logical == 1 {
                 assert!(
-                    matches!(handle.contract().call().selected().argument_types[0], FunctionArgumentType::Value(ref actual) if actual.data_type == DataType::Int32 && actual.nullable)
+                    matches!(handle.contract().call().selected().argument_types[0], FunctionArgumentType::Value(ref actual) if actual.data_type() == &DataType::Int32 && actual.nullable())
                 );
             }
             let frozen = fixture
@@ -663,7 +672,7 @@ fn merge_wide_nested_state_uses_real_type_walk_quantum_and_exact_metadata() {
         .collect::<Vec<_>>();
     let data = StaticInput::new(
         0,
-        FunctionValueType::new(DataType::Struct(fields.into()), false),
+        FunctionValueType::from_legacy_declared_projection(DataType::Struct(fields.into()), false),
     );
     let baseline = Control::default();
     refine_call_effects(&Refiner::new(), data.input(), &baseline).unwrap();
@@ -685,7 +694,7 @@ fn merge_wide_nested_state_uses_real_type_walk_quantum_and_exact_metadata() {
         }
     }
     let mut changed = data.state.clone();
-    let DataType::Struct(fields) = &mut changed.data_type else {
+    let DataType::Struct(fields) = changed.data_type() else {
         unreachable!()
     };
     let mut changed_fields = fields.to_vec();
@@ -693,16 +702,17 @@ fn merge_wide_nested_state_uses_real_type_walk_quantum_and_exact_metadata() {
         Field::new("field319", DataType::Int64, false)
             .with_metadata([("provider-id".into(), "wrong".into())].into()),
     );
-    *fields = changed_fields.into();
+    changed = FunctionValueType::from_legacy_declared_projection(
+        DataType::Struct(changed_fields.into()),
+        changed.nullable(),
+    );
     let mut input = data.input();
     input.argument_uses = CallArgumentUses::AggregateMerge {
         phase: AggregateKernelPhase::Final,
         state_context: state_context(),
         state_input_type: &changed,
     };
-    // Nonlogical provider annotations preserve the original semantic state
-    // domain. The actual input and its owned options still require full exact
-    // metadata correspondence at their separate alignment boundary.
+    // Provider annotations do not participate in typed execution identity.
     refine_call_effects(&Refiner::new(), input, &Control::default()).unwrap();
     let control = Control::default();
     let mut work =
@@ -713,15 +723,18 @@ fn merge_wide_nested_state_uses_real_type_walk_quantum_and_exact_metadata() {
             data.state.clone(),
             &mut work
         ),
-        Err(KernelFailure::InvalidProgram(_))
+        Ok(_)
     ));
     work.finish().unwrap();
-    let DataType::Struct(fields) = &mut changed.data_type else {
+    let DataType::Struct(fields) = changed.data_type() else {
         unreachable!()
     };
     let mut changed_fields = fields.to_vec();
     changed_fields[319] = Arc::new(Field::new("different-field319", DataType::Int64, false));
-    *fields = changed_fields.into();
+    changed = FunctionValueType::from_legacy_declared_projection(
+        DataType::Struct(changed_fields.into()),
+        changed.nullable(),
+    );
     let mut input = data.input();
     input.argument_uses = CallArgumentUses::AggregateMerge {
         phase: AggregateKernelPhase::Final,

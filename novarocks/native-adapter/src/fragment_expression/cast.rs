@@ -19,19 +19,22 @@
 
 use arrow::datatypes::DataType;
 
-use super::{decode_expr_at, decode_type, nested};
+use super::{decode_expr_at_with_types, decode_type_with_decoder, nested};
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{common, expr};
 
 use super::NativeExpressionInputLayout;
 
-pub(crate) fn lower_cast(
+pub(crate) fn lower_cast_with_binding(
     cast: &expr::CastExpr,
     path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
     data_type: DataType,
+    declared: Option<&novarocks_type_contract::FunctionValueType>,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, super::NativeExpressionDecodeError> {
     let policy = super::decode_decimal_overflow_policy(
         cast.decimal_overflow_policy,
@@ -49,9 +52,7 @@ pub(crate) fn lower_cast(
             "native Cast requires target",
         )
     })?;
-    let target_type = decode_type(target).map_err(|error| {
-        super::NativeExpressionDecodeError::invalid_value(path.clone().field("target"), error)
-    })?;
+    let target_type = decode_type_with_decoder(target, path.clone().field("target"), type_decoder)?;
     if target_type != data_type {
         return Err(super::NativeExpressionDecodeError::inconsistent(
             path.clone().field("target"),
@@ -59,7 +60,25 @@ pub(crate) fn lower_cast(
         ));
     }
 
-    let source_type = super::decode_expr_type_at(operand, path.clone().field("operand"))?;
+    if let Some(declared) = declared {
+        let actual = type_decoder
+            .value_type(target, path.clone().field("target"))?
+            .ok_or_else(|| {
+                super::NativeExpressionDecodeError::missing(
+                    path.clone().field("target"),
+                    "typed CAST target lacks its complete binding",
+                )
+            })?;
+        if !type_decoder.bindings_match(actual.typed_binding(), declared.typed_binding(), false)? {
+            return Err(super::NativeExpressionDecodeError::inconsistent(
+                path.clone().field("target"),
+                "CAST target differs from its complete expression binding",
+            ));
+        }
+    }
+
+    let source_type =
+        super::decode_expr_type_at(operand, path.clone().field("operand"), type_decoder)?;
     if !novarocks_type_contract::decimal_error_policy_cast_supported(
         &source_type,
         &target_type,
@@ -70,7 +89,27 @@ pub(crate) fn lower_cast(
             "ReportError decimal CAST does not support nested type conversion",
         ));
     }
-    let child = decode_expr_at(operand, path.clone().field("operand"), arena, input_layout)?;
+    let child = decode_expr_at_with_types(
+        operand,
+        path.clone().field("operand"),
+        arena,
+        input_layout,
+        type_decoder,
+    )?;
+
+    if let (Some(source), Some(target)) = (arena.value_type(child), declared) {
+        use novarocks_type_contract as conversion;
+        if conversion::default_json_structure_carrier_cast_supported(
+            source.data_type(),
+            target.data_type(),
+        ) && !conversion::is_default_json_structure_cast(source, target)
+        {
+            return Err(super::NativeExpressionDecodeError::inconsistent(
+                path.clone().field("target"),
+                "JSON structure CAST differs from its complete source/target intrinsic",
+            ));
+        }
+    }
 
     if matches!(data_type, DataType::LargeBinary) {
         let child_type = arena.data_type(child).ok_or_else(|| {
@@ -111,12 +150,17 @@ pub(crate) fn lower_cast(
         }
     }
 
-    let target_primitive = scalar_primitive_from_type_desc(target, path.clone().field("target"))?;
+    let target_primitive =
+        scalar_primitive_from_type_desc(target, path.clone().field("target"), type_decoder)?;
     let source_primitive = operand
         .r#type
         .as_ref()
         .map(|desc| {
-            scalar_primitive_from_type_desc(desc, path.clone().field("operand").field("type"))
+            scalar_primitive_from_type_desc(
+                desc,
+                path.clone().field("operand").field("type"),
+                type_decoder,
+            )
         })
         .transpose()?
         .flatten();
@@ -132,32 +176,50 @@ pub(crate) fn lower_cast(
     Ok(arena.push_typed(node, data_type))
 }
 
+// Keep the existing direct low-level codec fixture entry on the same body.
+// Production expressions supply their actual complete binding above.
+#[cfg(test)]
+fn lower_cast(
+    cast: &expr::CastExpr,
+    path: FieldPath,
+    arena: &mut ExprArena,
+    input_layout: &NativeExpressionInputLayout,
+    data_type: DataType,
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
+) -> Result<ExprId, super::NativeExpressionDecodeError> {
+    lower_cast_with_binding(
+        cast,
+        path,
+        arena,
+        input_layout,
+        data_type,
+        None,
+        type_decoder,
+    )
+}
+
 fn scalar_primitive_from_type_desc(
     desc: &common::TypeDesc,
     path: FieldPath,
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<Option<common::PrimitiveType>, super::NativeExpressionDecodeError> {
-    let Some(common::type_desc::Kind::Scalar(scalar)) = desc.kind.as_ref() else {
-        return Ok(None);
-    };
-    let primitive = common::PrimitiveType::try_from(scalar.r#type).map_err(|_| {
-        super::NativeExpressionDecodeError::invalid_enum(
-            path.clone(),
-            format!("unknown primitive type {}", scalar.r#type),
-        )
-    })?;
-    if primitive == common::PrimitiveType::Unspecified {
-        return Err(super::NativeExpressionDecodeError::invalid_enum(
-            path,
-            "primitive type is unspecified",
-        ));
-    }
-    Ok(Some(primitive))
+    let data_type = decode_type_with_decoder(desc, path, type_decoder)?;
+    Ok(match data_type {
+        DataType::Time64(arrow::datatypes::TimeUnit::Microsecond) => {
+            Some(common::PrimitiveType::Time)
+        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None) => {
+            Some(common::PrimitiveType::Datetime)
+        }
+        _ => None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::tests::{
         col, lower_err_with_slots, lower_with_slots, map_string_json_type, scalar_expr, type_desc,
+        variant_type,
     };
     use super::{NativeExpressionInputLayout, lower_cast};
     use arrow::datatypes::{DataType, TimeUnit};
@@ -170,6 +232,7 @@ mod tests {
         let expr = scalar_expr(
             DataType::Float64,
             expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                allow_throw_exception: None,
                 decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 operand: Some(Box::new(col(1, DataType::Int64))),
                 target: Some(type_desc(&DataType::Utf8)),
@@ -187,6 +250,7 @@ mod tests {
         let datetime_to_time = scalar_expr(
             time_type.clone(),
             expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                allow_throw_exception: None,
                 decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 operand: Some(Box::new(col(1, datetime_type))),
                 target: Some(type_desc(&time_type)),
@@ -195,6 +259,7 @@ mod tests {
         let int_to_time = scalar_expr(
             time_type.clone(),
             expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                allow_throw_exception: None,
                 decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 operand: Some(Box::new(col(7, DataType::Int64))),
                 target: Some(type_desc(&time_type)),
@@ -226,6 +291,7 @@ mod tests {
         let cast = scalar_expr(
             map_type.clone(),
             expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                allow_throw_exception: None,
                 decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 operand: Some(Box::new(col(1, DataType::Utf8))),
                 target: Some(type_desc(&map_type)),
@@ -234,28 +300,28 @@ mod tests {
 
         let (arena, id) = lower_with_slots(&cast, &[1]);
         let field_schema = arena.field_schema(id).expect("cast field schema");
-        assert!(
-            field_schema
-                .map_value()
-                .is_some_and(|schema| schema.json_semantic())
-        );
+        assert!(field_schema.map_value().is_some_and(
+            |schema| schema.domain() == Some(novarocks_type_contract::ValueLogicalType::Json)
+        ));
     }
 
     #[test]
     fn cast_preserves_variant_guards() {
         let scalar_to_variant = scalar_expr(
-            DataType::LargeBinary,
+            variant_type(),
             expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                allow_throw_exception: None,
                 decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 operand: Some(Box::new(col(1, DataType::Int64))),
-                target: Some(type_desc(&DataType::LargeBinary)),
+                target: Some(type_desc(&variant_type())),
             })),
         );
         let variant_to_decimal = scalar_expr(
             DataType::Decimal128(10, 2),
             expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                allow_throw_exception: None,
                 decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
-                operand: Some(Box::new(col(1, DataType::LargeBinary))),
+                operand: Some(Box::new(col(1, variant_type()))),
                 target: Some(type_desc(&DataType::Decimal128(10, 2))),
             })),
         );
@@ -281,18 +347,22 @@ mod tests {
             true,
         )));
         let cast = expr::CastExpr {
+            allow_throw_exception: None,
             operand: Some(Box::new(col(1, source.clone()))),
             target: Some(type_desc(&target)),
             decimal_overflow_policy: expr::DecimalOverflowPolicy::ReportError as i32,
         };
         let mut arena = ExprArena::default();
-        let error = lower_cast(
-            &cast,
-            FieldPath::root("expr").field("cast"),
-            &mut arena,
-            &NativeExpressionInputLayout::default(),
-            target.clone(),
-        )
+        let error = super::super::tests::with_fixture_decoder(|decoder| {
+            lower_cast(
+                &cast,
+                FieldPath::root("expr").field("cast"),
+                &mut arena,
+                &NativeExpressionInputLayout::default(),
+                target.clone(),
+                decoder,
+            )
+        })
         .unwrap_err();
         assert!(
             error
@@ -306,7 +376,8 @@ mod tests {
         );
         let wire = scalar_expr(target.clone(), expr::expr::Kind::Cast(Box::new(cast)));
         let error =
-            super::super::validate_proto_expr_shape_at(&wire, FieldPath::root("expr")).unwrap_err();
+            super::super::tests::validate_fixture_expression(&wire, FieldPath::root("expr"))
+                .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -336,6 +407,7 @@ mod tests {
             let wire = scalar_expr(
                 result_type.clone(),
                 expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                    allow_throw_exception: None,
                     operand: Some(Box::new(operand)),
                     target: Some(type_desc(&result_type)),
                     decimal_overflow_policy: wire_policy as i32,

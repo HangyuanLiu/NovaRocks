@@ -147,12 +147,28 @@ fn bigint() -> FunctionValueType {
     FunctionValueType::new(DataType::Int64, true)
 }
 fn nested() -> FunctionValueType {
-    let child =
-        Field::new("child_".repeat(100), DataType::Utf8, true).with_metadata(HashMap::from([
-            ("nr_logical_type".to_owned(), "json".to_owned()),
-            ("source_note".to_owned(), "original metadata".repeat(32)),
-        ]));
-    FunctionValueType::new(DataType::Struct(vec![Arc::new(child)].into()), true)
+    let storage = ValueTypeStorageLifetime::pure();
+    let json =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+            .unwrap();
+    let fields = vec![ValueField::new(
+        "child_".repeat(100),
+        json.value_type().clone(),
+        storage.clone(),
+    )];
+    let physical = vec![Arc::new(Field::new(
+        "child_".repeat(100),
+        DataType::Utf8,
+        true,
+    ))];
+    let value = ValueTypeRef::try_new(
+        ValueKind::Struct(fields.into_boxed_slice()),
+        true,
+        storage.clone(),
+    )
+    .unwrap();
+    let layout = ValueLayout::try_new(&DataType::Struct(physical.into()), storage).unwrap();
+    FunctionValueType::try_from_value(value, layout).unwrap()
 }
 // A legal public builtin binding and a complete original Window result port.
 // The root labels are authored before encoding, never patched after compilation.
@@ -390,27 +406,36 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
         .unwrap()
         .encode_to_vec()
 }
+fn construction_tracker() -> Arc<novarocks_execution::runtime::mem_tracker::MemTracker> {
+    let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+        "typed schema funding test",
+    );
+    tracker.install_limit_once(64 << 20).unwrap();
+    tracker
+}
 fn compile(
     bytes: &[u8],
     binding: &QueryMemoryBinding,
+    tracker: &Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
     preparation: &novarocks_worker::PreparationControlLoan<'_>,
     journal: &mut ProjectMetadataJournal,
 ) -> CompiledTaskProgram {
     let mut types = TypeMaterializationJournal::default();
     let mut type_host = TypeMaterializationHost::new(binding, preparation, &mut types);
     let mut project_host = ProjectMetadataHost::new(binding, preparation, journal);
-    interpreter()
-        .compile(
-            bytes,
-            CompiledTaskOptions {
-                pipeline_dop: NonZeroUsize::MIN,
-                exchange_wait: Duration::from_millis(50),
-            },
-            &Control,
-            &mut type_host,
-            &mut project_host,
-        )
-        .unwrap()
+    novarocks_native_adapter::backend_task_execution::compile_native_package_with_funding_for_test(
+        &interpreter(),
+        bytes,
+        CompiledTaskOptions {
+            pipeline_dop: NonZeroUsize::MIN,
+            exchange_wait: Duration::from_millis(50),
+        },
+        Arc::clone(tracker),
+        &Control,
+        &mut type_host,
+        &mut project_host,
+    )
+    .unwrap()
 }
 fn token(value: &String) -> RecordRef {
     assert!(value.capacity() >= 512);
@@ -431,6 +456,11 @@ fn settled(journal: &ProjectMetadataJournal, has_tagged_label: bool) {
     let receipt = journal.body.settlement.as_ref().unwrap();
     if has_tagged_label {
         assert!(receipt.accepted_live > 0);
+    } else {
+        assert_eq!(
+            receipt.accepted_live, 0,
+            "shared labels are not fresh runtime backing"
+        );
     }
     assert_eq!(receipt.debt, 0);
     assert_eq!(receipt.next_step, Ok(()));
@@ -454,11 +484,12 @@ fn analytic_original_schema_independent_aliases_keep_query_origin_to_last_free()
         (nested(), false),
     ] {
         let binding = binding(64 << 20);
+        let tracker = construction_tracker();
         let bytes = source(input_type, 512);
         let owner = TestPreparationControl::new(Duration::from_millis(1));
         let loan = owner.loan();
         let mut compile_journal = ProjectMetadataJournal::default();
-        let compiled = compile(&bytes, &binding, &loan, &mut compile_journal);
+        let compiled = compile(&bytes, &binding, &tracker, &loan, &mut compile_journal);
         let node = compiled.program().graph().root();
         assert!(matches!(
             compiled.program().graph().nodes()[node.index()].kind(),
@@ -474,19 +505,31 @@ fn analytic_original_schema_independent_aliases_keep_query_origin_to_last_free()
             program,
             factory,
             occurrence,
-        } = prepare_window_metadata_for_test(compiled, node, &binding, &loan, &Control).unwrap();
-        settled(&occurrence.journal, true);
+        } = prepare_window_metadata_for_test(
+            compiled,
+            node,
+            &binding,
+            Arc::clone(&tracker),
+            &loan,
+            &Control,
+        )
+        .unwrap();
+        settled(&occurrence.journal, false);
         assert_eq!(occurrence.site, CompiledSchemaSite::AnalyticOutput(node));
         let arrow = occurrence.schema.arrow_schema_ref();
         let root_field = Arc::clone(occurrence.schema.slots()[1].field_ref());
         let arrow_field = &arrow.fields()[1];
         assert_eq!(root_field.as_ref(), earlier.as_ref());
         assert_eq!(arrow_field.as_ref(), earlier.as_ref());
-        assert_ne!(root_field.name().as_ptr(), earlier.name().as_ptr());
-        assert_ne!(arrow_field.name().as_ptr(), earlier.name().as_ptr());
-        assert_ne!(root_field.name().as_ptr(), arrow_field.name().as_ptr());
+        assert!(Arc::ptr_eq(&root_field, &earlier));
+        assert!(Arc::ptr_eq(arrow_field, &earlier));
+        assert!(Arc::ptr_eq(&root_field, arrow_field));
         let first = token(root_field.name());
         let second = token(arrow_field.name());
+        assert_eq!(
+            first, second,
+            "all aliases retain the actual funded label origin"
+        );
         eprintln!(
             "WINDOW_GLOBAL account={} schema_first={} slot_base={:p} slot_capacity={} arrow_base={:p} arrow_capacity={} slot_token={:?} arrow_token={:?} facts={:?} workset={:?} settlement={:?}",
             binding.account().id().get(),
@@ -582,11 +625,12 @@ fn analytic_actual_private_host_and_original_builder_capture_separate_occurrence
     let _ = novarocks_server::memory_observation::snapshot();
     for label_bytes in [1, 512] {
         let binding = binding(64 << 20);
+        let tracker = construction_tracker();
         let bytes = source(bigint(), label_bytes);
         let owner = TestPreparationControl::new(Duration::from_millis(1));
         let loan = owner.loan();
         let mut journal = ProjectMetadataJournal::default();
-        let compiled = compile(&bytes, &binding, &loan, &mut journal);
+        let compiled = compile(&bytes, &binding, &tracker, &loan, &mut journal);
         let node = compiled.program().graph().root();
         let mut functions = ExecutionFunctionSetBuilder::new();
         functions
@@ -605,6 +649,7 @@ fn analytic_actual_private_host_and_original_builder_capture_separate_occurrence
             1,
             Some(1),
             &binding,
+            Arc::clone(&tracker),
             &loan,
             &Control,
         )
@@ -649,7 +694,7 @@ fn analytic_actual_private_host_and_original_builder_capture_separate_occurrence
                 occurrence.journal.workset_bytes,
                 occurrence.journal.body.settlement
             );
-            settled(&occurrence.journal, label_bytes >= 512);
+            settled(&occurrence.journal, false);
             assert_eq!(
                 occurrence.schema.arrow_schema_ref().fields()[1].name(),
                 &"r".repeat(label_bytes)
@@ -686,19 +731,27 @@ fn analytic_original_schema_actual_capacity_and_worker_stop_remain_nominal() {
     use novarocks_worker::PreparationStop;
     let _ = novarocks_server::memory_observation::snapshot();
     let binding = binding(64 << 20);
+    let tracker = construction_tracker();
     let bytes = source(bigint(), 512);
     let owner = TestPreparationControl::new(Duration::from_millis(1));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
-    let first = compile(&bytes, &binding, &loan, &mut journal);
-    let second = compile(&bytes, &binding, &loan, &mut journal);
+    let first = compile(&bytes, &binding, &tracker, &loan, &mut journal);
+    let second = compile(&bytes, &binding, &tracker, &loan, &mut journal);
     let node = first.program().graph().root();
     binding
         .account()
         .install_policy(0, novarocks_memory::LimitDimension::Work);
-    let error = prepare_window_metadata_for_test(first, node, &binding, &loan, &Control)
-        .err()
-        .unwrap();
+    let error = prepare_window_metadata_for_test(
+        first,
+        node,
+        &binding,
+        Arc::clone(&tracker),
+        &loan,
+        &Control,
+    )
+    .err()
+    .unwrap();
     assert!(matches!(
         error.cause(),
         ExecutionFailureCause::PreparationMetadata(PreparationMetadataFailure::Host(
@@ -708,9 +761,16 @@ fn analytic_original_schema_actual_capacity_and_worker_stop_remain_nominal() {
     assert!(owner.stop(PreparationStop::Abort(
         novarocks_execution_contract::AbortCause::QueryFailed
     )));
-    let error = prepare_window_metadata_for_test(second, node, &binding, &loan, &Control)
-        .err()
-        .unwrap();
+    let error = prepare_window_metadata_for_test(
+        second,
+        node,
+        &binding,
+        Arc::clone(&tracker),
+        &loan,
+        &Control,
+    )
+    .err()
+    .unwrap();
     assert_eq!(
         error.cause(),
         &ExecutionFailureCause::PreparationMetadata(PreparationMetadataFailure::Host(
@@ -732,11 +792,12 @@ fn analytic_original_schema_actual_occupied_capacity_retains_qualified_shortage(
     const TOTAL: u64 = 2 << 20;
     const CAPACITY: u64 = TOTAL * 3 / 4;
     let binding = binding(TOTAL);
+    let tracker = construction_tracker();
     let bytes = source(bigint(), 512);
     let owner = TestPreparationControl::new(Duration::from_millis(1));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
-    let compiled = compile(&bytes, &binding, &loan, &mut journal);
+    let compiled = compile(&bytes, &binding, &tracker, &loan, &mut journal);
     let node = compiled.program().graph().root();
     let payload = usize::try_from(
         CAPACITY
@@ -759,9 +820,16 @@ fn analytic_original_schema_actual_occupied_capacity_retains_qualified_shortage(
         filler_journal.settlement.as_ref().unwrap().accepted_live,
         (payload + 8) as u64
     );
-    let error = prepare_window_metadata_for_test(compiled, node, &binding, &loan, &Control)
-        .err()
-        .unwrap();
+    let error = prepare_window_metadata_for_test(
+        compiled,
+        node,
+        &binding,
+        Arc::clone(&tracker),
+        &loan,
+        &Control,
+    )
+    .err()
+    .unwrap();
     let ExecutionFailureCause::PreparationMetadata(PreparationMetadataFailure::Host(
         PreparationMemoryRefusal::SharedShortage(receipt),
     )) = error.cause()

@@ -17,18 +17,16 @@
 
 //! Exact root occurrence provenance carried through the owned compiler phases.
 
-use std::borrow::Cow;
-
 use novarocks_physical_plan::ResultValueDomain;
 use novarocks_result_contract::{ScalarField, ScalarSchema};
-use novarocks_types::schema::SqlType;
+use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 
 use crate::column_id::{ColumnId, ColumnRefFactory};
 use crate::common::OutputColumn;
 
 #[derive(Debug)]
 pub(crate) struct RootOutputSemantics {
-    occurrences: Box<[(ColumnId, ResultValueDomain)]>,
+    occurrences: Box<[(ColumnId, FunctionValueType, ResultValueDomain)]>,
     scalar_field: Option<ScalarField>,
     private_persistence_domain: bool,
 }
@@ -36,7 +34,7 @@ pub(crate) struct RootOutputSemantics {
 impl RootOutputSemantics {
     pub(crate) fn capture(
         columns: &[OutputColumn],
-        factory: &ColumnRefFactory,
+        _factory: &ColumnRefFactory,
     ) -> Result<Self, String> {
         if columns.len() > novarocks_result_contract::RootProfileV1::MAX_COLUMNS {
             return Err("root output occurrence count exceeds its admitted profile".into());
@@ -45,15 +43,7 @@ impl RootOutputSemantics {
         // for preflight, then construct one bounded owned field; do not clone
         // a nested declaration once per repeated output occurrence.
         let scalar_field = match columns {
-            [column] => {
-                let logical = output_logical_type(column, factory);
-                super::root_scalar_type::scalar_field(
-                    &column.value_type.data_type,
-                    column.value_type.nullable,
-                    logical.as_deref(),
-                )
-                .ok()
-            }
+            [column] => super::root_scalar_type::scalar_field(&column.value_type).ok(),
             _ => None,
         };
         let private_persistence_domain =
@@ -61,9 +51,9 @@ impl RootOutputSemantics {
                 .iter()
                 .filter(|column| !column.is_internal)
                 .any(|column| {
-                    output_logical_type(column, factory)
-                        .as_deref()
-                        .is_some_and(private_persistence_domain)
+                    crate::planning::mv::has_private_persistence_domain(
+                        column.value_type.value_type(),
+                    )
                 });
         Ok(Self {
             scalar_field,
@@ -71,16 +61,16 @@ impl RootOutputSemantics {
             occurrences: columns
                 .iter()
                 .map(|column| {
-                    let domain = match output_logical_type(column, factory).as_deref() {
-                        Some(SqlType::Json) => ResultValueDomain::Json,
-                        Some(SqlType::Variant) => ResultValueDomain::Variant,
-                        Some(SqlType::Hll) => ResultValueDomain::Hll,
-                        Some(SqlType::Bitmap) => ResultValueDomain::Bitmap,
-                        Some(SqlType::Object) => ResultValueDomain::Object,
-                        Some(SqlType::Percentile) => ResultValueDomain::Percentile,
+                    let domain = match column.value_type.logical_type() {
+                        ValueLogicalType::Json => ResultValueDomain::Json,
+                        ValueLogicalType::Variant => ResultValueDomain::Variant,
+                        ValueLogicalType::Hll => ResultValueDomain::Hll,
+                        ValueLogicalType::Bitmap => ResultValueDomain::Bitmap,
+                        ValueLogicalType::Object => ResultValueDomain::Object,
+                        ValueLogicalType::Percentile => ResultValueDomain::Percentile,
                         _ => ResultValueDomain::Plain,
                     };
-                    (column.column_id, domain)
+                    (column.column_id, column.value_type.clone(), domain)
                 })
                 .collect(),
         })
@@ -105,9 +95,8 @@ impl RootOutputSemantics {
             .iter()
             .zip(columns)
             .enumerate()
-            .map(|(ordinal, ((id, domain), column))| {
-                if *id != column.column_id || !domain.matches_storage(&column.value_type.data_type)
-                {
+            .map(|(ordinal, ((id, captured, domain), column))| {
+                if *id != column.column_id || !same_captured_binding(captured, &column.value_type) {
                     return Err(format!(
                         "root semantic occurrence changed at ordinal {ordinal}"
                     ));
@@ -124,59 +113,43 @@ impl RootOutputSemantics {
         let [ty] = types else {
             return None;
         };
+        let [(_, captured, _)] = self.occurrences.as_ref() else {
+            return None;
+        };
+        if !same_captured_binding(captured, ty) {
+            return None;
+        }
         let mut field = self.scalar_field?;
         // Nullability is the final lowered value's fact. Move the one owned
         // type tree into the result port; no declaration or tree clone here.
-        field.nullable = ty.nullable;
-        if !novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
+        field.nullable = ty.nullable();
+        if !novarocks_type_contract::result_scalar_type::scalar_field_matches_binding(
             &field,
-            &ty.data_type,
-            ty.nullable,
-        ) || !super::root_scalar_type::nested_domains_match(&field, &ty.data_type)
-        {
+            ty.typed_binding(),
+        ) {
             return None;
         }
         ScalarSchema::try_new(field).ok()
     }
 }
 
-/// Root value identity comes from the unified value contract. A complete
-/// nested catalog declaration remains borrowed, without copying its type tree.
-fn output_logical_type<'a>(
-    column: &OutputColumn,
-    factory: &'a ColumnRefFactory,
-) -> Option<Cow<'a, SqlType>> {
-    use novarocks_type_contract::ValueLogicalType as V;
-    let logical = match column.value_type.logical_type {
-        V::Physical => {
-            return factory
-                .borrowed_logical_type(column.column_id)
-                .map(Cow::Borrowed);
-        }
-        V::Json => SqlType::Json,
-        V::Variant => SqlType::Variant,
-        V::Hll => SqlType::Hll,
-        V::Bitmap => SqlType::Bitmap,
-        V::Object => SqlType::Object,
-        V::Percentile => SqlType::Percentile,
-        V::LargeInt => SqlType::LargeInt,
-        V::Uuid => SqlType::Uuid,
-    };
-    Some(Cow::Owned(logical))
-}
-
-fn private_persistence_domain(logical: &SqlType) -> bool {
-    match logical {
-        SqlType::Object | SqlType::Percentile => true,
-        SqlType::Array(item) => private_persistence_domain(item),
-        SqlType::Map(key, value) => {
-            private_persistence_domain(key) || private_persistence_domain(value)
-        }
-        SqlType::Struct(fields) => fields
-            .iter()
-            .any(|(_, field)| private_persistence_domain(field)),
-        _ => false,
+/// Preserve all captured semantic nodes and precise value layout; only the
+/// final lowered root NULL promise may differ. This borrowed comparison creates
+/// no projected declaration, field metadata or runtime allocation authority.
+fn same_captured_binding(captured: &FunctionValueType, actual: &FunctionValueType) -> bool {
+    if captured.value_type().shares_storage(actual.value_type())
+        && captured
+            .typed_binding()
+            .layout()
+            .shares_storage(actual.typed_binding().layout())
+    {
+        return true;
     }
+    captured
+        .same_physical_binding_ignoring_root_nullability_observed(actual, || {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -185,7 +158,7 @@ mod tests {
     use crate::compiler::completion::SqlCompletedPlan;
     use arrow::datatypes::{DataType as D, Field};
     use novarocks_physical_plan::ValueType;
-    use novarocks_types::logical::{LogicalType, field_with_logical_type};
+    use novarocks_types::schema::SqlType;
     use std::sync::Arc;
 
     #[test]
@@ -262,22 +235,45 @@ mod tests {
         }
     }
 
-    fn declared_map(marked: bool) -> (ColumnRefFactory, OutputColumn) {
-        let mut value = Field::new("value", D::Binary, true);
-        if marked {
-            value = field_with_logical_type(value, LogicalType::Hll);
-        }
-        let data_type = D::Map(
+    fn declared_map(nominal: bool) -> (ColumnRefFactory, OutputColumn) {
+        use novarocks_type_contract::{
+            ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime as Hold,
+        };
+        let key = ValueTypeRef::try_new(ValueKind::String, false, Hold::pure()).unwrap();
+        let value = ValueTypeRef::try_new(
+            if nominal {
+                ValueKind::Nominal(ValueLogicalType::Hll)
+            } else {
+                ValueKind::Binary
+            },
+            true,
+            Hold::pure(),
+        )
+        .unwrap();
+        let value =
+            ValueTypeRef::try_new(ValueKind::Map { key, value }, false, Hold::pure()).unwrap();
+        let layout = D::Map(
             Arc::new(Field::new(
                 "entries",
-                D::Struct(vec![Arc::new(Field::new("key", D::Utf8, true)), Arc::new(value)].into()),
+                D::Struct(
+                    vec![
+                        Arc::new(Field::new("key", D::Utf8, false)),
+                        Arc::new(Field::new("value", D::Binary, true)),
+                    ]
+                    .into(),
+                ),
                 false,
             )),
             false,
         );
+        let value_type = FunctionValueType::try_from_value(
+            value,
+            ValueLayout::try_new(&layout, Hold::pure()).unwrap(),
+        )
+        .unwrap();
         let mut factory = ColumnRefFactory::new();
-        let value_type = novarocks_type_contract::FunctionValueType::new(data_type.clone(), false);
         let id = factory.create(None, "m".into(), value_type.clone());
+        // Deliberately stale catalog summary; it cannot author the output.
         factory.set_logical_type(
             id,
             Some(SqlType::Map(
@@ -354,59 +350,35 @@ mod tests {
     }
 
     #[test]
-    fn complete_uuid_without_a_legacy_declaration_never_captures_largeint_proof() {
-        use novarocks_type_contract::ValueLogicalType;
-        for logical in [
-            ValueLogicalType::Uuid,
-            ValueLogicalType::LargeInt,
-            ValueLogicalType::Physical,
-        ] {
-            let mut factory = ColumnRefFactory::new();
-            let mut ty = ValueType::new(D::FixedSizeBinary(16), true);
-            ty.logical_type = logical;
-            let id = factory.create(None, "value".into(), ty.clone());
-            assert!(factory.borrowed_logical_type(id).is_none());
-            let column = OutputColumn {
-                column_id: id,
-                name: "value".into(),
-                value_type: ty,
-                is_internal: false,
-            };
-            let captured = RootOutputSemantics::capture(&[column], &factory).unwrap();
-            if logical == ValueLogicalType::Uuid {
-                assert!(captured.scalar_field.is_none());
-            } else {
-                assert!(matches!(
-                    captured.scalar_field.unwrap().value_type,
-                    novarocks_result_contract::ScalarValueType::LargeInt
-                ));
-            }
-        }
-    }
-
-    #[test]
-    fn m07_scalar_complete_nested_declaration_is_not_lost_as_plain_storage() {
-        for marked in [false, true] {
-            let (factory, column) = declared_map(marked);
+    fn m07_scalar_complete_binding_is_authority_without_factory_declaration() {
+        for nominal in [false, true] {
+            let (factory, column) = declared_map(nominal);
+            assert_eq!(
+                column.value_type.data_type().to_string(),
+                declared_map(!nominal).1.value_type.data_type().to_string()
+            );
             let semantics =
                 RootOutputSemantics::capture(std::slice::from_ref(&column), &factory).unwrap();
             let completed = completed(column, semantics);
-            assert_eq!(completed.scalar_schema().is_ok(), marked);
-            if marked {
-                let schema = completed.scalar_schema().unwrap();
-                let novarocks_result_contract::ScalarValueType::Map { key, value } =
-                    &schema.field().value_type
-                else {
-                    panic!("expected Map")
-                };
-                assert!(key.nullable);
-                assert_eq!(
-                    value.value_type,
+            let schema = completed
+                .scalar_schema()
+                .expect("complete metadata-free Map binding");
+            let novarocks_result_contract::ScalarValueType::Map { key, value } =
+                &schema.field().value_type
+            else {
+                panic!("expected Map")
+            };
+            assert!(!key.nullable, "the actual declared Map key is required");
+            assert_eq!(
+                value.value_type,
+                if nominal {
                     novarocks_result_contract::ScalarValueType::Opaque(
-                        novarocks_result_contract::ScalarOpaqueType::Hll
+                        novarocks_result_contract::ScalarOpaqueType::Hll,
                     )
-                );
-            }
+                } else {
+                    novarocks_result_contract::ScalarValueType::Binary
+                }
+            );
         }
     }
 
@@ -418,10 +390,22 @@ mod tests {
         assert!(semantics.scalar_field.is_none());
         assert_eq!(semantics.occurrences.len(), repeated.len());
         assert!(
+            semantics.occurrences.iter().all(|(_, captured, _)| {
+                captured
+                    .value_type()
+                    .shares_storage(column.value_type.value_type())
+                    && captured
+                        .typed_binding()
+                        .layout()
+                        .shares_storage(column.value_type.typed_binding().layout())
+            }),
+            "repeated occurrences retain the original immutable author without cloning its tree"
+        );
+        assert!(
             semantics
                 .scalar_schema(&vec![
                     ValueType::new(
-                        column.value_type.data_type.clone(),
+                        column.value_type.data_type().clone(),
                         true
                     );
                     2
@@ -433,38 +417,85 @@ mod tests {
     }
 
     #[test]
-    fn m07_scalar_final_carrier_must_keep_the_captured_nested_domain() {
+    fn m07_scalar_final_complete_binding_must_keep_captured_nested_domain_and_nulls() {
         let (factory, original) = declared_map(true);
-        for replacement in [None, Some("bitmap"), Some("unknown"), Some(" HLL ")] {
+        for domain in [
+            None,
+            Some(ValueLogicalType::Bitmap),
+            Some(ValueLogicalType::Hll),
+        ] {
+            use novarocks_type_contract::{
+                ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime as Hold,
+            };
+            let key = ValueTypeRef::try_new(ValueKind::String, false, Hold::pure()).unwrap();
+            let value = ValueTypeRef::try_new(
+                domain.map_or(ValueKind::Binary, ValueKind::Nominal),
+                true,
+                Hold::pure(),
+            )
+            .unwrap();
+            let value =
+                ValueTypeRef::try_new(ValueKind::Map { key, value }, false, Hold::pure()).unwrap();
+            let ty = FunctionValueType::try_from_value(
+                value,
+                ValueLayout::try_new(original.value_type.data_type(), Hold::pure()).unwrap(),
+            )
+            .unwrap();
             let semantics =
                 RootOutputSemantics::capture(std::slice::from_ref(&original), &factory).unwrap();
-            let mut value = Field::new("value", D::Binary, true);
-            if let Some(marker) = replacement {
-                value = value.with_metadata(
-                    [(
-                        novarocks_types::logical::NR_LOGICAL_TYPE_KEY.to_owned(),
-                        marker.to_owned(),
-                    )]
-                    .into(),
-                );
-            }
-            let final_type = D::Map(
-                Arc::new(Field::new(
-                    "entries",
-                    D::Struct(
-                        vec![Arc::new(Field::new("key", D::Utf8, true)), Arc::new(value)].into(),
-                    ),
-                    false,
-                )),
-                false,
-            );
             assert_eq!(
-                semantics
-                    .scalar_schema(&[ValueType::new(final_type, false)])
-                    .is_some(),
-                replacement == Some(" HLL "),
-                "{replacement:?}"
+                semantics.scalar_schema(&[ty]).is_some(),
+                domain == Some(ValueLogicalType::Hll)
             );
+        }
+        let semantics =
+            RootOutputSemantics::capture(std::slice::from_ref(&original), &factory).unwrap();
+        assert!(
+            semantics
+                .scalar_schema(&[original.value_type.with_nullable(true).unwrap()])
+                .unwrap()
+                .field()
+                .nullable
+        );
+        let semantics =
+            RootOutputSemantics::capture(std::slice::from_ref(&original), &factory).unwrap();
+        let mut changed = original.clone();
+        changed.value_type = declared_map(false).1.value_type;
+        assert!(
+            semantics.domains(&[changed]).is_err(),
+            "optimizer cannot replace a captured nested domain"
+        );
+    }
+
+    #[test]
+    fn private_nested_domain_refusal_uses_complete_binding_not_catalog_fallback() {
+        use novarocks_type_contract::{
+            ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime as Hold,
+        };
+        let (factory, mut column) = declared_map(false);
+        for domain in [ValueLogicalType::Object, ValueLogicalType::Percentile] {
+            let key = ValueTypeRef::try_new(ValueKind::String, false, Hold::pure()).unwrap();
+            let value =
+                ValueTypeRef::try_new(ValueKind::Nominal(domain), true, Hold::pure()).unwrap();
+            let value =
+                ValueTypeRef::try_new(ValueKind::Map { key, value }, false, Hold::pure()).unwrap();
+            column.value_type = FunctionValueType::try_from_value(
+                value,
+                ValueLayout::try_new(column.value_type.data_type(), Hold::pure()).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                RootOutputSemantics::capture(std::slice::from_ref(&column), &factory)
+                    .unwrap()
+                    .has_private_persistence_domain()
+            );
+            column.is_internal = true;
+            assert!(
+                !RootOutputSemantics::capture(std::slice::from_ref(&column), &factory)
+                    .unwrap()
+                    .has_private_persistence_domain()
+            );
+            column.is_internal = false;
         }
     }
 }

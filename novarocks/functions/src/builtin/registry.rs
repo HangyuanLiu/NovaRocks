@@ -1654,6 +1654,13 @@ fn register_bitmap_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "bitmap_to_string",
         Signature::new(vec![TypeSpec::Binary], TypeSpec::Utf8),
     );
+    // Preserve the original plain Binary overload and freeze bitmap semantics
+    // independently for the actual bitmap aggregate output.
+    add(
+        m,
+        "bitmap_to_string",
+        Signature::new(vec![TypeSpec::Bitmap], TypeSpec::Utf8),
+    );
     // bitmap_to_array -> List<Int64>
     add(
         m,
@@ -1908,7 +1915,7 @@ fn register_json_fns(m: &mut HashMap<String, Vec<Signature>>) {
         add(
             m,
             name,
-            Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Utf8),
+            Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Json),
         );
     }
 
@@ -1923,7 +1930,7 @@ fn register_json_fns(m: &mut HashMap<String, Vec<Signature>>) {
     add(
         m,
         "parse_json",
-        Signature::new(vec![TypeSpec::Utf8], TypeSpec::Utf8),
+        Signature::new(vec![TypeSpec::Utf8], TypeSpec::Json),
     );
 }
 

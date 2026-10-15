@@ -69,7 +69,9 @@ impl FragmentResultSession for CollectingSession {
         &self,
         chunk: Chunk,
         _credit: ResultWriteCredit,
-    ) -> Result<(), FragmentIoError> {
+        _factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+        _control: &dyn novarocks_functions::KernelEvaluationControl,
+    ) -> Result<(), crate::runtime::fragment::io::ResultWriteFailure> {
         self.chunks.lock().unwrap().push(chunk);
         Ok(())
     }
@@ -150,7 +152,11 @@ fn compiled_submission_prepares_and_runs_into_the_result_session() {
     let chunks = session.chunks.lock().unwrap();
     let rows: usize = chunks.iter().map(Chunk::len).sum();
     assert_eq!(rows, 1);
-    let batch = &chunks.iter().find(|chunk| chunk.len() == 1).unwrap().batch;
+    let batch = chunks
+        .iter()
+        .find(|chunk| chunk.len() == 1)
+        .unwrap()
+        .record_batch();
     let sample = batch
         .column(0)
         .as_any()
@@ -386,19 +392,16 @@ struct RecordingProjectSchemaHost<'a> {
         crate::runtime::preparation_metadata::PreparationMetadataFailure,
     )>,
 }
-impl crate::runtime::preparation_metadata::CompiledSchemaMetadataScope
+impl crate::runtime::preparation_metadata::CompiledSchemaPreparationScope
     for RecordingProjectSchemaHost<'_>
 {
-    fn materialize<B>(
+    fn prepare(
         &mut self,
         program: &Arc<LocalProgram>,
         site: crate::runtime::preparation_metadata::CompiledSchemaSite,
         layout: &novarocks_local_program::StaticLayout,
-        body: B,
-    ) -> ExecutionResult<crate::exec::chunk::ChunkSchemaRef>
-    where
-        B: FnOnce() -> Result<crate::exec::chunk::ChunkSchemaRef, String>,
-    {
+        body: &mut dyn FnMut() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
         use crate::runtime::preparation_metadata::CompiledSchemaSite;
         assert!(Arc::ptr_eq(program, self.program));
         let node = match site {
@@ -430,7 +433,7 @@ impl crate::runtime::preparation_metadata::CompiledSchemaMetadataScope
             return Err(cause.clone().into());
         }
         self.body_calls += 1;
-        body().map_err(Into::into)
+        body()
     }
 }
 
@@ -495,7 +498,11 @@ fn project_metadata_borrow_reaches_nested_projects_before_running() {
     ));
     let chunks = session.chunks.lock().unwrap();
     assert_eq!(chunks.iter().map(Chunk::len).sum::<usize>(), 1);
-    let batch = &chunks.iter().find(|chunk| chunk.len() == 1).unwrap().batch;
+    let batch = chunks
+        .iter()
+        .find(|chunk| chunk.len() == 1)
+        .unwrap()
+        .record_batch();
     assert_eq!(
         batch
             .column(0)

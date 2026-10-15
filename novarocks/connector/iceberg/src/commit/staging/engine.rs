@@ -249,14 +249,9 @@ fn validate_initialization(base: &TableMetadata, updates: &[TableUpdate]) -> Res
             }
             TableUpdate::AssignUuid { uuid } => *uuid == base.uuid(),
             TableUpdate::SetLocation { location } => location == base.location(),
-            TableUpdate::AddSchema {
-                schema,
-                last_column_id,
-            } => {
-                base.schema_by_id(schema.schema_id())
-                    .is_some_and(|s| s.as_ref() == schema)
-                    && last_column_id.is_none_or(|id| id == base.last_column_id())
-            }
+            TableUpdate::AddSchema { schema } => base
+                .schema_by_id(schema.schema_id())
+                .is_some_and(|s| s.as_ref() == schema),
             TableUpdate::SetCurrentSchema { schema_id } => *schema_id == base.current_schema_id(),
             TableUpdate::AddSpec { spec } => spec
                 .spec_id()

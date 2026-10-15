@@ -28,6 +28,18 @@ pub enum CompiledSchemaSite {
     FinalResult,
     AnalyticOutput(ProgramNodeId),
 }
+/// Funding around the actual typed runtime constructor. The observer creates
+/// no schema and retains no factory after synchronous preparation exits.
+pub trait CompiledSchemaPreparationScope {
+    fn prepare(
+        &mut self,
+        program: &Arc<LocalProgram>,
+        site: CompiledSchemaSite,
+        layout: &StaticLayout,
+        body: &mut dyn FnMut() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()>;
+}
+
 pub trait CompiledSchemaMetadataScope {
     fn materialize<B>(
         &mut self,
@@ -81,4 +93,27 @@ impl std::error::Error for PreparationMetadataFailure {
             Self::Host(error) => Some(error),
         }
     }
+}
+
+/// Component tests invoke the same operator preparation boundary after their
+/// existing fixture has installed the actual construction factory.
+#[cfg(any(test, feature = "test-support"))]
+pub fn prepare_operator_schema_for_test(
+    operator: &mut dyn crate::exec::pipeline::operator::Operator,
+    observer: &mut dyn CompiledSchemaPreparationScope,
+) -> ExecutionResult<()> {
+    let (program, site) = operator
+        .compiled_schema_preparation_site()
+        .map(|(program, site)| (Arc::clone(program), site))
+        .ok_or("operator has no compiled schema preparation site")?;
+    let node = match site {
+        CompiledSchemaSite::Project(node) | CompiledSchemaSite::AnalyticOutput(node) => node,
+        CompiledSchemaSite::FinalResult => program.graph().root(),
+    };
+    observer.prepare(
+        &program,
+        site,
+        program.graph().nodes()[node.index()].output_layout(),
+        &mut || operator.prepare(),
+    )
 }

@@ -87,7 +87,10 @@ fn native_bitnot_kernel_signed_four_profiles_preserve_exact_nonnull_nullable_emp
     ];
     for (input, expected) in pairs {
         for nullable in [false, true] {
-            let ty = FunctionValueType::new(input.data_type().clone(), nullable);
+            let ty = FunctionValueType::from_legacy_declared_projection(
+                input.data_type().clone(),
+                nullable,
+            );
             let recipe = prepared(ty.clone());
             assert_eq!(recipe.source_type(), &ty);
             assert_eq!(recipe.result_type(), &ty);

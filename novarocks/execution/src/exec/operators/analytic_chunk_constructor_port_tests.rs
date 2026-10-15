@@ -178,10 +178,10 @@ fn c02_p2_constructor_gather_original_batch_schema_and_zero_column_rows() {
     let result = stages::gather(&inputs, &mut work).unwrap();
     let original_batch = arrow::compute::concat_batches(
         &inputs[0].schema(),
-        inputs.iter().map(|input| &input.batch),
+        inputs.iter().map(|input| input.record_batch()),
     )
     .unwrap();
-    assert_eq!(result.value.batch, original_batch);
+    assert_eq!(result.value.record_batch(), &original_batch);
     assert_eq!(work.births.len(), 1);
     assert_eq!(work.bodies, 1);
     let birth = &work.births[0];
@@ -286,7 +286,7 @@ fn c02_p2_constructor_regroup_consumes_actual_taken_columns_and_stable_ties() {
     );
     let original =
         Chunk::try_new_with_columns(source.chunk_schema_ref(), work.taken.clone()).unwrap();
-    assert_eq!(result.value.batch, original.batch);
+    assert_eq!(result.value.record_batch(), original.record_batch());
     assert_eq!(result.value.chunk_schema_ref(), original.chunk_schema_ref());
     assert!(!Arc::ptr_eq(&result.value.schema(), &source.schema()));
 }
@@ -347,7 +347,7 @@ fn c02_p2_constructor_split_actual_slices_reconcile_each_null_and_nested_metadat
         let original =
             Chunk::try_new_with_columns(Arc::clone(&output), vec![column.slice(ordinal * 2, 2)])
                 .unwrap();
-        assert_eq!(actual.batch, original.batch);
+        assert_eq!(actual.record_batch(), original.record_batch());
         assert_eq!(actual.chunk_schema_ref(), original.chunk_schema_ref());
         assert_eq!(actual.schema().field(0).is_nullable(), ordinal == 1);
         let DataType::Struct(fields) = actual.columns()[0].data_type() else {

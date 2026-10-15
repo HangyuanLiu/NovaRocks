@@ -102,7 +102,7 @@ use crate::typed_read::{
     IcebergTableExecuteProcedureHandle, IcebergTableHandle, IcebergTableHandleParams,
     REWRITE_POSITION_DELETE_OUTPUT_COLUMNS, ROW_LINEAGE_METADATA_COLUMNS, TrinoManifestFile,
     bounds_row_type, change_op_column_handle, derived_row_type_json, files_relation_schema_json,
-    partition_row_type, plan_change_window_splits, system_relation_columns, system_relation_schema,
+    partition_row_type, plan_change_window_splits, system_relation_columns,
 };
 #[cfg(test)]
 use novarocks_spi::connector::read_stack::{
@@ -950,7 +950,11 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             .into_iter()
             .chain(ROW_LINEAGE_METADATA_COLUMNS.into_iter())
         {
-            let Ok(signed) = source.signed_schema.field_with_name(metadata.column_name()) else {
+            let Ok(signed) = source
+                .signed_source
+                .scan_schema()
+                .field_with_name(metadata.column_name())
+            else {
                 if ALWAYS_BOUND_METADATA_COLUMNS.contains(&metadata) {
                     return Err(corrupt(
                         "Iceberg COW signed source lost an identity metadata field",
@@ -1181,9 +1185,6 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                         IcebergColumnHandle::base_column(field.as_ref())?
                             .with_scalar_integer_domain(
                                 handle.scalar_integer_domains().get(&field.id).copied(),
-                            )?
-                            .with_nominal_read_domain(
-                                handle.nominal_read_domains().get(&field.id).copied(),
                             )?,
                         false,
                     ));
@@ -1234,23 +1235,34 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         &self,
         _session: &ConnectorSession,
         table: &crate::typed_read::IcebergRuntimeRelation,
-        columns: &[IcebergColumnHandle],
-    ) -> Result<ConnectorReadPublicSchema, ConnectorError> {
+        columns: &[&IcebergColumnHandle],
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorReadPublicSchema,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         match table {
-            // A metadata relation's columns come from its system schema, which
-            // the reference does not carry: author it from the same pinned
-            // metadata, verified against the reference, its columns were bound
-            // from.
             crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) => {
+                creation.work(1)?;
                 let metadata = self.system_relation_metadata(reference)?;
-                let system = system_relation_schema(
+                creation.work(1)?;
+                let count = metadata.partition_specs_iter().len();
+                let mut specs = creation.reserve(count)?;
+                for spec in metadata.partition_specs_iter() {
+                    creation.work(1)?;
+                    specs.push(spec.as_ref());
+                }
+                // The schema author borrows exact specs from the loaded metadata;
+                // no service or metadata authority is retained in public facts.
+                system_public_read_schema(
                     reference.system_table_type(),
+                    columns,
                     metadata.current_schema(),
-                    &partition_specs_of(&metadata),
-                )?;
-                system_public_read_schema(reference.system_table_type(), columns, &system)
+                    &specs,
+                    creation,
+                )
             }
-            relation => public_read_schema(relation, columns),
+            relation => public_read_schema(relation, columns, creation),
         }
     }
 
@@ -1430,28 +1442,26 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             return Ok(None);
         };
         let metadata = physical.table.metadata();
-        let loaded = crate::distributed_rewrite::load_frozen_rewrite_group(
-            &self.runtime,
-            physical.table.file_io(),
-            &crate::distributed_rewrite::IcebergRewriteGroupPayloadV1 {
-                version: crate::distributed_rewrite::GROUP_PAYLOAD_VERSION,
-                group_digest_hex: group.group_digest_hex().to_string(),
-                artifact_digest_hex: group.artifact_digest_hex().to_string(),
-                artifact_location: group.artifact_location().to_string(),
-            },
-        )?;
-        let snapshot_id =
-            validate_rewrite_position_delete_artifact(name, metadata, &loaded.artifact)?;
+        let content = group
+            .content()
+            .value::<crate::distributed_rewrite::FrozenRewritePlanContent>(
+                self.descriptor.instance_id.as_str(),
+            )?
+            .clone();
+        content.validate_identity(group.operation_id(), group.artifact_digest_hex())?;
+        content.group(group.group_digest_hex())?;
+        let snapshot_id = validate_rewrite_position_delete_artifact(name, metadata, &content)?;
         let table_handle = pinned_table_handle(name, metadata, Some(snapshot_id))?;
         let procedure_handle = IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(
             IcebergRewritePositionDeleteFilesHandle::try_new(
                 table_handle.clone(),
                 IcebergRewriteArtifactContentId::try_new(
-                    group.artifact_location(),
+                    group.operation_id(),
                     group.artifact_digest_hex(),
                 )?,
                 group.group_digest_hex(),
-            )?,
+            )?
+            .with_content(content),
         );
         Ok(Some(
             crate::typed_read::IcebergRuntimeRelation::TableExecute(
@@ -1864,12 +1874,8 @@ impl IcebergTypedBoundary {
                 &self.runtime,
                 &physical.table,
                 snapshot_id,
-                &crate::distributed_rewrite::IcebergRewriteGroupPayloadV1 {
-                    version: crate::distributed_rewrite::GROUP_PAYLOAD_VERSION,
-                    group_digest_hex: rewrite.group_digest_hex().to_string(),
-                    artifact_digest_hex: rewrite.artifact().artifact_digest_hex().to_string(),
-                    artifact_location: rewrite.artifact().artifact_location().to_string(),
-                },
+                rewrite.content()?.as_ref(),
+                rewrite.group_digest_hex(),
                 request_context,
             )?;
         let deletes = selected
@@ -2251,8 +2257,6 @@ fn pinned_table_handle_with_schema_and_domain(
         .map_err(|error| corrupt(format!("iceberg table schema cannot be encoded: {error}")))?;
 
     let read_domain = read_domain()?;
-    let authored = crate::scalar_integer_domain::metadata_sql_schema(metadata, &schema)?;
-    let nominal = crate::nominal_read_domain::from_sql_schema(&schema, &authored)?;
     IcebergTableHandle::try_new(IcebergTableHandleParams {
         schema_table_name: name.clone(),
         snapshot_id,
@@ -2276,7 +2280,12 @@ fn pinned_table_handle_with_schema_and_domain(
         &schema,
         &crate::scalar_integer_domain::metadata_declarations(metadata)?,
     )?)?
-    .with_nominal_read_domains(nominal)
+    .with_nominal_declarations(
+        crate::schema_mapping::nominal_declaration::restrict_to_schema(
+            &schema,
+            &crate::schema_mapping::nominal_declaration::from_metadata(metadata)?,
+        )?,
+    )
 }
 
 /// Freeze one worker-visible change-window relation handle.
@@ -2341,16 +2350,11 @@ fn pinned_change_window_handle(
             "Iceberg change-window endpoints have different declared scalar integer domains",
         ));
     }
-    let authored = crate::scalar_integer_domain::metadata_sql_schema(metadata, &to_schema)?;
-    let nominal = crate::nominal_read_domain::from_sql_schema(&to_schema, &authored)?;
     let columns = change_window_columns(to_schema.as_ref(), row_lineage_enabled(metadata))?
         .into_iter()
         .map(|column| {
             let domain = to_domains.get(&column.base_field_id()).copied();
-            let nominal_domain = nominal.get(&column.base_field_id()).copied();
-            column
-                .with_scalar_integer_domain(domain)?
-                .with_nominal_read_domain(nominal_domain)
+            column.with_scalar_integer_domain(domain)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let table_schema_json = serde_json::to_string(to_schema.as_ref())
@@ -2382,7 +2386,13 @@ fn pinned_change_window_handle(
         to_read_domain: crate::read_snapshot::mint_read_domain(metadata, to, &to_schema)
             .map_err(corrupt)?,
         partition_spec_jsons,
-    })
+    })?
+    .with_nominal_declarations(
+        crate::schema_mapping::nominal_declaration::restrict_to_schema(
+            &to_schema,
+            &crate::schema_mapping::nominal_declaration::from_metadata(metadata)?,
+        )?,
+    )
     .map(Some)
 }
 
@@ -3562,6 +3572,32 @@ mod public_read_schema_tests {
 
     use super::*;
 
+    fn with_creation<T>(
+        run: impl FnOnce(
+            &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> T,
+    ) -> T {
+        let mut request = |_: std::alloc::Layout| Ok(());
+        let mut work = |_: usize| Ok(());
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
+        run(&mut creation)
+    }
+    fn public_read_schema(
+        relation: &crate::typed_read::IcebergRuntimeRelation,
+        columns: &[IcebergColumnHandle],
+    ) -> Result<
+        ConnectorReadPublicSchema,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        let columns: Vec<_> = columns.iter().collect();
+        with_creation(|creation| {
+            crate::typed_read::codec::public_read_schema(relation, &columns, creation)
+        })
+    }
     fn installed_adapter(
         runtime: &tokio::runtime::Runtime,
         warehouse: &tempfile::TempDir,
@@ -3626,203 +3662,27 @@ mod public_read_schema_tests {
             .into_iter()
             .map(|column| adapter.wrap_column(column))
             .collect::<Vec<_>>();
-        let published =
-            ConnectorReadMetadata::read_public_schema(&adapter, &session(), &table, &columns)
-                .expect("published schema");
+        let published = with_creation(|creation| {
+            ConnectorReadMetadata::read_public_schema(
+                &adapter,
+                &session(),
+                &table,
+                &columns,
+                creation,
+            )
+        })
+        .expect("published schema");
         assert_eq!(published, expected);
-        assert_eq!(
+        assert!(
             published
                 .schema()
                 .fields()
                 .iter()
-                .map(|field| (
-                    field.name().as_str(),
-                    field.metadata()[PARQUET_FIELD_ID_META_KEY].as_str()
-                ))
-                .collect::<Vec<_>>(),
-            [("id", "1"), ("id", "1")]
+                .all(|field| field.metadata().is_empty())
         );
-    }
-
-    /// Component contract: real metadata freezes nominal roots for table,
-    /// pinned-file and change-window reads; the installed public boundary
-    /// publishes literal identities, including carrier-compatible nonnominals.
-    /// Temporary local resources are owned by this test. Run with read-schema
-    /// changes; no external catalog or cluster is needed for this property.
-    #[test]
-    fn installed_read_metadata_keeps_nominal_declarations_from_pinned_metadata() {
-        use crate::nominal_read_domain::NominalReadDomain;
-        use novarocks_type_contract::ValueLogicalType;
-
-        let schema = Schema::builder()
-            .with_fields(vec![
-                Arc::new(NestedField::optional(
-                    1,
-                    "n",
-                    Type::Primitive(PrimitiveType::Fixed(16)),
-                )),
-                Arc::new(NestedField::required(
-                    2,
-                    "h",
-                    Type::Primitive(PrimitiveType::Binary),
-                )),
-                Arc::new(NestedField::optional(
-                    3,
-                    "b",
-                    Type::Primitive(PrimitiveType::Binary),
-                )),
-                Arc::new(NestedField::required(
-                    4,
-                    "u",
-                    Type::Primitive(PrimitiveType::Uuid),
-                )),
-                Arc::new(NestedField::optional(
-                    5,
-                    "p",
-                    Type::Primitive(PrimitiveType::Fixed(16)),
-                )),
-            ])
-            .build()
-            .unwrap();
-        let mut builder = crate::iceberg::spec::TableMetadataBuilder::new(
-            schema,
-            PartitionSpec::unpartition_spec(),
-            crate::iceberg::spec::SortOrder::unsorted_order(),
-            "memory://nominal-read".into(),
-            FormatVersion::V2,
-            HashMap::from([
-                ("novarocks.logical_type.n".into(), "largeint".into()),
-                ("novarocks.logical_type.h".into(), "hll".into()),
-                ("novarocks.logical_type.b".into(), "bitmap".into()),
-            ]),
-        )
-        .unwrap();
-        for (id, parent, sequence) in [(41, None, 1), (42, Some(41), 2)] {
-            let snapshot = crate::iceberg::spec::Snapshot::builder()
-                .with_snapshot_id(id)
-                .with_parent_snapshot_id(parent)
-                .with_sequence_number(sequence)
-                .with_timestamp_ms(1_700_000_000_000 + sequence)
-                .with_manifest_list(format!("memory://nominal-read/snap-{id}.avro"))
-                .with_summary(crate::iceberg::spec::Summary {
-                    operation: crate::iceberg::spec::Operation::Append,
-                    additional_properties: HashMap::new(),
-                })
-                .build();
-            builder = builder.add_snapshot(snapshot).unwrap();
-        }
-        let metadata = builder.build().unwrap().metadata;
-        let name = SchemaTableName::try_new("db", "nominals").unwrap();
-        let expected = BTreeMap::from([
-            (1, NominalReadDomain::LargeInt),
-            (2, NominalReadDomain::Hll),
-            (3, NominalReadDomain::Bitmap),
-        ]);
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let warehouse = tempfile::tempdir().unwrap();
-        let adapter = installed_adapter(&runtime, &warehouse);
-        for handle in [
-            pinned_table_handle(&name, &metadata, None).unwrap(),
-            pinned_table_handle(&name, &metadata, Some(41)).unwrap(),
-            pinned_table_handle_with_files(
-                &name,
-                &metadata,
-                Some(42),
-                Some(IcebergPinnedDataFileSet::try_new(Vec::<String>::new()).unwrap()),
-            )
-            .unwrap(),
-        ] {
-            assert_eq!(handle.nominal_read_domains(), &expected);
-            let schema = handle.parse_table_schema().unwrap();
-            let columns = [3, 1, 1, 4, 5, 2].map(|id| {
-                adapter.wrap_column(
-                    IcebergColumnHandle::base_column_of(&schema, id)
-                        .unwrap()
-                        .with_nominal_read_domain(handle.nominal_read_domains().get(&id).copied())
-                        .unwrap(),
-                )
-            });
-            let table =
-                adapter.wrap_table(crate::typed_read::IcebergRuntimeRelation::Table(handle));
-            let public =
-                ConnectorReadMetadata::read_public_schema(&adapter, &session(), &table, &columns)
-                    .unwrap();
-            assert_eq!(
-                public.logical_types(),
-                &[
-                    ValueLogicalType::Bitmap,
-                    ValueLogicalType::LargeInt,
-                    ValueLogicalType::LargeInt,
-                    ValueLogicalType::Uuid,
-                    ValueLogicalType::Physical,
-                    ValueLogicalType::Hll,
-                ]
-            );
-            assert_eq!(
-                public
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|field| (
-                        field.name().as_str(),
-                        field.is_nullable(),
-                        field.metadata()[PARQUET_FIELD_ID_META_KEY].as_str(),
-                    ))
-                    .collect::<Vec<_>>(),
-                [
-                    ("b", true, "3"),
-                    ("n", true, "1"),
-                    ("n", true, "1"),
-                    ("u", false, "4"),
-                    ("p", true, "5"),
-                    ("h", false, "2"),
-                ]
-            );
-        }
-        let window =
-            pinned_change_window_handle(&name, &metadata, ConnectorReadChangeWindow::new(41, 42))
-                .unwrap()
-                .unwrap();
-        assert_eq!(
-            window
-                .columns()
-                .iter()
-                .map(|column| (column.base_field_id(), column.nominal_read_domain(),))
-                .collect::<Vec<_>>(),
-            [
-                (1, Some(NominalReadDomain::LargeInt)),
-                (2, Some(NominalReadDomain::Hll)),
-                (3, Some(NominalReadDomain::Bitmap)),
-                (4, None),
-                (5, None),
-            ]
-        );
-        let table = adapter.wrap_table(crate::typed_read::IcebergRuntimeRelation::ChangeWindow(
-            window,
-        ));
-        let columns =
-            ConnectorReadMetadata::get_column_bindings(&adapter, &session(), &table).unwrap();
-        let handles = columns
-            .iter()
-            .map(|binding| binding.column().clone())
-            .collect::<Vec<_>>();
-        let public =
-            ConnectorReadMetadata::read_public_schema(&adapter, &session(), &table, &handles)
-                .unwrap();
-        assert_eq!(
-            &public.logical_types()[..5],
-            &[
-                ValueLogicalType::LargeInt,
-                ValueLogicalType::Hll,
-                ValueLogicalType::Bitmap,
-                ValueLogicalType::Uuid,
-                ValueLogicalType::Physical,
-            ]
-        );
-        assert_eq!(
-            public.schema().fields().last().unwrap().name(),
-            ICEBERG_CHANGE_OP_COLUMN
-        );
+        let facts = published.source_schema_facts().unwrap();
+        assert_eq!(facts.field_fact(&[0]).unwrap().field_id(), Some(1));
+        assert_eq!(facts.field_fact(&[1]).unwrap().field_id(), Some(1));
     }
 
     /// A hidden metadata column is planned with the field the table metadata
@@ -3884,14 +3744,19 @@ mod public_read_schema_tests {
         let table = adapter.wrap_table(crate::typed_read::IcebergRuntimeRelation::TableFunction(
             function,
         ));
-        let error = ConnectorReadMetadata::read_public_schema(
-            &adapter,
-            &session(),
-            &table,
-            &[adapter.wrap_column(column)],
-        )
+        let error = with_creation(|creation| {
+            ConnectorReadMetadata::read_public_schema(
+                &adapter,
+                &session(),
+                &table,
+                &[adapter.wrap_column(column)],
+                creation,
+            )
+        })
         .expect_err("a table-function relation has no public read schema");
-        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert!(
+            matches!(error,novarocks_connector_contract::PureProviderCompileError::Provider(cause) if cause.kind()==ConnectorErrorKind::Unsupported)
+        );
     }
 }
 

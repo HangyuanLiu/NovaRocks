@@ -51,22 +51,22 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef};
-use arrow::compute::{
-    SortColumn, SortOptions, concat, concat_batches, lexsort_to_indices, take, take_record_batch,
-};
+use arrow::array::ArrayRef;
+use arrow::compute::{SortColumn, SortOptions};
 use novarocks_local_program::{
     LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
     ProgramNodeKind, SortTopNType,
 };
 
-use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
-use super::sort::{append_stable_row_index_sort_column, normalize_sort_key_array};
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+use super::compiled_expression::{
+    RuntimeKernelControl, evaluate_chunk_all, instances, root_value_type,
+};
+use super::sort::creation::{CreatedSortColumns, SortCreation};
+use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{ConstructionFailure, Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::fragment::ExecutionResult;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
 /// TopN prunes its buffer to `offset + limit` rows once it holds at least
@@ -84,7 +84,7 @@ pub struct CompiledSortProcessorFactory {
     limit: Option<usize>,
     offset: usize,
     prune_rows: usize,
-    output: ChunkSchemaRef,
+    output_node: ProgramNodeId,
     error: Arc<RuntimeErrorState>,
 }
 
@@ -185,7 +185,6 @@ impl CompiledSortProcessorFactory {
         let prune_rows = keep.map_or(usize::MAX, |keep| {
             keep.saturating_mul(PRUNE_FACTOR).max(PRUNE_MIN_ROWS)
         });
-        let output = ChunkSchema::from_compiled_layout(graph_node.output_layout())?;
         let (limit, offset) = (*limit, *offset);
         let name = if *use_top_n {
             format!("COMPILED_TOP_N (node={at})")
@@ -201,7 +200,7 @@ impl CompiledSortProcessorFactory {
             limit,
             offset,
             prune_rows,
-            output,
+            output_node: node,
             error,
         })
     }
@@ -232,7 +231,9 @@ impl OperatorFactory for CompiledSortProcessorFactory {
             limit: self.limit,
             offset: self.offset,
             prune_rows: self.prune_rows,
-            output: Arc::clone(&self.output),
+            output_node: self.output_node,
+            output: None,
+            construction: None,
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             instances: None,
             runs: Vec::new(),
@@ -246,8 +247,8 @@ impl OperatorFactory for CompiledSortProcessorFactory {
 
 /// Payload rows with their already evaluated, normalized key columns.
 struct SortedRun {
-    chunk: Chunk,
-    keys: Vec<ArrayRef>,
+    batch: ChunkBatchProjection,
+    keys: CreatedSortColumns,
 }
 
 struct CompiledSortProcessor {
@@ -259,7 +260,9 @@ struct CompiledSortProcessor {
     limit: Option<usize>,
     offset: usize,
     prune_rows: usize,
-    output: ChunkSchemaRef,
+    output_node: ProgramNodeId,
+    output: Option<ChunkSchemaRef>,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     control: RuntimeKernelControl,
     instances: Option<Vec<CompiledExpressionInstance>>,
     runs: Vec<SortedRun>,
@@ -269,11 +272,23 @@ struct CompiledSortProcessor {
     finished: bool,
 }
 
-fn failure(context: &str, error: impl std::fmt::Display) -> ExecutionFailure {
-    ExecutionFailure::from(format!("{context}: {error}"))
-}
-
 impl CompiledSortProcessor {
+    fn prepared_output(&self) -> ExecutionResult<&ChunkSchemaRef> {
+        self.output.as_ref().ok_or_else(|| {
+            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into()
+        })
+    }
+
+    fn creation(&self) -> ExecutionResult<SortCreation<'_>> {
+        Ok(SortCreation::new(
+            self.construction
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?
+                .as_ref(),
+            self.prepared_output()?,
+        ))
+    }
+
     /// Concatenate the runs and return their first `take_rows` rows in sorted
     /// order (all rows when `None`). The sorted keys are kept only when the
     /// result is buffered again (`keep_keys`).
@@ -285,44 +300,101 @@ impl CompiledSortProcessor {
         if self.runs.is_empty() {
             return Ok(None);
         }
-        let schema = self.output.arrow_schema_ref();
-        let batch = concat_batches(&schema, self.runs.iter().map(|run| &run.chunk.batch))
-            .map_err(|error| failure("compiled Sort payload concat", error))?;
-        let mut keys = Vec::with_capacity(self.options.len());
-        for key in 0..self.options.len() {
-            let parts = self
-                .runs
-                .iter()
-                .map(|run| run.keys[key].as_ref())
-                .collect::<Vec<&dyn Array>>();
-            keys.push(concat(&parts).map_err(|error| failure("compiled Sort key concat", error))?);
+        let creation = self.creation()?;
+        // The borrowed projection clones only existing Arcs/finite storage.
+        // No typed source is reconstructed from RecordBatch fields.
+        let source = self.runs[0].batch.clone().into_chunk();
+        let temporary = creation.begin(&source)?;
+        let payload = creation.begin(&source)?;
+        let owner = creation.begin(&source)?;
+        let key_concat_owner = creation.begin(&source)?;
+        let key_owner = creation.begin(&source)?;
+        let key_types = creation.begin(&source)?;
+        let mut chunks = creation.vector::<Chunk>(self.runs.len(), temporary.as_ref())?;
+        for run in &self.runs {
+            chunks.push(run.batch.clone().into_chunk());
         }
-        let mut columns = keys
-            .iter()
-            .zip(&self.options)
-            .map(|(values, options)| SortColumn {
-                values: Arc::clone(values),
-                options: Some(*options),
-            })
-            .collect::<Vec<_>>();
-        // The arrival-order row index is the last key, so ties are stable and
-        // a bounded prefix selects exactly the same rows as a full sort.
-        append_stable_row_index_sort_column(&mut columns, batch.num_rows());
-        let indices = lexsort_to_indices(&columns, take_rows)
-            .map_err(|error| failure("compiled Sort order", error))?;
-        let batch = take_record_batch(&batch, &indices)
-            .map_err(|error| failure("compiled Sort payload take", error))?;
-        let keys = if keep_keys {
+        let batch = creation.concat(&chunks, payload.as_ref())?;
+        let mut keys = creation.vector::<ArrayRef>(self.options.len(), temporary.as_ref())?;
+        for key in 0..self.options.len() {
+            let mut parts = creation.vector::<&ArrayRef>(self.runs.len(), temporary.as_ref())?;
+            parts.extend(self.runs.iter().map(|run| &run.keys.columns()[key]));
+            keys.push(creation.concat_array(&parts, &source, key_concat_owner.as_ref())?);
+        }
+        let mut columns = creation.vector::<SortColumn>(keys.len(), temporary.as_ref())?;
+        columns.extend(
             keys.iter()
-                .map(|key| take(key.as_ref(), &indices, None))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| failure("compiled Sort key take", error))?
+                .zip(&self.options)
+                .map(|(values, options)| SortColumn {
+                    values: Arc::clone(values),
+                    options: Some(*options),
+                }),
+        );
+        // Arrival order is the same final key and limit as the original body.
+        creation.stable_index(&mut columns, batch.num_rows(), temporary.as_ref())?;
+        let indices = creation.lexsort(&columns, take_rows, &source)?;
+        let batch =
+            creation.take_batch(&batch, indices.array().as_ref(), &source, owner.as_ref())?;
+        let mut kept_keys = creation
+            .vector::<ArrayRef>(if keep_keys { keys.len() } else { 0 }, key_owner.as_ref())?;
+        if keep_keys {
+            for key in &keys {
+                kept_keys.push(creation.take_array(
+                    key,
+                    indices.array().as_ref(),
+                    &source,
+                    key_owner.as_ref(),
+                )?);
+            }
+        }
+        // Keep only source type/array responsibility, never the old runs,
+        // temporary sort keys, factory, or runtime controller.
+        let mut type_storage = key_types.storage_lifetime();
+        let mut key_storage = if keep_keys {
+            key_owner
+                .storage_lifetime()
+                .retaining_observed::<ConstructionFailure>(
+                    &key_concat_owner.storage_lifetime(),
+                    |layout| key_owner.request(layout),
+                )?
         } else {
-            Vec::new()
+            key_owner.storage_lifetime()
         };
+        // Dictionary/View take can reuse the concat result's private owners.
+        // This is its finite result scope, not concat/preflight scratch.
+        let mut payload_storage = owner
+            .storage_lifetime()
+            .retaining_observed::<ConstructionFailure>(&payload.storage_lifetime(), |layout| {
+                owner.request(layout)
+            })?;
+        for run in &self.runs {
+            if keep_keys {
+                type_storage = type_storage.retaining_observed::<ConstructionFailure>(
+                    &run.keys.storage_lifetime(),
+                    |layout| key_types.request(layout),
+                )?;
+                key_storage = key_storage.retaining_observed::<ConstructionFailure>(
+                    &run.keys.array_storage_lifetime(),
+                    |layout| key_owner.request(layout),
+                )?;
+            }
+            payload_storage = payload_storage.retaining_observed::<ConstructionFailure>(
+                &run.batch.array_type_storage_lifetime(),
+                |layout| owner.request(layout),
+            )?;
+        }
+        let (_, data, rows) = batch.into_parts();
+        let batch = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            self.prepared_output()?.clone(),
+            data,
+            rows,
+            payload_storage,
+            |step| owner.observe(0, &[], step),
+        )?
+        .into_batch_projection();
         Ok(Some(SortedRun {
-            chunk: Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.output))?,
-            keys,
+            batch,
+            keys: CreatedSortColumns::new(kept_keys, type_storage, key_storage),
         }))
     }
 
@@ -337,7 +409,7 @@ impl CompiledSortProcessor {
         self.runs.clear();
         self.buffered_rows = 0;
         if let Some(run) = kept {
-            self.buffered_rows = run.chunk.len();
+            self.buffered_rows = run.batch.len();
             self.runs.push(run);
         }
         Ok(())
@@ -347,7 +419,7 @@ impl CompiledSortProcessor {
         let Some(sorted) = self.sort_runs(self.keep, false)? else {
             return Ok(None);
         };
-        let rows = sorted.chunk.len();
+        let rows = sorted.batch.len();
         if self.offset >= rows {
             return Ok(None);
         }
@@ -357,15 +429,36 @@ impl CompiledSortProcessor {
         if len == 0 {
             return Ok(None);
         }
-        let batch = sorted.chunk.batch.slice(self.offset, len);
-        Ok(Some(Chunk::try_new_with_chunk_schema(
-            batch,
-            Arc::clone(&self.output),
-        )?))
+        let source = sorted.batch.into_chunk();
+        Ok(Some(self.creation()?.slice(&source, self.offset, len)?))
     }
 }
 
 impl Operator for CompiledSortProcessor {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.control.bind_construction_factory(factory.clone());
+        self.construction = Some(factory);
+    }
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        if self.output.is_some() {
+            return Ok(());
+        }
+        let layout = self.program.graph().nodes()[self.output_node.index()].output_layout();
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        self.output = Some(factory.create_compiled_chunk_schema(layout)?);
+        Ok(())
+    }
+
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.control.bind_runtime_memory(state);
         Ok(())
@@ -395,6 +488,7 @@ impl ProcessorOperator for CompiledSortProcessor {
         self.pending.is_some()
     }
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+        self.prepared_output()?;
         if self.finishing || self.finished {
             return Err("compiled Sort received input after finishing".into());
         }
@@ -407,19 +501,53 @@ impl ProcessorOperator for CompiledSortProcessor {
             &self.sites,
             &self.control,
         )?;
+        let output = self.prepared_output()?.clone();
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?
+            .clone();
+        let creation = SortCreation::new(factory.as_ref(), &output);
+        creation.verify_chunks(std::slice::from_ref(&chunk))?;
+        let owner = creation.begin(&chunk)?;
+        let types = creation.begin(&chunk)?;
+        let mut type_storage = creation.source_type_storage(&chunk, types.as_ref())?;
+        let array_storage = owner
+            .storage_lifetime()
+            .retaining_observed::<ConstructionFailure>(
+                &chunk.array_type_storage_lifetime(),
+                |layout| owner.request(layout),
+            )?;
         let instances = self.instances.as_mut().expect("instances were created");
-        let mut keys = Vec::with_capacity(self.sites.len());
+        let mut keys = creation.vector::<ArrayRef>(self.sites.len(), owner.as_ref())?;
         for (instance, site) in instances.iter_mut().zip(&self.sites) {
-            let values = evaluate_all(instance, *site, &chunk.batch, &self.control)?;
-            keys.push(normalize_sort_key_array(&values).map_err(ExecutionFailure::from)?);
+            let values = evaluate_chunk_all(instance, *site, &chunk, &self.control)?;
+            let declared = root_value_type(&self.program, *site)?;
+            type_storage = type_storage.retaining_observed::<ConstructionFailure>(
+                &declared
+                    .typed_binding()
+                    .layout()
+                    .arrow_backing_storage_lifetime(),
+                |layout| types.request(layout),
+            )?;
+            keys.push(creation.normalize_key(
+                &values,
+                declared.value_type(),
+                owner.as_ref(),
+                types.as_ref(),
+            )?);
         }
+        let keys = CreatedSortColumns::new(keys, type_storage, array_storage);
         // Every arriving row's keys are evaluated, even when no row can be
         // kept, so a key's row error never depends on the limit.
         if self.keep == Some(0) {
             return Ok(());
         }
         self.buffered_rows = self.buffered_rows.saturating_add(chunk.len());
-        self.runs.push(SortedRun { chunk, keys });
+        self.runs.push(SortedRun {
+            batch: chunk.into_batch_projection(),
+            keys,
+        });
         self.prune()
     }
     fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
@@ -430,6 +558,7 @@ impl ProcessorOperator for CompiledSortProcessor {
         Ok(output)
     }
     fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+        self.prepared_output()?;
         if self.finishing || self.finished {
             return Ok(());
         }

@@ -100,14 +100,15 @@ impl<'a> ProjectMetadataHost<'a> {
     }
 
     #[cfg(test)]
-    pub(super) fn materialize_with_request<B, R>(
+    pub(super) fn materialize_with_request<C, B, R>(
         &mut self,
         request: &ProjectOutputRequestFacts,
         body: B,
         qualification: R,
-    ) -> Result<ProjectMetadataOutput, ProjectMetadataFailure<PreparationMemoryRefusal>>
+    ) -> Result<ProjectMetadataOutput, ProjectMetadataFailure<PreparationMemoryRefusal, C>>
     where
-        B: FnOnce() -> Result<ProjectMetadataOutput, FragmentCompileError>,
+        C: From<FragmentCompileError>,
+        B: FnOnce() -> Result<ProjectMetadataOutput, C>,
         R: FnMut(
             &QueryMemoryBinding,
             usize,
@@ -134,13 +135,14 @@ impl<'a> ProjectMetadataHost<'a> {
 }
 impl ProjectMetadataScope for ProjectMetadataHost<'_> {
     type HostError = PreparationMemoryRefusal;
-    fn materialize<B>(
+    fn materialize<C, B>(
         &mut self,
         request: &ProjectOutputRequestFacts,
         body: B,
-    ) -> Result<ProjectMetadataOutput, ProjectMetadataFailure<Self::HostError>>
+    ) -> Result<ProjectMetadataOutput, ProjectMetadataFailure<Self::HostError, C>>
     where
-        B: FnOnce() -> Result<ProjectMetadataOutput, FragmentCompileError>,
+        C: From<FragmentCompileError>,
+        B: FnOnce() -> Result<ProjectMetadataOutput, C>,
     {
         self.journal
             .start(ProjectMetadataPhase::Compile(request.node));
@@ -243,6 +245,7 @@ impl<'a> CompiledProjectMetadataHost<'a> {
         Ok(id)
     }
 }
+#[cfg(test)]
 impl CompiledSchemaMetadataScope for CompiledProjectMetadataHost<'_> {
     fn materialize<B>(
         &mut self,
@@ -301,6 +304,42 @@ impl CompiledSchemaMetadataScope for CompiledProjectMetadataHost<'_> {
     }
 }
 
+impl novarocks_execution::runtime::preparation_metadata::CompiledSchemaPreparationScope
+    for CompiledProjectMetadataHost<'_>
+{
+    fn prepare(
+        &mut self,
+        program: &Arc<LocalProgram>,
+        site: CompiledSchemaSite,
+        layout: &StaticLayout,
+        body: &mut dyn FnMut() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
+        let node = self
+            .source_node(program, site, layout)
+            .map_err(PreparationMetadataFailure::Request)?;
+        self.journal.start(ProjectMetadataPhase::Prepare(node));
+        let facts = original_compiled_schema_metadata_request(layout, self.control)
+            .map_err(PreparationMetadataFailure::Request)?;
+        self.journal.facts = Some(facts);
+        let control = WorkerPreparationMemoryControl {
+            preparation: self.preparation,
+        };
+        SynchronousPreparationMemory::new(Some(self.binding), &control, self.journal.loan())
+            .materialize(
+                facts,
+                "typed schema request bound exceeds funding width",
+                body,
+            )
+            .map_err(|error| match error {
+                SynchronousPreparationFailure::Body(original) => original,
+                SynchronousPreparationFailure::Host(error) => {
+                    PreparationMetadataFailure::Host(error).into()
+                }
+            })
+    }
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OriginalSchemaRoute {
     NormalPositive,
@@ -308,10 +347,14 @@ enum OriginalSchemaRoute {
     Foreign,
     Mixed,
 }
+#[cfg(test)]
 fn original_schema_route(
     layout: &StaticLayout,
     control: &dyn PureCompileControl,
 ) -> Result<OriginalSchemaRoute, MetadataRequestError> {
+    if layout.is_typed() {
+        return Ok(OriginalSchemaRoute::NormalPositive);
+    }
     if layout.field_metadata_origins().is_some() {
         return Ok(OriginalSchemaRoute::SharedOrigins);
     }

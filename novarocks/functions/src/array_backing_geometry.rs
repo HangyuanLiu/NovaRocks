@@ -63,6 +63,24 @@ pub(crate) trait BorrowedSourceObservation<'source> {
     ) -> Result<(), KernelFailure>;
 }
 
+pub(crate) trait MetadataWork {
+    type Error: From<KernelFailure>;
+    fn step(&mut self) -> Result<(), Self::Error>;
+}
+impl MetadataWork for EvaluationCheckpoints<'_> {
+    type Error = KernelFailure;
+    fn step(&mut self) -> Result<(), Self::Error> {
+        EvaluationCheckpoints::step(self)
+    }
+}
+struct CreatorMetadataWork<'a, E>(&'a mut dyn FnMut(bool) -> Result<(), E>);
+impl<E: From<KernelFailure>> MetadataWork for CreatorMetadataWork<'_, E> {
+    type Error = E;
+    fn step(&mut self) -> Result<(), E> {
+        (self.0)(false)
+    }
+}
+
 struct SourceGraphResult {
     legacy: Option<usize>,
     requests: Option<RequestSummary>,
@@ -145,14 +163,14 @@ fn actual_rebox_layout(array: &dyn Array) -> Result<Layout, KernelFailure> {
 /// Use ONE custody metadata arithmetic with borrowed actual table counts. The
 /// returned bytes cover metadata construction only; existing input lease owners
 /// retain the original payload independently and are never replaced by this sum.
-fn source_metadata_graph<'source>(
+fn source_metadata_graph<'source, W: MetadataWork>(
     array: &'source dyn Array,
-    work: &mut EvaluationCheckpoints<'_>,
+    work: &mut W,
     copy_nulls: bool,
-    observer: &mut Option<&mut dyn BorrowedSourceObservation<'source>>,
+    observer: &mut impl FnMut(BorrowedSourceNode<'source>, &mut W) -> Result<(), W::Error>,
     pricing: Option<&SourceRequestPricing>,
     role: SourceNodeRole,
-) -> Result<SourceGraphResult, KernelFailure> {
+) -> Result<SourceGraphResult, W::Error> {
     work.step()?;
     // Do not run unused legacy envelope arithmetic on the request route.
     let mut child_bytes = pricing.is_none().then_some(0usize);
@@ -270,7 +288,11 @@ fn source_metadata_graph<'source>(
                 DataType::UInt16 => dictionary!(UInt16Type),
                 DataType::UInt32 => dictionary!(UInt32Type),
                 DataType::UInt64 => dictionary!(UInt64Type),
-                _ => return Err(invalid("source dictionary has no actual Arrow key carrier")),
+                _ => {
+                    return Err(W::Error::from(invalid(
+                        "source dictionary has no actual Arrow key carrier",
+                    )));
+                }
             }
         }
         DataType::Union(fields, mode) => {
@@ -313,7 +335,11 @@ fn source_metadata_graph<'source>(
                 DataType::Int16 => child!(concrete::<RunArray<Int16Type>>(array)?.values()),
                 DataType::Int32 => child!(concrete::<RunArray<Int32Type>>(array)?.values()),
                 DataType::Int64 => child!(concrete::<RunArray<Int64Type>>(array)?.values()),
-                _ => return Err(invalid("source run-end has no actual Arrow index carrier")),
+                _ => {
+                    return Err(W::Error::from(invalid(
+                        "source run-end has no actual Arrow index carrier",
+                    )));
+                }
             }
         }
         DataType::Boolean
@@ -344,8 +370,8 @@ fn source_metadata_graph<'source>(
             children = 0;
         }
     }
-    if let Some(observer) = observer.as_deref_mut() {
-        observer.node(
+    {
+        observer(
             BorrowedSourceNode {
                 array,
                 data_buffers: buffers,
@@ -390,9 +416,9 @@ fn source_metadata_graph<'source>(
         }
         (None, None) => None,
         _ => {
-            return Err(invalid(
-                "source custody traversal has inconsistent request premises",
-            ));
+            return Err(
+                invalid("source custody traversal has inconsistent request premises").into(),
+            );
         }
     };
     let bufferless_root = pricing.map(|_| {
@@ -413,11 +439,40 @@ pub(crate) fn source_metadata_bytes(
     // Four envelopes cover pinned Arrow to_data transient table growth,
     // clone/into_builder/make_array coexistence, and custom-buffer metadata.
     // Apply it ONCE to the complete actual graph, not exponentially by depth.
-    source_metadata_graph(array, work, false, &mut None, None, SourceNodeRole::Rebox)?
-        .legacy
-        .expect("legacy source traversal amount")
+    source_metadata_graph(
+        array,
+        work,
+        false,
+        &mut |_, _| Ok(()),
+        None,
+        SourceNodeRole::Rebox,
+    )?
+    .legacy
+    .expect("legacy source traversal amount")
+    .checked_mul(4)
+    .ok_or(KernelFailure::ResourceExhausted)
+}
+
+/// SAME source graph for opaque to_data/validation/canonical wrapper calls.
+/// Original payload is borrowed and excluded from this metadata-only bound.
+pub fn source_metadata_bytes_observed<E: From<KernelFailure>>(
+    array: &dyn Array,
+    observe: &mut impl FnMut(bool) -> Result<(), E>,
+) -> Result<usize, E> {
+    let mut work = CreatorMetadataWork(observe);
+    let bytes = source_metadata_graph(
+        array,
+        &mut work,
+        false,
+        &mut |_, _| Ok(()),
+        None,
+        SourceNodeRole::Rebox,
+    )?
+    .legacy
+    .expect("legacy source traversal amount");
+    Ok(bytes
         .checked_mul(4)
-        .ok_or(KernelFailure::ResourceExhausted)
+        .ok_or(KernelFailure::ResourceExhausted)?)
 }
 
 /// The SAME actual source graph bounds copy metadata. Any copied node may gain
@@ -428,11 +483,40 @@ pub(crate) fn copy_metadata_bytes(
     array: &dyn Array,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<usize, KernelFailure> {
-    source_metadata_graph(array, work, true, &mut None, None, SourceNodeRole::Rebox)?
-        .legacy
-        .expect("legacy copy traversal amount")
+    source_metadata_graph(
+        array,
+        work,
+        true,
+        &mut |_, _| Ok(()),
+        None,
+        SourceNodeRole::Rebox,
+    )?
+    .legacy
+    .expect("legacy copy traversal amount")
+    .checked_mul(4)
+    .ok_or(KernelFailure::ResourceExhausted)
+}
+
+/// Direct creator work observes the SAME source graph; original H is never
+/// converted into a kernel-control error or captured in a side channel.
+pub(crate) fn copy_metadata_bytes_observed<E: From<KernelFailure>>(
+    array: &dyn Array,
+    observe: &mut impl FnMut(bool) -> Result<(), E>,
+) -> Result<usize, E> {
+    let mut work = CreatorMetadataWork(observe);
+    let bytes = source_metadata_graph(
+        array,
+        &mut work,
+        true,
+        &mut |_, _| Ok(()),
+        None,
+        SourceNodeRole::Rebox,
+    )?
+    .legacy
+    .expect("legacy copy traversal amount");
+    Ok(bytes
         .checked_mul(4)
-        .ok_or(KernelFailure::ResourceExhausted)
+        .ok_or(KernelFailure::ResourceExhausted)?)
 }
 
 /// Explicit resource observation borrows the existing parent work. Legacy
@@ -447,7 +531,7 @@ pub(crate) fn observe_source_metadata<'source>(
         array,
         work,
         copy_nulls,
-        &mut Some(observer),
+        &mut |node, work| observer.node(node, work),
         None,
         SourceNodeRole::Rebox,
     )?
@@ -470,7 +554,7 @@ pub(crate) fn source_request_facts(
         array,
         work,
         false,
-        &mut None,
+        &mut |_, _| Ok(()),
         Some(pricing),
         SourceNodeRole::Rebox,
     )?;

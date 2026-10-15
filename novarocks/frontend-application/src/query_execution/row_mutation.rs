@@ -1000,21 +1000,27 @@ mod tests {
             bytes::Bytes::from_static(b"t"),
         )
         .unwrap();
-        let identity = ConnectorMutationSourceField::new(
+        let identity = ConnectorMutationSourceField::try_new_typed(
             ConnectorWriteFieldToken::from_bytes([1; 32]),
             Field::new("identity", DataType::Int32, false),
             0,
-        );
-        let before = ConnectorMutationTargetField::new(
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+        )
+        .expect("explicit mutation fixture declaration");
+        let before = ConnectorMutationTargetField::try_new_typed(
             ConnectorWriteFieldToken::from_bytes([2; 32]),
             Field::new("before", DataType::Int32, true),
             1,
-        );
-        let after = ConnectorMutationTargetField::new(
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+        )
+        .expect("explicit mutation fixture declaration");
+        let after = ConnectorMutationTargetField::try_new_typed(
             ConnectorWriteFieldToken::from_bytes([3; 32]),
             Field::new("after", DataType::Int32, true),
             2,
-        );
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+        )
+        .expect("explicit mutation fixture declaration");
         let effect = ConnectorMutationEffectField::try_new(
             ConnectorWriteFieldToken::from_bytes([4; 32]),
             Field::new("effect", DataType::Int8, false),

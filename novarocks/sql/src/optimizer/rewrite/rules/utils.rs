@@ -520,7 +520,7 @@ mod typed_legacy {
             result = TypedExpr {
                 value_type: novarocks_type_contract::FunctionValueType::new(
                     DataType::Boolean,
-                    left.value_type.nullable || result.value_type.nullable,
+                    left.value_type.nullable() || result.value_type.nullable(),
                 ),
 
                 kind: ExprKind::BinaryOp {

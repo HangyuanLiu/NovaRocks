@@ -25,7 +25,10 @@ use arrow::datatypes::Field;
 use novarocks_functions::builtin::value_conversion::{
     VALUE_CONVERSION_NAME, value_conversion_definition,
 };
-use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+use novarocks_type_contract::{
+    NR_LOGICAL_TYPE_KEY, ValueField, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+    ValueTypeStorageLifetime,
+};
 
 fn conversion_catalogue() -> PureEngineFunctionCatalog {
     let actual = catalogue(Shape::Decimal);
@@ -75,10 +78,11 @@ fn conversion_catalogue() -> PureEngineFunctionCatalog {
     builder
         .register(value_conversion_definition().unwrap())
         .unwrap();
-    // This independent installed manifest covers all six real implementations
+    // This independent installed manifest covers all seven real implementations
     // of the original hidden definition, without claiming a Server catalogue.
     for stem in [
         "json_text_same_structure",
+        "opaque_to_binary_same_structure",
         "signed_to_largeint",
         "largeint_to_signed_null_overflow",
         "largeint_to_float_round",
@@ -135,7 +139,7 @@ fn conversion_program(
     let mut items = Vec::new();
     let mut values = Vec::new();
     for (ordinal, ty) in columns.iter().enumerate() {
-        assert!(ty.nullable);
+        assert!(ty.nullable());
         let expr = builder
             .add_expression(input, ty.clone(), ExprKind::Literal(LiteralValue::Null))
             .unwrap();
@@ -322,8 +326,14 @@ fn signed_array(carrier: &DataType, values: &[Option<i64>]) -> ArrayRef {
     }
 }
 fn result_type(program: &LocalProgram) -> FunctionValueType {
-    FunctionValueType::try_from_field(program.graph().nodes()[2].output_layout().schema().field(0))
-        .unwrap()
+    FunctionValueType::try_from_typed_binding(
+        program.graph().nodes()[2]
+            .output_layout()
+            .value_binding_at(0)
+            .expect("complete frozen output occurrence")
+            .clone(),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -583,8 +593,35 @@ fn actual_compiled_value_conversion_json_root_and_nested_struct_preserve_bytes_n
     let sibling = tagged_field("opaque", DataType::LargeBinary, Some("variant"), "29");
     let source_fields = vec![json, sibling.clone()];
     let target_fields = vec![text, sibling];
-    let source = FunctionValueType::new(DataType::Struct(source_fields.clone().into()), true);
-    let target = FunctionValueType::new(DataType::Struct(target_fields.clone().into()), true);
+    let explicit_struct = |fields: &[Arc<Field>], payload: ValueKind| {
+        let storage = ValueTypeStorageLifetime::pure();
+        let payload = ValueTypeRef::try_new(payload, true, storage.clone()).unwrap();
+        let sibling = ValueTypeRef::try_new(
+            ValueKind::Nominal(ValueLogicalType::Variant),
+            true,
+            storage.clone(),
+        )
+        .unwrap();
+        let value = ValueTypeRef::try_new(
+            ValueKind::Struct(
+                vec![
+                    ValueField::new("payload", payload, storage.clone()),
+                    ValueField::new("opaque", sibling, storage.clone()),
+                ]
+                .into_boxed_slice(),
+            ),
+            true,
+            storage.clone(),
+        )
+        .unwrap();
+        FunctionValueType::try_from_value(
+            value,
+            ValueLayout::try_new(&DataType::Struct(fields.to_vec().into()), storage).unwrap(),
+        )
+        .unwrap()
+    };
+    let source = explicit_struct(&source_fields, ValueKind::Nominal(ValueLogicalType::Json));
+    let target = explicit_struct(&target_fields, ValueKind::String);
     let program = direct_program(source, target.clone());
     let original: ArrayRef = Arc::new(StructArray::new(
         source_fields.into(),
@@ -608,7 +645,8 @@ fn actual_compiled_value_conversion_json_root_and_nested_struct_preserve_bytes_n
         ],
         Some(NullBuffer::from(vec![true, true, false, true, true, true])),
     ));
-    let input = input_batch(&program, vec![original.slice(1, 4)]);
+    let normalized = crate::exec::chunk::normalize_execution_array(&original).unwrap();
+    let input = input_batch(&program, vec![normalized.slice(1, 4)]);
     let rows = [0, 1, 3];
     let output = instance(&program)
         .evaluate(&input, Selection::try_sparse(4, &rows).unwrap(), &Control)
@@ -620,7 +658,10 @@ fn actual_compiled_value_conversion_json_root_and_nested_struct_preserve_bytes_n
         .as_any()
         .downcast_ref::<StructArray>()
         .unwrap();
-    assert_eq!(array.fields().as_ref(), target_fields.as_slice());
+    let DataType::Struct(expected_fields) = target.data_type() else {
+        panic!("explicit Struct target");
+    };
+    assert_eq!(array.fields(), expected_fields);
     assert!(!array.is_null(0));
     assert!(array.is_null(1));
     assert!(!array.is_null(2));
@@ -640,11 +681,15 @@ fn actual_compiled_value_conversion_json_root_and_nested_struct_preserve_bytes_n
     assert!(opaque.is_null(2));
     assert_eq!(
         ValueLogicalType::Variant,
-        FunctionValueType::try_from_field(array.fields()[1].as_ref())
-            .unwrap()
-            .logical_type
+        result_type(&program).child_at(1).unwrap().logical_type()
     );
-    assert_eq!(array.fields()[1].metadata()["PARQUET:field_id"], "29");
+    assert!(
+        array
+            .fields()
+            .iter()
+            .all(|field| field.metadata().capacity() == 0)
+    );
+    assert_eq!(target_fields[1].metadata()["PARQUET:field_id"], "29");
 }
 
 #[test]
@@ -665,7 +710,10 @@ fn actual_compiled_value_conversion_null_lift_preserves_nonencoded_target_type_s
                 .evaluate(&input, Selection::try_sparse(6, &rows).unwrap(), &Control)
                 .unwrap();
             assert_eq!(output.selection().iter().collect::<Vec<_>>(), rows);
-            assert_eq!(output.values().data_type(), &target.data_type);
+            assert_eq!(
+                output.values().data_type().clone(),
+                target.data_type().clone()
+            );
             assert_eq!(output.values().null_count(), 2);
             assert!(output.errors().is_empty());
         }
@@ -673,7 +721,10 @@ fn actual_compiled_value_conversion_null_lift_preserves_nonencoded_target_type_s
             .evaluate(&input, Selection::try_sparse(6, &[]).unwrap(), &Control)
             .unwrap();
         assert!(output.values().is_empty());
-        assert_eq!(output.values().data_type(), &target.data_type);
+        assert_eq!(
+            output.values().data_type().clone(),
+            target.data_type().clone()
+        );
     }
 }
 

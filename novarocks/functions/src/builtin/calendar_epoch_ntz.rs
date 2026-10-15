@@ -55,10 +55,10 @@ pub(super) fn evaluate_epoch_ntz<'a>(
     let mut work = EvaluationCheckpoints::new(control);
     let result = (|| {
         let target = input.target;
-        if target.logical_type != ValueLogicalType::Physical
-            || !target.nullable
+        if target.logical_type() != ValueLogicalType::Physical
+            || !target.nullable()
             || (!input.legacy
-                && target.data_type != DataType::Timestamp(TimeUnit::Microsecond, None))
+                && target.data_type() != &DataType::Timestamp(TimeUnit::Microsecond, None))
             || input.types.len() != input.arguments().len()
             || !(1..=2).contains(&input.types.len())
         {
@@ -78,8 +78,8 @@ pub(super) fn evaluate_epoch_ntz<'a>(
             let FunctionArgumentType::Value(ty) = ty else {
                 return Err(invalid("to_datetime_ntz requires exact value arguments"));
             };
-            if ty.logical_type != ValueLogicalType::Physical
-                || ty.data_type != DataType::Int64
+            if ty.logical_type() != ValueLogicalType::Physical
+                || ty.data_type() != &DataType::Int64
                 || argument.array().data_type() != &DataType::Int64
             {
                 return Err(invalid(
@@ -115,7 +115,7 @@ pub(super) fn evaluate_epoch_ntz<'a>(
                     return Err(internal("to_datetime_ntz selected row is out of bounds"));
                 }
                 let is_null = values[index].is_null(rows[index]);
-                if is_null && !types[index].nullable {
+                if is_null && !types[index].nullable() {
                     return Err(internal(
                         "to_datetime_ntz non-null selected input contains SQL NULL",
                     ));
@@ -136,7 +136,7 @@ pub(super) fn evaluate_epoch_ntz<'a>(
                 let result = split_epoch_value(value, scale)
                     .and_then(|(seconds, micros)| epoch_utc_datetime(seconds, micros))
                     .and_then(|date| {
-                        timestamp_value_for_type(date.naive_utc(), &target.data_type).ok()
+                        timestamp_value_for_type(date.naive_utc(), target.data_type()).ok()
                     });
                 work.flush()?;
                 result

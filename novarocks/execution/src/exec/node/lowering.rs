@@ -29,7 +29,6 @@ use novarocks_local_program as lp;
 use super::{ExecNode, ExecNodeKind, ExecPlan};
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
-use crate::exec::expr::static_program::freeze_field_schema;
 use crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
 use crate::runtime_filter as rf;
 
@@ -51,6 +50,76 @@ impl fmt::Display for LocalProgramLoweringError {
 impl std::error::Error for LocalProgramLoweringError {}
 
 type Result<T> = std::result::Result<T, LocalProgramLoweringError>;
+
+/// The actual creator's refusal is never folded into a semantic diagnostic.
+#[derive(Debug)]
+pub enum LocalProgramCreationFailure<H> {
+    Lowering(LocalProgramLoweringError),
+    Control(novarocks_type_contract::CompileControlError),
+    Creator(H),
+    Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+}
+impl<H> From<LocalProgramLoweringError> for LocalProgramCreationFailure<H> {
+    fn from(error: LocalProgramLoweringError) -> Self {
+        Self::Lowering(error)
+    }
+}
+impl<H> From<novarocks_type_contract::CompileControlError> for LocalProgramCreationFailure<H> {
+    fn from(error: novarocks_type_contract::CompileControlError) -> Self {
+        Self::Control(error)
+    }
+}
+impl<H> From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for LocalProgramCreationFailure<H>
+{
+    fn from(error: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::Resource(error)
+    }
+}
+impl<H> From<lp::LayoutCreationFailure<H>> for LocalProgramCreationFailure<H> {
+    fn from(error: lp::LayoutCreationFailure<H>) -> Self {
+        match error {
+            lp::LayoutCreationFailure::Creator(error) => Self::Creator(error),
+            lp::LayoutCreationFailure::Resource(error) => Self::Resource(error),
+            lp::LayoutCreationFailure::Layout(lp::LayoutCompileError::Control(error)) => {
+                Self::Control(error)
+            }
+            lp::LayoutCreationFailure::Layout(error) => {
+                Self::Lowering(LocalProgramLoweringError::new(error.to_string()))
+            }
+        }
+    }
+}
+impl<H> From<String> for LocalProgramCreationFailure<H> {
+    fn from(cause: String) -> Self {
+        Self::Lowering(LocalProgramLoweringError::new(cause))
+    }
+}
+type CreationResult<T, H> = std::result::Result<T, LocalProgramCreationFailure<H>>;
+
+/// This carries only the caller's real construction request and storage hold.
+/// It owns no query runtime and turns no numeric profile into capacity.
+pub struct LocalLayoutCreation<'a, H> {
+    pub storage: novarocks_type_contract::ValueTypeStorageLifetime,
+    pub request: &'a mut dyn FnMut(std::alloc::Layout) -> std::result::Result<(), H>,
+    pub temporary_request: &'a mut dyn FnMut(std::alloc::Layout) -> std::result::Result<(), H>,
+    pub control: &'a dyn novarocks_type_contract::PureCompileControl,
+}
+impl<'a, H> LocalLayoutCreation<'a, H> {
+    pub fn new(
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+        request: &'a mut dyn FnMut(std::alloc::Layout) -> std::result::Result<(), H>,
+        temporary_request: &'a mut dyn FnMut(std::alloc::Layout) -> std::result::Result<(), H>,
+        control: &'a dyn novarocks_type_contract::PureCompileControl,
+    ) -> Self {
+        Self {
+            storage,
+            request,
+            temporary_request,
+            control,
+        }
+    }
+}
 
 /// Only sink edges outside the root tree may be supplied by the fragment
 /// envelope. All node-owned requirements are derived from the frozen nodes.
@@ -93,16 +162,26 @@ impl LocalRuntimeBindings {
 impl ExecPlan {
     /// Derive a specialization profile from the decoded root's exact slot
     /// metadata and the effective pipeline width for this task.
-    pub fn local_compile_profile(
+    pub fn local_compile_profile_with_creator<H>(
         &self,
         pipeline_dop: NonZeroUsize,
         root_sink_dop: Option<NonZeroUsize>,
-    ) -> Result<lp::CompileProfile> {
-        let schema = crate::exec::pipeline::builder::output_chunk_schema_for_node(&self.root)
-            .ok_or_else(|| LocalProgramLoweringError::new("root has no output chunk schema"))?;
-        let identity = layout(&schema)?
-            .identity()
-            .map_err(|error| LocalProgramLoweringError::new(error.to_string()))?;
+        creation: &mut LocalLayoutCreation<'_, H>,
+    ) -> CreationResult<lp::CompileProfile, H> {
+        let schema = crate::exec::pipeline::builder::output_chunk_schema_for_node_with_creator(
+            &self.root, creation,
+        )?
+        .ok_or_else(|| LocalProgramLoweringError::new("root has no output chunk schema"))?;
+        let identity = layout_with_creator(&schema, creation)?
+            .identity_for_compile(creation.control)
+            .map_err(|error| match error {
+                lp::LayoutCompileError::Control(error) => {
+                    LocalProgramCreationFailure::Control(error)
+                }
+                error => LocalProgramCreationFailure::Lowering(LocalProgramLoweringError::new(
+                    error.to_string(),
+                )),
+            })?;
         Ok(lp::CompileProfile::new(
             pipeline_dop,
             root_sink_dop,
@@ -111,37 +190,31 @@ impl ExecPlan {
         ))
     }
 
-    #[cfg(test)]
-    pub fn into_local_program(
-        self,
-        profile: lp::CompileProfile,
-        scan_sources: BTreeMap<i32, lp::StaticConnectorScan>,
-        sink_requirements: Vec<ExternalSinkRequirement>,
-    ) -> Result<lp::LocalProgramGraph> {
-        self.lower_with_optional_sink(profile, scan_sources, sink_requirements, None)
-            .map(|(program, _runtime)| program)
-    }
-
-    /// Freeze a temporary decoder tree and return its runtime capabilities as
-    /// a separate Task binding. Production callers must retain the second
-    /// result until the instance has either started or failed closed.
-    pub fn into_local_program_and_bindings(
+    pub fn into_local_program_and_bindings_with_creator<H>(
         self,
         profile: lp::CompileProfile,
         scan_sources: BTreeMap<i32, lp::StaticConnectorScan>,
         sink_requirements: Vec<ExternalSinkRequirement>,
         sink: lp::StaticSinkProgram,
-    ) -> Result<(lp::LocalProgramGraph, LocalRuntimeBindings)> {
-        self.lower_with_optional_sink(profile, scan_sources, sink_requirements, Some(sink))
+        creation: LocalLayoutCreation<'_, H>,
+    ) -> CreationResult<(lp::LocalProgramGraph, LocalRuntimeBindings), H> {
+        self.lower_with_optional_sink_and_creator(
+            profile,
+            scan_sources,
+            sink_requirements,
+            Some(sink),
+            creation,
+        )
     }
 
-    fn lower_with_optional_sink(
+    fn lower_with_optional_sink_and_creator<H>(
         self,
         profile: lp::CompileProfile,
         mut scan_sources: BTreeMap<i32, lp::StaticConnectorScan>,
         sink_requirements: Vec<ExternalSinkRequirement>,
         sink: Option<lp::StaticSinkProgram>,
-    ) -> Result<(lp::LocalProgramGraph, LocalRuntimeBindings)> {
+        creation: LocalLayoutCreation<'_, H>,
+    ) -> CreationResult<(lp::LocalProgramGraph, LocalRuntimeBindings), H> {
         preflight(&self.root)?;
         let ExecPlan { arena, root } = self;
         let expressions = Arc::new(arena.into_immutable().map_err(|error| {
@@ -153,13 +226,15 @@ impl ExecPlan {
             filter_bindings: BTreeSet::new(),
             scan_sources: &mut scan_sources,
             runtime: LocalRuntimeBindings::new(),
+            creation,
         };
         let root = lowering.node(root)?;
         if !lowering.scan_sources.is_empty() {
             return Err(LocalProgramLoweringError::new(format!(
                 "unused static scan recipes for node IDs {:?}",
                 lowering.scan_sources.keys().collect::<Vec<_>>()
-            )));
+            ))
+            .into());
         }
         let layout = lowering.nodes[root.index()].output_layout().clone();
         for sink_requirement in sink_requirements {
@@ -174,15 +249,18 @@ impl ExecPlan {
                                 "exchange output branch has no static sink branch",
                             )
                         })?;
+                        let creation = &mut lowering.creation;
                         layout
-                            .project_by_slots(branch_program.output_columns())
-                            .map_err(|error| {
-                                LocalProgramLoweringError::new(format!(
-                                    "{error}: branch {branch} output slots {:?}, root output slots {:?}",
-                                    branch_program.output_columns(),
-                                    layout.slots()
-                                ))
-                            })?
+                            .project_by_slots_typed_with_creator(
+                                branch_program.output_columns(),
+                                creation.storage.clone(),
+                                |request| {
+                                    (creation.request)(request)
+                                        .map_err(lp::LayoutCreationFailure::Creator)
+                                },
+                                creation.control,
+                            )
+                            .map_err(LocalProgramCreationFailure::from)?
                     } else {
                         layout.clone()
                     };
@@ -262,26 +340,43 @@ fn preflight(root: &ExecNode) -> Result<()> {
     Ok(())
 }
 
-struct Lowering<'a> {
+fn values_creation_failure<H>(
+    error: lp::ValuesCreationFailure<H>,
+) -> LocalProgramCreationFailure<H> {
+    match error {
+        lp::ValuesCreationFailure::Creator(cause) => LocalProgramCreationFailure::Creator(cause),
+        lp::ValuesCreationFailure::Control(cause) => LocalProgramCreationFailure::Control(cause),
+        lp::ValuesCreationFailure::Resource(cause) => LocalProgramCreationFailure::Resource(cause),
+        lp::ValuesCreationFailure::Values(cause) => {
+            LocalProgramLoweringError::new(cause.to_string()).into()
+        }
+    }
+}
+
+struct Lowering<'a, 'creator, H> {
     nodes: Vec<lp::ProgramNode>,
     requirements: Vec<lp::BindingRequirement>,
     filter_bindings: BTreeSet<i32>,
     scan_sources: &'a mut BTreeMap<i32, lp::StaticConnectorScan>,
     runtime: LocalRuntimeBindings,
+    creation: LocalLayoutCreation<'creator, H>,
 }
 
-impl Lowering<'_> {
-    fn node(&mut self, node: ExecNode) -> Result<lp::ProgramNodeId> {
-        let schema = crate::exec::pipeline::builder::output_chunk_schema_for_node(&node)
-            .ok_or_else(|| LocalProgramLoweringError::new("node has no output chunk schema"))?;
-        let output = layout(&schema)?;
+impl<H> Lowering<'_, '_, H> {
+    fn node(&mut self, node: ExecNode) -> CreationResult<lp::ProgramNodeId, H> {
+        let schema = crate::exec::pipeline::builder::output_chunk_schema_for_node_with_creator(
+            &node,
+            &mut self.creation,
+        )?
+        .ok_or_else(|| LocalProgramLoweringError::new("node has no output chunk schema"))?;
+        let output = layout_with_creator(&schema, &mut self.creation)?;
         let (node_id, kind) = self.kind(node.kind, &output)?;
         let id = lp::ProgramNodeId::new(self.nodes.len());
         self.nodes.push(lp::ProgramNode::new(node_id, kind, output));
         Ok(id)
     }
 
-    fn filter_requirement(&mut self, id: u32) -> Result<()> {
+    fn filter_requirement(&mut self, id: u32) -> CreationResult<(), H> {
         let id = i32::try_from(id).map_err(|_| {
             LocalProgramLoweringError::new("runtime filter binding ID overflows i32")
         })?;
@@ -295,7 +390,7 @@ impl Lowering<'_> {
     fn consumers(
         &mut self,
         bindings: Vec<RuntimeFilterConsumerBinding>,
-    ) -> Result<Vec<lp::FilterConsumerAtExpr>> {
+    ) -> CreationResult<Vec<lp::FilterConsumerAtExpr>, H> {
         bindings
             .into_iter()
             .map(|binding| {
@@ -312,7 +407,7 @@ impl Lowering<'_> {
     fn producers(
         &mut self,
         bindings: impl IntoIterator<Item = (ExprId, usize, rf::RuntimeFilterProducerContract)>,
-    ) -> Result<Vec<lp::FilterProducerAtExpr>> {
+    ) -> CreationResult<Vec<lp::FilterProducerAtExpr>, H> {
         bindings
             .into_iter()
             .map(|(expr_id, key_ordinal, contract)| {
@@ -330,7 +425,7 @@ impl Lowering<'_> {
         &mut self,
         node: ExecNodeKind,
         output: &lp::StaticLayout,
-    ) -> Result<(i32, lp::ProgramNodeKind)> {
+    ) -> CreationResult<(i32, lp::ProgramNodeKind), H> {
         use lp::ProgramNodeKind as P;
         let mapped = match node {
             ExecNodeKind::AssertNumRows(n) => {
@@ -365,28 +460,123 @@ impl Lowering<'_> {
                 (n.node_id, P::AssertNumRows { input, mode })
             }
             ExecNodeKind::Values(n) => {
-                let batch = n
+                let creation = &mut self.creation;
+                creation
+                    .control
+                    .checkpoint(novarocks_type_contract::CompilePhase::LowerProgram, 0)?;
+                let layout=std::alloc::Layout::array::<arrow::array::ArrayRef>(n.chunk.record_batch().num_columns())
+                    .map_err(|_|LocalProgramCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?;
+                (creation.request)(layout).map_err(LocalProgramCreationFailure::Creator)?;
+                let source = n
                     .chunk
-                    .try_into_static_batch()
-                    .map_err(LocalProgramLoweringError::new)?;
-                let values = lp::StaticValues::try_new(batch, output.clone())
-                    .map_err(|error| LocalProgramLoweringError::new(error.to_string()))?;
+                    .source_storage_lifetime_observed::<lp::ValuesCreationFailure<H>>(
+                        creation.storage.clone(),
+                        |layout| {
+                            (creation.request)(layout).map_err(lp::ValuesCreationFailure::Creator)
+                        },
+                    )
+                    .map_err(values_creation_failure)?;
+                // Clone only the concrete column table; each actual ArrayRef
+                // shares its original buffer/type backing under source custody.
+                let batch = n.chunk.record_batch().clone();
+                let mut request = |layout| {
+                    (creation.request)(layout).map_err(LocalProgramCreationFailure::Creator)
+                };
+                let mut opaque = |_: usize| {
+                    Err(LocalProgramCreationFailure::<H>::Lowering(
+                        LocalProgramLoweringError::new(
+                            "Values batch transfer performs no opaque allocation",
+                        ),
+                    ))
+                };
+                let mut values_creation = novarocks_type_contract::ValueSchemaCreation::new(
+                    creation.storage.clone(),
+                    &mut request,
+                    &mut opaque,
+                );
+                let values = lp::StaticValues::try_new_with_creator(
+                    batch,
+                    output.clone(),
+                    source,
+                    &mut values_creation,
+                    creation.control,
+                )
+                .map_err(|error| match error {
+                    lp::ValuesCreationFailure::Creator(cause) => cause,
+                    lp::ValuesCreationFailure::Control(cause) => {
+                        LocalProgramCreationFailure::Control(cause)
+                    }
+                    lp::ValuesCreationFailure::Resource(cause) => {
+                        LocalProgramCreationFailure::Resource(cause)
+                    }
+                    lp::ValuesCreationFailure::Values(cause) => {
+                        LocalProgramLoweringError::new(cause.to_string()).into()
+                    }
+                })?;
                 (n.node_id, P::Values { values })
             }
             ExecNodeKind::Project(n) => {
                 let input = self.node(*n.input)?;
-                let expr_slot_schemas = n.expr_slot_schemas.map(|slots| {
-                    slots
-                        .into_iter()
-                        .map(|slot| lp::ProjectExpressionSlot {
+                let expr_slot_schemas = if let Some(slots) = n.expr_slot_schemas {
+                    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+                    self.creation
+                        .control
+                        .checkpoint(novarocks_type_contract::CompilePhase::LowerProgram, 0)?;
+                    if !slots.is_empty() {
+                        (self.creation.request)(
+                            std::alloc::Layout::array::<lp::ProjectExpressionSlot>(slots.len())
+                                .map_err(|_| LayoutResourceError::Arithmetic)?,
+                        )
+                        .map_err(LocalProgramCreationFailure::Creator)?;
+                    }
+                    let mut saved = Vec::new();
+                    saved.try_reserve_exact(slots.len()).map_err(|_| {
+                        novarocks_type_contract::CompileControlError::ResourceExhausted
+                    })?;
+                    for slot in slots {
+                        self.creation
+                            .control
+                            .checkpoint(novarocks_type_contract::CompilePhase::LowerProgram, 1)?;
+                        if !slot.is_typed() {
+                            return Err(LocalProgramLoweringError::new(
+                                "project expression purpose lacks its complete typed binding",
+                            )
+                            .into());
+                        }
+                        saved.push(lp::ProjectExpressionSlot {
                             slot_id: slot.slot_id(),
                             field: Arc::clone(slot.field_ref()),
-                            metadata_origins: slot.metadata_origins().cloned(),
-                            field_schema: freeze_field_schema(slot.field_schema().clone()),
+                            binding: slot.typed_binding().clone(),
+                            storage: slot.storage_lifetime(),
                             unique_id: slot.unique_id(),
-                        })
-                        .collect()
-                });
+                        });
+                    }
+                    if saved.capacity() != saved.len() && !saved.is_empty() {
+                        (self.creation.request)(
+                            std::alloc::Layout::array::<lp::ProjectExpressionSlot>(saved.len())
+                                .map_err(|_| LayoutResourceError::Arithmetic)?,
+                        )
+                        .map_err(LocalProgramCreationFailure::Creator)?;
+                    }
+                    self.creation
+                        .control
+                        .checkpoint(novarocks_type_contract::CompilePhase::LowerProgram, 0)?;
+                    let boxed = saved.into_boxed_slice();
+                    Some(lp::ProjectExpressionSlots::try_from_boxed_observed(
+                        boxed,
+                        self.creation.storage.clone(),
+                        |layout| {
+                            self.creation.control.checkpoint(
+                                novarocks_type_contract::CompilePhase::LowerProgram,
+                                0,
+                            )?;
+                            (self.creation.request)(layout)
+                                .map_err(LocalProgramCreationFailure::Creator)
+                        },
+                    )?)
+                } else {
+                    None
+                };
                 (
                     n.node_id,
                     P::Project {
@@ -490,7 +680,7 @@ impl Lowering<'_> {
                         .inputs
                         .into_iter()
                         .map(|input| self.node(input))
-                        .collect::<Result<_>>()?,
+                        .collect::<CreationResult<_, H>>()?,
                 },
             ),
             ExecNodeKind::Limit(n) => {
@@ -513,7 +703,7 @@ impl Lowering<'_> {
         &mut self,
         node: ExecNodeKind,
         output: &lp::StaticLayout,
-    ) -> Result<(i32, lp::ProgramNodeKind)> {
+    ) -> CreationResult<(i32, lp::ProgramNodeKind), H> {
         use lp::ProgramNodeKind as P;
         let mapped = match node {
             ExecNodeKind::Scan(n) => {
@@ -571,13 +761,15 @@ impl Lowering<'_> {
                 if n.functions.len() != n.resolved_aggregates.len() {
                     return Err(LocalProgramLoweringError::new(
                         "aggregate calls and resolved signatures differ",
-                    ));
+                    )
+                    .into());
                 }
                 let functions = n
                     .functions
                     .into_iter()
                     .zip(n.resolved_aggregates)
                     .map(|(function, resolved)| lp::StaticAggregateCall {
+                        frozen: function.frozen,
                         state_interpretation: None,
                         name: Arc::from(function.name),
                         inputs: function.inputs.into_iter().map(expr).collect(),
@@ -611,7 +803,7 @@ impl Lowering<'_> {
                             producer: freeze_producer(&producer.contract)?,
                         })
                     })
-                    .collect::<Result<_>>()?;
+                    .collect::<CreationResult<_, H>>()?;
                 (n.node_id, P::Aggregate { input, group_by: n.group_by.into_iter().map(expr).collect(), functions,
                     need_finalize: n.need_finalize, input_is_intermediate: n.input_is_intermediate, topn_filters,
                     streaming_preaggregation_mode: n.streaming_preaggregation_mode.map(|mode| match mode {
@@ -660,9 +852,15 @@ impl Lowering<'_> {
                                 lp::JoinDistributionMode::Partitioned
                             }
                         },
-                        left_layout: layout(&n.left_chunk_schema)?,
-                        right_layout: layout(&n.right_chunk_schema)?,
-                        join_scope_layout: layout(&n.join_scope_chunk_schema)?,
+                        left_layout: layout_with_creator(&n.left_chunk_schema, &mut self.creation)?,
+                        right_layout: layout_with_creator(
+                            &n.right_chunk_schema,
+                            &mut self.creation,
+                        )?,
+                        join_scope_layout: layout_with_creator(
+                            &n.join_scope_chunk_schema,
+                            &mut self.creation,
+                        )?,
                         probe_keys: n.probe_keys.into_iter().map(expr).collect(),
                         build_keys: n.build_keys.into_iter().map(expr).collect(),
                         eq_null_safe: n.eq_null_safe,
@@ -707,9 +905,15 @@ impl Lowering<'_> {
                             }
                         },
                         join_conjunct: n.join_conjunct.map(expr),
-                        left_layout: layout(&n.left_chunk_schema)?,
-                        right_layout: layout(&n.right_chunk_schema)?,
-                        join_scope_layout: layout(&n.join_scope_chunk_schema)?,
+                        left_layout: layout_with_creator(&n.left_chunk_schema, &mut self.creation)?,
+                        right_layout: layout_with_creator(
+                            &n.right_chunk_schema,
+                            &mut self.creation,
+                        )?,
+                        join_scope_layout: layout_with_creator(
+                            &n.join_scope_chunk_schema,
+                            &mut self.creation,
+                        )?,
                     },
                 )
             }
@@ -809,7 +1013,7 @@ impl Lowering<'_> {
                     .inputs
                     .into_iter()
                     .map(|node| self.node(node))
-                    .collect::<Result<_>>()?;
+                    .collect::<CreationResult<_, H>>()?;
                 (
                     n.node_id,
                     P::SetOp {
@@ -842,17 +1046,19 @@ impl Lowering<'_> {
                     node: id,
                     layout: output.clone(),
                 });
-                let exact_projection_layout = layout(projection.chunk_schema())?;
-                if exact_projection_layout.schema().as_ref() != expected_schema.as_ref() {
+                let exact_projection_layout =
+                    layout_with_creator(projection.chunk_schema(), &mut self.creation)?;
+                let expected_layout =
+                    layout_with_creator(projection.provider_chunk_schema(), &mut self.creation)?;
+                if expected_layout.schema().as_ref() != expected_schema.as_ref() {
                     return Err(LocalProgramLoweringError::new(
                         "writer projection layout differs from expected writer schema",
-                    ));
+                    )
+                    .into());
                 }
-                let mut projection = projection
-                    .into_static()
+                let projection = projection
+                    .into_static(exact_projection_layout)
                     .map_err(LocalProgramLoweringError::new)?;
-                projection.layout = exact_projection_layout.clone();
-                let expected_layout = exact_projection_layout;
                 (
                     node_id,
                     P::TableWriter {
@@ -860,11 +1066,16 @@ impl Lowering<'_> {
                         target,
                         expected_layout,
                         projection,
-                        writer_multiplex_layout: layout(writer_schema.chunk_schema())?,
+                        writer_multiplex_layout: layout_with_creator(
+                            writer_schema.chunk_schema(),
+                            &mut self.creation,
+                        )?,
+                        partial_preparation: aggregate.prepared,
                         partial_aggregates: aggregate
                             .calls
                             .into_iter()
                             .map(|call| lp::WriterPartialAggregateCall {
+                                frozen: call.frozen,
                                 input_slot_id: call.input_slot_id,
                                 function_name: call.function_name,
                                 resolved: call.resolved,
@@ -883,7 +1094,7 @@ impl Lowering<'_> {
                 let inputs = children
                     .into_iter()
                     .map(|node| self.node(node))
-                    .collect::<Result<_>>()?;
+                    .collect::<CreationResult<_, H>>()?;
                 let id = lp::ProgramNodeId::new(self.nodes.len());
                 self.runtime.finishers.insert(id, runtime_binding);
                 self.requirements.push(lp::BindingRequirement::TableFinish {
@@ -895,13 +1106,21 @@ impl Lowering<'_> {
                     P::TableFinish {
                         inputs,
                         expected_targets,
-                        writer_multiplex_layout: layout(writer_schema.chunk_schema())?,
-                        root_result_layout: layout(root_schema.chunk_schema())?,
+                        writer_multiplex_layout: layout_with_creator(
+                            writer_schema.chunk_schema(),
+                            &mut self.creation,
+                        )?,
+                        root_result_layout: layout_with_creator(
+                            root_schema.chunk_schema(),
+                            &mut self.creation,
+                        )?,
                         final_aggregates: lp::WriterFinalAggregatePlan {
+                            prepared: final_aggregate.prepared,
                             calls: final_aggregate
                                 .calls
                                 .into_iter()
                                 .map(|call| lp::WriterFinalAggregateCall {
+                                    frozen: call.frozen,
                                     function_name: call.function_name,
                                     resolved: call.resolved,
                                     intermediate_input_slot_id: call.intermediate_input_slot_id,
@@ -952,29 +1171,56 @@ impl Lowering<'_> {
     }
 }
 
-fn layout(schema: &ChunkSchemaRef) -> Result<lp::StaticLayout> {
-    let layout = lp::StaticLayout::try_new_exact(
-        schema.arrow_schema_ref(),
-        Arc::from(schema.slot_ids()),
-        schema
-            .slots()
-            .iter()
-            .map(|slot| {
-                (
-                    freeze_field_schema(slot.field_schema().clone()),
-                    slot.unique_id(),
-                )
-            })
-            .collect(),
-    )
-    .map_err(|error| LocalProgramLoweringError::new(error.to_string()))?;
-    if let Some(origins) = schema.field_metadata_origins() {
-        layout
-            .with_metadata_origins(origins.clone(), schema.schema_metadata_origin().cloned())
-            .map_err(|error| LocalProgramLoweringError::new(error.to_string()))
-    } else {
-        Ok(layout)
+fn layout_with_creator<H>(
+    schema: &ChunkSchemaRef,
+    creation: &mut LocalLayoutCreation<'_, H>,
+) -> CreationResult<lp::StaticLayout, H> {
+    use novarocks_type_contract::{
+        CompileCheckpoints, CompilePhase, TypedValueBinding, owned_resources::layout::arc_layout,
+    };
+    let mut work = CompileCheckpoints::try_new(creation.control, CompilePhase::LowerProgram)?;
+    let count = schema.slots().len();
+    let bindings_layout = std::alloc::Layout::array::<(TypedValueBinding, Option<i32>)>(count)
+        .map_err(|_| {
+            LocalProgramCreationFailure::Resource(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            )
+        })?;
+    work.flush()?;
+    (creation.request)(bindings_layout).map_err(LocalProgramCreationFailure::Creator)?;
+    let mut bindings = Vec::with_capacity(count);
+    for slot in schema.slots() {
+        work.step()?;
+        bindings.push((
+            slot.typed_binding().clone_observed(|| work.step())?,
+            slot.unique_id(),
+        ));
     }
+    let slots_layout = arc_layout(
+        std::alloc::Layout::array::<novarocks_types::SlotId>(count).map_err(|_| {
+            LocalProgramCreationFailure::Resource(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            )
+        })?,
+    )
+    .map_err(LocalProgramCreationFailure::Resource)?;
+    work.flush()?;
+    (creation.request)(slots_layout).map_err(LocalProgramCreationFailure::Creator)?;
+    let slots = Arc::from(schema.slot_ids());
+    work.step()?;
+    let arrow_schema = schema.arrow_schema_ref();
+    work.step()?;
+    let storage = creation.storage.clone();
+    work.finish()?;
+    lp::StaticLayout::try_new_typed_with_creator(
+        arrow_schema,
+        slots,
+        bindings,
+        storage,
+        |layout| (creation.request)(layout).map_err(lp::LayoutCreationFailure::Creator),
+        creation.control,
+    )
+    .map_err(Into::into)
 }
 
 fn expr(id: ExprId) -> lp::ProgramExprId {
@@ -1003,47 +1249,30 @@ fn freeze_unpivot_constant(value: super::unpivot::UnpivotConstant) -> lp::Unpivo
 
 fn freeze_filter_contract(
     contract: &rf::RuntimeFilterExecutionContract,
-) -> lp::StaticFilterContract {
+) -> Result<lp::StaticFilterContract> {
     match contract {
         rf::RuntimeFilterExecutionContract::Membership(schema) => {
-            lp::StaticFilterContract::Membership {
-                data_type: schema.data_type().clone(),
-                null_semantics: match schema.null_semantics() {
-                    rf::RuntimeFilterNullSemantics::NeverMatches => {
-                        lp::FilterNullSemantics::NeverMatches
-                    }
-                    rf::RuntimeFilterNullSemantics::NullSafeEqual => {
-                        lp::FilterNullSemantics::NullSafeEqual
-                    }
-                },
-                digest: schema.digest(),
-            }
+            let value_type = schema.value_type().ok_or_else(|| LocalProgramLoweringError::new(
+                "runtime-filter membership contract has no complete execution declaration"))?;
+            lp::StaticFilterContract::membership_from_canonical(
+                schema.canonical_schema().clone(), value_type.clone(),
+            ).map_err(|cause| LocalProgramLoweringError::new(cause.to_string()))
         }
-        rf::RuntimeFilterExecutionContract::Ordered(order) => lp::StaticFilterContract::Ordered {
-            keys: order
-                .keys()
-                .iter()
-                .map(|key| lp::FilterOrderKey {
-                    data_type: key.data_type().clone(),
-                    direction: match key.direction() {
-                        rf::contribution::RuntimeOrderSortDirection::Ascending => {
-                            lp::FilterSortDirection::Ascending
-                        }
-                        rf::contribution::RuntimeOrderSortDirection::Descending => {
-                            lp::FilterSortDirection::Descending
-                        }
-                    },
-                    null_order: match key.null_order() {
-                        rf::contribution::RuntimeOrderNullOrder::First => {
-                            lp::FilterNullOrder::First
-                        }
-                        rf::contribution::RuntimeOrderNullOrder::Last => lp::FilterNullOrder::Last,
-                    },
-                })
-                .collect(),
-            comparator_digest: order.comparator_digest(),
-            contract_digest: order.digest(),
-        },
+        rf::RuntimeFilterExecutionContract::Ordered(order) => Ok(lp::StaticFilterContract::Ordered {
+            keys: order.keys().iter().map(|key| Ok(lp::FilterOrderKey {
+                value_type: key.value_type().ok_or_else(|| LocalProgramLoweringError::new(
+                    "runtime-filter ordered key has no complete execution declaration"))?.clone(),
+                direction: match key.direction() {
+                    rf::contribution::RuntimeOrderSortDirection::Ascending => lp::FilterSortDirection::Ascending,
+                    rf::contribution::RuntimeOrderSortDirection::Descending => lp::FilterSortDirection::Descending,
+                },
+                null_order: match key.null_order() {
+                    rf::contribution::RuntimeOrderNullOrder::First => lp::FilterNullOrder::First,
+                    rf::contribution::RuntimeOrderNullOrder::Last => lp::FilterNullOrder::Last,
+                },
+            })).collect::<Result<Vec<_>>>()?.into(),
+            comparator_digest: order.comparator_digest(), contract_digest: order.digest(),
+        }),
     }
 }
 
@@ -1090,7 +1319,7 @@ fn freeze_consumer(binding: &RuntimeFilterConsumerBinding) -> Result<lp::StaticF
         contract.binding_id().get(),
         contract.channel_id().get(),
         activation,
-        freeze_filter_contract(contract.contract()),
+        freeze_filter_contract(contract.contract())?,
         freeze_reduction(contract.reduction())?,
     )
     .map_err(|error| LocalProgramLoweringError::new(error.to_string()))
@@ -1109,7 +1338,7 @@ fn freeze_producer(
         contract.binding_id().get(),
         contract.channel_id().get(),
         kind,
-        freeze_filter_contract(contract.contract()),
+        freeze_filter_contract(contract.contract())?,
         freeze_reduction(contract.reduction())?,
     )
     .map_err(|error| LocalProgramLoweringError::new(error.to_string()))
@@ -1186,6 +1415,10 @@ fn freeze_window_function(
         },
         args: function.args.into_iter().map(expr).collect(),
         return_type: function.return_type,
+        frozen_aggregate: function
+            .aggregate_binding
+            .as_ref()
+            .and_then(|binding| binding.frozen.clone()),
         aggregate_binding: function
             .aggregate_binding
             .map(|binding| (Arc::from(binding.function_name), binding.resolved)),
@@ -1198,72 +1431,102 @@ fn freeze_window_function(
 mod tests {
     use std::num::{NonZeroU32, NonZeroUsize};
 
-    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use novarocks_types::SlotId;
 
     use super::*;
-    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::exec::node::filter::FilterNode;
     use crate::exec::node::limit::LimitNode;
     use crate::exec::node::repeat::RepeatNode;
     use crate::exec::node::values::ValuesNode;
 
-    fn values() -> (ExecNode, lp::StaticLayout) {
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
-                .unwrap();
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))])
-            .unwrap();
-        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
-        let layout = super::layout(&chunk.chunk_schema_ref()).unwrap();
-        (
-            ExecNode {
-                kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 1 }),
-            },
-            layout,
-        )
+    fn typed_values() -> ExecNode {
+        let chunk = crate::exec::chunk::typed_fixture::columns(
+            &["v"],
+            &[SlotId::new(1)],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int64,
+                false,
+            )],
+            vec![Arc::new(Int64Array::from(vec![1]))],
+            1,
+        );
+        ExecNode {
+            kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 1 }),
+        }
     }
 
-    fn profile(layout: &lp::StaticLayout) -> lp::CompileProfile {
-        lp::CompileProfile::new(
-            NonZeroUsize::new(1).unwrap(),
-            None,
-            layout.identity().unwrap(),
-            lp::KernelAbiVersion::CURRENT,
-        )
+    fn values() -> ExecNode {
+        typed_values()
     }
 
     #[test]
     fn partition_only_topn_survives_lowering_and_caps_each_partition() {
         use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
         use crate::exec::operators::SortProcessorFactory;
+        use crate::exec::pipeline::operator::ConstructionFailure;
         use crate::exec::pipeline::operator_factory::OperatorFactory;
-        use arrow::array::Array;
+        use arrow::array::{Array, ArrayRef};
+        use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+        struct DeclarationControl;
+        impl novarocks_type_contract::PureCompileControl for DeclarationControl {
+            fn checkpoint(
+                &self,
+                _: novarocks_type_contract::CompilePhase,
+                _: u32,
+            ) -> std::result::Result<(), novarocks_type_contract::CompileControlError> {
+                Ok(())
+            }
+        }
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("partition", DataType::Int64, false),
             Field::new("value", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
+        // This pure fixture publishes its explicit source declaration before
+        // runtime preparation. No type is inferred from a batch or annotation.
+        let value = FunctionValueType::new(DataType::Int64, false);
+        let layout = lp::StaticLayout::try_new_typed_for_compile(
+            schema,
+            Arc::from([SlotId::new(1), SlotId::new(2)]),
             vec![
-                Arc::new(Int64Array::from(vec![2, 1, 2, 1, 2, 1])),
-                Arc::new(Int64Array::from(vec![20, 10, 21, 11, 22, 12])),
+                (value.typed_binding().clone(), None),
+                (value.typed_binding().clone(), None),
             ],
+            ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+            &DeclarationControl,
         )
         .unwrap();
-        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-            schema.as_ref(),
-            &[SlotId::new(1), SlotId::new(2)],
+        let state = crate::runtime::runtime_state::RuntimeState::default();
+        let tracker =
+            crate::runtime::mem_tracker::MemTracker::new_root("partition-only-sort-construction");
+        let creator = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker.clone(),
+            state.error_state(),
+        ).unwrap();
+        let chunk_schema = creator.create_compiled_chunk_schema(&layout).unwrap();
+        let owner = creator.begin_typed_construction(&chunk_schema).unwrap();
+        owner
+            .request(std::alloc::Layout::array::<ArrayRef>(2).unwrap())
+            .unwrap();
+        let chunk = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            chunk_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![2, 1, 2, 1, 2, 1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![20, 10, 21, 11, 22, 12])) as ArrayRef,
+            ],
+            6,
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
         )
         .unwrap();
-        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
-        let layout = super::layout(&chunk.chunk_schema_ref()).unwrap();
         let mut arena = ExprArena::default();
-        let partition = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        let partition = arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), value);
         let plan = ExecPlan {
             arena,
             root: ExecNode {
@@ -1291,13 +1554,14 @@ mod tests {
                 }),
             },
         };
-        let program = plan
-            .into_local_program(
-                profile(&layout),
-                BTreeMap::new(),
-                vec![ExternalSinkRequirement::Result],
-            )
-            .unwrap();
+        let profile =
+            crate::exec::chunk::typed_fixture::profile(&plan, NonZeroUsize::new(1).unwrap(), None);
+        let (program, _runtime) = crate::exec::chunk::typed_fixture::lower(
+            plan,
+            profile,
+            vec![ExternalSinkRequirement::Result],
+            lp::StaticSinkProgram::Result,
+        );
         let lp::ProgramNodeKind::Sort {
             order_by,
             partition_exprs,
@@ -1321,7 +1585,7 @@ mod tests {
             .collect();
         let runtime_arena = Arc::new(
             ExprArena::from_immutable(program.expressions())
-                .expect("legacy frozen expression fixture"),
+                .expect("frozen explicit partition expression"),
         );
         let factory = SortProcessorFactory::new_topn(
             2,
@@ -1334,10 +1598,13 @@ mod tests {
             None,
             runtime_partition_exprs,
             *partition_limit,
-        );
+        )
+        .with_input_layout(program.nodes()[0].output_layout().clone());
         let mut op = factory.create(1, 0);
+        op.set_mem_tracker(tracker);
+        op.set_construction_factory(creator);
+        op.prepare().unwrap();
         let processor = op.as_processor_mut().unwrap();
-        let state = crate::runtime::runtime_state::RuntimeState::default();
         processor.push_chunk(&state, chunk).unwrap();
         processor.set_finishing(&state).unwrap();
         let output = processor.pull_chunk(&state).unwrap().unwrap();
@@ -1363,11 +1630,11 @@ mod tests {
 
     #[test]
     fn lowering_consumes_values_and_keeps_expression_and_sink_exact() {
-        let (input, layout) = values();
+        let input = typed_values();
         let mut arena = ExprArena::default();
-        let predicate = arena.push_typed(
+        let predicate = arena.push_value_typed(
             ExprNode::Literal(LiteralValue::Bool(true)),
-            DataType::Boolean,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         let plan = ExecPlan {
             arena,
@@ -1379,13 +1646,15 @@ mod tests {
                 }),
             },
         };
-        let program = plan
-            .into_local_program(
-                profile(&layout),
-                BTreeMap::new(),
-                vec![ExternalSinkRequirement::Result],
-            )
-            .unwrap();
+        let profile =
+            crate::exec::chunk::typed_fixture::profile(&plan, NonZeroUsize::new(1).unwrap(), None);
+        let (program, runtime) = crate::exec::chunk::typed_fixture::lower(
+            plan,
+            profile,
+            vec![ExternalSinkRequirement::Result],
+            lp::StaticSinkProgram::Result,
+        );
+        assert_eq!(runtime.scan_count(), 0);
         assert_eq!(program.nodes().len(), 2);
         assert!(matches!(
             program.nodes()[0].kind(),
@@ -1403,7 +1672,7 @@ mod tests {
 
     #[test]
     fn lowering_rejects_excess_depth_before_recursive_consume() {
-        let (mut root, layout) = values();
+        let mut root = typed_values();
         for id in 2..=66 {
             root = ExecNode {
                 kind: ExecNodeKind::Limit(LimitNode {
@@ -1414,18 +1683,31 @@ mod tests {
                 }),
             };
         }
-        let error = ExecPlan {
+        let plan = ExecPlan {
             arena: ExprArena::default(),
             root,
-        }
-        .into_local_program(profile(&layout), BTreeMap::new(), vec![])
-        .unwrap_err();
+        };
+        let profile =
+            crate::exec::chunk::typed_fixture::profile(&plan, NonZeroUsize::new(1).unwrap(), None);
+        let error = crate::exec::chunk::typed_fixture::try_lower_with_scans(
+            plan,
+            profile,
+            BTreeMap::new(),
+            vec![],
+            lp::StaticSinkProgram::Noop,
+        )
+        .err()
+        .expect("original excessive depth is rejected");
+        let error = match error {
+            LocalProgramCreationFailure::Lowering(error) => error,
+            other => panic!("original lowering depth cause was replaced: {other:?}"),
+        };
         assert!(error.to_string().contains("node/depth limit"));
     }
 
     #[test]
     fn repeat_grouping_slot_is_available_to_static_exchange_sink() {
-        let (input, _) = values();
+        let input = values();
         let plan = ExecPlan {
             arena: ExprArena::default(),
             root: ExecNode {
@@ -1439,9 +1721,8 @@ mod tests {
                 }),
             },
         };
-        let profile = plan
-            .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
-            .unwrap();
+        let profile =
+            crate::exec::chunk::typed_fixture::profile(&plan, NonZeroUsize::new(1).unwrap(), None);
         let branch = lp::StaticStreamBranch::try_new(
             3,
             novarocks_execution_contract::DataStreamPartitionType::Unpartitioned,
@@ -1458,14 +1739,18 @@ mod tests {
             ),
         )
         .unwrap();
-        let (program, _) = plan
-            .into_local_program_and_bindings(
-                profile,
-                BTreeMap::new(),
-                vec![ExternalSinkRequirement::ExchangeOutput { branch: 0 }],
-                sink,
-            )
-            .unwrap();
+        let (program, runtime) = crate::exec::chunk::typed_fixture::lower(
+            plan,
+            profile,
+            vec![ExternalSinkRequirement::ExchangeOutput { branch: 0 }],
+            sink,
+        );
+        assert_eq!(runtime.scan_count(), 0);
+        assert!(
+            program.nodes()[program.root().index()]
+                .output_layout()
+                .is_typed()
+        );
         assert_eq!(
             program.nodes()[program.root().index()]
                 .output_layout()

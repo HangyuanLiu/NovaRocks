@@ -201,13 +201,13 @@ fn child_values(a: &ArrayRef) -> Value {
     )
 }
 fn type_metadata(ty: &FunctionValueType) -> Value {
-    let field = match &ty.data_type {
+    let field = match ty.data_type() {
         DataType::List(field) => {
             json!({"name":field.name(), "nullable":field.is_nullable(), "data_type":format!("{:?}",field.data_type()), "metadata":field.metadata()})
         }
         _ => Value::Null,
     };
-    json!({"physical_type":format!("{:?}",ty.data_type),"nullable":ty.nullable,"logical_type":format!("{:?}",ty.logical_type),"field":field})
+    json!({"physical_type":format!("{:?}",ty.data_type()),"nullable":ty.nullable(),"logical_type":format!("{:?}",ty.logical_type()),"field":field})
 }
 fn original_query(query: usize, rows: &[usize]) -> Value {
     let (mut arena, ids, chunk) = setup(rows);
@@ -280,14 +280,14 @@ fn original_query(query: usize, rows: &[usize]) -> Value {
     let FunctionResultType::Scalar(result_type) = binding.selected.result_type else {
         panic!("scalar result")
     };
-    assert_eq!(result_type.data_type, DataType::Utf8);
-    assert_eq!(result_type.logical_type, ValueLogicalType::Json);
+    assert_eq!(result_type.data_type(), &DataType::Utf8);
+    assert_eq!(result_type.logical_type(), ValueLogicalType::Json);
     let call = arena.push_typed(
         ExprNode::FunctionCall {
             kind: lookup_function("json_object").unwrap(),
             args: arguments,
         },
-        result_type.data_type.clone(),
+        result_type.data_type().clone(),
     );
     let result = arena.eval(call, &chunk);
     let outcome = match result {
@@ -428,8 +428,8 @@ fn json_object_legacy_native_oracle_original_sql_metadata_and_error_preservation
                 if function.function_id.as_str() != "builtin.scalar/json_object/v1" {
                     continue;
                 }
-                assert_eq!(expr.ty.logical_type, ValueLogicalType::Json);
-                assert_eq!(expr.ty.data_type, DataType::Utf8);
+                assert_eq!(expr.ty.logical_type(), ValueLogicalType::Json);
+                assert_eq!(expr.ty.data_type(), &DataType::Utf8);
                 assert_eq!(function.result_type, expr.ty);
                 assert!(
                     live.contains(&(fragment.id(), expr.owner)),
@@ -567,7 +567,7 @@ fn c16_p1_json_object_nested_index_child_matches_frozen_original_if_child() {
                 kind: lookup_function("__array_element_at").unwrap(),
                 args: vec![outer, index],
             },
-            result_type.data_type.clone(),
+            result_type.data_type().clone(),
         );
         let index64_values = arena.eval(index64, &chunk).unwrap();
         let index_values = arena.eval(index, &chunk).unwrap();

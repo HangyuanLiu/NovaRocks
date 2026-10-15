@@ -83,14 +83,18 @@ fn adapter() -> WriteRuntimeAdapter<MarkerProvider> {
 fn input_shape() -> ConnectorWriteInputShape {
     ConnectorWriteInputShape::Data {
         fields: vec![
-            ConnectorWriteFieldBinding::new(
+            ConnectorWriteFieldBinding::try_new_typed(
                 ConnectorWriteFieldToken::from_bytes([1; 32]),
                 Field::new("c1", DataType::Int64, false),
-            ),
-            ConnectorWriteFieldBinding::new(
+                ty(DataType::Int64, false),
+            )
+            .expect("provider c1 complete declaration"),
+            ConnectorWriteFieldBinding::try_new_typed(
                 ConnectorWriteFieldToken::from_bytes([2; 32]),
                 Field::new("c2", DataType::Utf8, true),
-            ),
+                ty(DataType::Utf8, true),
+            )
+            .expect("provider c2 complete declaration"),
         ],
     }
 }
@@ -230,7 +234,7 @@ fn pool(
     data: arrow::array::ArrayData,
 ) -> p::ConstantPool {
     p::ConstantPool::try_new(
-        Arc::new(Field::new(field, value_type.data_type.clone(), false)),
+        Arc::new(Field::new(field, value_type.data_type().clone(), false)),
         value_type,
         data,
         crate::application::test_constant_policy(),
@@ -335,10 +339,10 @@ fn insert_values_plan_writing(written: u32, sealed: &[u32]) -> (p::PhysicalPlan,
                             provider_name: binding.field().name().clone().into(),
                             token: binding.token(),
                             input: *value,
-                            ty: ty(
-                                binding.field().data_type().clone(),
-                                binding.field().is_nullable(),
-                            ),
+                            ty: binding
+                                .execution_type()
+                                .expect("provider complete target declaration")
+                                .clone(),
                             hidden: false,
                         })
                         .collect(),

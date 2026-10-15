@@ -263,7 +263,7 @@ fn installed_five_rankings_preserve_independent_peer_values_and_exact_effects_un
                 call.effects().proof_scope,
                 CallProofScope::Domain(context().domain)
             );
-            assert!(prepared.contract().result_type().nullable);
+            assert!(prepared.contract().result_type().nullable());
             let input = geometry(&prepared, 6, &peers, &frames);
             let mut partition =
                 WindowEvaluationPartition::begin(prepared.clone(), input, &Control::default())

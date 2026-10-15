@@ -1543,7 +1543,7 @@ mod tests {
             &self,
             _: &novarocks_execution_contract::task_execution::descriptor::TaskDescriptor,
             _: novarocks_execution_contract::task_execution::creation::TaskCreationInput,
-            _preparation: &novarocks_worker::PreparationControlLoan<'_>,
+            _preparation_stop: novarocks_worker::TaskPreparationStopView,
         ) -> Result<novarocks_worker::PreparedTaskInstallation, novarocks_worker::HostRejection>
         {
             panic!("metrics fixture must not install a task")
@@ -1598,7 +1598,7 @@ mod tests {
         )
     }
 
-    #[cfg(all(debug_assertions, feature = "test-controls"))]
+    #[cfg(feature = "test-controls")]
     #[test]
     fn root_ownership_scrape_omits_stale_or_absent_samples_in_both_formats() {
         let absent = BackendMetricsRegistry::new().unwrap();
@@ -1729,7 +1729,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(debug_assertions, feature = "test-controls"))]
+    #[cfg(feature = "test-controls")]
     #[test]
     fn preparation_busy_scrape_omits_stale_values_without_blocking_control_metrics() {
         let owner = preparation_owner();
@@ -1814,7 +1814,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(debug_assertions, feature = "test-controls"))]
+    #[cfg(feature = "test-controls")]
     #[test]
     fn preparation_poison_is_an_error_in_both_formats() {
         let owner = preparation_owner();

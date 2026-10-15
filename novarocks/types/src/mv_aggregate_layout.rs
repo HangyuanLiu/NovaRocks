@@ -77,11 +77,11 @@ impl MvAggregateVisibleColumn {
     }
 
     pub fn data_type(&self) -> &DataType {
-        &self.value_type.data_type
+        &self.value_type.data_type()
     }
 
     pub fn nullable(&self) -> bool {
-        self.value_type.nullable
+        self.value_type.nullable()
     }
 
     pub fn source_index(&self) -> usize {
@@ -132,11 +132,11 @@ impl MvAggregateStateColumn {
     }
 
     pub fn data_type(&self) -> &DataType {
-        &self.value_type.data_type
+        &self.value_type.data_type()
     }
 
     pub fn nullable(&self) -> bool {
-        self.value_type.nullable
+        self.value_type.nullable()
     }
 
     pub fn visible_source_index(&self) -> usize {
@@ -222,7 +222,7 @@ impl MvAggregateRuntimeLayout {
         for state_column in &state_columns {
             // These persisted state bytes belong to the MV state recipe, not
             // to an aggregate's visible logical result domain.
-            if state_column.value_type.logical_type != ValueLogicalType::Physical {
+            if state_column.value_type.logical_type() != ValueLogicalType::Physical {
                 return Err(format!(
                     "aggregate MV state column must have a Physical logical domain: column={}",
                     state_column.name
@@ -236,13 +236,14 @@ impl MvAggregateRuntimeLayout {
                             state_column.aggregate_index
                         ));
                     }
-                    if !is_varbinary_data_type(&state_column.value_type.data_type) {
+                    if !is_varbinary_data_type(&state_column.value_type.data_type()) {
                         return Err(format!(
                             "aggregate MV Single state column must be Binary or LargeBinary: column={} data_type={:?}",
-                            state_column.name, state_column.value_type.data_type
+                            state_column.name,
+                            state_column.value_type.data_type()
                         ));
                     }
-                    if state_column.value_type.nullable {
+                    if state_column.value_type.nullable() {
                         return Err(format!(
                             "aggregate MV state column must be non-nullable: column={}",
                             state_column.name
@@ -289,8 +290,8 @@ impl MvAggregateRuntimeLayout {
                 MvAggregateStateRole::AvgSum | MvAggregateStateRole::AvgCount => {
                     if state_column.aggregate_index >= aggregate_count
                         || state_column.aggregate_kind != MvAggregateRuntimeKind::Avg
-                        || !is_varbinary_data_type(&state_column.value_type.data_type)
-                        || state_column.value_type.nullable
+                        || !is_varbinary_data_type(&state_column.value_type.data_type())
+                        || state_column.value_type.nullable()
                     {
                         return Err(format!(
                             "aggregate MV AVG state has invalid runtime shape: column={}",
@@ -353,8 +354,8 @@ impl MvAggregateRuntimeLayout {
                     if state_column.aggregate_kind != MvAggregateRuntimeKind::Count
                         || !state_column.count_star
                         || state_column.aggregate_index != aggregate_count
-                        || state_column.value_type.data_type != DataType::Int64
-                        || state_column.value_type.nullable
+                        || *state_column.value_type.data_type() != DataType::Int64
+                        || state_column.value_type.nullable()
                     {
                         return Err(format!(
                             "aggregate MV retraction count state has invalid runtime shape: column={}",
@@ -470,22 +471,25 @@ mod tests {
         let item = Field::new("item", DataType::Utf8, true)
             .with_metadata([(NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string())].into());
         let values = vec![
-            FunctionValueType {
-                data_type: DataType::Utf8,
-                nullable: true,
-                logical_type: ValueLogicalType::Json,
-            },
+            FunctionValueType::try_from_legacy_declared_projection(
+                DataType::Utf8,
+                true,
+                ValueLogicalType::Json,
+            )
+            .expect("valid temporary legacy value projection"),
             FunctionValueType::new(DataType::List(Arc::new(item)), false),
-            FunctionValueType {
-                data_type: DataType::LargeBinary,
-                nullable: false,
-                logical_type: ValueLogicalType::Variant,
-            },
-            FunctionValueType {
-                data_type: DataType::FixedSizeBinary(16),
-                nullable: false,
-                logical_type: ValueLogicalType::LargeInt,
-            },
+            FunctionValueType::try_from_legacy_declared_projection(
+                DataType::LargeBinary,
+                false,
+                ValueLogicalType::Variant,
+            )
+            .expect("valid temporary legacy value projection"),
+            FunctionValueType::try_from_legacy_declared_projection(
+                DataType::FixedSizeBinary(16),
+                false,
+                ValueLogicalType::LargeInt,
+            )
+            .expect("valid temporary legacy value projection"),
             FunctionValueType::new(DataType::FixedSizeBinary(16), false),
         ];
         let layout = MvAggregateRuntimeLayout::try_new(
@@ -504,18 +508,19 @@ mod tests {
         .expect("group-only source layout");
         for (column, source) in layout.visible_columns().iter().zip(&values) {
             assert_eq!(column.value_type(), source);
-            assert_eq!(column.data_type(), &source.data_type);
-            assert_eq!(column.nullable(), source.nullable);
+            assert_eq!(column.data_type(), source.data_type());
+            assert_eq!(column.nullable(), source.nullable());
         }
     }
 
     #[test]
     fn opaque_state_recipe_does_not_adopt_visible_logical_domain() {
-        let value = FunctionValueType {
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: ValueLogicalType::Json,
-        };
+        let value = FunctionValueType::try_from_legacy_declared_projection(
+            DataType::Utf8,
+            true,
+            ValueLogicalType::Json,
+        )
+        .expect("valid temporary legacy value projection");
         let layout = MvAggregateRuntimeLayout::try_new(
             "row_id".to_string(),
             vec![MvAggregateVisibleColumn::new("v".to_string(), value, 0)],
@@ -530,11 +535,12 @@ mod tests {
         );
         let logical_state = MvAggregateStateColumn::new(
             "state".to_string(),
-            FunctionValueType {
-                data_type: DataType::LargeBinary,
-                nullable: false,
-                logical_type: ValueLogicalType::Variant,
-            },
+            FunctionValueType::try_from_legacy_declared_projection(
+                DataType::LargeBinary,
+                false,
+                ValueLogicalType::Variant,
+            )
+            .expect("valid temporary legacy value projection"),
             0,
             0,
             MvAggregateRuntimeKind::Min,

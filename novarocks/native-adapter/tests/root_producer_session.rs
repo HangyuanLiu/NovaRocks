@@ -204,7 +204,7 @@ fn owned_chunk(array: ArrayRef) -> Chunk {
 }
 
 /// Nested child fields must come from known metadata owners too.
-fn owned_nested_chunk(array: ArrayRef, children: Vec<MetadataOwnedField>) -> Chunk {
+fn source_owned_nested_chunk(array: ArrayRef, children: Vec<MetadataOwnedField>) -> Chunk {
     let field = owned_field("value", array.data_type().clone(), true);
     let mut owners = vec![field.clone()];
     owners.extend(children);
@@ -220,6 +220,34 @@ fn owned_nested_chunk(array: ArrayRef, children: Vec<MetadataOwnedField>) -> Chu
     .unwrap();
     let schema = Arc::new(ChunkSchema::try_new(vec![slot]).unwrap());
     let batch = RecordBatch::try_new(schema.arrow_schema_ref(), vec![array]).unwrap();
+    Chunk::try_new_with_chunk_schema(batch, schema).unwrap()
+}
+
+fn owned_nested_chunk(array: ArrayRef, children: Vec<MetadataOwnedField>) -> Chunk {
+    let source = source_owned_nested_chunk(array, children);
+    let slot = &source.chunk_schema().slots()[0];
+    // Keep the original source owner above and publish its complete binding
+    // explicitly for the typed root consumer. The source facts are not a type.
+    let slot = ChunkSlotSchema::try_new_typed(
+        slot.slot_id(),
+        Arc::clone(slot.field_ref()),
+        slot.typed_binding().clone(),
+        None,
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    let schema = Arc::new(
+        ChunkSchema::try_new_typed(
+            vec![slot],
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+    );
+    let batch = RecordBatch::try_new(
+        schema.arrow_schema_ref(),
+        source.record_batch().columns().to_vec(),
+    )
+    .unwrap();
     Chunk::try_new_with_chunk_schema(batch, schema).unwrap()
 }
 
@@ -479,15 +507,23 @@ async fn unknown_actual_schema_refuses_before_producer_and_drops_chunk_before_cr
     let fixture = Fixture::new(client(1));
     let array: ArrayRef = Arc::new(StringArray::from(vec!["unproven"]));
     let weak = Arc::downgrade(&array);
-    let original = owned_chunk(array);
+    // This negative protects source provenance. A typed execution constructor
+    // validates and canonicalizes an equivalent schema, so it is not unknown.
+    let original = source_owned_nested_chunk(array, Vec::new());
     // Same field/schema contents, independently allocated top-level schema.
     // Generic Chunk construction preserves semantics but cannot mint an origin.
-    let unknown_schema = Arc::new(original.batch.schema().as_ref().clone());
-    let unknown_batch =
-        RecordBatch::try_new(unknown_schema.clone(), original.batch.columns().to_vec()).unwrap();
+    let unknown_schema = Arc::new(original.record_batch().schema().as_ref().clone());
+    let unknown_batch = RecordBatch::try_new(
+        unknown_schema.clone(),
+        original.record_batch().columns().to_vec(),
+    )
+    .unwrap();
     let unknown =
         Chunk::try_new_with_chunk_schema(unknown_batch, original.chunk_schema_ref()).unwrap();
-    assert!(Arc::ptr_eq(&unknown.batch.schema(), &unknown_schema));
+    assert!(Arc::ptr_eq(
+        &unknown.record_batch().schema(),
+        &unknown_schema
+    ));
     drop(original);
     let permit = input(&fixture.session).await;
     let callbacks = Arc::new(AtomicUsize::new(0));
@@ -835,13 +871,85 @@ async fn writable_snapshot_retains_fixed_metadata_after_last_session_arc_exits()
     shutdown(&pool).await;
 }
 
-// Construct from the real Arrow physical DTO decoder and retain its exact
-// nested Field owners in each List/Map carrier. A borrowed equal schema cannot
-// stand in for this construction provenance.
+// This source-only fixture declares physical values explicitly. It does not
+// infer nominal domains from metadata or from arrays, nor install a BE owner.
+// The shared type-table codec creates the exact nested Field/type owners that
+// both the typed ChunkSchema and its List/Map arrays retain.
+fn decoded_fixture_schema(schema: &Schema, slots: &[u32]) -> Arc<ChunkSchema> {
+    use novarocks_plan_codec::execution_type_table::{
+        ExecutionTypeRoot, ExecutionTypeTableBuilder, ExecutionTypeTableLimits,
+        decode_execution_type_table_observed,
+    };
+    use novarocks_plan_codec::host_projection_v2::AdmissionRefusal;
+    use novarocks_type_contract::{
+        CompileCheckpoints, CompilePhase, FunctionValueType, ValueTypeStorageLifetime,
+    };
+    assert_eq!(schema.fields().len(), slots.len());
+    assert_eq!(schema.metadata().capacity(), 0);
+    // Both call sites author their original metadata-free physical contracts:
+    // StatisticsArtifactV1 and the fixed RootWriteResultSchema, respectively.
+    let declared: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            assert_eq!(field.metadata().capacity(), 0);
+            FunctionValueType::new(field.data_type().clone(), field.is_nullable())
+        })
+        .collect();
+    let roots: Vec<_> = slots
+        .iter()
+        .zip(&declared)
+        .map(|(&id, value)| ExecutionTypeRoot { id, value })
+        .collect();
+    let limits = ExecutionTypeTableLimits::for_validated_root_count(roots.len()).unwrap();
+    let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
+    let mut encode_work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    let encoded = ExecutionTypeTableBuilder::new(&roots)
+        .encode_observed(
+            limits,
+            &mut |_| Ok::<_, AdmissionRefusal<()>>(()),
+            &mut encode_work,
+        )
+        .unwrap();
+    encode_work.finish().unwrap();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let decoded = decode_execution_type_table_observed(
+        encoded.wire(),
+        limits,
+        ValueTypeStorageLifetime::pure(),
+        &mut |_| Ok::<_, AdmissionRefusal<()>>(()),
+        &mut work,
+    )
+    .unwrap();
+    let slots = slots
+        .iter()
+        .zip(schema.fields())
+        .zip(&declared)
+        .map(|((&id, field), expected)| {
+            let value = decoded.get_observed(id, &mut work).unwrap().unwrap();
+            assert_eq!(value, expected);
+            let decoded_field = Arc::new(Field::new(
+                field.name(),
+                value.data_type().clone(),
+                value.nullable(),
+            ));
+            ChunkSlotSchema::try_new_typed(
+                SlotId::new(id),
+                decoded_field,
+                value.typed_binding().clone(),
+                None,
+                ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap()
+        })
+        .collect();
+    work.finish().unwrap();
+    Arc::new(ChunkSchema::try_new_typed(slots, ValueTypeStorageLifetime::pure()).unwrap())
+}
+
 fn statistics_chunk(ids: &[i32], blob: &str, body: &[u8]) -> (Chunk, std::sync::Weak<BinaryArray>) {
     use arrow::array::{ListArray, MapArray, StructArray};
     use arrow::buffer::OffsetBuffer;
-    use novarocks_proto_codec::{FieldPath, arrow_physical};
     let entries = Arc::new(Field::new(
         "entries",
         DataType::Struct(
@@ -863,26 +971,12 @@ fn statistics_chunk(ids: &[i32], blob: &str, body: &[u8]) -> (Chunk, std::sync::
         Field::new("body", DataType::Binary, true),
         Field::new("properties", DataType::Map(entries, false), false),
     ]);
-    let (wire, metadata) =
-        arrow_physical::encode_schema(&schema, &[1, 2, 3, 4], false, FieldPath::root("schema"))
-            .unwrap();
-    let decoded =
-        arrow_physical::decode_schema(&wire, &metadata, FieldPath::root("schema")).unwrap();
-    let chunk_schema = ChunkSchema::try_ref_from_owned_schema_and_slot_ids(
-        decoded.schema_metadata_origin(),
-        decoded.field_metadata_origins(),
-        &[
-            SlotId::new(1),
-            SlotId::new(2),
-            SlotId::new(3),
-            SlotId::new(4),
-        ],
-    )
-    .unwrap();
-    let DataType::List(item) = decoded.schema().field(0).data_type() else {
+    let chunk_schema = decoded_fixture_schema(&schema, &[1, 2, 3, 4]);
+    let decoded_schema = chunk_schema.arrow_schema_ref();
+    let DataType::List(item) = decoded_schema.field(0).data_type() else {
         panic!("list");
     };
-    let DataType::Map(entries, false) = decoded.schema().field(3).data_type() else {
+    let DataType::Map(entries, false) = decoded_schema.field(3).data_type() else {
         panic!("map");
     };
     let DataType::Struct(fields) = entries.data_type() else {
@@ -990,29 +1084,14 @@ async fn statistics_record_can_cross_segments_and_cancel_releases_its_original_b
 fn write_chunk(fragments: &[(i32, &[u8])], summary: Option<i64>) -> Chunk {
     use arrow::array::{Int8Array, ListArray, MapArray, StructArray};
     use arrow::buffer::OffsetBuffer;
-    use novarocks_proto_codec::{FieldPath, arrow_physical};
     use novarocks_spi::connector::write_stack::root_write_result_schema;
     let schema = root_write_result_schema();
-    let (wire, metadata) = arrow_physical::encode_schema(
-        &schema,
-        &[1, 2, 3, 4, 5, 6, 7, 8],
-        false,
-        FieldPath::root("schema"),
-    )
-    .unwrap();
-    let decoded =
-        arrow_physical::decode_schema(&wire, &metadata, FieldPath::root("schema")).unwrap();
-    let slots = (1..=8).map(SlotId::new).collect::<Vec<_>>();
-    let chunk_schema = ChunkSchema::try_ref_from_owned_schema_and_slot_ids(
-        decoded.schema_metadata_origin(),
-        decoded.field_metadata_origins(),
-        &slots,
-    )
-    .unwrap();
-    let DataType::List(item) = decoded.schema().field(4).data_type() else {
+    let chunk_schema = decoded_fixture_schema(&schema, &[1, 2, 3, 4, 5, 6, 7, 8]);
+    let decoded_schema = chunk_schema.arrow_schema_ref();
+    let DataType::List(item) = decoded_schema.field(4).data_type() else {
         panic!("list");
     };
-    let DataType::Map(entries, false) = decoded.schema().field(7).data_type() else {
+    let DataType::Map(entries, false) = decoded_schema.field(7).data_type() else {
         panic!("map");
     };
     let DataType::Struct(entry_fields) = entries.data_type() else {
@@ -1207,7 +1286,7 @@ async fn cow_selection_records_decode_back_to_their_batches() {
     ];
     let expected = inputs[1..]
         .iter()
-        .map(|chunk| chunk.batch.clone())
+        .map(|chunk| chunk.record_batch().clone())
         .collect::<Vec<_>>();
     for chunk in inputs {
         fixture

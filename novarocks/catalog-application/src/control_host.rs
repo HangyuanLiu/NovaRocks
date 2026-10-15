@@ -1093,8 +1093,12 @@ pub(crate) mod tests {
         fn load_table(
             &self,
             _request: ConnectorTableRequest,
-        ) -> Result<ConnectorTableMetadata, ConnectorError> {
-            Err(unsupported())
+            _creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
+            Err(novarocks_connector_contract::PureProviderCompileError::Provider(unsupported()))
         }
     }
 

@@ -180,7 +180,28 @@ fn legacy_to_date_baseline_raw_timestamp_units_ignore_zone_and_extreme_ranges() 
     }
 }
 #[test]
-fn legacy_to_date_baseline_declared_int64_drift_and_complete_unsupported_type_errors() {
+fn legacy_to_date_baseline_declared_int64_drift_and_complete_unsupported_type_errors_layout_boundary_and_complete_diagnostic()
+ {
+    // Keep the original oversized input as a real construction refusal.
+    let oversized = DataType::Struct(
+        vec![Arc::new(Field::new(
+            "long_FIELD_é".repeat(180),
+            DataType::Int64,
+            true,
+        ))]
+        .into(),
+    );
+    assert_eq!(
+        novarocks_type_contract::ValueLayout::try_new(
+            &oversized,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap_err(),
+        novarocks_type_contract::ExecutionValueTypeError::Invalid(
+            "value layout field name exceeds the byte limit"
+        ),
+    );
+
     for name in ["date", "to_date"] {
         for input in [
             Arc::new(Int64Array::from(vec![None])) as ArrayRef,
@@ -194,7 +215,7 @@ fn legacy_to_date_baseline_declared_int64_drift_and_complete_unsupported_type_er
             );
         }
         let fields = Fields::from(vec![Arc::new(Field::new(
-            "long_FIELD_é".repeat(180),
+            "long_FIELD_é".repeat(78),
             DataType::Int64,
             true,
         ))]);

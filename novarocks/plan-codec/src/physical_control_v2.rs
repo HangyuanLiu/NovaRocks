@@ -426,6 +426,16 @@ pub fn encode_expression_control(
     Ok(encoded?.0)
 }
 
+/// Explicit FE pure author using its caller's original checkpoint stream.
+/// This is the original writer body, without a constructor grant or footer.
+pub fn encode_expression_control_pure_in(
+    roots: &PhysicalRootUses,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::ExpressionControl, ControlCodecError> {
+    let mut model = encode_model(roots, 0, unbounded())?;
+    encode_in(roots, &mut model, &mut |_| Ok(()), false, work).map(|encoded| encoded.0)
+}
+
 /// Full Control component sender using the actual immutable fragment and root
 /// source, the caller's work scope and one union source invoice. No footer.
 pub fn encode_expression_control_observed(
@@ -632,13 +642,35 @@ fn decode_model(
     b: usize,
     limits: ControlProjectionLimits,
 ) -> Result<Model, ControlCodecError> {
-    let mut m = Model::new(
-        input.domains.len(),
-        input.uses.len(),
-        input.roots.len(),
-        b,
-        limits,
-    );
+    let mut model = decode_parts_model(input, b, limits)?;
+    let mut future = novarocks_type_contract::ControlResourceCounter::default();
+    future.merge(model.future)?;
+    future.merge(physical_expression_roots_header_resource_facts(fragment)?)?;
+    model.future = future.facts();
+    Ok(model)
+}
+fn decode_parts_model(
+    input: &wire::ExpressionControl,
+    b: usize,
+    limits: ControlProjectionLimits,
+) -> Result<Model, ControlCodecError> {
+    decode_parts_model_core(input, b, Some(limits))
+}
+fn decode_parts_model_core(
+    input: &wire::ExpressionControl,
+    b: usize,
+    limits: Option<ControlProjectionLimits>,
+) -> Result<Model, ControlCodecError> {
+    let mut m = match limits {
+        Some(limits) => Model::new(
+            input.domains.len(),
+            input.uses.len(),
+            input.roots.len(),
+            b,
+            limits,
+        ),
+        None => Model::input_derived(input.domains.len(), input.uses.len(), input.roots.len(), b),
+    };
     m.resources
         .buffer::<ExpressionEvaluationDomain>(input.domains.len(), 1)?;
     m.resources
@@ -658,7 +690,7 @@ fn decode_model(
         input.uses.len(),
     )?)?;
     future.merge(root_use_binding_header_resource_facts(input.roots.len())?)?;
-    future.merge(physical_expression_roots_header_resource_facts(fragment)?)?;
+
     m.future = future.facts();
     Ok(m)
 }
@@ -777,61 +809,273 @@ fn project_decode_in(
     input: &wire::ExpressionControl,
     m: &mut Model,
     admit: &mut impl FnMut(&ControlProjectionFacts) -> Result<(), CompileControlError>,
-    mut source_floor: Option<usize>,
+    floor: Option<usize>,
     observed: bool,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ControlProjectionParts, ControlCodecError> {
-    m.gate(admit)?;
+    project_decode_core(
+        input,
+        m,
+        &mut OriginalControlProjection { admit },
+        floor,
+        observed,
+        work,
+    )
+}
+trait ControlPartsProjection {
+    type Error: From<ControlCodecError>;
+    fn gate(&mut self, model: &Model) -> Result<(), Self::Error>;
+    fn reserve<T>(
+        &mut self,
+        value: &mut Vec<T>,
+        count: usize,
+        observed: bool,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Self::Error>;
+    fn boxed<T>(
+        &mut self,
+        value: Vec<T>,
+        observed: bool,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Box<[T]>, Self::Error>;
+}
+struct OriginalControlProjection<'a, A> {
+    admit: &'a mut A,
+}
+impl<A: FnMut(&ControlProjectionFacts) -> Result<(), CompileControlError>> ControlPartsProjection
+    for OriginalControlProjection<'_, A>
+{
+    type Error = ControlCodecError;
+    fn gate(&mut self, m: &Model) -> Result<(), Self::Error> {
+        m.gate(self.admit).map(|_| ())
+    }
+    fn reserve<T>(
+        &mut self,
+        v: &mut Vec<T>,
+        n: usize,
+        o: bool,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Self::Error> {
+        reserve(v, n, o, w)
+    }
+    fn boxed<T>(
+        &mut self,
+        v: Vec<T>,
+        o: bool,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<Box<[T]>, Self::Error> {
+        boxed(v, o, w)
+    }
+}
+struct CreatedControlProjection<'a, 'c, H> {
+    creation: &'a mut novarocks_type_contract::ValueSchemaCreation<'c, H>,
+}
+impl<H> ControlPartsProjection for CreatedControlProjection<'_, '_, H> {
+    type Error = crate::host_projection_v2::ProjectionFailure<ControlCodecError, H>;
+    fn gate(&mut self, m: &Model) -> Result<(), Self::Error> {
+        let facts = m.check_with(ControlOwnedResourceFacts::default())?;
+        let _ = facts;
+        Ok(())
+    }
+    fn reserve<T>(
+        &mut self,
+        v: &mut Vec<T>,
+        n: usize,
+        o: bool,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Self::Error> {
+        w.flush().map_err(ControlCodecError::from)?;
+        let layout = Layout::array::<T>(n)
+            .map_err(|_| ControlCodecError::Control(CompileControlError::ResourceExhausted))?;
+        self.creation
+            .request_layout(layout)
+            .map_err(crate::host_projection_v2::ProjectionFailure::Host)?;
+        reserve(v, n, o, w).map_err(Into::into)
+    }
+    fn boxed<T>(
+        &mut self,
+        v: Vec<T>,
+        o: bool,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<Box<[T]>, Self::Error> {
+        w.flush().map_err(ControlCodecError::from)?;
+        if v.capacity() != v.len() {
+            let bytes = Layout::array::<T>(v.len())
+                .map_err(|_| ControlCodecError::Control(CompileControlError::ResourceExhausted))?
+                .size();
+            self.creation
+                .observe_opaque_upper_bound(bytes)
+                .map_err(crate::host_projection_v2::ProjectionFailure::Host)?;
+        }
+        boxed(v, o, w).map_err(Into::into)
+    }
+}
+
+/// Projected grammar facts, not a validated expression graph or root attachment.
+/// Native must map these exact definitions and run its full ProgramControlFlow
+/// and RootAttachment checks before publishing a LocalProgram.
+pub struct CreatedExpressionControlParts {
+    domains: Vec<ExpressionEvaluationDomain>,
+    uses: Vec<ExpressionInvocation<ExprId>>,
+    roots: Vec<(ExpressionRootSite, ExpressionUseId)>,
+    storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl CreatedExpressionControlParts {
+    pub fn domains(&self) -> &[ExpressionEvaluationDomain] {
+        &self.domains
+    }
+    pub fn uses(&self) -> &[ExpressionInvocation<ExprId>] {
+        &self.uses
+    }
+    pub fn roots(&self) -> &[(ExpressionRootSite, ExpressionUseId)] {
+        &self.roots
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<ExpressionEvaluationDomain>,
+        Vec<ExpressionInvocation<ExprId>>,
+        Vec<(ExpressionRootSite, ExpressionUseId)>,
+        novarocks_type_contract::ValueTypeStorageLifetime,
+    ) {
+        (self.domains, self.uses, self.roots, self.storage)
+    }
+}
+/// Receive from this actual input's sole checked model/grammar. There is no
+/// receiving-profile threshold or fabricated grant; the actual creator admits
+/// each request and the same original checkpoint stream controls all work.
+pub fn decode_expression_control_parts_input_derived_with_creator_in<H>(
+    input: &wire::ExpressionControl,
+    source_retained_bytes: usize,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    (CreatedExpressionControlParts, ControlProjectionFacts),
+    crate::host_projection_v2::ProjectionFailure<ControlCodecError, H>,
+> {
+    decode_expression_control_parts_core(input, source_retained_bytes, creation, work)
+}
+fn decode_expression_control_parts_core<H>(
+    input: &wire::ExpressionControl,
+    source_retained_bytes: usize,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    (CreatedExpressionControlParts, ControlProjectionFacts),
+    crate::host_projection_v2::ProjectionFailure<ControlCodecError, H>,
+> {
+    let mut model = decode_parts_model_core(input, source_retained_bytes, None)?;
+    let storage = creation.storage_lifetime();
+    let mut projection = CreatedControlProjection { creation };
+    projection.gate(&model)?;
+    let floor = control_source_floor(input)?;
+    model.floor(floor)?;
+    let (domains, uses, roots) =
+        project_decode_core(input, &mut model, &mut projection, Some(floor), true, work)?;
+    // Graph/root constructor resources are admitted by the actual downstream
+    // constructor. Parts do not allocate or claim those future owners.
+    model.future = ControlOwnedResourceFacts::default();
+    let facts = model.check_with(ControlOwnedResourceFacts::default())?;
+    Ok((
+        CreatedExpressionControlParts {
+            domains,
+            uses,
+            roots,
+            storage,
+        },
+        facts,
+    ))
+}
+fn control_source_floor(input: &wire::ExpressionControl) -> Result<usize, ControlCodecError> {
+    let mut bytes = std::mem::size_of::<wire::ExpressionControl>();
+    for next in [
+        Layout::array::<wire::EvaluationDomain>(input.domains.capacity()),
+        Layout::array::<wire::ExpressionUse>(input.uses.capacity()),
+        Layout::array::<wire::RootBinding>(input.roots.capacity()),
+    ] {
+        bytes = control_resource_add(
+            bytes,
+            next.map_err(|_| CompileControlError::ResourceExhausted)?
+                .size(),
+        )?;
+    }
+    Ok(bytes)
+}
+fn project_decode_core<P: ControlPartsProjection>(
+    input: &wire::ExpressionControl,
+    m: &mut Model,
+    projection: &mut P,
+    mut source_floor: Option<usize>,
+    observed: bool,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ControlProjectionParts, P::Error> {
+    projection.gate(m)?;
     (|| {
         original_decode_header(input)?;
         let mut references = input.uses.len();
         for invocation in &input.uses {
             references = references
                 .checked_add(invocation.argument_use_ids.len())
-                .ok_or(ExpressionControlFlowError::TooManyItems)?;
+                .ok_or(ControlCodecError::Flow(
+                    ExpressionControlFlowError::TooManyItems,
+                ))?;
             if references > MAX_CONTROL_USE_REFERENCES {
-                return Err(ExpressionControlFlowError::TooManyItems.into());
+                return Err(
+                    ControlCodecError::Flow(ExpressionControlFlowError::TooManyItems).into(),
+                );
             }
             m.counts[1] = references;
             m.resources
-                .buffer::<ExpressionUseId>(invocation.argument_use_ids.len(), 2)?;
+                .buffer::<ExpressionUseId>(invocation.argument_use_ids.len(), 2)
+                .map_err(ControlCodecError::from)?;
             m.resources
-                .work(control_resource_mul(invocation.argument_use_ids.len(), 16)?)?;
+                .work(
+                    control_resource_mul(invocation.argument_use_ids.len(), 16)
+                        .map_err(ControlCodecError::from)?,
+                )
+                .map_err(ControlCodecError::from)?;
             let mut future = novarocks_type_contract::ControlResourceCounter::default();
-            future.merge(m.future)?;
-            future.merge(expression_control_flow_edge_resource_facts(
-                invocation.argument_use_ids.len(),
-                input.domains.len(),
-                input.uses.len(),
-            )?)?;
+            future.merge(m.future).map_err(ControlCodecError::from)?;
+            future
+                .merge(
+                    expression_control_flow_edge_resource_facts(
+                        invocation.argument_use_ids.len(),
+                        input.domains.len(),
+                        input.uses.len(),
+                    )
+                    .map_err(ControlCodecError::from)?,
+                )
+                .map_err(ControlCodecError::from)?;
             m.future = future.facts();
-            m.gate(admit)?;
+            projection.gate(m)?;
             if let Some(floor) = &mut source_floor {
                 // Each actual argument Vec owns disjoint backing in this DTO.
                 // This is a necessary floor, not a private-capacity estimate.
                 let backing = Layout::array::<u32>(invocation.argument_use_ids.capacity())
-                    .map_err(|_| CompileControlError::ResourceExhausted)?
+                    .map_err(|_| {
+                        ControlCodecError::Control(CompileControlError::ResourceExhausted)
+                    })?
                     .size();
-                *floor = control_resource_add(*floor, backing)?;
+                *floor = control_resource_add(*floor, backing).map_err(ControlCodecError::from)?;
                 m.floor(*floor)?;
             }
-            work.step()?;
+            work.step().map_err(ControlCodecError::from)?;
         }
         let mut domains = Vec::new();
-        reserve(&mut domains, input.domains.len(), observed, work)?;
+        projection.reserve(&mut domains, input.domains.len(), observed, work)?;
         for domain in &input.domains {
             domains.push(ExpressionEvaluationDomain {
                 id: EvaluationDomainId::new(domain.id),
                 parent: domain.parent_domain_id.map(EvaluationDomainId::new),
                 guard: domain.guard.as_ref().map(decode_guard).transpose()?,
             });
-            work.step()?;
+            work.step().map_err(ControlCodecError::from)?;
         }
         let mut uses = Vec::new();
-        reserve(&mut uses, input.uses.len(), observed, work)?;
+        projection.reserve(&mut uses, input.uses.len(), observed, work)?;
         for invocation in &input.uses {
             let mut arguments = Vec::new();
-            reserve(
+            projection.reserve(
                 &mut arguments,
                 invocation.argument_use_ids.len(),
                 observed,
@@ -839,7 +1083,7 @@ fn project_decode_in(
             )?;
             for argument in &invocation.argument_use_ids {
                 arguments.push(ExpressionUseId::new(*argument));
-                work.step()?;
+                work.step().map_err(ControlCodecError::from)?;
             }
             uses.push(ExpressionInvocation {
                 context: ExpressionEffectContext {
@@ -860,12 +1104,12 @@ fn project_decode_in(
                         .as_ref()
                         .ok_or(ControlCodecError::InvalidShape("use control is missing"))?,
                 )?,
-                arguments: boxed(arguments, observed, work)?,
+                arguments: projection.boxed(arguments, observed, work)?,
             });
-            work.step()?;
+            work.step().map_err(ControlCodecError::from)?;
         }
         let mut roots = Vec::new();
-        reserve(&mut roots, input.roots.len(), observed, work)?;
+        projection.reserve(&mut roots, input.roots.len(), observed, work)?;
         for binding in &input.roots {
             roots.push((
                 decode_site(
@@ -876,7 +1120,7 @@ fn project_decode_in(
                 )?,
                 ExpressionUseId::new(required(binding.use_id, "root use is missing")?),
             ));
-            work.step()?;
+            work.step().map_err(ControlCodecError::from)?;
         }
         Ok((domains, uses, roots))
     })()
@@ -919,4 +1163,107 @@ pub(crate) fn decode_temporal_shape(
             ));
         }
     })
+}
+
+#[cfg(test)]
+mod created_parts_tests {
+    use super::*;
+    use novarocks_type_contract::{
+        ValueSchemaCreation, ValueTypeStorageHold, ValueTypeStorageLifetime,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert!(units <= 256);
+            Ok(())
+        }
+    }
+    struct Hold(Arc<AtomicUsize>);
+    impl ValueTypeStorageHold for Hold {}
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn raw() -> wire::ExpressionControl {
+        wire::ExpressionControl {
+            domains: vec![wire::EvaluationDomain {
+                id: 0,
+                parent_domain_id: None,
+                guard: None,
+            }],
+            uses: Vec::new(),
+            roots: Vec::new(),
+        }
+    }
+    #[test]
+    fn created_control_parts_preserve_sparse_zero_and_finite_source_owner_without_graph_claim() {
+        let source = raw();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner = Arc::new(Hold(drops.clone()));
+        let mut requests = Vec::new();
+        let mut exact = |layout: Layout| {
+            requests.push(layout);
+            Ok::<_, std::convert::Infallible>(())
+        };
+        let mut opaque = |_: usize| Ok::<_, std::convert::Infallible>(());
+        let mut creation = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::held(owner.clone()),
+            &mut exact,
+            &mut opaque,
+        );
+        let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Decode).unwrap();
+        let (parts, facts) = decode_expression_control_parts_input_derived_with_creator_in(
+            &source,
+            control_source_floor(&source).unwrap(),
+            &mut creation,
+            &mut work,
+        )
+        .unwrap();
+        assert_eq!(parts.domains()[0].id.get(), 0);
+        assert!(parts.uses().is_empty());
+        assert!(parts.roots().is_empty());
+        assert_eq!(facts.domain_count, 1);
+        drop(creation);
+        drop(owner);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(requests.iter().any(|layout| layout.size() > 0));
+        let (_, _, _, storage) = parts.into_parts();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(storage);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn created_control_parts_return_first_original_host_with_no_allocation_tail() {
+        use crate::host_projection_v2::ProjectionFailure;
+        let source = raw();
+        let original = Arc::new(17u64);
+        let expected = original.clone();
+        let mut count = 0;
+        let mut exact = |_: Layout| {
+            count += 1;
+            assert_eq!(count, 1, "allocation after original refusal");
+            Err(original.clone())
+        };
+        let mut opaque =
+            |_: usize| -> Result<(), Arc<u64>> { panic!("opaque tail after original refusal") };
+        let mut creation =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
+        let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Decode).unwrap();
+        let result = decode_expression_control_parts_input_derived_with_creator_in(
+            &source,
+            control_source_floor(&source).unwrap(),
+            &mut creation,
+            &mut work,
+        );
+        assert!(
+            matches!(result,Err(ProjectionFailure::Host(cause)) if Arc::ptr_eq(&cause,&expected))
+        );
+        drop(creation);
+        assert_eq!(count, 1);
+    }
 }

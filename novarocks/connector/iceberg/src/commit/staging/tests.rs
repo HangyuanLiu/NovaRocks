@@ -190,7 +190,6 @@ fn initialization(base: &TableMetadata) -> Vec<TableUpdate> {
         TableUpdate::AssignUuid { uuid: base.uuid() },
         TableUpdate::AddSchema {
             schema: base.current_schema().as_ref().clone(),
-            last_column_id: None,
         },
         TableUpdate::SetCurrentSchema { schema_id: -1 },
         TableUpdate::AddSpec {
@@ -442,7 +441,6 @@ async fn historical_spec_and_equivalent_schema_reuse_emit_explicit_selectors() {
                     schema["schema-id"] = 99.into();
                     serde_json::from_value(schema).unwrap()
                 },
-                last_column_id: Some(base.last_column_id()),
             },
             TableUpdate::SetCurrentSchema { schema_id: -1 },
             TableUpdate::AddSortOrder {
@@ -519,14 +517,13 @@ async fn requirements_from_staged_schema_are_folded_to_parent_schema() {
         .unwrap();
     engine
         .stage_change(change(vec![
-            TableUpdate::AddSchema {
-                schema,
-                last_column_id: Some(9),
-            },
+            TableUpdate::AddSchema { schema },
             TableUpdate::SetCurrentSchema { schema_id: -1 },
         ]))
         .unwrap();
-    assert_eq!(engine.metadata().last_column_id(), 9);
+    // The builder advances the high-water mark to the added schema's highest
+    // field ID, exactly as a REST server applying the update does.
+    assert_eq!(engine.metadata().last_column_id(), 2);
     let current_schema_id = engine.metadata().current_schema_id();
     assert_ne!(current_schema_id, 0);
     engine
@@ -535,7 +532,7 @@ async fn requirements_from_staged_schema_are_folded_to_parent_schema() {
             requirements: vec![
                 TableRequirement::CurrentSchemaIdMatch { current_schema_id },
                 TableRequirement::LastAssignedFieldIdMatch {
-                    last_assigned_field_id: 9,
+                    last_assigned_field_id: 2,
                 },
             ],
         })
@@ -973,10 +970,7 @@ async fn equivalent_schema_identifier_sets_are_independent_of_iteration_order() 
         let schema = serde_json::from_value(json).unwrap();
         engine
             .stage_change(change(vec![
-                TableUpdate::AddSchema {
-                    schema,
-                    last_column_id: None,
-                },
+                TableUpdate::AddSchema { schema },
                 TableUpdate::SetCurrentSchema { schema_id: -1 },
             ]))
             .unwrap();

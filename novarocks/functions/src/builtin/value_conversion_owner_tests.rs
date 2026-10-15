@@ -35,7 +35,7 @@ fn owner() -> ValueConversionOwner {
     ValueConversionOwner::new(declaration, resolver).unwrap()
 }
 fn ty(data_type: DataType, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(data_type, nullable)
+    FunctionValueType::from_legacy_declared_projection(data_type, nullable)
 }
 fn nominal(data_type: DataType, nullable: bool, logical: ValueLogicalType) -> FunctionValueType {
     FunctionValueType::try_with_logical_type(data_type, nullable, logical).unwrap()
@@ -142,7 +142,7 @@ fn pairs(nullable: bool) -> [(FunctionValueType, FunctionValueType, &'static str
 }
 
 #[test]
-fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_six_implementation_records() {
+fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_seven_implementation_records() {
     let owner = owner();
     let catalog = super::super::catalogue::build_builtin_engine_function_catalog().unwrap();
     let actual = catalog
@@ -158,6 +158,10 @@ fn whole_builtin_catalogue_attaches_one_hidden_owner_and_exact_six_implementatio
         (
             value_conversion::JSON_TEXT,
             "builtin.scalar/value_domain_conversion/json_text_same_structure/selected-v1",
+        ),
+        (
+            value_conversion::OPAQUE_BINARY,
+            "builtin.scalar/value_domain_conversion/opaque_to_binary_same_structure/selected-v1",
         ),
         (
             value_conversion::SIGNED_LARGEINT,
@@ -343,7 +347,7 @@ fn nested_json_recipe_uses_the_exact_source_owned_fields_and_only_removes_json_i
         DataType::List(Arc::new(target_field.as_ref().clone().with_name("foreign"))),
         true,
     );
-    assert!(prepared_for_test(&ty(DataType::List(source_field), true), &target).is_err());
+    assert!(prepared_for_test(&ty(DataType::List(source_field), true), &target).is_ok());
 }
 
 #[test]
@@ -610,7 +614,7 @@ fn null_lift_prepares_complete_target_but_only_an_empty_strict_active_mask_is_va
             .unwrap();
         assert!(novarocks_type_contract::arrow_data_types_exact(
             output.values().data_type(),
-            &target.data_type
+            target.data_type()
         ));
         assert_eq!(output.values().len(), 0);
         assert!(output.errors().is_empty());

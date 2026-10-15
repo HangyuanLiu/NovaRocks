@@ -95,6 +95,20 @@ pub(super) const POLICY: DecimalOverflowPolicy = DecimalOverflowPolicy::ReportEr
 /// Relational use IDs start far above every expression use of a fixture.
 const RELATIONAL_USE_BASE: u32 = 1_000_000;
 
+/// Direct operator fixtures install the same original tracker/control host as
+/// pipeline preparation; the representation profile has one production owner.
+pub(super) fn runtime_construction_factory(
+    tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
+    error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
+) -> Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory> {
+    crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+        crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+        tracker,
+        error,
+    )
+    .expect("original operator construction host is installed")
+}
+
 /// A sealed subset of the real builtin catalogue holding exactly the named
 /// aggregate owners with their installed ABIs.
 pub(super) fn aggregate_catalog(owners: &[(&str, PureKernelAbi)]) -> PureEngineFunctionCatalog {
@@ -158,6 +172,7 @@ pub(super) struct Bound {
     pub selected: FunctionBindingSelection,
     pub semantics: novarocks_functions::FunctionSemantics,
     pub arguments: Vec<FunctionValueType>,
+    pub state_interpretation: Option<Arc<novarocks_type_contract::AggregateStateInterpretation>>,
 }
 
 impl Bound {
@@ -206,7 +221,9 @@ impl Bound {
             semantic_parameters: Box::default(),
         });
         AggregateBinding {
-            state_interpretation: None,
+            // The physical port owns this small facts projection. Its guarded
+            // order collection shares the original immutable backing.
+            state_interpretation: self.state_interpretation.as_deref().cloned(),
             state_argument_contract: aggregate.state_argument_contract,
             function,
             phase,
@@ -247,6 +264,7 @@ pub(super) fn bind(
         selected: bound.selected,
         semantics: bound.semantics,
         arguments: arguments.to_vec(),
+        state_interpretation: None,
     }
 }
 
@@ -665,7 +683,7 @@ fn freeze(
                 // A call's frozen effects do not depend on DISTINCT; whether
                 // the owner implements DISTINCT is the compiler's preparation.
                 AggregatePreparationOptions {
-                    state_interpretation: None,
+                    state_interpretation: binding.state_interpretation.clone().map(Arc::new),
                     phase,
                     distinct: false,
                     order_keys: Arc::from([]),
@@ -687,7 +705,7 @@ fn freeze(
                     state_input_type: &state_type,
                 },
                 AggregatePreparationOptions {
-                    state_interpretation: None,
+                    state_interpretation: binding.state_interpretation.clone().map(Arc::new),
                     phase,
                     distinct: false,
                     order_keys: Arc::from([]),
@@ -725,6 +743,7 @@ fn freeze(
             )
             .unwrap_or_else(|error| panic!("fixture aggregate call prepares: {error}"));
         frozen.push(FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
@@ -893,7 +912,7 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
                 ExchangeTransmitRejection::Failed(FragmentIoError::new(
                     FragmentIoOperation::ExchangeTransmit,
                     FragmentIoErrorKind::RemoteRejected,
-                    error,
+                    error.to_string(),
                 ))
             })
     }
@@ -906,7 +925,9 @@ fn runtime_state() -> Arc<RuntimeState> {
         None,
         None,
         None,
-        None,
+        Some(crate::runtime::mem_tracker::MemTracker::new_root(
+            "compiled aggregate fixture",
+        )),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ))
 }
@@ -997,6 +1018,7 @@ pub(super) fn register(
             ExchangeInputAssignment::new(NonZeroUsize::new(senders).unwrap()),
         )])),
         Arc::clone(port),
+        Some(&crate::runtime::fragment::exchange::test_receiver_creation_factory()),
     )
     .expect("compiled receivers");
     for registration in registrations {

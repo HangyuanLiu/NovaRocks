@@ -73,7 +73,7 @@ struct Counts {
 }
 
 fn value_type(data_type: DataType) -> FunctionValueType {
-    FunctionValueType::new(data_type, false)
+    FunctionValueType::from_legacy_declared_projection(data_type, false)
 }
 fn state_format() -> AggregateStateFormatIdentity {
     AggregateStateFormatIdentity::try_new("fixture/catalogue/sum-state-v1").unwrap()
@@ -136,7 +136,7 @@ impl Owner {
             });
             overloads.push(FunctionOverloadDeclaration::from_effects(
                 overload.clone(),
-                format!("{:?}", argument.data_type),
+                format!("{:?}", argument.data_type()),
                 "Int64",
                 (kind == FunctionKind::Aggregate).then(|| AggregateBindingDeclaration {
                     state_argument_contract:
@@ -294,7 +294,7 @@ impl AggregateSignatureResolver for Owner {
             .iter()
             .find(|selected| {
                 matches!(&selected.argument_types[0], FunctionArgumentType::Value(ty)
-                    if arguments == [ty.data_type.clone()])
+                    if arguments == [ty.data_type().clone()])
             })
             .ok_or(FunctionResolutionError::NoMatchingSignature {
                 candidates: self.selections.len(),
@@ -1641,12 +1641,16 @@ fn c02_p1_preparation_by_domains_follow_the_same_registered_owner_use_point() {
                         assert_eq!(prepared.contract().call().selected(), selected.as_ref());
                     } else {
                         let expected = format!(
-                            "{} has no installed max_by/min_by input profile for {:?}",
+                            "{} has no installed max_by/min_by input profile for {}",
                             bound.function_id.as_str(),
-                            selected.argument_types
+                            "[Value(FunctionValueType { data_type: LargeUtf8, nullable: true, logical_type: Physical }), Value(FunctionValueType { data_type: Utf8, nullable: true, logical_type: Physical })]"
                         );
                         assert!(
-                            matches!(result, Err(FunctionSpecializationFailure::Kernel(KernelFailure::InvalidProgram(actual))) if actual.message() == expected)
+                            matches!(&result, Err(FunctionSpecializationFailure::Kernel(KernelFailure::InvalidProgram(actual))) if actual.message() == expected),
+                            "name={name}, frozen={frozen}, window_first={window_first}, selected={:?}, expected={expected:?}, error={:?}, success={}",
+                            selected.argument_types,
+                            result.as_ref().err(),
+                            result.is_ok(),
                         );
                     }
                 }

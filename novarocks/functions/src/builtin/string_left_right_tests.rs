@@ -174,7 +174,9 @@ fn string_left_right_actual_four_profiles_keep_unicode_scalar_and_full_i64_lengt
         ] {
             let mut types = sources();
             for ty in &mut types {
-                ty.nullable = false;
+                *ty = ty
+                    .with_nullable(false)
+                    .expect("valid function nullability declaration");
             }
             let prepared = prepared_for_test_with_policy(name, &types, policy).unwrap();
             assert_eq!(prepared.contract().result_type(), &source(true));
@@ -636,7 +638,7 @@ fn string_left_right_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_
         for source in [
             FunctionValueType::new(DataType::LargeUtf8, true),
             FunctionValueType::new(DataType::Binary, true),
-            FunctionValueType::new(
+            FunctionValueType::from_legacy_declared_projection(
                 DataType::List(Arc::new(arrow_schema::Field::new(
                     "item",
                     DataType::Int64,
@@ -663,7 +665,7 @@ fn string_left_right_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_
 fn string_left_right_compile_success_and_ordinary_tail_preserve_all_callback_causes() {
     for ty in [source(true), FunctionValueType::new(DataType::Binary, true)] {
         let good = CompileControl::default();
-        let success = ty.data_type == DataType::Utf8;
+        let success = ty.data_type() == &DataType::Utf8;
         assert_eq!(
             prepared_for_test_with_control(
                 "left",

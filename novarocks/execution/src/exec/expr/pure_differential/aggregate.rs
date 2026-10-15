@@ -54,7 +54,7 @@ use novarocks_functions::{
 };
 use novarocks_type_contract::{
     CallProofScope, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext, ExpressionUseId,
-    FunctionValueType,
+    FunctionValueType, ValueLogicalType,
 };
 
 use super::generate::InputGenerator;
@@ -122,6 +122,8 @@ impl AggregateDiffSpec {
     }
 
     pub(crate) fn typed_column(mut self, value_type: FunctionValueType, values: ArrayRef) -> Self {
+        let values = crate::exec::chunk::normalize_execution_array(&values)
+            .expect("differential source has a valid canonical actual representation");
         self.arguments
             .push(DiffArgument::Column { value_type, values });
         self
@@ -172,7 +174,9 @@ impl AggregateDiffSpec {
     ) -> Self {
         self.original_state = Some(novarocks_type_contract::AggregateStateInterpretation {
             distinct,
-            order_keys: order.into_boxed_slice(),
+            order_keys: novarocks_type_contract::AggregateStateOrderKeys::from_pure_boxed(
+                order.into_boxed_slice(),
+            ),
         });
         self
     }
@@ -383,18 +387,18 @@ fn n_raw16_legacy_spec(spec: &AggregateDiffSpec) -> Result<AggregateDiffSpec, Di
     }
     let value = spec.arguments[0].value_type();
     let limit = spec.arguments[1].value_type();
-    if value.logical_type != ValueLogicalType::LargeInt
-        || value.data_type != DataType::FixedSizeBinary(16)
-        || limit.logical_type != ValueLogicalType::Physical
+    if value.logical_type() != ValueLogicalType::LargeInt
+        || value.data_type() != &DataType::FixedSizeBinary(16)
+        || limit.logical_type() != ValueLogicalType::Physical
         || !matches!(
-            limit.data_type,
+            limit.data_type(),
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
         )
     {
         return Err(invalid());
     }
     let mut legacy = spec.clone();
-    let raw_type = FunctionValueType::new(DataType::FixedSizeBinary(16), value.nullable);
+    let raw_type = FunctionValueType::new(DataType::FixedSizeBinary(16), value.nullable());
     legacy.arguments[0] = match &spec.arguments[0] {
         DiffArgument::Column { values, .. } => DiffArgument::Column {
             value_type: raw_type,
@@ -407,7 +411,7 @@ fn n_raw16_legacy_spec(spec: &AggregateDiffSpec) -> Result<AggregateDiffSpec, Di
                 Field::new(
                     value.field().name(),
                     DataType::FixedSizeBinary(16),
-                    value.value_type().nullable,
+                    value.value_type().nullable(),
                 )
                 .with_metadata(metadata),
             );
@@ -464,7 +468,7 @@ fn run_aggregate_with_legacy_spec(
             "legacy aggregate selected a relation result".into(),
         ));
     };
-    let legacy_signature = if split_legacy.is_some() {
+    let mut legacy_signature = if split_legacy.is_some() {
         resolved_aggregate_signature_from_binding(legacy_bound)
             .map_err(|error| DifferentialFailure::InvalidSpec(error.to_string()))?
     } else {
@@ -472,6 +476,19 @@ fn run_aggregate_with_legacy_spec(
     };
     if split_legacy.is_some() {
         validate_n_split_result_types(&result_type, &legacy_result_type)?;
+    } else if matches!(spec.name.as_str(), "min_n" | "max_n")
+        && spec.arguments.first().is_some_and(|argument| {
+            argument.value_type().logical_type() == ValueLogicalType::LargeInt
+        })
+    {
+        // This is the explicit legacy declaration ABI, not an execution schema.
+        // Preserve the original full N declaration/refusal while the new typed
+        // computation is accepted separately against its original raw16 oracle.
+        legacy_signature.output_type = legacy_result_type
+            .try_to_legacy_field_projection("output")
+            .map_err(|cause| DifferentialFailure::InvalidSpec(cause.to_string()))?
+            .data_type()
+            .clone();
     }
     let legacy = LegacyAggregate::try_new(legacy_spec, &legacy_signature);
     let legacy_status = match &legacy {
@@ -560,21 +577,40 @@ fn run_aggregate_with_legacy_spec(
     }
 }
 
+fn n_largeint_list_type() -> FunctionValueType {
+    let item = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        true,
+        ValueLogicalType::LargeInt,
+    )
+    .unwrap();
+    FunctionValueType::try_from_value(
+        novarocks_type_contract::ValueTypeRef::try_new(
+            novarocks_type_contract::ValueKind::List(item.value_type().clone()),
+            true,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+        novarocks_type_contract::ValueLayout::try_new(
+            &DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::FixedSizeBinary(16),
+                true,
+            ))),
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
 fn validate_n_split_result_types(
     full: &FunctionValueType,
     raw: &FunctionValueType,
 ) -> Result<(), DifferentialFailure> {
     let item = Field::new("item", DataType::FixedSizeBinary(16), true);
     let raw_expected = FunctionValueType::new(DataType::List(Arc::new(item.clone())), true);
-    let full_expected = FunctionValueType::new(
-        DataType::List(Arc::new(item.with_metadata(
-            std::collections::HashMap::from([(
-                "nr_logical_type".to_owned(),
-                "largeint".to_owned(),
-            )]),
-        ))),
-        true,
-    );
+    let full_expected = n_largeint_list_type();
     if full != &full_expected || raw != &raw_expected {
         return Err(DifferentialFailure::InvalidSpec(
             "N split oracle has an unapproved declaration difference".into(),
@@ -583,9 +619,9 @@ fn validate_n_split_result_types(
     Ok(())
 }
 
-/// Validate the original v1 array BEFORE the accepted test-only item marker
-/// projection. Offsets, child buffers, values and NULLs are borrowed unchanged.
-/// Ordinary differential callers never use this projection.
+/// Validate the original v1 carrier against the approved split declaration.
+/// Execution metadata stays empty; complete item semantics are checked above.
+/// Offsets, child buffers, values and NULLs remain borrowed unchanged.
 fn project_n_raw16_result(
     result: Result<ArrayRef, String>,
     raw: &FunctionValueType,
@@ -596,7 +632,7 @@ fn project_n_raw16_result(
         Ok(values) => values,
         Err(error) => return Ok(Err(error)),
     };
-    if values.data_type() != &raw.data_type {
+    if values.data_type() != raw.data_type() {
         return Err(format!(
             "original raw16 output differs from its exact declaration: {:?}",
             values.data_type()
@@ -606,7 +642,7 @@ fn project_n_raw16_result(
         .as_any()
         .downcast_ref::<arrow::array::ListArray>()
         .ok_or_else(|| "original raw16 output is not ListArray".to_owned())?;
-    let DataType::List(item) = &full.data_type else {
+    let DataType::List(item) = full.data_type() else {
         return Err("N split oracle requires List result".into());
     };
     let projected = arrow::array::ListArray::try_new(
@@ -684,18 +720,18 @@ fn compare_shape(
                 ));
                 return;
             }
-            if !novarocks_type_contract::arrow_data_types_exact(pure.data_type(), &result_type.data_type)
+            if !novarocks_type_contract::arrow_data_types_exact(pure.data_type(), &result_type.data_type())
                 || !novarocks_type_contract::arrow_data_types_exact(legacy.data_type(), pure.data_type())
             {
                 details.push(format!(
                     "{shape}: result type legacy {:?}, pure {:?}, selected {:?}",
                     legacy.data_type(),
                     pure.data_type(),
-                    result_type.data_type
+                    result_type.data_type()
                 ));
                 return;
             }
-            if !result_type.nullable && (legacy.null_count() > 0 || pure.null_count() > 0) {
+            if !result_type.nullable() && (legacy.null_count() > 0 || pure.null_count() > 0) {
                 details.push(format!(
                     "{shape}: NULL in a non-nullable result (legacy {}, pure {})",
                     legacy.null_count(),
@@ -765,6 +801,34 @@ struct LegacyAggregate {
     channels: Vec<usize>,
 }
 
+/// Pure fixture preparation decodes legal encodings when the exact installed
+/// consumer requires plain input. This does not widen the BE carrier set.
+pub(crate) fn plain_value_array(
+    values: &ArrayRef,
+    value_type: &FunctionValueType,
+) -> Result<ArrayRef, String> {
+    let values = crate::exec::chunk::normalize_execution_array(values)?;
+    if !novarocks_type_contract::value_layout_matches_carrier_observed::<
+        novarocks_type_contract::ValueTypeError,
+    >(
+        value_type.typed_binding().layout(),
+        values.data_type(),
+        |_| Ok(()),
+    )
+    .map_err(|error| error.to_string())?
+    {
+        return Err("differential source differs from its explicitly authored value layout".into());
+    }
+    if values.data_type() == value_type.data_type() {
+        Ok(values)
+    } else {
+        // The borrowed comparison above already ruled out value conversions.
+        // Locked Arrow performs only the remaining encoding removal here.
+        arrow::compute::cast(values.as_ref(), value_type.data_type())
+            .map_err(|error| error.to_string())
+    }
+}
+
 impl LegacyAggregate {
     fn try_new(
         spec: &AggregateDiffSpec,
@@ -777,14 +841,14 @@ impl LegacyAggregate {
         };
         let input_type = match channels.as_slice() {
             [] => None,
-            [single] => Some(spec.arguments[*single].value_type().data_type.clone()),
+            [single] => Some(spec.arguments[*single].value_type().data_type().clone()),
             many => Some(DataType::Struct(Fields::from(
                 many.iter()
                     .enumerate()
                     .map(|(index, channel)| {
                         Field::new(
                             format!("f{index}"),
-                            spec.arguments[*channel].value_type().data_type.clone(),
+                            spec.arguments[*channel].value_type().data_type().clone(),
                             true,
                         )
                     })
@@ -796,6 +860,8 @@ impl LegacyAggregate {
             .flatten();
         let has_input = input_type.is_some();
         let function = |merge: bool| AggFunction {
+            // Explicit legacy carrier fixture; this is not frozen-binding admission.
+            frozen: None,
             name: spec.name.clone(),
             inputs: if has_input || merge {
                 vec![ExprId(0)]
@@ -866,7 +932,10 @@ impl LegacyAggregate {
                     take(value.pool().array().as_ref(), &repeat, None).map_err(|e| e.to_string())?
                 }
             };
-            columns.push(column);
+            columns.push(plain_value_array(
+                &column,
+                spec.arguments[*channel].value_type(),
+            )?);
         }
         Ok(match columns.len() {
             0 => None,
@@ -1056,16 +1125,49 @@ impl PureAggregate {
         mapping: &[usize],
     ) -> Result<(), novarocks_functions::EvaluationFailure> {
         let contract = Arc::clone(handle.contract());
+        let prepared = spec
+            .arguments
+            .iter()
+            .enumerate()
+            .map(|(ordinal, argument)| {
+                let DiffArgument::Column { value_type, values } = argument else {
+                    return Ok(None);
+                };
+                let accepted = handle
+                    .argument_encoding(ordinal)?
+                    .accepts_root_int32_string_dictionary()
+                    && matches!(values.data_type(), DataType::Dictionary(key, value)
+                        if key.as_ref() == &DataType::Int32
+                            && matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8));
+                if accepted {
+                    Ok(Some(Arc::clone(values)))
+                } else {
+                    plain_value_array(values, value_type)
+                        .map(Some)
+                        .map_err(|message| {
+                            KernelFailure::InvalidProgram(
+                                novarocks_functions::KernelDiagnostic::new(&message),
+                            )
+                        })
+                }
+            })
+            .collect::<Result<Vec<_>, KernelFailure>>()?;
         let arguments = spec
             .arguments
             .iter()
-            .map(DiffArgument::evaluated)
+            .zip(&prepared)
+            .map(|(argument, prepared)| match prepared {
+                Some(values) => EvaluatedArgument::Column(values),
+                None => argument.evaluated(),
+            })
             .collect::<Vec<_>>();
-        let input = SelectedAggregateUpdateInput::try_new(
+        let input = SelectedAggregateUpdateInput::try_new_with_typed_source_lookup(
             &contract,
             selection,
             &arguments[..contract.call().logical_argument_count()],
             &arguments[contract.call().logical_argument_count()..],
+            |ordinal| Ok(spec.arguments[ordinal].value_type()),
+            |ordinal| handle.argument_encoding(ordinal),
             &HarnessControl,
         )?;
         column
@@ -1503,13 +1605,9 @@ mod n_largeint_split_oracle_contract_tests {
     use novarocks_functions::{EvaluationFailure, KernelDiagnostic};
     fn types() -> (FunctionValueType, FunctionValueType) {
         let raw = Field::new("item", DataType::FixedSizeBinary(16), true);
-        let full = raw.clone().with_metadata(std::collections::HashMap::from([(
-            "nr_logical_type".into(),
-            "largeint".into(),
-        )]));
         (
             FunctionValueType::new(DataType::List(Arc::new(raw)), true),
-            FunctionValueType::new(DataType::List(Arc::new(full)), true),
+            n_largeint_list_type(),
         )
     }
     fn list(data_type: &DataType, values: &[Option<i128>], null: bool) -> ArrayRef {
@@ -1564,29 +1662,29 @@ mod n_largeint_split_oracle_contract_tests {
         let (raw, full) = types();
         assert!(
             compare(
-                Ok(list(&raw.data_type, &[Some(i128::MIN), Some(9)], false)),
-                Ok(list(&full.data_type, &[Some(i128::MIN), Some(9)], false))
+                Ok(list(raw.data_type(), &[Some(i128::MIN), Some(9)], false)),
+                Ok(list(full.data_type(), &[Some(i128::MIN), Some(9)], false))
             )
             .is_empty()
         );
         assert!(
             !compare(
-                Ok(list(&raw.data_type, &[Some(1)], false)),
-                Ok(list(&full.data_type, &[Some(2)], false))
+                Ok(list(raw.data_type(), &[Some(1)], false)),
+                Ok(list(full.data_type(), &[Some(2)], false))
             )
             .is_empty()
         );
         assert!(
             !compare(
-                Ok(list(&raw.data_type, &[Some(1)], false)),
-                Ok(list(&full.data_type, &[None], false))
+                Ok(list(raw.data_type(), &[Some(1)], false)),
+                Ok(list(full.data_type(), &[None], false))
             )
             .is_empty()
         );
         assert!(
             !compare(
-                Ok(list(&raw.data_type, &[], false)),
-                Ok(list(&full.data_type, &[], true))
+                Ok(list(raw.data_type(), &[], false)),
+                Ok(list(full.data_type(), &[], true))
             )
             .is_empty()
         );
@@ -1594,14 +1692,14 @@ mod n_largeint_split_oracle_contract_tests {
     #[test]
     fn marker_projection_rejects_extra_metadata_and_other_declaration_drift() {
         let (raw, full) = types();
-        let DataType::List(raw_item) = &raw.data_type else {
+        let DataType::List(raw_item) = raw.data_type() else {
             panic!("List fixture")
         };
         let extra = DataType::List(Arc::new(raw_item.as_ref().clone().with_metadata(
             std::collections::HashMap::from([("unexpected".into(), "value".into())]),
         )));
         assert!(project_n_raw16_result(Ok(list(&extra, &[Some(1)], false)), &raw, &full).is_err());
-        let DataType::List(full_item) = &full.data_type else {
+        let DataType::List(full_item) = full.data_type() else {
             panic!("List fixture")
         };
         let mut metadata = full_item.metadata().clone();
@@ -1609,13 +1707,12 @@ mod n_largeint_split_oracle_contract_tests {
         let extra = DataType::List(Arc::new(full_item.as_ref().clone().with_metadata(metadata)));
         assert!(
             !compare(
-                Ok(list(&raw.data_type, &[Some(1)], false)),
+                Ok(list(raw.data_type(), &[Some(1)], false)),
                 Ok(list(&extra, &[Some(1)], false))
             )
             .is_empty()
         );
-        let mut changed = full.clone();
-        changed.nullable = false;
+        let changed = full.with_nullable(false).unwrap();
         assert!(validate_n_split_result_types(&changed, &raw).is_err());
     }
     #[test]

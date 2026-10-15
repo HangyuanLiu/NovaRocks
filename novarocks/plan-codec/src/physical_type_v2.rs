@@ -22,10 +22,12 @@
 
 use arrow::datatypes::{DataType, Field};
 use novarocks_proto_models::physical_type_v2 as wire;
+#[cfg(test)]
+use novarocks_type_contract::ValueLogicalType;
 use novarocks_type_contract::{
     CarrierParameterError, CompileCheckpoints, CompileControlError, CompilePhase,
-    FunctionValueType, PureCompileControl, ValueLogicalType, ValueTypeError, ValueTypeVisit,
-    validate_arrow_carrier_parameters_observed, validate_value_type_structure_observed,
+    FunctionValueType, PureCompileControl, ValueTypeError, ValueTypeVisit,
+    validate_arrow_carrier_parameters_observed, validate_arrow_layout_structure_observed,
 };
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
@@ -38,6 +40,7 @@ mod graph_domains;
 mod package_graph;
 mod root_sources;
 mod scalars;
+mod semantic;
 
 pub use root_sources::{
     PackageTypeRootSource, PackageTypeRootSourceFacts, PackageTypeRootSources, WriterTypeRootRole,
@@ -57,6 +60,8 @@ pub enum TypeCodecError {
     Carrier(CarrierParameterError),
     Writer(novarocks_connector_contract::ConnectorError),
     ResourceSource(&'static str),
+    Logical(crate::value_type_table::LogicalTypeCodecError),
+    ExecutionValue(novarocks_type_contract::ExecutionValueTypeError),
 }
 impl fmt::Display for TypeCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -67,10 +72,26 @@ impl fmt::Display for TypeCodecError {
             Self::Carrier(error) => error.fmt(f),
             Self::Writer(error) => error.fmt(f),
             Self::ResourceSource(message) => f.write_str(message),
+            Self::Logical(error) => error.fmt(f),
+            Self::ExecutionValue(error) => error.fmt(f),
         }
     }
 }
 impl std::error::Error for TypeCodecError {}
+impl From<crate::value_type_table::LogicalTypeCodecError> for TypeCodecError {
+    fn from(error: crate::value_type_table::LogicalTypeCodecError) -> Self {
+        match error {
+            crate::value_type_table::LogicalTypeCodecError::Control(cause) => Self::Control(cause),
+            error => Self::Logical(error),
+        }
+    }
+}
+impl From<novarocks_type_contract::ExecutionValueTypeError> for TypeCodecError {
+    fn from(error: novarocks_type_contract::ExecutionValueTypeError) -> Self {
+        Self::ExecutionValue(error)
+    }
+}
+
 impl From<CompileControlError> for TypeCodecError {
     fn from(value: CompileControlError) -> Self {
         Self::Control(value)
@@ -160,65 +181,191 @@ pub fn decode_package_type_table_observed(
     decode::decode_package(package, source_retained_bytes, limits, admit, work)
 }
 
-/// Host capability for exactly the original final materialization tail.
-/// Preflight, topology and the last numerical gate have already succeeded.
-/// The synchronous continuation retains the original source borrows and may
-/// execute at most once; this trait supplies no allocation or account policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypeMaterializationNamespace {
+    ExecutionPhysical,
+    Source,
+}
+
+/// Funding around the original physical/source materialization tail only.
+/// Logical namespace construction retains its own creator responsibility.
+/// A host may run the borrowed continuation at most once; it authors no types.
 pub trait PackageTypeMaterializationScope {
     type HostError;
-
-    fn materialize<B>(
+    fn materialize<C, B>(
         &mut self,
         facts: &PackageTypeProjectionFacts,
         body: B,
-    ) -> Result<
-        DecodedTypeTable,
-        crate::host_projection_v2::ProjectionFailure<TypeCodecError, Self::HostError>,
-    >
+    ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<C, Self::HostError>>
     where
-        B: FnOnce() -> Result<DecodedTypeTable, TypeCodecError>;
+        C: From<TypeCodecError>,
+        B: FnOnce() -> Result<DecodedTypeTable, C>;
+
+    fn materialize_namespace<C, B>(
+        &mut self,
+        _namespace: TypeMaterializationNamespace,
+        facts: &PackageTypeProjectionFacts,
+        body: B,
+    ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<C, Self::HostError>>
+    where
+        C: From<TypeCodecError>,
+        B: FnOnce() -> Result<DecodedTypeTable, C>,
+    {
+        self.materialize(facts, body)
+    }
 }
 
-/// The original decoder's adapter, with an uninhabited host failure channel.
-/// Runtime callers needing funding must supply their own explicit capability.
+/// Object-safe funding for a receiver with an already selected real creator.
+/// Both original creator and funding failures stay in the caller's typed port.
+pub trait PackageTypeFundingScope<H> {
+    fn materialize(
+        &mut self,
+        namespace: TypeMaterializationNamespace,
+        facts: &PackageTypeProjectionFacts,
+        body: &mut dyn FnMut() -> Result<
+            DecodedTypeTable,
+            crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+        >,
+    ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>>;
+}
+
+impl<H, T: PackageTypeMaterializationScope<HostError = H>> PackageTypeFundingScope<H> for T {
+    fn materialize(
+        &mut self,
+        namespace: TypeMaterializationNamespace,
+        facts: &PackageTypeProjectionFacts,
+        body: &mut dyn FnMut() -> Result<
+            DecodedTypeTable,
+            crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+        >,
+    ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>>
+    {
+        use crate::host_projection_v2::ProjectionFailure;
+        match PackageTypeMaterializationScope::materialize_namespace(self, namespace, facts, body) {
+            Ok(value) => Ok(value),
+            Err(ProjectionFailure::Host(cause)) => Err(ProjectionFailure::Host(cause)),
+            Err(ProjectionFailure::Codec(original)) => Err(original),
+        }
+    }
+}
+
+/// Pure/direct expansion has no construction funding capability.
 pub struct DirectTypeMaterialization;
 impl PackageTypeMaterializationScope for DirectTypeMaterialization {
     type HostError = std::convert::Infallible;
-
-    fn materialize<B>(
+    fn materialize<C, B>(
         &mut self,
         _: &PackageTypeProjectionFacts,
         body: B,
-    ) -> Result<
-        DecodedTypeTable,
-        crate::host_projection_v2::ProjectionFailure<TypeCodecError, Self::HostError>,
-    >
+    ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<C, Self::HostError>>
     where
-        B: FnOnce() -> Result<DecodedTypeTable, TypeCodecError>,
+        C: From<TypeCodecError>,
+        B: FnOnce() -> Result<DecodedTypeTable, C>,
     {
         body().map_err(crate::host_projection_v2::ProjectionFailure::Codec)
     }
 }
 
-/// The same package decoder with a borrowed host at its one materialization
-/// boundary. The original type/control failure and nominal host refusal remain
-/// separate, with no extra decoder, checkpoint or fallible completion callback.
-pub fn decode_package_type_table_with_host_observed<H: PackageTypeMaterializationScope>(
+pub fn decode_package_type_table_with_host_observed<G: PackageTypeMaterializationScope>(
     package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
     source_retained_bytes: usize,
     limits: PackageTypeProjectionLimits,
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
-    host: &mut H,
+    host: &mut G,
 ) -> Result<
     DecodedTypeTable,
-    crate::host_projection_v2::ProjectionFailure<TypeCodecError, H::HostError>,
+    crate::host_projection_v2::ProjectionFailure<TypeCodecError, G::HostError>,
 > {
-    decode::decode_package_with_host(package, source_retained_bytes, limits, admit, work, host)
+    decode::decode_package_with_funding(package, source_retained_bytes, limits, admit, work, host)
+}
+
+pub(crate) fn decode_package_type_table_with_funding_in<H>(
+    package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
+    source: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+    funding: &mut dyn PackageTypeFundingScope<H>,
+) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
+    decode::decode_package_with_funding(package, source, limits, admit, work, funding)
+}
+
+pub fn decode_package_type_table_with_factory_and_funding_in<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
+    package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
+    source: usize,
+    limits: PackageTypeProjectionLimits,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    factory: &F,
+    work: &mut CompileCheckpoints<'_>,
+    funding: &mut dyn PackageTypeFundingScope<H>,
+) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
+    decode::decode_package_with_factory_and_funding(
+        package, source, limits, creation, factory, work, funding,
+    )
+}
+
+/// Production creator supplies the real retained storage lifetime. The caller
+/// owns admission/control; this entry neither mints a hold nor a capacity grant.
+pub fn decode_package_type_table_with_storage_observed(
+    package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
+    source_retained_bytes: usize,
+    storage: novarocks_type_contract::ValueTypeStorageLifetime,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DecodedTypeTable, TypeCodecError> {
+    decode::decode_package_with_storage(
+        package,
+        source_retained_bytes,
+        storage,
+        limits,
+        admit,
+        work,
+    )
+}
+
+/// Decode the actual package owner with its original creator and control.
+/// Opaque library/scratch upper bounds stay distinct from exact Layout requests.
+pub fn decode_package_type_table_with_creator_in<H>(
+    package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
+    original_source_bytes: usize,
+    limits: PackageTypeProjectionLimits,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
+    decode::decode_package_with_creator(package, original_source_bytes, limits, creation, work)
+}
+
+/// Independent logical entity lifetimes supplied by the actual BE creator.
+/// The original complete-table numeric model remains the sole cap author.
+pub fn decode_package_type_table_with_factory_in<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
+    package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
+    original_source_bytes: usize,
+    limits: PackageTypeProjectionLimits,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    factory: &F,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
+    decode::decode_package_with_factory(
+        package,
+        original_source_bytes,
+        limits,
+        creation,
+        factory,
+        work,
+    )
 }
 
 /// A caller-authored projection envelope. No guessed or unbounded default is
-/// available. Definitions count all three namespaces; expanded nodes count
+/// available. Definitions count logical, carrier, field and binding namespaces;
+/// expanded nodes count
 /// each definition's unfolded carrier subtree, including field/value copies and
 /// repeated references. String
 /// bytes include field names, metadata and timestamp zones before copying.
@@ -229,21 +376,143 @@ pub struct TypeProjectionLimits {
     pub max_string_bytes: usize,
 }
 
+impl TypeProjectionLimits {
+    /// Finite source grammar bound, derived from this owner's actual root count.
+    /// Source attributes have their own byte laws and never authorize values.
+    pub fn for_validated_source_root_count(roots: usize) -> Result<Self, CompileControlError> {
+        use novarocks_type_contract::{
+            MAX_ARROW_FIELD_METADATA_BYTES as ATTRS, MAX_ARROW_FIELD_NAME_BYTES as NAME,
+            MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES as ZONE, MAX_VALUE_TYPE_DEPTH as D,
+            MAX_VALUE_TYPE_NODES as N,
+        };
+        let overflow = || CompileControlError::ResourceExhausted;
+        let nodes = roots
+            .checked_mul(N.checked_add(1).ok_or_else(overflow)?)
+            .ok_or_else(overflow)?;
+        let definitions = nodes.checked_mul(2).ok_or_else(overflow)?;
+        Ok(Self {
+            max_definitions: definitions,
+            max_expanded_nodes: definitions
+                .checked_mul(D.checked_add(1).ok_or_else(overflow)?)
+                .ok_or_else(overflow)?,
+            max_string_bytes: nodes
+                .checked_mul(
+                    NAME.checked_add(ATTRS)
+                        .and_then(|n| n.checked_add(ZONE))
+                        .ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)?,
+        })
+    }
+}
+
+// The physical backing and its allocation responsibility travel together.
+// Inline map entries allocate no extra owner; independently held layouts
+// borrow only their corresponding entry's reachable backing lifetime.
+pub(super) struct Materialized<T> {
+    // Only actual value-layout roots freeze this cache. Source/unused Fields
+    // remain physical facts and never manufacture a semantic declaration.
+    pub(super) layout: Option<novarocks_type_contract::ValueLayout>,
+    pub(super) value: T,
+    pub(super) storage: novarocks_type_contract::ValueTypeStorageLifetime,
+    // DataType Dictionary clones copy Boxes; only their shared descendants
+    // borrow original backing. Arc<Field> clones borrow the complete Field.
+    pub(super) clone_storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl<T> std::ops::Deref for Materialized<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
 pub struct DecodedTypeTable {
+    pub(super) source_fields: Option<DecodedSourceFieldTable>,
+    pub(super) field_execution_refs: Vec<(u32, bool)>,
+    pub(super) creation_requests: Option<usize>,
     pub(super) metadata_namespace: Option<novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>,
-    pub(super) carriers: BTreeMap<u32, DataType>,
-    pub(super) fields: BTreeMap<u32, Arc<Field>>,
+    pub(super) carriers: BTreeMap<u32, Materialized<DataType>>,
+    pub(super) fields: BTreeMap<u32, Materialized<Arc<Field>>>,
     pub(super) values: BTreeMap<u32, FunctionValueType>,
+    pub(super) field_values: BTreeMap<u32, FunctionValueType>,
+    // Drop original temporary/container backing before its responsibility.
+    pub(super) storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 impl DecodedTypeTable {
+    /// Validate a source-only role against this exact decoded wire graph.
+    /// Shared physical carriers are legal; any reachable Field logical/value
+    /// reference is not a source-shape fact, even below an unpaired root.
+    pub fn validate_source_field_root_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(), TypeCodecError> {
+        let position = crate::value_type_table::resources::find(
+            &self.field_execution_refs,
+            id,
+            |field| field.0,
+            work,
+        )?
+        .ok_or(TypeCodecError::InvalidShape("dangling source field root"))?;
+        work.step()?;
+        if self.field_execution_refs[position].1 {
+            Err(TypeCodecError::InvalidShape(
+                "source-only field graph contains execution references",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Carried original decoder construction upper, not private retained size.
+    /// Pure expansion owners have no supplied construction provenance.
+    pub fn creation_request_bytes_upper_bound(&self) -> Option<usize> {
+        self.creation_requests
+    }
+    pub fn storage_lifetime(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+        self.storage.clone()
+    }
     pub fn metadata_namespace(&self) -> Option<&novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>{
         self.metadata_namespace.as_ref()
     }
+    pub fn source_metadata_namespace(&self) -> Option<&novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>{
+        self.source_fields
+            .as_ref()
+            .and_then(DecodedSourceFieldTable::metadata_namespace)
+    }
+    /// Borrow the exact source occurrence and only its reachable backing loan.
+    /// This token contains no table/container marker or allocation authority.
+    pub fn source_field_borrow(&self, id: u32) -> Option<SourceFieldBorrow<'_>> {
+        self.source_fields.as_ref()?.field_borrow(id)
+    }
+    pub fn source_field(&self, id: u32) -> Option<&Arc<Field>> {
+        self.source_fields
+            .as_ref()
+            .and_then(|source| source.fields.get(&id).map(|field| &field.value))
+    }
+    pub(crate) fn source_field_count(&self) -> usize {
+        self.source_fields
+            .as_ref()
+            .map_or(0, |source| source.fields.len())
+    }
+    pub(crate) fn source_field_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&Arc<Field>>, TypeCodecError> {
+        match &self.source_fields {
+            Some(source) => source.field_observed(id, work),
+            None => {
+                work.step()?;
+                Ok(None)
+            }
+        }
+    }
     pub fn carrier(&self, id: u32) -> Option<&DataType> {
-        self.carriers.get(&id)
+        self.carriers.get(&id).map(|carrier| &carrier.value)
     }
     pub fn field(&self, id: u32) -> Option<&Arc<Field>> {
-        self.fields.get(&id)
+        self.fields.get(&id).map(|field| &field.value)
     }
     /// Actual sparse Field namespace size for admission of opaque lookups.
     pub(crate) fn field_count(&self) -> usize {
@@ -252,6 +521,15 @@ impl DecodedTypeTable {
     /// Necessary inline table and occupied Field key/handle bytes only. This
     /// is not a private BTree capacity estimate or a complete shared backing
     /// invoice; the caller owns the truthful original-source union.
+    pub(crate) fn necessary_source_fields_retained_floor(&self) -> Result<usize, TypeCodecError> {
+        let entries = self
+            .source_field_count()
+            .checked_mul(std::mem::size_of::<u32>() + std::mem::size_of::<Arc<Field>>())
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        entries
+            .checked_add(std::mem::size_of::<Self>())
+            .ok_or_else(|| CompileControlError::ResourceExhausted.into())
+    }
     pub(crate) fn necessary_fields_retained_floor(&self) -> Result<usize, TypeCodecError> {
         let entry = std::mem::size_of::<u32>()
             .checked_add(std::mem::size_of::<Arc<Field>>())
@@ -269,11 +547,53 @@ impl DecodedTypeTable {
         id: u32,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<&Arc<Field>>, TypeCodecError> {
+        self.field_backing_observed(id, work)
+            .map(|field| field.map(|field| field.field()))
+    }
+    /// Borrow one exact SchemaDefinition Field and its reachable Arrow backing.
+    /// This loan carries neither a table marker nor semantic declaration/cache.
+    pub(crate) fn field_backing_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<SourceFieldBorrow<'_>>, TypeCodecError> {
         work.flush()?;
-        let field = self.fields.get(&id);
+        let field = self.fields.get(&id).map(|field| SourceFieldBorrow {
+            field: &field.value,
+            storage: &field.clone_storage,
+        });
         work.step()?;
         work.flush()?;
         Ok(field)
+    }
+    /// Only an explicitly paired source projection has an execution type.
+    pub fn field_execution_type(&self, id: u32) -> Option<&FunctionValueType> {
+        self.field_values.get(&id)
+    }
+    pub(crate) fn field_execution_type_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&FunctionValueType>, TypeCodecError> {
+        work.flush()?;
+        let value = self.field_values.get(&id);
+        work.step()?;
+        work.flush()?;
+        Ok(value)
+    }
+    pub(crate) fn value_type_count(&self) -> usize {
+        self.values.len()
+    }
+    pub(crate) fn value_type_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&FunctionValueType>, TypeCodecError> {
+        work.flush()?;
+        let value = self.values.get(&id);
+        work.step()?;
+        work.flush()?;
+        Ok(value)
     }
     pub fn value_type(&self, id: u32) -> Option<&FunctionValueType> {
         self.values.get(&id)
@@ -281,6 +601,138 @@ impl DecodedTypeTable {
     pub fn value_types(&self) -> impl ExactSizeIterator<Item = (u32, &FunctionValueType)> {
         self.values.iter().map(|(id, value)| (*id, value))
     }
+}
+
+/// Explicit pure author: no source invoice or receiving memory grant is minted.
+/// The caller retains its original control and borrowed source field owners.
+pub fn encode_source_field_table_pure_in(
+    fields: &[(u32, &Arc<Field>)],
+    limits: TypeProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::SourceFieldTable, TypeCodecError> {
+    encode::encode_source_fields_pure_in(fields, limits, work)
+}
+pub fn encode_source_field_table_with_creator<H>(
+    fields: &[(u32, &Arc<Field>)],
+    original_source_bytes: usize,
+    limits: PackageTypeProjectionLimits,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::SourceFieldTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>>
+{
+    encode::encode_source_fields_with_creator(fields, original_source_bytes, limits, creation, work)
+}
+
+/// Independently held source fields, with no value/logical namespace. Callers
+/// borrow both the exact Field and this creation lifetime into IPC preparation.
+/// One exact source occurrence. Cloning its lifetime preserves only the
+/// original Field and reachable physical child backing, never its namespace.
+#[derive(Clone, Copy)]
+pub struct SourceFieldBorrow<'a> {
+    field: &'a Arc<Field>,
+    storage: &'a novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl<'a> SourceFieldBorrow<'a> {
+    pub fn field(&self) -> &'a Arc<Field> {
+        self.field
+    }
+    pub fn storage_lifetime(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+        self.storage.clone()
+    }
+}
+
+pub struct DecodedSourceFieldTable {
+    pub(super) fields: BTreeMap<u32, Materialized<Arc<Field>>>,
+    pub(super) metadata_namespace: Option<novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>,
+    pub(super) creation_requests: Option<usize>,
+    pub(super) storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl DecodedSourceFieldTable {
+    pub fn creation_request_bytes_upper_bound(&self) -> Option<usize> {
+        self.creation_requests
+    }
+    pub fn field_borrow(&self, id: u32) -> Option<SourceFieldBorrow<'_>> {
+        self.fields.get(&id).map(|field| SourceFieldBorrow {
+            field: &field.value,
+            storage: &field.storage,
+        })
+    }
+    pub fn field_borrow_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<SourceFieldBorrow<'_>>, TypeCodecError> {
+        work.flush()?;
+        let field = self.field_borrow(id);
+        work.step()?;
+        work.flush()?;
+        Ok(field)
+    }
+    pub fn field_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&Arc<Field>>, TypeCodecError> {
+        self.field_borrow_observed(id, work)
+            .map(|field| field.map(|field| field.field()))
+    }
+    pub fn storage_lifetime(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+        self.storage.clone()
+    }
+    pub fn metadata_namespace(&self) -> Option<&novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>{
+        self.metadata_namespace.as_ref()
+    }
+}
+
+pub fn decode_source_field_table_with_creator<H>(
+    table: &wire::SourceFieldTable,
+    original_source_bytes: usize,
+    limits: PackageTypeProjectionLimits,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DecodedSourceFieldTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>>
+{
+    decode::decode_source_fields_with_creator(table, original_source_bytes, limits, creation, work)
+}
+
+/// Derive finite structural bounds from this source owner's actual vertices.
+/// The caller's actual source provenance and creator remain mandatory; no
+/// sender policy or synthetic receiving quota authorizes construction.
+pub fn decode_source_field_table_input_derived_with_creator<H>(
+    table: &wire::SourceFieldTable,
+    original_source_bytes: usize,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DecodedSourceFieldTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>>
+{
+    decode::decode_source_fields_input_derived_with_creator(
+        table,
+        original_source_bytes,
+        creation,
+        work,
+    )
+}
+
+/// The actual factory creates independent source Fields/carriers under the
+/// same input-derived receiver model, checkpoints and full namespace grammar.
+pub fn decode_source_field_table_input_derived_with_factory<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
+    table: &wire::SourceFieldTable,
+    original_source_bytes: usize,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    factory: &F,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DecodedSourceFieldTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>>
+{
+    decode::decode_source_fields_input_derived_with_factory(
+        table,
+        original_source_bytes,
+        creation,
+        factory,
+        work,
+    )
 }
 
 fn finish<T>(
@@ -327,30 +779,116 @@ impl<'source> ValueRootSources<'source> {
         layout.map_err(|_| CompileControlError::ResourceExhausted)
     }
 }
+/// One original field root and its optional explicitly authored execution binding.
+/// A missing binding denotes source facts only; attributes never infer semantics.
+#[derive(Clone, Copy)]
+pub struct BorrowedFieldTypeRoot<'source> {
+    pub id: u32,
+    pub field: &'source Arc<Field>,
+    pub value_type_id: Option<u32>,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum FieldRootSources<'source> {
     Owned(&'source [(u32, Arc<Field>)]),
     Borrowed(&'source [(u32, &'source Arc<Field>)]),
+    Associated(&'source [BorrowedFieldTypeRoot<'source>]),
 }
 impl<'source> FieldRootSources<'source> {
     pub(super) fn len(self) -> usize {
         match self {
             Self::Owned(roots) => roots.len(),
             Self::Borrowed(roots) => roots.len(),
+            Self::Associated(roots) => roots.len(),
         }
     }
     pub(super) fn iter(self) -> impl ExactSizeIterator<Item = (u32, &'source Arc<Field>)> {
         (0..self.len()).map(move |index| match self {
             Self::Owned(roots) => (roots[index].0, &roots[index].1),
             Self::Borrowed(roots) => roots[index],
+            Self::Associated(roots) => (roots[index].id, roots[index].field),
         })
+    }
+    pub(super) fn value_binding(self, ordinal: usize) -> Option<u32> {
+        match self {
+            Self::Associated(roots) => roots[ordinal].value_type_id,
+            Self::Owned(_) | Self::Borrowed(_) => None,
+        }
     }
     pub(super) fn payload_layout(self) -> Result<std::alloc::Layout, CompileControlError> {
         let layout = match self {
             Self::Owned(roots) => std::alloc::Layout::array::<(u32, Arc<Field>)>(roots.len()),
             Self::Borrowed(roots) => std::alloc::Layout::array::<(u32, &Arc<Field>)>(roots.len()),
+            Self::Associated(roots) => {
+                std::alloc::Layout::array::<BorrowedFieldTypeRoot<'_>>(roots.len())
+            }
         };
         layout.map_err(|_| CompileControlError::ResourceExhausted)
+    }
+}
+
+pub(super) fn combine_namespace_facts(
+    left: PackageTypeProjectionFacts,
+    right: PackageTypeProjectionFacts,
+    source: usize,
+) -> Result<PackageTypeProjectionFacts, TypeCodecError> {
+    let add = |a: usize, b: usize| {
+        a.checked_add(b)
+            .ok_or(CompileControlError::ResourceExhausted)
+    };
+    let left_extra = if left == PackageTypeProjectionFacts::default() {
+        0
+    } else {
+        left.coexisting_source_and_request_bytes_upper_bound
+            .checked_sub(source)
+            .ok_or(TypeCodecError::ResourceSource(
+                "completed namespace source prefix is understated",
+            ))?
+    };
+    let right_extra = right
+        .coexisting_source_and_request_bytes_upper_bound
+        .checked_sub(source)
+        .ok_or(TypeCodecError::ResourceSource(
+            "namespace source prefix is understated",
+        ))?;
+    Ok(PackageTypeProjectionFacts {
+        definition_count: add(left.definition_count, right.definition_count)?,
+        expanded_node_count: add(left.expanded_node_count, right.expanded_node_count)?,
+        string_bytes: add(left.string_bytes, right.string_bytes)?,
+        allocation_requests_upper_bound: add(
+            left.allocation_requests_upper_bound,
+            right.allocation_requests_upper_bound,
+        )?,
+        allocation_request_bytes_upper_bound: add(
+            left.allocation_request_bytes_upper_bound,
+            right.allocation_request_bytes_upper_bound,
+        )?,
+        coexisting_source_and_request_bytes_upper_bound: add(
+            source,
+            add(left_extra, right_extra)?,
+        )?,
+        cumulative_work_upper_bound: add(
+            left.cumulative_work_upper_bound,
+            right.cumulative_work_upper_bound,
+        )?,
+    })
+}
+pub(super) fn validate_namespace_facts(
+    f: &PackageTypeProjectionFacts,
+    l: PackageTypeProjectionLimits,
+) -> Result<(), CompileControlError> {
+    if f.definition_count > l.max_definitions
+        || f.expanded_node_count > l.max_expanded_nodes
+        || f.string_bytes > l.max_string_bytes
+        || f.allocation_requests_upper_bound > l.max_allocation_requests
+        || f.allocation_request_bytes_upper_bound > l.max_allocation_request_bytes
+        || f.coexisting_source_and_request_bytes_upper_bound
+            > l.max_coexisting_source_and_request_bytes
+        || f.cumulative_work_upper_bound > l.max_work
+    {
+        Err(CompileControlError::ResourceExhausted)
+    } else {
+        Ok(())
     }
 }
 
@@ -361,6 +899,8 @@ pub struct EncodedTypeTable<'source> {
     table: wire::TypeTable,
     values: ValueRootSources<'source>,
     fields: FieldRootSources<'source>,
+    source_table: Option<wire::SourceFieldTable>,
+    source_fields: FieldRootSources<'source>,
     writers: &'source [WriterTypeSource<'source>],
 }
 impl<'source> EncodedTypeTable<'source> {
@@ -370,12 +910,91 @@ impl<'source> EncodedTypeTable<'source> {
     pub fn into_wire(self) -> wire::TypeTable {
         self.table
     }
+    pub(crate) fn as_source_wire(&self) -> Option<&wire::SourceFieldTable> {
+        self.source_table.as_ref()
+    }
+    pub fn into_namespaces(self) -> (wire::TypeTable, Option<wire::SourceFieldTable>) {
+        (self.table, self.source_table)
+    }
+    pub(crate) fn source_field_captured<E>(
+        &self,
+        id: u32,
+        capture: &mut impl FnMut(&'source Arc<Field>, &mut CompileCheckpoints<'_>) -> Result<(), E>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source Arc<Field>>, E>
+    where
+        E: From<TypeCodecError>,
+    {
+        for (candidate, field) in self.source_fields.iter() {
+            let matches = candidate == id;
+            if matches {
+                capture(field, work)?;
+            }
+            work.step().map_err(TypeCodecError::from)?;
+            if matches {
+                return Ok(Some(field));
+            }
+        }
+        Ok(None)
+    }
+    pub(crate) fn source_field_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source Arc<Field>>, TypeCodecError> {
+        self.source_field_captured(id, &mut |_, _| Ok(()), work)
+    }
+    pub fn source_field_source_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source Field>, TypeCodecError> {
+        if let Some(field) = self.source_field_observed(id, work)? {
+            return Ok(Some(field.as_ref()));
+        }
+        for source in self.writers {
+            for (candidate, binding) in source
+                .field_ids
+                .iter()
+                .zip(source.recipe.input().fields_iter())
+            {
+                let matches = *candidate == id;
+                work.step()?;
+                if matches {
+                    return Ok(Some(binding.field()));
+                }
+            }
+        }
+        Ok(None)
+    }
+    pub fn source_field_value_type_id_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<u32>, TypeCodecError> {
+        for source in self.writers {
+            for (ordinal, candidate) in source.field_ids.iter().enumerate() {
+                let matches = *candidate == id;
+                work.step()?;
+                if matches {
+                    let ids = source.value_ids.ok_or(TypeCodecError::InvalidShape(
+                        "writer source has no explicit value namespace association",
+                    ))?;
+                    return ids.get(ordinal).copied().map(Some).ok_or(
+                        TypeCodecError::InvalidShape("writer value association is absent"),
+                    );
+                }
+            }
+        }
+        Ok(None)
+    }
     /// Counts for caller admission of repeated root lookups. No index, source
     /// copy or maximum-ID-indexed storage is created by this owner.
     pub(crate) fn source_counts(&self) -> (usize, usize) {
         (
             self.values.len(),
             self.fields.len()
+                + self.source_fields.len()
                 + self
                     .writers
                     .iter()
@@ -466,6 +1085,39 @@ impl<'source> EncodedTypeTable<'source> {
         }
         Ok(None)
     }
+    /// Borrow the complete explicitly paired execution author retained by the
+    /// immutable emission. Source-only fields return None rather than deriving
+    /// semantics from Arrow facts.
+    pub fn field_execution_type_observed(
+        &self,
+        id: u32,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'source FunctionValueType>, TypeCodecError> {
+        for (ordinal, (candidate, _)) in self.fields.iter().enumerate() {
+            let matches = candidate == id;
+            work.step()?;
+            if matches {
+                return match self.fields.value_binding(ordinal) {
+                    Some(binding_id) => self.value_type_observed(binding_id, work),
+                    None => Ok(None),
+                };
+            }
+        }
+        for source in self.writers {
+            for (candidate, binding) in source
+                .field_ids
+                .iter()
+                .zip(source.recipe.input().fields_iter())
+            {
+                let matches = *candidate == id;
+                work.step()?;
+                if matches {
+                    return Ok(binding.execution_type());
+                }
+            }
+        }
+        Ok(None)
+    }
     /// Borrow the actual authored root Field. Writer fields remain inline in
     /// their original immutable recipe; no Arc wrapper or equal-content copy
     /// is manufactured to satisfy a later namespace consumer.
@@ -531,6 +1183,7 @@ impl<'source> EncodedTypeTable<'source> {
 pub struct WriterTypeSource<'source> {
     recipe: &'source novarocks_connector_contract::ConnectorWriteRecipeDraft,
     field_ids: &'source [u32],
+    value_ids: Option<&'source [u32]>,
 }
 impl<'source> WriterTypeSource<'source> {
     pub(crate) fn recipe(
@@ -545,7 +1198,22 @@ impl<'source> WriterTypeSource<'source> {
         recipe: &'source novarocks_connector_contract::ConnectorWriteRecipeDraft,
         field_ids: &'source [u32],
     ) -> Self {
-        Self { recipe, field_ids }
+        Self {
+            recipe,
+            field_ids,
+            value_ids: None,
+        }
+    }
+    pub(crate) fn new_with_value_ids(
+        recipe: &'source novarocks_connector_contract::ConnectorWriteRecipeDraft,
+        field_ids: &'source [u32],
+        value_ids: &'source [u32],
+    ) -> Self {
+        Self {
+            recipe,
+            field_ids,
+            value_ids: Some(value_ids),
+        }
     }
 }
 
@@ -579,6 +1247,8 @@ pub fn encode_type_table_writer_sources_observed<'source>(
         values,
         fields,
         writers,
+        source_table: None,
+        source_fields: FieldRootSources::Borrowed(&[]),
     })
 }
 
@@ -610,6 +1280,8 @@ pub fn encode_borrowed_type_table_writer_sources_in<'source>(
         values,
         fields,
         writers,
+        source_table: None,
+        source_fields: FieldRootSources::Borrowed(&[]),
     })
 }
 
@@ -646,7 +1318,91 @@ pub fn encode_borrowed_type_table_writer_sources_with_host_in<'source, H>(
         values,
         fields,
         writers,
+        source_table: None,
+        source_fields: FieldRootSources::Borrowed(&[]),
     })
+}
+
+/// Pure original-source author using the same associated field emitter.
+/// No source invoice or receiving memory profile is invented by this entry.
+pub fn encode_borrowed_type_table_associated_sources_pure_in<'source>(
+    values: &'source [(u32, &'source FunctionValueType)],
+    fields: &'source [BorrowedFieldTypeRoot<'source>],
+    limits: TypeProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<EncodedTypeTable<'source>, TypeCodecError> {
+    let table = encode::encode_associated_sources_pure_in(values, fields, limits, work)?;
+    Ok(EncodedTypeTable {
+        table,
+        values: ValueRootSources::Borrowed(values),
+        fields: FieldRootSources::Associated(fields),
+        writers: &[],
+        source_table: None,
+        source_fields: FieldRootSources::Borrowed(&[]),
+    })
+}
+
+/// Encode source fields and explicit execution-field associations under the
+/// same original resource/graph body. Associations refer to supplied value IDs;
+/// they never manufacture a value author from a Field or its attributes.
+pub fn encode_borrowed_type_table_associated_sources_with_host_in<'source, H>(
+    values: &'source [(u32, &'source FunctionValueType)],
+    fields: &'source [BorrowedFieldTypeRoot<'source>],
+    writers: &'source [WriterTypeSource<'source>],
+    source_retained_bytes: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(
+        &PackageTypeProjectionFacts,
+    ) -> Result<(), crate::host_projection_v2::AdmissionRefusal<H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    EncodedTypeTable<'source>,
+    crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+> {
+    let values = ValueRootSources::Borrowed(values);
+    let fields = FieldRootSources::Associated(fields);
+    let table = encode::encode_writer_sources_with_host(
+        values,
+        fields,
+        writers,
+        source_retained_bytes,
+        limits,
+        admit,
+        work,
+    )?;
+    Ok(EncodedTypeTable {
+        table,
+        values,
+        fields,
+        writers,
+        source_table: None,
+        source_fields: FieldRootSources::Borrowed(&[]),
+    })
+}
+
+pub fn encode_borrowed_type_table_associated_sources_in<'source>(
+    values: &'source [(u32, &'source FunctionValueType)],
+    fields: &'source [BorrowedFieldTypeRoot<'source>],
+    writers: &'source [WriterTypeSource<'source>],
+    source_retained_bytes: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<EncodedTypeTable<'source>, TypeCodecError> {
+    encode_borrowed_type_table_associated_sources_with_host_in(
+        values,
+        fields,
+        writers,
+        source_retained_bytes,
+        limits,
+        &mut |facts| {
+            admit(facts).map_err(
+                crate::host_projection_v2::AdmissionRefusal::<std::convert::Infallible>::Control,
+            )
+        },
+        work,
+    )
+    .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
 }
 
 /// Project source roots once and retain their original borrowed identity for
@@ -666,6 +1422,8 @@ pub fn encode_type_table_sources<'source>(
         values: ValueRootSources::Owned(values),
         fields: FieldRootSources::Owned(fields),
         writers: &[],
+        source_table: None,
+        source_fields: FieldRootSources::Borrowed(&[]),
     })
 }
 
@@ -690,7 +1448,18 @@ pub fn encode_type_table_with_fields(
     encode_type_table_sources(values, fields, limits, control).map(EncodedTypeTable::into_wire)
 }
 
+/// Expansion-only alias for the independently controlled pure codec helper.
+/// Production package creators must supply storage through the observed entry.
 pub fn decode_type_table(
+    table: &wire::TypeTable,
+    limits: TypeProjectionLimits,
+    control: &dyn PureCompileControl,
+) -> Result<DecodedTypeTable, TypeCodecError> {
+    decode_type_table_pure(table, limits, control)
+}
+
+/// Pure post-Prost projection for tests and pure callers; it holds no host stock.
+pub fn decode_type_table_pure(
     table: &wire::TypeTable,
     limits: TypeProjectionLimits,
     control: &dyn PureCompileControl,
@@ -698,41 +1467,6 @@ pub fn decode_type_table(
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = decode::decode(table, limits, &mut work);
     finish(work, result)
-}
-
-pub(crate) fn encode_logical(logical: ValueLogicalType) -> i32 {
-    use wire::LogicalType as W;
-    (match logical {
-        ValueLogicalType::Physical => W::Physical,
-        ValueLogicalType::Json => W::Json,
-        ValueLogicalType::Variant => W::Variant,
-        ValueLogicalType::Hll => W::Hll,
-        ValueLogicalType::Bitmap => W::Bitmap,
-        ValueLogicalType::Object => W::Object,
-        ValueLogicalType::Percentile => W::Percentile,
-        ValueLogicalType::LargeInt => W::LargeInt,
-        ValueLogicalType::Uuid => W::Uuid,
-    }) as i32
-}
-
-pub(crate) fn decode_logical(logical: i32) -> Result<ValueLogicalType, TypeCodecError> {
-    use wire::LogicalType as W;
-    Ok(match W::try_from(logical) {
-        Ok(W::Physical) => ValueLogicalType::Physical,
-        Ok(W::Json) => ValueLogicalType::Json,
-        Ok(W::Variant) => ValueLogicalType::Variant,
-        Ok(W::Hll) => ValueLogicalType::Hll,
-        Ok(W::Bitmap) => ValueLogicalType::Bitmap,
-        Ok(W::Object) => ValueLogicalType::Object,
-        Ok(W::Percentile) => ValueLogicalType::Percentile,
-        Ok(W::LargeInt) => ValueLogicalType::LargeInt,
-        Ok(W::Uuid) => ValueLogicalType::Uuid,
-        _ => {
-            return Err(TypeCodecError::InvalidShape(
-                "unknown or unspecified logical type",
-            ));
-        }
-    })
 }
 
 fn observe_bytes(bytes: &[u8], work: &mut CompileCheckpoints<'_>) -> Result<(), TypeCodecError> {
@@ -762,123 +1496,42 @@ impl ValueTypeCloneFacts {
     }
 }
 
-/// Admit the original bounded clone preflight before walking its immutable
-/// source. This is a numerical ceiling, never synthetic completed work.
+/// The immutable FVT clone performs two strong-handle increments. The
+/// preflight inspects no semantic/layout tree and reserves no allocation.
 pub(crate) const fn value_type_clone_preflight_work_upper_bound() -> usize {
-    16 + 8 * novarocks_type_contract::MAX_VALUE_TYPE_NODES
+    2
 }
 
-/// The sole clone author's known root contribution, before a lookup callback.
-/// Shared FieldRef children have no independently owned request at this root.
 pub(crate) fn value_type_clone_root_facts(
-    value: &FunctionValueType,
+    _value: &FunctionValueType,
 ) -> Result<ValueTypeCloneFacts, TypeCodecError> {
-    value_type_clone_facts(1, value_type_clone_requests(&value.data_type, 0)?)
+    Ok(ValueTypeCloneFacts {
+        requests: 0,
+        bytes: 0,
+        work: 2,
+    })
 }
-
-fn value_type_clone_requests(carrier: &DataType, requests: usize) -> Result<usize, TypeCodecError> {
-    if matches!(carrier, DataType::Dictionary(_, _)) {
-        requests.checked_add(2).ok_or(TypeCodecError::InvalidShape(
-            "value type clone request count overflow",
-        ))
-    } else {
-        Ok(requests)
-    }
-}
-
-/// Fixed borrowed scratch covers only children which the sole clone author
-/// actually clones. Dictionaries underneath shared FieldRef owners allocate
-/// nothing here. This is numerical admission, not a host allocation grant.
 pub(crate) fn preflight_value_type_clone(
     value: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ValueTypeCloneFacts, TypeCodecError> {
     preflight_value_type_clone_admitted(value, &mut |_, _| Ok(()), work)
 }
-
-/// The same clone grammar exposes each captured request prefix before the
-/// next completed-work checkpoint. Admission owns no scope or observation.
 pub(crate) fn preflight_value_type_clone_admitted<E: From<TypeCodecError>>(
     value: &FunctionValueType,
     admit: &mut impl FnMut(ValueTypeCloneFacts, &mut CompileCheckpoints<'_>) -> Result<(), E>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ValueTypeCloneFacts, E> {
-    use novarocks_type_contract::{MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES};
-    let mut pending = [None; MAX_VALUE_TYPE_DEPTH + 1];
-    pending[0] = Some((&value.data_type, 1usize));
-    let mut length = 1usize;
-    let mut nodes = 0usize;
-    let mut requests = 0usize;
-    while length != 0 {
-        length -= 1;
-        let (carrier, depth) = pending[length].take().ok_or(TypeCodecError::InvalidShape(
-            "value type clone scratch is empty",
-        ))?;
-        nodes = nodes.checked_add(1).ok_or(TypeCodecError::InvalidShape(
-            "value type clone node count overflow",
-        ))?;
-        if nodes > MAX_VALUE_TYPE_NODES || depth > MAX_VALUE_TYPE_DEPTH {
-            work.step().map_err(TypeCodecError::from)?;
-            return Err(TypeCodecError::InvalidShape(
-                "value type clone exceeds the checked carrier grammar",
-            )
-            .into());
-        }
-        requests = value_type_clone_requests(carrier, requests)?;
-        if let DataType::Dictionary(key, item) = carrier {
-            // Preserve the original ordinary-error checkpoint and its grammar.
-            if length + 2 > pending.len() {
-                work.step().map_err(TypeCodecError::from)?;
-                return Err(TypeCodecError::InvalidShape(
-                    "value type clone scratch capacity exceeded",
-                )
-                .into());
-            }
-            admit(value_type_clone_facts(nodes, requests)?, work)?;
-            work.step().map_err(TypeCodecError::from)?;
-            pending[length] = Some((item.as_ref(), depth + 1));
-            pending[length + 1] = Some((key.as_ref(), depth + 1));
-            length += 2;
-            work.step().map_err(TypeCodecError::from)?;
-        } else {
-            admit(value_type_clone_facts(nodes, requests)?, work)?;
-            work.step().map_err(TypeCodecError::from)?;
-        }
-    }
-    let facts = value_type_clone_facts(nodes, requests)?;
+    let facts = value_type_clone_root_facts(value)?;
     admit(facts, work)?;
     work.step().map_err(TypeCodecError::from)?;
     Ok(facts)
 }
-
-fn value_type_clone_facts(
-    nodes: usize,
-    requests: usize,
-) -> Result<ValueTypeCloneFacts, TypeCodecError> {
-    let bytes = std::alloc::Layout::array::<DataType>(requests)
-        .map_err(|_| TypeCodecError::InvalidShape("value type clone layout is unrepresentable"))?
-        .size();
-    let bound = nodes.checked_mul(8).and_then(|n| n.checked_add(16)).ok_or(
-        TypeCodecError::InvalidShape("value type clone work overflow"),
-    )?;
-    Ok(ValueTypeCloneFacts {
-        requests,
-        bytes,
-        work: bound,
-    })
-}
-
-/// Preserve every value-root flag through the same carrier clone author.
-/// The composing caller must first admit preflight_value_type_clone's facts.
 pub(crate) fn clone_value_type_observed(
     value: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<FunctionValueType, TypeCodecError> {
-    Ok(FunctionValueType {
-        data_type: clone_carrier(&value.data_type, work)?,
-        nullable: value.nullable,
-        logical_type: value.logical_type,
-    })
+    value.clone_observed(|| work.step().map_err(TypeCodecError::from))
 }
 
 fn clone_carrier(
@@ -994,7 +1647,7 @@ pub(crate) fn validate_type(
     ty: &DataType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), TypeCodecError> {
-    validate_value_type_structure_observed(ty, |visit| validate_type_visit(visit, work))
+    validate_arrow_layout_structure_observed(ty, |visit| validate_type_visit(visit, work))
 }
 
 /// The same carrier and Field author on the sole shared grammar. The caller
@@ -1050,7 +1703,7 @@ pub(crate) fn validate_type_with_scratch_host_observed<'source, H>(
     >();
     admit_scratch(layout)?;
     let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
-    novarocks_type_contract::validate_value_type_structure_with_scratch_observed(
+    novarocks_type_contract::validate_arrow_layout_structure_with_scratch_observed(
         ty,
         &mut scratch,
         |visit| {
@@ -1088,3 +1741,80 @@ pub(crate) mod sender_tests;
 
 #[cfg(test)]
 mod constant_source_tests;
+
+#[cfg(test)]
+mod typed_binding_tests;
+
+#[cfg(test)]
+#[path = "physical_type_v2/source_fields_tests.rs"]
+pub(crate) mod source_fields_tests;
+
+/// Actual package sender: independent execution and source owners share the
+/// original numerical admission prefix, source invoice and caller checkpoints.
+pub(crate) fn encode_borrowed_type_namespaces_sources_in<'source>(
+    values: &'source [(u32, &'source FunctionValueType)],
+    fields: &'source [BorrowedFieldTypeRoot<'source>],
+    source_fields: &'source [(u32, &'source Arc<Field>)],
+    writers: &'source [WriterTypeSource<'source>],
+    source: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<EncodedTypeTable<'source>, TypeCodecError> {
+    let mut completed = PackageTypeProjectionFacts::default();
+    let table = encode::encode_writer_sources(
+        ValueRootSources::Borrowed(values),
+        FieldRootSources::Associated(fields),
+        &[],
+        source,
+        limits,
+        &mut |facts| {
+            validate_namespace_facts(facts, limits)?;
+            admit(facts)?;
+            completed = *facts;
+            Ok(())
+        },
+        work,
+    )?;
+    let source_table = encode::encode_source_writer_sources(
+        source_fields,
+        writers,
+        source,
+        limits,
+        &mut |facts| {
+            let combined = combine_namespace_facts(completed, *facts, source)?;
+            validate_namespace_facts(&combined, limits)?;
+            admit(&combined).map_err(TypeCodecError::from)
+        },
+        work,
+    )?;
+    Ok(EncodedTypeTable {
+        table,
+        values: ValueRootSources::Borrowed(values),
+        fields: FieldRootSources::Associated(fields),
+        source_table: Some(source_table),
+        source_fields: FieldRootSources::Borrowed(source_fields),
+        writers,
+    })
+}
+
+/// Explicit pure sender: both namespaces borrow their real original authors.
+/// No receiving memory/work profile or source invoice is minted for FE.
+pub(crate) fn encode_borrowed_type_namespaces_pure_in<'source>(
+    values: &'source [(u32, &'source FunctionValueType)],
+    fields: &'source [BorrowedFieldTypeRoot<'source>],
+    source_fields: &'source [(u32, &'source Arc<Field>)],
+    limits: TypeProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<EncodedTypeTable<'source>, TypeCodecError> {
+    let table = encode::encode_associated_sources_pure_in(values, fields, limits, work)?;
+    let source_table = encode::encode_source_fields_pure_in(source_fields, limits, work)?;
+    Ok(EncodedTypeTable {
+        table,
+        values: ValueRootSources::Borrowed(values),
+        fields: FieldRootSources::Associated(fields),
+        source_table: Some(source_table),
+        source_fields: FieldRootSources::Borrowed(source_fields),
+        writers: &[],
+    })
+}

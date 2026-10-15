@@ -38,7 +38,7 @@ fn checked_input<'a>(
     source: &FunctionValueType,
     array: &'a dyn Array,
 ) -> Result<CollectionOffsets<'a>, KernelFailure> {
-    if source.logical_type != ValueLogicalType::Physical {
+    if source.logical_type() != ValueLogicalType::Physical {
         return Err(invalid(
             "cardinality requires its selected Physical collection domain",
         ));
@@ -46,7 +46,7 @@ fn checked_input<'a>(
     // The original ScalarCallInput wrapper has already compared full fields
     // through the observed type author. Here only the concrete root class is
     // checked; a second uncontrolled recursive Arrow equality is unnecessary.
-    match &source.data_type {
+    match source.data_type() {
         DataType::List(_) => {
             let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
                 internal("cardinality exact List source has a foreign carrier class")
@@ -103,9 +103,9 @@ pub(super) fn evaluate_collection_cardinality<'a>(
             ));
         };
         let target = input.contract().result_type();
-        let exact = target.logical_type == ValueLogicalType::Physical
-            && target.data_type == DataType::Int32
-            && target.nullable;
+        let exact = target.logical_type() == ValueLogicalType::Physical
+            && target.data_type() == &DataType::Int32
+            && target.nullable();
         work.borrow_mut().step()?;
         if !exact {
             return Err(invalid(
@@ -138,7 +138,7 @@ pub(super) fn evaluate_collection_cardinality<'a>(
                 }
                 let source_null = argument.array().is_null(row);
                 work.borrow_mut().step()?;
-                if source_null && !source.nullable {
+                if source_null && !source.nullable() {
                     return Err(internal(
                         "cardinality non-null source contains selected SQL NULL",
                     ));
@@ -173,7 +173,7 @@ pub(super) fn evaluate_collection_cardinality<'a>(
         })?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.borrow_mut().step(),

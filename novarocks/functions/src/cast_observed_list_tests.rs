@@ -68,7 +68,7 @@ fn input(null: bool, rows: usize) -> ArrayRef {
                 .collect::<Vec<_>>(),
         ))
     };
-    Arc::new(ListArray::new(
+    let raw: ArrayRef = Arc::new(ListArray::new(
         Arc::new(Field::new("", values.data_type().clone(), true)),
         OffsetBuffer::new(ScalarBuffer::from(
             (0..=rows)
@@ -79,10 +79,15 @@ fn input(null: bool, rows: usize) -> ArrayRef {
         Some(NullBuffer::from(
             (0..rows).map(|i| i % 3 != 1).collect::<Vec<_>>(),
         )),
-    ))
+    ));
+    crate::test_value_ingress::array_for_binding(
+        &raw,
+        &FunctionValueType::new(raw.data_type().clone(), true),
+    )
+    .unwrap()
 }
 fn target(null: bool, id: &str) -> DataType {
-    DataType::List(Arc::new(
+    let raw = DataType::List(Arc::new(
         Field::new(
             "element",
             if null {
@@ -96,7 +101,8 @@ fn target(null: bool, id: &str) -> DataType {
             ("PARQUET:field_id".to_string(), id.to_string()),
             ("custom".to_string(), "preserve exactly".to_string()),
         ])),
-    ))
+    ));
+    FunctionValueType::new(raw, true).data_type().clone()
 }
 fn recipe(
     a: &ArrayRef,
@@ -106,13 +112,37 @@ fn recipe(
 ) -> PreparedCastRecipe {
     PreparedCastRecipe::try_new(
         CastOperation::Carrier,
-        &FunctionValueType::new(a.data_type().clone(), true),
-        &FunctionValueType::new(target.clone(), true),
+        &FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true),
+        &FunctionValueType::from_legacy_declared_projection(target.clone(), true),
         policy,
         allow,
         &Control::default(),
     )
     .unwrap()
+}
+impl PreparedCastRecipe {
+    /// Identical normalized bindings use the runtime identity edge. These
+    /// cases exercise the independent selected-copy primitive directly.
+    fn evaluate_list_primitive_for_test<'a>(
+        &self,
+        argument: EvaluatedArgument<'_>,
+        selection: Selection<'a>,
+        inherited: &[crate::RowDataError],
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<crate::SelectedValues<'a>, KernelFailure> {
+        if self.is_identity() {
+            crate::list_cast_selected::evaluate(
+                self.source_type(),
+                self.result_type(),
+                argument,
+                selection,
+                inherited,
+                control,
+            )
+        } else {
+            self.evaluate_collection(argument, selection, inherited, control)
+        }
+    }
 }
 fn legacy(a: &ArrayRef, ty: &DataType) -> ArrayRef {
     let DataType::List(field) = ty else {
@@ -159,8 +189,8 @@ fn list_cast_recipe_all_observed_profiles_policies_sparse_empty_and_slices() {
         ] {
             for allow in [false, true] {
                 let r = recipe(&full, &target, policy, allow);
-                assert!(r.is_collection());
-                assert!(!r.is_identity());
+                assert!(r.is_collection() || r.is_identity());
+                assert_eq!(r.is_identity(), !null);
                 assert_eq!(r.policy(), policy);
                 assert_eq!(r.allow_throw_exception(), allow);
                 for a in [full.clone(), full.slice(1, 5), full.slice(3, 0)] {
@@ -171,7 +201,7 @@ fn list_cast_recipe_all_observed_profiles_policies_sparse_empty_and_slices() {
                     ] {
                         let selection = Selection::try_sparse(a.len(), &rows).unwrap();
                         let result = r
-                            .evaluate_collection(
+                            .evaluate_list_primitive_for_test(
                                 EvaluatedArgument::Column(&a),
                                 selection,
                                 &[],
@@ -200,7 +230,8 @@ fn list_cast_recipe_pool_ordinal_scalar_and_selected_compact_address_are_distinc
         let full = input(null, 7);
         let target = target(null, "7");
         let r = recipe(&full, &target, DecimalOverflowPolicy::OutputNull, false);
-        let value_type = FunctionValueType::new(full.data_type().clone(), true);
+        let value_type =
+            FunctionValueType::from_legacy_declared_projection(full.data_type().clone(), true);
         let pool = ConstantPool::try_new(
             Arc::new(value_type.try_to_field("pool").unwrap()),
             value_type,
@@ -225,7 +256,7 @@ fn list_cast_recipe_pool_ordinal_scalar_and_selected_compact_address_are_distinc
         let rows = [1, 8, 17];
         let selection = Selection::try_sparse(18, &rows).unwrap();
         let out = r
-            .evaluate_collection(
+            .evaluate_list_primitive_for_test(
                 EvaluatedArgument::Constant(&constant),
                 selection,
                 &[],
@@ -241,7 +272,7 @@ fn list_cast_recipe_pool_ordinal_scalar_and_selected_compact_address_are_distinc
         same(out.values(), &expanded);
         let scalar = full.slice(5, 1);
         let out = r
-            .evaluate_collection(
+            .evaluate_list_primitive_for_test(
                 EvaluatedArgument::Scalar(&scalar),
                 selection,
                 &[],
@@ -256,7 +287,7 @@ fn list_cast_recipe_pool_ordinal_scalar_and_selected_compact_address_are_distinc
             SelectedValues::try_new(selection, dense.data_type(), dense.clone(), Box::new([]))
                 .unwrap();
         let out = r
-            .evaluate_collection(
+            .evaluate_list_primitive_for_test(
                 EvaluatedArgument::SelectedColumn(&selected),
                 selection,
                 selected.errors(),
@@ -267,7 +298,7 @@ fn list_cast_recipe_pool_ordinal_scalar_and_selected_compact_address_are_distinc
         let wrong_rows = [0, 8, 17];
         let wrong = Selection::try_sparse(18, &wrong_rows).unwrap();
         assert!(matches!(
-            r.evaluate_collection(
+            r.evaluate_list_primitive_for_test(
                 EvaluatedArgument::SelectedColumn(&selected),
                 wrong,
                 selected.errors(),
@@ -294,7 +325,7 @@ fn list_cast_recipe_inherited_errors_do_not_demand_child_rows_or_become_new_data
     let selected =
         SelectedValues::try_new(selection, dense.data_type(), dense.clone(), inherited).unwrap();
     let result = r
-        .evaluate_collection(
+        .evaluate_list_primitive_for_test(
             EvaluatedArgument::SelectedColumn(&selected),
             selection,
             selected.errors(),
@@ -314,7 +345,7 @@ fn list_cast_recipe_selected_children_do_not_retain_inactive_payload() {
         let rows = [5];
         let selected = Selection::try_sparse(7, &rows).unwrap();
         let out = r
-            .evaluate_collection(
+            .evaluate_list_primitive_for_test(
                 EvaluatedArgument::Column(&a),
                 selected,
                 &[],
@@ -349,8 +380,8 @@ fn list_cast_recipe_no_new_row_error_and_explicit_unsupported_child_forms() {
         assert_eq!(
             PreparedCastRecipe::try_new(
                 CastOperation::Carrier,
-                &FunctionValueType::new(a.data_type().clone(), true),
-                &FunctionValueType::new(target, true),
+                &FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true),
+                &FunctionValueType::from_legacy_declared_projection(target, true),
                 DecimalOverflowPolicy::OutputNull,
                 false,
                 &Control::default()
@@ -358,12 +389,12 @@ fn list_cast_recipe_no_new_row_error_and_explicit_unsupported_child_forms() {
             Err(CastPrepareError::Unsupported)
         );
     }
-    let physical = FunctionValueType::new(a.data_type().clone(), true);
+    let physical = FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true);
     assert_eq!(
         PreparedCastRecipe::try_new(
             CastOperation::Carrier,
             &physical,
-            &FunctionValueType::new(ty, false),
+            &FunctionValueType::from_legacy_declared_projection(ty, false),
             DecimalOverflowPolicy::OutputNull,
             false,
             &Control::default()
@@ -379,7 +410,7 @@ fn list_cast_recipe_every_callback_preserves_seven_causes_and_no_footer() {
         let r = recipe(&a, &ty, DecimalOverflowPolicy::ReportError, true);
         let selection = Selection::all(a.len());
         let ok = Control::default();
-        r.evaluate_collection(EvaluatedArgument::Column(&a), selection, &[], &ok)
+        r.evaluate_list_primitive_for_test(EvaluatedArgument::Column(&a), selection, &[], &ok)
             .unwrap();
         let callbacks = ok.trace.lock().unwrap().len();
         assert!(callbacks > 8);
@@ -390,8 +421,13 @@ fn list_cast_recipe_every_callback_preserves_seven_causes_and_no_footer() {
                     refusal: Some((stop, cause.clone())),
                 };
                 assert_eq!(
-                    r.evaluate_collection(EvaluatedArgument::Column(&a), selection, &[], &control)
-                        .unwrap_err(),
+                    r.evaluate_list_primitive_for_test(
+                        EvaluatedArgument::Column(&a),
+                        selection,
+                        &[],
+                        &control
+                    )
+                    .unwrap_err(),
                     cause
                 );
                 assert_eq!(control.trace.lock().unwrap().len(), stop + 1);
@@ -410,7 +446,7 @@ fn list_cast_recipe_constant_null_root_broadcast_and_nested_logical_identity_gua
     let rows = [0, 3, 17];
     let selection = Selection::try_sparse(18, &rows).unwrap();
     let result = r
-        .evaluate_collection(
+        .evaluate_list_primitive_for_test(
             EvaluatedArgument::Scalar(&scalar),
             selection,
             &[],
@@ -429,12 +465,12 @@ fn list_cast_recipe_constant_null_root_broadcast_and_nested_logical_identity_gua
     );
     let json = DataType::List(Arc::new(field.as_ref().clone().with_metadata(meta)));
     // A nominal child may not silently become Physical just because Utf8 is shared.
-    let source = FunctionValueType::new(json, true);
+    let source = FunctionValueType::from_legacy_declared_projection(json, true);
     assert_eq!(
         PreparedCastRecipe::try_new(
             CastOperation::Carrier,
             &source,
-            &FunctionValueType::new(target, true),
+            &FunctionValueType::from_legacy_declared_projection(target, true),
             DecimalOverflowPolicy::OutputNull,
             false,
             &Control::default()

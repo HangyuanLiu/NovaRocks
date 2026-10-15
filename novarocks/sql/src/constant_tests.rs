@@ -74,10 +74,10 @@ fn admit(value: LiteralValue, ty: &FunctionValueType) -> ConstantValue {
     assert_eq!(value.ordinal(), 0);
     assert_eq!(value.pool().array().len(), 1);
     assert_eq!(value.value_type(), ty);
-    assert_eq!(
-        value.pool().field_ref().as_ref(),
-        &ty.try_to_field("literal").unwrap()
-    );
+    assert_eq!(value.pool().field_ref().name(), "literal");
+    assert_eq!(value.pool().field_ref().data_type(), ty.data_type());
+    assert_eq!(value.pool().field_ref().is_nullable(), ty.nullable());
+    assert_eq!(value.pool().field_ref().metadata().capacity(), 0);
     value
 }
 fn refused(value: LiteralValue, ty: &FunctionValueType) {
@@ -551,7 +551,7 @@ fn syntax_temporal_integer_routes_keep_actual_units_timezone_and_signed_counts()
                         .value(0),
                 };
                 assert_eq!(actual, input);
-                assert_eq!(array.data_type(), &declared.data_type);
+                assert_eq!(array.data_type().clone(), declared.data_type().clone());
             }
         }
     }
@@ -572,4 +572,33 @@ fn syntax_decimal_accepts_explicit_sign_and_fraction_without_integer_digits() {
         wide.try_decimal256().unwrap(),
         Some(arrow::datatypes::i256::from_i128(50))
     );
+}
+#[test]
+fn pure_nominal_constant_author_keeps_semantics_out_of_field_metadata() {
+    use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+    let control = Control::new(None);
+    for (literal, carrier, domain) in [
+        (
+            crate::common::LiteralValue::String("{}".into()),
+            arrow::datatypes::DataType::Utf8,
+            ValueLogicalType::Json,
+        ),
+        (
+            crate::common::LiteralValue::LargeInt(7),
+            arrow::datatypes::DataType::FixedSizeBinary(16),
+            ValueLogicalType::LargeInt,
+        ),
+    ] {
+        let declared = FunctionValueType::try_with_logical_type(carrier, false, domain).unwrap();
+        let value = super::admit_syntax_constant(
+            &literal,
+            &declared,
+            super::test_constant_policy(),
+            &control,
+        )
+        .unwrap();
+        assert_eq!(value.value_type(), &declared);
+        assert_eq!(value.pool().field_ref().metadata().capacity(), 0);
+        assert!(value.pool().source_metadata_namespace().is_none());
+    }
 }

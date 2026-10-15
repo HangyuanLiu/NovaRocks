@@ -2577,7 +2577,7 @@ mod tests {
             );
             assert_eq!(ledger.raw_bytes(), 0);
         }
-        for revision in [3, 4] {
+        for revision in [3, 4, 5] {
             for category in [
                 ConnectorCodecCategory::WriteHandle,
                 ConnectorCodecCategory::CommitFragment,

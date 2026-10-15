@@ -445,7 +445,7 @@ mod tests {
         // immutable rewrite artifact, and it is entirely independent of a
         // merge source: it names an object the source never produces.
         let artifact = IcebergRewriteArtifactContentId::try_new(
-            "s3://warehouse/db/t/_rewrite/0199",
+            novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([1; 16]),
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         )
         .expect("artifact content id");
@@ -456,7 +456,7 @@ mod tests {
         // A page source and an ordinary scan produce no content digest at all,
         // so nothing about the plan can be derived from the artifact.
         assert_ne!(
-            artifact.artifact_location(),
+            artifact.operation_id().to_string(),
             plan.table_handle().table_location()
         );
     }

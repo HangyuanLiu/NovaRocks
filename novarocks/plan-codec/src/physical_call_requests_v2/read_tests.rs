@@ -173,6 +173,7 @@ fn value_argument(
 }
 fn request(id: u32) -> wire::OriginalCallRequest {
     wire::OriginalCallRequest {
+        request_id: None,
         definition: Some(expression(id)),
         arguments: vec![],
         logical_argument_count: Some(0),
@@ -403,7 +404,7 @@ fn original_request_decode_preserves_none_typed_null_cv_ordinal_full_lambda_and_
     let c = Control::default();
     let token = prepare_call_requests_decode(Some(&raw), &t, &pools, SOURCE, limits(), &c).unwrap();
     assert!(std::ptr::eq(token.source, &raw));
-    assert!(std::ptr::eq(token.types, &t));
+    assert!(matches!(token.types,CallRequestTypeOwner::Package(source) if std::ptr::eq(source,&t)));
     assert!(std::ptr::eq(token._pools, &pools));
     let output = decode_call_requests(token).unwrap();
     let request = &output[0].1;
@@ -449,23 +450,24 @@ fn original_request_decode_preserves_none_typed_null_cv_ordinal_full_lambda_and_
     };
     assert_eq!(parameter_types.len(), 4);
     assert_eq!(result_type, t.value_type(7).unwrap());
-    assert_eq!(parameter_types[2].logical_type, ValueLogicalType::Json);
+    assert_eq!(parameter_types[2].logical_type(), ValueLogicalType::Json);
     let (DataType::Struct(a), DataType::Struct(b)) = (
-        &parameter_types[0].data_type,
-        &t.value_type(u32::MAX).unwrap().data_type,
+        &parameter_types[0].data_type(),
+        &t.value_type(u32::MAX).unwrap().data_type(),
     ) else {
         panic!("Struct lost")
     };
     assert!(Arc::ptr_eq(&a[0], &b[0]));
-    assert_eq!(a[0].metadata()["author"], "retained\0元");
-    // Dictionary root Boxes are new, whereas the nested Field owner stays shared.
-    let (DataType::Dictionary(a, _), DataType::Dictionary(b, _)) = (
-        &parameter_types[1].data_type,
-        &t.value_type(42).unwrap().data_type,
-    ) else {
-        panic!("dictionary lost")
-    };
-    assert!(!std::ptr::eq(a.as_ref(), b.as_ref()));
+    assert_eq!(a[0].metadata().capacity(), 0);
+    assert_eq!(parameter_types[1].data_type(), &DataType::Utf8);
+    assert!(std::ptr::eq(
+        parameter_types[1].data_type(),
+        t.value_type(42).unwrap().data_type()
+    ));
+    assert!(std::ptr::eq(
+        parameter_types[0].data_type(),
+        t.value_type(u32::MAX).unwrap().data_type()
+    ));
     assert_eq!(
         request.constant_policy.max_rows, 0,
         "source policy was incorrectly used to re-admit the pool"
@@ -580,16 +582,18 @@ fn original_request_decode_independent_layout_and_all_six_exact_under_limits() {
     let token = prepare_call_requests_decode(Some(&raw), &t, &p, SOURCE, limits(), &c).unwrap();
     let facts = *token.facts();
     // One sparse key Vec and outer output Vec; arguments Vec+Box, four Lambda
-    // parameters Vec+Box and exactly two root-owned Dictionary child Boxes.
+    // parameters Vec+Box and their actual guarded collection Arc; FVT clones allocate nothing.
     let golden = Layout::array::<PhysicalCallDefinition>(1).unwrap().size()
         + Layout::array::<(PhysicalCallDefinition, PhysicalCallRequest)>(1)
             .unwrap()
             .size()
         + 2 * Layout::array::<StaticFunctionArgument>(3).unwrap().size()
         + 2 * Layout::array::<FunctionValueType>(4).unwrap().size()
-        + 2 * Layout::new::<DataType>().size();
+        + novarocks_type_contract::FunctionParameterTypes::storage_allocation_layout()
+            .unwrap()
+            .size();
     assert_eq!(facts.request_bytes_upper_bound, golden);
-    assert_eq!(facts.allocation_requests_upper_bound, 8);
+    assert_eq!(facts.allocation_requests_upper_bound, 7);
     assert_eq!(facts.definition_count, 1);
     assert_eq!(facts.type_reference_count, 8);
     let exact = Limits {
@@ -787,4 +791,274 @@ fn original_request_decode_new_argument_resource_at_real_pending_256_never_obser
 
 mod receiver_owned_tests {
     include!("receiver_owned_tests.rs");
+}
+
+fn plan_tree_types_with_actual_request_upper() -> (
+    crate::execution_type_table::DecodedExecutionTypeTable,
+    usize,
+) {
+    use crate::{execution_type_table::*, host_projection_v2::AdmissionRefusal};
+    use novarocks_type_contract::{
+        ValueField, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    use std::convert::Infallible;
+    let child = ValueTypeRef::try_new(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        true,
+        ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    let logical = ValueTypeRef::try_new(
+        ValueKind::Struct(
+            vec![ValueField::new(
+                "payload",
+                child,
+                ValueTypeStorageLifetime::pure(),
+            )]
+            .into_boxed_slice(),
+        ),
+        true,
+        ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    let layout = ValueLayout::try_new(
+        &DataType::Struct(vec![Arc::new(Field::new("payload", DataType::Utf8, true))].into()),
+        ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    let structured = FunctionValueType::try_from_typed_binding(
+        novarocks_type_contract::TypedValueBinding::try_new(logical, layout).unwrap(),
+    )
+    .unwrap();
+    let scalar = FunctionValueType::new(DataType::Int64, false);
+    let roots = [
+        ExecutionTypeRoot {
+            id: 0,
+            value: &structured,
+        },
+        ExecutionTypeRoot {
+            id: u32::MAX,
+            value: &scalar,
+        },
+    ];
+    let limits = ExecutionTypeTableLimits::for_validated_root_count(roots.len()).unwrap();
+    let mut work = CompileCheckpoints::try_new(&Setup, CompilePhase::Encode).unwrap();
+    let wire = ExecutionTypeTableBuilder::new(&roots)
+        .encode_observed(
+            limits,
+            &mut |_| Ok::<_, AdmissionRefusal<Infallible>>(()),
+            &mut work,
+        )
+        .unwrap()
+        .into_wire();
+    let mut actual_requests = 0usize;
+    let mut work = CompileCheckpoints::try_new(&Setup, CompilePhase::Decode).unwrap();
+    let types = decode_execution_type_table_observed(
+        &wire,
+        limits,
+        ValueTypeStorageLifetime::pure(),
+        &mut |layout| {
+            actual_requests = actual_requests.checked_add(layout.size()).unwrap();
+            Ok::<_, AdmissionRefusal<Infallible>>(())
+        },
+        &mut work,
+    )
+    .unwrap();
+    // The original decoder reported these real construction requests before
+    // creating this namespace. Their cumulative upper includes scratch and is
+    // a conservative source invoice, never private retained-size inference.
+    let bytes = actual_requests + std::mem::size_of_val(&types);
+    (types, bytes)
+}
+fn plan_tree_request_fixture() -> wire::FragmentCallRequests {
+    wire::FragmentCallRequests {
+        entries: vec![wire::OriginalCallRequest {
+            request_id: Some(0),
+            definition: Some(expression(41)),
+            arguments: vec![
+                value_argument(0, None),
+                wire::OriginalFunctionArgument {
+                    kind: Some(wire::original_function_argument::Kind::Lambda(
+                        wire::LambdaArgumentType {
+                            parameter_value_type_ids: vec![0],
+                            result_value_type_id: Some(u32::MAX),
+                        },
+                    )),
+                },
+            ],
+            logical_argument_count: Some(2),
+            expected_result_value_type_id: Some(0),
+            constant_policy: Some(zero_policy()),
+        }],
+    }
+}
+fn request_fixture_source_bytes(
+    source: &wire::FragmentCallRequests,
+    types: usize,
+    pools: &ConstantPools,
+) -> usize {
+    // Fresh public protobuf Vecs are the exact source backings. The supplied
+    // type contribution comes from its actual constructing decoder above.
+    std::mem::size_of_val(source)
+        + source.entries.capacity() * std::mem::size_of::<wire::OriginalCallRequest>()
+        + source
+            .entries
+            .iter()
+            .map(|entry| {
+                entry.arguments.capacity() * std::mem::size_of::<wire::OriginalFunctionArgument>()
+                    + entry
+                        .arguments
+                        .iter()
+                        .map(|argument| match &argument.kind {
+                            Some(wire::original_function_argument::Kind::Lambda(lambda)) => {
+                                lambda.parameter_value_type_ids.capacity()
+                                    * std::mem::size_of::<u32>()
+                            }
+                            _ => 0,
+                        })
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+        + types
+        + std::mem::size_of_val(pools)
+}
+#[test]
+fn plan_tree_original_request_reader_keeps_complete_nested_types_and_original_creator() {
+    use novarocks_type_contract::{
+        ValueSchemaCreation, ValueTypeStorageHold, ValueTypeStorageLifetime,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Hold(Arc<AtomicUsize>);
+    impl ValueTypeStorageHold for Hold {}
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let (types, type_bytes) = plan_tree_types_with_actual_request_upper();
+    let source = plan_tree_request_fixture();
+    let pools = ConstantPools::empty();
+    let invoice = request_fixture_source_bytes(&source, type_bytes, &pools);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut exact = |_: Layout| Ok::<_, &'static str>(());
+    let mut opaque = |_: usize| Ok::<_, &'static str>(());
+    let mut creation = ValueSchemaCreation::new(
+        ValueTypeStorageLifetime::held(Arc::new(Hold(dropped.clone()))),
+        &mut exact,
+        &mut opaque,
+    );
+    let mut work = CompileCheckpoints::try_new(&Setup, CompilePhase::Decode).unwrap();
+    let token = prepare_call_requests_decode_with_creator_in(
+        Some(&source),
+        CallRequestTypeOwner::PlanTree(&types),
+        &pools,
+        invoice,
+        limits(),
+        &mut creation,
+        &mut work,
+    )
+    .unwrap();
+    let decoded = decode_call_requests_with_creator_in::<&'static str>(token, &mut work).unwrap();
+    let request = &decoded.entries()[0].1;
+    assert_eq!(request.logical_argument_count, 2);
+    let expected = types.get_observed(0, &mut work).unwrap().unwrap();
+    assert_eq!(request.expected_result_type.as_ref().unwrap(), expected);
+    let StaticFunctionArgument::Value {
+        value_type,
+        constant: None,
+    } = &request.arguments[0]
+    else {
+        panic!("original nonconstant")
+    };
+    assert_eq!(value_type, expected);
+    let StaticFunctionArgument::Lambda {
+        parameter_types,
+        result_type,
+    } = &request.arguments[1]
+    else {
+        panic!("original lambda")
+    };
+    assert_eq!(&parameter_types[0], expected);
+    assert_eq!(
+        result_type,
+        types.get_observed(u32::MAX, &mut work).unwrap().unwrap()
+    );
+    drop(creation);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    let (entries, storage) = decoded.into_parts();
+    drop(entries);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    drop(storage);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+#[test]
+fn plan_tree_original_request_first_host_refusal_has_no_followup_constructor() {
+    use crate::host_projection_v2::ProjectionFailure;
+    use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
+    let (types, type_bytes) = plan_tree_types_with_actual_request_upper();
+    let source = plan_tree_request_fixture();
+    let pools = ConstantPools::empty();
+    let invoice = request_fixture_source_bytes(&source, type_bytes, &pools);
+    let mut exact = |_: Layout| panic!("no exact request after original host refusal");
+    let mut calls = 0usize;
+    let mut opaque = |_: usize| {
+        calls += 1;
+        Err((3usize, "original host cause"))
+    };
+    let mut creation =
+        ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
+    let mut work = CompileCheckpoints::try_new(&Setup, CompilePhase::Decode).unwrap();
+    assert!(matches!(
+        prepare_call_requests_decode_with_creator_in(
+            Some(&source),
+            CallRequestTypeOwner::PlanTree(&types),
+            &pools,
+            invoice,
+            limits(),
+            &mut creation,
+            &mut work
+        ),
+        Err(ProjectionFailure::Host((3, "original host cause")))
+    ));
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn input_derived_original_request_keeps_zero_source_policy_and_full_types() {
+    use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
+    let (types, type_source) = plan_tree_types_with_actual_request_upper();
+    let source = plan_tree_request_fixture();
+    let pools = ConstantPools::empty();
+    let invoice = request_fixture_source_bytes(&source, type_source, &pools);
+    let mut exact = |_: Layout| Ok::<_, &'static str>(());
+    let mut opaque = |_: usize| Ok::<_, &'static str>(());
+    let mut creation =
+        ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
+    let mut work = CompileCheckpoints::try_new(&Setup, CompilePhase::Decode).unwrap();
+    let prepared = prepare_call_requests_decode_input_derived_with_creator_in(
+        Some(&source),
+        CallRequestTypeOwner::PlanTree(&types),
+        &pools,
+        invoice,
+        &mut creation,
+        &mut work,
+    )
+    .unwrap();
+    assert!(prepared.facts().cumulative_work_upper_bound > 0);
+    let decoded =
+        decode_call_requests_with_creator_in::<&'static str>(prepared, &mut work).unwrap();
+    assert_eq!(decoded.entries()[0].1.constant_policy.max_rows, 0);
+    assert_eq!(decoded.entries()[0].1.logical_argument_count, 2);
+    let StaticFunctionArgument::Value { value_type, .. } = &decoded.entries()[0].1.arguments[0]
+    else {
+        panic!("lost value")
+    };
+    assert_eq!(
+        value_type,
+        types.get_observed(0, &mut work).unwrap().unwrap()
+    );
+    assert!(matches!(
+        decoded.entries()[0].1.arguments[1],
+        StaticFunctionArgument::Lambda { .. }
+    ));
 }

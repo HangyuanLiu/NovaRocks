@@ -102,10 +102,7 @@ fn caller_owned_receiving_and_materializing_preserve_original_complete_kinds_and
     else {
         panic!("original lambda")
     };
-    assert_eq!(
-        parameter_types[0].data_type,
-        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
-    );
+    assert_eq!(parameter_types[0].data_type(), &DataType::Utf8);
     assert_eq!(parameter_types[1], *f.types.value_type(4).unwrap());
 }
 #[test]

@@ -73,7 +73,7 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
             .catalog_handle()
             .map_err(|error| error.to_string())?
             .clone(),
-        schema: metadata.schema.clone(),
+        schema: Arc::new(metadata.schema().clone()),
         selector,
         mv_partition_selection: None,
         statistics_pin: None,

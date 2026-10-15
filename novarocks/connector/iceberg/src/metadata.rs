@@ -202,11 +202,25 @@ impl IcebergMetadata {
         resolution: ConnectorTableResolution,
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
-        let metadata = self.load_table(ConnectorTableRequest {
-            table,
-            resolution,
-            context,
-        })?;
+        // Physical-object capture is FE catalog preparation. It retains the
+        // original stop/deadline checks, with no memory grant or byte quota.
+        let mut request_observer = |_: std::alloc::Layout| pure_catalog_control(&context);
+        let mut work_observer = |_: usize| pure_catalog_control(&context);
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request_observer,
+            &mut work_observer,
+        );
+        let metadata = self
+            .load_table(
+                ConnectorTableRequest {
+                    table,
+                    resolution,
+                    context: context.clone(),
+                },
+                &mut creation,
+            )
+            .map_err(metadata_creation_error)?;
         // Design: ADR-0085 (docs/adr/ADR-0085-connector-physical-table-object-bindings.md)
         // Reuse the UUID frozen into this exact metadata observation instead of
         // issuing a second catalog lookup or deriving identity from a name.
@@ -601,7 +615,12 @@ impl ConnectorMetadata for IcebergMetadata {
     fn load_table(
         &self,
         request: ConnectorTableRequest,
-    ) -> Result<ConnectorTableMetadata, ConnectorError> {
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        creation.work(1)?;
         self.validate_context(&request.context)?;
         self.ensure_owner(&request.table.instance_id)?;
         let (table_name, metadata_table_type) =
@@ -723,10 +742,14 @@ impl ConnectorMetadata for IcebergMetadata {
             logical_type_columns,
             hidden_columns,
         };
-        let schema = if let Some(metadata_table_type) = payload.metadata_table_type {
-            let columns =
-                metadata_table_output_columns(metadata_table_type, metadata).map_err(corrupt)?;
-            metadata_output_schema(&columns).map_err(corrupt)?
+        let (schema, execution_schema) = if let Some(metadata_table_type) =
+            payload.metadata_table_type
+        {
+            let columns = metadata_table_output_columns(metadata_table_type, metadata, creation)?;
+            let schema = metadata_output_schema(&columns).map_err(corrupt)?;
+            let execution =
+                crate::metadata_batch_reader::metadata_output_execution_schema(&columns, creation)?;
+            (schema, execution)
         } else {
             // The table schema exposed to SQL carries the Iceberg metadata
             // pseudo-columns after the storage fields, in exactly the order
@@ -736,10 +759,17 @@ impl ConnectorMetadata for IcebergMetadata {
             // `_last_updated_sequence_number` unresolvable.
             let mut fields = base_schema.fields().to_vec();
             fields.extend(metadata_arrow_fields(&payload.metadata_columns)?);
-            Arc::new(Schema::new_with_metadata(
+            let schema = Arc::new(Schema::new_with_metadata(
                 fields,
                 base_schema.metadata().clone(),
-            ))
+            ));
+            let execution = crate::schema_mapping::catalog_value::table(
+                metadata,
+                definition_schema.as_ref(),
+                &payload.metadata_columns,
+                creation,
+            )?;
+            (schema, execution)
         };
         let planning_facts = if payload.metadata_table_type.is_some() {
             ConnectorTablePlanningFacts::empty()
@@ -774,28 +804,32 @@ impl ConnectorMetadata for IcebergMetadata {
             &metadata.uuid().to_string(),
             metadata.current_snapshot_id(),
         )?;
-        Ok(ConnectorTableMetadata {
-            identity: ConnectorTableIdentity {
-                instance_id: self.descriptor.instance_id.clone(),
-                namespace: request.table.namespace,
-                table: Arc::from(table_name),
+        ConnectorTableMetadata::try_new_typed(
+            novarocks_spi::connector::ConnectorTableMetadataHeader {
+                identity: ConnectorTableIdentity {
+                    instance_id: self.descriptor.instance_id.clone(),
+                    namespace: request.table.namespace,
+                    table: Arc::from(table_name),
+                },
+                planning_facts,
+                definition_facts,
+                version: Some(Bytes::copy_from_slice(
+                    &metadata.current_schema_id().to_le_bytes(),
+                )),
+                statistics_data_version: Some(statistics_data_version),
+                table: ConnectorTableHandle::try_new(
+                    self.descriptor.instance_id.clone(),
+                    encode_payload(
+                        &payload,
+                        "table handle",
+                        request.context.max_handle_payload_bytes(),
+                    )?,
+                )?,
             },
             schema,
-            planning_facts,
-            definition_facts,
-            version: Some(Bytes::copy_from_slice(
-                &metadata.current_schema_id().to_le_bytes(),
-            )),
-            statistics_data_version: Some(statistics_data_version),
-            table: ConnectorTableHandle::try_new(
-                self.descriptor.instance_id.clone(),
-                encode_payload(
-                    &payload,
-                    "table handle",
-                    request.context.max_handle_payload_bytes(),
-                )?,
-            )?,
-        })
+            execution_schema,
+            creation,
+        )
     }
 }
 
@@ -813,7 +847,7 @@ impl ConnectorScanPlanning for IcebergMetadata {
         validate_static_predicates(&request.static_predicates)?;
         let table = self.table_payload(table)?;
         let output_schema = if table.metadata_table_type.is_some() {
-            projected_metadata_schema(&table, &request.projection)?
+            projected_metadata_schema(&table, &request.projection, &request.context)?
         } else {
             projected_schema(&table, &request.projection)?
         };
@@ -1777,7 +1811,34 @@ pub(crate) fn projected_schema_with_metadata(
 fn projected_metadata_schema(
     table: &IcebergTablePayload,
     projection: &[usize],
+    context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<SchemaRef, ConnectorError> {
+    // This is the legacy FE scan-negotiation format projection. It performs
+    // pure preparation with the original cancellation/deadline control; no
+    // memory grant or FE byte budget is minted by this source author.
+    let mut request = |_: std::alloc::Layout| {
+        if context.is_cancelled() {
+            Err(novarocks_type_contract::CompileControlError::Cancelled)
+        } else if Instant::now() >= context.deadline() {
+            Err(novarocks_type_contract::CompileControlError::DeadlineExceeded)
+        } else {
+            Ok(())
+        }
+    };
+    let mut work = |_: usize| {
+        if context.is_cancelled() {
+            Err(novarocks_type_contract::CompileControlError::Cancelled)
+        } else if Instant::now() >= context.deadline() {
+            Err(novarocks_type_contract::CompileControlError::DeadlineExceeded)
+        } else {
+            Ok(())
+        }
+    };
+    let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        &mut request,
+        &mut work,
+    );
     let metadata_table_type = table.metadata_table_type.ok_or_else(|| {
         ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
@@ -1791,7 +1852,8 @@ fn projected_metadata_schema(
         .ok_or_else(|| corrupt("Iceberg metadata alias has no serialized table metadata"))?;
     let metadata: crate::iceberg::spec::TableMetadata = serde_json::from_str(serialized)
         .map_err(|error| corrupt(format!("decode Iceberg table metadata: {error}")))?;
-    let columns = metadata_table_output_columns(metadata_table_type, &metadata).map_err(corrupt)?;
+    let columns = metadata_table_output_columns(metadata_table_type, &metadata, &mut creation)
+        .map_err(metadata_creation_error)?;
     let schema = metadata_output_schema(&columns).map_err(corrupt)?;
     if projection.is_empty() {
         return Ok(schema);
@@ -2906,3 +2968,60 @@ mod plan_splits_pruning_tests {
 #[cfg(test)]
 #[path = "metadata/cow_borrowed_schema_tests.rs"]
 mod cow_borrowed_schema_tests;
+
+pub(crate) fn metadata_creation_error(
+    cause: novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+) -> ConnectorError {
+    match cause {
+        novarocks_connector_contract::PureProviderCompileError::Provider(cause) => cause,
+        novarocks_connector_contract::PureProviderCompileError::Control(cause) => {
+            ConnectorError::new(
+                match cause {
+                    novarocks_type_contract::CompileControlError::Cancelled => {
+                        ConnectorErrorKind::Cancelled
+                    }
+                    novarocks_type_contract::CompileControlError::DeadlineExceeded => {
+                        ConnectorErrorKind::DeadlineExceeded
+                    }
+                    novarocks_type_contract::CompileControlError::ResourceExhausted => {
+                        ConnectorErrorKind::ResourceExhausted
+                    }
+                },
+                cause.to_string(),
+            )
+        }
+    }
+}
+
+pub(crate) fn pure_catalog_control(
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), novarocks_type_contract::CompileControlError> {
+    if context.is_cancelled() {
+        Err(novarocks_type_contract::CompileControlError::Cancelled)
+    } else if Instant::now() >= context.deadline() {
+        Err(novarocks_type_contract::CompileControlError::DeadlineExceeded)
+    } else {
+        Ok(())
+    }
+}
+
+/// Use the original FE/provider cancellation and deadline observations. This
+/// pure preparation creates no capacity authority or retained-memory invoice.
+pub(crate) fn with_pure_schema_creation<T>(
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    operation: impl FnOnce(
+        &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<T, ConnectorError>,
+) -> Result<T, ConnectorError> {
+    let mut request = |_: std::alloc::Layout| pure_catalog_control(context);
+    let mut work = |_: usize| pure_catalog_control(context);
+    let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        &mut request,
+        &mut work,
+    );
+    creation.work(0).map_err(metadata_creation_error)?;
+    let result = operation(&mut creation)?;
+    creation.work(0).map_err(metadata_creation_error)?;
+    Ok(result)
+}

@@ -27,6 +27,10 @@
 use super::nodes::{NodeDecodeContext, NodeDispatchLimits, prepare_node_decode_in};
 use super::{PackageWireError, prepare_package_wire_in};
 use crate::host_projection_v2::ProjectionFailure;
+use crate::physical_public_source_schema_v2::{
+    PublicSourceSchemaCodecError, decode_public_source_schemas_pure_in,
+    decode_public_source_schemas_with_creator_in, decode_public_source_schemas_with_factory_in,
+};
 use crate::{
     physical_aggregate_binding_v2::{
         materialize_aggregate_bindings_in, prepare_aggregate_binding_headers_in,
@@ -37,8 +41,9 @@ use crate::{
         prepare_function_binding_headers_in, prepare_function_bindings_materialization_in,
     },
     physical_call_requests_v2::{
-        CallRequestCodecError, CallRequestProjectionLimits, decode_call_requests_in,
-        prepare_call_requests_decode_in,
+        CallRequestCodecError, CallRequestProjectionLimits, CallRequestTypeOwner,
+        decode_call_requests_in, decode_call_requests_with_creator_in,
+        prepare_call_requests_decode_in, prepare_call_requests_decode_with_creator_in,
     },
     physical_connector_payload_v2::{
         ConnectorPayloadCodecError, ConnectorPayloadProjectionLimits, decode_connector_payloads_in,
@@ -46,6 +51,7 @@ use crate::{
     physical_constant_v2::{
         ConstantDecodeProjectionLimits, ConstantNamespaceProjectionLimits,
         PhysicalConstantCodecError, prepare_constant_namespace_in,
+        prepare_constant_namespace_with_creator_in, prepare_constant_namespace_with_factory_in,
     },
     physical_control_v2::{
         ControlCodecError, ControlProjectionLimits, decode_expression_control_observed,
@@ -67,23 +73,27 @@ use crate::{
     },
     physical_read_scan_v2::{
         ReadScanCodecError, ReadScanDecodeContext, ReadScanProjectionLimits,
-        decode_read_scans_observed,
+        decode_read_scans_observed, decode_read_scans_with_creator,
     },
     physical_relation_v2::{RelationCodecError, RelationProjectionLimits, decode_relations_in},
     physical_result_v2::prepare_result_decode_in,
-    physical_schema_v2::{SchemaCodecError, prepare_schemas_decode_observed_in},
+    physical_schema_v2::{
+        SchemaCodecError, decode_schemas_with_factory_in, prepare_schemas_decode_observed_in,
+        prepare_schemas_decode_with_creator_in,
+    },
     physical_semantics_v2::{
         ParameterProjectionLimits, SemanticsCodecError, decode_frozen_calls_observed,
         decode_frozen_pruning_observed, prepare_semantic_parameters_decode_observed_in,
     },
     physical_type_v2::{
-        DirectTypeMaterialization, PackageTypeMaterializationScope, PackageTypeProjectionFacts,
-        PackageTypeProjectionLimits, TypeCodecError, decode_package_type_table_with_host_observed,
+        PackageTypeProjectionFacts, PackageTypeProjectionLimits, TypeCodecError,
+        decode_package_type_table_observed, decode_package_type_table_with_creator_in,
+        decode_package_type_table_with_factory_in,
     },
     physical_value_v2::{ValueCodecError, ValueProjectionLimits, decode_values_observed_in},
     physical_writer_recipe_v2::{
         WriterRecipeCodecError, WriterRecipeDecodeContext, WriterRecipeProjectionLimits,
-        decode_writer_recipes_observed,
+        decode_writer_recipes_observed, decode_writer_recipes_with_factory_in,
     },
     physical_writer_schema_v2::WriterSchemaProjectionLimits,
     resource_preflight_v2::{DecodeProjectionLimits, FragmentDecodeResourceModel},
@@ -97,6 +107,7 @@ use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
+use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
 use std::{
     alloc::Layout,
     collections::{BTreeMap, btree_map::Entry},
@@ -146,6 +157,7 @@ pub enum PackageDecodeError {
     Metadata(PackageMetadataCodecError),
     Type(TypeCodecError),
     Schema(SchemaCodecError),
+    PublicSourceSchema(PublicSourceSchemaCodecError),
     Constant(PhysicalConstantCodecError),
     Binding(BindingCodecError),
     ProviderBinding(ProviderBindingCodecError),
@@ -171,8 +183,90 @@ impl From<CompileControlError> for PackageDecodeError {
     }
 }
 impl<H> From<CompileControlError> for ProjectionFailure<PackageDecodeError, H> {
-    fn from(cause: CompileControlError) -> Self {
-        Self::Codec(PackageDecodeError::Control(cause))
+    fn from(error: CompileControlError) -> Self {
+        Self::Codec(error.into())
+    }
+}
+impl<H> From<ProjectionFailure<BindingCodecError, H>> for ProjectionFailure<PackageDecodeError, H> {
+    fn from(error: ProjectionFailure<BindingCodecError, H>) -> Self {
+        match error {
+            ProjectionFailure::Host(error) => Self::Host(error),
+            ProjectionFailure::Codec(error) => Self::Codec(error.into()),
+        }
+    }
+}
+impl<H> From<ProjectionFailure<TypeCodecError, H>> for ProjectionFailure<PackageDecodeError, H> {
+    fn from(error: ProjectionFailure<TypeCodecError, H>) -> Self {
+        match error {
+            ProjectionFailure::Host(error) => Self::Host(error),
+            ProjectionFailure::Codec(error) => Self::Codec(error.into()),
+        }
+    }
+}
+impl<H> From<ProjectionFailure<PhysicalConstantCodecError, H>>
+    for ProjectionFailure<PackageDecodeError, H>
+{
+    fn from(error: ProjectionFailure<PhysicalConstantCodecError, H>) -> Self {
+        match error {
+            ProjectionFailure::Host(error) => Self::Host(error),
+            ProjectionFailure::Codec(error) => Self::Codec(error.into()),
+        }
+    }
+}
+impl<H> From<ProjectionFailure<WriterRecipeCodecError, H>>
+    for ProjectionFailure<PackageDecodeError, H>
+{
+    fn from(error: ProjectionFailure<WriterRecipeCodecError, H>) -> Self {
+        match error {
+            ProjectionFailure::Host(e) => Self::Host(e),
+            ProjectionFailure::Codec(e) => Self::Codec(e.into()),
+        }
+    }
+}
+impl<H> From<ProjectionFailure<SchemaCodecError, H>> for ProjectionFailure<PackageDecodeError, H> {
+    fn from(error: ProjectionFailure<SchemaCodecError, H>) -> Self {
+        match error {
+            ProjectionFailure::Host(error) => Self::Host(error),
+            ProjectionFailure::Codec(error) => Self::Codec(error.into()),
+        }
+    }
+}
+impl<H> From<ProjectionFailure<CallRequestCodecError, H>>
+    for ProjectionFailure<PackageDecodeError, H>
+{
+    fn from(error: ProjectionFailure<CallRequestCodecError, H>) -> Self {
+        match error {
+            ProjectionFailure::Host(error) => Self::Host(error),
+            ProjectionFailure::Codec(error) => Self::Codec(error.into()),
+        }
+    }
+}
+impl<H> From<ProjectionFailure<ReadScanCodecError, H>>
+    for ProjectionFailure<PackageDecodeError, H>
+{
+    fn from(error: ProjectionFailure<ReadScanCodecError, H>) -> Self {
+        match error {
+            ProjectionFailure::Host(error) => Self::Host(error),
+            ProjectionFailure::Codec(error) => Self::Codec(error.into()),
+        }
+    }
+}
+impl<H> From<ProjectionFailure<PublicSourceSchemaCodecError, H>>
+    for ProjectionFailure<PackageDecodeError, H>
+{
+    fn from(error: ProjectionFailure<PublicSourceSchemaCodecError, H>) -> Self {
+        match error {
+            ProjectionFailure::Host(error) => Self::Host(error),
+            ProjectionFailure::Codec(error) => Self::Codec(error.into()),
+        }
+    }
+}
+impl<H> From<p::CallRequestCreationFailure<H>> for ProjectionFailure<PackageDecodeError, H> {
+    fn from(error: p::CallRequestCreationFailure<H>) -> Self {
+        match error {
+            p::CallRequestCreationFailure::Creator(error) => Self::Host(error),
+            p::CallRequestCreationFailure::Request(error) => Self::Codec(error.into()),
+        }
     }
 }
 // Every component's own control cause stays primary; nothing else is lifted.
@@ -186,10 +280,8 @@ macro_rules! component_error {
                 }
             }
         }
-        impl<H> From<$source> for ProjectionFailure<PackageDecodeError, H> {
-            fn from(error: $source) -> Self {
-                Self::Codec(PackageDecodeError::from(error))
-            }
+        impl<H> From<$source> for ProjectionFailure<PackageDecodeError,H> {
+            fn from(error:$source)->Self { Self::Codec(PackageDecodeError::from(error)) }
         }
     )+};
 }
@@ -198,6 +290,7 @@ component_error!(
     PackageMetadataCodecError => Metadata,
     TypeCodecError => Type,
     SchemaCodecError => Schema,
+    PublicSourceSchemaCodecError => PublicSourceSchema,
     PhysicalConstantCodecError => Constant,
     BindingCodecError => Binding,
     ProviderBindingCodecError => ProviderBinding,
@@ -224,6 +317,7 @@ impl fmt::Display for PackageDecodeError {
             Self::Metadata(error) => error.fmt(f),
             Self::Type(error) => error.fmt(f),
             Self::Schema(error) => error.fmt(f),
+            Self::PublicSourceSchema(error) => error.fmt(f),
             Self::Constant(error) => error.fmt(f),
             Self::Binding(error) => error.fmt(f),
             Self::ProviderBinding(error) => error.fmt(f),
@@ -362,28 +456,119 @@ pub fn decode_fragment_package(
     limits: &PackageDecodeLimits,
     control: &dyn PureCompileControl,
 ) -> Result<p::FragmentPackage, PackageDecodeError> {
-    decode_fragment_package_with_type_host(
-        raw,
-        model,
-        limits,
-        control,
-        &mut DirectTypeMaterialization,
-    )
-    .map_err(ProjectionFailure::without_host)
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+    let result = decode_fragment_package_in(raw, model, limits, &mut work);
+    if matches!(&result, Err(PackageDecodeError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
 }
 
-/// The one whole-package receiver with a borrowed Type materialization host.
-/// Host refusal and an original Control refusal return without a fallible
-/// completion callback; all other codec outcomes keep the original footer.
-pub fn decode_fragment_package_with_type_host<H: PackageTypeMaterializationScope>(
+/// Same receiver on the caller's scope; the caller owns entry and completion.
+/// Admission callbacks are pass-through: each component gates its own limits.
+pub(crate) fn decode_fragment_package_in(
     raw: &[u8],
     model: &FragmentDecodeResourceModel,
     limits: &PackageDecodeLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<p::FragmentPackage, PackageDecodeError> {
+    decode_fragment_package_core::<std::convert::Infallible>(raw, model, limits, None, work)
+        .map_err(ProjectionFailure::without_host)
+}
+
+/// Actual BE creator for the same receiver body. Pure preparation uses the
+/// separate legacy expansion entry; it never mints a runtime storage hold.
+pub fn decode_fragment_package_with_creator<H>(
+    raw: &[u8],
+    model: &FragmentDecodeResourceModel,
+    limits: &PackageDecodeLimits,
+    creation: &mut ValueSchemaCreation<'_, H>,
     control: &dyn PureCompileControl,
-    host: &mut H,
-) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H::HostError>> {
+) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
-    let result = decode_fragment_package_in(raw, model, limits, &mut work, host);
+    let result = decode_fragment_package_core(raw, model, limits, Some(creation), &mut work);
+    if matches!(
+        &result,
+        Err(ProjectionFailure::Host(_))
+            | Err(ProjectionFailure::Codec(PackageDecodeError::Control(_)))
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+pub(crate) fn decode_fragment_package_core<H>(
+    raw: &[u8],
+    model: &FragmentDecodeResourceModel,
+    limits: &PackageDecodeLimits,
+    creation: Option<&mut ValueSchemaCreation<'_, H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
+    decode_fragment_package_factory_core::<H, crate::value_type_table::resources::NoFactory>(
+        raw, model, limits, creation, None, work, &mut None,
+    )
+}
+
+/// The actual BE supplies its sealed factory alongside the existing physical
+/// creator. Neither port is derived from storage or transported policies.
+pub fn decode_fragment_package_with_factory<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
+    raw: &[u8],
+    model: &FragmentDecodeResourceModel,
+    limits: &PackageDecodeLimits,
+    creation: &mut ValueSchemaCreation<'_, H>,
+    factory: &F,
+    control: &dyn PureCompileControl,
+) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+    let result = decode_fragment_package_factory_core(
+        raw,
+        model,
+        limits,
+        Some(creation),
+        Some(factory),
+        &mut work,
+        &mut None,
+    );
+    if matches!(
+        &result,
+        Err(ProjectionFailure::Host(_))
+            | Err(ProjectionFailure::Codec(PackageDecodeError::Control(_)))
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+/// The existing receiver with the caller's actual creator and narrow original
+/// Arrow/source tail funding. Other namespaces retain their existing responsibility.
+pub fn decode_fragment_package_with_factory_and_funding<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
+    raw: &[u8],
+    model: &FragmentDecodeResourceModel,
+    limits: &PackageDecodeLimits,
+    creation: &mut ValueSchemaCreation<'_, H>,
+    factory: &F,
+    control: &dyn PureCompileControl,
+    funding: &mut dyn crate::physical_type_v2::PackageTypeFundingScope<H>,
+) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+    let result = decode_fragment_package_factory_core(
+        raw,
+        model,
+        limits,
+        Some(creation),
+        Some(factory),
+        &mut work,
+        &mut Some(funding),
+    );
     if matches!(
         &result,
         Err(ProjectionFailure::Host(_) | ProjectionFailure::Codec(PackageDecodeError::Control(_)))
@@ -394,20 +579,54 @@ pub fn decode_fragment_package_with_type_host<H: PackageTypeMaterializationScope
     result
 }
 
-/// Same receiver on the caller's scope; the caller owns entry and completion.
-/// Admission callbacks are pass-through: each component gates its own limits.
-fn decode_fragment_package_in<H: PackageTypeMaterializationScope>(
+pub fn decode_fragment_package_with_type_host<
+    G: crate::physical_type_v2::PackageTypeMaterializationScope,
+>(
     raw: &[u8],
     model: &FragmentDecodeResourceModel,
     limits: &PackageDecodeLimits,
+    control: &dyn PureCompileControl,
+    host: &mut G,
+) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, G::HostError>> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+    let result = decode_fragment_package_factory_core::<
+        G::HostError,
+        crate::value_type_table::resources::NoFactory,
+    >(raw, model, limits, None, None, &mut work, &mut Some(host));
+    if matches!(
+        &result,
+        Err(ProjectionFailure::Host(_) | ProjectionFailure::Codec(PackageDecodeError::Control(_)))
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+fn decode_fragment_package_factory_core<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
+    raw: &[u8],
+    model: &FragmentDecodeResourceModel,
+    limits: &PackageDecodeLimits,
+    mut creation: Option<&mut ValueSchemaCreation<'_, H>>,
+    factory: Option<&F>,
     work: &mut CompileCheckpoints<'_>,
-    host: &mut H,
-) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H::HostError>> {
+    funding: &mut Option<&mut dyn crate::physical_type_v2::PackageTypeFundingScope<H>>,
+) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H>> {
     let plan_limits = limits.admission.plan_limits;
 
     // L0: generated-layout byte admission, then the original Prost verdict.
     let prepared = prepare_package_wire_in(raw, model, limits.wire, &mut |_| Ok(()), work)?;
     let usage = prepared.projection().usage;
+    if let Some(creator) = creation.as_deref_mut() {
+        // Original generated-layout Prost heap request upper. Raw input and
+        // inline DTO bytes are borrowed source, never new allocator requests.
+        creator
+            .observe_opaque_upper_bound(usage.peak_requested_heap_bytes_upper)
+            .map_err(ProjectionFailure::<PackageDecodeError, H>::Host)?;
+    }
     let wire_package = prepared.materialize_in(&mut |_| Ok(()), work)?;
     // Raw input, DTO root and every requested DTO heap block stay live until
     // publication. Each decoded namespace floor carries the invoice it was
@@ -451,24 +670,67 @@ fn decode_fragment_package_in<H: PackageTypeMaterializationScope>(
     // Types and constant pools have no retained-floor author, yet later laws
     // charge their roots; their own admitted request upper bound and inline
     // header join the invoice once.
-    let mut type_requests = 0;
-    let types = decode_package_type_table_with_host_observed(
-        &wire_package,
-        invoice,
-        limits.types,
-        &mut |facts: &PackageTypeProjectionFacts| {
-            type_requests = type_requests.max(facts.allocation_request_bytes_upper_bound);
-            Ok(())
-        },
-        work,
-        host,
-    )
-    .map_err(|error| match error {
-        ProjectionFailure::Codec(error) => {
-            ProjectionFailure::Codec(PackageDecodeError::from(error))
-        }
-        ProjectionFailure::Host(error) => ProjectionFailure::Host(error),
-    })?;
+    let mut type_requests = 0usize;
+    let types = if let Some(creator) = creation.as_deref_mut() {
+        let types = match (factory, funding.as_deref_mut()) {
+            (Some(factory), Some(funding)) => {
+                crate::physical_type_v2::decode_package_type_table_with_factory_and_funding_in(
+                    &wire_package,
+                    invoice,
+                    limits.types,
+                    creator,
+                    factory,
+                    work,
+                    funding,
+                )?
+            }
+            (Some(factory), None) => decode_package_type_table_with_factory_in(
+                &wire_package,
+                invoice,
+                limits.types,
+                creator,
+                factory,
+                work,
+            )?,
+            (None, _) => decode_package_type_table_with_creator_in(
+                &wire_package,
+                invoice,
+                limits.types,
+                creator,
+                work,
+            )?,
+        };
+        type_requests =
+            types
+                .creation_request_bytes_upper_bound()
+                .ok_or(PackageDecodeError::Invalid(
+                    "package type creator omitted its original request receipt",
+                ))?;
+        types
+    } else if let Some(funding) = funding.as_deref_mut() {
+        crate::physical_type_v2::decode_package_type_table_with_funding_in(
+            &wire_package,
+            invoice,
+            limits.types,
+            &mut |facts: &PackageTypeProjectionFacts| {
+                type_requests = type_requests.max(facts.allocation_request_bytes_upper_bound);
+                Ok(())
+            },
+            work,
+            funding,
+        )?
+    } else {
+        decode_package_type_table_observed(
+            &wire_package,
+            invoice,
+            limits.types,
+            &mut |facts: &PackageTypeProjectionFacts| {
+                type_requests = type_requests.max(facts.allocation_request_bytes_upper_bound);
+                Ok(())
+            },
+            work,
+        )?
+    };
     invoice = add(add(invoice, type_requests)?, size_of_val(&types))?;
     // Joint mode is required: writer views exist only on joint bindings.
     let provider_bindings = decode_joint_provider_bindings_in(
@@ -505,47 +767,141 @@ fn decode_fragment_package_in<H: PackageTypeMaterializationScope>(
     .emit_in(&mut |_| Ok(()), work)?;
 
     // L2: owners over types and provider namespaces.
-    let (writes, _) = decode_writer_recipes_observed(
-        &wire_package.writes,
-        WriterRecipeDecodeContext {
-            bindings: &provider_bindings,
-            payloads: &payloads,
-            types: &types,
-        },
-        invoice,
-        limits.writers,
-        &mut |_| Ok(()),
-        work,
-    )?;
+    let writer_context = WriterRecipeDecodeContext {
+        bindings: &provider_bindings,
+        payloads: &payloads,
+        types: &types,
+    };
+    let (writes, writer_facts, writer_temporary) = if let Some(factory) = factory {
+        decode_writer_recipes_with_factory_in(
+            &wire_package.writes,
+            writer_context,
+            invoice,
+            limits.writers,
+            factory,
+            &mut |_| Ok(()),
+            work,
+        )?
+        .into_parts()
+    } else {
+        let (writes, facts) = decode_writer_recipes_observed(
+            &wire_package.writes,
+            writer_context,
+            invoice,
+            limits.writers,
+            &mut |_| Ok(()),
+            work,
+        )?;
+        (writes, facts, ValueTypeStorageLifetime::pure())
+    };
     let writes = unique_map(
         writes,
         plan_limits.fragment_nodes,
         "writer recipe node ID is duplicated",
         work,
     )?;
-    let schemas = prepare_schemas_decode_observed_in(
-        &wire_package.schemas,
-        &types,
-        invoice,
-        limits.node,
-        &mut |_| Ok(()),
-        work,
-    )?
-    .emit_observed_in(&mut |_| Ok(()), work)?;
-    invoice = invoice.max(schemas.retained_invoice_floor()?);
-    let (scans, _) = decode_read_scans_observed(
-        &wire_package.scans,
-        &wire_package.connector_expressions,
-        ReadScanDecodeContext {
-            bindings: &provider_bindings,
-            payloads: &payloads,
-            schemas: &schemas,
-        },
-        invoice,
-        limits.scans,
-        &mut |_| Ok(()),
-        work,
-    )?;
+    drop(writer_temporary);
+    // The sole writer model combines the original source B exactly once with
+    // completed constructor requests. This conservative numerical provenance
+    // includes temporary requests; it is neither retained precision nor grant.
+    // Subsequent namespace models must not lose newly owned writer backing.
+    invoice = invoice.max(writer_facts.coexisting_source_and_request_bytes_upper_bound);
+    let schemas = if let Some(factory) = factory {
+        decode_schemas_with_factory_in(
+            &wire_package.schemas,
+            &types,
+            invoice,
+            limits.node,
+            factory,
+            &mut |_| Ok(()),
+            work,
+        )?
+    } else if let Some(creator) = creation.as_deref_mut() {
+        prepare_schemas_decode_with_creator_in(
+            &wire_package.schemas,
+            &types,
+            invoice,
+            limits.node,
+            creator,
+            work,
+        )?
+        .emit_observed_in(&mut |_| Ok(()), work)?
+    } else {
+        prepare_schemas_decode_observed_in(
+            &wire_package.schemas,
+            &types,
+            invoice,
+            limits.node,
+            &mut |_| Ok(()),
+            work,
+        )?
+        .emit_observed_in(&mut |_| Ok(()), work)?
+    };
+    invoice = invoice.max(if factory.is_some() {
+        // Completed actual constructor upper is numerical source provenance,
+        // not a grant or an exact retained-byte ledger. It includes the new
+        // scopes/loan holders once, on the unchanged namespace model.
+        schemas
+            .facts()
+            .coexisting_source_and_request_bytes_upper_bound
+    } else {
+        schemas.retained_invoice_floor()?
+    });
+    let public_source_schemas = if let Some(factory) = factory {
+        decode_public_source_schemas_with_factory_in(
+            &wire_package.public_source_schemas,
+            &schemas,
+            invoice,
+            limits.node,
+            factory,
+            work,
+        )?
+    } else if let Some(creator) = creation.as_deref_mut() {
+        decode_public_source_schemas_with_creator_in(
+            &wire_package.public_source_schemas,
+            &schemas,
+            invoice,
+            limits.node,
+            creator,
+            work,
+        )?
+    } else {
+        decode_public_source_schemas_pure_in(
+            &wire_package.public_source_schemas,
+            &schemas,
+            invoice,
+            limits.node,
+            work,
+        )?
+    };
+    let scan_context = ReadScanDecodeContext {
+        bindings: &provider_bindings,
+        payloads: &payloads,
+        schemas: &schemas,
+        source_schemas: Some(&public_source_schemas),
+    };
+    let (scans, _) = if let Some(creator) = creation.as_deref_mut() {
+        decode_read_scans_with_creator(
+            &wire_package.scans,
+            &wire_package.connector_expressions,
+            scan_context,
+            invoice,
+            limits.scans,
+            &mut |_| Ok(()),
+            creator,
+            work,
+        )?
+    } else {
+        decode_read_scans_observed(
+            &wire_package.scans,
+            &wire_package.connector_expressions,
+            scan_context,
+            invoice,
+            limits.scans,
+            &mut |_| Ok(()),
+            work,
+        )?
+    };
     let scans = unique_map(
         scans,
         plan_limits.fragment_nodes,
@@ -572,21 +928,76 @@ fn decode_fragment_package_in<H: PackageTypeMaterializationScope>(
         work,
     )?;
     invoice = invoice.max(relations.retained_invoice_floor_in(work)?);
-    let pools = prepare_constant_namespace_in(
-        &wire_package.constants,
-        &types,
-        invoice,
-        limits.constant_policy,
-        limits.constant_records,
-        limits.constants,
-        &limits.verifier,
-        &mut |_| Ok(()),
-        work,
-    )?;
-    let pool_requests = pools.facts().new_allocation_request_bytes_upper_bound;
-    let pools = pools.materialize_in(&mut |_| Ok(()), work)?;
+    let (pools, pool_requests) = if let Some(factory) = factory {
+        let prepared = prepare_constant_namespace_with_factory_in(
+            &wire_package.constants,
+            &types,
+            invoice,
+            types.source_metadata_namespace(),
+            limits.constant_policy,
+            limits.constant_records,
+            limits.constants,
+            &limits.verifier,
+            factory,
+            &mut |_| Ok(()),
+            work,
+        )?;
+        let (pools, facts) =
+            prepared.materialize_with_factory_in(factory, &mut |_| Ok(()), work)?;
+        (
+            pools,
+            facts.retained_new_allocation_request_bytes_upper_bound,
+        )
+    } else if let Some(creator) = creation.as_deref_mut() {
+        // No source Fields/constants means no metadata namespace. Every
+        // captured source occurrence still requires its original receipt.
+        let source_metadata = types.source_metadata_namespace();
+        let prepared = prepare_constant_namespace_with_creator_in(
+            &wire_package.constants,
+            &types,
+            invoice,
+            source_metadata,
+            limits.constant_policy,
+            limits.constant_records,
+            limits.constants,
+            &limits.verifier,
+            creator,
+            &mut |_| Ok(()),
+            work,
+        )?;
+        let requests = prepared.facts().new_allocation_request_bytes_upper_bound;
+        (
+            prepared.materialize_with_creator_in(creator, &mut |_| Ok(()), work)?,
+            requests,
+        )
+    } else {
+        let prepared = prepare_constant_namespace_in(
+            &wire_package.constants,
+            &types,
+            invoice,
+            limits.constant_policy,
+            limits.constant_records,
+            limits.constants,
+            &limits.verifier,
+            &mut |_| Ok(()),
+            work,
+        )?;
+        let requests = prepared.facts().new_allocation_request_bytes_upper_bound;
+        (prepared.materialize_in(&mut |_| Ok(()), work)?, requests)
+    };
     invoice = add(add(invoice, pool_requests)?, size_of_val(&pools))?;
-    let requests = {
+    let (requests, request_storage) = if let Some(creator) = creation.as_deref_mut() {
+        let prepared = prepare_call_requests_decode_with_creator_in(
+            fragment_wire.call_requests.as_ref(),
+            CallRequestTypeOwner::Package(&types),
+            &pools,
+            invoice,
+            limits.requests,
+            creator,
+            work,
+        )?;
+        decode_call_requests_with_creator_in::<H>(prepared, work)?.into_parts()
+    } else {
         let prepared = prepare_call_requests_decode_in(
             fragment_wire.call_requests.as_ref(),
             &types,
@@ -596,7 +1007,10 @@ fn decode_fragment_package_in<H: PackageTypeMaterializationScope>(
             &mut |_| Ok(()),
             work,
         )?;
-        decode_call_requests_in(prepared, &mut |_| Ok(()), work)?
+        (
+            decode_call_requests_in(prepared, &mut |_| Ok(()), work)?,
+            ValueTypeStorageLifetime::pure(),
+        )
     };
     let (cuts, _) = decode_fragment_cuts_observed(
         cuts_wire,
@@ -656,31 +1070,55 @@ fn decode_fragment_package_in<H: PackageTypeMaterializationScope>(
             work,
         )?;
         invoice = invoice.max(expressions.retained_floor_observed(work)?);
-        let functions = materialize_function_bindings_in(
-            prepare_function_bindings_materialization_in(
-                &function_headers,
-                invoice,
-                limits.bindings,
-                &mut |_| Ok(()),
-                work,
-            )?,
+        let function_token = prepare_function_bindings_materialization_in(
+            &function_headers,
+            invoice,
+            limits.bindings,
             &mut |_| Ok(()),
             work,
         )?;
-        invoice = invoice.max(functions.retained_invoice_floor()?);
-        let aggregates = materialize_aggregate_bindings_in(
-            prepare_aggregate_bindings_materialization_in(
-                &aggregate_headers,
-                &functions,
-                invoice,
-                limits.bindings,
-                &mut |_| Ok(()),
+        let functions = if let Some(creator) = creation.as_deref_mut() {
+            crate::physical_binding_v2::materialize_function_bindings_with_creator_in(
+                function_token,
+                creator,
                 work,
-            )?,
+            )?
+        } else {
+            materialize_function_bindings_in(function_token, &mut |_| Ok(()), work)?
+        };
+        invoice = if creation.is_some() {
+            let requests = functions.creation_request_bytes_upper_bound().ok_or(
+                PackageDecodeError::Invalid("strong binding construction provenance is absent"),
+            )?;
+            add(invoice, add(std::mem::size_of_val(&functions), requests)?)?
+        } else {
+            invoice.max(functions.retained_invoice_floor()?)
+        };
+        let aggregate_token = prepare_aggregate_bindings_materialization_in(
+            &aggregate_headers,
+            &functions,
+            invoice,
+            limits.bindings,
             &mut |_| Ok(()),
             work,
         )?;
-        invoice = invoice.max(aggregates.retained_invoice_floor()?);
+        let aggregates = if let Some(creator) = creation.as_deref_mut() {
+            crate::physical_aggregate_binding_v2::materialize_aggregate_bindings_with_creator_in(
+                aggregate_token,
+                creator,
+                work,
+            )?
+        } else {
+            materialize_aggregate_bindings_in(aggregate_token, &mut |_| Ok(()), work)?
+        };
+        invoice = if creation.is_some() {
+            let requests = aggregates.creation_request_bytes_upper_bound().ok_or(
+                PackageDecodeError::Invalid("strong binding construction provenance is absent"),
+            )?;
+            add(invoice, add(std::mem::size_of_val(&aggregates), requests)?)?
+        } else {
+            invoice.max(aggregates.retained_invoice_floor()?)
+        };
         let materialized = materialize_expressions_in(
             prepare_expression_materialization_in(
                 &expressions,
@@ -767,8 +1205,12 @@ fn decode_fragment_package_in<H: PackageTypeMaterializationScope>(
         },
         plan_limits,
         work,
-    )?
-    .with_call_requests_in(requests, work)?;
+    )?;
+    let fragment = if let Some(creator) = creation.as_deref_mut() {
+        fragment.with_call_requests_created_in(requests, request_storage, creator, work)?
+    } else {
+        fragment.with_call_requests_in(requests, work)?
+    };
 
     // L8: components whose membership is the final Fragment.
     let (expression_uses, _) = decode_expression_control_observed(
@@ -818,7 +1260,7 @@ fn decode_fragment_package_in<H: PackageTypeMaterializationScope>(
         &mut |_| Ok(()),
         work,
     )?;
-    Ok(match types.metadata_namespace() {
+    Ok(match types.source_metadata_namespace() {
         Some(namespace) => package.with_original_metadata_namespace(namespace.clone()),
         None => package,
     })

@@ -294,11 +294,11 @@ pub(super) fn evaluate_string_url_decode<'a>(
             return Err(invalid("URL decoding requires one checked value argument"));
         };
         let target = input.contract().result_type();
-        if source.logical_type != ValueLogicalType::Physical
-            || source.data_type != DataType::Utf8
-            || target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
+        if source.logical_type() != ValueLogicalType::Physical
+            || source.data_type() != &DataType::Utf8
+            || target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Utf8
+            || !target.nullable()
         {
             return Err(invalid(
                 "URL decoding differs from its exact installed profile",
@@ -320,7 +320,7 @@ pub(super) fn evaluate_string_url_decode<'a>(
                 return Err(internal("URL decoding selected row is outside its carrier"));
             }
             if values.is_null(row) {
-                if !source.nullable {
+                if !source.nullable() {
                     return Err(internal(
                         "URL decoding non-null source contains selected SQL NULL",
                     ));
@@ -416,7 +416,7 @@ pub(super) fn evaluate_string_url_decode<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             errors,
             || work.step(),

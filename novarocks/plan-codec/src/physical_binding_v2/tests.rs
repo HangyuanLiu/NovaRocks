@@ -82,7 +82,9 @@ fn scalar(
         function_id: FunctionId::try_new("builtin/test-signature/v1").unwrap(),
         overload: FunctionOverloadId::try_new("builtin/test-signature/exact-v1").unwrap(),
         kind,
-        argument_types: arguments.into_boxed_slice(),
+        argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+            arguments.into_boxed_slice(),
+        ),
         result_type: result,
 
         legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
@@ -101,8 +103,12 @@ fn table(
     BoundTableFunction {
         function_id: FunctionId::try_new("builtin/table-signature/v1").unwrap(),
         overload: FunctionOverloadId::try_new("builtin/table-signature/exact-v1").unwrap(),
-        argument_types: arguments.into_boxed_slice(),
-        result_types: results.into_boxed_slice(),
+        argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+            arguments.into_boxed_slice(),
+        ),
+        result_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+            results.into_boxed_slice(),
+        ),
 
         legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
             volatility: FunctionVolatility::Immutable,
@@ -159,7 +165,9 @@ fn exact_signature_wire_covers_all_kinds_lambda_relation_and_sparse_namespaces()
     let b = scalar(
         FunctionKind::Aggregate,
         vec![FunctionArgumentType::Lambda {
-            parameter_types: vec![int.clone(), text.clone()].into_boxed_slice(),
+            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                vec![int.clone(), text.clone()].into_boxed_slice(),
+            ),
             result_type: int.clone(),
         }],
         text.clone(),
@@ -287,7 +295,7 @@ fn binding_shape_missing_ids_and_full_type_disagreements_refuse() {
         FunctionValueType::new(
             DataType::Struct(
                 vec![Arc::new(
-                    Field::new("child", DataType::Int64, true)
+                    Field::new(value, DataType::Int64, true)
                         .with_metadata(HashMap::from([("id".into(), value.into())])),
                 )]
                 .into(),
@@ -505,13 +513,19 @@ fn signature_comparison_ignores_five_legacy_fields_but_keeps_full_ordered_contra
             0 => other.overload = FunctionOverloadId::try_new("different").unwrap(),
             1 => other.kind = FunctionKind::Window,
             2 => {
-                other.argument_types = vec![FunctionArgumentType::Lambda {
-                    parameter_types: Box::new([]),
-                    result_type: int.clone(),
-                }]
-                .into_boxed_slice()
+                other.argument_types =
+                    novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                        vec![FunctionArgumentType::Lambda {
+                            parameter_types:
+                                novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                                    Box::new([]),
+                                ),
+                            result_type: int.clone(),
+                        }]
+                        .into_boxed_slice(),
+                    )
             }
-            _ => other.result_type.nullable = false,
+            _ => other.result_type = other.result_type.with_nullable(false).unwrap(),
         }
         assert!(
             !finish(&Control::default(), |work| verify_scalar_signature(

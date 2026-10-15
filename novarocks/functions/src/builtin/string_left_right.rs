@@ -138,8 +138,8 @@ pub(super) fn evaluate_string_left_right<'a>(
             let FunctionArgumentType::Value(ty) = ty else {
                 return Err(invalid("left/right requires value arguments"));
             };
-            if ty.logical_type != ValueLogicalType::Physical
-                || ty.data_type
+            if ty.logical_type() != ValueLogicalType::Physical
+                || *ty.data_type()
                     != if index == 0 {
                         DataType::Utf8
                     } else {
@@ -153,9 +153,9 @@ pub(super) fn evaluate_string_left_right<'a>(
             work.step()?;
         }
         let target = input.contract().result_type();
-        if target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
+        if target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Utf8
+            || !target.nullable()
         {
             return Err(invalid(
                 "left/right differs from its exact installed result profile",
@@ -190,7 +190,7 @@ pub(super) fn evaluate_string_left_right<'a>(
                     let FunctionArgumentType::Value(ty) = &types[index] else {
                         return Err(invalid("left/right requires value arguments"));
                     };
-                    if !ty.nullable {
+                    if !ty.nullable() {
                         return Err(internal(
                             "left/right non-null argument contains selected SQL NULL",
                         ));
@@ -263,7 +263,7 @@ pub(super) fn evaluate_string_left_right<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

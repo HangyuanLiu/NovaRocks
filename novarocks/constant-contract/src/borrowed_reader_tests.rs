@@ -119,7 +119,7 @@ fn borrowed_readers_keep_nonzero_ordinals_offsets_nulls_and_original_source() {
             &maps.0.data.child_data()[0].child_data()[0]
         ));
         assert_eq!(view.len(), 4);
-        assert_eq!(view.item_observed(0, work)?, (None, Some("雪☃")));
+        assert_eq!(view.item_observed(0, work)?, (Some(""), Some("雪☃")));
         assert_eq!(view.item_observed(1, work)?, (Some(""), None));
         assert_eq!(view.item_observed(2, work)?, (Some("dup"), Some("left")));
         assert_eq!(view.item_observed(3, work)?, (Some("dup"), Some("right")));

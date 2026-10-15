@@ -248,7 +248,7 @@ fn checked_list_pool(first: i32, nullable: bool, wrong_type: bool) -> ConstantPo
 }
 fn checked_map_pool(bad_order: bool) -> ConstantPool {
     let ty = FunctionValueType::new(map_type(), false);
-    let DataType::Map(entries, _) = &ty.data_type else {
+    let DataType::Map(entries, _) = &ty.data_type() else {
         unreachable!()
     };
     let DataType::Struct(fields) = entries.data_type() else {
@@ -407,7 +407,11 @@ fn fixture(
         scalar_type = FunctionValueType::new(DataType::Utf8, true);
         data = StringArray::from(vec![Some("unused"), Some("selected-λ\0"), None]).to_data();
     }
-    let field = Arc::new(scalar_type.try_to_field("original-pool").unwrap());
+    let field = Arc::new(Field::new(
+        "original-pool",
+        data.data_type().clone(),
+        scalar_type.nullable(),
+    ));
     let pool = ConstantPool::try_new(
         field,
         scalar_type.clone(),
@@ -752,7 +756,7 @@ fn unpivot_complete_lowering_preserves_ordered_roles_repeated_sources_constants_
         assert_eq!((references[0].ordinal, references[1].ordinal), (1, 2));
         let original = &source.package.constants().entries()[&references[0].pool];
         assert_eq!(original.resource_facts().rows, 3);
-        assert!(!original.value_type().nullable);
+        assert!(!original.value_type().nullable());
     }
     assert_eq!(value_mappings[0].input_value_slot_id, old[0]);
     assert_eq!(value_mappings[1].input_value_slot_id, old[2]);
@@ -860,11 +864,18 @@ fn unpivot_selected_nested_constant_keeps_original_ordinal_complete_field_and_su
                 .unwrap(),
             index == 1
         );
-        let DataType::List(field) = &value.value_type().data_type else {
+        let DataType::List(field) = &value.value_type().data_type() else {
             panic!("exact List");
         };
-        assert_eq!(field.metadata().get("original-child").unwrap(), "preserved");
+        assert!(field.metadata().is_empty());
         assert!(field.is_nullable());
+        let DataType::List(source_field) = value.pool().field_ref().data_type() else {
+            panic!("original source List");
+        };
+        assert_eq!(
+            source_field.metadata().get("original-child").unwrap(),
+            "preserved"
+        );
     }
     let expected = &source.package.fragment().values()[&source.package.fragment().nodes()
         [&source.unpivot]
@@ -890,7 +901,7 @@ fn unpivot_selected_nested_constant_keeps_original_ordinal_complete_field_and_su
     let DataType::List(field) = node.output_layout().schema().field(3).data_type() else {
         panic!("original metadata");
     };
-    assert_eq!(field.metadata().get("original-child").unwrap(), "preserved");
+    assert!(field.metadata().is_empty());
 }
 #[test]
 fn unpivot_downstream_value_uses_actual_output_ordinal_and_keeps_independent_passthrough_slot() {
@@ -978,11 +989,11 @@ fn unpivot_special_reference_borrows_nonnullable_source_under_nullable_joined_ou
     };
     let original = &source.package.constants().entries()[&reference.pool];
     assert_eq!(reference.ordinal, 1);
-    assert!(!original.value_type().nullable);
+    assert!(!original.value_type().nullable());
     assert!(
         source.package.fragment().values()[&spec.literal_outputs[1]]
             .ty
-            .nullable
+            .nullable()
     );
     assert_eq!(original.resource_facts().rows, 3);
     let program = compile(&source, &functions(), &Control).unwrap();
@@ -1010,7 +1021,7 @@ fn unpivot_special_reference_borrows_nonnullable_source_under_nullable_joined_ou
     assert!(node.output_layout().schema().field(4).is_nullable());
     // The source promise and original field/backing have not been retagged to
     // the joined output's true nullable metadata.
-    assert!(!original.value_type().nullable);
+    assert!(!original.value_type().nullable());
     assert_eq!(original.field_ref().name(), "original-special-list");
 }
 
@@ -1190,7 +1201,7 @@ fn unpivot_literal_source_keeps_individual_nullability_under_joined_nullable_out
         panic!("shared literal admission owner");
     };
     assert_eq!(value.try_utf8().unwrap(), Some("authored-literal"));
-    assert!(!value.value_type().nullable);
+    assert!(!value.value_type().nullable());
     let LocalConstant::Scalar { expr_id, nullable } = &value_mappings[1].constants[0] else {
         panic!("CV NULL");
     };

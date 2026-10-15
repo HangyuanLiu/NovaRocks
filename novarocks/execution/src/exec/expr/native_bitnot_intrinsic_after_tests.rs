@@ -147,7 +147,7 @@ fn native_bitnot_intrinsic_actual_sql_signed_four_widths_frame_matches_original_
             .unwrap();
         let computed = source.plan().result_port().unwrap();
         assert_eq!(public.original_port(), computed);
-        assert!(!public.fields()[0].ty.nullable);
+        assert!(!public.fields()[0].ty.nullable());
         let plans = programs(&source);
         let (program, root) = producer_root(&plans);
         let data = batch(&program, root, input.clone());
@@ -224,7 +224,7 @@ fn native_bitnot_intrinsic_actual_sql_largeint_cast_uses_exact_logical_recipe() 
     assert_eq!(
         source.plan().result_port().unwrap().fields[0]
             .ty
-            .logical_type,
+            .logical_type(),
         novarocks_type_contract::ValueLogicalType::LargeInt
     );
 }
@@ -251,7 +251,7 @@ fn native_bitnot_intrinsic_actual_sql_nullable_values_current_domain_matches_ori
         sparse.values().to_data(),
         Int64Array::from(vec![-2, 1]).to_data()
     );
-    assert!(source.plan().result_port().unwrap().fields[0].ty.nullable);
+    assert!(source.plan().result_port().unwrap().fields[0].ty.nullable());
 }
 fn constant_outputs(sql: &str) -> Vec<ArrayRef> {
     let source = sql_source(sql, DataType::Int64, EXACT);

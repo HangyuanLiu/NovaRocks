@@ -27,7 +27,7 @@ use crate::{
 };
 use novarocks_type_contract::{
     ArgumentControl, CallEffects, CallProofScope, CompileCheckpoints, CompileControlError,
-    CompilePhase, DecimalOverflowPolicy, EffectContractError, EvaluationDemand,
+    CompilePhase, DecimalOverflowPolicy, EffectContractError, EvaluationDemand, EvaluationDomainId,
     ExpressionEffectContext, ExpressionUseId, FunctionEffectDeclaration, FunctionKind,
     MAX_CONTROL_USE_REFERENCES, PureCompileControl, SemanticParameterRef,
 };
@@ -57,6 +57,10 @@ pub enum PhysicalCallSite {
 pub struct FrozenPhysicalCall {
     pub site: PhysicalCallSite,
     pub context: ExpressionEffectContext,
+    /// Original materialized Value occurrence authored by the writer journal.
+    /// It is a root domain, but deliberately not an expression invocation.
+    /// Required for WriterPartial/WriterFinal and absent for every other site.
+    pub materialized_writer_input: Option<ExpressionEffectContext>,
     pub effects: CallEffects,
     /// Authored by this call's SQL scope, independently of effect claims and
     /// environment parameters. Compilation must not infer a package default.
@@ -199,7 +203,13 @@ impl FrozenFragmentCalls {
     pub fn construction_resources(
         count: usize,
     ) -> Result<novarocks_type_contract::ControlOwnedResourceFacts, FrozenCallError> {
-        if count > MAX_CONTROL_USE_REFERENCES {
+        Self::construction_resources_with_writer_inputs(count, count)
+    }
+    pub fn construction_resources_with_writer_inputs(
+        count: usize,
+        writer_inputs: usize,
+    ) -> Result<novarocks_type_contract::ControlOwnedResourceFacts, FrozenCallError> {
+        if count > MAX_CONTROL_USE_REFERENCES || writer_inputs > count {
             return Err(FrozenCallError::TooManyItems);
         }
         let mut resources = novarocks_type_contract::ControlResourceCounter::default();
@@ -210,8 +220,21 @@ impl FrozenFragmentCalls {
             .arc::<BTreeMap<PhysicalCallSite, FrozenPhysicalCall>>(1)
             .map_err(resource_error)?;
         resources
-            .tree::<ExpressionUseId, ()>(count)
+            .tree::<ExpressionUseId, ()>(
+                count
+                    .checked_add(writer_inputs)
+                    .ok_or(FrozenCallError::TooManyItems)?,
+            )
             .map_err(resource_error)?;
+        if writer_inputs != 0 {
+            resources
+                .tree::<EvaluationDomainId, ()>(
+                    count
+                        .checked_add(writer_inputs)
+                        .ok_or(FrozenCallError::TooManyItems)?,
+                )
+                .map_err(resource_error)?;
+        }
         Ok(resources.facts())
     }
 
@@ -240,10 +263,23 @@ impl FrozenFragmentCalls {
         if calls.len() > MAX_CONTROL_USE_REFERENCES {
             return Err(FrozenCallError::TooManyItems);
         }
+
         let mut resources = novarocks_type_contract::ControlResourceCounter::default();
         if admit.is_some() {
             resources
-                .merge(Self::construction_resources(calls.len())?)
+                .merge(Self::construction_resources_with_writer_inputs(
+                    calls.len(),
+                    calls
+                        .iter()
+                        .filter(|call| {
+                            matches!(
+                                call.site,
+                                PhysicalCallSite::WriterPartial { .. }
+                                    | PhysicalCallSite::WriterFinal { .. }
+                            )
+                        })
+                        .count(),
+                )?)
                 .map_err(resource_error)?;
             admit_resources(&resources, &mut admit)?;
         }
@@ -332,13 +368,41 @@ impl FrozenFragmentCalls {
         if self.fragment != fragment.id() {
             return Err(FrozenCallError::WrongFragment);
         }
+        let mut writer_inputs = 0usize;
+        for call in self.entries.values() {
+            work.step()?;
+            writer_inputs += usize::from(matches!(
+                call.site,
+                PhysicalCallSite::WriterPartial { .. } | PhysicalCallSite::WriterFinal { .. }
+            ));
+        }
         let mut resources = novarocks_type_contract::ControlResourceCounter::default();
         if let Some(parent) = admit.as_mut() {
             // This is an upper bound for the actual relational-ID set. Each
             // environment collection is charged at its captured occurrence.
             if !special_precharged {
                 resources
-                    .tree::<ExpressionUseId, ()>(self.entries.len())
+                    .tree::<ExpressionUseId, ()>(
+                        self.entries
+                            .len()
+                            .checked_add(writer_inputs)
+                            .ok_or(FrozenCallError::TooManyItems)?,
+                    )
+                    .map_err(resource_error)?;
+            }
+            if writer_inputs != 0 && !special_precharged {
+                resources
+                    .tree::<EvaluationDomainId, ()>(
+                        self.entries
+                            .len()
+                            .checked_add(writer_inputs)
+                            .ok_or(FrozenCallError::TooManyItems)?,
+                    )
+                    .map_err(resource_error)?;
+            }
+            if writer_inputs != 0 {
+                resources
+                    .tree::<EvaluationDomainId, ()>(uses.flow().uses().len())
                     .map_err(resource_error)?;
             }
             let lookups =
@@ -385,6 +449,24 @@ impl FrozenFragmentCalls {
         // relational calls. It does not multiply by an arena's maximum ID.
         let mut references = uses.flow().use_reference_count();
         let mut special_ids = BTreeSet::new();
+        let mut special_domains = BTreeSet::new();
+        let mut expression_domains = BTreeSet::new();
+        if writer_inputs != 0 {
+            for invocation in uses.flow().uses().values() {
+                work.step()?;
+                expression_domains.insert(invocation.context.domain);
+            }
+        }
+        // Reserve relational domains before validating writer Values so call
+        // order cannot disguise borrowing a later call's root domain.
+        if writer_inputs != 0 {
+            for call in self.entries.values() {
+                work.step()?;
+                if !matches!(call.site, PhysicalCallSite::Expression(_)) {
+                    special_domains.insert(call.context.domain);
+                }
+            }
+        }
         let mut visited = 0usize;
         visit_calls(fragment, uses, work, |site, binding, work| {
             let call = self
@@ -600,6 +682,43 @@ impl FrozenFragmentCalls {
                         return Err(FrozenCallError::InvalidDomain);
                     }
                 }
+            }
+            let writer = matches!(
+                call.site,
+                PhysicalCallSite::WriterPartial { .. } | PhysicalCallSite::WriterFinal { .. }
+            );
+            match (writer, call.materialized_writer_input) {
+                (true, Some(input)) => {
+                    if input.demand != EvaluationDemand::Value
+                        || input.domain == call.context.domain
+                        || input.use_id == call.context.use_id
+                    {
+                        return Err(FrozenCallError::WrongContext);
+                    }
+                    if uses.flow().uses().contains_key(&input.use_id)
+                        || !special_ids.insert(input.use_id)
+                    {
+                        return Err(FrozenCallError::SharedUse);
+                    }
+                    let domain = uses
+                        .flow()
+                        .domains()
+                        .get(&input.domain)
+                        .ok_or(FrozenCallError::InvalidDomain)?;
+                    if domain.parent.is_some() || domain.guard.is_some() {
+                        return Err(FrozenCallError::InvalidDomain);
+                    }
+                    // Actual source domains are retained; their uses are not
+                    // expression invocations. One indexed pass avoids a scan
+                    // of the whole graph for each writer channel.
+                    if expression_domains.contains(&input.domain)
+                        || !special_domains.insert(input.domain)
+                    {
+                        return Err(FrozenCallError::InvalidDomain);
+                    }
+                }
+                (false, None) => {}
+                _ => return Err(FrozenCallError::WrongContext),
             }
             if call.effects.proof_scope != CallProofScope::Unconditional
                 && call.effects.proof_scope != CallProofScope::Domain(call.context.domain)

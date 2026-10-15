@@ -60,7 +60,7 @@ pub(super) fn actual(
             .unwrap();
     let mut arena = ExprArena::default();
     arena.set_allow_throw_exception(allow);
-    let child = arena.push_typed(ExprNode::SlotId(SlotId::new(17)), ty.data_type);
+    let child = arena.push_typed(ExprNode::SlotId(SlotId::new(17)), ty.data_type().clone());
     let root = arena.push_typed(ExprNode::Cast(child, policy), target);
     arena.eval(root, &Chunk::new_with_chunk_schema(data, schema))
 }

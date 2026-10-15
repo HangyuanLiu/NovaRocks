@@ -168,9 +168,13 @@ impl PreparedWindowKernel for PreparedOffset {
                 work.step()?;
                 for row in 0..rows {
                     let address = source.value_row(row, row);
-                    // Original IGNORE NULLS tests physical Array::is_null. No
-                    // encoded logical-NULL rule is substituted here.
-                    if !source.array().is_null(address) {
+                    // Encoded values use the same logical NULL rule as plain values.
+                    if !crate::kernel_input::logical_is_null(
+                        source.array().as_ref(),
+                        address,
+                        1,
+                        &mut work,
+                    )? {
                         positions.push(row);
                     }
                     prefix.push(positions.len());
@@ -359,7 +363,7 @@ impl WindowKernelPartition for OffsetPartition<'_> {
                 };
                 SelectedValues::try_new_observed::<KernelFailure>(
                     selection,
-                    &self.prepared.contract.result_type().data_type,
+                    self.prepared.contract.result_type().data_type(),
                     copied,
                     Box::default(),
                     || work.step(),

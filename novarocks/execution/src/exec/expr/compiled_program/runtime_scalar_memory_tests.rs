@@ -117,7 +117,7 @@ fn fixture_family(
     let integer = FunctionValueType::new(source_type, true);
     let count_type = FunctionValueType::new(
         if bitwise {
-            integer.data_type.clone()
+            integer.data_type().clone()
         } else {
             DataType::Int64
         },
@@ -229,7 +229,7 @@ fn fixture_family(
     };
     let result_value = ValueId::new(101);
     let result_type = if matches!(shape, Shape::Filter) {
-        let zero = if integer.data_type == DataType::Int64 {
+        let zero = if integer.data_type() == &DataType::Int64 {
             builder
                 .add_expression(
                     output,

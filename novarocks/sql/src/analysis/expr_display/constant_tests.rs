@@ -184,7 +184,12 @@ fn selected_field_path_and_aggregate_labels_preserve_existing_source_spelling() 
 fn selected_display_rejects_foreign_full_type_and_preserves_ordinary_failure_tail() {
     let pool = source(DataType::Utf8, "chosen");
     let mut bad = constant(pool.value(2).unwrap());
-    bad.value_type.logical_type = ValueLogicalType::Json;
+    bad.value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+        bad.value_type.data_type().clone(),
+        bad.value_type.nullable(),
+        ValueLogicalType::Json,
+    )
+    .unwrap();
     let baseline = Control::default();
     assert!(matches!(
         typed_expr_display_name(&case(bad.clone()), &baseline),

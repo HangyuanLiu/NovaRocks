@@ -52,7 +52,7 @@ impl<'a> CompiledInputLoan<'a> {
     pub(crate) fn batch(self) -> &'a RecordBatch {
         match self {
             Self::RecordBatch(batch) => batch,
-            Self::Chunk(chunk) => &chunk.batch,
+            Self::Chunk(chunk) => chunk.record_batch(),
             #[cfg(test)]
             Self::Observed { input, .. } => input.batch(),
         }

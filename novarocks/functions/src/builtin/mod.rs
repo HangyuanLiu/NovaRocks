@@ -236,6 +236,7 @@ mod string_url_encode;
 mod string_url_encode_owner;
 mod table_unnest;
 mod table_unnest_owner;
+pub(crate) use table_unnest_owner::Owner as UnnestOwner;
 #[cfg(test)]
 mod table_unnest_tests;
 mod truncate;
@@ -371,3 +372,9 @@ mod aggregate_top_k_owner;
 pub mod string_concat_core;
 
 pub mod array_repeat_core;
+mod parametric_aggregate_construction;
+mod scalar_construction;
+mod scalar_type_recipe;
+
+// The single binding carrier preserves FIELD's actual validation prefix.
+pub(crate) use string_field_owner::StringFieldOwner;

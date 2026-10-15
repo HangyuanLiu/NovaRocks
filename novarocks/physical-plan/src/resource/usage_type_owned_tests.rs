@@ -19,7 +19,7 @@ use super::*;
 use crate::*;
 use novarocks_type_contract::{
     CompilePhase, PureCompileControl,
-    owned_resources::{btree, copy::copy_string, type_validation},
+    owned_resources::{btree, copy::copy_string},
 };
 use std::{alloc::Layout, collections::BTreeMap, mem::size_of, sync::Mutex};
 
@@ -62,7 +62,9 @@ fn function(kind: FunctionKind, lambda: bool) -> BoundFunction {
         Box::from([
             FunctionArgumentType::Value(ty()),
             FunctionArgumentType::Lambda {
-                parameter_types: Box::from([ty(), ty()]),
+                parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    Box::from([ty(), ty()]),
+                ),
                 result_type: ty(),
             },
         ])
@@ -73,7 +75,7 @@ fn function(kind: FunctionKind, lambda: bool) -> BoundFunction {
         novarocks_type_contract::FunctionId::try_new("test.resource.signature").unwrap(),
         novarocks_type_contract::FunctionOverloadId::try_new("test.resource.overload").unwrap(),
         kind,
-        arguments,
+        novarocks_type_contract::TypedFactSlice::from_pure_boxed(arguments),
         ty(),
     )
 }
@@ -133,7 +135,7 @@ fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, usize) {
             ValueDef {
                 id,
                 ty: if bad && ordinal == 0 {
-                    ValueType::new(DataType::FixedSizeBinary(-1), false)
+                    ValueType::new(DataType::Binary, false)
                 } else {
                     ty()
                 },
@@ -222,11 +224,15 @@ fn fragment(width: u32, rich: bool, bad: bool) -> (Fragment, usize) {
             novarocks_type_contract::FunctionId::try_new("test.resource.table").unwrap(),
             novarocks_type_contract::FunctionOverloadId::try_new("test.resource.table.overload")
                 .unwrap(),
-            Box::from([FunctionArgumentType::Lambda {
-                parameter_types: Box::from([ty(), ty()]),
-                result_type: ty(),
-            }]),
-            Box::from([ty(), ty()]),
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                FunctionArgumentType::Lambda {
+                    parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        Box::from([ty(), ty()]),
+                    ),
+                    result_type: ty(),
+                },
+            ])),
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([ty(), ty()])),
         );
         heap += table.function_id.as_str().len()
             + table.overload.as_str().len()
@@ -379,10 +385,7 @@ fn assert_primitives(facts: ControlOwnedResourceFacts, data_roots: usize, logica
     assert_eq!(Layout::new::<(&DataType, usize)>().size(), 16);
     assert_eq!(facts.allocation_requests_upper_bound, data_roots);
     assert_eq!(facts.allocation_request_bytes_upper_bound, 16 * data_roots);
-    assert!(
-        facts.cumulative_work_upper_bound
-            >= logical_roots * type_validation::scratch_work_upper_bound()
-    );
+    assert!(facts.cumulative_work_upper_bound >= logical_roots);
 }
 
 #[test]
@@ -531,13 +534,13 @@ fn actual_cuts_keep_inbound_writer_and_both_outbound_type_occurrences_and_filter
 }
 
 #[test]
-fn each_actual_small_fragment_success_and_ordinary_diagnostic_callback_keeps_caller_cause() {
+fn each_actual_small_fragment_type_variant_callback_keeps_caller_cause() {
     for bad in [false, true] {
         let (fragment, source) = fragment(1, false, bad);
         let control = Control::default();
         let actual = run_fragment(&fragment, source, &control).unwrap();
         assert_plain(&fragment, &actual);
-        assert_eq!(actual.errors.is_empty(), !bad);
+        assert!(actual.errors.is_empty());
         let trace = control.trace();
         assert_eq!(trace.first(), Some(&0));
         assert!(trace.last().is_some());

@@ -36,8 +36,8 @@ enum IntegerReader {
 }
 impl IntegerReader {
     fn from_type(ty: &FunctionValueType) -> Option<Self> {
-        if ty.logical_type == ValueLogicalType::LargeInt
-            && ty.data_type == DataType::FixedSizeBinary(16)
+        if ty.logical_type() == ValueLogicalType::LargeInt
+            && ty.data_type() == &DataType::FixedSizeBinary(16)
         {
             Some(Self::LargeInt)
         } else {
@@ -108,7 +108,6 @@ impl LargeIntArithmetic {
         operator: ArithmeticOperator,
         left: &FunctionValueType,
         right: &FunctionValueType,
-        _result: &FunctionValueType,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<Self>, ArithmeticPrepareError> {
         let readers = (

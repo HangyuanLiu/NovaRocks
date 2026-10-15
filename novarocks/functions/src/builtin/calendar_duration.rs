@@ -92,13 +92,13 @@ pub(super) fn evaluate_duration_shift<'a>(
             ));
         };
         let target = input.target;
-        if target.logical_type != ValueLogicalType::Physical
-            || !target.nullable
-            || interval_type.logical_type != ValueLogicalType::Physical
-            || interval_type.data_type != DataType::Int64
+        if target.logical_type() != ValueLogicalType::Physical
+            || !target.nullable()
+            || interval_type.logical_type() != ValueLogicalType::Physical
+            || interval_type.data_type() != &DataType::Int64
             || interval_arg.array().data_type() != &DataType::Int64
             || (!input.legacy
-                && target.data_type != DataType::Timestamp(TimeUnit::Microsecond, None))
+                && target.data_type() != &DataType::Timestamp(TimeUnit::Microsecond, None))
         {
             return Err(invalid(
                 "duration shift differs from its exact declared profile",
@@ -128,7 +128,8 @@ pub(super) fn evaluate_duration_shift<'a>(
             }
             let date_null = date_arg.array().is_null(date_row);
             let interval_null = intervals.is_null(interval_row);
-            if (date_null && !date_type.nullable) || (interval_null && !interval_type.nullable) {
+            if (date_null && !date_type.nullable()) || (interval_null && !interval_type.nullable())
+            {
                 return Err(internal("duration shift non-null source contains SQL NULL"));
             }
             work.step()?;
@@ -158,7 +159,7 @@ pub(super) fn evaluate_duration_shift<'a>(
             // A legacy Date32 requested result intentionally projects NULL into its
             // historical TimestampUS carrier; the owner admits only exact TimestampUS.
             projected.push(
-                value.and_then(|date| timestamp_value_for_type(date, &target.data_type).ok()),
+                value.and_then(|date| timestamp_value_for_type(date, target.data_type()).ok()),
             );
             work.step()?;
         }

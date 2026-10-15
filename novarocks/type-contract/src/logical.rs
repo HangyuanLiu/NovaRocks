@@ -110,6 +110,7 @@ impl ValueLogicalType {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValueTypeError {
+    InvalidType(&'static str),
     UnknownLogicalMetadata,
     InvalidLogicalCarrier(ValueLogicalType),
     TooDeep,
@@ -118,6 +119,7 @@ pub enum ValueTypeError {
 impl fmt::Display for ValueTypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidType(message) => f.write_str(message),
             Self::UnknownLogicalMetadata => f.write_str("unknown logical type metadata"),
             Self::InvalidLogicalCarrier(logical) => {
                 write!(f, "invalid Arrow carrier for {logical:?}")
@@ -128,6 +130,17 @@ impl fmt::Display for ValueTypeError {
     }
 }
 impl std::error::Error for ValueTypeError {}
+
+impl From<crate::ExecutionValueTypeError> for ValueTypeError {
+    fn from(error: crate::ExecutionValueTypeError) -> Self {
+        match error {
+            crate::ExecutionValueTypeError::Invalid(message) => Self::InvalidType(message),
+            crate::ExecutionValueTypeError::Logical(error) => error,
+            crate::ExecutionValueTypeError::Depth => Self::TooDeep,
+            crate::ExecutionValueTypeError::Nodes => Self::TooManyNodes,
+        }
+    }
+}
 
 pub fn field_logical_type(field: &Field) -> Result<ValueLogicalType, ValueTypeError> {
     let logical = match field.metadata().get(NR_LOGICAL_TYPE_KEY) {
@@ -213,7 +226,17 @@ pub fn validate_value_type_structure_observed<'a, E: From<ValueTypeError>>(
     observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
 ) -> Result<(), E> {
     let mut pending = vec![(root, 1usize)];
-    validate_value_type_structure_with_pending(&mut pending, observe)
+    validate_value_type_structure_with_pending(&mut pending, true, observe)
+}
+
+/// Validate only borrowed Arrow layout shape and bounds. Format annotations
+/// cannot author execution semantics and are never interpreted by this entry.
+pub fn validate_arrow_layout_structure_observed<'a, E: From<ValueTypeError>>(
+    root: &'a DataType,
+    observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut pending = vec![(root, 1usize)];
+    validate_value_type_structure_with_pending(&mut pending, false, observe)
 }
 
 /// The same grammar, bounds, borrowed events and primary-error order, using
@@ -230,14 +253,30 @@ pub fn validate_value_type_structure_with_scratch_observed<'a, E: From<ValueType
         len: 0,
     };
     pending.push((root, 1));
-    validate_value_type_structure_with_pending(&mut pending, observe)
+    validate_value_type_structure_with_pending(&mut pending, true, observe)
+}
+
+/// The layout-only grammar and borrowed attributes, using caller-owned scratch.
+/// Source annotations remain observable carrier attributes, never semantics.
+pub fn validate_arrow_layout_structure_with_scratch_observed<'a, E: From<ValueTypeError>>(
+    root: &'a DataType,
+    scratch: &mut [Option<(&'a DataType, usize)>; MAX_VALUE_TYPE_NODES],
+    observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut pending = BorrowedTypePending {
+        slots: scratch,
+        len: 0,
+    };
+    pending.push((root, 1));
+    validate_value_type_structure_with_pending(&mut pending, false, observe)
 }
 
 fn validate_value_type_structure_with_pending<'a, E: From<ValueTypeError>>(
     pending: &mut impl TypePending<'a>,
+    validate_annotations: bool,
     observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
 ) -> Result<(), E> {
-    visit_value_type_with_pending(pending, false, observe)
+    visit_value_type_with_pending(pending, false, validate_annotations, observe)
 }
 
 /// Borrow the owned edges of the original derived DataType::clone. All FieldRef,
@@ -255,12 +294,13 @@ pub fn visit_original_data_type_clone_with_scratch_observed<'a, E: From<ValueTyp
         len: 0,
     };
     pending.push((root, 1));
-    visit_value_type_with_pending(&mut pending, true, observe)
+    visit_value_type_with_pending(&mut pending, true, true, observe)
 }
 
 fn visit_value_type_with_pending<'a, E: From<ValueTypeError>>(
     pending: &mut impl TypePending<'a>,
     original_owned_clone: bool,
+    validate_annotations: bool,
     mut observe: impl FnMut(ValueTypeVisit<'a>) -> Result<(), E>,
 ) -> Result<(), E> {
     let mut visited = 0usize;
@@ -276,7 +316,9 @@ fn visit_value_type_with_pending<'a, E: From<ValueTypeError>>(
         let mut push = |child: &'a DataType, field: Option<&'a Field>| -> Result<(), E> {
             if let Some(field) = field {
                 observe(ValueTypeVisit::Field(field))?;
-                field_logical_type(field)?;
+                if validate_annotations {
+                    field_logical_type(field)?;
+                }
             }
             observe(ValueTypeVisit::ChildEdge(child))?;
             if visited + pending.len() >= MAX_VALUE_TYPE_NODES {
@@ -478,7 +520,7 @@ pub fn preserves_nested_logical_identity_observed<E: From<ValueTypeError>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FunctionValueType, fits_nested_nullability};
+    use crate::FunctionValueType;
     use std::sync::Arc;
 
     #[test]
@@ -538,7 +580,7 @@ mod tests {
         ] {
             let typed =
                 FunctionValueType::try_with_logical_type(carrier.clone(), false, logical).unwrap();
-            let plain = FunctionValueType::new(carrier, false);
+            let plain = FunctionValueType::from_legacy_declared_projection(carrier, false);
             assert!(!typed.same_value_domain(&plain));
             assert!(!typed.fits_value_type(&plain));
             assert!(!plain.fits_value_type(&typed));
@@ -582,18 +624,37 @@ mod tests {
         };
         let actual = DataType::List(Arc::new(field(false, Some("json"))));
         let expected = DataType::List(Arc::new(field(true, Some("json"))));
-        assert!(fits_nested_nullability(&actual, &expected));
-        assert!(!fits_nested_nullability(&expected, &actual));
-        assert!(!fits_nested_nullability(
-            &actual,
-            &DataType::List(Arc::new(field(true, None)))
-        ));
+        let declared_list = |nullable, kind| {
+            let storage = crate::ValueTypeStorageLifetime::pure();
+            let child = crate::ValueTypeRef::try_new(kind, nullable, storage.clone()).unwrap();
+            let value =
+                crate::ValueTypeRef::try_new(crate::ValueKind::List(child), true, storage.clone())
+                    .unwrap();
+            let layout = crate::ValueLayout::try_new(
+                &DataType::List(Arc::new(Field::new("item", DataType::Utf8, nullable))),
+                storage,
+            )
+            .unwrap();
+            FunctionValueType::try_from_value(value, layout).unwrap()
+        };
+        let actual_value = declared_list(false, crate::ValueKind::Nominal(ValueLogicalType::Json));
+        let expected_value = declared_list(true, crate::ValueKind::Nominal(ValueLogicalType::Json));
+        let plain_value = declared_list(true, crate::ValueKind::String);
+        let fits = |actual: &FunctionValueType, expected: &FunctionValueType| {
+            actual
+                .fits_physical_binding_observed::<ValueTypeError>(expected, || Ok(()))
+                .unwrap()
+        };
+        assert!(fits(&actual_value, &expected_value));
+        assert!(!fits(&expected_value, &actual_value));
+        assert!(!fits(&actual_value, &plain_value));
+        assert!(!fits(&plain_value, &actual_value));
         let unknown = DataType::List(Arc::new(field(true, Some("unknown"))));
         assert_eq!(
             validate_nested_logical_types(&unknown),
             Err(ValueTypeError::UnknownLogicalMetadata)
         );
-        assert!(!fits_nested_nullability(&unknown, &unknown));
+
         assert!(preserves_nested_logical_identity(&actual, &expected));
         let plain = DataType::List(Arc::new(field(true, None)));
         assert!(!preserves_nested_logical_identity(&actual, &plain));
@@ -627,10 +688,10 @@ mod tests {
     }
 
     #[test]
-    fn typed_equality_keeps_nested_dictionary_ids() {
+    fn typed_equality_excludes_nested_dictionary_encoding_ids() {
         #[allow(deprecated)]
         let value = |id| {
-            FunctionValueType::new(
+            FunctionValueType::from_legacy_declared_projection(
                 DataType::Struct(
                     vec![Field::new_dict(
                         "dict",
@@ -644,8 +705,8 @@ mod tests {
                 false,
             )
         };
-        assert_ne!(value(1), value(2));
-        assert!(!value(1).same_value_domain(&value(2)));
+        assert_eq!(value(1), value(2));
+        assert!(value(1).same_value_domain(&value(2)));
     }
 
     #[test]

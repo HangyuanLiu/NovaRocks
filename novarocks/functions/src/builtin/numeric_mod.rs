@@ -76,11 +76,11 @@ pub(super) fn evaluate_numeric_mod<'a>(
         ));
     };
     let target = input.contract().result_type();
-    if left_type.logical_type != ValueLogicalType::Physical
-        || right_type.logical_type != ValueLogicalType::Physical
-        || target.logical_type != ValueLogicalType::Physical
-        || target.data_type != DataType::Float64
-        || !target.nullable
+    if left_type.logical_type() != ValueLogicalType::Physical
+        || right_type.logical_type() != ValueLogicalType::Physical
+        || target.logical_type() != ValueLogicalType::Physical
+        || target.data_type() != &DataType::Float64
+        || !target.nullable()
     {
         return Err(invalid(
             "integer remainder logical or result type differs from its exact profile",
@@ -88,8 +88,8 @@ pub(super) fn evaluate_numeric_mod<'a>(
     }
     let left_array = left.array();
     let right_array = right.array();
-    let left_view = checked_view(left_array, &left_type.data_type)?;
-    let right_view = checked_view(right_array, &right_type.data_type)?;
+    let left_view = checked_view(left_array, left_type.data_type())?;
+    let right_view = checked_view(right_array, right_type.data_type())?;
     let selection = input.selection();
     output_capacity(selection.len())?;
     let mut builder = Float64Builder::with_capacity(selection.len());
@@ -107,8 +107,8 @@ pub(super) fn evaluate_numeric_mod<'a>(
                     "integer remainder selected row is outside its checked carrier",
                 ));
             }
-            if (left_array.is_null(left_row) && !left_type.nullable)
-                || (right_array.is_null(right_row) && !right_type.nullable)
+            if (left_array.is_null(left_row) && !left_type.nullable())
+                || (right_array.is_null(right_row) && !right_type.nullable())
             {
                 return Err(internal(
                     "integer remainder non-null input contains selected SQL NULL",
@@ -133,7 +133,7 @@ pub(super) fn evaluate_numeric_mod<'a>(
     })?;
     let values = Arc::new(builder.finish()) as ArrayRef;
     work.finish()?;
-    SelectedValues::try_new(selection, &target.data_type, values, Box::default())
+    SelectedValues::try_new(selection, target.data_type(), values, Box::default())
         .map_err(|_| internal("integer remainder compact output violates its selected contract"))
 }
 /// Rust allocation representability only; this does not authorize memory.
@@ -201,8 +201,8 @@ mod tests {
     }
     fn dense(name: &str, left: ArrayRef, right: ArrayRef) -> ArrayRef {
         let types = [
-            FunctionValueType::new(left.data_type().clone(), true),
-            FunctionValueType::new(right.data_type().clone(), true),
+            FunctionValueType::from_legacy_declared_projection(left.data_type().clone(), true),
+            FunctionValueType::from_legacy_declared_projection(right.data_type().clone(), true),
         ];
         let mut instance = instance(name, &types);
         let arguments = [

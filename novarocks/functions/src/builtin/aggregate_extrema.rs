@@ -352,7 +352,7 @@ impl PreparedAggregateKernel for ExtremaKernel {
     {
         build(
             states,
-            &self.contract.intermediate_type().data_type,
+            self.contract.intermediate_type().data_type(),
             control,
         )
     }
@@ -364,7 +364,7 @@ impl PreparedAggregateKernel for ExtremaKernel {
     where
         I: ExactSizeIterator<Item = &'state Self::State>,
     {
-        build(states, &self.contract.final_type().data_type, control)
+        build(states, self.contract.final_type().data_type(), control)
     }
 }
 fn bitmap_bytes(rows: usize) -> Result<usize, KernelFailure> {

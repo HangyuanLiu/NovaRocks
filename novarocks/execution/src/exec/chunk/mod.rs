@@ -20,6 +20,7 @@ mod compiled_layout_metadata_request;
 mod hydrate;
 mod memory;
 mod output_metadata;
+mod required_dictionary_nulls;
 mod root_array_storage;
 mod root_chunk_storage;
 mod root_schema_backing;
@@ -31,10 +32,16 @@ pub(crate) mod source_authority_tests;
 #[cfg(test)]
 mod tests;
 pub mod type_compatibility;
+mod typed_array_normalization;
+#[cfg(test)]
+pub(crate) mod typed_fixture;
 
-pub use chunk_impl::Chunk;
+pub use chunk_impl::{Chunk, ChunkBatchProjection};
 pub use compiled_layout_metadata_request::original_compiled_schema_metadata_request;
+pub use hydrate::dictionary_hydration_required_observed;
 pub use hydrate::hydrate_dictionary_columns_except;
+pub use hydrate::hydrate_dictionary_columns_observed;
+pub use hydrate::hydrate_dictionary_columns_owned_observed;
 pub use memory::record_batch_bytes;
 pub(crate) use memory::{
     ChunkMemoryLease, TransferredChunkBytes, record_batch_additional_bytes,
@@ -49,3 +56,9 @@ pub use root_chunk_storage::{borrowed_root_chunk_schema_storage, borrowed_root_c
 pub use schema::{ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 pub use slot_layout::SlotLayout;
 pub(crate) use source_authority::ChunkSourceAuthorityRef;
+pub use typed_array_normalization::{
+    ArrayNormalizationStep, ArrayPathStep, normalize_execution_array,
+    normalize_execution_array_observed, normalize_execution_field_observed,
+};
+
+pub(crate) use schema::validate_chunk_carrier_encoding_observed;

@@ -96,6 +96,7 @@ pub struct IcebergMvRewriteContext {
     pub target_snapshot_id: Option<i64>,
     pub target_table_uuid: String,
     pub target_arrow_schema: SchemaRef,
+    pub(crate) target_write_fields: Arc<[novarocks_spi::connector::ConnectorWriteFieldRequest]>,
     pub target_field_ids: Arc<[Bytes]>,
     pub runtime_bindings: MvRuntimeBindings,
     analysis: MvRewriteAnalysisFacts,
@@ -115,12 +116,17 @@ impl IcebergMvRewriteContext {
             .collect()
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The immutable MV handoff keeps source schema and complete write declarations independent."
+    )]
     pub fn from_parts(
         projection: Arc<StoredMvProjection>,
         current: Vec<MvRewriteSourceSnapshot>,
         previous: Vec<MvRewriteSourceSnapshot>,
         target_table_uuid: String,
         target_arrow_schema: SchemaRef,
+        target_write_fields: Arc<[novarocks_spi::connector::ConnectorWriteFieldRequest]>,
         exact_target: MvExactTargetSchemaFacts,
         analysis: MvRewriteAnalysisFacts,
     ) -> Result<Self, String> {
@@ -133,6 +139,20 @@ impl IcebergMvRewriteContext {
         }
         if target_table_uuid.is_empty() {
             return Err("MV rewrite target UUID is absent".into());
+        }
+        if target_write_fields.len() != target_arrow_schema.fields().len()
+            || target_write_fields
+                .iter()
+                .zip(target_arrow_schema.fields())
+                .any(|(request, field)| {
+                    request.execution_type().is_none()
+                        || !novarocks_type_contract::arrow_fields_exact(
+                            request.field(),
+                            field.as_ref(),
+                        )
+                })
+        {
+            return Err("MV rewrite target fields lack their exact complete declarations".into());
         }
         let runtime_bindings = reconstruct_runtime_bindings(facts, &exact_target)?;
         let target_field_ids = validate_target_schema(&target_arrow_schema, &exact_target)?;
@@ -192,6 +212,7 @@ impl IcebergMvRewriteContext {
             target_snapshot_id,
             target_table_uuid,
             target_arrow_schema,
+            target_write_fields,
             target_field_ids: target_field_ids.into(),
             runtime_bindings,
             analysis,
@@ -357,17 +378,20 @@ impl IcebergMvRewriteContext {
             )?)?;
         }
         builder.set_target_columns(SqlImvTargetColumnsFacts::try_new(
-            self.target_arrow_schema
-                .fields()
+            self.target_write_fields
                 .iter()
-                .map(|field| novarocks_types::schema::ColumnDef {
-                    name: field.name().clone(),
-                    data_type: field.data_type().clone(),
-                    nullable: field.is_nullable(),
-                    write_default: None,
-                    logical_type: None,
+                .map(|field| {
+                    let declared = field.execution_type().ok_or_else(|| {
+                        "MV target has no complete execution declaration".to_string()
+                    })?;
+                    novarocks_types::schema::ColumnDef::from_value_type(
+                        field.field().name().clone(),
+                        declared.clone(),
+                        None,
+                    )
+                    .map_err(|error| error.to_string())
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, String>>()?,
         )?)?;
         builder.set_refresh_history(SqlImvRefreshHistoryFacts::try_new(
             self.previous_snapshot_ids.clone(),

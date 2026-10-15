@@ -156,7 +156,10 @@ async fn original_pressure_intermediary(pool_refusal: bool) {
     // and its real Closing grant are verified here; this is not a full Native inventory.
     let (producer, execution, _resources, _schema) = ResultStreamTestProducer::open(
         execution_id,
-        vec![ResultField::new("payload", DataType::Utf8, false, None)],
+        vec![ResultField::new(
+            "payload",
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+        )],
         2,
         ResourceConfig {
             total_bytes: 1024 * 1024,
@@ -766,7 +769,10 @@ async fn component_resident_pair_rejects_piggyback_end_and_fabricated_consumptio
         QueryExecutionId::new(QueryId::new(773, 1), AttemptId::new(1).unwrap()).unwrap();
     let (producer, _execution, _resources, _schema) = ResultStreamTestProducer::open(
         execution_id,
-        vec![ResultField::new("payload", DataType::Utf8, false, None)],
+        vec![ResultField::new(
+            "payload",
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+        )],
         1,
         ResourceConfig {
             total_bytes: 1024 * 1024,

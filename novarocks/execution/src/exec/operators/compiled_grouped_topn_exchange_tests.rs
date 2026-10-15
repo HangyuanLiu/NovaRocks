@@ -451,7 +451,7 @@ fn cross_instance_input(program: &LocalProgram, destinations: usize, limit: usiz
     );
     let parts = partition_chunk_by_hash_arrays(
         &input,
-        &[input.batch.column(1).clone()],
+        &[input.record_batch().column(1).clone()],
         destinations,
         false,
     )
@@ -459,7 +459,7 @@ fn cross_instance_input(program: &LocalProgram, destinations: usize, limit: usiz
     for (key, _, _, _, _) in expected(true, limit) {
         for part in &parts {
             let keys = part
-                .batch
+                .record_batch()
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()

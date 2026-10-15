@@ -618,7 +618,7 @@ pub(crate) fn output_column_to_table_column(
         name: column.name.clone(),
         data_type: novarocks_types::sql_type_from_value_type(&column.value_type)
             .map_err(|error| error.to_string())?,
-        nullable: column.value_type.nullable,
+        nullable: column.value_type.nullable(),
         aggregation: None,
         default: None,
     })

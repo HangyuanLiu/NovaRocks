@@ -153,9 +153,10 @@ pub fn preflight_zip(
     mut observe: impl FnMut(bool) -> Result<(), KernelFailure>,
 ) -> Result<(), CopyError> {
     let mut work = CopyObservation(
-        &mut observe,
+        super::WorkObservation::Legacy(&mut observe),
         None,
         super::ScratchCoverage::ChildTables,
+        None,
         None,
     );
     work.boundary()?;
@@ -170,12 +171,7 @@ pub fn preflight_zip(
         let ty = truthy.data_type();
         flat_extent(ty, truthy.len())?;
         work.step()?;
-        let equal = novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-            ty,
-            falsy.data_type(),
-            || (work.0)(false),
-        )
-        .map_err(CopyError::Control)?;
+        let equal = work.exact_types(ty, falsy.data_type())?;
         work.step()?;
         if !equal {
             return Err(CopyError::Invalid(
@@ -208,12 +204,7 @@ pub fn preflight_zip(
         mutable_capacity(&truthy_data, truthy.len(), &mut work)?;
         // Flat sources have no constructor children or combined dictionaries.
         // The second source contributes to selected payload, not a second hint.
-        let same_data = novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-            truthy_data.data_type(),
-            falsy_data.data_type(),
-            || (work.0)(false),
-        )
-        .map_err(CopyError::Control)?;
+        let same_data = work.exact_types(truthy_data.data_type(), falsy_data.data_type())?;
         work.step()?;
         if !same_data {
             return Err(CopyError::Invalid(

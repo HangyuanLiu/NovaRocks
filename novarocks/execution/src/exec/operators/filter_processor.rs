@@ -360,7 +360,7 @@ impl ProcessorOperator for FilterProcessorOperator {
             .ok_or_else(|| "Filter predicate must return boolean array".to_string())?;
 
         // Use Arrow filter kernel to filter the RecordBatch
-        let filtered_batch = filter_record_batch(&chunk.batch, filter_mask)
+        let filtered_batch = filter_record_batch(chunk.record_batch(), filter_mask)
             .map_err(|e| format!("Filter failed: {}", e))?;
 
         self.pending_output = Some(Chunk::new_like(filtered_batch, &chunk));
@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn filter_empty_input_preserves_slot_schema_for_downstream_readers() {
         let original = filter_test_chunk();
-        let empty = Chunk::new_like(original.batch.slice(0, 0), &original);
+        let empty = Chunk::new_like(original.record_batch().slice(0, 0), &original);
         let mut arena = ExprArena::default();
         let status = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
         let absent = utf8_literal(&mut arena, "ABSENT");
@@ -481,7 +481,7 @@ mod tests {
                 .unwrap()
                 .expect("filtered batch");
             assert!(filtered.is_empty());
-            let expected_schema = filtered.batch.schema();
+            let expected_schema = filtered.schema();
             let expected_slots = filtered.chunk_schema_ref();
             let mut second = factory.create(1, 0);
             let processor = second.as_processor_mut().expect("second filter processor");
@@ -490,7 +490,7 @@ mod tests {
                 .expect("typed empty filter");
             let output = processor.pull_chunk(&state).unwrap().expect("empty output");
             assert!(output.is_empty());
-            assert_eq!(output.batch.schema(), expected_schema);
+            assert_eq!(output.schema(), expected_schema);
             assert!(Arc::ptr_eq(&output.chunk_schema_ref(), &expected_slots));
             assert_eq!(output.column_by_slot_id(SlotId::new(1)).unwrap().len(), 0);
             assert_eq!(

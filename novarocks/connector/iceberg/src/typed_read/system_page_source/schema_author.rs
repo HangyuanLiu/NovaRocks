@@ -1,0 +1,1305 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! The system relation's explicit complete value author. All new projection
+//! backing is admitted by the creating caller before allocation.
+
+use super::*;
+use novarocks_connector_contract::{
+    ConnectorReadExecutionSchema, ConnectorSourceSchemaFacts, ConnectorSourceSchemaShape,
+};
+use novarocks_spi::connector::read_stack::{
+    ConnectorReadPublicSchema, ConnectorReadSchemaCreation,
+};
+use novarocks_type_contract::{ValueField, ValueKind, ValueLayout, ValueTypeRef};
+use std::alloc::Layout;
+
+type Failure = PureProviderCompileError<ConnectorError>;
+type Columns = Vec<(String, FunctionValueType)>;
+fn bad(message: &'static str) -> Failure {
+    invalid(message).into()
+}
+fn extent() -> Failure {
+    ConnectorError::new(
+        ConnectorErrorKind::ResourceExhausted,
+        "system schema creation exceeds its finite source model",
+    )
+    .into()
+}
+fn compact<T>(
+    values: Vec<T>,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<Vec<T>, Failure> {
+    if values.len() == values.capacity() {
+        return Ok(values);
+    }
+    let mut output = creation.reserve(values.len())?;
+    for value in values {
+        creation.work(1)?;
+        output.push(value);
+    }
+    Ok(output)
+}
+fn bind(
+    kind: ValueKind,
+    layout: DataType,
+    nullable: bool,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<FunctionValueType, Failure> {
+    creation.work(1)?;
+    creation.request(ValueTypeRef::storage_allocation_layout().map_err(|_| extent())?)?;
+    let value = ValueTypeRef::try_new(kind, nullable, creation.storage())
+        .map_err(|_| bad("invalid system value declaration"))?;
+    creation.request(ValueLayout::storage_allocation_layout().map_err(|_| extent())?)?;
+    let layout =
+        ValueLayout::try_from_normalized_arrow_observed(layout, creation.storage(), |units| {
+            creation.work(units).map_err(LayoutError::Caller)
+        })
+        .map_err(LayoutError::into_failure)?;
+    FunctionValueType::try_from_value(value, layout)
+        .map_err(|_| bad("system declaration differs from its exact layout"))
+}
+#[derive(Debug)]
+enum LayoutError {
+    Caller(Failure),
+    Source,
+}
+impl From<novarocks_type_contract::ExecutionValueTypeError> for LayoutError {
+    fn from(_: novarocks_type_contract::ExecutionValueTypeError) -> Self {
+        Self::Source
+    }
+}
+impl LayoutError {
+    fn into_failure(self) -> Failure {
+        match self {
+            Self::Caller(cause) => cause,
+            Self::Source => bad("invalid system layout declaration"),
+        }
+    }
+}
+fn scalar(
+    ty: DataType,
+    nullable: bool,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<FunctionValueType, Failure> {
+    let kind = match &ty {
+        DataType::Utf8 => ValueKind::String,
+        DataType::Binary => ValueKind::Binary,
+        _ => ValueKind::Scalar(ty.clone()),
+    };
+    bind(kind, ty, nullable, creation)
+}
+fn json(
+    nullable: bool,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<FunctionValueType, Failure> {
+    bind(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        DataType::Utf8,
+        nullable,
+        creation,
+    )
+}
+fn primitive(
+    ty: &PrimitiveType,
+    nullable: bool,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<FunctionValueType, Failure> {
+    creation.work(1)?;
+    let ty = match ty {
+        PrimitiveType::Timestamptz | PrimitiveType::TimestamptzNs => {
+            let units = if *ty == PrimitiveType::Timestamptz {
+                TimeUnit::Microsecond
+            } else {
+                TimeUnit::Nanosecond
+            };
+            let text = creation.text(UTC_TIME_ZONE)?;
+            creation.request(
+                novarocks_type_contract::owned_resources::layout::arc_layout(
+                    Layout::array::<u8>(text.len()).map_err(|_| extent())?,
+                )
+                .map_err(|_| extent())?,
+            )?;
+            creation.work(text.len())?;
+            DataType::Timestamp(units, Some(Arc::<str>::from(text.as_str())))
+        }
+        // These system columns intentionally render UUID partition/bound values
+        // as text. The formal system author declares text, independently of a
+        // base-table UUID declaration.
+        _ => iceberg_primitive_to_arrow(ty)?,
+    };
+    scalar(ty, nullable, creation)
+}
+fn clone_value(
+    value: &FunctionValueType,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<FunctionValueType, Failure> {
+    value.clone_observed(|| creation.work(1))
+}
+fn add(
+    columns: &mut Columns,
+    name: &str,
+    value: FunctionValueType,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<(), Failure> {
+    if columns.len() == columns.capacity() {
+        return Err(extent());
+    }
+    columns.push((creation.text(name)?, value));
+    Ok(())
+}
+fn field(
+    name: &str,
+    value: &FunctionValueType,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<Arc<Field>, Failure> {
+    creation.work(1)?;
+    let name = creation.text(name)?;
+    creation.arc(Field::new(
+        name,
+        value.data_type().clone(),
+        value.nullable(),
+    ))
+}
+fn row(
+    columns: Columns,
+    nullable: bool,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<FunctionValueType, Failure> {
+    let mut fields = creation.reserve(columns.len())?;
+    let mut values = creation.reserve(columns.len())?;
+    for (name, value) in columns {
+        fields.push(field(&name, &value, creation)?);
+        creation.request(ValueField::storage_allocation_layout().map_err(|_| extent())?)?;
+        creation.work(1)?;
+        values.push(ValueField::new(
+            name.into_boxed_str(),
+            value.value_type().clone(),
+            creation.storage(),
+        ));
+    }
+    let layout = DataType::Struct(creation.arrow_fields(fields)?);
+    bind(
+        ValueKind::Struct(values.into_boxed_slice()),
+        layout,
+        nullable,
+        creation,
+    )
+}
+fn list(
+    item: FunctionValueType,
+    nullable: bool,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<FunctionValueType, Failure> {
+    let layout = DataType::List(field("item", &item, creation)?);
+    bind(
+        ValueKind::List(item.value_type().clone()),
+        layout,
+        nullable,
+        creation,
+    )
+}
+fn map(
+    key: FunctionValueType,
+    value: FunctionValueType,
+    nullable: bool,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<FunctionValueType, Failure> {
+    let mut fields = creation.reserve(2)?;
+    fields.push(field("key", &key, creation)?);
+    fields.push(field("value", &value, creation)?);
+    let entries = DataType::Struct(creation.arrow_fields(fields)?);
+    let name = creation.text("entries")?;
+    let layout = DataType::Map(creation.arc(Field::new(name, entries, false))?, false);
+    bind(
+        ValueKind::Map {
+            key: key.value_type().clone(),
+            value: value.value_type().clone(),
+        },
+        layout,
+        nullable,
+        creation,
+    )
+}
+fn find_source<'a>(
+    ty: &'a Type,
+    id: i32,
+    depth: usize,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<Option<&'a NestedField>, Failure> {
+    creation.work(1)?;
+    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+        return Err(extent());
+    }
+    let mut find = |field: &'a NestedField| -> Result<Option<&'a NestedField>, Failure> {
+        creation.work(1)?;
+        if field.id == id {
+            Ok(Some(field))
+        } else {
+            find_source(&field.field_type, id, depth + 1, creation)
+        }
+    };
+    match ty {
+        Type::Primitive(_) | Type::Variant(_) => Ok(None),
+        Type::Struct(fields) => {
+            for field in fields.fields() {
+                if let Some(field) = find(field)? {
+                    return Ok(Some(field));
+                }
+            }
+            Ok(None)
+        }
+        Type::List(list) => find(&list.element_field),
+        Type::Map(map) => {
+            if let Some(field) = find(&map.key_field)? {
+                Ok(Some(field))
+            } else {
+                find(&map.value_field)
+            }
+        }
+    }
+}
+fn partition(
+    schema: &Schema,
+    specs: &[&PartitionSpec],
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<Option<FunctionValueType>, Failure> {
+    let count = specs.iter().try_fold(0usize, |count, spec| {
+        creation.work(1)?;
+        count.checked_add(spec.fields().len()).ok_or_else(extent)
+    })?;
+    if count > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
+        return Err(extent());
+    }
+    let mut ordered = creation.reserve(specs.len())?;
+    for spec in specs {
+        creation.work(1)?;
+        ordered.push(spec);
+    }
+    // Sorting is an opaque bounded library operation; its bound is observed
+    // before entry and its completion before any further construction.
+    creation.work(
+        ordered
+            .len()
+            .checked_mul(ordered.len().max(1).ilog2() as usize + 1)
+            .ok_or_else(extent)?,
+    )?;
+    ordered.sort_unstable_by_key(|spec| spec.spec_id());
+    creation.work(1)?;
+    let mut columns: Columns = creation.reserve(count)?;
+    for spec in ordered {
+        for part in spec.fields() {
+            let mut found = None;
+            for root in schema.as_struct().fields() {
+                creation.work(1)?;
+                if root.id == part.source_id {
+                    found = Some(root.as_ref());
+                    break;
+                }
+                if let Some(field) = find_source(&root.field_type, part.source_id, 1, creation)? {
+                    found = Some(field);
+                    break;
+                }
+            }
+            let source =
+                found.ok_or_else(|| bad("partition source ID is absent from frozen metadata"))?;
+            creation.work(1)?;
+            let transformed = part
+                .transform
+                .result_type(&source.field_type)
+                .map_err(|_| bad("partition transform has no exact declared result"))?;
+            creation.work(1)?;
+            let Type::Primitive(ty) = transformed else {
+                return Err(bad("partition result is not a primitive"));
+            };
+            let value = primitive(&ty, true, creation)?;
+            let mut previous = None;
+            for (name, existing) in &columns {
+                creation.work(part.name.len() + 1)?;
+                if name.eq_ignore_ascii_case(&part.name) {
+                    previous = Some(existing);
+                    break;
+                }
+            }
+            if let Some(previous) = previous {
+                if !previous.exactly_equals_checked_observed(&value, || creation.work(1))? {
+                    return Err(bad("partition declaration differs across specs"));
+                }
+            } else {
+                add(&mut columns, &part.name, value, creation)?;
+            }
+        }
+    }
+    if columns.is_empty() {
+        Ok(None)
+    } else {
+        row(compact(columns, creation)?, true, creation).map(Some)
+    }
+}
+fn count_primitives(
+    field: &NestedField,
+    depth: usize,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<usize, Failure> {
+    creation.work(1)?;
+    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+        return Err(extent());
+    }
+    let count = match field.field_type.as_ref() {
+        Type::Variant(_) => 0,
+        Type::Primitive(_) => 1,
+        Type::Struct(fields) => fields.fields().iter().try_fold(0usize, |count, field| {
+            count
+                .checked_add(count_primitives(field, depth + 1, creation)?)
+                .ok_or_else(extent)
+        })?,
+        Type::List(list) => count_primitives(&list.element_field, depth + 1, creation)?,
+        Type::Map(map) => count_primitives(&map.key_field, depth + 1, creation)?
+            .checked_add(count_primitives(&map.value_field, depth + 1, creation)?)
+            .ok_or_else(extent)?,
+    };
+    if count > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
+        return Err(extent());
+    }
+    Ok(count)
+}
+fn collect_primitives<'a>(
+    field: &'a NestedField,
+    depth: usize,
+    output: &mut Vec<&'a NestedField>,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<(), Failure> {
+    creation.work(1)?;
+    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+        return Err(extent());
+    }
+    match field.field_type.as_ref() {
+        Type::Variant(_) => {}
+        Type::Primitive(_) => {
+            if output.len() == output.capacity() {
+                return Err(extent());
+            }
+            output.push(field);
+        }
+        Type::Struct(fields) => {
+            for field in fields.fields() {
+                collect_primitives(field, depth + 1, output, creation)?;
+            }
+        }
+        Type::List(list) => collect_primitives(&list.element_field, depth + 1, output, creation)?,
+        Type::Map(map) => {
+            collect_primitives(&map.key_field, depth + 1, output, creation)?;
+            collect_primitives(&map.value_field, depth + 1, output, creation)?;
+        }
+    }
+    Ok(())
+}
+fn bounds(
+    schema: &Schema,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<Option<FunctionValueType>, Failure> {
+    let count = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .try_fold(0usize, |count, field| {
+            count
+                .checked_add(count_primitives(field, 1, creation)?)
+                .ok_or_else(extent)
+        })?;
+    if count > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
+        return Err(extent());
+    }
+    let mut fields = creation.reserve(count)?;
+    for field in schema.as_struct().fields() {
+        collect_primitives(field, 1, &mut fields, creation)?;
+    }
+    if fields.is_empty() {
+        return Ok(None);
+    }
+    creation.work(
+        fields
+            .len()
+            .checked_mul(fields.len().ilog2() as usize + 1)
+            .ok_or_else(extent)?,
+    )?;
+    fields.sort_unstable_by_key(|field| field.id);
+    creation.work(1)?;
+    let mut columns = creation.reserve(fields.len())?;
+    for field in fields {
+        let Type::Primitive(ty) = field.field_type.as_ref() else {
+            return Err(bad("bounds source is not primitive"));
+        };
+        // Decimal ID formatting is bounded by i32's exact maximum spelling.
+        let len = if field.id < 0 { 1 } else { 0 }
+            + field.id.unsigned_abs().checked_ilog10().unwrap_or(0) as usize
+            + 1;
+        let backing = creation.reserve::<u8>(len)?;
+        let mut id = String::from_utf8(backing).map_err(|_| bad("invalid ID spelling backing"))?;
+        creation.work(len)?;
+        use std::fmt::Write as _;
+        write!(&mut id, "{}", field.id).map_err(|_| bad("source ID formatting failed"))?;
+        let value = primitive(ty, true, creation)?;
+        add(&mut columns, &id, value, creation)?;
+    }
+    row(columns, true, creation).map(Some)
+}
+fn s(
+    columns: &mut Columns,
+    name: &str,
+    ty: DataType,
+    nullable: bool,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<(), Failure> {
+    let value = scalar(ty, nullable, creation)?;
+    add(columns, name, value, creation)
+}
+fn m(
+    columns: &mut Columns,
+    name: &str,
+    key: DataType,
+    value: DataType,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<(), Failure> {
+    let key = scalar(key, false, creation)?;
+    let value = scalar(value, true, creation)?;
+    let value = map(key, value, true, creation)?;
+    add(columns, name, value, creation)
+}
+fn l(
+    columns: &mut Columns,
+    name: &str,
+    ty: DataType,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<(), Failure> {
+    let item = scalar(ty, true, creation)?;
+    let value = list(item, true, creation)?;
+    add(columns, name, value, creation)
+}
+fn j(
+    columns: &mut Columns,
+    name: &str,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<(), Failure> {
+    let value = json(true, creation)?;
+    add(columns, name, value, creation)
+}
+fn metrics(
+    schema: &Schema,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<Option<FunctionValueType>, Failure> {
+    let mut count = 0;
+    for field in schema.as_struct().fields() {
+        creation.work(1)?;
+        if matches!(field.field_type.as_ref(), Type::Primitive(_)) {
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return Ok(None);
+    }
+    let mut columns = creation.reserve(count)?;
+    for field in schema.as_struct().fields() {
+        let Type::Primitive(ty) = field.field_type.as_ref() else {
+            continue;
+        };
+        let mut children = creation.reserve(4)?;
+        for name in ["min", "max"] {
+            let value = primitive(ty, true, creation)?;
+            add(&mut children, name, value, creation)?;
+        }
+        s(&mut children, "null_count", DataType::Int64, true, creation)?;
+        s(&mut children, "nan_count", DataType::Int64, true, creation)?;
+        let value = row(children, true, creation)?;
+        add(&mut columns, &field.name, value, creation)?;
+    }
+    row(columns, true, creation).map(Some)
+}
+fn files(
+    partition: Option<FunctionValueType>,
+    bounds: Option<FunctionValueType>,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<Columns, Failure> {
+    let mut columns = creation
+        .reserve(24 + usize::from(partition.is_some()) + 2 * usize::from(bounds.is_some()))?;
+    for (name, ty) in [
+        ("content", DataType::Int32),
+        ("file_path", DataType::Utf8),
+        ("file_format", DataType::Utf8),
+        ("spec_id", DataType::Int32),
+    ] {
+        s(&mut columns, name, ty, false, creation)?;
+    }
+    if let Some(partition) = partition {
+        add(&mut columns, "partition", partition, creation)?;
+    }
+    s(
+        &mut columns,
+        "record_count",
+        DataType::Int64,
+        false,
+        creation,
+    )?;
+    s(
+        &mut columns,
+        "file_size_in_bytes",
+        DataType::Int64,
+        false,
+        creation,
+    )?;
+    for name in [
+        "column_sizes",
+        "value_counts",
+        "null_value_counts",
+        "nan_value_counts",
+    ] {
+        m(
+            &mut columns,
+            name,
+            DataType::Int32,
+            DataType::Int64,
+            creation,
+        )?;
+    }
+    if let Some(bounds) = bounds {
+        let lower = clone_value(&bounds, creation)?;
+        add(&mut columns, "lower_bounds", lower, creation)?;
+        add(&mut columns, "upper_bounds", bounds, creation)?;
+    }
+    s(
+        &mut columns,
+        "key_metadata",
+        DataType::Binary,
+        true,
+        creation,
+    )?;
+    l(&mut columns, "split_offsets", DataType::Int64, creation)?;
+    l(&mut columns, "equality_ids", DataType::Int32, creation)?;
+    s(
+        &mut columns,
+        "sort_order_id",
+        DataType::Int32,
+        true,
+        creation,
+    )?;
+    j(&mut columns, "readable_metrics", creation)?;
+    for name in [
+        "added_snapshot_id",
+        "file_sequence_number",
+        "data_sequence_number",
+    ] {
+        s(&mut columns, name, DataType::Int64, true, creation)?;
+    }
+    s(
+        &mut columns,
+        "referenced_data_file",
+        DataType::Utf8,
+        true,
+        creation,
+    )?;
+    s(&mut columns, "pos", DataType::Int64, false, creation)?;
+    s(
+        &mut columns,
+        "manifest_location",
+        DataType::Utf8,
+        false,
+        creation,
+    )?;
+    for name in ["first_row_id", "content_offset", "content_size_in_bytes"] {
+        s(&mut columns, name, DataType::Int64, true, creation)?;
+    }
+    Ok(columns)
+}
+fn entries(
+    partition: Option<FunctionValueType>,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<Columns, Failure> {
+    let mut data = creation.reserve(16 + usize::from(partition.is_some()))?;
+    for (name, ty) in [
+        ("content", DataType::Int32),
+        ("file_path", DataType::Utf8),
+        ("file_format", DataType::Utf8),
+        ("spec_id", DataType::Int32),
+    ] {
+        s(&mut data, name, ty, false, creation)?;
+    }
+    if let Some(partition) = partition {
+        add(&mut data, "partition", partition, creation)?;
+    }
+    s(&mut data, "record_count", DataType::Int64, false, creation)?;
+    s(
+        &mut data,
+        "file_size_in_bytes",
+        DataType::Int64,
+        false,
+        creation,
+    )?;
+    for name in [
+        "column_sizes",
+        "value_counts",
+        "null_value_counts",
+        "nan_value_counts",
+    ] {
+        m(&mut data, name, DataType::Int32, DataType::Int64, creation)?;
+    }
+    for name in ["lower_bounds", "upper_bounds"] {
+        m(&mut data, name, DataType::Int32, DataType::Utf8, creation)?;
+    }
+    s(&mut data, "key_metadata", DataType::Binary, true, creation)?;
+    l(&mut data, "split_offsets", DataType::Int64, creation)?;
+    l(&mut data, "equality_ids", DataType::Int32, creation)?;
+    s(&mut data, "sort_order_id", DataType::Int32, true, creation)?;
+    let data = row(data, false, creation)?;
+    let mut columns = creation.reserve(6)?;
+    s(&mut columns, "status", DataType::Int32, false, creation)?;
+    for name in ["snapshot_id", "sequence_number", "file_sequence_number"] {
+        s(&mut columns, name, DataType::Int64, true, creation)?;
+    }
+    add(&mut columns, "data_file", data, creation)?;
+    j(&mut columns, "readable_metrics", creation)?;
+    Ok(columns)
+}
+fn snapshots(creation: &mut ConnectorReadSchemaCreation<'_>) -> Result<Columns, Failure> {
+    let mut columns = creation.reserve(6)?;
+    let time = primitive(&PrimitiveType::Timestamptz, false, creation)?;
+    add(&mut columns, "committed_at", time, creation)?;
+    s(
+        &mut columns,
+        "snapshot_id",
+        DataType::Int64,
+        false,
+        creation,
+    )?;
+    s(&mut columns, "parent_id", DataType::Int64, true, creation)?;
+    s(&mut columns, "operation", DataType::Utf8, false, creation)?;
+    s(
+        &mut columns,
+        "manifest_list",
+        DataType::Utf8,
+        false,
+        creation,
+    )?;
+    m(
+        &mut columns,
+        "summary",
+        DataType::Utf8,
+        DataType::Utf8,
+        creation,
+    )?;
+    Ok(columns)
+}
+fn history(creation: &mut ConnectorReadSchemaCreation<'_>) -> Result<Columns, Failure> {
+    let mut columns = creation.reserve(4)?;
+    let time = primitive(&PrimitiveType::Timestamptz, false, creation)?;
+    add(&mut columns, "made_current_at", time, creation)?;
+    s(
+        &mut columns,
+        "snapshot_id",
+        DataType::Int64,
+        false,
+        creation,
+    )?;
+    s(&mut columns, "parent_id", DataType::Int64, true, creation)?;
+    s(
+        &mut columns,
+        "is_current_ancestor",
+        DataType::Boolean,
+        false,
+        creation,
+    )?;
+    Ok(columns)
+}
+fn refs(creation: &mut ConnectorReadSchemaCreation<'_>) -> Result<Columns, Failure> {
+    let mut columns = creation.reserve(6)?;
+    s(&mut columns, "name", DataType::Utf8, false, creation)?;
+    s(&mut columns, "type", DataType::Utf8, false, creation)?;
+    s(
+        &mut columns,
+        "snapshot_id",
+        DataType::Int64,
+        false,
+        creation,
+    )?;
+    s(
+        &mut columns,
+        "max_reference_age_in_ms",
+        DataType::Int64,
+        true,
+        creation,
+    )?;
+    s(
+        &mut columns,
+        "min_snapshots_to_keep",
+        DataType::Int32,
+        true,
+        creation,
+    )?;
+    s(
+        &mut columns,
+        "max_snapshot_age_in_ms",
+        DataType::Int64,
+        true,
+        creation,
+    )?;
+    Ok(columns)
+}
+fn manifests(creation: &mut ConnectorReadSchemaCreation<'_>) -> Result<Columns, Failure> {
+    let mut columns = creation.reserve(12)?;
+    for (name, ty) in [
+        ("content", DataType::Int32),
+        ("path", DataType::Utf8),
+        ("length", DataType::Int64),
+        ("partition_spec_id", DataType::Int32),
+        ("added_snapshot_id", DataType::Int64),
+    ] {
+        s(&mut columns, name, ty, false, creation)?;
+    }
+    for (name, ty) in [
+        ("added_data_files_count", DataType::Int32),
+        ("added_rows_count", DataType::Int64),
+        ("existing_data_files_count", DataType::Int32),
+        ("existing_rows_count", DataType::Int64),
+        ("deleted_data_files_count", DataType::Int32),
+        ("deleted_rows_count", DataType::Int64),
+    ] {
+        s(&mut columns, name, ty, true, creation)?;
+    }
+    let mut summary = creation.reserve(4)?;
+    s(
+        &mut summary,
+        "contains_null",
+        DataType::Boolean,
+        false,
+        creation,
+    )?;
+    s(
+        &mut summary,
+        "contains_nan",
+        DataType::Boolean,
+        true,
+        creation,
+    )?;
+    s(&mut summary, "lower_bound", DataType::Utf8, true, creation)?;
+    s(&mut summary, "upper_bound", DataType::Utf8, true, creation)?;
+    let summary = row(summary, true, creation)?;
+    let summary = list(summary, true, creation)?;
+    add(&mut columns, "partition_summaries", summary, creation)?;
+    Ok(columns)
+}
+fn partitions(
+    partition: Option<FunctionValueType>,
+    metrics: Option<FunctionValueType>,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<Columns, Failure> {
+    let mut columns =
+        creation.reserve(3 + usize::from(partition.is_some()) + usize::from(metrics.is_some()))?;
+    if let Some(partition) = partition {
+        add(&mut columns, "partition", partition, creation)?;
+    }
+    for name in ["record_count", "file_count", "total_size"] {
+        s(&mut columns, name, DataType::Int64, false, creation)?;
+    }
+    if let Some(metrics) = metrics {
+        add(&mut columns, "data", metrics, creation)?;
+    }
+    Ok(columns)
+}
+fn columns(
+    kind: IcebergSystemTableType,
+    schema: &Schema,
+    specs: &[&PartitionSpec],
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<Columns, Failure> {
+    creation.work(1)?;
+    match kind {
+        IcebergSystemTableType::Files => {
+            let p = partition(schema, specs, creation)?;
+            let b = bounds(schema, creation)?;
+            files(p, b, creation)
+        }
+        IcebergSystemTableType::Entries => {
+            let p = partition(schema, specs, creation)?;
+            entries(p, creation)
+        }
+        IcebergSystemTableType::Snapshots => snapshots(creation),
+        IcebergSystemTableType::History => history(creation),
+        IcebergSystemTableType::Refs => refs(creation),
+        IcebergSystemTableType::Manifests => manifests(creation),
+        IcebergSystemTableType::Partitions => {
+            let p = partition(schema, specs, creation)?;
+            let m = metrics(schema, creation)?;
+            partitions(p, m, creation)
+        }
+    }
+}
+
+/// Publish only selected columns, borrowing the real frozen system relation's
+/// formal metadata and the caller's exact creation/control context.
+pub(crate) fn publish_read_schema(
+    kind: IcebergSystemTableType,
+    requested: &[&IcebergColumnHandle],
+    schema: &Schema,
+    specs: &[&PartitionSpec],
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<ConnectorReadPublicSchema, Failure> {
+    creation.work(1)?;
+    if requested.len() > novarocks_connector_contract::MAX_CONNECTOR_RECIPE_COLUMNS {
+        return Err(extent());
+    }
+    let authored = if requested.is_empty() {
+        Vec::new()
+    } else {
+        columns(kind, schema, specs, creation)?
+    };
+    let mut selected = creation.reserve(requested.len())?;
+    let mut fields = creation.reserve(requested.len())?;
+    for column in requested {
+        let mut found = None;
+        for (name, value) in &authored {
+            creation.work(name.len() + 1)?;
+            if name == column.base_column_identity().name() {
+                found = Some((name, value));
+                break;
+            }
+        }
+        let (name, value) = found.ok_or_else(|| bad("system relation has no requested column"))?;
+        if !column.is_base_column() || value.nullable() != column.nullable() {
+            return Err(bad(
+                "system source column differs from its complete declaration",
+            ));
+        }
+        let field = field(name, value, creation)?;
+        creation.work(column.type_json().len())?;
+        let declaration = super::super::column_handle::parse_type(column.type_json(), "type_json")?;
+        creation.work(1)?;
+        private_value(
+            &declaration,
+            value.value_type(),
+            value.data_type(),
+            creation,
+        )?;
+        creation.work(column.base_type_json().len())?;
+        let base =
+            super::super::column_handle::parse_type(column.base_type_json(), "base_type_json")?;
+        creation.work(1)?;
+        if base != declaration {
+            return Err(bad(
+                "system base column declaration differs from its projected declaration",
+            ));
+        }
+        private_identity(
+            column.base_column_identity(),
+            &declaration,
+            value.data_type(),
+            creation,
+        )?;
+        selected.push(clone_value(value, creation)?);
+        fields.push(field);
+    }
+    let fields = creation.arrow_fields(fields)?;
+    let schema = creation.arc(ArrowSchema::new(fields))?;
+    let shape = ConnectorSourceSchemaShape::try_new_observed(
+        schema.clone(),
+        creation.storage(),
+        |units| creation.work(units),
+    )?;
+    let storage = creation.storage();
+    let (request, work) = creation.observers();
+    // System relation IDs are private connector identity vocabulary; no file
+    // assigns these occurrences external field IDs or initial defaults.
+    let source = ConnectorSourceSchemaFacts::try_new_observed(
+        shape,
+        HashMap::new(),
+        Box::default(),
+        storage.clone(),
+        |layout| request(layout).map_err(Failure::Control),
+        |units| work(units).map_err(Failure::Control),
+    )?;
+    let (request, work) = creation.observers();
+    let execution = ConnectorReadExecutionSchema::try_new_observed(
+        schema,
+        selected.into_boxed_slice(),
+        storage.clone(),
+        |layout| request(layout).map_err(Failure::Control),
+        |units| work(units).map_err(Failure::Control),
+    )?;
+    let (request, work) = creation.observers();
+    ConnectorReadPublicSchema::try_new_typed_observed(
+        &execution,
+        &source,
+        storage,
+        |layout| request(layout).map_err(Failure::Control),
+        |units| work(units).map_err(Failure::Control),
+    )
+}
+fn private_value(
+    source: &Type,
+    value: &ValueTypeRef,
+    layout: &DataType,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<(), Failure> {
+    creation.work(1)?;
+    match source {
+        Type::Variant(_) => {
+            return Err(bad(
+                "system private variant is neither a partition value nor a bound",
+            ));
+        }
+        Type::Primitive(primitive) => {
+            let layout_matches = match (primitive, layout) {
+                (
+                    PrimitiveType::Timestamptz,
+                    DataType::Timestamp(TimeUnit::Microsecond, Some(tz)),
+                )
+                | (
+                    PrimitiveType::TimestamptzNs,
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some(tz)),
+                ) => tz.as_ref() == UTC_TIME_ZONE,
+                _ => iceberg_primitive_to_arrow(primitive)? == *layout,
+            };
+            let semantic_matches = match value.kind() {
+                ValueKind::String => *primitive == PrimitiveType::String,
+                ValueKind::Binary => *primitive == PrimitiveType::Binary,
+                ValueKind::Nominal(ValueLogicalType::Json) => *primitive == PrimitiveType::String,
+                ValueKind::Scalar(scalar) => scalar == layout,
+                _ => false,
+            };
+            if !layout_matches || !semantic_matches {
+                return Err(bad(
+                    "system private primitive differs from complete source declaration",
+                ));
+            }
+        }
+        Type::Struct(source) => {
+            let (ValueKind::Struct(values), DataType::Struct(fields)) = (value.kind(), layout)
+            else {
+                return Err(bad("system private struct differs"));
+            };
+            if source.fields().len() != values.len() || fields.len() != values.len() {
+                return Err(bad("system private struct arity differs"));
+            }
+            for ((source, value), field) in source.fields().iter().zip(values).zip(fields) {
+                creation.work(source.name.len() + 1)?;
+                if source.name != value.name()
+                    || source.name != *field.name()
+                    || value.value_type().nullable() == source.required
+                    || field.is_nullable() == source.required
+                {
+                    return Err(bad("system private struct child differs"));
+                }
+                private_value(
+                    &source.field_type,
+                    value.value_type(),
+                    field.data_type(),
+                    creation,
+                )?;
+            }
+        }
+        Type::List(source) => {
+            let (ValueKind::List(value), DataType::List(field)) = (value.kind(), layout) else {
+                return Err(bad("system private list differs"));
+            };
+            if value.nullable() == source.element_field.required
+                || field.is_nullable() == source.element_field.required
+            {
+                return Err(bad("system list NULL contract differs"));
+            }
+            private_value(
+                &source.element_field.field_type,
+                value,
+                field.data_type(),
+                creation,
+            )?;
+        }
+        Type::Map(source) => {
+            let (ValueKind::Map { key, value }, DataType::Map(entries, false)) =
+                (value.kind(), layout)
+            else {
+                return Err(bad("system private map differs"));
+            };
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(bad("system map entries differs"));
+            };
+            if fields.len() != 2
+                || key.nullable() == source.key_field.required
+                || value.nullable() == source.value_field.required
+            {
+                return Err(bad("system map NULL contract differs"));
+            }
+            private_value(
+                &source.key_field.field_type,
+                key,
+                fields[0].data_type(),
+                creation,
+            )?;
+            private_value(
+                &source.value_field.field_type,
+                value,
+                fields[1].data_type(),
+                creation,
+            )?;
+        }
+    }
+    Ok(())
+}
+fn private_identity(
+    identity: &super::super::ColumnIdentity,
+    source: &Type,
+    layout: &DataType,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<(), Failure> {
+    creation.work(1)?;
+    let category = match source {
+        Type::Primitive(_) | Type::Variant(_) => super::super::ColumnIdentityCategory::Primitive,
+        Type::Struct(_) => super::super::ColumnIdentityCategory::Struct,
+        Type::List(_) => super::super::ColumnIdentityCategory::Array,
+        Type::Map(_) => super::super::ColumnIdentityCategory::Map,
+    };
+    if identity.category() != category {
+        return Err(bad("system identity category differs from declaration"));
+    }
+    let children = identity.children();
+    match (source, layout) {
+        (Type::Primitive(_) | Type::Variant(_), _) => {
+            if !children.is_empty() {
+                return Err(bad("system scalar identity has children"));
+            }
+        }
+        (Type::List(list), DataType::List(field)) => {
+            if children.len() != 1 {
+                return Err(bad("system list identity arity differs"));
+            }
+            private_identity_field(
+                &children[0],
+                &list.element_field,
+                field.name(),
+                field.data_type(),
+                creation,
+            )?;
+        }
+        (Type::Map(map), DataType::Map(entries, _)) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(bad("system map identity has no entries"));
+            };
+            if children.len() != 2 || fields.len() != 2 {
+                return Err(bad("system map identity arity differs"));
+            }
+            private_identity_field(
+                &children[0],
+                &map.key_field,
+                fields[0].name(),
+                fields[0].data_type(),
+                creation,
+            )?;
+            private_identity_field(
+                &children[1],
+                &map.value_field,
+                fields[1].name(),
+                fields[1].data_type(),
+                creation,
+            )?;
+        }
+        (Type::Struct(fields), DataType::Struct(layouts)) => {
+            if fields.fields().len() != children.len() || layouts.len() != children.len() {
+                return Err(bad("system struct identity arity differs"));
+            }
+            for ((identity, field), layout) in children.iter().zip(fields.fields()).zip(layouts) {
+                private_identity_field(identity, field, &field.name, layout.data_type(), creation)?;
+            }
+        }
+        _ => return Err(bad("system identity layout differs from its formal shape")),
+    }
+    Ok(())
+}
+fn private_identity_field(
+    identity: &super::super::ColumnIdentity,
+    field: &NestedField,
+    source_name: &str,
+    layout: &DataType,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<(), Failure> {
+    // LIST/MAP have anonymous roles. The genuine system Arrow author supplies
+    // their physical names; Struct field names remain the formal declaration.
+    creation.work(source_name.len() + identity.name().len() + 1)?;
+    if identity.field_id() != field.id || identity.name() != source_name {
+        return Err(bad("system identity differs from formal source child"));
+    }
+    private_identity(identity, &field.field_type, layout, creation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_type_contract::{ValueTypeStorageHold, ValueTypeStorageLifetime};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Hold(Arc<AtomicUsize>);
+    impl ValueTypeStorageHold for Hold {}
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn schema() -> Schema {
+        Schema::builder()
+            .with_fields([Arc::new(NestedField::optional(
+                17,
+                "a",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap()
+    }
+    #[test]
+    fn genuine_system_authors_publish_complete_json_children_nulls_and_exact_utc() {
+        let schema = schema();
+        for kind in [
+            IcebergSystemTableType::Files,
+            IcebergSystemTableType::Entries,
+            IcebergSystemTableType::Snapshots,
+            IcebergSystemTableType::History,
+            IcebergSystemTableType::Refs,
+            IcebergSystemTableType::Manifests,
+            IcebergSystemTableType::Partitions,
+        ] {
+            let original = system_relation_schema(kind, &schema, &[]).unwrap();
+            let Type::Struct(row) = metadata_relation_row(&original).unwrap() else {
+                panic!("system declaration is a row");
+            };
+            let columns: Vec<_> = row
+                .fields()
+                .iter()
+                .map(|field| IcebergColumnHandle::base_column(field).unwrap())
+                .collect();
+            let borrowed: Vec<_> = columns.iter().collect();
+            let mut requests = Vec::new();
+            let mut observed = 0usize;
+            let mut request = |layout: Layout| {
+                requests.push(layout);
+                Ok(())
+            };
+            let mut work = |units: usize| {
+                observed += units;
+                Ok(())
+            };
+            let mut creation = ConnectorReadSchemaCreation::new(
+                ValueTypeStorageLifetime::pure(),
+                &mut request,
+                &mut work,
+            );
+            let public = publish_read_schema(kind, &borrowed, &schema, &[], &mut creation).unwrap();
+            let execution = public.execution_schema().unwrap();
+            let source = public.source_schema_facts().unwrap();
+            assert!(source.field_facts().is_empty());
+            assert_eq!(execution.bindings().len(), original.fields().len());
+            for (ordinal, original) in original.fields().iter().enumerate() {
+                let field = &public.schema().fields()[ordinal];
+                let binding = execution.binding(ordinal).unwrap();
+                assert_eq!(field.name(), original.name());
+                assert_eq!(field.data_type(), original.data_type());
+                assert_eq!(field.is_nullable(), original.is_nullable());
+                assert!(field.metadata().is_empty());
+                assert_eq!(
+                    binding.logical_type(),
+                    system_column_domain(kind, original.name())
+                );
+                assert_eq!(source.shape().schema().fields()[ordinal], *field);
+            }
+            drop(creation);
+            assert!(!requests.is_empty());
+            assert!(observed > 0);
+        }
+    }
+    #[test]
+    fn independent_system_binding_keeps_only_actual_creator_and_zero_projection_stays_empty() {
+        let schema = schema();
+        let original =
+            system_relation_schema(IcebergSystemTableType::Snapshots, &schema, &[]).unwrap();
+        let Type::Struct(row) = metadata_relation_row(&original).unwrap() else {
+            panic!("row");
+        };
+        let column = IcebergColumnHandle::base_column(&row.fields()[0]).unwrap();
+        let exits = Arc::new(AtomicUsize::new(0));
+        let storage = ValueTypeStorageLifetime::held(Arc::new(Hold(exits.clone())));
+        let mut request = |_: Layout| Ok(());
+        let mut work = |_: usize| Ok(());
+        let mut creation = ConnectorReadSchemaCreation::new(storage, &mut request, &mut work);
+        let public = publish_read_schema(
+            IcebergSystemTableType::Snapshots,
+            &[&column],
+            &schema,
+            &[],
+            &mut creation,
+        )
+        .unwrap();
+        let value = public
+            .execution_schema()
+            .unwrap()
+            .binding(0)
+            .unwrap()
+            .clone();
+        let source = public.source_schema_facts().unwrap().shape().clone();
+        assert!(std::ptr::eq(
+            source.field_at(&[0]).unwrap(),
+            public
+                .source_schema_facts()
+                .unwrap()
+                .shape()
+                .schema()
+                .fields()[0]
+                .as_ref(),
+        ));
+        drop(public);
+        drop(creation);
+        assert_eq!(exits.load(Ordering::SeqCst), 0);
+        assert!(
+            matches!(value.data_type(),DataType::Timestamp(TimeUnit::Microsecond,Some(tz)) if tz.as_ref()==UTC_TIME_ZONE)
+        );
+        drop(value);
+        assert_eq!(exits.load(Ordering::SeqCst), 0);
+        assert!(
+            matches!(source.field_at(&[0]).unwrap().data_type(),DataType::Timestamp(TimeUnit::Microsecond,Some(tz)) if tz.as_ref()==UTC_TIME_ZONE)
+        );
+        drop(source);
+        assert_eq!(exits.load(Ordering::SeqCst), 1);
+        let mut request = |_: Layout| Ok(());
+        let mut work = |_: usize| Ok(());
+        let mut creation = ConnectorReadSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
+        let public = publish_read_schema(
+            IcebergSystemTableType::Files,
+            &[],
+            &schema,
+            &[],
+            &mut creation,
+        )
+        .unwrap();
+        assert!(public.schema().fields().is_empty());
+        assert!(public.execution_schema().unwrap().bindings().is_empty());
+        assert!(
+            public
+                .source_schema_facts()
+                .unwrap()
+                .shape()
+                .schema()
+                .fields()
+                .is_empty()
+        );
+    }
+}

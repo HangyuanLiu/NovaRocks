@@ -52,6 +52,33 @@ fn field(name: &str, ty: DataType) -> Arc<Field> {
     Arc::new(Field::new(name, ty, false))
 }
 
+fn source_encode(
+    fields: &[(u32, Arc<Field>)],
+    limits: TypeProjectionLimits,
+    scope: &Scope,
+) -> Result<wire::SourceFieldTable, TypeCodecError> {
+    let roots: Vec<_> = fields.iter().map(|(id, field)| (*id, field)).collect();
+    let mut work = CompileCheckpoints::try_new(scope, CompilePhase::Encode)?;
+    let result = encode_source_field_table_pure_in(&roots, limits, &mut work);
+    finish(work, result)
+}
+fn source_decode(table: &wire::SourceFieldTable, scope: &Scope) -> DecodedSourceFieldTable {
+    use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
+    let mut exact = |_: std::alloc::Layout| Ok::<(), ()>(());
+    let mut opaque = |_: usize| Ok::<(), ()>(());
+    let mut creation =
+        ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
+    let mut work = CompileCheckpoints::try_new(scope, CompilePhase::Decode).unwrap();
+    let decoded = decode_source_field_table_input_derived_with_creator(
+        table,
+        super::source_fields_tests::source_bytes(table),
+        &mut creation,
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
+    decoded
+}
 #[test]
 fn authored_root_field_keeps_complete_identity_without_inferred_logical_metadata() {
     let original = Arc::new(
@@ -61,26 +88,26 @@ fn authored_root_field_keeps_complete_identity_without_inferred_logical_metadata
     let value =
         FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
             .unwrap();
-    let table = encode_type_table_with_fields(
-        &[(7, value)],
+    let table = encode_type_table(&[(7, value)], envelope(), &Scope::default()).unwrap();
+    let decoded = decode_type_table(&table, envelope(), &Scope::default()).unwrap();
+    let source = source_encode(
         &[(u32::MAX, original.clone())],
         envelope(),
         &Scope::default(),
     )
     .unwrap();
-    let decoded = decode_type_table(&table, envelope(), &Scope::default()).unwrap();
+    let scope = Scope::default();
+    let fields = source_decode(&source, &scope);
+    let mut work = CompileCheckpoints::try_new(&scope, CompilePhase::Decode).unwrap();
+    let field = fields.field_observed(u32::MAX, &mut work).unwrap().unwrap();
     assert!(novarocks_type_contract::arrow_fields_exact(
-        &original,
-        decoded.field(u32::MAX).unwrap()
+        &original, field
     ));
     assert_eq!(
-        decoded.value_type(7).unwrap().logical_type,
+        decoded.value_type(7).unwrap().logical_type(),
         ValueLogicalType::Json
     );
-    assert_eq!(
-        decoded.field(u32::MAX).unwrap().metadata(),
-        original.metadata()
-    );
+    assert_eq!(field.metadata(), original.metadata());
 }
 
 #[test]
@@ -112,22 +139,43 @@ fn sparse_authored_ids_reserve_zero_max_and_nested_occurrences_preserve_dictiona
         (u32::MAX, field("last", DataType::Null)),
     ];
     let values = [(0, FunctionValueType::new(DataType::Int64, false))];
-    let table =
-        encode_type_table_with_fields(&values, &roots, envelope(), &Scope::default()).unwrap();
-    let ids: BTreeSet<_> = table.fields.iter().map(|f| f.id).collect();
-    assert_eq!(ids.len(), table.fields.len());
+    let table = source_encode(&roots, envelope(), &Scope::default()).unwrap();
+    let shape = table.shape.as_ref().unwrap();
+    let ids: BTreeSet<_> = shape.fields.iter().map(|f| f.id).collect();
+    assert_eq!(ids.len(), shape.fields.len());
     assert!(ids.contains(&0) && ids.contains(&1) && ids.contains(&u32::MAX) && ids.contains(&2));
-    assert!(table.fields.len() < 16); // No allocation indexed by sparse MAX.
-    let decoded = decode_type_table(&table, envelope(), &Scope::default()).unwrap();
+    assert!(shape.fields.len() < 16);
+    let scope = Scope::default();
+    let decoded = source_decode(&table, &scope);
+    let mut work = CompileCheckpoints::try_new(&scope, CompilePhase::Decode).unwrap();
     for (id, original) in roots {
         assert!(novarocks_type_contract::arrow_fields_exact(
             &original,
-            decoded.field(id).unwrap()
+            decoded.field_observed(id, &mut work).unwrap().unwrap()
         ));
     }
-    assert_eq!(decoded.field(1).unwrap().dict_id(), Some(-99));
-    assert_eq!(decoded.field(1).unwrap().dict_is_ordered(), Some(true));
-    assert_eq!(decoded.value_type(0).unwrap().data_type, DataType::Int64);
+    assert_eq!(
+        decoded
+            .field_observed(1, &mut work)
+            .unwrap()
+            .unwrap()
+            .dict_id(),
+        Some(-99)
+    );
+    assert_eq!(
+        decoded
+            .field_observed(1, &mut work)
+            .unwrap()
+            .unwrap()
+            .dict_is_ordered(),
+        Some(true)
+    );
+    let value_table = encode_type_table(&values, envelope(), &Scope::default()).unwrap();
+    let value_decoded = decode_type_table(&value_table, envelope(), &Scope::default()).unwrap();
+    assert_eq!(
+        value_decoded.value_type(0).unwrap().data_type(),
+        &DataType::Int64
+    );
 }
 
 #[test]
@@ -149,7 +197,7 @@ fn duplicate_authored_field_ids_refuse_but_value_and_field_namespaces_remain_ind
     .unwrap();
     let decoded = decode_type_table(&table, envelope(), &Scope::default()).unwrap();
     assert_eq!(decoded.field(7).unwrap().data_type(), &DataType::Int32);
-    assert_eq!(decoded.value_type(7).unwrap().data_type, DataType::Int64);
+    assert_eq!(decoded.value_type(7).unwrap().data_type(), &DataType::Int64);
 }
 
 #[test]
@@ -166,12 +214,12 @@ fn explicit_root_counts_and_utf8_bytes_have_exact_independent_envelopes() {
         max_expanded_nodes: 2,
         max_string_bytes: 7,
     };
-    let table = encode_type_table_with_fields(&[], &fields, exact, &Scope::default()).unwrap();
+    let table = source_encode(&fields, exact, &Scope::default()).unwrap();
     assert_eq!(
         (
-            table.carriers.len(),
-            table.fields.len(),
-            table.value_types.len()
+            table.shape.as_ref().unwrap().carriers.len(),
+            table.shape.as_ref().unwrap().fields.len(),
+            table.shape.as_ref().unwrap().value_types.len()
         ),
         (1, 1, 0)
     );
@@ -190,7 +238,7 @@ fn explicit_root_counts_and_utf8_bytes_have_exact_independent_envelopes() {
         },
     ] {
         assert!(matches!(
-            encode_type_table_with_fields(&[], &fields, limits, &Scope::default()),
+            source_encode(&fields, limits, &Scope::default()),
             Err(TypeCodecError::InvalidShape(_))
         ));
     }

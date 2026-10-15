@@ -464,7 +464,7 @@ fn exact_percentile_owner_original_long_nested_diagnostic_is_unbounded_data() {
     )]));
     let kernel = kernel(
         "percentile_disc",
-        FunctionValueType::new(ty.clone(), false),
+        FunctionValueType::from_legacy_declared_projection(ty.clone(), false),
         FunctionValueType::new(DataType::Float64, false),
         AggregateKernelPhase::Single,
     );

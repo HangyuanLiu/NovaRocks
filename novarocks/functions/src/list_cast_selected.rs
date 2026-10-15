@@ -34,23 +34,23 @@ use std::{alloc::Layout, cell::RefCell};
 /// all admitted metadata are retained by the shared body, not a whitelist.
 pub(crate) fn profile(source: &FunctionValueType, result: &FunctionValueType) -> bool {
     let (DataType::List(source_item), DataType::List(target_item)) =
-        (&source.data_type, &result.data_type)
+        (source.data_type(), result.data_type())
     else {
         return false;
     };
-    let (Ok(source_item), Ok(target_item)) = (
-        FunctionValueType::try_from_field(source_item),
-        FunctionValueType::try_from_field(target_item),
+    let (Some(source_semantic), Some(target_semantic)) = (
+        source.value_type().child_type_at(0),
+        result.value_type().child_type_at(0),
     ) else {
         return false;
     };
-    source.logical_type == ValueLogicalType::Physical
-        && result.logical_type == ValueLogicalType::Physical
-        && source_item.logical_type == ValueLogicalType::Physical
-        && target_item.logical_type == ValueLogicalType::Physical
-        && target_item.nullable
+    source.logical_type() == ValueLogicalType::Physical
+        && result.logical_type() == ValueLogicalType::Physical
+        && source_semantic.domain().is_none()
+        && target_semantic.domain().is_none()
+        && target_semantic.nullable()
         && matches!(
-            (&source_item.data_type, &target_item.data_type),
+            (source_item.data_type(), target_item.data_type()),
             (DataType::Null, DataType::Int32) | (DataType::Utf8, DataType::Utf8)
         )
 }
@@ -108,8 +108,9 @@ pub(crate) fn evaluate<'a>(
             }
         }
         if let EvaluatedArgument::Constant(value) = argument {
-            if value.value_type().logical_type != source.logical_type
-                || (value.value_type().nullable && !source.nullable)
+            if !value
+                .value_type()
+                .fits_value_type_observed(source, || work.borrow_mut().step())?
             {
                 return Err(invalid(
                     "List CAST constant differs from its frozen logical identity",
@@ -119,7 +120,7 @@ pub(crate) fn evaluate<'a>(
         }
         if !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
             argument.array().data_type(),
-            &source.data_type,
+            source.data_type(),
             || work.borrow_mut().step(),
         )? {
             return Err(invalid(
@@ -147,7 +148,7 @@ pub(crate) fn evaluate<'a>(
             if row >= list.len() {
                 return Err(invalid("List CAST address is outside its carrier"));
             }
-            if !source.nullable && list.is_null(row) {
+            if !source.nullable() && list.is_null(row) {
                 return Err(invalid(
                     "non-null List CAST argument contains a selected NULL",
                 ));
@@ -172,7 +173,7 @@ pub(crate) fn evaluate<'a>(
         let compact = arrow_select::take::take(list, &indices, None)
             .map_err(|cause| internal(&format!("checked List CAST projection failed: {cause}")))?;
         work.borrow_mut().flush()?;
-        let DataType::List(target_field) = &result.data_type else {
+        let DataType::List(target_field) = result.data_type() else {
             return Err(internal("prepared List CAST target is not a List"));
         };
         let mut observe = |event| match event {
@@ -213,7 +214,7 @@ pub(crate) fn evaluate<'a>(
         work.borrow_mut().flush()?;
         SelectedValues::try_new_observed(
             selection,
-            &result.data_type,
+            result.data_type(),
             out,
             errors.into_boxed_slice(),
             || work.borrow_mut().step(),

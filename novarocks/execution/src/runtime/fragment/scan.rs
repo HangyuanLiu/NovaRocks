@@ -309,27 +309,29 @@ mod tests {
             kind: ExecNodeKind::Scan(
                 ScanNode::new(Arc::new(CountingFileSource))
                     .with_node_id(SCAN_NODE_ID)
-                    .with_output_chunk_schema(Arc::new(crate::exec::chunk::ChunkSchema::empty())),
+                    .with_output_chunk_schema(
+                        crate::exec::chunk::typed_fixture::columns(&[], &[], &[], Vec::new(), 0)
+                            .chunk_schema_ref(),
+                    ),
             ),
         };
         let plan = ExecPlan {
             arena: ExprArena::default(),
             root,
         };
-        let profile = plan
-            .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
-            .unwrap();
-        let (local, runtime) = plan
-            .into_local_program_and_bindings(
-                profile,
-                BTreeMap::from([(
-                    SCAN_NODE_ID,
-                    crate::runtime::fragment::submission::tests::static_scan_for_test(),
-                )]),
-                Vec::new(),
-                novarocks_local_program::StaticSinkProgram::Noop,
-            )
-            .unwrap();
+        let profile =
+            crate::exec::chunk::typed_fixture::profile(&plan, NonZeroUsize::new(1).unwrap(), None);
+        let (local, runtime) = crate::exec::chunk::typed_fixture::try_lower_with_scans(
+            plan,
+            profile,
+            BTreeMap::from([(
+                SCAN_NODE_ID,
+                crate::runtime::fragment::submission::tests::static_scan_for_test(),
+            )]),
+            Vec::new(),
+            novarocks_local_program::StaticSinkProgram::Noop,
+        )
+        .unwrap();
         assert_eq!(runtime.scan_count(), 1);
         FragmentProgram::try_new(
             Arc::new(local),

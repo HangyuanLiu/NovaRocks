@@ -522,6 +522,7 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
         facts.previous.clone(),
         facts.target_table_uuid.clone(),
         target_binding.physical_write_schema()?,
+        target_binding.write_input_fields()?,
         target_schema.exact_schema().clone(),
         facts.analysis.clone(),
     )

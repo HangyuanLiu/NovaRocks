@@ -172,7 +172,7 @@ fn caller_scope_package_admission_charges_nested_field_lookups_linearly() {
         .fragment()
         .values()
         .values()
-        .map(|value| nested_fields(&value.ty.data_type))
+        .map(|value| nested_fields(&value.ty.data_type()))
         .sum();
     assert!(nested >= 2, "the fixture carries {nested} nested fields");
     let admission = decode_limits().admission;
@@ -282,24 +282,31 @@ fn oversized_input_is_refused_by_byte_admission_before_any_dto() {
     ));
 }
 
-// Representative positions on the one Decode scope: the caller's cause is
-// primary at entry, in the middle and at the footer.
+// Package decoding and the original provider validation share the caller's
+// control; every refusal keeps the exact completed prefix.
 #[test]
 fn caller_control_cause_stays_primary_across_the_receiver() {
     let package = checked_read(true);
     let bytes = encode(&package).unwrap();
     let control = Control::default();
     decode_fragment_package(&bytes, &model(), &decode_limits(), &control).unwrap();
-    let callbacks = control.trace.lock().unwrap().len();
+    let trace = control.trace.lock().unwrap().clone();
+    let callbacks = trace.len();
     assert!(callbacks > 2);
     assert!(
-        control
-            .trace
-            .lock()
-            .unwrap()
+        trace
             .iter()
-            .all(|(phase, _)| *phase == CompilePhase::Decode)
+            .any(|(phase, _)| *phase == CompilePhase::Decode)
     );
+    assert!(
+        trace
+            .iter()
+            .any(|(phase, _)| *phase == CompilePhase::ProviderValidation)
+    );
+    assert!(trace.iter().all(|(phase, _)| matches!(
+        phase,
+        CompilePhase::Decode | CompilePhase::ProviderValidation
+    )));
     for at in [0, callbacks / 3, callbacks / 2, callbacks - 1] {
         for cause in [
             CompileControlError::Cancelled,
@@ -317,7 +324,7 @@ fn caller_control_cause_stays_primary_across_the_receiver() {
                 ),
                 "position {at}"
             );
-            assert_eq!(stop.trace.lock().unwrap().len(), at + 1);
+            assert_eq!(*stop.trace.lock().unwrap(), trace[..=at]);
         }
     }
 }
@@ -510,13 +517,14 @@ struct TypeScope {
 }
 impl PackageTypeMaterializationScope for TypeScope {
     type HostError = u32;
-    fn materialize<B>(
+    fn materialize<C, B>(
         &mut self,
         _: &PackageTypeProjectionFacts,
         body: B,
-    ) -> Result<crate::physical_type_v2::DecodedTypeTable, ProjectionFailure<TypeCodecError, u32>>
+    ) -> Result<crate::physical_type_v2::DecodedTypeTable, ProjectionFailure<C, u32>>
     where
-        B: FnOnce() -> Result<crate::physical_type_v2::DecodedTypeTable, TypeCodecError>,
+        C: From<TypeCodecError>,
+        B: FnOnce() -> Result<crate::physical_type_v2::DecodedTypeTable, C>,
     {
         self.calls += 1;
         if self.refuse {
@@ -557,7 +565,7 @@ fn whole_package_type_host_keeps_original_bytes_and_every_checkpoint() {
             *direct.trace.lock().unwrap(),
             "{name}"
         );
-        assert_eq!((host.calls, host.ran), (1, 1), "{name}");
+        assert_eq!((host.calls, host.ran), (2, 2), "{name}");
     }
 }
 #[test]

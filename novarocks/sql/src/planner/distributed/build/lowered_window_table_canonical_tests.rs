@@ -153,7 +153,9 @@ fn checked_table<'a>(
             TableFunctionOutput::FunctionResult { result_ordinal, .. } => {
                 let result = &results[*result_ordinal as usize];
                 let mut expected = result.clone();
-                expected.nullable |= *left_outer;
+                expected = expected
+                    .with_nullable(expected.nullable() || (*left_outer))
+                    .unwrap();
                 assert_eq!(value.ty, expected);
                 assert!(
                     matches!(value.origin, ValueOrigin::NodeOutput { node: owner, output_ordinal }
@@ -180,7 +182,7 @@ fn assert_result(owner: &SqlAuthoredPhysicalPlan) {
 
 fn repeat(input: OutputColumn, row: TypedExpr) -> PhysicalPlanNode {
     let mut output = input.clone();
-    output.value_type.nullable = true;
+    output.value_type = output.value_type.with_nullable(true).unwrap();
     PhysicalPlanNode {
         kind: PhysicalPlanKind::Repeat(PlanRepeatNode {
             repeat_column_ref_list: vec![vec![input.name.clone()], vec![]],
@@ -228,11 +230,17 @@ fn canonical_window_real_row_number_and_min_over_use_one_emitted_selection() {
         assert_eq!(owner.plan().result_port().unwrap().fields[0].ty, expected);
     }
     let (mut malformed, _) = window_fixture(vec![integer(7)], vec![]);
-    malformed.output_columns[1].value_type.nullable = false;
+    malformed.output_columns[1].value_type = malformed.output_columns[1]
+        .value_type
+        .with_nullable(false)
+        .unwrap();
     let PhysicalPlanKind::Window(window) = &mut malformed.kind else {
         unreachable!()
     };
-    window.output_columns[1].value_type.nullable = false;
+    window.output_columns[1].value_type = window.output_columns[1]
+        .value_type
+        .with_nullable(false)
+        .unwrap();
     assert!(matches!(
         lower_final_physical_plan(
             &malformed,
@@ -456,11 +464,11 @@ fn canonical_table_real_unnest_and_left_cv_keep_whole_relation_and_ordinals() {
             actual.pool().field_ref(),
             cv.pool().field_ref()
         ));
-        let DataType::List(item) = &cv.value_type().data_type else {
+        let DataType::List(item) = &cv.value_type().data_type() else {
             unreachable!()
         };
-        assert_eq!(item.name(), "original.element");
-        assert_eq!(item.metadata()["source.child"], "kept");
+        assert_eq!(item.name(), "item");
+        assert!(item.metadata().is_empty());
         assert_eq!(
             actual
                 .is_null_observed(CompilePhase::Validate, &Control::default())
@@ -473,19 +481,21 @@ fn canonical_table_real_unnest_and_left_cv_keep_whole_relation_and_ordinals() {
 
 #[test]
 fn canonical_table_struct_relation_retains_nested_field_identity() {
-    let leaf = Arc::new(
-        arrow::datatypes::Field::new("nested.payload", DataType::Int64, false)
-            .with_metadata(HashMap::from([("source.leaf".into(), "kept".into())])),
-    );
+    let leaf = Arc::new(arrow::datatypes::Field::new(
+        "nested.payload",
+        DataType::Int64,
+        false,
+    ));
     let children = arrow::array::StructArray::new(
         vec![leaf.clone()].into(),
         vec![Arc::new(Int64Array::from(vec![999, 7, 8]))],
         None,
     );
-    let item = Arc::new(
-        arrow::datatypes::Field::new("source.record", children.data_type().clone(), false)
-            .with_metadata(HashMap::from([("source.list".into(), "kept".into())])),
-    );
+    let item = Arc::new(arrow::datatypes::Field::new(
+        "item",
+        children.data_type().clone(),
+        false,
+    ));
     let array = ListArray::new(
         item.clone(),
         OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 3])),
@@ -519,17 +529,23 @@ fn canonical_table_struct_relation_retains_nested_field_identity() {
         unreachable!()
     };
     assert_eq!(results.len(), 1);
-    assert!(results[0].nullable);
-    let DataType::Struct(fields) = &results[0].data_type else {
+    assert!(results[0].nullable());
+    let DataType::Struct(fields) = &results[0].data_type() else {
         panic!("whole nested relation result");
     };
     assert_eq!(fields[0].name(), "nested.payload");
-    assert_eq!(fields[0].metadata()["source.leaf"], "kept");
-    assert!(Arc::ptr_eq(&fields[0], &leaf));
-    let DataType::List(selected_item) = &cv.value_type().data_type else {
+    assert!(fields[0].metadata().is_empty());
+    let DataType::List(authored_item) = cv.value_type().data_type() else {
         unreachable!()
     };
-    assert!(Arc::ptr_eq(selected_item, &item));
+    let DataType::Struct(authored_fields) = authored_item.data_type() else {
+        unreachable!()
+    };
+    assert!(Arc::ptr_eq(&fields[0], &authored_fields[0]));
+    let DataType::List(selected_item) = &cv.value_type().data_type() else {
+        unreachable!()
+    };
+    assert!(Arc::ptr_eq(&selected_item, &authored_item));
     assert_result(&owner);
 }
 
@@ -540,11 +556,17 @@ fn canonical_window_table_repeat_nullable_source_changes_selected_arguments_befo
     let input = column(1, "k", DataType::Int64, false);
     let (mut plan, binding) = window_fixture(vec![reference(&input)], vec![]);
     plan.children = vec![repeat(input, integer(9))];
-    plan.output_columns[0].value_type.nullable = true;
+    plan.output_columns[0].value_type = plan.output_columns[0]
+        .value_type
+        .with_nullable(true)
+        .unwrap();
     let PhysicalPlanKind::Window(window) = &mut plan.kind else {
         unreachable!()
     };
-    window.output_columns[0].value_type.nullable = true;
+    window.output_columns[0].value_type = window.output_columns[0]
+        .value_type
+        .with_nullable(true)
+        .unwrap();
     let owner = finish(&plan);
     let (fragment, source) = window_source(&owner);
     let receipt = checked_window(&owner, fragment, source);
@@ -584,7 +606,7 @@ fn canonical_window_table_repeat_nullable_source_changes_selected_arguments_befo
         unreachable!()
     };
     let array = ListArray::new(
-        match &row.value_type.data_type {
+        match &row.value_type.data_type() {
             DataType::List(item) => item.clone(),
             _ => unreachable!(),
         },
@@ -607,11 +629,11 @@ fn canonical_window_table_repeat_nullable_source_changes_selected_arguments_befo
         kind: ExprKind::Constant(pool.value(1).unwrap()),
         value_type: ty.clone(),
     };
-    let mut input = column(1, "outer_list", ty.data_type.clone(), false);
+    let mut input = column(1, "outer_list", ty.data_type().clone(), false);
     input.value_type = ty.clone();
     let (mut plan, binding) = table_fixture(vec![reference(&input)], true);
     plan.children = vec![repeat(input.clone(), row)];
-    input.value_type.nullable = true;
+    input.value_type = input.value_type.with_nullable(true).unwrap();
     plan.output_columns[0] = input;
     let owner = finish(&plan);
     let (fragment, node) = table_source(&owner);
@@ -630,7 +652,7 @@ fn canonical_window_table_repeat_nullable_source_changes_selected_arguments_befo
         unreachable!()
     };
     let mut expected = ty;
-    expected.nullable = true;
+    expected = expected.with_nullable(true).unwrap();
     assert_eq!(selected, &expected);
     let child = fragment.expressions().get(receipt.arguments()[0]).unwrap();
     let ContractExprKind::Value(value) = child.kind else {

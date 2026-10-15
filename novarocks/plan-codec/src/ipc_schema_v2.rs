@@ -30,7 +30,7 @@ use arrow::datatypes::{DataType, Field};
 use flatbuffers::FlatBufferBuilder;
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, PureCompileControl, ValueTypeVisit,
-    validate_value_type_structure_observed,
+    validate_arrow_layout_structure_observed,
 };
 
 mod emit;
@@ -101,23 +101,25 @@ impl Counts {
     fn string(
         &mut self,
         length: usize,
-        limits: IpcSchemaProjectionLimits,
+        limits: Option<IpcSchemaProjectionLimits>,
         policy: Policy,
     ) -> Result<(), TypeCodecError> {
         let checked_add = |a, b| policy.numeric(checked_add(a, b));
         self.string_count = checked_add(self.string_count, 1)?;
         self.string_bytes = checked_add(self.string_bytes, length)?;
-        policy.cap(
-            self.string_bytes,
-            limits.max_string_bytes,
-            "IPC schema string envelope exceeded",
-        )?;
+        if let Some(limits) = limits {
+            policy.cap(
+                self.string_bytes,
+                limits.max_string_bytes,
+                "IPC schema string envelope exceeded",
+            )?;
+        }
         Ok(())
     }
     fn field<H>(
         &mut self,
         field: &Field,
-        limits: IpcSchemaProjectionLimits,
+        limits: Option<IpcSchemaProjectionLimits>,
         admission: &mut Option<(
             writer_resources::SchemaWriterPrefixFacts,
             &mut Admission<'_, '_, H>,
@@ -130,11 +132,13 @@ impl Counts {
             source_floor(field, admission.source)?;
         }
         self.fields = checked_add(self.fields, 1)?;
-        policy.cap(
-            self.fields,
-            limits.max_field_occurrences,
-            "IPC schema field envelope exceeded",
-        )?;
+        if let Some(limits) = limits {
+            policy.cap(
+                self.fields,
+                limits.max_field_occurrences,
+                "IPC schema field envelope exceeded",
+            )?;
+        }
         self.string(field.name().len(), limits, policy)?;
         if !field.metadata().is_empty() {
             self.metadata_nonempty_fields = checked_add(self.metadata_nonempty_fields, 1)?;
@@ -157,42 +161,32 @@ impl Counts {
     fn type_header(
         &mut self,
         ty: &DataType,
-        limits: IpcSchemaProjectionLimits,
+        limits: Option<IpcSchemaProjectionLimits>,
         policy: Policy,
     ) -> Result<usize, TypeCodecError> {
         let checked_add = |a, b| policy.numeric(checked_add(a, b));
         self.types = checked_add(self.types, 1)?;
-        policy.cap(
-            self.types,
-            limits.max_type_occurrences,
-            "IPC schema type envelope exceeded",
-        )?;
+        if let Some(limits) = limits {
+            policy.cap(
+                self.types,
+                limits.max_type_occurrences,
+                "IPC schema type envelope exceeded",
+            )?;
+        }
         // These counters describe allocations of the existing emit_type
         // branches. They neither add carriers nor define another schema.
-        let children = match ty {
-            DataType::List(_)
-            | DataType::LargeList(_)
-            | DataType::ListView(_)
-            | DataType::LargeListView(_)
-            | DataType::FixedSizeList(_, _)
-            | DataType::Map(_, _) => 1,
-            DataType::Struct(fields) => fields.len(),
-            DataType::Union(fields, _) => {
-                if !fields.is_empty() {
-                    self.union_id_items = checked_add(self.union_id_items, fields.len())?;
-                    self.union_id_requests = checked_add(self.union_id_requests, 1)?;
-                }
-                fields.len()
-            }
-            DataType::RunEndEncoded(_, _) => 2,
-            _ => 0,
-        };
+        let geometry = novarocks_functions::arrow_ipc_construction::type_header_geometry(ty);
+        let children = geometry.children;
+        if geometry.union_ids != 0 {
+            self.union_id_items = checked_add(self.union_id_items, geometry.union_ids)?;
+            self.union_id_requests = checked_add(self.union_id_requests, 1)?;
+        }
         if children != 0 {
             self.child_offset_items = checked_add(self.child_offset_items, children)?;
             self.child_offset_requests = checked_add(self.child_offset_requests, 1)?;
         }
-        if let DataType::Timestamp(_, Some(zone)) = ty {
-            self.string(zone.len(), limits, policy)?;
+        if let Some(bytes) = geometry.timezone_bytes {
+            self.string(bytes, limits, policy)?;
         }
         Ok(children)
     }
@@ -228,31 +222,14 @@ impl Counts {
         Ok(())
     }
     fn backing_upper(&self) -> Result<usize, TypeCodecError> {
-        // Arrow's current schema/message tables have at most seven slots.
-        // Each slot is at most eight bytes with at most seven alignment bytes.
-        // Include every possible slot, a signed vtable offset/alignment, and
-        // the entire vtable even when the builder later deduplicates it.
-        const TABLE_SLOTS: usize = 7;
-        const TABLE_BYTES: usize = TABLE_SLOTS * (8 + 7) + (4 + 7) + (4 + 2 * TABLE_SLOTS);
-        let tables = checked_add(
-            checked_add(self.fields, self.types)?,
-            checked_add(self.metadata_entries, 2)?,
-        )?;
-        // Each type can emit a children vector and a Union tag vector; each
-        // Field can emit a metadata vector. The Schema has one root vector.
-        let vectors = checked_add(checked_add(checked_mul(self.types, 2)?, self.fields)?, 1)?;
-        let vector_payload = checked_add(
-            checked_add(
-                checked_mul(self.fields, 8)?,
-                checked_mul(self.metadata_entries, 4)?,
-            )?,
-            4,
-        )?;
-        let string_bytes = checked_add(self.string_bytes, checked_mul(self.string_count, 8)?)?;
-        checked_add(
-            checked_add(checked_mul(tables, TABLE_BYTES)?, string_bytes)?,
-            checked_add(checked_add(vector_payload, checked_mul(vectors, 7)?)?, 11)?,
+        novarocks_functions::arrow_ipc_construction::schema_backing_upper_bound(
+            self.fields,
+            self.types,
+            self.metadata_entries,
+            self.string_count,
+            self.string_bytes,
         )
+        .map_err(TypeCodecError::from)
     }
 }
 
@@ -318,7 +295,7 @@ pub(crate) fn initial_writer_request_facts(
         string_bytes: field.name().len(),
         ..Counts::default()
     };
-    let children = initial.type_header(field.data_type(), limits, policy)?;
+    let children = initial.type_header(field.data_type(), Some(limits), policy)?;
     initial.fields = policy.numeric(checked_add(initial.fields, children))?;
     policy.cap(
         initial.fields,
@@ -349,6 +326,17 @@ fn preflight_source(
 fn preflight_source_core<H>(
     field: &Field,
     limits: IpcSchemaProjectionLimits,
+    admission: Option<(
+        writer_resources::SchemaWriterPrefixFacts,
+        &mut Admission<'_, '_, H>,
+    )>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Counts, HostError<H>> {
+    preflight_source_policy_core(field, Some(limits), admission, work)
+}
+fn preflight_source_policy_core<H>(
+    field: &Field,
+    limits: Option<IpcSchemaProjectionLimits>,
     mut admission: Option<(
         writer_resources::SchemaWriterPrefixFacts,
         &mut Admission<'_, '_, H>,
@@ -357,7 +345,6 @@ fn preflight_source_core<H>(
 ) -> Result<Counts, HostError<H>> {
     let policy = Policy(admission.is_some());
     validate_field(field, work)?;
-    novarocks_type_contract::field_logical_type(field)?;
     if let Some((prefix, admission)) = admission.as_mut().filter(|(_, a)| a.reader) {
         let mut headers = Counts {
             fields: 1,
@@ -419,7 +406,7 @@ fn preflight_source_core<H>(
     }
     let mut counts = Counts::default();
     counts.field(field, limits, &mut admission, work)?;
-    validate_value_type_structure_observed(
+    validate_arrow_layout_structure_observed(
         field.data_type(),
         |visit| -> Result<(), HostError<H>> {
             if admission.is_none() {
@@ -473,14 +460,34 @@ fn preflight_writer_core<H>(
     )>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<SchemaPreflight, HostError<H>> {
+    preflight_writer_policy_core(field, Some(limits), admission, work)
+}
+pub(crate) fn preflight_writer_pure_in(
+    field: &Field,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<SchemaPreflight, TypeCodecError> {
+    preflight_writer_policy_core::<std::convert::Infallible>(field, None, None, work)
+        .map_err(ProjectionFailure::without_host)
+}
+fn preflight_writer_policy_core<H>(
+    field: &Field,
+    limits: Option<IpcSchemaProjectionLimits>,
+    admission: Option<(
+        writer_resources::SchemaWriterPrefixFacts,
+        &mut Admission<'_, '_, H>,
+    )>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<SchemaPreflight, HostError<H>> {
     let policy = Policy(admission.is_some());
-    let counts = preflight_source_core(field, limits, admission, work)?;
+    let counts = preflight_source_policy_core(field, limits, admission, work)?;
     let schema = policy.numeric(counts.schema())?;
-    policy.cap(
-        schema.backing,
-        limits.max_flatbuffer_bytes,
-        "IPC schema FlatBuffer envelope exceeded",
-    )?;
+    if let Some(limits) = limits {
+        policy.cap(
+            schema.backing,
+            limits.max_flatbuffer_bytes,
+            "IPC schema FlatBuffer envelope exceeded",
+        )?;
+    }
     if schema.backing >= (1usize << 31) {
         return Err((if policy.0 {
             novarocks_type_contract::CompileControlError::ResourceExhausted.into()
@@ -512,6 +519,24 @@ pub fn encode_single_field_schema(
 fn encode_schema_core<H>(
     field: &Field,
     limits: IpcSchemaProjectionLimits,
+    admission: Option<(
+        writer_resources::SchemaWriterPrefixFacts,
+        &mut Admission<'_, '_, H>,
+    )>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<u8>, HostError<H>> {
+    encode_schema_policy_core(field, Some(limits), admission, work)
+}
+pub(crate) fn encode_single_field_schema_pure_in(
+    field: &Field,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<u8>, TypeCodecError> {
+    encode_schema_policy_core::<std::convert::Infallible>(field, None, None, work)
+        .map_err(ProjectionFailure::without_host)
+}
+fn encode_schema_policy_core<H>(
+    field: &Field,
+    limits: Option<IpcSchemaProjectionLimits>,
     mut admission: Option<(
         writer_resources::SchemaWriterPrefixFacts,
         &mut Admission<'_, '_, H>,
@@ -520,9 +545,9 @@ fn encode_schema_core<H>(
 ) -> Result<Vec<u8>, HostError<H>> {
     (|| {
         let facts = if let Some((prefix, admission)) = admission.as_mut() {
-            preflight_writer_core(field, limits, Some((*prefix, &mut **admission)), work)?
+            preflight_writer_policy_core(field, limits, Some((*prefix, &mut **admission)), work)?
         } else {
-            preflight_writer(field, limits, work)?
+            preflight_writer_policy_core(field, limits, None, work)?
         };
         let capacity = facts.backing;
         work.flush()?;
@@ -644,7 +669,7 @@ impl PreparedSchemaWriter<'_> {
             parent: Some(admit),
             source: self.source,
             reader: false,
-            max_work: self.resources.work_upper_bound,
+            max_work: Some(self.resources.work_upper_bound),
             facts: self.facts(),
         };
         admission.update(self.facts())?;
@@ -723,7 +748,7 @@ pub(crate) fn prepare_schema_writer_with_prefix_host_in<'field, H>(
         parent: Some(admit),
         source,
         reader: false,
-        max_work,
+        max_work: Some(max_work),
         facts: SchemaWriterRequestFacts {
             request_bytes: prefix.request_bytes,
             request_count: 0,
@@ -790,22 +815,81 @@ pub(crate) fn verify_single_field_schema_in(
     admit: &mut SchemaAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), TypeCodecError> {
+    verify_single_field_schema_with_host_in(
+        metadata,
+        expected,
+        limits,
+        verifier,
+        source,
+        max_work,
+        &mut |facts| admit(facts).map_err(HostError::<std::convert::Infallible>::from),
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)
+}
+
+pub(crate) fn verify_single_field_schema_with_host_in<H>(
+    metadata: &[u8],
+    expected: &Field,
+    limits: IpcSchemaProjectionLimits,
+    verifier: &novarocks_arrow_ipc_frame::VerifierOptions,
+    source: usize,
+    max_work: usize,
+    admit: &mut HostSchemaAdmit<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ProjectionFailure<TypeCodecError, H>> {
+    verify_single_field_schema_profile_with_host_in(
+        metadata,
+        expected,
+        Some(limits),
+        Some(verifier),
+        source,
+        Some(max_work),
+        admit,
+        work,
+    )
+    .map(|_| ())
+}
+/// Same caller-observed source/count author seals this input's verifier before
+/// the sole official parse. No plain DFS or unobserved temporary is introduced.
+pub(crate) fn verify_single_field_schema_input_derived_with_host_in<H>(
+    metadata: &[u8],
+    expected: &Field,
+    source: usize,
+    admit: &mut HostSchemaAdmit<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<novarocks_arrow_ipc_frame::VerifierOptions, ProjectionFailure<TypeCodecError, H>> {
+    verify_single_field_schema_profile_with_host_in(
+        metadata, expected, None, None, source, None, admit, work,
+    )
+}
+fn verify_single_field_schema_profile_with_host_in<H>(
+    metadata: &[u8],
+    expected: &Field,
+    limits: Option<IpcSchemaProjectionLimits>,
+    verifier: Option<&novarocks_arrow_ipc_frame::VerifierOptions>,
+    source: usize,
+    max_work: Option<usize>,
+    admit: &mut HostSchemaAdmit<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<novarocks_arrow_ipc_frame::VerifierOptions, ProjectionFailure<TypeCodecError, H>> {
     let policy = Policy(true);
     // This original verifier arithmetic is known before any parent admission
     // or completed observation. Plain verification retains its own error order.
-    policy.numeric(checked_add(verifier.max_apparent_size, metadata.len()))?;
-    policy.cap(
-        metadata.len(),
-        limits.max_flatbuffer_bytes,
-        "IPC schema metadata envelope exceeded",
-    )?;
+    if let Some(verifier) = verifier {
+        policy.numeric(checked_add(verifier.max_apparent_size, metadata.len()))?;
+    }
+    if let Some(limits) = limits {
+        policy.cap(
+            metadata.len(),
+            limits.max_flatbuffer_bytes,
+            "IPC schema metadata envelope exceeded",
+        )?;
+    }
     source_floor(expected, source)?;
     let prefix = policy.numeric(writer_resources::prefix_initial(expected, source))?;
-    let mut parent = |facts: &SchemaWriterRequestFacts| {
-        admit(facts).map_err(HostError::<std::convert::Infallible>::from)
-    };
     let mut admission = Admission {
-        parent: Some(&mut parent),
+        parent: Some(admit),
         source,
         reader: true,
         max_work,
@@ -820,30 +904,63 @@ pub(crate) fn verify_single_field_schema_in(
         metadata_nonempty_fields: usize::from(!expected.metadata().is_empty()),
         ..Counts::default()
     };
-    policy.cap(
-        initial.string_bytes,
-        limits.max_string_bytes,
-        "IPC schema string envelope exceeded",
-    )?;
-    policy.cap(
-        1,
-        limits.max_field_occurrences,
-        "IPC schema field envelope exceeded",
-    )?;
+    if let Some(limits) = limits {
+        policy.cap(
+            initial.string_bytes,
+            limits.max_string_bytes,
+            "IPC schema string envelope exceeded",
+        )?;
+        policy.cap(
+            1,
+            limits.max_field_occurrences,
+            "IPC schema field envelope exceeded",
+        )?;
+    }
     let mut initial = initial;
     let children = initial.type_header(expected.data_type(), limits, policy)?;
     initial.fields = policy.numeric(checked_add(initial.fields, children))?;
-    policy.cap(
-        initial.fields,
-        limits.max_field_occurrences,
-        "IPC schema field envelope exceeded",
-    )?;
-    writer_resources::counts_prefix(policy.numeric(initial.schema())?, prefix, &mut admission)
-        .map_err(ProjectionFailure::without_host)?;
+    if let Some(limits) = limits {
+        policy.cap(
+            initial.fields,
+            limits.max_field_occurrences,
+            "IPC schema field envelope exceeded",
+        )?;
+    }
+    writer_resources::counts_prefix(policy.numeric(initial.schema())?, prefix, &mut admission)?;
     (|| {
-        preflight_source_core(expected, limits, Some((prefix, &mut admission)), work)
-            .map_err(ProjectionFailure::without_host)?;
-        verify_message(metadata, expected, verifier, work)
+        let counts =
+            preflight_source_policy_core(expected, limits, Some((prefix, &mut admission)), work)?;
+        let sealed = match verifier {
+            Some(verifier) => novarocks_arrow_ipc_frame::VerifierOptions {
+                max_depth: verifier.max_depth,
+                max_tables: verifier.max_tables,
+                max_apparent_size: verifier.max_apparent_size,
+                ignore_missing_null_terminator: verifier.ignore_missing_null_terminator,
+            },
+            None => {
+                let facts = policy.numeric(counts.schema())?;
+                novarocks_arrow_ipc_frame::VerifierOptions {
+                    max_depth: MAX_SCHEMA_VERIFIER_DEPTH,
+                    max_tables: facts.tables,
+                    // The original source grammar cover includes repeated
+                    // strings/vtables; actual metadata covers wire padding.
+                    max_apparent_size: policy
+                        .numeric(checked_add(facts.backing, metadata.len()))?,
+                    ignore_missing_null_terminator: false,
+                }
+            }
+        };
+        // The real host observes the opaque official verifier before it runs.
+        if verifier.is_none() {
+            let mut facts = admission.facts;
+            facts.work_upper_bound = policy.numeric(checked_add(
+                facts.work_upper_bound,
+                policy.numeric(checked_add(sealed.max_apparent_size, metadata.len()))?,
+            ))?;
+            admission.update(facts)?;
+        }
+        verify_message(metadata, expected, &sealed, work)?;
+        Ok(sealed)
     })()
 }
 

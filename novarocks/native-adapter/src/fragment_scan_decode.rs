@@ -20,7 +20,7 @@
 use arrow::datatypes::DataType;
 
 use crate::fragment_error::NativeFragmentLeafDecodeError;
-use crate::fragment_expression::decode_expr_for_slot_layout;
+use crate::fragment_expression::decode_expr_for_slot_layout_with_types;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_execution::exec::variant_read::VariantPathSpec;
@@ -40,13 +40,14 @@ pub fn validate_variant_path_read_slots(
     field: &'static str,
 ) -> Result<(), NativeFragmentLeafDecodeError> {
     for spec in specs {
-        if !read_slot_ids.contains(&spec.source_read_slot_id) {
+        if !read_slot_ids.contains(&spec.source_read_slot_id()) {
             return Err(NativeFragmentLeafDecodeError::at_field(
                 ProtocolErrorKind::InconsistentFields,
                 field,
                 format!(
                     "scan read columns omit VARIANT source `{}` for output `{}`",
-                    spec.source_name, spec.output_name
+                    spec.source_name(),
+                    spec.output_name()
                 ),
             ));
         }
@@ -54,26 +55,26 @@ pub fn validate_variant_path_read_slots(
     Ok(())
 }
 
-pub fn lower_scan_predicate(
+pub(crate) fn lower_scan_predicate(
     scan: &plan::ScanNode,
     arena: &mut ExprArena,
     layout: &Layout,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<Option<ExprId>, NativeFragmentLeafDecodeError> {
     let mut predicate = None;
     for (idx, expr) in scan.predicates.iter().enumerate() {
-        let expr_id = decode_expr_for_slot_layout(
+        let expr_id = decode_expr_for_slot_layout_with_types(
             expr,
             FieldPath::root("scan").field("predicates").index(idx),
             arena,
             layout,
+            type_decoder,
         )
         .map_err(|err| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "predicates",
-                format!("ScanNode predicate {idx}: {err}"),
-            )
-            .append_index(idx)
+            NativeFragmentLeafDecodeError::from(err)
+                .prepend_field("predicates")
+                .append_index(idx)
         })?;
         predicate = Some(match predicate {
             Some(prev) => arena.push_typed(ExprNode::And(prev, expr_id), DataType::Boolean),

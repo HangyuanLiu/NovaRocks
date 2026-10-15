@@ -176,7 +176,7 @@ impl InputGenerator {
         rows: usize,
         profile: &InputProfile,
     ) -> ArrayRef {
-        let null_ratio = if value_type.nullable {
+        let null_ratio = if value_type.nullable() {
             profile.null_ratio
         } else {
             0.0
@@ -201,7 +201,7 @@ impl InputGenerator {
                 Arc::new(<$array>::from(values)) as ArrayRef
             }};
         }
-        match (&value_type.data_type, value_type.logical_type) {
+        match (&value_type.data_type(), value_type.logical_type()) {
             (DataType::Null, _) => new_null_array(&DataType::Null, rows),
             (DataType::Boolean, ValueLogicalType::Physical) => {
                 primitive!(BooleanArray, |rng: &mut SplitMix64| rng.chance(0.5))

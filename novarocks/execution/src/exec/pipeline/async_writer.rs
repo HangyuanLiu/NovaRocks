@@ -34,11 +34,13 @@ use novarocks_spi::connector::write_stack::{
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::exec::chunk::{ChunkMemoryLease, TransferredChunkBytes};
+use crate::exec::chunk::{ChunkBatchProjection, ChunkMemoryLease, TransferredChunkBytes};
+use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner};
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::execution_services::IoExecutor;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::runtime_state::RuntimeErrorState;
+use novarocks_type_contract::ValueTypeStorageLifetime;
 
 /// Limits one writer's retained input. A single input page must fit both
 /// per-page limits. `need_input` reserves against the worst legal next page, so
@@ -67,8 +69,52 @@ impl Default for AsyncWriterQueueConfig {
     }
 }
 
-struct AppendCommand {
+/// The queued provider copy always travels with its original typed projection.
+/// It retains only immutable batch/type loans and this copy's finite storage.
+pub(crate) struct WriterAppendBatch {
     batch: RecordBatch,
+    projection: ChunkBatchProjection,
+    construction: ValueTypeStorageLifetime,
+}
+impl WriterAppendBatch {
+    pub(crate) fn try_new(
+        projection: ChunkBatchProjection,
+        owner: &dyn InputConstructionOwner,
+    ) -> Result<Self, ConstructionFailure> {
+        owner.observe(
+            0,
+            &[],
+            crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
+                units: projection.columns().len(),
+            },
+        )?;
+        // RecordBatch::clone shares Schema/Array Arcs but clones its actual
+        // Vec<ArrayRef> backing. Quote that same operation before the clone.
+        owner.request(std::alloc::Layout::array::<arrow::array::ArrayRef>(
+            projection.columns().len(),
+        ).map_err(|_| novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic)?)?;
+        let batch = projection.record_batch().clone();
+        Ok(Self {
+            batch,
+            projection,
+            construction: owner.storage_lifetime(),
+        })
+    }
+
+    // Original accounting tests explicitly author expansion fixtures. This is
+    // never a production alternative to the actual constructor above.
+    #[cfg(test)]
+    pub(crate) fn from_fixture_projection(projection: ChunkBatchProjection) -> Self {
+        Self {
+            batch: projection.record_batch().clone(),
+            projection,
+            construction: ValueTypeStorageLifetime::pure(),
+        }
+    }
+}
+
+struct AppendCommand {
+    batch: WriterAppendBatch,
     rows: usize,
     bytes: usize,
     _transferred_accounting: Option<TransferredChunkBytes>,
@@ -238,7 +284,7 @@ pub(crate) struct AsyncWriterReservation<O: Send + 'static> {
 }
 
 impl<O: Send + 'static> AsyncWriterReservation<O> {
-    pub(crate) fn send(mut self, batch: RecordBatch) -> Result<(), String> {
+    pub(crate) fn send(mut self, batch: WriterAppendBatch) -> Result<(), String> {
         if let Some(accounting) = self.transferred_accounting.as_mut() {
             accounting.release_unshared_connector_bytes()?;
         }
@@ -404,7 +450,7 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
             connector_retained_bytes,
             additional_bytes,
         )?;
-        reservation.send(batch)
+        reservation.send(tests::fixture_append_batch(batch))
     }
 
     pub(crate) fn try_reserve_input(
@@ -754,7 +800,16 @@ async fn run_writer_actor<O: Send + 'static>(
             WriterCommand::Append(command) => {
                 let rows = command.rows;
                 let bytes = command.bytes;
-                let outcome = await_or_abort(writer.append(command.batch), shared.as_ref()).await;
+                let WriterAppendBatch {
+                    batch,
+                    projection,
+                    construction,
+                } = command.batch;
+                let outcome = await_or_abort(writer.append(batch), shared.as_ref()).await;
+                // await_or_abort has completed or dropped the actual append
+                // future. Only now can its shared type and copy loans exit.
+                drop(projection);
+                drop(construction);
                 drop(command._additional_accounting);
                 drop(command._transferred_accounting);
                 shared.release_append(rows, bytes);
@@ -1165,6 +1220,21 @@ pub(crate) mod tests {
         .expect("record batch")
     }
 
+    pub(super) fn fixture_append_batch(batch: RecordBatch) -> WriterAppendBatch {
+        let slots = (0..batch.num_columns())
+            .map(|i| novarocks_types::SlotId::new(u32::try_from(i + 1).unwrap()))
+            .collect::<Vec<_>>();
+        let schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &slots,
+        )
+        .expect("original accounting fixture schema");
+        let projection = crate::exec::chunk::Chunk::try_new_with_chunk_schema(batch, schema)
+            .expect("original accounting fixture batch")
+            .into_batch_projection();
+        WriterAppendBatch::from_fixture_projection(projection)
+    }
+
     fn wait_until(predicate: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -1310,6 +1380,98 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn typed_append_custody_survives_pending_provider_future_until_success_or_abort_exit() {
+        use crate::exec::chunk::{Chunk, typed_fixture};
+        use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
+        use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+        for abort in [false, true] {
+            let calls = Arc::new(Calls::default());
+            let gate = Arc::new(Notify::new());
+            let (mut writer, error, tracker, _runtime) = owner(
+                calls.clone(),
+                Some(gate.clone()),
+                false,
+                false,
+                AsyncWriterQueueConfig::default(),
+            );
+            let factory = try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                tracker.clone(),
+                error.clone(),
+            )
+            .unwrap();
+            let source = batch(3);
+            let declared = typed_fixture::layout(
+                source.schema(),
+                &[novarocks_types::SlotId::new(1)],
+                &[FunctionValueType::new(DataType::Int32, false)],
+            );
+            let schema = factory.create_compiled_chunk_schema(&declared).unwrap();
+            let input_owner = factory.begin_typed_construction(&schema).unwrap();
+            let input =
+                Chunk::try_new_typed_record_batch_owned_observed::<ConstructionFailure, _, _>(
+                    source,
+                    schema.clone(),
+                    ValueTypeStorageLifetime::pure(),
+                    input_owner.storage_lifetime(),
+                    |layout| input_owner.request(layout),
+                    |step| input_owner.observe(0, &[], step),
+                )
+                .unwrap();
+            let projection = input.into_batch_projection();
+            let bytes = crate::exec::chunk::record_batch_bytes(projection.record_batch());
+            let reservation = writer.try_reserve_input(3, bytes, None, 0, bytes).unwrap();
+            let copy_owner = factory
+                .begin_typed_construction(projection.chunk_schema())
+                .unwrap();
+            let append = WriterAppendBatch::try_new(projection, copy_owner.as_ref()).unwrap();
+            let weak_factory = Arc::downgrade(&factory);
+            drop((copy_owner, input_owner, schema, declared, factory));
+            assert!(
+                weak_factory.upgrade().is_none(),
+                "queued custody must not retain the factory"
+            );
+            // Scope/factory control and model objects are transient. Measure
+            // the actual durable queue obligation only after those exit.
+            let pending_current = tracker.current();
+            assert!(
+                pending_current > i64::try_from(bytes).unwrap(),
+                "real schema/wrapper/copy responsibility is distinct from payload queue accounting"
+            );
+            reservation.send(append).unwrap();
+            wait_until(|| calls.append_started.load(Ordering::Relaxed) == 1);
+            assert_eq!(
+                tracker.current(),
+                pending_current,
+                "the actual pending append still owns the finite projection and provider-copy responsibility"
+            );
+            assert_eq!(writer.queued_usage(), (3, bytes));
+            if abort {
+                writer.request_abort();
+                wait_until(|| writer.actor_exited());
+                assert_eq!(calls.aborted.load(Ordering::Relaxed), 1);
+                assert_eq!(calls.appended.load(Ordering::Relaxed), 0);
+                assert_eq!(calls.finished.load(Ordering::Relaxed), 0);
+            } else {
+                gate.notify_one();
+                wait_until(|| writer.queued_usage() == (0, 0));
+                assert_eq!(tracker.current(), 0);
+                writer.request_finish().unwrap();
+                wait_until(|| writer.actor_exited());
+                assert_eq!(writer.take_output(), Some(3));
+                assert_eq!(calls.appended.load(Ordering::Relaxed), 3);
+                assert_eq!(calls.finished.load(Ordering::Relaxed), 1);
+            }
+            assert_eq!(
+                tracker.current(),
+                0,
+                "actual final exit releases every finite input holder"
+            );
+            assert!(error.error().is_none());
+        }
+    }
+
+    #[test]
     fn slow_append_holds_exact_rows_bytes_and_backpressures_until_release() {
         let calls = Arc::new(Calls::default());
         let gate = Arc::new(Notify::new());
@@ -1446,7 +1608,7 @@ pub(crate) mod tests {
         let program = program(SeedMode::Input, false);
         let input = input_chunk(&program, vec![Some(42), None, Some(7)]);
         let mut input = if provider {
-            provider_chunk_with_original_token(input.batch, &tracker).0
+            provider_chunk_with_original_token(input.record_batch().clone(), &tracker).0
         } else {
             let mut input = input;
             input.try_transfer_to(&tracker).unwrap();
@@ -1459,9 +1621,9 @@ pub(crate) mod tests {
         let output = projector.project(&input).unwrap();
         assert_eq!(input.source_authority().strong_counts(), counts);
         assert_eq!(tracker.current(), source_bytes);
-        let retained = crate::exec::chunk::record_batch_bytes(&output.batch);
-        let shared = record_batch_shared_owner_bytes(&output.batch, &input.batch);
-        let additional = record_batch_additional_bytes(&output.batch, &input.batch);
+        let retained = crate::exec::chunk::record_batch_bytes(output.record_batch());
+        let shared = record_batch_shared_owner_bytes(output.record_batch(), input.record_batch());
+        let additional = record_batch_additional_bytes(output.record_batch(), input.record_batch());
         assert_eq!(additional, 0);
         assert_eq!(shared, retained);
         assert!(retained < source_bytes as usize);
@@ -1471,8 +1633,24 @@ pub(crate) mod tests {
         let reservation = owner
             .try_reserve_input(output.len(), retained, Some(lease), shared, additional)
             .expect("original exclusive reservation avoids a second charge");
+        let construction_tracker = MemTracker::new_root("source-loan append construction");
+        construction_tracker
+            .install_limit_once(64 * 1024 * 1024)
+            .unwrap();
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            construction_tracker,
+            error.clone(),
+        ).unwrap();
+        let copy_owner = factory
+            .begin_typed_construction(output.chunk_schema())
+            .unwrap();
+        let append =
+            WriterAppendBatch::try_new(output.into_batch_projection(), copy_owner.as_ref())
+                .unwrap();
+        drop((copy_owner, factory));
         drop(input);
-        reservation.send(output.batch).unwrap();
+        reservation.send(append).unwrap();
         assert_eq!(tracker.current(), retained as i64);
         assert_eq!(tracker.peak(), source_bytes);
         gate.notify_one();
@@ -1585,7 +1763,7 @@ pub(crate) mod tests {
         assert_eq!(tracker.current(), i64::try_from(peak_bytes).unwrap());
         drop(source_chunk);
         reservation
-            .send(projection)
+            .send(fixture_append_batch(projection))
             .expect("retire dead source bytes before enqueue");
         assert_eq!(tracker.current(), i64::try_from(retained_bytes).unwrap());
 
@@ -1666,7 +1844,7 @@ pub(crate) mod tests {
         assert_eq!(tracker.current(), i64::try_from(peak_bytes).unwrap());
         drop(source_chunk);
         reservation
-            .send(projection)
+            .send(fixture_append_batch(projection))
             .expect("enqueue mixed projection");
         assert_eq!(tracker.current(), i64::try_from(retained_bytes).unwrap());
 

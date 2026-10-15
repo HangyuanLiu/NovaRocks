@@ -449,19 +449,25 @@ impl TypedCommandRoute {
 /// to the MySQL listener, the current database is session-local SQL state, and
 /// this engine has no per-statement state machine to name. None of the three
 /// is registry state, so none is invented here.
-fn process_list_schema() -> Arc<arrow::datatypes::Schema> {
-    use arrow::datatypes::{DataType, Field, Schema};
-
-    Arc::new(Schema::new(vec![
-        Field::new("Id", DataType::Int64, false),
-        Field::new("User", DataType::Utf8, false),
-        Field::new("Host", DataType::Utf8, true),
-        Field::new("db", DataType::Utf8, true),
-        Field::new("Command", DataType::Utf8, false),
-        Field::new("Time", DataType::Int64, false),
-        Field::new("State", DataType::Utf8, true),
-        Field::new("Info", DataType::Utf8, true),
-    ]))
+fn process_list_columns() -> Vec<novarocks_query_application::api::ResultField> {
+    use arrow::datatypes::DataType;
+    use novarocks_query_application::api::ResultField;
+    use novarocks_type_contract::FunctionValueType;
+    [
+        ("Id", DataType::Int64, false),
+        ("User", DataType::Utf8, false),
+        ("Host", DataType::Utf8, true),
+        ("db", DataType::Utf8, true),
+        ("Command", DataType::Utf8, false),
+        ("Time", DataType::Int64, false),
+        ("State", DataType::Utf8, true),
+        ("Info", DataType::Utf8, true),
+    ]
+    .into_iter()
+    .map(|(name, carrier, nullable)| {
+        ResultField::new(name, FunctionValueType::new(carrier, nullable))
+    })
+    .collect()
 }
 
 /// MySQL truncates `Info` here unless the caller asked for `FULL`.
@@ -510,7 +516,19 @@ fn process_list_result(
         .unwrap_or(usize::MAX);
     LocalResultBound::V1.admit(processes.len(), bytes)?;
 
-    let schema = process_list_schema();
+    let columns = process_list_columns();
+    let schema = Arc::new(arrow::datatypes::Schema::new(
+        columns
+            .iter()
+            .map(|field| {
+                arrow::datatypes::Field::new(
+                    field.name(),
+                    field.data_type().clone(),
+                    field.nullable(),
+                )
+            })
+            .collect::<Vec<_>>(),
+    ));
     let mut ids = arrow::array::Int64Builder::with_capacity(processes.len());
     let mut times = arrow::array::Int64Builder::with_capacity(processes.len());
     for process in &processes {
@@ -550,18 +568,7 @@ fn process_list_result(
     .map_err(|error| format!("build SHOW PROCESSLIST result: {error}"))?;
 
     Ok(QueryResult {
-        columns: schema
-            .fields()
-            .iter()
-            .map(|field| {
-                novarocks_query_application::api::ResultField::new(
-                    field.name().as_str(),
-                    field.data_type().clone(),
-                    field.is_nullable(),
-                    None,
-                )
-            })
-            .collect(),
+        columns,
         batches: vec![batch],
     })
 }
@@ -3441,7 +3448,10 @@ mod tests {
     }
 
     fn scalar_field(nullable: bool) -> ResultField {
-        ResultField::new("value", DataType::Int64, nullable, None)
+        ResultField::new(
+            "value",
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, nullable),
+        )
     }
 
     fn relayed_scalar_fixture() -> (

@@ -114,7 +114,9 @@ fn function(types: Vec<FunctionArgumentType>) -> crate::BoundFunction {
         function_id: FunctionId::try_new("fixture/static-request/component").unwrap(),
         overload: FunctionOverloadId::try_new("fixture/static-request/exact").unwrap(),
         kind: FunctionKind::Scalar,
-        argument_types: types.into_boxed_slice(),
+        argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+            types.into_boxed_slice(),
+        ),
         result_type: integer(false),
         legacy_metadata: Some(crate::LegacyBindingMetadata {
             volatility: FunctionVolatility::Immutable,
@@ -187,6 +189,113 @@ fn values() -> NodeKind {
 }
 fn key(id: u32) -> PhysicalCallDefinition {
     PhysicalCallDefinition::Expression(ExprId::new(id))
+}
+
+#[test]
+fn created_request_table_clone_keeps_original_and_new_storage_after_fragment_exit() {
+    use novarocks_type_contract::{
+        ValueSchemaCreation, ValueTypeStorageHold, ValueTypeStorageLifetime,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Hold(Arc<AtomicUsize>);
+    impl ValueTypeStorageHold for Hold {}
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let original_drops = Arc::new(AtomicUsize::new(0));
+    let new_drops = Arc::new(AtomicUsize::new(0));
+    let source_storage = ValueTypeStorageLifetime::held(Arc::new(Hold(original_drops.clone())));
+    let new_storage = ValueTypeStorageLifetime::held(Arc::new(Hold(new_drops.clone())));
+    let trace = Mutex::new(Vec::new());
+    let mut exact = |layout: std::alloc::Layout| {
+        trace.lock().unwrap().push((true, layout.size()));
+        Ok::<(), ()>(())
+    };
+    let mut opaque = |bytes: usize| {
+        trace.lock().unwrap().push((false, bytes));
+        Ok::<(), ()>(())
+    };
+    let mut creation = ValueSchemaCreation::new(new_storage, &mut exact, &mut opaque);
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
+    let fragment = fragment(7, vec![expression(1, vec![], vec![])], values())
+        .with_call_requests_created_in(
+            vec![(key(1), request(vec![]))],
+            source_storage,
+            &mut creation,
+            &mut work,
+        )
+        .unwrap();
+    work.finish().unwrap();
+    let standalone = fragment.call_requests().clone();
+    drop((fragment, creation));
+    assert_eq!(original_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(new_drops.load(Ordering::SeqCst), 0);
+    let trace = trace.into_inner().unwrap();
+    assert_eq!(trace.iter().filter(|(exact, _)| *exact).count(), 2);
+    assert_eq!(trace.iter().filter(|(exact, _)| !*exact).count(), 1);
+    let expected = novarocks_type_contract::owned_resources::btree::insertion_only::<
+        PhysicalCallDefinition,
+        PhysicalCallRequest,
+    >(1)
+    .unwrap();
+    assert_eq!(
+        trace.iter().find(|(exact, _)| !*exact).unwrap().1,
+        expected.request_bytes_upper_bound
+    );
+    assert!(standalone.get(key(1)).is_some());
+    drop(standalone);
+    assert_eq!(original_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(new_drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn created_request_table_returns_first_host_before_tree_or_arc_without_tail_control() {
+    use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct HostControl(AtomicBool);
+    impl PureCompileControl for HostControl {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            assert!(
+                !self.0.load(Ordering::SeqCst),
+                "control after original host refusal"
+            );
+            Ok(())
+        }
+    }
+    for stop in 0..2 {
+        let control = HostControl(AtomicBool::new(false));
+        let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
+        let failure: Arc<str> = Arc::from("actual caller refusal");
+        let calls = AtomicUsize::new(0);
+        let callback = |_: usize| {
+            assert!(!control.0.load(Ordering::SeqCst));
+            if calls.fetch_add(1, Ordering::SeqCst) == stop {
+                control.0.store(true, Ordering::SeqCst);
+                Err(failure.clone())
+            } else {
+                Ok(())
+            }
+        };
+        let mut exact = |layout: std::alloc::Layout| callback(layout.size());
+        let mut opaque = |bytes: usize| callback(bytes);
+        let mut creation =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
+        let result = fragment(7, vec![expression(1, vec![], vec![])], values())
+            .with_call_requests_created_in(
+                vec![(key(1), request(vec![]))],
+                ValueTypeStorageLifetime::pure(),
+                &mut creation,
+                &mut work,
+            );
+        let Err(CallRequestCreationFailure::Creator(actual)) = result else {
+            panic!("host refusal was reclassified")
+        };
+        assert!(Arc::ptr_eq(&failure, &actual));
+        assert_eq!(calls.load(Ordering::SeqCst), stop + 1);
+    }
 }
 fn attach(
     source: &Fragment,
@@ -361,7 +470,12 @@ fn nested(root_nullable: bool, child_nullable: bool, metadata: &str) -> ValueTyp
     ValueType::new(
         DataType::Struct(
             vec![Arc::new(
-                Field::new("original.child", DataType::Int64, child_nullable).with_metadata(
+                Field::new(
+                    format!("original.child.{metadata}"),
+                    DataType::Int64,
+                    child_nullable,
+                )
+                .with_metadata(
                     [("source".to_owned(), metadata.to_owned())]
                         .into_iter()
                         .collect(),
@@ -430,7 +544,10 @@ fn static_requests_value_nullable_covariance_and_lambda_complete_exactness_stay_
     )
     .unwrap();
     let expected_lambda = FunctionArgumentType::Lambda {
-        parameter_types: Box::from([nominal.clone(), nested(false, false, "original")]),
+        parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+            nominal.clone(),
+            nested(false, false, "original"),
+        ])),
         result_type: integer(true),
     };
     let lambda_source = fragment(
@@ -439,7 +556,10 @@ fn static_requests_value_nullable_covariance_and_lambda_complete_exactness_stay_
         values(),
     );
     let lambda = |nominal: ValueType, metadata: &str, result: ValueType| FunctionArgument::Lambda {
-        parameter_types: Box::from([nominal, nested(false, false, metadata)]),
+        parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+            nominal,
+            nested(false, false, metadata),
+        ])),
         result_type: result,
     };
     let correct = request(vec![lambda(nominal.clone(), "original", integer(true))]);
@@ -562,7 +682,7 @@ fn static_requests_wrong_channel_kind_arity_and_logical_count_refuse_with_ordina
         );
     }
     let lambda = request(vec![FunctionArgument::Lambda {
-        parameter_types: Box::default(),
+        parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::default()),
         result_type: integer(true),
     }]);
     prefixes(

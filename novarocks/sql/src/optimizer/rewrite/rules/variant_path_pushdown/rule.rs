@@ -779,9 +779,9 @@ fn string_literal_value_scalar<'a>(
     let source = arena.value_type(expr);
     // A nominal JSON value is not a string path/type declaration. A carrier
     // cannot authorize a logical domain that this consumer does not own.
-    if source.logical_type != ValueLogicalType::Physical
+    if source.logical_type() != ValueLogicalType::Physical
         || !matches!(
-            source.data_type,
+            source.data_type(),
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
         )
     {
@@ -1051,7 +1051,7 @@ fn find_or_create_slot_on_scan(
     let Some(source_column) = source_column else {
         return Ok(None);
     };
-    if source_column.value_type.data_type != DataType::LargeBinary {
+    if *source_column.value_type.data_type() != DataType::LargeBinary {
         return Ok(None);
     }
 

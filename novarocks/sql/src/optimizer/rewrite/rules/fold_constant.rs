@@ -1019,7 +1019,7 @@ mod tests {
                 }
                 FoldNodeKind::Function { .. } => test_fold_value(
                     request,
-                    if request.result_type.data_type == DataType::Utf8 {
+                    if *request.result_type.data_type() == DataType::Utf8 {
                         LiteralValue::String(FUNCTION_MARKER.to_string())
                     } else {
                         LiteralValue::Int(FUNCTION_MARKER)
@@ -1046,6 +1046,7 @@ mod tests {
             let mut ctx = RewriteContext::for_query(Vec::<String>::new());
             ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
             ctx.set_scalar_arena(Rc::clone(&arena));
+            ctx.set_function_catalog(crate::functions::builtin_sql_function_catalog().snapshot());
             ctx.set_constant_evaluator(evaluator);
             Self {
                 arena,
@@ -1060,6 +1061,7 @@ mod tests {
             let mut ctx = RewriteContext::for_query(Vec::<String>::new());
             ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
             ctx.set_scalar_arena(Rc::clone(&arena));
+            ctx.set_function_catalog(crate::functions::builtin_sql_function_catalog().snapshot());
             Self {
                 arena,
                 ctx,
@@ -1270,6 +1272,7 @@ mod tests {
         );
         ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_scalar_arena(Rc::clone(&fixture.arena));
+        ctx.set_function_catalog(crate::functions::builtin_sql_function_catalog().snapshot());
         if let Some(evaluator) = evaluator {
             ctx.set_constant_evaluator(evaluator);
         }
@@ -2395,7 +2398,7 @@ mod complete_fold_type_tests {
             let root = arena.intern(
                 ScalarNode::Cast {
                     child,
-                    target: result_type.data_type.clone(),
+                    target: result_type.data_type().clone(),
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
@@ -2418,12 +2421,15 @@ mod complete_fold_type_tests {
                     .unwrap()
             );
             assert_eq!(request.args[0].value_type, nested_type);
-            let DataType::Struct(fields) = &request.args[0].value_type.data_type else {
+            let DataType::Struct(fields) = &request.args[0].value_type.data_type() else {
                 panic!("the authored structure must survive the real request");
             };
-            assert_eq!(fields[0].dict_id(), Some(73));
-            assert_eq!(fields[0].dict_is_ordered(), Some(true));
-            assert_eq!(fields[0].metadata()["provider.identity"], "source-field-9");
+            assert_eq!(fields[0].name(), "encoded");
+            assert!(fields[0].is_nullable());
+            assert_eq!(fields[0].data_type(), &DataType::Utf8);
+            assert_eq!(fields[0].dict_id(), None);
+            assert_eq!(fields[0].dict_is_ordered(), None);
+            assert_eq!(fields[0].metadata().capacity(), 0);
         }
     }
 

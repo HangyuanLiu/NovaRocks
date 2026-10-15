@@ -150,6 +150,9 @@ fn union_chunk(program: &LocalProgram, array: ArrayRef) -> Chunk {
         .find(|node| matches!(node.kind(), ProgramNodeKind::Values { .. }))
         .unwrap();
     let schema = ChunkSchema::from_compiled_layout(node.output_layout()).unwrap();
+    // Fixture ingress performs the same representation-only normalization as
+    // an actual source author. Real Struct names and declared semantics survive.
+    let array = novarocks_functions::array_projection::normalize_execution_array(&array).unwrap();
     Chunk::try_new_with_chunk_schema(
         RecordBatch::try_new(schema.arrow_schema_ref(), vec![array]).unwrap(),
         schema,
@@ -189,7 +192,7 @@ fn percentile_union_private_real_factory_single_partial_final_binary_exact() {
     }
     assert_eq!(
         actual
-            .batch
+            .record_batch()
             .column(0)
             .as_any()
             .downcast_ref::<BinaryArray>()
@@ -197,16 +200,22 @@ fn percentile_union_private_real_factory_single_partial_final_binary_exact() {
             .value(0),
         novarocks_functions::approx_percentile_core::encode_state(&expected)
     );
+    // The later Final output is a separate owner. Release this already checked
+    // Single output before shadowing its binding and testing the final last ref.
+    drop(actual);
     let stages = union_program(DataType::Binary, true);
     let chunk = union_chunk(&stages, array);
     let left = run(
         &factory(&stages, P::Partial),
-        &[Chunk::new_like(chunk.batch.slice(0, 161), &chunk)],
+        &[Chunk::new_like(chunk.record_batch().slice(0, 161), &chunk)],
         tracker.clone(),
     );
     let right = run(
         &factory(&stages, P::Partial),
-        &[Chunk::new_like(chunk.batch.slice(161, 160), &chunk)],
+        &[Chunk::new_like(
+            chunk.record_batch().slice(161, 160),
+            &chunk,
+        )],
         tracker.clone(),
     );
     let actual = run(
@@ -216,12 +225,12 @@ fn percentile_union_private_real_factory_single_partial_final_binary_exact() {
     );
     let mut expected = novarocks_functions::approx_percentile_core::PercentileState::default();
     for partial in [&left, &right] {
-        novarocks_functions::approx_percentile_aggregate_core::merge_row(&mut expected,partial.batch.column(0),0,
+        novarocks_functions::approx_percentile_aggregate_core::merge_row(&mut expected,partial.record_batch().column(0),0,
         novarocks_functions::approx_percentile_aggregate_core::ApproxPercentileDiagnostic::UnweightedMerge).unwrap();
     }
     assert_eq!(
         actual
-            .batch
+            .record_batch()
             .column(0)
             .as_any()
             .downcast_ref::<BinaryArray>()
@@ -241,7 +250,7 @@ fn percentile_union_private_real_factory_empty_encodes_non_null_state() {
     let tracker = MemTracker::new_root("UnionEmptyFactory");
     let actual = run(&factory(&program, P::Single), &[], tracker.clone());
     let array = actual
-        .batch
+        .record_batch()
         .column(0)
         .as_any()
         .downcast_ref::<BinaryArray>()
@@ -256,8 +265,15 @@ fn percentile_union_private_real_factory_empty_encodes_non_null_state() {
 fn percentile_union_private_real_factory_whole_long_data_exact_and_drop() {
     use novarocks_functions::AggregateKernelPhase as P;
     let ty = DataType::List(Arc::new(arrow::datatypes::Field::new(
-        "original-key".repeat(80),
-        DataType::UInt32,
+        "item",
+        DataType::Struct(
+            vec![Arc::new(arrow::datatypes::Field::new(
+                "original-key".repeat(80),
+                DataType::UInt32,
+                true,
+            ))]
+            .into(),
+        ),
         true,
     )));
     let program = union_program(ty.clone(), false);
@@ -270,7 +286,12 @@ fn percentile_union_private_real_factory_whole_long_data_exact_and_drop() {
     {
         let factory = factory(&program, P::Single);
         let mut operator = factory.create(1, 0);
+        operator.set_construction_factory(aggregate_fixture::runtime_construction_factory(
+            tracker.clone(),
+            factory.error.clone(),
+        ));
         operator.set_mem_tracker(tracker.clone());
+        operator.prepare().expect("prepare actual aggregate schema");
         let result = operator
             .as_processor_mut()
             .unwrap()

@@ -128,7 +128,7 @@ fn direct_capture_last_buffer(chunk: Chunk, source_tracker: Arc<MemTracker>, sto
     let mut control = RuntimeKernelControl::new(Arc::new(RuntimeErrorState::default()));
     control.bind_mem_tracker(wrap_tracker.clone());
     let host = control.allocator().unwrap();
-    let array = chunk.batch.column(0).clone();
+    let array = chunk.record_batch().column(0).clone();
     let captured = chunk.source_authority().capture().unwrap();
     let mut work = EvaluationCheckpoints::new(&control);
     let source =
@@ -197,7 +197,7 @@ fn source_authority_direct_constructor_refusal_preserves_the_paid_raw_source_ali
             native_chunk(&tracker)
         };
         let stock = tracker.current();
-        let raw = chunk.batch.column(0).clone();
+        let raw = chunk.record_batch().column(0).clone();
         let captured = chunk.source_authority().capture().unwrap();
         let wrap_tracker = MemTracker::new_root("refused direct holder");
         wrap_tracker.install_limit_once(1).unwrap();

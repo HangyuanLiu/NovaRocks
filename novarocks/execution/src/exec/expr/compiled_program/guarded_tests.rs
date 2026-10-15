@@ -952,6 +952,7 @@ pub(crate) fn compile_checked_fragment_with_parameters(
                 )
                 .unwrap();
             frozen.push(FrozenPhysicalCall {
+                materialized_writer_input: None,
                 site: PhysicalCallSite::Expression(context.use_id),
                 context,
                 effects: token.call_contract().effects().clone(),

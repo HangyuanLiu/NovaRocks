@@ -459,6 +459,22 @@ impl Model {
         values: usize,
         l: NodeProjectionLimits,
     ) -> Result<(NodeProjectionFacts, usize), Error> {
+        self.checked_facts_core(source, values, Some(l))
+    }
+    pub(crate) fn numerical_input_derived_facts(
+        &self,
+        source: usize,
+        values: usize,
+    ) -> Result<NodeProjectionFacts, Error> {
+        self.checked_facts_core(source, values, None)
+            .map(|(facts, _)| facts)
+    }
+    fn checked_facts_core(
+        &self,
+        source: usize,
+        values: usize,
+        limits: Option<NodeProjectionLimits>,
+    ) -> Result<(NodeProjectionFacts, usize), Error> {
         let search_height = (usize::BITS - values.leading_zeros()) as usize + 1;
         // Each original list/reference has a bounded count/shape pass, exact
         // namespace lookup and emission pass. The multiplier covers their
@@ -486,6 +502,9 @@ impl Model {
         };
         // Every numerical fact is now known. Admit all axes before observing
         // completed gate work, so a later axis cannot lose to the next quantum.
+        let Some(l) = limits else {
+            return Ok((facts, 0));
+        };
         let axes = [
             (facts.input_node_count, l.max_input_nodes),
             (facts.value_reference_count, l.max_value_references),

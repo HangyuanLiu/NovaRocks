@@ -507,7 +507,12 @@ fn journal_update_shared_signature_comparison_rejects_full_type_drift_and_ignore
         selected.as_ref(),
         &entry.captured().binding().resolved().selected
     );
-    changed.binding.function.result_type.nullable = !changed.binding.function.result_type.nullable;
+    changed.binding.function.result_type = changed
+        .binding
+        .function
+        .result_type
+        .with_nullable(!changed.binding.function.result_type.nullable())
+        .unwrap();
     let invoke = |control: &Control| {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
         let result =

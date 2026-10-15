@@ -71,7 +71,7 @@ impl<'call, 'batch> CalendarInput<'call, 'batch> {
         Self {
             types: &input.contract().selected().argument_types,
             target: input.contract().result_type(),
-            carrier: &input.contract().result_type().data_type,
+            carrier: input.contract().result_type().data_type(),
             arguments: input.arguments(),
             selected: input.selection(),
             legacy: false,
@@ -172,9 +172,15 @@ pub fn evaluate_legacy_calendar(
     let types: Vec<_> = arguments
         .iter()
         .map(|array| {
-            FunctionArgumentType::Value(FunctionValueType::new(array.data_type().clone(), true))
+            FunctionValueType::try_with_logical_type(
+                array.data_type().clone(),
+                true,
+                novarocks_type_contract::ValueLogicalType::Physical,
+            )
+            .map(FunctionArgumentType::Value)
+            .map_err(|error| error.to_string())
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
     let arguments_view: Vec<_> = arguments
         .iter()
         .map(|argument| {
@@ -206,7 +212,12 @@ pub fn evaluate_legacy_calendar(
             "legacy calendar row out of bounds"
         );
     }
-    let target = FunctionValueType::new(output_type.clone(), true);
+    let target = FunctionValueType::try_with_logical_type(
+        output_type.clone(),
+        true,
+        novarocks_type_contract::ValueLogicalType::Physical,
+    )
+    .map_err(|error| error.to_string())?;
     let carrier = if matches!(
         operation,
         CalendarOperation::Timestamp
@@ -576,10 +587,20 @@ mod carrier_diagnostic_tests {
 
     #[test]
     fn legacy_carrier_admission_retains_the_complete_nested_type_diagnostic() {
-        let field = Arc::new(Field::new("raw_field_".repeat(512), DataType::Int64, true));
+        let fields = (0..16)
+            .map(|index| {
+                Arc::new(Field::new(
+                    format!("raw_field_{index}_").repeat(24),
+                    DataType::Int64,
+                    true,
+                ))
+            })
+            .collect::<Vec<_>>();
         let source: ArrayRef = Arc::new(StructArray::new(
-            vec![field].into(),
-            vec![Arc::new(Int64Array::from(vec![1]))],
+            fields.into(),
+            (0..16)
+                .map(|_| Arc::new(Int64Array::from(vec![1])) as ArrayRef)
+                .collect(),
             None,
         ));
         let expected = format!("unsupported datetime input type: {:?}", source.data_type());

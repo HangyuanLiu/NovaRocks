@@ -52,34 +52,112 @@ impl ConnectorWriteBinding {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct CreatedWriterField {
+    field: novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization,
+    // Only this copied root and its actual reachable child backing loans.
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+#[derive(Clone, Debug)]
+enum WriterFieldStorage {
+    Pure(novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization),
+    Created(std::sync::Arc<CreatedWriterField>),
+}
+impl WriterFieldStorage {
+    fn original(&self) -> &novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization{
+        match self {
+            Self::Pure(field) => field,
+            Self::Created(field) => &field.field,
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct ConnectorWriteFieldBinding {
     token: ConnectorWriteFieldToken,
-    field: novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization,
+    field: WriterFieldStorage,
+    execution_type: Option<novarocks_type_contract::FunctionValueType>,
 }
 
 impl PartialEq for ConnectorWriteFieldBinding {
     fn eq(&self, other: &Self) -> bool {
-        self.token == other.token && crate::arrow_fields_exact(self.field(), other.field())
+        self.token == other.token
+            && self.execution_type == other.execution_type
+            && crate::arrow_fields_exact(self.field(), other.field())
     }
 }
 impl Eq for ConnectorWriteFieldBinding {}
 
 impl ConnectorWriteFieldBinding {
     pub fn new(token: ConnectorWriteFieldToken, field: Field) -> Self {
-        Self { token, field: novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::Plain(field) }
+        Self { token, field: WriterFieldStorage::Pure(novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::Plain(field)), execution_type: None }
     }
 
     pub(crate) fn from_owned_materialization(
         token: ConnectorWriteFieldToken,
         field: novarocks_type_contract::owned_resources::metadata_materialization::MaterializedField,
     ) -> Self {
-        Self { token, field: novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::Materialized(field) }
+        Self { token, field: WriterFieldStorage::Pure(novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::Materialized(field)), execution_type: None }
+    }
+
+    pub(crate) fn created_allocation_layout() -> Result<
+        std::alloc::Layout,
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    > {
+        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            CreatedWriterField,
+        >())
+    }
+    pub(crate) fn from_created_materialization(
+        token: ConnectorWriteFieldToken,
+        field:novarocks_type_contract::owned_resources::metadata_materialization::MaterializedField,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+    ) -> Self {
+        Self {
+            token,
+            field:WriterFieldStorage::Created(std::sync::Arc::new(CreatedWriterField {
+                field:novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::Materialized(field),
+                _storage:storage,
+            })),
+            execution_type:None,
+        }
+    }
+    /// Pair provider-owned source facts with their explicitly authored execution
+    /// projection. An absent projection belongs only to the expansion adapter.
+    pub fn try_new_typed(
+        token: ConnectorWriteFieldToken,
+        field: Field,
+        execution_type: novarocks_type_contract::FunctionValueType,
+    ) -> Result<Self, ConnectorError> {
+        Self::new(token, field).with_execution_type(execution_type)
+    }
+
+    pub fn with_execution_type(
+        mut self,
+        execution_type: novarocks_type_contract::FunctionValueType,
+    ) -> Result<Self, ConnectorError> {
+        let matches = write_field_matches_execution_type_observed::<
+            novarocks_type_contract::ValueTypeError,
+        >(self.field(), &execution_type, |_| Ok(()))
+        .map_err(|error| {
+            ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+        })?;
+        if !matches {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "writer source facts conflict with their explicit execution projection",
+            ));
+        }
+        self.execution_type = Some(execution_type);
+        Ok(self)
+    }
+
+    pub fn execution_type(&self) -> Option<&novarocks_type_contract::FunctionValueType> {
+        self.execution_type.as_ref()
     }
 
     /// Borrow the exact immutable writer-owned field and its constructor fact.
     pub fn original_field_materialization(&self) -> &novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization{
-        &self.field
+        self.field.original()
     }
 
     pub const fn token(&self) -> ConnectorWriteFieldToken {
@@ -87,8 +165,29 @@ impl ConnectorWriteFieldBinding {
     }
 
     pub fn field(&self) -> &Field {
-        self.field.field()
+        self.field.original().field()
     }
+}
+
+/// Validate the physical part of an explicitly authored writer input. The
+/// provider's Field remains a source fact, and contributes no inferred logical
+/// domain. Ownership and allocation admission remain with the real author.
+pub fn write_field_matches_execution_type_observed<
+    E: From<novarocks_type_contract::ValueTypeError>,
+>(
+    field: &Field,
+    execution_type: &novarocks_type_contract::FunctionValueType,
+    mut observe: impl FnMut(usize) -> Result<(), E>,
+) -> Result<bool, E> {
+    observe(1)?;
+    if field.is_nullable() != execution_type.nullable() {
+        return Ok(false);
+    }
+    novarocks_type_contract::value_layout_matches_carrier_observed(
+        execution_type.typed_binding().layout(),
+        field.data_type(),
+        observe,
+    )
 }
 
 /// One original field loan and its exact provider token. Constructing a loan
@@ -97,11 +196,40 @@ impl ConnectorWriteFieldBinding {
 pub struct ConnectorWriteFieldRef<'a> {
     token: ConnectorWriteFieldToken,
     field: &'a Field,
+    execution_type: Option<&'a novarocks_type_contract::FunctionValueType>,
 }
 
 impl<'a> ConnectorWriteFieldRef<'a> {
     pub const fn new(token: ConnectorWriteFieldToken, field: &'a Field) -> Self {
-        Self { token, field }
+        Self {
+            token,
+            field,
+            execution_type: None,
+        }
+    }
+
+    /// Borrow the original independent source Field and complete execution
+    /// declaration. The recipe's existing validator checks this pair.
+    pub const fn new_typed(
+        token: ConnectorWriteFieldToken,
+        field: &'a Field,
+        execution_type: &'a novarocks_type_contract::FunctionValueType,
+    ) -> Self {
+        Self {
+            token,
+            field,
+            execution_type: Some(execution_type),
+        }
+    }
+    pub fn from_binding(binding: &'a ConnectorWriteFieldBinding) -> Self {
+        Self {
+            token: binding.token(),
+            field: binding.field(),
+            execution_type: binding.execution_type(),
+        }
+    }
+    pub const fn execution_type(&self) -> Option<&'a novarocks_type_contract::FunctionValueType> {
+        self.execution_type
     }
 
     pub const fn token(&self) -> ConnectorWriteFieldToken {
@@ -199,13 +327,23 @@ impl ConnectorWriteInputShape {
         }
         for (left, right) in self.fields_iter().zip(other.fields_iter()) {
             observe()?;
-            if left.token() != right.token()
-                || !novarocks_type_contract::arrow_fields_exact_observed::<E>(
-                    left.field(),
-                    right.field(),
-                    &mut observe,
-                )?
-            {
+            if left.token() != right.token() {
+                return Ok(false);
+            }
+            match (left.execution_type(), right.execution_type()) {
+                (Some(left), Some(right))
+                    if !left.exactly_equals_checked_observed(right, &mut observe)? =>
+                {
+                    return Ok(false);
+                }
+                (None, None) | (Some(_), Some(_)) => {}
+                _ => return Ok(false),
+            }
+            if !novarocks_type_contract::arrow_fields_exact_observed::<E>(
+                left.field(),
+                right.field(),
+                &mut observe,
+            )? {
                 return Ok(false);
             }
         }
@@ -254,8 +392,7 @@ impl WriteInputFields for Vec<ConnectorWriteFieldBinding> {
         Vec::len(self)
     }
     fn field_refs(&self) -> impl Iterator<Item = ConnectorWriteFieldRef<'_>> {
-        self.iter()
-            .map(|field| ConnectorWriteFieldRef::new(field.token(), field.field()))
+        self.iter().map(ConnectorWriteFieldRef::from_binding)
     }
     fn accumulate_source_backing<O: OwnedCopy>(
         &self,
@@ -372,6 +509,13 @@ impl<F> ConnectorWriteInput<F> {
             context: &mut O,
         ) -> Result<Option<Vec<ConnectorWriteFieldBinding>>, O::Error> {
             let materializes = context.materializes();
+            if materializes {
+                context.prefunded_request(
+                    std::alloc::Layout::array::<ConnectorWriteFieldBinding>(fields.len())
+                        .map_err(|_| context.arithmetic())?,
+                    1,
+                )?;
+            }
             let mut output = Vec::new();
             if materializes {
                 context.flush()?;
@@ -388,7 +532,18 @@ impl<F> ConnectorWriteInput<F> {
                             "writer owned copy did not materialize a field",
                         )
                     })?;
-                    output.push(if context.source_invoice().is_some() {
+                    let mut copied = if context.created_fields() {
+                        let layout = ConnectorWriteFieldBinding::created_allocation_layout()
+                            .map_err(|_| context.arithmetic())?;
+                        context.created_wrapper(layout)?;
+                        let storage = context.finish_field()?;
+                        context.flush()?;
+                        ConnectorWriteFieldBinding::from_created_materialization(
+                            binding.token(),
+                            field,
+                            storage,
+                        )
+                    } else if context.source_invoice().is_some() {
                         ConnectorWriteFieldBinding::from_owned_materialization(
                             binding.token(),
                             field,
@@ -398,7 +553,19 @@ impl<F> ConnectorWriteInput<F> {
                             binding.token(),
                             field.into_original_field(),
                         )
-                    });
+                    };
+                    if !context.created_fields() {
+                        let _ = context.finish_field()?;
+                    }
+                    if let Some(value) = binding.execution_type() {
+                        copied.execution_type = Some(value.clone_observed(|| context.step())?);
+                    }
+                    output.push(copied);
+                } else {
+                    let _ = context.finish_field()?;
+                    if binding.execution_type().is_some() {
+                        context.work(2)?;
+                    }
                 }
                 context.step()?;
             }
@@ -408,6 +575,12 @@ impl<F> ConnectorWriteInput<F> {
             context.flush()?;
             // Preserve the original role-local trim; its conservative second
             // request and inline moves were admitted by preflight_owned_roles.
+            if let Some(layout) = novarocks_type_contract::owned_resources::vec::box_facts(&output)
+                .map_err(|_| context.arithmetic())?
+                .requested_backing
+            {
+                context.prefunded_request(layout, 1)?;
+            }
             let output = output.into_boxed_slice().into_vec();
             context.step()?;
             context.flush()?;
@@ -471,10 +644,22 @@ impl<F> ConnectorWriteInput<F> {
         context.table_cleanup::<ConnectorWriteFieldToken, ()>(count, 64)?;
         context.table_cleanup::<String, ()>(count, 128)?;
         context.flush()?;
+        if let Some(layout) = hashmap::fresh_table_layout::<ConnectorWriteFieldToken, ()>(count)
+            .map_err(|error| context.hash_error(error))?
+            .layout
+        {
+            context.temporary_request(layout)?;
+        }
         let mut tokens = HashSet::new();
         let reserved = tokens.try_reserve(count);
         context.reserve_exit(reserved)?;
         context.flush()?;
+        if let Some(layout) = hashmap::fresh_table_layout::<String, ()>(count)
+            .map_err(|error| context.hash_error(error))?
+            .layout
+        {
+            context.temporary_request(layout)?;
+        }
         let mut names = HashSet::new();
         let reserved = names.try_reserve(count);
         context.reserve_exit(reserved)?;

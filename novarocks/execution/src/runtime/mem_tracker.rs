@@ -18,6 +18,24 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+/// The original tracker's first crossed limit, without inferring a category
+/// from its diagnostic text. It owns no tracker or query lifetime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemTrackerLimitExceeded {
+    detail: String,
+}
+impl MemTrackerLimitExceeded {
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+impl std::fmt::Display for MemTrackerLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+impl std::error::Error for MemTrackerLimitExceeded {}
+
 /// Tracks a logically accounted byte buffer that can be transferred across trackers.
 ///
 /// This is used for non-Arrow allocations (e.g., serialized exchange payloads) where we
@@ -212,12 +230,22 @@ impl MemTracker {
     /// hide live memory. The owner must fail the operation and release the
     /// complete retained amount when the state is dropped.
     pub fn consume_and_check_limit(&self, bytes: i64) -> Result<(), String> {
-        self.consume_with_limit_projection(bytes, Self::limit_exceeded_detail)
+        self.consume_and_check_limit_typed(bytes)
+            .map_err(|cause| cause.detail)
     }
 
-    /// Typed allocation hosts need only the verdict. A refused reservation
-    /// must not allocate a diagnostic String before it can admit that backing.
-    /// Accounting and the first crossed limit share the original author.
+    /// The same accounting operation with its original typed limit cause.
+    /// Failed post-mutation accounting remains until the owner releases it;
+    /// prospective construction callers balance their unconstructed request.
+    pub fn consume_and_check_limit_typed(&self, bytes: i64) -> Result<(), MemTrackerLimitExceeded> {
+        self.consume_with_limit_projection(bytes, |tracker, current, limit| {
+            MemTrackerLimitExceeded {
+                detail: tracker.limit_exceeded_detail(current, limit),
+            }
+        })
+    }
+
+    /// The original accounting verdict without constructing an unadmitted diagnostic.
     pub(crate) fn consume_and_check_limit_nominal(&self, bytes: i64) -> Result<(), ()> {
         self.consume_with_limit_projection(bytes, |_, _, _| ())
     }
@@ -277,6 +305,16 @@ impl MemTracker {
         destination: &Arc<Self>,
         bytes: i64,
     ) -> Result<(), String> {
+        Self::try_transfer_charge_typed(source, destination, bytes).map_err(|error| error.detail)
+    }
+
+    /// Preserve the nominal destination limit refusal through the same
+    /// transfer body and its original rollback/source ownership law.
+    pub fn try_transfer_charge_typed(
+        source: &Arc<Self>,
+        destination: &Arc<Self>,
+        bytes: i64,
+    ) -> Result<(), MemTrackerLimitExceeded> {
         if bytes <= 0 || Arc::ptr_eq(source, destination) {
             return Ok(());
         }
@@ -298,7 +336,7 @@ impl MemTracker {
 
         let mut reserved: Vec<Arc<MemTracker>> = Vec::with_capacity(destination_shared);
         for tracker in &destination_path[..destination_shared] {
-            if let Err(error) = tracker.try_consume_local(bytes) {
+            if let Err(error) = tracker.try_consume_local_typed(bytes) {
                 for tracker in reserved.into_iter().rev() {
                     tracker.release_local(bytes);
                 }
@@ -312,13 +350,15 @@ impl MemTracker {
         Ok(())
     }
 
-    fn try_consume_local(&self, bytes: i64) -> Result<(), String> {
+    fn try_consume_local_typed(&self, bytes: i64) -> Result<(), MemTrackerLimitExceeded> {
         let limit = self.limit();
         let mut current = self.current.load(Ordering::Acquire);
         loop {
             let next = current.saturating_add(bytes);
             if limit > 0 && next > limit {
-                return Err(self.limit_exceeded_detail(next, limit));
+                return Err(MemTrackerLimitExceeded {
+                    detail: self.limit_exceeded_detail(next, limit),
+                });
             }
             match self.current.compare_exchange_weak(
                 current,
@@ -666,7 +706,11 @@ mod tests {
         destination.install_limit_once(4).unwrap();
         source.consume_and_check_limit(8).unwrap();
 
-        assert!(MemTracker::try_transfer_charge(&source, &destination, 8).is_err());
+        let error = MemTracker::try_transfer_charge_typed(&source, &destination, 8).unwrap_err();
+        assert_eq!(
+            error.detail(),
+            "ResourceExhausted: memory limit exceeded for tracker destination: current 8 bytes, limit 4 bytes"
+        );
         assert_eq!(source.current(), 8);
         assert_eq!(destination.current(), 0);
         assert_eq!(query.current(), 8);

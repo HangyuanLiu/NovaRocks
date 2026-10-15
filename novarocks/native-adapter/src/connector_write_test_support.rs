@@ -25,9 +25,10 @@
 use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::DataType;
 use bytes::Bytes;
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::connector_common::encode_connector_payload_message;
-use novarocks_proto_codec::{FieldPath, arrow_physical};
 use novarocks_proto_models::connector_write as write_dto;
 use novarocks_proto_models::{catalog as catalog_dto, plan};
 use novarocks_spi::connector::write_stack::{
@@ -368,35 +369,86 @@ pub fn table_writer_payload(
 }
 
 pub fn writer_multiplex_schema(schema: &WriterMultiplexSchema) -> plan::WriterMultiplexSchema {
-    let slot_ids = schema.slot_ids();
-    let (columns, schema_metadata) = arrow_physical::encode_schema(
-        schema.arrow_schema().as_ref(),
-        &slot_ids,
-        true,
-        FieldPath::root("writer_multiplex_schema"),
-    )
-    .expect("fixture relation schema");
+    use arrow::datatypes::DataType;
+    use novarocks_type_contract::FunctionValueType as V;
+    // The fixed prefix is independently declared by the writer relation contract.
+    let mut fields = schema
+        .arrow_schema()
+        .fields()
+        .iter()
+        .zip(schema.slot_ids())
+        .zip([
+            (DataType::Int8, false),
+            (DataType::Int32, false),
+            (DataType::Int64, true),
+            (DataType::Binary, true),
+        ])
+        .map(|((field, slot), (ty, nullable))| (slot, field.name().as_str(), V::new(ty, nullable)))
+        .collect::<Vec<_>>();
+    fields.extend(schema.auxiliary_channels().iter().map(|channel| {
+        (
+            channel.slot_id(),
+            channel.name(),
+            channel.value_type().clone(),
+        )
+    }));
+    let (columns, logical_types) = relation_fields(&fields);
     plan::WriterMultiplexSchema {
         contract_version: schema.contract_version(),
         columns,
-        schema_metadata,
+        logical_types,
     }
 }
 
 pub fn root_result_schema(schema: &RootWriteResultSchema) -> plan::RootWriteResultSchema {
-    let slot_ids = schema.slot_ids();
-    let arrow_schema = schema.arrow_schema();
-    let (columns, schema_metadata) = arrow_physical::encode_schema(
-        arrow_schema.as_ref(),
-        &slot_ids,
-        true,
-        FieldPath::root("root_result_schema"),
-    )
-    .expect("fixture relation schema");
+    use novarocks_type_contract::FunctionValueType as V;
+    let source = schema;
+    let schema = source.arrow_schema();
+    let types = vec![
+        (DataType::Int8, false),
+        (DataType::Int32, true),
+        (DataType::Int64, true),
+        (DataType::Binary, true),
+        (
+            DataType::List(Arc::new(arrow::datatypes::Field::new(
+                "item",
+                DataType::Int32,
+                false,
+            ))),
+            true,
+        ),
+        (DataType::Utf8, true),
+        (DataType::Binary, true),
+        (
+            DataType::Map(
+                Arc::new(arrow::datatypes::Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            arrow::datatypes::Field::new("key", DataType::Utf8, false),
+                            arrow::datatypes::Field::new("value", DataType::Utf8, false),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            true,
+        ),
+    ];
+    let fields = schema
+        .fields()
+        .iter()
+        .zip(source.slot_ids())
+        .zip(types)
+        .map(|((field, slot), (ty, nullable))| (slot, field.name().as_str(), V::new(ty, nullable)))
+        .collect::<Vec<_>>();
+    let (columns, logical_types) = relation_fields(&fields);
     plan::RootWriteResultSchema {
-        contract_version: schema.contract_version(),
+        contract_version: source.contract_version(),
         columns,
-        schema_metadata,
+        logical_types,
     }
 }
 
@@ -444,4 +496,64 @@ pub fn finish_node(
             },
         )),
     }
+}
+
+pub(crate) fn relation_fields(
+    fields: &[(u32, &str, novarocks_type_contract::FunctionValueType)],
+) -> (
+    Vec<plan::ArrowPhysicalColumn>,
+    Vec<novarocks_proto_models::value_type::LogicalTypeDefinition>,
+) {
+    use novarocks_plan_codec::execution_type_table::{
+        ExecutionTypeRoot, ExecutionTypeTableBuilder, ExecutionTypeTableLimits,
+    };
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(
+            &self,
+            _: CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+    let roots = fields
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (_, _, ty))| ExecutionTypeRoot {
+            id: ordinal as u32,
+            value: ty,
+        })
+        .collect::<Vec<_>>();
+    let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Encode).unwrap();
+    let table = ExecutionTypeTableBuilder::new(&roots)
+        .encode_observed::<std::convert::Infallible>(
+            ExecutionTypeTableLimits::for_validated_root_count(roots.len()).unwrap(),
+            &mut |_| {
+                Control
+                    .checkpoint(CompilePhase::Encode, 0)
+                    .map_err(Into::into)
+            },
+            &mut work,
+        )
+        .unwrap()
+        .into_wire();
+    let columns = fields
+        .iter()
+        .zip(table.value_bindings)
+        .map(|((slot, name, ty), binding)| plan::ArrowPhysicalColumn {
+            slot_id: *slot,
+            is_internal: true,
+            field: Some(plan::ArrowPhysicalField {
+                name: (*name).into(),
+                nullable: ty.nullable(),
+                r#type: binding.value_layout.map(Box::new),
+
+                logical_type_id: binding.logical_type_id,
+            }),
+        })
+        .collect();
+    work.finish().unwrap();
+    (columns, table.logical_types)
 }

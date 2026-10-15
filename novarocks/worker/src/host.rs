@@ -39,7 +39,7 @@ use crate::root_result_channel::RootResultChannel;
 /// Pending keeps its synchronous continuation and preparation charges on that
 /// same worker. This capability lends no account, grant, scope or runtime.
 pub struct PreparationControlLoan<'a> {
-    cell: &'a crate::task_registry_entry::CreationCell,
+    state: &'a crate::task_registry_entry::CreationControlState,
     cadence: std::time::Duration,
 }
 impl<'a> PreparationControlLoan<'a> {
@@ -47,18 +47,25 @@ impl<'a> PreparationControlLoan<'a> {
         cell: &'a crate::task_registry_entry::CreationCell,
         cadence: std::time::Duration,
     ) -> Self {
-        Self { cell, cadence }
+        Self {
+            state: cell.control_state(),
+            cadence,
+        }
+    }
+    pub(crate) fn from_view(view: &'a crate::TaskPreparationStopView) -> Self {
+        let (state, cadence) = view.control();
+        Self { state, cadence }
     }
     pub fn checkpoint(&self) -> Result<(), crate::PreparationStop> {
-        match self.cell.stop() {
+        match self.state.stop() {
             Some(stop) => Err(stop),
             None => Ok(()),
         }
     }
-    /// Return after the explicit worker cadence, a spurious wake, or an original stop. The
-    /// caller requalifies its original request OUTSIDE the decision lock.
+    /// Return after the explicit worker cadence, a spurious wake, or an original stop.
+    /// The caller requalifies its original request outside the decision lock.
     pub fn wait(&self) -> Result<(), crate::PreparationStop> {
-        self.cell.wait_preparation(self.cadence)
+        self.state.wait(self.cadence)
     }
 }
 
@@ -83,6 +90,9 @@ impl TestPreparationControl {
     }
     pub fn loan(&self) -> PreparationControlLoan<'_> {
         PreparationControlLoan::new(&self.cell, self.cadence)
+    }
+    pub fn stop_view(&self) -> crate::TaskPreparationStopView {
+        self.cell.preparation_stop_view(self.cadence)
     }
     pub fn stop(&self, stop: crate::PreparationStop) -> bool {
         self.cell.request_stop(stop)
@@ -426,7 +436,7 @@ pub trait TaskExecutionHost: Send + Sync {
         &self,
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
-        _preparation: &crate::PreparationControlLoan<'_>,
+        preparation_stop: crate::TaskPreparationStopView,
     ) -> Result<PreparedTaskInstallation, HostRejection>;
 
     fn remove_receiver(&self, descriptor: &TaskDescriptor);

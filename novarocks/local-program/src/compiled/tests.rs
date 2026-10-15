@@ -61,7 +61,16 @@ fn checked_with(writer: bool, sink: bool, legacy: bool, nullable: bool) -> Progr
         DataType::Int64,
         nullable,
     )]));
-    let layout = StaticLayout::try_new(schema.clone(), Arc::from([SlotId::new(1)])).unwrap();
+    let value_type = FunctionValueType::new(DataType::Int64, nullable);
+    let layout = StaticLayout::try_new_typed_for_compile(
+        schema.clone(),
+        Arc::from([SlotId::new(1)]),
+        vec![(value_type.typed_binding().clone(), None)],
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        |_| Ok(()),
+        &control,
+    )
+    .unwrap();
     let values = StaticValues::try_new(
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7]))]).unwrap(),
         layout.clone(),
@@ -107,6 +116,7 @@ fn checked_with(writer: bool, sink: bool, legacy: bool, nullable: bool) -> Progr
                 },
                 writer_multiplex_layout: layout.clone(),
                 partial_aggregates: vec![],
+                partial_preparation: None,
             },
         ));
     }
@@ -285,10 +295,21 @@ fn recipe(field: Field) -> ConnectorWriteRecipe {
         binding,
         payload,
         ConnectorWriteInputShape::Data {
-            fields: vec![ConnectorWriteFieldBinding::new(
-                ConnectorWriteFieldToken::from_bytes([1; 32]),
-                field,
-            )],
+            fields: vec![{
+                // These fixtures declare Plain signed integers explicitly.
+                assert!(matches!(
+                    field.data_type(),
+                    DataType::Int32 | DataType::Int64
+                ));
+                let value_type =
+                    FunctionValueType::new(field.data_type().clone(), field.is_nullable());
+                ConnectorWriteFieldBinding::try_new_typed(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    field,
+                    value_type,
+                )
+                .unwrap()
+            }],
         },
     )
     .unwrap();

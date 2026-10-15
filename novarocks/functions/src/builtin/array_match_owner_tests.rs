@@ -101,7 +101,10 @@ fn instance(name: &str, a: &ArrayRef) -> ScalarEvaluationInstance {
     ScalarEvaluationInstance::instantiate(
         prepared_for_test_with_control(
             name,
-            &[FunctionValueType::new(a.data_type().clone(), true)],
+            &[FunctionValueType::from_legacy_declared_projection(
+                a.data_type().clone(),
+                true,
+            )],
             DecimalOverflowPolicy::OutputNull,
             crate::binding_test_control(),
         )
@@ -153,7 +156,7 @@ fn array_match_selected_source_origin_root_null_three_values_slice_empty_and_non
             .unwrap();
         assert!(result.errors().is_empty());
         assert_eq!(bools(result.values()), expected);
-        let ty = FunctionValueType::new(a.data_type().clone(), true);
+        let ty = FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true);
         let pool = ConstantPool::try_new(
             Arc::new(ty.try_to_field("pool-source").unwrap()),
             ty,
@@ -222,13 +225,19 @@ fn array_match_selected_original_string_safe_nulls_and_exact_child_metadata() {
         );
         let prepared = prepared_for_test_with_policy(
             name,
-            &[FunctionValueType::new(a.data_type().clone(), true)],
+            &[FunctionValueType::from_legacy_declared_projection(
+                a.data_type().clone(),
+                true,
+            )],
             DecimalOverflowPolicy::ReportError,
         )
         .unwrap();
         assert_eq!(
             prepared.contract().selected().argument_types[0],
-            FunctionArgumentType::Value(FunctionValueType::new(a.data_type().clone(), true))
+            FunctionArgumentType::Value(FunctionValueType::from_legacy_declared_projection(
+                a.data_type().clone(),
+                true
+            ))
         );
         // Binding authored this canonical field. A changed already-evaluated
         // field is rejected rather than silently retagged by the kernel.
@@ -321,7 +330,7 @@ fn array_match_compile_callbacks_preserve_primary_causes_on_success_and_rejectio
     for name in ["all_match", "any_match"] {
         for (source, succeeds) in [
             (
-                FunctionValueType::new(
+                FunctionValueType::from_legacy_declared_projection(
                     DataType::List(Arc::new(Field::new("item", DataType::Boolean, true))),
                     true,
                 ),

@@ -19,8 +19,9 @@
 use super::borrowed_value_footprint::Failure;
 use super::recipe::SkeletonEvidence;
 use super::skeleton_shape::{self as shape, Expression as E, Factor};
-use super::type_footprint::exact_field_type_heap;
+use super::type_footprint::exact_type_heap;
 use arrow::datatypes::Field;
+use novarocks_type_contract::FunctionValueType;
 type Result<T> = std::result::Result<T, Failure>;
 fn add(a: u64, b: u64) -> Result<u64> {
     a.checked_add(b).ok_or(Failure::ResourceExhausted)
@@ -28,13 +29,30 @@ fn add(a: u64, b: u64) -> Result<u64> {
 
 pub struct AppendColumn<'a> {
     pub writer: &'a Field,
-    pub signed_selection: &'a Field,
+    pub writer_type: &'a FunctionValueType,
+    pub signed_selection_type: &'a FunctionValueType,
 }
 pub fn append(
     rows: u64,
     columns: &[AppendColumn<'_>],
     owned_target_metadata_upper: u64,
     construction_views_upper: u64,
+) -> Result<SkeletonEvidence> {
+    append_in(
+        rows,
+        columns,
+        owned_target_metadata_upper,
+        construction_views_upper,
+        false,
+    )
+}
+
+pub fn append_in(
+    rows: u64,
+    columns: &[AppendColumn<'_>],
+    owned_target_metadata_upper: u64,
+    construction_views_upper: u64,
+    materialized: bool,
 ) -> Result<SkeletonEvidence> {
     if rows == 0 || columns.is_empty() {
         return Err(Failure::OriginalSemantic("COW empty VALUES relation"));
@@ -45,22 +63,26 @@ pub fn append(
     for (ordinal, column) in columns.iter().enumerate() {
         let alias_len = shape::generated_value_alias_bytes(ordinal as u64);
         alias_bytes = add(alias_bytes, alias_len)?;
-        let expression = E::cast(
-            E::column("__nr_values".len() as u64, alias_len)?,
-            exact_field_type_heap(column.writer)?,
-        )?;
+        let value = E::column("__nr_values".len() as u64, alias_len)?;
+        let expression = if materialized {
+            value
+        } else {
+            E::cast(value, exact_type_heap(column.writer_type)?)?
+        };
         projection_heap = add(
             projection_heap,
             shape::item_heap(expression, column.writer.name().len() as u64)?,
         )?;
-        selected_type_heap = add(
-            selected_type_heap,
-            exact_field_type_heap(column.signed_selection)?,
-        )?;
+        if !materialized {
+            selected_type_heap = add(
+                selected_type_heap,
+                exact_type_heap(column.signed_selection_type)?,
+            )?;
+        }
     }
     // Zero cell sum means omit only row Expr storage, not row Vec headers.
     let from = Factor::derived_values(
-        rows,
+        if materialized { 0 } else { rows },
         0,
         "__nr_values".len() as u64,
         columns.len() as u64,
@@ -71,10 +93,14 @@ pub fn append(
         ast_owned: skeleton,
         clone_owned_upper: skeleton,
         owned_target_metadata_upper,
-        rows,
+        rows: if materialized { 0 } else { rows },
         width: columns.len() as u64,
-        selection_cast_width: columns.len() as u64,
-        one_row_selection_cast_type_heap: selected_type_heap,
+        selection_cast_width: if materialized {
+            0
+        } else {
+            columns.len() as u64
+        },
+        one_row_selection_cast_type_heap: if materialized { 0 } else { selected_type_heap },
         // Original usize decimal alias formatting: 7 prefix + at most 20
         // digits on the frozen 64-bit target, coexisting with its final Ident.
         constructor_transient_upper: add(
@@ -92,6 +118,7 @@ pub enum RewriteValue {
 }
 pub struct RewriteWriter<'a> {
     pub writer: &'a Field,
+    pub writer_type: &'a FunctionValueType,
     pub original_scan_field: &'a Field,
     pub value: RewriteValue,
 }
@@ -102,8 +129,7 @@ pub struct MatchKey<'a> {
 
 pub struct Rewrite<'a> {
     pub rows: u64,
-    pub original_values_fields: &'a [&'a Field],
-    pub signed_effect_field: &'a Field,
+    pub original_values_types: &'a [&'a FunctionValueType],
     pub writers: &'a [RewriteWriter<'a>],
     pub original_match_keys: &'a [MatchKey<'a>],
     pub frozen_catalog: &'a str,
@@ -114,6 +140,9 @@ pub struct Rewrite<'a> {
 }
 
 pub fn rewrite(spec: Rewrite<'_>) -> Result<SkeletonEvidence> {
+    rewrite_in(spec, false)
+}
+pub fn rewrite_in(spec: Rewrite<'_>, materialized: bool) -> Result<SkeletonEvidence> {
     if spec.rows == 0 {
         return Err(Failure::OriginalSemantic("COW empty VALUES relation"));
     }
@@ -147,7 +176,11 @@ pub fn rewrite(spec: Rewrite<'_>) -> Result<SkeletonEvidence> {
             )?,
             RewriteValue::InheritWrittenVersion => E::case(matched()?, E::literal(0)?, scan)?,
         };
-        let cast = E::cast(value, exact_field_type_heap(column.writer)?)?;
+        let cast = if materialized {
+            value
+        } else {
+            E::cast(value, exact_type_heap(column.writer_type)?)?
+        };
         projection_heap = add(
             projection_heap,
             shape::item_heap(cast, column.writer.name().len() as u64)?,
@@ -181,18 +214,25 @@ pub fn rewrite(spec: Rewrite<'_>) -> Result<SkeletonEvidence> {
         E::literal(delete_len)?
     };
     let where_clause = E::binary(E::is_null(effect()?)?, E::binary(effect()?, delete_shape)?)?;
-    let mut selected_type_heap = exact_field_type_heap(spec.signed_effect_field)?;
+    let mut selected_type_heap = super::type_footprint::effect_type_heap()?;
     let mut alias_bytes = add("__nr_matched".len() as u64, "__nr_effect".len() as u64)?;
-    for (ordinal, field) in spec.original_values_fields.iter().enumerate() {
-        selected_type_heap = add(selected_type_heap, exact_field_type_heap(field)?)?;
+    for (ordinal, field) in spec.original_values_types.iter().enumerate() {
+        if !materialized {
+            selected_type_heap = add(selected_type_heap, exact_type_heap(field)?)?;
+        }
         alias_bytes = add(
             alias_bytes,
             shape::generated_value_alias_bytes(ordinal as u64),
         )?;
     }
-    let width = add(spec.original_values_fields.len() as u64, 2)?;
-    let values =
-        Factor::derived_values(spec.rows, 0, "__nr_match".len() as u64, width, alias_bytes)?;
+    let width = add(spec.original_values_types.len() as u64, 2)?;
+    let values = Factor::derived_values(
+        if materialized { 0 } else { spec.rows },
+        0,
+        "__nr_match".len() as u64,
+        width,
+        alias_bytes,
+    )?;
     let scan = Factor::table(
         spec.frozen_catalog.len() as u64,
         spec.frozen_namespace.len() as u64,
@@ -213,14 +253,14 @@ pub fn rewrite(spec: Rewrite<'_>) -> Result<SkeletonEvidence> {
         ast_owned: skeleton,
         clone_owned_upper: skeleton,
         owned_target_metadata_upper: spec.owned_target_metadata_upper,
-        rows: spec.rows,
+        rows: if materialized { 0 } else { spec.rows },
         width,
-        selection_cast_width: width - 1,
-        one_row_selection_cast_type_heap: selected_type_heap,
+        selection_cast_width: if materialized { 0 } else { width - 1 },
+        one_row_selection_cast_type_heap: if materialized { 0 } else { selected_type_heap },
         constructor_transient_upper: add(
             add(
                 spec.construction_views_upper,
-                (spec.original_values_fields.len() as u64)
+                (spec.original_values_types.len() as u64)
                     .checked_mul(std::mem::size_of::<
                         novarocks_spi::connector::ConnectorWriteFieldToken,
                     >() as u64)

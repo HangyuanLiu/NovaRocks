@@ -284,7 +284,7 @@ fn workflow<H>(
     Ok((
         record.id,
         record.value_type_id,
-        record.field_id,
+        record.source_field_id,
         record.compression,
         record.arrow_ipc,
     ))
@@ -308,7 +308,7 @@ fn original(pool: &ConstantPool) -> Receipt {
     (
         record.id,
         record.value_type_id,
-        record.field_id,
+        record.source_field_id,
         record.compression,
         record.arrow_ipc,
     )

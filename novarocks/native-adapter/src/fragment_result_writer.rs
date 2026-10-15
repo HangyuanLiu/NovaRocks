@@ -5,7 +5,7 @@ use novarocks_execution::runtime::exchange;
 use novarocks_execution::runtime::fragment::io::{
     FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, FragmentResultSession,
     FragmentResultWriter, ResultAbort, ResultPresentation, ResultWriteAdmission, ResultWriteCredit,
-    ResultWriteSpec,
+    ResultWriteFailure, ResultWriteSpec,
 };
 use novarocks_execution::runtime::observable::Observable;
 use novarocks_worker::result_buffer::{
@@ -138,7 +138,9 @@ impl FragmentResultSession for NativeFragmentResultSession {
         &self,
         chunk: novarocks_execution::exec::chunk::Chunk,
         credit: ResultWriteCredit,
-    ) -> Result<(), FragmentIoError> {
+        factory: &dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
+        control: &dyn novarocks_functions::KernelEvaluationControl,
+    ) -> Result<(), ResultWriteFailure> {
         if chunk.is_empty() {
             return Ok(());
         }
@@ -156,16 +158,18 @@ impl FragmentResultSession for NativeFragmentResultSession {
                     ),
                 )
             })?;
-        let encoded =
-            exchange::encode_chunks_bounded(&[chunk], true, encoded_byte_cap).map_err(|error| {
-                    FragmentIoError::new(
-                        FragmentIoOperation::ResultWrite,
-                        FragmentIoErrorKind::Unavailable,
-                        format!(
-                            "typed result exceeds joint retained-byte cap: Arrow input retained {arrow_retained_bytes} bytes and encoded capacity is {encoded_byte_cap} bytes: {error}"
-                        ),
-                    )
-                })?;
+        let encoded = exchange::encode_chunks_bounded_with_creation(
+            &[chunk], true, encoded_byte_cap, factory, control,
+        ).map_err(|error| match error {
+            exchange::ExchangeEncodeFailure::Wire(error) => ResultWriteFailure::Io(FragmentIoError::new(
+                FragmentIoOperation::ResultWrite,
+                FragmentIoErrorKind::Unavailable,
+                format!(
+                    "typed result exceeds joint retained-byte cap: Arrow input retained {arrow_retained_bytes} bytes and encoded capacity is {encoded_byte_cap} bytes: {error}"
+                ),
+            )),
+            exchange::ExchangeEncodeFailure::Execution(error) => ResultWriteFailure::Execution(error),
+        })?;
         self.handle
             .write_typed_with_credit(encoded, credit)
             .map(|_| ())
@@ -175,6 +179,7 @@ impl FragmentResultSession for NativeFragmentResultSession {
                     FragmentIoErrorKind::Internal,
                     error,
                 )
+                .into()
             })
     }
 
@@ -232,20 +237,49 @@ mod tests {
     }
 
     fn typed_chunk() -> Chunk {
-        let schema = Arc::new(
-            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
-                SlotId::new(1),
-                Field::new("value", DataType::Int32, false),
-                None,
-                None,
-            )])
-            .expect("test schema"),
-        );
-        Chunk::try_new_with_columns(
+        use novarocks_type_contract::{
+            TypedValueBinding, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+        };
+        let pure = ValueTypeStorageLifetime::pure();
+        let binding = TypedValueBinding::try_new(
+            ValueTypeRef::try_new(ValueKind::Scalar(DataType::Int32), false, pure.clone()).unwrap(),
+            ValueLayout::try_new(&DataType::Int32, pure.clone()).unwrap(),
+        )
+        .unwrap();
+        let slot = ChunkSlotSchema::try_new_typed(
+            SlotId::new(1),
+            Arc::new(Field::new("value", DataType::Int32, false)),
+            binding,
+            None,
+            pure.clone(),
+        )
+        .unwrap();
+        let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap());
+        Chunk::try_new_typed_with_columns_observed::<String, _>(
             schema,
             vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+            1,
+            |_| Ok(()),
         )
-        .expect("test chunk")
+        .unwrap()
+    }
+
+    struct ResultTestControl;
+    impl novarocks_functions::KernelEvaluationControl for ResultTestControl {
+        fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+            Ok(())
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), novarocks_functions::KernelFailure> {
+            panic!("IPC construction does not wait");
+        }
+    }
+    fn actual_result_factory()
+    -> Arc<dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory> {
+        novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            novarocks_execution::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            novarocks_execution::runtime::mem_tracker::MemTracker::new_root("native result fixture"),
+            Arc::new(novarocks_execution::runtime::runtime_state::RuntimeErrorState::default()),
+        ).unwrap()
     }
 
     #[test]
@@ -283,10 +317,15 @@ mod tests {
     #[test]
     fn typed_result_joint_cap_counts_arrow_and_encoded_backings() {
         let arrow_retained = typed_chunk().logical_bytes();
-        let required_encoded_bytes =
-            exchange::encode_chunks_bounded(&[typed_chunk()], true, 1024 * 1024)
-                .expect("measure bounded result payload")
-                .len();
+        let required_encoded_bytes = exchange::encode_chunks_bounded_with_creation(
+            &[typed_chunk()],
+            true,
+            1024 * 1024,
+            actual_result_factory().as_ref(),
+            &ResultTestControl,
+        )
+        .expect("measure bounded result payload")
+        .len();
         let joint_cap = arrow_retained
             .checked_add(required_encoded_bytes)
             .expect("joint cap fits usize");
@@ -314,8 +353,16 @@ mod tests {
         };
 
         let error = session
-            .write_with_credit(typed_chunk(), credit)
+            .write_with_credit(
+                typed_chunk(),
+                credit,
+                actual_result_factory().as_ref(),
+                &ResultTestControl,
+            )
             .expect_err("Arrow plus encoded backing must not exceed the joint cap");
+        let ResultWriteFailure::Io(error) = error else {
+            panic!("joint cap refusal must retain its original I/O cause");
+        };
         assert_eq!(error.kind(), FragmentIoErrorKind::Unavailable);
         assert!(error.to_string().contains("joint retained-byte cap"));
         session.abort(ResultAbort::NeverStarted);
@@ -327,5 +374,325 @@ mod tests {
         assert!(!publishes_terminal(ResultPublication::DataReady));
         assert!(!publishes_terminal(ResultPublication::Removed));
         assert!(!publishes_terminal(ResultPublication::NoChange));
+    }
+    mod bounded_root_creator_tests {
+        use super::*;
+        use novarocks_execution::exec::chunk::{
+            ArrayNormalizationStep, ArrayPathStep, ChunkSchema,
+        };
+        use novarocks_execution::exec::pipeline::operator::{
+            ConstructionFailure, InputConstructionFactory, InputConstructionOwner,
+        };
+        use novarocks_execution::runtime::fragment::ExecutionFailureCause;
+        use novarocks_execution::runtime::mem_tracker::MemTracker;
+        use novarocks_type_contract::ValueTypeStorageLifetime;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct FirstHeaderRefusalFactory {
+            inner: Arc<dyn InputConstructionFactory>,
+            tracker: Arc<MemTracker>,
+            requests: Arc<AtomicUsize>,
+            refused: Arc<AtomicBool>,
+            tail: Arc<AtomicUsize>,
+        }
+        struct FirstHeaderRefusalOwner {
+            inner: Box<dyn InputConstructionOwner>,
+            tracker: Arc<MemTracker>,
+            requests: Arc<AtomicUsize>,
+            refused: Arc<AtomicBool>,
+            tail: Arc<AtomicUsize>,
+        }
+        impl FirstHeaderRefusalOwner {
+            fn before(&self) {
+                if self.refused.load(Ordering::SeqCst) {
+                    self.tail.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        impl InputConstructionOwner for FirstHeaderRefusalOwner {
+            fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+                self.inner.storage_lifetime()
+            }
+            fn request(&self, layout: std::alloc::Layout) -> Result<(), ConstructionFailure> {
+                self.before();
+                if self.requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.tracker
+                        .install_limit_once(self.tracker.current() + 1)
+                        .unwrap();
+                }
+                let result = self.inner.request(layout);
+                if result.is_err() {
+                    self.refused.store(true, Ordering::SeqCst);
+                }
+                result
+            }
+            fn observe_opaque_upper_bound(&self, bytes: usize) -> Result<(), ConstructionFailure> {
+                self.before();
+                self.inner.observe_opaque_upper_bound(bytes)
+            }
+            fn observe(
+                &self,
+                occurrence: usize,
+                path: &[ArrayPathStep],
+                step: ArrayNormalizationStep<'_>,
+            ) -> Result<(), ConstructionFailure> {
+                self.before();
+                self.inner.observe(occurrence, path, step)
+            }
+        }
+        impl InputConstructionFactory for FirstHeaderRefusalFactory {
+            fn observe_input_work(&self, units: usize) -> Result<(), ConstructionFailure> {
+                self.inner.observe_input_work(units)
+            }
+            fn begin_typed_construction(
+                &self,
+                schema: &ChunkSchema,
+            ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
+                Ok(Box::new(FirstHeaderRefusalOwner {
+                    inner: self.inner.begin_typed_construction(schema)?,
+                    tracker: self.tracker.clone(),
+                    requests: self.requests.clone(),
+                    refused: self.refused.clone(),
+                    tail: self.tail.clone(),
+                }))
+            }
+            fn begin_compiled_layout_construction(
+                &self,
+                layout: &novarocks_local_program::StaticLayout,
+            ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
+                self.inner.begin_compiled_layout_construction(layout)
+            }
+        }
+        fn open(
+            seed: u32,
+            budget: Arc<ResultRetainedBudget>,
+            cap: NonZeroUsize,
+        ) -> (TaskIdentity, Arc<dyn FragmentResultSession>) {
+            let identity = task_identity(seed);
+            let session = native_result_writer(budget, cap)
+                .open(
+                    ResultWriteSpec::new(
+                        UniqueId::new(i64::from(seed), 1),
+                        ResultPresentation::MysqlText,
+                        None,
+                        true,
+                    )
+                    .with_task_identity(identity),
+                )
+                .unwrap();
+            (identity, session)
+        }
+        async fn assert_no_publication(identity: TaskIdentity) {
+            assert!(matches!(
+                novarocks_worker::result_buffer::wait_fetch_task_typed(
+                    identity,
+                    None,
+                    std::time::Duration::ZERO,
+                    novarocks_execution_contract::ResultByteLimit::new(1024 * 1024).unwrap(),
+                )
+                .await,
+                novarocks_worker::result_buffer::TryFetchTypedResult::NotReady
+            ));
+        }
+        #[tokio::test]
+        async fn native_bounded_result_first_real_header_refusal_keeps_cause_credit_and_no_tail() {
+            let cap = NonZeroUsize::new(1024 * 1024).unwrap();
+            let budget = ResultRetainedBudget::new(cap);
+            let (identity, session) = open(1801, budget.clone(), cap);
+            let tracker = MemTracker::new_root("native bounded header refusal");
+            let inner = novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                novarocks_execution::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                tracker.clone(), Arc::new(novarocks_execution::runtime::runtime_state::RuntimeErrorState::default()),
+            ).unwrap();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let tail = Arc::new(AtomicUsize::new(0));
+            let factory = FirstHeaderRefusalFactory {
+                inner,
+                tracker: tracker.clone(),
+                requests: requests.clone(),
+                refused: Arc::new(AtomicBool::new(false)),
+                tail: tail.clone(),
+            };
+            let baseline = tracker.current();
+            let input = typed_chunk();
+            let ResultWriteAdmission::Granted(credit) = session
+                .try_acquire(session.reservation_bytes(&input).unwrap())
+                .unwrap()
+            else {
+                panic!("fresh stream has its original credit");
+            };
+            let error = session
+                .write_with_credit(input.clone(), credit, &factory, &ResultTestControl)
+                .unwrap_err();
+            let ResultWriteFailure::Execution(error) = error else {
+                panic!("actual creator refusal must remain nominal");
+            };
+            assert!(matches!(
+                error.cause(),
+                ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
+            ));
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            assert_eq!(tail.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                tracker.current(),
+                baseline,
+                "failed temporary writer scope is rolled back"
+            );
+            assert_no_publication(identity).await;
+            let ResultWriteAdmission::Granted(returned) =
+                budget.try_reserve_process(cap.get()).unwrap()
+            else {
+                panic!("failed write must return its entire original result credit");
+            };
+            drop(returned);
+            assert_eq!(
+                input.columns()[0]
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                1
+            );
+            session.abort(ResultAbort::NeverStarted);
+            drop(factory);
+            assert_eq!(tracker.current(), 0);
+        }
+        struct CancelControl(AtomicUsize);
+        impl novarocks_functions::KernelEvaluationControl for CancelControl {
+            fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(novarocks_functions::KernelFailure::Cancelled)
+            }
+            fn wait(
+                &self,
+                _: std::time::Duration,
+            ) -> Result<(), novarocks_functions::KernelFailure> {
+                panic!("writer does not wait");
+            }
+        }
+        #[tokio::test]
+        async fn native_bounded_result_original_control_refusal_is_not_io_or_publication() {
+            let cap = NonZeroUsize::new(1024 * 1024).unwrap();
+            let budget = ResultRetainedBudget::new(cap);
+            let (identity, session) = open(1802, budget.clone(), cap);
+            let factory = actual_result_factory();
+            let control = CancelControl(AtomicUsize::new(0));
+            let input = typed_chunk();
+            let ResultWriteAdmission::Granted(credit) = session
+                .try_acquire(session.reservation_bytes(&input).unwrap())
+                .unwrap()
+            else {
+                panic!("fresh stream credit");
+            };
+            let error = session
+                .write_with_credit(input, credit, factory.as_ref(), &control)
+                .unwrap_err();
+            let ResultWriteFailure::Execution(error) = error else {
+                panic!("control cause must remain nominal");
+            };
+            assert!(matches!(
+                error.cause(),
+                ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::Cancelled)
+            ));
+            assert_eq!(control.0.load(Ordering::SeqCst), 1);
+            assert_no_publication(identity).await;
+            let ResultWriteAdmission::Granted(returned) =
+                budget.try_reserve_process(cap.get()).unwrap()
+            else {
+                panic!("cancelled write returns credit");
+            };
+            drop(returned);
+            session.abort(ResultAbort::NeverStarted);
+        }
+        struct OriginalCallerFactory {
+            inner: Arc<dyn InputConstructionFactory>,
+            original: novarocks_execution::runtime::fragment::ExecutionFailure,
+            requests: Arc<AtomicUsize>,
+        }
+        struct OriginalCallerOwner {
+            inner: Box<dyn InputConstructionOwner>,
+            original: novarocks_execution::runtime::fragment::ExecutionFailure,
+            requests: Arc<AtomicUsize>,
+        }
+        impl InputConstructionOwner for OriginalCallerOwner {
+            fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+                self.inner.storage_lifetime()
+            }
+            fn request(&self, _layout: std::alloc::Layout) -> Result<(), ConstructionFailure> {
+                self.requests.fetch_add(1, Ordering::SeqCst);
+                Err(ConstructionFailure::Caller(Box::new(self.original.clone())))
+            }
+            fn observe_opaque_upper_bound(&self, bytes: usize) -> Result<(), ConstructionFailure> {
+                self.inner.observe_opaque_upper_bound(bytes)
+            }
+            fn observe(
+                &self,
+                occurrence: usize,
+                path: &[ArrayPathStep],
+                step: ArrayNormalizationStep<'_>,
+            ) -> Result<(), ConstructionFailure> {
+                self.inner.observe(occurrence, path, step)
+            }
+        }
+        impl InputConstructionFactory for OriginalCallerFactory {
+            fn observe_input_work(&self, units: usize) -> Result<(), ConstructionFailure> {
+                self.inner.observe_input_work(units)
+            }
+            fn begin_typed_construction(
+                &self,
+                schema: &ChunkSchema,
+            ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
+                Ok(Box::new(OriginalCallerOwner {
+                    inner: self.inner.begin_typed_construction(schema)?,
+                    original: self.original.clone(),
+                    requests: self.requests.clone(),
+                }))
+            }
+            fn begin_compiled_layout_construction(
+                &self,
+                layout: &novarocks_local_program::StaticLayout,
+            ) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
+                self.inner.begin_compiled_layout_construction(layout)
+            }
+        }
+        #[tokio::test]
+        async fn native_bounded_result_original_pipeline_caller_is_not_wire_io() {
+            let cap = NonZeroUsize::new(1024 * 1024).unwrap();
+            let budget = ResultRetainedBudget::new(cap);
+            let (identity, session) = open(1803, budget.clone(), cap);
+            let original: novarocks_execution::runtime::fragment::ExecutionFailure =
+                "actual creator original pipeline refusal"
+                    .to_string()
+                    .into();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let factory = OriginalCallerFactory {
+                inner: actual_result_factory(),
+                original: original.clone(),
+                requests: requests.clone(),
+            };
+            let input = typed_chunk();
+            let ResultWriteAdmission::Granted(credit) = session
+                .try_acquire(session.reservation_bytes(&input).unwrap())
+                .unwrap()
+            else {
+                panic!("fresh result credit");
+            };
+            let error = session
+                .write_with_credit(input, credit, &factory, &ResultTestControl)
+                .unwrap_err();
+            let ResultWriteFailure::Execution(error) = error else {
+                panic!("creator Caller(Pipeline) must not be classified as Wire");
+            };
+            assert_eq!(error, original);
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            assert_no_publication(identity).await;
+            let ResultWriteAdmission::Granted(returned) =
+                budget.try_reserve_process(cap.get()).unwrap()
+            else {
+                panic!("original Caller refusal returns credit");
+            };
+            drop(returned);
+            session.abort(ResultAbort::NeverStarted);
+        }
     }
 }

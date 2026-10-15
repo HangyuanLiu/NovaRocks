@@ -180,7 +180,7 @@ impl ContractLoweringVisitor<'_> {
             let ty = self.value_declared_type(*value)?;
             if !comparator.supports_value_type(&ty)
                 || !novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
-                    .supports_partition_key(&ty.data_type)
+                    .supports_partition_key(ty.data_type())
             {
                 return Err(grouped_shape(
                     "GroupedStates TopN grouping key lacks NativeScalarOrderV1 comparison equivalence",

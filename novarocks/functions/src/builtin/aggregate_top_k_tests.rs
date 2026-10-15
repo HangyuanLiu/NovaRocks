@@ -166,7 +166,7 @@ fn kernel(types: &[DataType], phase: AggregateKernelPhase) -> TopKKernel {
     let args: Vec<_> = types
         .iter()
         .map(|ty| FunctionArgument::Value {
-            value_type: FunctionValueType::new(ty.clone(), true),
+            value_type: FunctionValueType::from_legacy_declared_projection(ty.clone(), true),
             constant: None,
         })
         .collect();

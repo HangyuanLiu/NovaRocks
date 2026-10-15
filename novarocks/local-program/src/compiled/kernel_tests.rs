@@ -141,7 +141,7 @@ fn final_program_borrows_actual_rng_kernel_and_isolates_fresh_instance_state() {
         panic!("RNG is scalar");
     };
     let result_type = result_type.clone();
-    assert_eq!(result_type.data_type, DataType::Float64);
+    assert_eq!(result_type.data_type(), &DataType::Float64);
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(0),
         domain: EvaluationDomainId::new(u32::MAX),

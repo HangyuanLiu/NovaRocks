@@ -39,6 +39,7 @@ use novarocks_sql::compiler::{
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
+    ValueTypeStorageLifetime,
 };
 use std::{
     collections::BTreeMap,
@@ -193,9 +194,9 @@ pub(super) fn frozen_reads_with_explicit_source_shape(
                 assert_eq!(provider_outputs[0].0, relation.schema()[0].column);
                 let field = &relation.schema()[0];
                 if !admit_required_inlist_shape {
-                    assert!(!field.ty.nullable);
+                    assert!(!field.ty.nullable());
                 }
-                let carrier = match field.ty.data_type {
+                let carrier = match field.ty.data_type() {
                     DataType::Int8 => ConnectorValueType::TinyInt,
                     DataType::Int16 => ConnectorValueType::SmallInt,
                     DataType::Int32 => ConnectorValueType::Integer,
@@ -242,15 +243,33 @@ pub(super) fn frozen_reads_with_explicit_source_shape(
                     Vec::new(),
                 )
                 .unwrap();
-                let public = ConnectorReadPublicFacts::try_new(
+                let storage = ValueTypeStorageLifetime::pure();
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "k",
+                    field.ty.data_type().clone(),
+                    field.ty.nullable(),
+                )]));
+                let execution = ConnectorReadExecutionSchema::try_new(
+                    schema.clone(),
+                    vec![field.ty.clone()].into_boxed_slice(),
+                    storage.clone(),
+                )
+                .unwrap();
+                let source_shape =
+                    ConnectorSourceSchemaShape::try_new(schema, storage.clone()).unwrap();
+                let source_schema = ConnectorSourceSchemaFacts::try_new(
+                    source_shape,
+                    std::collections::HashMap::new(),
+                    Box::new([]),
+                    storage,
+                )
+                .unwrap();
+                let public = ConnectorReadPublicFacts::try_new_typed_with_control(
                     facts,
                     None,
-                    if admit_required_inlist_shape {
-                        Schema::new(vec![field.ty.try_to_field("k").unwrap()])
-                    } else {
-                        Schema::new(vec![Field::new("k", field.ty.data_type.clone(), false)])
-                    },
-                    vec![field.ty.logical_type],
+                    &execution,
+                    &source_schema,
+                    &Control,
                 )
                 .unwrap();
                 assert!(
@@ -440,8 +459,9 @@ fn numeric_unary_owned_transaction_actual_sql_three_widths_frame_and_exchange_ke
             .unwrap()
             .unwrap();
         let computed = source.plan().result_port().unwrap();
-        assert!(!original.fields()[0].ty.nullable);
-        assert!(computed.fields[0].ty.nullable);
+        assert!(original.fields()[0].ty.nullable());
+        assert!(computed.fields[0].ty.nullable());
+        assert_eq!(original.fields()[0].ty, computed.fields[0].ty);
         assert_eq!(computed.output, original.original_port().output);
         assert_eq!(computed.fields[0].name, original.fields()[0].name);
         assert_eq!(computed.fields[0].alias, original.fields()[0].alias);
@@ -451,7 +471,7 @@ fn numeric_unary_owned_transaction_actual_sql_three_widths_frame_and_exchange_ke
                 assert!(
                     source.plan().fragments()[&edge.source.fragment].values()[&value]
                         .ty
-                        .nullable
+                        .nullable()
                 );
             }
         }
@@ -631,7 +651,7 @@ fn numeric_unary_owned_transaction_actual_aggregate_window_and_table_sources_pub
                     ..
                 } = &expr.kind
                 {
-                    assert!(expr.ty.nullable);
+                    assert!(expr.ty.nullable());
                 }
             }
         }

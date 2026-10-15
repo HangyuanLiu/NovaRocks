@@ -20,15 +20,49 @@
 use std::fmt;
 
 /// Why a fragment could not be recovered from its wire form.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct NativeFragmentIngressError {
     message: String,
+    construction: Option<crate::fragment_error::NativeTypeConstructionError>,
+    specialization: Option<novarocks_functions::FunctionSpecializationFailure>,
 }
 
 impl NativeFragmentIngressError {
+    pub(crate) fn from_decode(error: crate::fragment_error::NativeFragmentDecodeError) -> Self {
+        let message = error.to_string();
+        let (construction, specialization) = match error {
+            crate::fragment_error::NativeFragmentDecodeError::Construction(cause) => {
+                (Some(cause), None)
+            }
+            crate::fragment_error::NativeFragmentDecodeError::Specialization(cause) => {
+                (None, Some(cause))
+            }
+            _ => (None, None),
+        };
+        Self {
+            message,
+            construction,
+            specialization,
+        }
+    }
+
+    pub fn specialization_cause(
+        &self,
+    ) -> Option<&novarocks_functions::FunctionSpecializationFailure> {
+        self.specialization.as_ref()
+    }
+
+    pub fn construction_cause(
+        &self,
+    ) -> Option<&crate::fragment_error::NativeTypeConstructionError> {
+        self.construction.as_ref()
+    }
+
     pub fn new(error: impl fmt::Display) -> Self {
         Self {
             message: error.to_string(),
+            construction: None,
+            specialization: None,
         }
     }
 }

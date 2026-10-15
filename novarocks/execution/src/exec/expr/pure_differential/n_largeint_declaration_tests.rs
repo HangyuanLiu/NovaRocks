@@ -27,7 +27,13 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 fn value_type(value: &FunctionValueType) -> Value {
-    let carrier = match &value.data_type {
+    // The frozen pre-ADR declaration oracle describes the external projection.
+    // Runtime layouts stay metadata-free; this explicit legacy projection
+    // retains the original independent declaration oracle byte for byte.
+    let legacy = value
+        .try_to_legacy_field_projection("declaration-oracle")
+        .unwrap();
+    let carrier = match legacy.data_type() {
         DataType::List(item) => json!({
             "kind": "List",
             "item": {
@@ -39,7 +45,7 @@ fn value_type(value: &FunctionValueType) -> Value {
         }),
         other => json!({"kind": format!("{other:?}")}),
     };
-    json!({"carrier": carrier, "logical": format!("{:?}",value.logical_type), "nullable": value.nullable})
+    json!({"carrier": carrier, "logical": format!("{:?}",value.logical_type()), "nullable": value.nullable()})
 }
 
 fn declarations() -> Value {

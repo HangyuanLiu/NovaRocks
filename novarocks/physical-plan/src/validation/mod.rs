@@ -661,3 +661,43 @@ pub(crate) fn _assert_required_contract_is_copy(_: RequiredContracts) {}
 pub(crate) fn _assert_maps_are_deterministic(_: BTreeMap<FragmentId, Fragment>) {}
 
 pub use aggregate::aggregate_bindings_match_observed;
+
+/// Frozen executable transport/projection identity, with root NULL admission
+/// delegated to the association owner. Semantic overload identity is separate.
+fn value_bindings_match_ignoring_root_nullability(
+    left: &crate::ValueType,
+    right: &crate::ValueType,
+) -> bool {
+    left.same_value_domain(right) && left.typed_binding().layout() == right.typed_binding().layout()
+}
+
+/// Borrow a canonical primitive requirement without allocating a fake source
+/// FunctionValueType, semantic holder or layout projection for comparison.
+fn value_binding_is_primitive(
+    value: &crate::ValueType,
+    expected: &arrow_schema::DataType,
+    nullable: bool,
+) -> bool {
+    use arrow_schema::DataType;
+    use novarocks_type_contract::ValueKind;
+    value.nullable() == nullable
+        && value.data_type() == expected
+        && match value.value_type().kind() {
+            ValueKind::Scalar(actual) => actual == expected,
+            ValueKind::String => matches!(
+                expected,
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            ),
+            ValueKind::Binary => matches!(
+                expected,
+                DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+            ),
+            _ => false,
+        }
+}
+
+fn value_has_plain_string_map_semantics(value: &crate::ValueType) -> bool {
+    use novarocks_type_contract::ValueKind;
+    matches!(value.value_type().kind(),ValueKind::Map{key,value}
+        if matches!(key.kind(),ValueKind::String) && matches!(value.kind(),ValueKind::String))
+}

@@ -130,7 +130,7 @@ pub(crate) fn prepare_delete_statement(
          INSERT OVERWRITE t SELECT * FROM t WHERE FALSE"
             .to_string()
     })?;
-    validate_where(where_clause, &target_binding.dml_target_columns())?;
+    validate_where(where_clause, &target_binding.dml_target_columns()?)?;
     let where_sql = novarocks_parser::printer::print_expr(where_clause);
 
     // 4. Ask the provider to admit the row mutation. The physical strategy, the
@@ -288,7 +288,7 @@ fn prepare_delete_write(
             target,
             target_ref,
             novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
-            delete_input_request(deletion_vectors),
+            delete_input_request(deletion_vectors)?,
             novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
             novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
             connector_context.clone(),
@@ -397,22 +397,30 @@ fn build_delete_position_sink_query(
 /// admitted metadata, so SQL never reconstructs them.
 fn delete_input_request(
     deletion_vectors: bool,
-) -> novarocks_spi::connector::ConnectorWriteInputRequest {
+) -> Result<novarocks_spi::connector::ConnectorWriteInputRequest, String> {
     use novarocks_spi::connector::{ConnectorWriteFieldRequest, ConnectorWriteInputRequest};
 
     let identity_fields = vec![
-        ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
-            novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
-            DataType::Utf8,
-            false,
-        )),
-        ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
-            novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
-            DataType::Int64,
-            false,
-        )),
+        ConnectorWriteFieldRequest::try_new_typed(
+            arrow::datatypes::Field::new(
+                novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
+                DataType::Utf8,
+                false,
+            ),
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+        )
+        .map_err(|error| error.to_string())?,
+        ConnectorWriteFieldRequest::try_new_typed(
+            arrow::datatypes::Field::new(
+                novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
+                DataType::Int64,
+                false,
+            ),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        )
+        .map_err(|error| error.to_string())?,
     ];
-    if deletion_vectors {
+    Ok(if deletion_vectors {
         ConnectorWriteInputRequest::DeletionVector {
             identity_fields,
             partition_source_fields: Vec::new(),
@@ -422,7 +430,7 @@ fn delete_input_request(
             identity_fields,
             partition_source_fields: Vec::new(),
         }
-    }
+    })
 }
 
 fn write_input_columns(

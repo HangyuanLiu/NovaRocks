@@ -89,7 +89,7 @@ impl TestCatalog {
                                     std::sync::Arc::new(arrow::datatypes::Field::new(
                                         "key",
                                         arrow::datatypes::DataType::Int32,
-                                        true,
+                                        false,
                                     )),
                                     std::sync::Arc::new(arrow::datatypes::Field::new(
                                         "value",
@@ -398,7 +398,7 @@ fn planner_group_by_targets_ignore_aggregate_public_output_order() {
         aggregates: vec![AggregateCall {
             name: "count".to_string(),
             distinct: false,
-            result_type: DataType::Int64,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             output_column_id: ColumnId(30),
             source: crate::binding::AggregateArgumentSource::uncertified(
                 Vec::new(),
@@ -812,7 +812,7 @@ fn adapt_plan_output_allows_nullable_widening() {
         panic!("expected Project adapter");
     };
     assert_eq!(project.items.len(), 1);
-    assert!(project.items[0].expr.value_type.nullable);
+    assert!(project.items[0].expr.value_type.nullable());
     assert_eq!(project.items[0].output_column_id, target_id);
 }
 
@@ -1021,18 +1021,21 @@ fn computed_aggregate_in_predicate_preserves_projection_nullability() {
     }
     let indicator = find_indicator(&plan).expect("JOIN ON must retain its match indicator");
     assert!(
-        !indicator.expr.value_type.nullable,
+        !indicator.expr.value_type.nullable(),
         "the literal producer cannot emit NULL"
     );
     assert!(
-        factory.get(indicator.output_column_id).value_type.nullable,
+        factory
+            .get(indicator.output_column_id)
+            .value_type
+            .nullable(),
         "the outer-join symbol must remain nullable for non-matches"
     );
 
     let max_plan = plan_test_query("SELECT MAX(b) - 501 FROM t WHERE false");
     let (project, _) = root_project_over_aggregate(&max_plan);
     assert!(
-        project.items[0].expr.value_type.nullable,
+        project.items[0].expr.value_type.nullable(),
         "empty MAX must still admit NULL"
     );
 }
@@ -3074,8 +3077,11 @@ fn direct_where_apply(plan: &LogicalPlanNode) -> &LogicalApplyNode {
 }
 
 fn assert_same_column_ref_expr(actual: &TypedExpr, expected: &TypedExpr) {
-    assert_eq!(actual.value_type.data_type, expected.value_type.data_type);
-    assert_eq!(actual.value_type.nullable, expected.value_type.nullable);
+    assert_eq!(
+        actual.value_type.data_type(),
+        expected.value_type.data_type()
+    );
+    assert_eq!(actual.value_type.nullable(), expected.value_type.nullable());
     let ExprKind::ColumnRef {
         column_id: actual_id,
         qualifier: actual_qualifier,
@@ -3159,11 +3165,12 @@ fn plan_exists_subquery_expr_is_boolean_colref() {
     let apply = direct_where_apply(&plan);
 
     assert_eq!(
-        apply.subquery_expr.value_type.data_type,
+        apply.subquery_expr.value_type.data_type().clone(),
         arrow::datatypes::DataType::Boolean
     );
     assert_eq!(
-        apply.subquery_expr.value_type.nullable, spec.output_column.value_type.nullable,
+        apply.subquery_expr.value_type.nullable(),
+        spec.output_column.value_type.nullable(),
         "EXISTS subquery_expr must mirror the Boolean predicate output nullability"
     );
     let ExprKind::ColumnRef { column_id, .. } = apply.subquery_expr.kind else {
@@ -3180,21 +3187,39 @@ fn plan_exists_subquery_expr_is_boolean_colref() {
 
 #[test]
 fn array_agg_json_project_retains_semantics_above_exact_aggregate_slots() {
-    use novarocks_types::logical::{LogicalType, logical_type_of_field};
+    use novarocks_type_contract::ValueLogicalType;
     for sql in [
         "select array_agg(json_object('k',1)) as j, array_agg(cast(json_object('k',1) as varchar)) as s",
         "select array_agg(json_object('k',1) order by a) as j, array_agg(cast(json_object('k',1) as varchar)) as s from t",
     ] {
         let plan = plan_test_query(sql);
         let (project, aggregate) = root_project_over_aggregate(&plan);
-        let DataType::List(json_item) = &project.items[0].expr.value_type.data_type else {
+        let DataType::List(json_item) = &project.items[0].expr.value_type.data_type() else {
             panic!("expected JSON List");
         };
-        let DataType::List(string_item) = &project.items[1].expr.value_type.data_type else {
+        let DataType::List(string_item) = &project.items[1].expr.value_type.data_type() else {
             panic!("expected STRING List");
         };
-        assert_eq!(logical_type_of_field(json_item), Some(LogicalType::Json));
-        assert_eq!(logical_type_of_field(string_item), None);
+        assert!(json_item.metadata().is_empty());
+        assert_eq!(
+            project.items[0]
+                .expr
+                .value_type
+                .child_at(0)
+                .unwrap()
+                .logical_type(),
+            ValueLogicalType::Json
+        );
+        assert!(string_item.metadata().is_empty());
+        assert_eq!(
+            project.items[1]
+                .expr
+                .value_type
+                .child_at(0)
+                .unwrap()
+                .logical_type(),
+            ValueLogicalType::Physical
+        );
         let reference = &project.items[0].expr;
         let ExprKind::ColumnRef { column_id, .. } = reference.kind else {
             panic!("expected exact aggregate output slot");
@@ -3206,13 +3231,14 @@ fn array_agg_json_project_retains_semantics_above_exact_aggregate_slots() {
             .unwrap();
         let selected = crate::functions::aggregate_result_type(call.source.binding());
         assert_eq!(&reference.value_type, selected);
-        assert_eq!(call.result_type, selected.data_type);
-        let DataType::List(selected_item) = &selected.data_type else {
+        assert_eq!(call.result_type, selected.clone());
+        let DataType::List(selected_item) = &selected.data_type() else {
             panic!("expected selected JSON List");
         };
+        assert!(selected_item.metadata().is_empty());
         assert_eq!(
-            logical_type_of_field(selected_item),
-            Some(LogicalType::Json)
+            selected.child_at(0).unwrap().logical_type(),
+            ValueLogicalType::Json
         );
         let output = aggregate
             .output_columns
@@ -3226,6 +3252,37 @@ fn array_agg_json_project_retains_semantics_above_exact_aggregate_slots() {
 fn assert_m07_planned_domains(sql: &str, expected: Vec<Option<novarocks_types::schema::SqlType>>) {
     use novarocks_physical_plan::ResultValueDomain as D;
     use novarocks_types::schema::SqlType as S;
+    fn check_complete(columns: &[OutputColumn], expected: &[Option<S>], sql: &str) {
+        fn has_nominal(value: &novarocks_type_contract::ValueTypeRef) -> bool {
+            if matches!(value.kind(), novarocks_type_contract::ValueKind::Nominal(_)) {
+                return true;
+            }
+            (0..value.child_count())
+                .any(|ordinal| has_nominal(value.child_type_at(ordinal).unwrap()))
+        }
+        assert_eq!(columns.len(), expected.len());
+        for (column, domain) in columns.iter().zip(expected) {
+            if let Some(domain) = domain {
+                let declared = novarocks_types::execution_value_type_from_declaration(
+                    domain,
+                    column.value_type.data_type(),
+                    column.value_type.nullable(),
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                )
+                .unwrap();
+                assert_eq!(
+                    column.value_type.value_type(),
+                    declared.value_type(),
+                    "complete authored declaration: {sql}"
+                );
+            } else {
+                assert!(
+                    !has_nominal(column.value_type.value_type()),
+                    "ordinary declaration cannot carry a hidden nominal child: {sql}"
+                );
+            }
+        }
+    }
     let (resolved, registry, mut factory) =
         parse_analyze_query(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
     let original_ids: Vec<_> = resolved
@@ -3233,14 +3290,7 @@ fn assert_m07_planned_domains(sql: &str, expected: Vec<Option<novarocks_types::s
         .iter()
         .map(|column| column.column_id)
         .collect();
-    assert_eq!(
-        original_ids
-            .iter()
-            .map(|id| factory.logical_type(*id))
-            .collect::<Vec<_>>(),
-        expected,
-        "analyzer: {sql}"
-    );
+    check_complete(&resolved.output_columns, &expected, sql);
     let witnesses: Vec<_> = original_ids
         .iter()
         .map(|id| factory.has_json_list_provenance(*id))
@@ -3253,14 +3303,7 @@ fn assert_m07_planned_domains(sql: &str, expected: Vec<Option<novarocks_types::s
     )
     .unwrap_or_else(|error| panic!("{sql}: {error}"));
     let columns = plan_output_columns(&plan).unwrap();
-    assert_eq!(
-        columns
-            .iter()
-            .map(|column| factory.logical_type(column.column_id))
-            .collect::<Vec<_>>(),
-        expected,
-        "logical planner: {sql}"
-    );
+    check_complete(&columns, &expected, sql);
     assert_eq!(
         columns
             .iter()
@@ -3402,7 +3445,23 @@ fn m07_shared_aggregate_symbol_refuses_conflicting_occurrence_facts() {
     for conflict in [None, Some(SqlType::Bitmap)] {
         for ordinal in [0, 1] {
             let (resolved, registry, mut factory) = parse_analyze_query(sql).unwrap();
-            factory.set_logical_type(resolved.output_columns[ordinal].column_id, conflict.clone());
+            let mut resolved = resolved;
+            let QueryBody::Select(select) = &mut resolved.body else {
+                unreachable!()
+            };
+            select.projection[ordinal].expr.value_type = if conflict.is_some() {
+                novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                    arrow::datatypes::DataType::Binary,
+                    true,
+                    novarocks_type_contract::ValueLogicalType::Bitmap,
+                )
+                .unwrap()
+            } else {
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Binary,
+                    true,
+                )
+            };
             let error = plan_query(
                 resolved,
                 registry,
@@ -3411,9 +3470,7 @@ fn m07_shared_aggregate_symbol_refuses_conflicting_occurrence_facts() {
             )
             .unwrap_err();
             assert!(
-                error
-                    .to_string()
-                    .contains("merged conflicting source domains"),
+                error.to_string().contains("complete declared type"),
                 "{error}"
             );
         }
@@ -3471,4 +3528,56 @@ fn m07_same_value_transfer_checks_carrier_nullability_and_existing_facts() {
     );
     factory.transfer_value_provenance(source, target).unwrap();
     assert_eq!(factory.logical_type(target), Some(SqlType::Hll));
+}
+
+#[test]
+fn flattened_union_spine_keeps_each_original_complete_declaration() {
+    let (resolved, registry, mut factory) = parse_analyze_query(
+        "SELECT 1 AS n, json_object('k',1) AS j UNION ALL SELECT 2, json_object('k',2) UNION ALL SELECT 3, NULL",
+    ).unwrap();
+    let mut original_layers = Vec::new();
+    let mut query = &resolved;
+    while let QueryBody::SetOperation(operation) = &query.body {
+        original_layers.push(query.output_columns.clone());
+        query = &operation.left;
+    }
+    assert_eq!(original_layers.len(), 2);
+    assert!(original_layers[0][1].value_type.nullable());
+    let plan = plan_query(
+        resolved,
+        registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .unwrap();
+    fn verify(plan: &LogicalPlanNode, original: &[Vec<OutputColumn>], seen: &mut usize) {
+        if let LogicalPlanKind::Union(union) = &plan.kind {
+            let expected = original
+                .iter()
+                .find(|columns| {
+                    columns.len() == union.output_columns.len()
+                        && columns
+                            .iter()
+                            .zip(&union.output_columns)
+                            .all(|(source, actual)| source.column_id == actual.column_id)
+                })
+                .expect("each flattened layer keeps its actual analyzer output identity");
+            for (source, actual) in expected.iter().zip(&union.output_columns) {
+                assert_eq!(actual.name, source.name);
+                assert_eq!(actual.is_internal, source.is_internal);
+                assert_eq!(actual.value_type, source.value_type);
+            }
+            assert_eq!(
+                union.output_columns[1].value_type.logical_type(),
+                novarocks_type_contract::ValueLogicalType::Json
+            );
+            *seen += 1;
+        }
+        for child in &plan.children {
+            verify(child, original, seen);
+        }
+    }
+    let mut seen = 0;
+    verify(&plan, &original_layers, &mut seen);
+    assert_eq!(seen, 2, "both original set-operation layers remain present");
 }

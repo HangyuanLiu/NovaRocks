@@ -228,75 +228,83 @@ impl IcebergOptimizeHandle {
     }
 }
 
-/// The immutable external content this rewrite was frozen against.
-///
-/// This is the only content digest anywhere in the typed read stack, and it
-/// earns its place: the rewrite artifact is a real, separately written,
-/// immutable object, so naming it by location alone would let a replacement
-/// written at the same location be read as the same plan. A page source or an
-/// ordinary scan produces no digest at all -- there is no external object to
-/// name, and a digest of a payload would only be a second identity for the
-/// facts the payload already spells out.
+/// Attempt-local identity of immutable provider content. Content never crosses wire.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct IcebergRewriteArtifactContentId {
-    artifact_location: Arc<str>,
+    operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
     artifact_digest_hex: Arc<str>,
 }
-
 impl IcebergRewriteArtifactContentId {
     pub fn try_new(
-        artifact_location: impl AsRef<str>,
+        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
         artifact_digest_hex: impl AsRef<str>,
     ) -> Result<Self, ConnectorError> {
-        let artifact_location = artifact_location.as_ref();
-        if artifact_location.is_empty() || artifact_location.len() > MAX_PATH_BYTES {
-            return Err(invalid(
-                "iceberg rewrite artifact location must be non-empty and bounded",
-            ));
-        }
-        if artifact_location.ends_with('/') {
-            return Err(invalid(
-                "iceberg rewrite artifact location must not end with a separator",
-            ));
-        }
         Ok(Self {
-            artifact_location: Arc::from(artifact_location),
+            operation_id,
             artifact_digest_hex: Arc::from(validate_digest_hex(
                 artifact_digest_hex.as_ref(),
                 "artifact",
             )?),
         })
     }
-
-    pub fn artifact_location(&self) -> &str {
-        &self.artifact_location
+    pub const fn operation_id(&self) -> novarocks_spi::connector::ConnectorWriteOperationId {
+        self.operation_id
     }
-
     pub fn artifact_digest_hex(&self) -> &str {
         &self.artifact_digest_hex
     }
-
+    pub(crate) fn evidence(&self) -> Vec<u8> {
+        let mut bytes = b"novarocks.iceberg.rewrite-input.v1\0".to_vec();
+        bytes.extend_from_slice(&self.operation_id.to_bytes());
+        bytes.extend_from_slice(self.artifact_digest_hex.as_bytes());
+        bytes
+    }
     fn to_proto(&self) -> dto::IcebergRewriteArtifactContentId {
         dto::IcebergRewriteArtifactContentId {
-            artifact_location: self.artifact_location.to_string(),
+            operation_id: self.operation_id.to_bytes().to_vec(),
             artifact_digest_hex: self.artifact_digest_hex.to_string(),
         }
     }
-
     fn from_proto(raw: &dto::IcebergRewriteArtifactContentId) -> Result<Self, ConnectorError> {
-        Self::try_new(&raw.artifact_location, &raw.artifact_digest_hex)
+        let bytes: [u8; 16] = raw
+            .operation_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid("iceberg rewrite operation identity must be 16 bytes"))?;
+        Self::try_new(
+            novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(bytes),
+            &raw.artifact_digest_hex,
+        )
     }
 }
 
 /// `REWRITE_POSITION_DELETE_FILES`: re-encode the position deletes of one
 /// exact frozen rewrite group.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct IcebergRewritePositionDeleteFilesHandle {
     table_handle: IcebergTableHandle,
     artifact: IcebergRewriteArtifactContentId,
     group_digest_hex: Arc<str>,
+    content: Option<Arc<crate::distributed_rewrite::FrozenRewritePlanContent>>,
 }
 
+impl std::fmt::Debug for IcebergRewritePositionDeleteFilesHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IcebergRewritePositionDeleteFilesHandle")
+            .field("table_handle", &self.table_handle)
+            .field("artifact", &self.artifact)
+            .field("group_digest_hex", &self.group_digest_hex)
+            .finish()
+    }
+}
+impl PartialEq for IcebergRewritePositionDeleteFilesHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.table_handle == other.table_handle
+            && self.artifact == other.artifact
+            && self.group_digest_hex == other.group_digest_hex
+    }
+}
+impl Eq for IcebergRewritePositionDeleteFilesHandle {}
 impl IcebergRewritePositionDeleteFilesHandle {
     pub fn try_new(
         table_handle: IcebergTableHandle,
@@ -312,9 +320,27 @@ impl IcebergRewritePositionDeleteFilesHandle {
             table_handle,
             artifact,
             group_digest_hex: Arc::from(validate_digest_hex(group_digest_hex.as_ref(), "group")?),
+            content: None,
         })
     }
 
+    pub(crate) fn with_content(
+        mut self,
+        content: Arc<crate::distributed_rewrite::FrozenRewritePlanContent>,
+    ) -> Self {
+        self.content = Some(content);
+        self
+    }
+    pub(crate) fn content(
+        &self,
+    ) -> Result<&Arc<crate::distributed_rewrite::FrozenRewritePlanContent>, ConnectorError> {
+        self.content.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Internal,
+                "Iceberg rewrite handle has no process-local frozen content",
+            )
+        })
+    }
     pub const fn table_handle(&self) -> &IcebergTableHandle {
         &self.table_handle
     }
@@ -724,7 +750,7 @@ mod tests {
 
     fn artifact() -> IcebergRewriteArtifactContentId {
         IcebergRewriteArtifactContentId::try_new(
-            "s3://warehouse/db/t/_rewrite/0199",
+            novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([1; 16]),
             ARTIFACT_DIGEST,
         )
         .expect("artifact content id")
@@ -933,27 +959,19 @@ mod tests {
     }
 
     #[test]
-    fn an_artifact_content_id_names_exact_immutable_external_content() {
+    fn an_artifact_content_id_distinguishes_attempts_and_validates_digests() {
+        let id = novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([1; 16]);
         assert_eq!(artifact().artifact_digest_hex(), ARTIFACT_DIGEST);
-        assert_eq!(
-            artifact().artifact_location(),
-            "s3://warehouse/db/t/_rewrite/0199"
-        );
-        // A directory is not an object, an uppercase digest is a different
-        // rendering, and a short digest is not a SHA-256 at all.
         assert!(
-            IcebergRewriteArtifactContentId::try_new(
-                "s3://warehouse/db/t/_rewrite/",
-                ARTIFACT_DIGEST
-            )
-            .is_err()
+            IcebergRewriteArtifactContentId::try_new(id, ARTIFACT_DIGEST.to_uppercase()).is_err()
         );
-        assert!(
-            IcebergRewriteArtifactContentId::try_new("s3://a", ARTIFACT_DIGEST.to_uppercase())
-                .is_err()
-        );
-        assert!(IcebergRewriteArtifactContentId::try_new("s3://a", "abcd").is_err());
-        assert!(IcebergRewriteArtifactContentId::try_new("", ARTIFACT_DIGEST).is_err());
+        assert!(IcebergRewriteArtifactContentId::try_new(id, "abcd").is_err());
+        let other = IcebergRewriteArtifactContentId::try_new(
+            novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([2; 16]),
+            ARTIFACT_DIGEST,
+        )
+        .unwrap();
+        assert_ne!(artifact().evidence(), other.evidence());
         assert!(
             IcebergRewritePositionDeleteFilesHandle::try_new(
                 partitioned_handle(),
@@ -1052,5 +1070,67 @@ mod tests {
             IcebergRewritePositionDeleteFilesHandle::try_new(unpinned, artifact(), GROUP_DIGEST)
                 .is_err()
         );
+    }
+    #[test]
+    fn rewrite_wire_transfers_identity_and_releases_fe_content() {
+        let content = Arc::new(crate::distributed_rewrite::FrozenRewritePlanContent {
+            operation_id: artifact().operation_id(),
+            manifest_digest: [1; 32],
+            artifact: crate::distributed_rewrite::IcebergFrozenRewriteArtifactV1 {
+                version: crate::distributed_rewrite::ARTIFACT_VERSION,
+                operation_kind: "rewrite_position_deletes".to_string(),
+                namespace: "db".to_string(),
+                table: "t".to_string(),
+                table_uuid: "uuid".to_string(),
+                target_ref: "main".to_string(),
+                base_snapshot_id: Some(11),
+                schema_id: 0,
+                default_spec_id: 7,
+                groups: Vec::new(),
+            },
+        });
+        let weak = Arc::downgrade(&content);
+        let rewrite = IcebergRewritePositionDeleteFilesHandle::try_new(
+            partitioned_handle(),
+            artifact(),
+            GROUP_DIGEST,
+        )
+        .unwrap()
+        .with_content(content);
+        let expected_evidence = rewrite.artifact().evidence();
+        let handle = IcebergTableExecuteHandle::try_new(IcebergTableExecuteHandleParams {
+            schema_table_name: SchemaTableName::try_new("db", "t").unwrap(),
+            procedure_id: IcebergProcedureId::RewritePositionDeleteFiles,
+            table_location: "s3://warehouse/db/t".to_string(),
+            procedure_handle: Some(
+                IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(rewrite),
+            ),
+        })
+        .unwrap();
+        let wire = handle.to_proto();
+        let decoded = IcebergTableExecuteHandle::from_proto(&wire).unwrap();
+        assert_eq!(decoded, handle);
+        let Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(worker)) =
+            decoded.procedure_handle()
+        else {
+            panic!("rewrite handle")
+        };
+        assert_eq!(
+            worker.content().err().unwrap().kind(),
+            novarocks_spi::connector::ConnectorErrorKind::Internal
+        );
+        assert_eq!(worker.artifact().evidence(), expected_evidence);
+        assert!(expected_evidence.starts_with(b"novarocks.iceberg.rewrite-input.v1\0"));
+        let mut malformed = wire;
+        let Some(dto::iceberg_table_execute_handle::ProcedureHandle::RewritePositionDeleteFiles(
+            raw,
+        )) = malformed.procedure_handle.as_mut()
+        else {
+            panic!("rewrite wire")
+        };
+        raw.artifact.as_mut().unwrap().operation_id.pop();
+        assert!(IcebergTableExecuteHandle::from_proto(&malformed).is_err());
+        drop(handle);
+        assert!(weak.upgrade().is_none());
     }
 }

@@ -16,7 +16,6 @@
 // under the License.
 
 use super::*;
-use crate::physical_type_v2::encode_type_table_sources;
 use novarocks_physical_plan::ConstantPools;
 
 fn namespace_limits() -> ConstantNamespaceProjectionLimits {
@@ -68,13 +67,15 @@ fn caller_constant_namespace_actual_aliases_keep_sparse_ids_and_source_once() {
             (0, Arc::clone(original.field_ref())),
             (u32::MAX, Arc::clone(original.field_ref())),
         ];
-        let typed = encode_type_table_sources(
-            &values,
-            &fields,
-            type_limits(),
-            &Control::good(CompilePhase::Encode),
-        )
-        .unwrap();
+        let value_refs = values
+            .iter()
+            .map(|(id, value)| (*id, value))
+            .collect::<Vec<_>>();
+        let field_refs = fields
+            .iter()
+            .map(|(id, field)| (*id, field))
+            .collect::<Vec<_>>();
+        let typed = encoded_fixture_types(&value_refs, &field_refs);
         let ids = bindings();
         let control = Control::good(CompilePhase::Encode);
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
@@ -117,12 +118,7 @@ fn caller_constant_namespace_actual_aliases_keep_sparse_ids_and_source_once() {
             records.iter().map(|record| record.id).collect::<Vec<_>>(),
             vec![0, u32::MAX]
         );
-        let decoded = decode_type_table(
-            typed.as_wire(),
-            type_limits(),
-            &Control::good(CompilePhase::Decode),
-        )
-        .unwrap();
+        let decoded = decode_fixture_types(&typed, &fields);
         let control = Control::good(CompilePhase::Decode);
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
         let mut last = ConstantNamespaceResourceFacts::default();
@@ -206,13 +202,15 @@ fn caller_constant_namespace_known_initial_requests_precede_all_late_causes() {
         (0, Arc::clone(original.field_ref())),
         (u32::MAX, Arc::clone(original.field_ref())),
     ];
-    let typed = encode_type_table_sources(
-        &values,
-        &fields,
-        type_limits(),
-        &Control::good(CompilePhase::Encode),
-    )
-    .unwrap();
+    let value_refs = values
+        .iter()
+        .map(|(id, value)| (*id, value))
+        .collect::<Vec<_>>();
+    let field_refs = fields
+        .iter()
+        .map(|(id, field)| (*id, field))
+        .collect::<Vec<_>>();
+    let typed = encoded_fixture_types(&value_refs, &field_refs);
     let ids = bindings();
     let mut limits = namespace_limits();
     limits.max_new_allocation_request_bytes = 0;
@@ -304,22 +302,19 @@ fn caller_constant_namespace_actual_success_and_ordinary_tails_keep_every_first_
         (0, Arc::clone(original.field_ref())),
         (u32::MAX, Arc::clone(original.field_ref())),
     ];
-    let typed = encode_type_table_sources(
-        &values,
-        &fields,
-        type_limits(),
-        &Control::good(CompilePhase::Encode),
-    )
-    .unwrap();
+    let value_refs = values
+        .iter()
+        .map(|(id, value)| (*id, value))
+        .collect::<Vec<_>>();
+    let field_refs = fields
+        .iter()
+        .map(|(id, field)| (*id, field))
+        .collect::<Vec<_>>();
+    let typed = encoded_fixture_types(&value_refs, &field_refs);
     let ids = bindings();
     let good = Control::good(CompilePhase::Encode);
     let records = caller_write(&pools, &ids, &typed, &good).unwrap();
-    let decoded = decode_type_table(
-        typed.as_wire(),
-        type_limits(),
-        &Control::good(CompilePhase::Decode),
-    )
-    .unwrap();
+    let decoded = decode_fixture_types(&typed, &fields);
     let mut bad_ids = ids;
     bad_ids.swap(0, 1);
     for ids in [&ids, &bad_ids] {
@@ -367,13 +362,15 @@ fn caller_constant_namespace_foreign_work_cannot_reach_parent_or_materialization
         (0, Arc::clone(original.field_ref())),
         (u32::MAX, Arc::clone(original.field_ref())),
     ];
-    let typed = encode_type_table_sources(
-        &values,
-        &fields,
-        type_limits(),
-        &Control::good(CompilePhase::Encode),
-    )
-    .unwrap();
+    let value_refs = values
+        .iter()
+        .map(|(id, value)| (*id, value))
+        .collect::<Vec<_>>();
+    let field_refs = fields
+        .iter()
+        .map(|(id, field)| (*id, field))
+        .collect::<Vec<_>>();
+    let typed = encoded_fixture_types(&value_refs, &field_refs);
     let ids = bindings();
     let owner = Control::good(CompilePhase::Encode);
     let mut work = CompileCheckpoints::try_new(&owner, CompilePhase::Encode).unwrap();
@@ -396,12 +393,7 @@ fn caller_constant_namespace_foreign_work_cannot_reach_parent_or_materialization
     ));
     assert_eq!(foreign.trace(), vec![(CompilePhase::Encode, 0)]);
     let records = caller_write(&pools, &ids, &typed, &Control::good(CompilePhase::Encode)).unwrap();
-    let decoded = decode_type_table(
-        typed.as_wire(),
-        type_limits(),
-        &Control::good(CompilePhase::Decode),
-    )
-    .unwrap();
+    let decoded = decode_fixture_types(&typed, &fields);
     let owner = Control::good(CompilePhase::Decode);
     let mut work = CompileCheckpoints::try_new(&owner, CompilePhase::Decode).unwrap();
     let token = prepare_constant_namespace_in(
@@ -440,13 +432,15 @@ fn caller_constant_namespace_receiver_known_header_overflow_precedes_pending_cau
         (0, Arc::clone(original.field_ref())),
         (u32::MAX, Arc::clone(original.field_ref())),
     ];
-    let typed = encode_type_table_sources(
-        &values,
-        &fields,
-        type_limits(),
-        &Control::good(CompilePhase::Encode),
-    )
-    .unwrap();
+    let value_refs = values
+        .iter()
+        .map(|(id, value)| (*id, value))
+        .collect::<Vec<_>>();
+    let field_refs = fields
+        .iter()
+        .map(|(id, field)| (*id, field))
+        .collect::<Vec<_>>();
+    let typed = encoded_fixture_types(&value_refs, &field_refs);
     let records = caller_write(
         &pools,
         &bindings(),
@@ -454,12 +448,7 @@ fn caller_constant_namespace_receiver_known_header_overflow_precedes_pending_cau
         &Control::good(CompilePhase::Encode),
     )
     .unwrap();
-    let decoded = decode_type_table(
-        typed.as_wire(),
-        type_limits(),
-        &Control::good(CompilePhase::Decode),
-    )
-    .unwrap();
+    let decoded = decode_fixture_types(&typed, &fields);
     for pending in [0, 254, 255] {
         for cause in CAUSES {
             let control = Control::refusing(CompilePhase::Decode, 1, cause);

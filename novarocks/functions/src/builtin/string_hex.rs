@@ -130,9 +130,9 @@ pub(super) fn evaluate_string_hex<'a>(
         let FunctionArgumentType::Value(source) = &types[0] else {
             return Err(invalid("hex requires a value argument"));
         };
-        let exact = source.logical_type == ValueLogicalType::Physical
+        let exact = source.logical_type() == ValueLogicalType::Physical
             && matches!(
-                source.data_type,
+                source.data_type(),
                 DataType::Utf8 | DataType::Binary | DataType::Int64
             );
         work.step()?;
@@ -142,16 +142,16 @@ pub(super) fn evaluate_string_hex<'a>(
             ));
         }
         let target = input.contract().result_type();
-        if target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
+        if target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Utf8
+            || !target.nullable()
         {
             return Err(invalid(
                 "hex differs from its exact installed result profile",
             ));
         }
         let array = arguments[0].array();
-        let concrete = match source.data_type {
+        let concrete = match source.data_type() {
             DataType::Utf8 => Source::Utf8(
                 array
                     .as_any()
@@ -186,7 +186,7 @@ pub(super) fn evaluate_string_hex<'a>(
                 return Err(internal("hex selected argument row is out of bounds"));
             }
             if array.is_null(row) {
-                if !source.nullable {
+                if !source.nullable() {
                     return Err(internal("hex non-null argument contains selected SQL NULL"));
                 }
                 Ok(None)
@@ -250,7 +250,7 @@ pub(super) fn evaluate_string_hex<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

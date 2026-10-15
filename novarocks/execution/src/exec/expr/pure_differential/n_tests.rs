@@ -71,7 +71,7 @@ fn profiles(nullable: bool) -> Vec<FunctionValueType> {
 }
 
 fn profile_values(source: &FunctionValueType, rows: usize) -> ArrayRef {
-    if source.data_type == DataType::FixedSizeBinary(16) {
+    if *source.data_type() == DataType::FixedSizeBinary(16) {
         // Genuine physical 16-byte carrier, with original endian/sign codec.
         // Binding stays Physical; this fixture does not assert logical LARGEINT.
         let pattern = [
@@ -86,7 +86,9 @@ fn profile_values(source: &FunctionValueType, rows: usize) -> ArrayRef {
         ];
         return novarocks_types::largeint::array_from_i128(
             &(0..rows)
-                .map(|row| pattern[row % pattern.len()].or_else(|| (!source.nullable).then_some(7)))
+                .map(|row| {
+                    pattern[row % pattern.len()].or_else(|| (!source.nullable()).then_some(7))
+                })
                 .collect::<Vec<_>>(),
         )
         .unwrap();
@@ -131,7 +133,7 @@ fn pure_differential_n_every_complete_scalar_codec_profile_and_signed_limit_carr
                                 .float_comparison(FloatComparison::Exact),
                         );
                         assert_eq!(summary.matched_failures, 0);
-                        assert!(summary.result_type.nullable);
+                        assert!(summary.result_type.nullable());
                         // Empty groups remain non-null empty Lists.
                         assert_eq!(summary.null_results, 0);
                     }
@@ -149,9 +151,9 @@ fn pure_differential_n_empty_all_null_values_and_constant_limits_keep_empty_list
         {
             for rows in [0, ROWS] {
                 let values = if rows == 0 {
-                    new_empty_array(&source.data_type)
+                    new_empty_array(&source.data_type())
                 } else {
-                    new_null_array(&source.data_type, rows)
+                    new_null_array(&source.data_type(), rows)
                 };
                 let summary = assert_aggregate_matches_v1(
                     AggregateDiffSpec::new(name)
@@ -232,7 +234,7 @@ fn pure_differential_n_logical_largeint_freezes_full_legacy_metadata_drift() {
                 for limit_nullable in [false, true] {
                     for rows in [0usize, 8] {
                         let values = if rows == 0 {
-                            new_empty_array(&source.data_type)
+                            new_empty_array(source.data_type())
                         } else {
                             InputGenerator::new(1821).column(
                                 &source,

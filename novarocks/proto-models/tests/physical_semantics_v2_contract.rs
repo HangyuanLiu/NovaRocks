@@ -203,6 +203,7 @@ fn six_typed_sites_and_context_references_preserve_zero_max_and_absence() {
             .into_iter()
             .enumerate()
             .map(|(ordinal, site)| v2::FrozenCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,

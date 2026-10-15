@@ -53,14 +53,14 @@ impl<'a> NumericValue<'a> {
         argument: EvaluatedArgument<'a>,
         source: &FunctionValueType,
     ) -> Result<Self, KernelFailure> {
-        if source.logical_type != ValueLogicalType::Physical
-            || argument.array().data_type() != &source.data_type
+        if source.logical_type() != ValueLogicalType::Physical
+            || argument.array().data_type() != source.data_type()
         {
             return Err(invalid(
                 "truncate input differs from its exact numeric carrier",
             ));
         }
-        match source.data_type {
+        match source.data_type() {
             DataType::Int8
             | DataType::Int16
             | DataType::Int32
@@ -68,10 +68,10 @@ impl<'a> NumericValue<'a> {
             | DataType::Float32
             | DataType::Float64 => {}
             DataType::Decimal128(precision, scale) => {
-                validate_decimal_precision_and_scale::<Decimal128Type>(precision, scale)
+                validate_decimal_precision_and_scale::<Decimal128Type>(*precision, *scale)
                     .map_err(|_| invalid("truncate selected decimal parameters are invalid"))?;
             }
-            DataType::Null if source.nullable => {}
+            DataType::Null if source.nullable() => {}
             _ => {
                 return Err(invalid(
                     "truncate input is not an installed numeric carrier",
@@ -82,7 +82,7 @@ impl<'a> NumericValue<'a> {
         Ok(Self {
             argument,
             view,
-            nullable: source.nullable,
+            nullable: source.nullable(),
         })
     }
     fn row(&self, ordinal: usize, batch_row: usize) -> Result<Option<usize>, KernelFailure> {
@@ -153,12 +153,12 @@ pub(super) fn evaluate_truncate<'a>(
         }
     };
     let target = input.contract().result_type();
-    if target.logical_type != ValueLogicalType::Physical || !target.nullable {
+    if target.logical_type() != ValueLogicalType::Physical || !target.nullable() {
         return Err(invalid(
             "truncate requires its exact nullable Physical result",
         ));
     }
-    match (value.argument.array().data_type(), &target.data_type, op) {
+    match (value.argument.array().data_type(), target.data_type(), op) {
         (DataType::Decimal128(..), DataType::Decimal128(38, scale), _) => {
             validate_decimal_precision_and_scale::<Decimal128Type>(38, *scale)
                 .map_err(|_| invalid("truncate selected decimal result parameters are invalid"))?;
@@ -182,7 +182,7 @@ pub(super) fn evaluate_truncate<'a>(
     let values = compute_dround(
         computation,
         selection,
-        Some(&target.data_type),
+        Some(target.data_type()),
         Some(control),
         |ordinal, batch_row| {
             let x = value.value(ordinal, batch_row)?;
@@ -200,7 +200,7 @@ pub(super) fn evaluate_truncate<'a>(
         // data-error route. Preserve an unexpected core diagnostic as Internal.
         MathNumericError::Legacy(message) => internal(&message),
     })?;
-    SelectedValues::try_new(selection, &target.data_type, values, Box::default())
+    SelectedValues::try_new(selection, target.data_type(), values, Box::default())
         .map_err(|_| internal("truncate compact output violates its selected contract"))
 }
 

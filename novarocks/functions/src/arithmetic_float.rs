@@ -17,7 +17,10 @@
 
 //! Exact original Float arithmetic adapters. The installed CAST author owns
 //! conversion; locked ArrowNativeTypeOp owns the original primitive mathematics.
-use super::{ArithmeticPrepareError, ArithmeticRowResult};
+use super::{
+    ArithmeticCreationFailure, ArithmeticPrepareError, ArithmeticRowResult,
+    ArithmeticTypeCreationFailure,
+};
 use crate::kernel_control::internal;
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
@@ -38,18 +41,22 @@ pub(super) struct FloatArithmetic {
     mask_right_zero: bool,
 }
 impl FloatArithmetic {
-    pub(super) fn prepare(
+    pub(super) fn prepare<H>(
         operator: ArithmeticOperator,
         left: &FunctionValueType,
         right: &FunctionValueType,
         policy: DecimalOverflowPolicy,
         allow: bool,
+        target: &mut impl FnMut(
+            &mut novarocks_type_contract::CompileCheckpoints<'_>,
+        ) -> Result<FunctionValueType, ArithmeticCreationFailure<H>>,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
         control: &dyn PureCompileControl,
-    ) -> Result<Option<Self>, ArithmeticPrepareError> {
+    ) -> Result<Option<Self>, ArithmeticCreationFailure<H>> {
         let successful = |ty: &FunctionValueType| {
-            ty.logical_type == ValueLogicalType::Physical
+            ty.logical_type() == ValueLogicalType::Physical
                 && matches!(
-                    ty.data_type,
+                    ty.data_type(),
                     DataType::Int8
                         | DataType::Int16
                         | DataType::Int32
@@ -59,14 +66,15 @@ impl FloatArithmetic {
                         | DataType::Decimal128(..)
                 )
         };
-        let is_float =
-            |ty: &FunctionValueType| matches!(ty.data_type, DataType::Float32 | DataType::Float64);
+        let is_float = |ty: &FunctionValueType| {
+            matches!(ty.data_type(), DataType::Float32 | DataType::Float64)
+        };
         // LARGEINT/Float is a legitimate frozen FVT but its original Arrow setup
         // is invocation-wide Data. This kernel-only slice does not claim that port.
         if !successful(left) || !successful(right) || !(is_float(left) || is_float(right)) {
             return Ok(None);
         }
-        let target = FunctionValueType::new(DataType::Float64, true);
+        let target = target(work)?;
         let prepare = |source: &FunctionValueType| {
             PreparedCastRecipe::try_new(
                 CastOperation::Carrier,
@@ -87,7 +95,7 @@ impl FloatArithmetic {
         let right_cast = prepare(right)?;
         // Original nullify_zeros deliberately omits F32 and Decimal128; their
         // zero values reach the same original unchecked IEEE division author.
-        let mask_right_zero = crate::legacy_arithmetic::division_masks_zeros(&right.data_type);
+        let mask_right_zero = crate::legacy_arithmetic::division_masks_zeros(right.data_type());
         Ok(Some(Self {
             left,
             right: right_cast,
@@ -156,3 +164,70 @@ impl FloatArithmetic {
 #[cfg(test)]
 #[path = "arithmetic_float_tests.rs"]
 mod tests;
+
+/// Reuse the original complete scalar constructor with a real independent
+/// entity scope. Its marker follows only the canonical target shared by the
+/// two original cast recipes; no input arrays, factory or program are retained.
+pub(super) fn canonical_target_with_factory<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
+    factory: &F,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<FunctionValueType, ArithmeticCreationFailure<H>> {
+    use novarocks_type_contract::{
+        ValueConstructionFailure, ValueConstructionRequest, ValueSchemaCreationScope,
+        ValueSchemaScopeBeginFailure,
+    };
+    work.flush()?;
+    let mut scope = factory
+        .begin_scope_observed(&mut |_| -> Result<(), ArithmeticTypeCreationFailure<H>> {
+            work.step()
+                .map_err(ArithmeticTypeCreationFailure::Control)?;
+            work.flush().map_err(ArithmeticTypeCreationFailure::Control)
+        })
+        .map_err(|error| {
+            ArithmeticCreationFailure::Construction(ValueConstructionFailure::Observer(
+                match error {
+                    ValueSchemaScopeBeginFailure::Observer(error) => error,
+                    ValueSchemaScopeBeginFailure::Creator(error) => {
+                        ArithmeticTypeCreationFailure::Creator(error)
+                    }
+                },
+            ))
+        })?;
+    let storage = scope.storage_lifetime();
+    let mut observe = |request| -> Result<(), ArithmeticTypeCreationFailure<H>> {
+        match request {
+            ValueConstructionRequest::Work(units) => {
+                for _ in 0..units {
+                    work.step()
+                        .map_err(ArithmeticTypeCreationFailure::Control)?;
+                }
+                Ok(())
+            }
+            ValueConstructionRequest::Exact(layout) => {
+                work.flush()
+                    .map_err(ArithmeticTypeCreationFailure::Control)?;
+                scope
+                    .request_layout(layout)
+                    .map_err(ArithmeticTypeCreationFailure::Creator)
+            }
+            ValueConstructionRequest::OpaqueUpper(bytes) => {
+                work.flush()
+                    .map_err(ArithmeticTypeCreationFailure::Control)?;
+                scope
+                    .observe_opaque_upper_bound(bytes)
+                    .map_err(ArithmeticTypeCreationFailure::Creator)
+            }
+        }
+    };
+    FunctionValueType::try_with_logical_type_with_construction(
+        DataType::Float64,
+        true,
+        ValueLogicalType::Physical,
+        storage,
+        Some(&mut observe),
+    )
+    .map_err(ArithmeticCreationFailure::Construction)
+}

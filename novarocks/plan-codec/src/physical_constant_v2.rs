@@ -108,6 +108,63 @@ impl From<FlatReaderError> for PhysicalConstantCodecError {
         }
     }
 }
+impl From<novarocks_constant_contract::ConstantError> for PhysicalConstantCodecError {
+    fn from(error: novarocks_constant_contract::ConstantError) -> Self {
+        Self::from(FlatReaderError::from(error))
+    }
+}
+impl From<FlatPoolResourceError> for PhysicalConstantCodecError {
+    fn from(error: FlatPoolResourceError) -> Self {
+        Self::from(FlatReaderError::from(error))
+    }
+}
+impl From<novarocks_type_contract::CarrierParameterError> for PhysicalConstantCodecError {
+    fn from(error: novarocks_type_contract::CarrierParameterError) -> Self {
+        Self::from(FlatReaderError::from(error))
+    }
+}
+impl<H> From<FlatReaderError>
+    for crate::host_projection_v2::ProjectionFailure<PhysicalConstantCodecError, H>
+{
+    fn from(error: FlatReaderError) -> Self {
+        Self::Codec(PhysicalConstantCodecError::from(error))
+    }
+}
+impl<H> From<FlatPoolResourceError>
+    for crate::host_projection_v2::ProjectionFailure<PhysicalConstantCodecError, H>
+{
+    fn from(error: FlatPoolResourceError) -> Self {
+        Self::Codec(PhysicalConstantCodecError::from(error))
+    }
+}
+impl<H> From<novarocks_constant_contract::ConstantError>
+    for crate::host_projection_v2::ProjectionFailure<PhysicalConstantCodecError, H>
+{
+    fn from(error: novarocks_constant_contract::ConstantError) -> Self {
+        Self::Codec(PhysicalConstantCodecError::from(error))
+    }
+}
+impl<H> From<novarocks_type_contract::CarrierParameterError>
+    for crate::host_projection_v2::ProjectionFailure<PhysicalConstantCodecError, H>
+{
+    fn from(error: novarocks_type_contract::CarrierParameterError) -> Self {
+        Self::Codec(PhysicalConstantCodecError::from(error))
+    }
+}
+impl<H> From<novarocks_type_contract::ValueTypeError>
+    for crate::host_projection_v2::ProjectionFailure<PhysicalConstantCodecError, H>
+{
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Codec(PhysicalConstantCodecError::from(error))
+    }
+}
+impl<H> From<novarocks_physical_plan::ConstantReferenceError>
+    for crate::host_projection_v2::ProjectionFailure<PhysicalConstantCodecError, H>
+{
+    fn from(error: novarocks_physical_plan::ConstantReferenceError) -> Self {
+        Self::Codec(PhysicalConstantCodecError::from(error))
+    }
+}
 fn recursive(ty: &DataType) -> bool {
     matches!(
         ty,
@@ -161,11 +218,32 @@ fn record_sources_captured<'t, 'control>(
     ) -> Result<(), PhysicalConstantCodecError>,
     work: &mut CompileCheckpoints<'control>,
 ) -> Result<(&'t FunctionValueType, &'t Arc<Field>), PhysicalConstantCodecError> {
-    work.step()?;
+    record_sources_captured_observed(
+        record,
+        types,
+        source_retained_bytes,
+        &mut |value, source, work| capture(value, source.field(), work),
+        work,
+    )
+}
+
+fn record_sources_captured_observed<'t, 'control, E: From<PhysicalConstantCodecError>>(
+    record: &wire::IpcConstantPool,
+    types: &'t DecodedTypeTable,
+    source_retained_bytes: usize,
+    capture: &mut impl FnMut(
+        &'t FunctionValueType,
+        crate::physical_type_v2::SourceFieldBorrow<'t>,
+        &mut CompileCheckpoints<'control>,
+    ) -> Result<(), E>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<(&'t FunctionValueType, &'t Arc<Field>), E> {
+    work.step().map_err(PhysicalConstantCodecError::from)?;
     if record.compression != wire::IpcCompression::Uncompressed as i32 {
-        return Err(PhysicalConstantCodecError::InvalidShape(
+        return Err((PhysicalConstantCodecError::InvalidShape(
             "constant record requires uncompressed IPC",
-        ));
+        ))
+        .into());
     }
     let type_id = required(
         record.value_type_id,
@@ -173,34 +251,35 @@ fn record_sources_captured<'t, 'control>(
         work,
     )?;
     let field_id = required(
-        record.field_id,
+        record.source_field_id,
         "constant record is missing its Field ID",
         work,
     )?;
     let value_type = types.value_type(type_id);
-    work.step()?;
+    work.step().map_err(PhysicalConstantCodecError::from)?;
     let value_type = value_type.ok_or(PhysicalConstantCodecError::InvalidShape(
         "constant record references an unknown value type",
     ))?;
-    let field = types.field(field_id);
+    let field = types.source_field_borrow(field_id);
     if source_retained_bytes >= record.arrow_ipc.capacity()
         && let Some(field) = field
     {
         capture(value_type, field, work)?;
     }
-    work.step()?;
+    work.step().map_err(PhysicalConstantCodecError::from)?;
     let field = field.ok_or(PhysicalConstantCodecError::InvalidShape(
         "constant record references an unknown Field",
     ))?;
     let source_covers_ipc = source_retained_bytes >= record.arrow_ipc.capacity();
-    work.step()?;
+    work.step().map_err(PhysicalConstantCodecError::from)?;
     if !source_covers_ipc {
-        return Err(PhysicalConstantCodecError::InvalidShape(
+        return Err((PhysicalConstantCodecError::InvalidShape(
             "constant record source invoice omits original IPC backing",
-        ));
+        ))
+        .into());
     }
-    work.flush()?;
-    Ok((value_type, field))
+    work.flush().map_err(PhysicalConstantCodecError::from)?;
+    Ok((value_type, field.field()))
 }
 
 /// The invoice covers every still-live DTO/input and type-table owner, including
@@ -318,6 +397,8 @@ impl<H> From<HostTypeError<H>> for HostError<H> {
 enum PreparedWriter<'pool, 'control> {
     Flat(PreparedFlatPoolWriter<'pool, 'control>),
     Recursive(PreparedRecursivePoolWriter<'pool, 'control>),
+    PureFlat(crate::ipc_flat_pool_v2::PreparedPureFlatPoolWriter<'pool, 'control>),
+    PureRecursive(crate::ipc_recursive_pool_v2::PreparedPureRecursivePoolWriter<'pool, 'control>),
 }
 /// One original checked pool and its sealed writer model. Table-ID binding
 /// still belongs to the sole whole-package type author, as for record encode.
@@ -335,6 +416,9 @@ impl PreparedConstantRecordWrite<'_, '_> {
         match &self.writer {
             PreparedWriter::Flat(writer) => writer.facts(),
             PreparedWriter::Recursive(writer) => &writer.facts().flat,
+            PreparedWriter::PureFlat(_) | PreparedWriter::PureRecursive(_) => {
+                unreachable!("pure writer has no receiving facts")
+            }
         }
     }
     pub fn emit(self) -> Result<wire::IpcConstantPool, PhysicalConstantCodecError> {
@@ -393,17 +477,66 @@ impl PreparedConstantRecordWrite<'_, '_> {
                     }
                     None => writer.emit(work.control())?,
                 },
+                PreparedWriter::PureFlat(writer) => writer.emit_in(work)?,
+                PreparedWriter::PureRecursive(writer) => writer.emit_in(work)?,
             };
             work.step()?;
             Ok(wire::IpcConstantPool {
                 id: self.id.get(),
                 value_type_id: Some(self.value_type_id),
-                field_id: Some(self.field_id),
+                source_field_id: Some(self.field_id),
                 compression: wire::IpcCompression::Uncompressed as i32,
                 arrow_ipc,
             })
         })()
     }
+}
+
+/// A pure FE preparation owns no receiving invoice or memory grant. Its writer
+/// is the same IPC body, with actual borrowed source custody and original control.
+pub struct PreparedPureConstantRecordWrite<'pool, 'control> {
+    prepared: PreparedConstantRecordWrite<'pool, 'control>,
+}
+impl PreparedPureConstantRecordWrite<'_, '_> {
+    pub fn emit_in(
+        self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<wire::IpcConstantPool, PhysicalConstantCodecError> {
+        if !std::ptr::addr_eq(self.prepared.control, work.control()) {
+            return Err(PhysicalConstantCodecError::InvalidShape(
+                "pure constant record uses a different original control",
+            ));
+        }
+        self.prepared
+            .emit_core::<std::convert::Infallible>(None, work)
+            .map_err(ProjectionFailure::without_host)
+    }
+}
+pub fn prepare_constant_record_write_pure_in<'pool, 'control>(
+    id: ConstantPoolId,
+    value_type_id: u32,
+    field_id: u32,
+    pool: &'pool ConstantPool,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedPureConstantRecordWrite<'pool, 'control>, PhysicalConstantCodecError> {
+    let writer = if recursive(pool.field().data_type()) {
+        PreparedWriter::PureRecursive(
+            crate::ipc_recursive_pool_v2::prepare_recursive_pool_write_pure_in(pool, work)?,
+        )
+    } else {
+        PreparedWriter::PureFlat(crate::ipc_flat_pool_v2::prepare_flat_pool_write_pure_in(
+            pool, work,
+        )?)
+    };
+    Ok(PreparedPureConstantRecordWrite {
+        prepared: PreparedConstantRecordWrite {
+            id,
+            value_type_id,
+            field_id,
+            writer,
+            control: work.control(),
+        },
+    })
 }
 
 /// Admit the exact original writer snapshot once. The caller may accumulate
@@ -542,6 +675,7 @@ pub(crate) use namespace::prepare_constant_namespace_in;
 pub use namespace::{
     ConstantNamespaceProjectionLimits, ConstantNamespaceResourceFacts, PreparedConstantNamespace,
     decode_constant_namespace, prepare_constant_namespace,
+    prepare_constant_namespace_with_creator_in, prepare_constant_namespace_with_factory_in,
 };
 
 pub(crate) use write_namespace::prepare_constant_namespace_write_in;
@@ -552,4 +686,17 @@ pub use write_namespace::{
 };
 
 #[cfg(test)]
+mod input_derived_tests;
+#[cfg(test)]
 mod tests;
+
+mod borrowed_reader;
+mod record_scopes;
+pub use borrowed_reader::{
+    PreparedConstantRecord, prepare_constant_record_from_sources_input_derived_with_creator_in,
+    prepare_constant_record_from_sources_with_creator_in,
+};
+pub use record_scopes::{
+    ConstantRecordConstructionFacts, ScopedPreparedConstantRecord,
+    prepare_constant_record_from_sources_input_derived_with_factory_in,
+};

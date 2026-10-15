@@ -341,6 +341,7 @@ fn package_with_case(
                 )
                 .unwrap();
             calls.push(FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -875,6 +876,9 @@ fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
         },
     }
 }
+
+#[path = "lowering_prepare_creator_tests.rs"]
+mod prepare_creator_tests;
 
 #[path = "project_metadata_tests.rs"]
 mod project_metadata_tests;

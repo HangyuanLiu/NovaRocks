@@ -27,11 +27,7 @@ pub enum CountObservation {
     Step,
     OpaqueBoundary,
 }
-#[derive(Clone, Copy, Debug)]
-pub enum CountNullRule {
-    AggregateRootFast,
-    AnalyticRoot,
-}
+pub use crate::logical_null::NullVisitError as CountVisitError;
 #[derive(Clone, Copy)]
 pub struct CountValue<'a> {
     pub array: &'a dyn Array,
@@ -48,13 +44,16 @@ pub enum CountMergeArray<'a> {
 pub const fn initial_state() -> i64 {
     0
 }
-/// The original aggregate skips its bitmap entirely when null_count is zero.
-/// The analytic kernel always asks Array::is_null; neither decodes logical NULL.
-pub fn contributes(value: CountValue<'_>, rule: CountNullRule) -> bool {
-    match rule {
-        CountNullRule::AggregateRootFast if value.array.null_count() == 0 => true,
-        _ => !value.array.is_null(value.row),
-    }
+/// COUNT(expr) follows the selected logical value, including encoded NULLs.
+/// Count-only callers supply no value and perform no NULL inspection.
+pub fn contributes_observed<E>(
+    value: CountValue<'_>,
+    observe: &mut dyn FnMut(CountObservation) -> Result<(), E>,
+) -> Result<bool, CountVisitError<E>> {
+    crate::logical_null::logical_is_null_observed(value.array, value.row, 1, &mut || {
+        observe(CountObservation::Step)
+    })
+    .map(|is_null| !is_null)
 }
 /// Ordinary += preserves the original debug panic and release wrapping.
 pub fn add_original(state: &mut i64, contribution: i64) {
@@ -78,8 +77,8 @@ pub unsafe fn update_legacy_batch(
     array: Option<&dyn Array>,
     offset: usize,
     bases: &[usize],
-) {
-    if array.is_none() || count_all || array.is_some_and(|a| a.null_count() == 0) {
+) -> Result<(), CountVisitError<std::convert::Infallible>> {
+    if array.is_none() || count_all {
         for &base in bases {
             let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
             add_original(slot, 1);
@@ -87,12 +86,15 @@ pub unsafe fn update_legacy_batch(
     } else {
         let array = array.unwrap();
         for (row, &base) in bases.iter().enumerate() {
-            if contributes(CountValue { array, row }, CountNullRule::AggregateRootFast) {
+            if contributes_observed(CountValue { array, row }, &mut |_| {
+                Ok::<(), std::convert::Infallible>(())
+            })? {
                 let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
                 add_original(slot, 1);
             }
         }
     }
+    Ok(())
 }
 /// # Safety
 /// Same initialized and exclusive state-slot contract as update_legacy_batch.
@@ -152,14 +154,14 @@ pub fn window_partition_observed<'a, E>(
     frames: impl Iterator<Item = (usize, usize)>,
     emit: &mut dyn FnMut(i64) -> Result<(), E>,
     observe: &mut dyn FnMut(CountObservation) -> Result<(), E>,
-) -> Result<(), E> {
+) -> Result<(), CountVisitError<E>> {
     let mut prefix_non_null: Vec<i64> = Vec::new();
     if let Some(source) = source {
         observe(CountObservation::OpaqueBoundary)?;
         prefix_non_null = vec![0; (end - start) + 1];
         observe(CountObservation::OpaqueBoundary)?;
         for (i, row) in (start..end).enumerate() {
-            let contribution = if contributes(source(row), CountNullRule::AnalyticRoot) {
+            let contribution = if contributes_observed(source(row), observe)? {
                 1
             } else {
                 0

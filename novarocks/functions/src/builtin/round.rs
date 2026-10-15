@@ -74,24 +74,24 @@ impl RoundRecipe {
                 ] => (source, Some(digits)),
                 _ => return Err(FunctionBindingError::NoMatchingOverload),
             };
-            if target.logical_type != ValueLogicalType::Physical || !target.nullable {
+            if target.logical_type() != ValueLogicalType::Physical || !target.nullable() {
                 return Err(FunctionBindingError::NoMatchingOverload);
             }
-            let value = match sources.0.data_type {
+            let value = match sources.0.data_type() {
                 DataType::Decimal128(_, source_scale) => {
-                    let DataType::Decimal128(38, output_scale) = target.data_type else {
+                    let DataType::Decimal128(38, output_scale) = target.data_type() else {
                         return Err(FunctionBindingError::NoMatchingOverload);
                     };
                     ValueRecipe::Decimal {
-                        source_scale,
-                        output_scale,
+                        source_scale: *source_scale,
+                        output_scale: *output_scale,
                     }
                 }
                 _ => {
                     let valid = if sources.1.is_some() {
-                        target.data_type == DataType::Float64
+                        target.data_type() == &DataType::Float64
                     } else {
-                        target.data_type == DataType::Int64
+                        target.data_type() == &DataType::Int64
                     };
                     if !valid {
                         return Err(FunctionBindingError::NoMatchingOverload);
@@ -380,7 +380,7 @@ pub(super) fn evaluate_round<'a>(
     // The production host still owes formal memory authorization before builders.
     SelectedValues::try_new(
         selection,
-        &input.contract().result_type().data_type,
+        input.contract().result_type().data_type(),
         output.finish(),
         errors.into_boxed_slice(),
     )

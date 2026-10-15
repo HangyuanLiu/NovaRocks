@@ -554,10 +554,12 @@ mod validation_error_tests {
                 function_id: crate::FunctionId::try_new("builtin/test_sum/v1").unwrap(),
                 overload: crate::FunctionOverloadId::try_new("i64").unwrap(),
                 kind: crate::FunctionKind::Aggregate,
-                argument_types: Box::from([crate::FunctionArgumentType::Value(ValueType::new(
-                    DataType::Int64,
-                    false,
-                ))]),
+                argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    Box::from([crate::FunctionArgumentType::Value(ValueType::new(
+                        DataType::Int64,
+                        false,
+                    ))]),
+                ),
                 result_type: ValueType::new(DataType::Int64, false),
             },
             phase: AggregatePhase::Partial { sequence },

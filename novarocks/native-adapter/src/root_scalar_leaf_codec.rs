@@ -44,8 +44,9 @@ use novarocks_result_contract::{
     ScalarLeafError, ScalarOpaqueType, ScalarSchema, ScalarTimestampUnit, ScalarValueType,
 };
 use novarocks_result_render::{RenderTurn, RenderTurnStatus};
+use novarocks_type_contract::ValueLogicalType;
 use novarocks_type_contract::result_scalar_type::scalar_field_matches_storage;
-use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY};
+use novarocks_types::logical::NR_LOGICAL_TYPE_KEY;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeScalarLeafError {
@@ -176,7 +177,7 @@ impl NativeScalarLeafEncoder {
         empty_validation: bool,
     ) -> Result<Self, NativeScalarLeafError> {
         let schema = owner.schema();
-        let batch = &chunk.batch;
+        let batch = chunk.record_batch();
         if batch.num_columns() != 1
             || batch.schema_ref().fields().len() != 1
             || batch.num_rows() > 1
@@ -196,7 +197,7 @@ impl NativeScalarLeafEncoder {
             return Err(NativeScalarLeafError::Slot);
         }
         reject_container(schema.field())?;
-        if !slot.field_schema().children().is_empty()
+        if slot.field_schema().value_type().child_count() != 0
             || slot.field_schema().logical_type() != expected_logical(&schema.field().value_type)
         {
             return Err(NativeScalarLeafError::LogicalMetadata);
@@ -204,8 +205,12 @@ impl NativeScalarLeafEncoder {
         if Self::scratch_capacity_bytes() > prepaid_scratch_capacity {
             return Err(NativeScalarLeafError::ScratchLimit);
         }
-        validate_field_preflight(schema.field(), slot.field())?;
-        validate_field_preflight(schema.field(), &batch.schema_ref().fields()[0])?;
+        validate_field_preflight(schema.field(), slot.field(), !slot.is_typed())?;
+        validate_field_preflight(
+            schema.field(),
+            &batch.schema_ref().fields()[0],
+            !slot.is_typed(),
+        )?;
         let array = batch.column(0).as_ref();
         if array.len() != usize::from(!empty_validation)
             || !carrier_preflight_matches(
@@ -392,46 +397,42 @@ fn reject_container(field: &ScalarField) -> Result<(), NativeScalarLeafError> {
     }
     Ok(())
 }
-pub(crate) fn expected_logical(value: &ScalarValueType) -> Option<LogicalType> {
+pub(crate) fn expected_logical(value: &ScalarValueType) -> Option<ValueLogicalType> {
     match value {
-        ScalarValueType::Json => Some(LogicalType::Json),
-        ScalarValueType::Opaque(ScalarOpaqueType::Hll) => Some(LogicalType::Hll),
-        ScalarValueType::Opaque(ScalarOpaqueType::Bitmap) => Some(LogicalType::Bitmap),
-        ScalarValueType::Opaque(ScalarOpaqueType::Object) => Some(LogicalType::Object),
-        ScalarValueType::Opaque(ScalarOpaqueType::Percentile) => Some(LogicalType::Percentile),
+        ScalarValueType::Json => Some(ValueLogicalType::Json),
+        ScalarValueType::Variant => Some(ValueLogicalType::Variant),
+        ScalarValueType::LargeInt => Some(ValueLogicalType::LargeInt),
+        ScalarValueType::Opaque(ScalarOpaqueType::Hll) => Some(ValueLogicalType::Hll),
+        ScalarValueType::Opaque(ScalarOpaqueType::Bitmap) => Some(ValueLogicalType::Bitmap),
+        ScalarValueType::Opaque(ScalarOpaqueType::Object) => Some(ValueLogicalType::Object),
+        ScalarValueType::Opaque(ScalarOpaqueType::Percentile) => Some(ValueLogicalType::Percentile),
         _ => None,
     }
 }
 fn validate_field_preflight(
     expected: &ScalarField,
     actual: &Field,
+    legacy_annotations: bool,
 ) -> Result<(), NativeScalarLeafError> {
     if !carrier_preflight_matches(expected, actual.data_type(), actual.is_nullable()) {
         return Err(NativeScalarLeafError::Type);
     }
+    if !legacy_annotations {
+        return if actual.metadata().is_empty() {
+            Ok(())
+        } else {
+            Err(NativeScalarLeafError::LogicalMetadata)
+        };
+    }
+    // Temporary legacy annotation check. Typed input uses its explicit tree.
     // Borrow the canonical fact; normalizing with logical_type_of_field would
     // allocate and could conceal a stale/forged cached logical classification.
     let logical = actual
         .metadata()
         .get(NR_LOGICAL_TYPE_KEY)
         .map(String::as_str);
-    let complete = logical
-        .map(novarocks_type_contract::ValueLogicalType::from_metadata_value)
-        .transpose()
-        .map_err(|_| NativeScalarLeafError::LogicalMetadata)?;
-    let expected_complete = match expected.value_type {
-        ScalarValueType::LargeInt => Some(novarocks_type_contract::ValueLogicalType::LargeInt),
-        ScalarValueType::Variant => Some(novarocks_type_contract::ValueLogicalType::Variant),
-        _ => expected_logical(&expected.value_type).map(LogicalType::semantic_identity),
-    };
-    // Original unmarked LARGEINT/Variant sources remain valid. A complete
-    // marker, when present, must match this exact frozen scalar schema.
-    let historical_unmarked = complete.is_none()
-        && matches!(
-            expected.value_type,
-            ScalarValueType::LargeInt | ScalarValueType::Variant
-        );
-    if !historical_unmarked && complete != expected_complete {
+    if logical != expected_logical(&expected.value_type).and_then(ValueLogicalType::metadata_value)
+    {
         return Err(NativeScalarLeafError::LogicalMetadata);
     }
     Ok(())
@@ -731,7 +732,7 @@ pub(crate) fn borrow_leaf_at<'a>(
 mod tests {
     use super::*;
     use arrow::datatypes::i256;
-    use novarocks_execution::exec::chunk::{ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
+    use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use novarocks_result_contract::SCALAR_LEAF_HEADER_BYTES;
     use novarocks_types::SlotId;
 
@@ -749,18 +750,14 @@ mod tests {
     #[test]
     fn empty_dictionary_does_not_select_retained_values_and_requires_logical_facts() {
         let values: ArrayRef =
-            Arc::new(LargeStringArray::from(vec!["x".repeat(
+            Arc::new(StringArray::from(vec!["x".repeat(
                 novarocks_result_contract::ScalarProfileV1::SINGLE_VALUE_BYTES + 1,
             )]));
         let dictionary: ArrayRef = Arc::new(
             DictionaryArray::<Int32Type>::try_new(Int32Array::from(Vec::<i32>::new()), values)
                 .unwrap(),
         );
-        let source = chunk(
-            Arc::clone(&dictionary),
-            Some(LogicalType::Json.metadata_value()),
-            None,
-        );
+        let source = chunk(Arc::clone(&dictionary), Some(ValueLogicalType::Json), None);
         let mut cursor = NativeScalarLeafEncoder::try_validate_empty(
             &source,
             schema(ScalarValueType::Json, true),
@@ -784,18 +781,82 @@ mod tests {
             Err(NativeScalarLeafError::LogicalMetadata)
         ));
     }
-    // These source fixtures are not original funding/provenance proofs. The
-    // leaf bridge is tested separately from the caller's complete Chunk proof.
-    fn chunk(array: ArrayRef, logical: Option<&str>, cached: Option<ChunkFieldSchema>) -> Chunk {
+    // Explicit fixture declarations and array backing precede the cursor's
+    // original funding proof. New Chunk wrappers use a real finite creation
+    // scope; source annotations never author or override the complete binding.
+    fn construction_factory(
+        tracker: &Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
+    ) -> Arc<dyn novarocks_execution::exec::pipeline::operator::input_construction::InputConstructionFactory>{
+        use novarocks_execution::exec::pipeline::operator::input_construction::{
+            InputConstructionProfile, try_runtime_input_construction_factory,
+        };
+        try_runtime_input_construction_factory(
+            InputConstructionProfile {
+                max_requests: 4096,
+                max_request_bytes: 1 << 20,
+                max_opaque_requests: 4096,
+                max_opaque_bytes: 1 << 20,
+                max_work: usize::MAX,
+                max_depth: 64,
+            },
+            tracker.clone(),
+            Arc::new(novarocks_execution::runtime::runtime_state::RuntimeErrorState::default()),
+        )
+        .unwrap()
+    }
+    fn try_chunk(
+        array: ArrayRef,
+        logical: Option<ValueLogicalType>,
+        source_annotation: Option<&str>,
+    ) -> Result<Chunk, String> {
+        use novarocks_execution::exec::pipeline::operator::input_construction::ConstructionFailure;
+        use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+        let value = FunctionValueType::try_with_logical_type(
+            array.data_type().clone(),
+            true,
+            logical.unwrap_or(ValueLogicalType::Physical),
+        )
+        .map_err(|error| error.to_string())?;
         let mut field = Field::new("value", array.data_type().clone(), true);
-        if let Some(logical) = logical {
-            field =
-                field.with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), logical.to_owned())].into());
+        if let Some(annotation) = source_annotation {
+            field = field
+                .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), annotation.to_owned())].into());
         }
-        let slot = ChunkSlotSchema::try_new_with_field(SlotId(7), field, cached, None).unwrap();
-        let schema = Arc::new(ChunkSchema::try_new(vec![slot]).unwrap());
-        let batch = RecordBatch::try_new(schema.arrow_schema_ref(), vec![array]).unwrap();
-        Chunk::try_new_with_chunk_schema(batch, schema).unwrap()
+        let fixture_storage = ValueTypeStorageLifetime::pure();
+        let slot = ChunkSlotSchema::try_new_typed(
+            SlotId(7),
+            Arc::new(field),
+            value.typed_binding().clone(),
+            None,
+            fixture_storage.clone(),
+        )?;
+        let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], fixture_storage)?);
+        let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+            "scalar leaf source fixture",
+        );
+        let factory = construction_factory(&tracker);
+        let scope = factory
+            .begin_typed_construction(&schema)
+            .map_err(|error| error.to_string())?;
+        let rows = array.len();
+        scope
+            .request(std::alloc::Layout::array::<ArrayRef>(1).unwrap())
+            .map_err(|error| error.to_string())?;
+        Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            schema,
+            vec![array],
+            rows,
+            scope.storage_lifetime(),
+            |step| scope.observe(0, &[], step),
+        )
+        .map_err(|error| error.to_string())
+    }
+    fn chunk(
+        array: ArrayRef,
+        logical: Option<ValueLogicalType>,
+        source_annotation: Option<&str>,
+    ) -> Chunk {
+        try_chunk(array, logical, source_annotation).unwrap()
     }
     fn finish_validation(
         cursor: &mut NativeScalarLeafEncoder,
@@ -854,8 +915,8 @@ mod tests {
         let expected = schema(ScalarValueType::Json, true);
         let empty = chunk(
             Arc::new(StringArray::from(Vec::<&str>::new())),
-            Some("forged"),
             None,
+            Some("forged"),
         );
         assert_eq!(
             validate_to_completion(&empty, &expected),
@@ -863,8 +924,8 @@ mod tests {
         );
         let rows = chunk(
             Arc::new(StringArray::from(vec!["a", "b"])),
-            Some("forged"),
             None,
+            Some("forged"),
         );
         assert_eq!(
             validate_to_completion(&rows, &expected),
@@ -872,69 +933,43 @@ mod tests {
         );
     }
     #[test]
-    fn canonical_metadata_and_cached_facts_must_both_match() {
-        let expected = schema(ScalarValueType::Json, true);
-        let plain = chunk(Arc::new(StringArray::from(vec!["{}"])), None, None);
-        assert_eq!(
-            validate_to_completion(&plain, &expected),
-            Err(NativeScalarLeafError::LogicalMetadata)
-        );
-        let fake = ChunkFieldSchema::from_field(
-            &Field::new("fake", DataType::Utf8, true)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned())].into()),
-        )
-        .unwrap();
-        let forged_cache = chunk(Arc::new(StringArray::from(vec!["{}"])), None, Some(fake));
-        assert_eq!(
-            validate_to_completion(&forged_cache, &expected),
-            Err(NativeScalarLeafError::LogicalMetadata)
-        );
-        let normalized = chunk(
-            Arc::new(StringArray::from(vec!["{}"])),
-            Some(" JSON "),
-            None,
-        );
-        assert_eq!(
-            validate_to_completion(&normalized, &expected),
-            Err(NativeScalarLeafError::LogicalMetadata)
-        );
-        let exact = chunk(Arc::new(StringArray::from(vec!["{}"])), Some("json"), None);
-        assert!(validate_to_completion(&exact, &expected).is_ok());
-        assert_eq!(
-            validate_to_completion(&exact, &schema(ScalarValueType::String, true)),
-            Err(NativeScalarLeafError::LogicalMetadata)
-        );
+    fn complete_typed_domain_cannot_be_retagged_by_source_annotations() {
+        for annotation in ["json", " JSON ", "forged", ""] {
+            let plain = chunk(
+                Arc::new(StringArray::from(vec!["{}"])),
+                None,
+                Some(annotation),
+            );
+            assert_eq!(
+                validate_to_completion(&plain, &schema(ScalarValueType::Json, true)),
+                Err(NativeScalarLeafError::LogicalMetadata)
+            );
+            assert!(validate_to_completion(&plain, &schema(ScalarValueType::String, true)).is_ok());
+            let json = chunk(
+                Arc::new(StringArray::from(vec!["{}"])),
+                Some(ValueLogicalType::Json),
+                Some(annotation),
+            );
+            assert!(json.chunk_schema().slots()[0].field().metadata().is_empty());
+            assert!(validate_to_completion(&json, &schema(ScalarValueType::Json, true)).is_ok());
+            assert_eq!(
+                validate_to_completion(&json, &schema(ScalarValueType::String, true)),
+                Err(NativeScalarLeafError::LogicalMetadata)
+            );
+        }
     }
     #[test]
-    fn cached_logical_fact_cannot_override_or_erase_exact_field_metadata() {
-        let canonical_json_with_empty_cache = chunk(
-            Arc::new(StringArray::from(vec!["{}"])),
-            Some("json"),
-            Some(ChunkFieldSchema::empty()),
-        );
+    fn bare_fixed_binary_does_not_author_large_int() {
+        let array: ArrayRef =
+            Arc::new(FixedSizeBinaryArray::try_from_iter([[0u8; 16]].into_iter()).unwrap());
+        let plain = chunk(array.clone(), None, None);
         assert_eq!(
-            validate_to_completion(
-                &canonical_json_with_empty_cache,
-                &schema(ScalarValueType::Json, true),
-            ),
-            Err(NativeScalarLeafError::LogicalMetadata),
+            validate_to_completion(&plain, &schema(ScalarValueType::LargeInt, true)),
+            Err(NativeScalarLeafError::LogicalMetadata)
         );
-        let cached_json = ChunkFieldSchema::from_field(
-            &Field::new("cache", DataType::Utf8, true)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned())].into()),
-        )
-        .unwrap();
-        let plain_string_with_json_cache = chunk(
-            Arc::new(StringArray::from(vec!["plain"])),
-            None,
-            Some(cached_json),
-        );
-        assert_eq!(
-            validate_to_completion(
-                &plain_string_with_json_cache,
-                &schema(ScalarValueType::String, true),
-            ),
-            Err(NativeScalarLeafError::LogicalMetadata),
+        let declared = chunk(array, Some(ValueLogicalType::LargeInt), None);
+        assert!(
+            validate_to_completion(&declared, &schema(ScalarValueType::LargeInt, true)).is_ok()
         );
     }
     #[test]
@@ -1048,7 +1083,10 @@ mod tests {
     fn raw_binary_and_opaque_bytes_survive_one_byte_output_turns() {
         for (value_type, logical) in [
             (ScalarValueType::Binary, None),
-            (ScalarValueType::Opaque(ScalarOpaqueType::Hll), Some("hll")),
+            (
+                ScalarValueType::Opaque(ScalarOpaqueType::Hll),
+                Some(ValueLogicalType::Hll),
+            ),
         ] {
             let input = chunk(
                 Arc::new(BinaryArray::from(vec![&[0xff, 0x00, 0x80][..]])),
@@ -1209,7 +1247,7 @@ mod tests {
             ),
         ];
         for (array, semantic, payload) in cases {
-            let input = chunk(array, None, None);
+            let input = chunk(array, expected_logical(&semantic), None);
             let expected = schema(semantic, true);
             let wire = encode(&input, Arc::clone(&expected), 1);
             assert_eq!(&wire[SCALAR_LEAF_HEADER_BYTES..], payload.as_slice());
@@ -1217,16 +1255,16 @@ mod tests {
         }
     }
     #[test]
-    fn complete_scalar_markers_preserve_largeint_and_variant_without_new_tags() {
+    fn complete_scalar_identities_preserve_largeint_and_variant_without_source_tags() {
         let large: ArrayRef =
             Arc::new(FixedSizeBinaryArray::try_from_iter([[0_u8; 16]].into_iter()).unwrap());
         let variant: ArrayRef = Arc::new(LargeBinaryArray::from(vec![&[0xff, 0x00][..]]));
         for (array, marker, value_type) in [
-            (large, "largeint", ScalarValueType::LargeInt),
-            (variant, "variant", ScalarValueType::Variant),
+            (large, ValueLogicalType::LargeInt, ScalarValueType::LargeInt),
+            (variant, ValueLogicalType::Variant, ScalarValueType::Variant),
         ] {
-            let plain = chunk(Arc::clone(&array), None, None);
-            let marked = chunk(array, Some(marker), None);
+            let plain = chunk(Arc::clone(&array), Some(marker), None);
+            let marked = chunk(array, Some(marker), Some("forged"));
             let expected = schema(value_type, true);
             assert_eq!(
                 encode(&plain, Arc::clone(&expected), 1),
@@ -1235,7 +1273,7 @@ mod tests {
         }
         let uuid = chunk(
             Arc::new(FixedSizeBinaryArray::try_from_iter([[0_u8; 16]].into_iter()).unwrap()),
-            Some("uuid"),
+            Some(ValueLogicalType::Uuid),
             None,
         );
         assert_eq!(
@@ -1248,7 +1286,7 @@ mod tests {
     fn variant_and_json_preserve_the_declared_domain_without_formatting() {
         let variant = chunk(
             Arc::new(LargeBinaryArray::from(vec![&[0xff, 0x00][..]])),
-            None,
+            Some(ValueLogicalType::Variant),
             None,
         );
         let expected = schema(ScalarValueType::Variant, true);
@@ -1259,7 +1297,7 @@ mod tests {
         );
         let json = chunk(
             Arc::new(StringArray::from(vec![" {\"key\": 1} "])),
-            Some("json"),
+            Some(ValueLogicalType::Json),
             None,
         );
         let expected = schema(ScalarValueType::Json, true);
@@ -1300,13 +1338,22 @@ mod tests {
             Arc::new(StringArray::from(vec!["value"])),
         )
         .unwrap();
-        let input = chunk(Arc::new(wrong), None, None);
-        let expected = schema(ScalarValueType::String, true);
-        assert_eq!(
-            validate_to_completion(&input, &expected),
-            Err(NativeScalarLeafError::Type)
+        let error = try_chunk(Arc::new(wrong), None, None).unwrap_err();
+        assert!(
+            error.contains("Int32"),
+            "unsupported encoding must fail at typed ingress: {error}"
         );
-        let input = chunk(Arc::new(Int64Array::from(vec![11, -22, 33])), None, None).slice(1, 1);
+        let source = chunk(Arc::new(Int64Array::from(vec![11, -22, 33])), None, None);
+        let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+            "scalar leaf slice fixture",
+        );
+        let factory = construction_factory(&tracker);
+        let scope = factory.begin_input_construction(&source).unwrap();
+        let input = source
+            .slice_typed_observed(1, 1, scope.storage_lifetime(), |step| {
+                scope.observe(0, &[], step)
+            })
+            .unwrap();
         let expected = schema(ScalarValueType::SignedInteger(64), true);
         let wire = encode(&input, Arc::clone(&expected), 1);
         assert_eq!(&wire[SCALAR_LEAF_HEADER_BYTES..], &(-22_i64).to_le_bytes());
@@ -1364,7 +1411,7 @@ mod tests {
     }
     #[test]
     fn initial_timezone_validation_counts_all_three_sources_without_emission() {
-        let zone = "z".repeat(64 * 1024);
+        let zone = "z".repeat(novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES);
         let input = chunk(
             Arc::new(TimestampNanosecondArray::from(vec![7]).with_timezone(zone.clone())),
             None,
@@ -1383,20 +1430,20 @@ mod tests {
             NativeScalarLeafEncoder::scratch_capacity_bytes(),
         )
         .unwrap();
-        let mut examined = 0;
-        for turn_index in 0..6 {
-            assert_eq!(cursor.encoded_len(), None);
-            let mut output = [0xa5; 128];
-            let turn = cursor.step(&mut output).unwrap();
-            assert_eq!(output, [0xa5; 128]);
-            assert_eq!((turn.emitted_bytes, turn.completed_rows), (0, 0));
-            assert_eq!(turn.status, RenderTurnStatus::Yielded);
-            assert_eq!(turn.examined_bytes, 64 * 1024);
-            assert!(turn.visited_cells <= 1024);
-            examined += turn.examined_bytes;
-            assert_eq!(cursor.encoded_len().is_some(), turn_index == 5);
-        }
-        assert_eq!(examined, 6 * 64 * 1024);
+        assert_eq!(cursor.encoded_len(), None);
+        let mut untouched = [0xa5; 128];
+        let turn = cursor.step(&mut untouched).unwrap();
+        assert_eq!(untouched, [0xa5; 128]);
+        assert_eq!((turn.emitted_bytes, turn.completed_rows), (0, 0));
+        assert_eq!(turn.status, RenderTurnStatus::Yielded);
+        assert_eq!(
+            turn.examined_bytes,
+            6 * novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES
+        );
+        assert!(turn.visited_cells <= 1024);
+        // Valid execution types cap timezone bytes below one render quantum.
+        // All three immutable sources are still checked, counting both inputs.
+        assert!(cursor.encoded_len().is_some());
         assert_eq!(cursor.encoded_len(), Some(32));
         let before = cursor.offset;
         assert_eq!(cursor.step(&mut []).unwrap().emitted_bytes, 0);
@@ -1406,8 +1453,8 @@ mod tests {
         assert_eq!(&output[24..], &7_i64.to_le_bytes());
     }
     #[test]
-    fn equal_length_timezone_mismatch_is_incremental_and_latched() {
-        let original_zone = "z".repeat(64 * 1024);
+    fn equal_length_valid_timezone_mismatch_is_rejected_and_latched() {
+        let original_zone = "z".repeat(novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES);
         let input = chunk(
             Arc::new(TimestampNanosecondArray::from(vec![7]).with_timezone(original_zone.clone())),
             None,
@@ -1428,8 +1475,6 @@ mod tests {
             NativeScalarLeafEncoder::scratch_capacity_bytes(),
         )
         .unwrap();
-        let first = cursor.step(&mut []).unwrap();
-        assert_eq!(first.examined_bytes, 64 * 1024);
         assert_eq!(cursor.encoded_len(), None);
         let mut output = [0xa5; 32];
         assert!(matches!(
@@ -1444,27 +1489,43 @@ mod tests {
         ));
     }
     #[test]
-    fn batch_timezone_is_checked_after_a_distinct_matching_slot_field() {
-        let zone = "z".repeat(64 * 1024);
+    fn timezone_over_execution_profile_is_refused_before_scalar_cursor_construction() {
+        let array: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![7]).with_timezone(
+            "z".repeat(novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES + 1),
+        ));
+        let error = try_chunk(array, None, None).unwrap_err();
+        assert!(error.contains("timezone exceeds the byte limit"), "{error}");
+    }
+    #[test]
+    fn immutable_typed_constructor_refuses_batch_timezone_drift_and_target_stays_exact() {
+        use novarocks_execution::exec::pipeline::operator::input_construction::ConstructionFailure;
+        let zone = "z".repeat(novarocks_type_contract::MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES);
         let good = TimestampNanosecondArray::from(vec![7]).with_timezone(zone.clone());
-        let mut input = chunk(Arc::new(good), None, None);
+        let input = chunk(Arc::new(good), None, None);
         let mut wrong = zone.clone().into_bytes();
         *wrong.last_mut().unwrap() = b'q';
-        let bad = Arc::new(
+        let bad: ArrayRef = Arc::new(
             TimestampNanosecondArray::from(vec![7])
                 .with_timezone(String::from_utf8(wrong).unwrap()),
-        ) as ArrayRef;
-        // The public Chunk batch can be replaced independently of its slot
-        // schema. Keep a valid RecordBatch; do not violate Arrow unsafe APIs.
-        input.batch = RecordBatch::try_new(
-            Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
-                "value",
-                bad.data_type().clone(),
-                true,
-            )])),
-            vec![bad],
+        );
+        let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+            "scalar timezone mismatch",
+        );
+        let factory = construction_factory(&tracker);
+        let initial = tracker.current();
+        let scope = factory.begin_input_construction(&input).unwrap();
+        scope
+            .request(std::alloc::Layout::array::<ArrayRef>(1).unwrap())
+            .unwrap();
+        let failure = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            input.chunk_schema_ref(),
+            vec![bad.clone()],
+            1,
+            scope.storage_lifetime(),
+            |step| scope.observe(0, &[], step),
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(failure.to_string().contains("layout") || failure.to_string().contains("carrier"));
         let expected = schema(
             ScalarValueType::Timestamp {
                 unit: ScalarTimestampUnit::Nanosecond,
@@ -1472,21 +1533,16 @@ mod tests {
             },
             true,
         );
-        let mut cursor = NativeScalarLeafEncoder::try_begin(
-            &input,
-            expected,
-            NativeScalarLeafEncoder::scratch_capacity_bytes(),
-        )
-        .unwrap();
-        for _ in 0..3 {
-            let turn = cursor.step(&mut []).unwrap();
-            assert_eq!(turn.examined_bytes, 64 * 1024);
-            assert_eq!(turn.emitted_bytes, 0);
-        }
-        assert!(matches!(
-            cursor.step(&mut []),
+        assert!(validate_to_completion(&input, &expected).is_ok());
+        let distinct = chunk(bad, None, None);
+        assert_eq!(
+            validate_to_completion(&distinct, &expected),
             Err(NativeScalarLeafError::Type)
-        ));
+        );
+        drop(scope);
+        assert_eq!(tracker.current(), initial);
+        drop(factory);
+        assert_eq!(tracker.current(), 0);
     }
     #[test]
     fn cancellation_in_both_phases_retires_retained_array_and_slot_aliases() {

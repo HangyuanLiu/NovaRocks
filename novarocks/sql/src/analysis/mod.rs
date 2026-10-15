@@ -43,7 +43,7 @@ pub enum UnpivotConstant {
 impl UnpivotConstant {
     pub fn data_type(&self) -> arrow::datatypes::DataType {
         match self {
-            Self::Scalar(expression) => expression.value_type.data_type.clone(),
+            Self::Scalar(expression) => expression.value_type.data_type().clone(),
             Self::Int32List(_) => arrow::datatypes::DataType::List(std::sync::Arc::new(
                 arrow::datatypes::Field::new("item", arrow::datatypes::DataType::Int32, false),
             )),
@@ -71,7 +71,7 @@ impl UnpivotConstant {
 
     pub fn nullable(&self) -> bool {
         match self {
-            Self::Scalar(expression) => expression.value_type.nullable,
+            Self::Scalar(expression) => expression.value_type.nullable(),
             Self::Int32List(_) | Self::Utf8Map(_) => false,
         }
     }
@@ -358,7 +358,10 @@ pub(crate) fn function_argument(
                     parameter_types.push(param.value_type.clone());
                 }
                 FunctionArgument::Lambda {
-                    parameter_types: parameter_types.into_boxed_slice(),
+                    parameter_types:
+                        novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                            parameter_types.into_boxed_slice(),
+                        ),
                     result_type: body.value_type.clone(),
                 }
             }
@@ -506,23 +509,28 @@ pub(crate) fn test_function_binding(
             selected: novarocks_functions::FunctionBindingSelection {
                 overload: FunctionOverloadId::try_new(format!("test.scalar/{name}/overload-v1"))
                     .expect("test function overload identity"),
-                argument_types: args
-                    .iter()
-                    .map(|argument| match &argument.kind {
-                        ExprKind::LambdaFunction { params, body } => {
-                            novarocks_functions::FunctionArgumentType::Lambda {
-                                parameter_types: params
-                                    .iter()
-                                    .map(|param| param.value_type.clone())
-                                    .collect(),
-                                result_type: body.value_type.clone(),
-                            }
-                        }
-                        _ => novarocks_functions::FunctionArgumentType::Value(
-                            argument.value_type.clone(),
-                        ),
-                    })
-                    .collect(),
+                argument_types:
+                    novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                        args.iter()
+                            .map(|argument| match &argument.kind {
+                                ExprKind::LambdaFunction { params, body } => {
+                                    novarocks_functions::FunctionArgumentType::Lambda {
+                                        parameter_types:
+                                            novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                                                params
+                                                    .iter()
+                                                    .map(|param| param.value_type.clone())
+                                                    .collect(),
+                                            ),
+                                        result_type: body.value_type.clone(),
+                                    }
+                                }
+                                _ => novarocks_functions::FunctionArgumentType::Value(
+                                    argument.value_type.clone(),
+                                ),
+                            })
+                            .collect(),
+                    ),
                 result_type: FunctionResultType::Scalar(FunctionValueType::new(
                     result_type,
                     result_nullable,

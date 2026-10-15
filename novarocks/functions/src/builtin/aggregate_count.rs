@@ -18,7 +18,7 @@
 //! Exact four-phase non-DISTINCT COUNT lifecycle. Inline state has no heap.
 //! Allocation Layout checks describe requests; host memory grants remain external.
 
-use super::aggregate_count_core::{self as core, CountNullRule, CountObservation, CountValue};
+use super::aggregate_count_core::{self as core, CountObservation};
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
@@ -88,6 +88,19 @@ impl PreparedAggregateKernel for CountKernel {
     fn contract(&self) -> &Arc<AggregateCallContract> {
         &self.contract
     }
+    fn argument_encoding(&self, ordinal: usize) -> crate::AggregateArgumentEncoding<'_> {
+        if self.contract.phase().consumes_logical_arguments()
+            && self.contract.logical_argument_types().len() == 1
+            && ordinal == 0
+        {
+            crate::AggregateArgumentEncoding::root_int32_string_dictionary(
+                self.contract.as_ref(),
+                ordinal,
+            )
+        } else {
+            crate::AggregateArgumentEncoding::plain(self.contract.as_ref(), ordinal)
+        }
+    }
     fn memory_policy(&self) -> AggregateStateMemoryPolicy {
         AggregateStateMemoryPolicy::FixedZero
     }
@@ -134,13 +147,12 @@ impl PreparedAggregateKernel for CountKernel {
                 row.ok_or_else(|| invalid("COUNT selected update ordinal is out of bounds"))?;
             if let Some(argument) = prepared.logical_arguments().first() {
                 let address = argument.value_row(ordinal, row);
-                let contributes = core::contributes(
-                    CountValue {
-                        array: argument.array().as_ref(),
-                        row: address,
-                    },
-                    CountNullRule::AggregateRootFast,
-                );
+                let contributes = !crate::kernel_input::logical_is_null(
+                    argument.array().as_ref(),
+                    address,
+                    1,
+                    work,
+                )?;
                 work.step()?;
                 if !contributes {
                     return Ok(());

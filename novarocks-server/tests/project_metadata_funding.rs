@@ -120,21 +120,35 @@ fn json() -> FunctionValueType {
     FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap()
 }
 fn nested() -> FunctionValueType {
-    let child =
-        Field::new("child_".repeat(100), DataType::Utf8, true).with_metadata(HashMap::from([
-            ("nr_logical_type".to_owned(), "json".to_owned()),
-            ("source_note".to_owned(), "original metadata".repeat(32)),
-        ]));
-    FunctionValueType::new(
-        DataType::Struct(
-            vec![
-                Arc::new(child),
-                Arc::new(Field::new("leaf", DataType::Int64, true)),
-            ]
-            .into(),
-        ),
+    let storage = ValueTypeStorageLifetime::pure();
+    let json =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+            .unwrap();
+    let mut fields = vec![ValueField::new(
+        "child_".repeat(100),
+        json.value_type().clone(),
+        storage.clone(),
+    )];
+    let mut physical = vec![Arc::new(Field::new(
+        "child_".repeat(100),
+        DataType::Utf8,
         true,
+    ))];
+    let leaf = FunctionValueType::new(DataType::Int64, true);
+    fields.push(ValueField::new(
+        "leaf",
+        leaf.value_type().clone(),
+        storage.clone(),
+    ));
+    physical.push(Arc::new(Field::new("leaf", DataType::Int64, true)));
+    let value = ValueTypeRef::try_new(
+        ValueKind::Struct(fields.into_boxed_slice()),
+        true,
+        storage.clone(),
     )
+    .unwrap();
+    let layout = ValueLayout::try_new(&DataType::Struct(physical.into()), storage).unwrap();
+    FunctionValueType::try_from_value(value, layout).unwrap()
 }
 // A legal zero-row Values input and a computing Project value root. No data
 // calculation is necessary to exercise the original immutable metadata births.
@@ -221,7 +235,7 @@ fn source(ty: FunctionValueType, label_bytes: usize) -> Vec<u8> {
         fragment: fragment.id(),
         output: fragment.nodes()[&project].output.clone(),
         fields: Box::from([ResultField {
-            domain: if ty.logical_type == ValueLogicalType::Json {
+            domain: if ty.logical_type() == ValueLogicalType::Json {
                 ResultValueDomain::Json
             } else {
                 ResultValueDomain::Plain
@@ -265,27 +279,36 @@ fn source(ty: FunctionValueType, label_bytes: usize) -> Vec<u8> {
         .unwrap()
         .encode_to_vec()
 }
+fn construction_tracker() -> Arc<novarocks_execution::runtime::mem_tracker::MemTracker> {
+    let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+        "typed schema funding test",
+    );
+    tracker.install_limit_once(64 << 20).unwrap();
+    tracker
+}
 fn compile(
     bytes: &[u8],
     binding: &QueryMemoryBinding,
+    tracker: &Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
     preparation: &novarocks_worker::PreparationControlLoan<'_>,
     journal: &mut ProjectMetadataJournal,
 ) -> CompiledTaskProgram {
     let mut types = TypeMaterializationJournal::default();
     let mut type_host = TypeMaterializationHost::new(binding, preparation, &mut types);
     let mut project_host = ProjectMetadataHost::new(binding, preparation, journal);
-    interpreter()
-        .compile(
-            bytes,
-            CompiledTaskOptions {
-                pipeline_dop: NonZeroUsize::MIN,
-                exchange_wait: Duration::from_millis(50),
-            },
-            &Control,
-            &mut type_host,
-            &mut project_host,
-        )
-        .unwrap()
+    novarocks_native_adapter::backend_task_execution::compile_native_package_with_funding_for_test(
+        &interpreter(),
+        bytes,
+        CompiledTaskOptions {
+            pipeline_dop: NonZeroUsize::MIN,
+            exchange_wait: Duration::from_millis(50),
+        },
+        Arc::clone(tracker),
+        &Control,
+        &mut type_host,
+        &mut project_host,
+    )
+    .unwrap()
 }
 fn token(value: &String) -> RecordRef {
     assert!(value.capacity() >= 512);
@@ -293,7 +316,7 @@ fn token(value: &String) -> RecordRef {
     // initialized tag immediately follows this live original String backing.
     unsafe { RecordRef::read(value.as_ptr().add(value.capacity())) }
 }
-fn settled(journal: &ProjectMetadataJournal) {
+fn settled(journal: &ProjectMetadataJournal, has_fresh_large_backing: bool) {
     use novarocks_memory::attribution::scope::{AmbientEntryObservation, AmbientExitObservation};
     assert_eq!(
         journal.body.observation.entry(),
@@ -304,7 +327,14 @@ fn settled(journal: &ProjectMetadataJournal) {
         AmbientExitObservation::Restored
     );
     let receipt = journal.body.settlement.as_ref().unwrap();
-    assert!(receipt.accepted_live > 0);
+    if has_fresh_large_backing {
+        assert!(receipt.accepted_live > 0);
+    } else {
+        assert_eq!(
+            receipt.accepted_live, 0,
+            "shared Fields are not charged as fresh backing"
+        );
+    }
     assert_eq!(receipt.debt, 0);
     assert_eq!(receipt.next_step, Ok(()));
     assert_eq!(journal.body.stopped, Some(Ok(())));
@@ -321,12 +351,13 @@ fn project_original_compile_and_schema_aliases_keep_tagged_origin_to_cross_threa
     let _ = novarocks_server::memory_observation::snapshot();
     for ty in [json(), nested()] {
         let binding = binding(64 << 20);
+        let tracker = construction_tracker();
         let bytes = source(ty.clone(), 512);
         let owner = TestPreparationControl::new(Duration::from_millis(1));
         let loan = owner.loan();
         let mut journal = ProjectMetadataJournal::default();
-        let compiled = compile(&bytes, &binding, &loan, &mut journal);
-        settled(&journal);
+        let compiled = compile(&bytes, &binding, &tracker, &loan, &mut journal);
+        settled(&journal, true);
         let root = compiled.program().graph().root();
         let first = Arc::clone(
             &compiled.program().graph().nodes()[root.index()]
@@ -335,7 +366,18 @@ fn project_original_compile_and_schema_aliases_keep_tagged_origin_to_cross_threa
                 .fields()[0],
         );
         let first_token = token(first.name());
-        assert_eq!(FunctionValueType::try_from_field(&first).unwrap(), ty);
+        assert_eq!(
+            compiled.program().graph().nodes()[root.index()]
+                .output_layout()
+                .value_binding_at(0),
+            Some(ty.typed_binding()),
+        );
+        assert_eq!(first.metadata().capacity(), 0);
+        if let DataType::Struct(children) = first.data_type() {
+            for child in children {
+                assert_eq!(child.metadata().capacity(), 0);
+            }
+        }
         let PreparedProjectMetadataForTest {
             program,
             factory,
@@ -344,17 +386,22 @@ fn project_original_compile_and_schema_aliases_keep_tagged_origin_to_cross_threa
             compiled,
             CompiledSchemaSite::Project(root),
             &binding,
+            Arc::clone(&tracker),
             &loan,
             &Control,
             &mut journal,
         )
         .unwrap();
-        settled(&journal);
+        settled(&journal, false);
         let last = Arc::clone(&schema.arrow_schema_ref().fields()[0]);
         let last_token = token(last.name());
-        assert_ne!(
+        assert!(
+            Arc::ptr_eq(&first, &last),
+            "runtime shares the accurately bound immutable Field"
+        );
+        assert_eq!(
             first_token, last_token,
-            "the two original births retain distinct real records"
+            "shared backing keeps its original funded record"
         );
         assert_eq!(first.as_ref(), last.as_ref());
         for reference in [first_token, last_token] {
@@ -386,8 +433,8 @@ fn project_original_compile_and_schema_aliases_keep_tagged_origin_to_cross_threa
             })
             .unwrap();
         // The earlier type producer has already exited. Only its genuinely
-        // idle rights may return; the two independent live alias records keep
-        // their exact responsibility through retirement.
+        // idle rights may return; independent aliases keep the original
+        // shared backing responsibility through retirement.
         let retained_committed = committed.checked_sub(transfer.returned_idle).unwrap();
         assert!(retained_committed > 0);
         assert_eq!(
@@ -401,6 +448,10 @@ fn project_original_compile_and_schema_aliases_keep_tagged_origin_to_cross_threa
         }
         std::thread::spawn(move || {
             drop(first);
+            assert!(
+                global_store().snapshot_ref(last_token).unwrap().outstanding > 0,
+                "the last independent Field alias still retains the original backing"
+            );
             drop(last);
         })
         .join()
@@ -464,20 +515,28 @@ fn project_original_schema_host_preserves_capacity_and_worker_stop_before_body()
     use novarocks_worker::PreparationStop;
     let _ = novarocks_server::memory_observation::snapshot();
     let binding = binding(64 << 20);
+    let tracker = construction_tracker();
     let bytes = source(json(), 512);
     let owner = TestPreparationControl::new(Duration::from_millis(1));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
-    let first = compile(&bytes, &binding, &loan, &mut journal);
-    let second = compile(&bytes, &binding, &loan, &mut journal);
+    let first = compile(&bytes, &binding, &tracker, &loan, &mut journal);
+    let second = compile(&bytes, &binding, &tracker, &loan, &mut journal);
     let site = CompiledSchemaSite::Project(first.program().graph().root());
     binding
         .account()
         .install_policy(0, novarocks_memory::LimitDimension::Work);
-    let error =
-        prepare_project_metadata_for_test(first, site, &binding, &loan, &Control, &mut journal)
-            .err()
-            .expect("actual account policy refuses schema admission");
+    let error = prepare_project_metadata_for_test(
+        first,
+        site,
+        &binding,
+        Arc::clone(&tracker),
+        &loan,
+        &Control,
+        &mut journal,
+    )
+    .err()
+    .expect("actual account policy refuses schema admission");
     assert!(matches!(
         error.cause(),
         ExecutionFailureCause::PreparationMetadata(PreparationMetadataFailure::Host(
@@ -489,10 +548,17 @@ fn project_original_schema_host_preserves_capacity_and_worker_stop_before_body()
     assert!(owner.stop(PreparationStop::Abort(
         novarocks_execution_contract::AbortCause::QueryFailed
     )));
-    let error =
-        prepare_project_metadata_for_test(second, site, &binding, &loan, &Control, &mut journal)
-            .err()
-            .expect("original Worker stop precedes another admission");
+    let error = prepare_project_metadata_for_test(
+        second,
+        site,
+        &binding,
+        Arc::clone(&tracker),
+        &loan,
+        &Control,
+        &mut journal,
+    )
+    .err()
+    .expect("original Worker stop precedes another admission");
     assert_eq!(
         error.cause(),
         &ExecutionFailureCause::PreparationMetadata(PreparationMetadataFailure::Host(
@@ -515,11 +581,12 @@ fn project_original_schema_host_preserves_real_qualified_shared_shortage_before_
     const TOTAL: u64 = 2 << 20;
     const CAPACITY: u64 = TOTAL * 3 / 4;
     let binding = binding(TOTAL);
+    let tracker = construction_tracker();
     let bytes = source(json(), 512);
     let owner = TestPreparationControl::new(Duration::from_millis(1));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
-    let compiled = compile(&bytes, &binding, &loan, &mut journal);
+    let compiled = compile(&bytes, &binding, &tracker, &loan, &mut journal);
     let site = CompiledSchemaSite::Project(compiled.program().graph().root());
     let original = token(
         compiled.program().graph().nodes()[compiled.program().graph().root().index()]
@@ -548,10 +615,17 @@ fn project_original_schema_host_preserves_real_qualified_shared_shortage_before_
     let settlement = filler_journal.settlement.as_ref().unwrap();
     assert_eq!(settlement.accepted_live, (payload + 8) as u64);
     assert_eq!(settlement.debt, 0);
-    let error =
-        prepare_project_metadata_for_test(compiled, site, &binding, &loan, &Control, &mut journal)
-            .err()
-            .expect("actual occupied capacity refuses the schema request");
+    let error = prepare_project_metadata_for_test(
+        compiled,
+        site,
+        &binding,
+        Arc::clone(&tracker),
+        &loan,
+        &Control,
+        &mut journal,
+    )
+    .err()
+    .expect("actual occupied capacity refuses the schema request");
     let ExecutionFailureCause::PreparationMetadata(PreparationMetadataFailure::Host(
         PreparationMemoryRefusal::SharedShortage(receipt),
     )) = error.cause()

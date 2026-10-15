@@ -71,7 +71,8 @@ fn between_recipe_original_expansion_and_exact_flat_full_types() {
             DataType::Date32,
         ] {
             for nullable in [false, true] {
-                let ty = FunctionValueType::new(dtype.clone(), nullable);
+                let ty =
+                    FunctionValueType::from_legacy_declared_projection(dtype.clone(), nullable);
                 let out = FunctionValueType::new(DataType::Boolean, nullable);
                 let recipe = PreparedNativeBetweenRecipe::try_new(
                     plan,
@@ -90,7 +91,12 @@ fn between_recipe_original_expansion_and_exact_flat_full_types() {
         }
         for logical in [ValueLogicalType::LargeInt, ValueLogicalType::Uuid] {
             let mut ty = FunctionValueType::new(DataType::FixedSizeBinary(16), true);
-            ty.logical_type = logical;
+            ty = FunctionValueType::try_with_logical_type(
+                ty.data_type().clone(),
+                ty.nullable(),
+                logical,
+            )
+            .expect("valid declared function domain");
             PreparedNativeBetweenRecipe::try_new(
                 plan,
                 &ty,
@@ -131,7 +137,7 @@ fn between_recipe_refuses_inexact_domain_or_successful_null_loss() {
         ),
         Err(ComparisonPrepareError::TypeMismatch)
     ));
-    let nested = FunctionValueType::new(
+    let nested = FunctionValueType::from_legacy_declared_projection(
         DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
             "actual",
             DataType::Int64,

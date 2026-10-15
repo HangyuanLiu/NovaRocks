@@ -486,7 +486,10 @@ mod tests {
                 aggregates: vec![AggregateCall {
                     name: "max".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                     output_column_id: MAX_RESULT,
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![col_ref(T2_V2, "v2", DataType::Int64)],
@@ -694,7 +697,10 @@ mod tests {
                 aggregates: vec![AggregateCall {
                     name: "max".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                     output_column_id: MAX_RESULT,
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![col_ref(T2_V2, "v2", DataType::Int64)],
@@ -1008,7 +1014,10 @@ mod tests {
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                     output_column_id: SUM_RESULT,
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![col_ref(T2_V2, "v2", DataType::Int64)],

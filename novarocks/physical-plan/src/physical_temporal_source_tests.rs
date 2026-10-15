@@ -89,9 +89,11 @@ fn call(id: u32, identity: &str, child: u32, ty: DataType) -> ExprNode {
                 function_id: FunctionId::try_new(identity).unwrap(),
                 overload: FunctionOverloadId::try_new("fixture/exact-v1").unwrap(),
                 kind: FunctionKind::Scalar,
-                argument_types: Box::from([novarocks_type_contract::FunctionArgumentType::Value(
-                    ValueType::new(DataType::Int64, true),
-                )]),
+                argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    Box::from([novarocks_type_contract::FunctionArgumentType::Value(
+                        ValueType::new(DataType::Int64, true),
+                    )]),
+                ),
                 result_type: ValueType::new(ty, true),
                 legacy_metadata: None,
             },

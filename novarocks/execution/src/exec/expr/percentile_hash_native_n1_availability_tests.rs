@@ -62,14 +62,25 @@ fn hash_native_n1_exact_admission_preserves_original_variadic_binding_and_refuse
             )
             .unwrap();
         if n == 1 {
-            // Admission preserves every original fact and adds the exact ABI.
-            let mut expected = bound.clone();
-            expected.admitted_execution_abi = Some(novarocks_functions::PureKernelAbi::ScalarV1);
+            assert_eq!(bound.admitted_execution_abi, None);
+            let actual_abi = original
+                .pure_overload_declaration_observed(
+                    &bound.function_id,
+                    bound.kind,
+                    &bound.selected.overload,
+                    &control,
+                )
+                .unwrap()
+                .implementation()
+                .abi;
+            let mut admitted = exact
+                .resolve_scalar_binding("percentile_hash", &args, &control)
+                .unwrap();
+            assert_eq!(admitted.admitted_execution_abi, Some(actual_abi));
+            admitted.admitted_execution_abi = None;
             assert_eq!(
-                exact
-                    .resolve_scalar_binding("percentile_hash", &args, &control)
-                    .unwrap(),
-                expected
+                admitted, bound,
+                "complete original selected source is unchanged"
             );
             exact
                 .select_exact_overload_observed(

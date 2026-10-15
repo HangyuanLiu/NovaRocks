@@ -158,17 +158,24 @@ fn write_relation_contracts_are_versioned_append_only_fields() {
                 .as_message()
                 .expect("ArrowPhysicalColumn message")
                 .full_name(),
-            "novarocks.plan.ArrowPhysicalColumn"
+            "novarocks.arrow_type.ArrowPhysicalColumn"
         );
-        let metadata = schema
-            .get_field_by_name("schema_metadata")
-            .expect("schema metadata");
-        assert_eq!(metadata.number(), 3);
-        assert!(metadata.is_list());
+        assert!(schema.get_field_by_name("schema_metadata").is_none());
+        assert!(schema.reserved_ranges().any(|range| range.contains(&3)));
+        assert!(
+            schema
+                .reserved_names()
+                .any(|name| name == "schema_metadata")
+        );
+        let logical = schema
+            .get_field_by_name("logical_types")
+            .expect("complete logical namespace");
+        assert_eq!(logical.number(), 4);
+        assert!(logical.is_list());
     }
 
     let column = pool
-        .get_message_by_name("novarocks.plan.ArrowPhysicalColumn")
+        .get_message_by_name("novarocks.arrow_type.ArrowPhysicalColumn")
         .expect("ArrowPhysicalColumn descriptor");
     assert_eq!(
         column
@@ -190,21 +197,59 @@ fn write_relation_contracts_are_versioned_append_only_fields() {
     );
 
     let field = pool
-        .get_message_by_name("novarocks.plan.ArrowPhysicalField")
+        .get_message_by_name("novarocks.arrow_type.ArrowPhysicalField")
         .expect("ArrowPhysicalField descriptor");
     for (name, number) in [
         ("name", 1),
         ("nullable", 2),
         ("type", 3),
-        ("metadata", 4),
-        ("dictionary_id", 5),
-        ("dictionary_is_ordered", 6),
+        ("logical_type_id", 7),
     ] {
         assert_eq!(field.get_field_by_name(name).expect(name).number(), number);
     }
 
+    assert!(
+        field
+            .get_field_by_name("logical_type_id")
+            .unwrap()
+            .supports_presence()
+    );
+    for (number, name) in [
+        (4, "metadata"),
+        (5, "dictionary_id"),
+        (6, "dictionary_is_ordered"),
+    ] {
+        assert!(field.get_field_by_name(name).is_none());
+        assert!(field.reserved_ranges().any(|range| range.contains(&number)));
+        assert!(field.reserved_names().any(|reserved| reserved == name));
+    }
+    for (message, number, name) in [
+        (
+            "novarocks.arrow_type.ArrowPhysicalSchema",
+            2,
+            "schema_metadata",
+        ),
+        ("novarocks.plan.ColumnDef", 5, "logical_type"),
+    ] {
+        let descriptor = pool.get_message_by_name(message).unwrap();
+        assert!(descriptor.get_field_by_name(name).is_none());
+        assert!(
+            descriptor
+                .reserved_ranges()
+                .any(|range| range.contains(&number))
+        );
+        assert!(descriptor.reserved_names().any(|reserved| reserved == name));
+    }
+    let schema = pool
+        .get_message_by_name("novarocks.arrow_type.ArrowPhysicalSchema")
+        .unwrap();
+    assert_eq!(
+        schema.get_field_by_name("logical_types").unwrap().number(),
+        3
+    );
+
     let physical_type = pool
-        .get_message_by_name("novarocks.plan.ArrowPhysicalType")
+        .get_message_by_name("novarocks.arrow_type.ArrowPhysicalType")
         .expect("ArrowPhysicalType descriptor");
     let expected = [
         ("primitive", 1),
@@ -2031,4 +2076,40 @@ fn root_result_revocation_has_a_distinct_control_wait_status() {
     );
     assert_eq!(status.get_value_by_name("NOT_READY").unwrap().number(), 2);
     assert_eq!(status.get_value_by_name("ERROR").unwrap().number(), 4);
+}
+
+#[test]
+fn type_desc_is_only_an_explicit_complete_binding_reference() {
+    let pool = DescriptorPool::decode(FILE_DESCRIPTOR_SET).unwrap();
+    let desc = pool
+        .get_message_by_name("novarocks.common.TypeDesc")
+        .unwrap();
+    assert_eq!(desc.fields().count(), 1);
+    let binding = desc.get_field_by_name("value_binding_id").unwrap();
+    assert_eq!(binding.number(), 5);
+    assert!(binding.supports_presence());
+    let definition = desc.descriptor_proto();
+    assert_eq!(definition.oneof_decl.len(), 1);
+    assert_eq!(
+        definition.oneof_decl[0].name.as_deref(),
+        Some("_value_binding_id")
+    );
+    for name in ["scalar", "list", "map", "strct"] {
+        assert!(desc.get_field_by_name(name).is_none());
+        assert!(
+            definition
+                .reserved_name
+                .iter()
+                .any(|reserved| reserved == name)
+        );
+    }
+    for number in 1..=4 {
+        assert!(
+            definition
+                .reserved_range
+                .iter()
+                .any(|range| range.start.is_some_and(|start| start <= number)
+                    && range.end.is_some_and(|end| number < end))
+        );
+    }
 }

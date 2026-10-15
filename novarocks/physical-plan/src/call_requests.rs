@@ -19,6 +19,13 @@
 //! Representation equality compares pool addresses, never selected values.
 //! This table supplies no SQL provenance, effects or installed capability.
 
+mod materialize;
+pub use materialize::{
+    CallRequestMaterializationError, CallRequestMaterializationFailure, MaterializedCallRequest,
+    materialize_call_request_observed, materialize_call_request_with_creator_in,
+    materialize_call_request_with_factory_in,
+};
+
 use crate::{
     ConstantPolicy, ConstantReference, ExprId, ExprKind, Fragment, FragmentId, FrozenCallError,
     PhysicalCallBinding, PhysicalCallSite, ValueType,
@@ -56,11 +63,19 @@ impl PhysicalCallRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct FragmentCallRequests {
     fragment: FragmentId,
     entries: Arc<BTreeMap<PhysicalCallDefinition, PhysicalCallRequest>>,
+    // The independent table may outlive its Fragment and decoded request Vec.
+    storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
+impl PartialEq for FragmentCallRequests {
+    fn eq(&self, other: &Self) -> bool {
+        self.fragment == other.fragment && self.entries == other.entries
+    }
+}
+impl Eq for FragmentCallRequests {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CallRequestError {
     Control(CompileControlError),
@@ -73,6 +88,53 @@ pub enum CallRequestError {
     ExtraDefinition,
     InvalidArgumentCount(PhysicalCallDefinition),
     ArgumentTypeMismatch(PhysicalCallDefinition),
+    ConstructionResource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+    ConstructionTree(novarocks_type_contract::owned_resources::btree::BTreeResourceError),
+}
+impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for CallRequestError
+{
+    fn from(error: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::ConstructionResource(error)
+    }
+}
+#[derive(Debug)]
+pub enum CallRequestCreationFailure<H> {
+    Request(CallRequestError),
+    Creator(H),
+}
+impl<H> From<CallRequestError> for CallRequestCreationFailure<H> {
+    fn from(error: CallRequestError) -> Self {
+        Self::Request(error)
+    }
+}
+impl<H> From<CompileControlError> for CallRequestCreationFailure<H> {
+    fn from(error: CompileControlError) -> Self {
+        Self::Request(error.into())
+    }
+}
+impl<H> From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for CallRequestCreationFailure<H>
+{
+    fn from(error: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::Request(error.into())
+    }
+}
+impl<H: fmt::Display> fmt::Display for CallRequestCreationFailure<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Request(error) => error.fmt(f),
+            Self::Creator(error) => error.fmt(f),
+        }
+    }
+}
+impl<H: std::error::Error + 'static> std::error::Error for CallRequestCreationFailure<H> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Request(error) => Some(error),
+            Self::Creator(error) => Some(error),
+        }
+    }
 }
 impl fmt::Display for CallRequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -117,6 +179,7 @@ impl FragmentCallRequests {
         Self {
             fragment,
             entries: Arc::new(BTreeMap::new()),
+            storage: novarocks_type_contract::ValueTypeStorageLifetime::pure(),
         }
     }
     pub const fn fragment(&self) -> FragmentId {
@@ -134,9 +197,14 @@ impl FragmentCallRequests {
         control: &dyn PureCompileControl,
     ) -> Result<Self, CallRequestError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let result = Self::try_new_core(fragment, entries, &mut work, |table, fragment, _| {
-            table.validate_fragment(fragment, control)
-        });
+        let result = Self::try_new_core(
+            fragment,
+            entries,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            None,
+            &mut work,
+            |table, fragment, _| table.validate_fragment(fragment, control),
+        );
         finish(result, work)
     }
     /// Construct mandatory requests on the caller's original meter. The caller
@@ -147,21 +215,78 @@ impl FragmentCallRequests {
         entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, CallRequestError> {
-        Self::try_new_core(fragment, entries, work, |table, fragment, work| {
-            table.validate_fragment_in(fragment, work)
-        })
+        Self::try_new_core(
+            fragment,
+            entries,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            None,
+            work,
+            |table, fragment, work| table.validate_fragment_in(fragment, work),
+        )
     }
-    fn try_new_core(
+    /// Construct the same table through its actual caller's original ports.
+    /// Known Arc layout and locked BTree operation bounds remain distinct.
+    pub fn try_new_created_in<H>(
         fragment: &Fragment,
         entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+        creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
         work: &mut CompileCheckpoints<'_>,
-        validate: impl FnOnce(
-            &Self,
-            &Fragment,
-            &mut CompileCheckpoints<'_>,
-        ) -> Result<(), CallRequestError>,
-    ) -> Result<Self, CallRequestError> {
+    ) -> Result<Self, CallRequestCreationFailure<H>> {
+        creation.with_error_mapping(CallRequestCreationFailure::Creator, |mapped| {
+            Self::try_new_core(
+                fragment,
+                entries,
+                storage,
+                Some(mapped),
+                work,
+                |table, fragment, work| {
+                    table
+                        .validate_fragment_in(fragment, work)
+                        .map_err(Into::into)
+                },
+            )
+        })
+    }
+    pub fn storage_lifetime(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+        self.storage.clone()
+    }
+    fn try_new_core<E>(
+        fragment: &Fragment,
+        entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+        mut creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, E>>,
+        work: &mut CompileCheckpoints<'_>,
+        validate: impl FnOnce(&Self, &Fragment, &mut CompileCheckpoints<'_>) -> Result<(), E>,
+    ) -> Result<Self, E>
+    where
+        E: From<CallRequestError>
+            + From<CompileControlError>
+            + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+    {
         crate::resource::validate_call_request_source_observed(&entries, entries.capacity(), work)?;
+        let storage = if let Some(creation) = creation.as_deref_mut() {
+            work.flush()?;
+            let storage = creation
+                .storage_lifetime()
+                .retaining_observed(&storage, |layout| creation.request_layout(layout))?;
+            let tree = novarocks_type_contract::owned_resources::btree::insertion_only::<
+                PhysicalCallDefinition,
+                PhysicalCallRequest,
+            >(entries.len())
+            .map_err(CallRequestError::ConstructionTree)?;
+            if tree.request_bytes_upper_bound != 0 {
+                creation.observe_opaque_upper_bound(tree.request_bytes_upper_bound)?;
+            }
+            let arc = novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::new::<BTreeMap<PhysicalCallDefinition, PhysicalCallRequest>>(),
+            )?;
+            creation.request_layout(arc)?;
+            storage
+        } else {
+            storage
+        };
+
         let mut table = BTreeMap::new();
         for (definition, request) in entries {
             work.flush()?;
@@ -169,12 +294,13 @@ impl FragmentCallRequests {
             work.step()?;
             work.flush()?;
             if previous.is_some() {
-                return Err(CallRequestError::DuplicateDefinition(definition));
+                return Err(CallRequestError::DuplicateDefinition(definition).into());
             }
         }
         let table = Self {
             fragment: fragment.id(),
             entries: Arc::new(table),
+            storage,
         };
         work.flush()?;
         validate(&table, fragment, work)?;
@@ -327,6 +453,17 @@ impl Fragment {
     ) -> Result<Self, CallRequestError> {
         let requests = FragmentCallRequests::try_new_in(&self, entries, work)?;
         self.call_requests = requests;
+        Ok(self)
+    }
+    pub fn with_call_requests_created_in<H>(
+        mut self,
+        entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+        creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, CallRequestCreationFailure<H>> {
+        self.call_requests =
+            FragmentCallRequests::try_new_created_in(&self, entries, storage, creation, work)?;
         Ok(self)
     }
 }

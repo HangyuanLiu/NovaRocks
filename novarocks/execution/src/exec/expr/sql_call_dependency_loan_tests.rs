@@ -167,17 +167,24 @@ fn sql_call_dependency_loan_real_typed_empty_array_has_original_constraint() {
         .result_constraint()
         .expect("actual syntax authored result target");
     assert_eq!(original, &expression.ty);
-    assert!(!original.nullable);
-    assert_eq!(original.logical_type, ValueLogicalType::Physical);
-    let DataType::List(item) = &original.data_type else {
+    assert!(!original.nullable());
+    assert_eq!(original.logical_type(), ValueLogicalType::Physical);
+    let DataType::List(item) = &original.data_type() else {
         panic!("original typed array target")
     };
     assert_eq!(item.name(), "item");
     assert_eq!(item.data_type(), &DataType::Utf8);
-    assert_eq!(
-        novarocks_type_contract::field_logical_type(item).unwrap(),
-        ValueLogicalType::Json
-    );
+    let original_child = original
+        .child_at(0)
+        .expect("complete syntax-authored list child");
+    assert_eq!(original_child.logical_type(), ValueLogicalType::Json);
+    assert!(matches!(
+        original_child.value_type().kind(),
+        novarocks_type_contract::ValueKind::Nominal(ValueLogicalType::Json)
+    ));
+    assert_eq!(original_child.data_type(), item.data_type());
+    assert_eq!(original_child.nullable(), item.is_nullable());
+    assert_eq!(item.metadata().capacity(), 0);
     assert!(loan.original_arguments().is_empty());
     assert_eq!(loan.original_logical_argument_count(), 0);
     let canonical = loan.canonical().unwrap();

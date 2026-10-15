@@ -132,7 +132,7 @@ const NAMES: [&str; 2] = ["locate", "instr"];
 fn sources(arity: usize) -> Vec<FunctionValueType> {
     (0..arity)
         .map(|i| {
-            FunctionValueType::new(
+            FunctionValueType::from_legacy_declared_projection(
                 if i < 2 {
                     DataType::Utf8
                 } else {
@@ -204,7 +204,9 @@ fn string_locate_actual_three_profiles_preserve_independent_scalar_positions_and
     ] {
         let mut types = sources(3);
         for ty in &mut types {
-            ty.nullable = false;
+            *ty = ty
+                .with_nullable(false)
+                .expect("valid function nullability declaration");
         }
         let prepared = prepared_for_test_with_policy("locate", &types, policy).unwrap();
         assert_eq!(prepared.contract().result_type(), &target());
@@ -717,7 +719,7 @@ fn string_locate_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
             for source in [
                 FunctionValueType::new(DataType::LargeUtf8, true),
                 FunctionValueType::new(DataType::Binary, true),
-                FunctionValueType::new(
+                FunctionValueType::from_legacy_declared_projection(
                     DataType::List(Arc::new(arrow_schema::Field::new(
                         "item",
                         DataType::Int64,
@@ -749,7 +751,7 @@ fn string_locate_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
 fn string_locate_compile_success_and_ordinary_tail_preserve_all_callback_causes() {
     for ty in [source(true), FunctionValueType::new(DataType::Binary, true)] {
         let good = CompileControl::default();
-        let success = ty.data_type == DataType::Utf8;
+        let success = ty.data_type() == &DataType::Utf8;
         assert_eq!(
             prepared_for_test_with_control(
                 "locate",

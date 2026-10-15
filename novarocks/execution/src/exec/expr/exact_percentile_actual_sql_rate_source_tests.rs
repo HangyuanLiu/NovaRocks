@@ -68,7 +68,7 @@ fn check(mode: SqlPhysicalEmissionMode) {
                             call.binding.function.result_type
                         );
                         if !rate.starts_with("CAST") {
-                            assert_ne!(actual_rate.data_type, DataType::Float64);
+                            assert_ne!(actual_rate.data_type().clone(), DataType::Float64);
                         }
                         let FunctionArgumentType::Value(value) =
                             &call.binding.function.argument_types[0]
@@ -76,7 +76,9 @@ fn check(mode: SqlPhysicalEmissionMode) {
                             panic!("value")
                         };
                         let mut expected = value.clone();
-                        expected.nullable = true;
+                        expected = expected
+                            .with_nullable(true)
+                            .expect("valid test root nullability");
                         assert_eq!(call.binding.function.result_type, expected);
                         assert_eq!(
                             call.binding.intermediate_type,

@@ -42,7 +42,8 @@ mod type_views;
 pub use binding_sources::BindingSourceLimits;
 pub use decode::{
     PackageDecodeError, PackageDecodeLimits, decode_fragment_package,
-    decode_fragment_package_with_type_host,
+    decode_fragment_package_with_creator, decode_fragment_package_with_factory,
+    decode_fragment_package_with_factory_and_funding, decode_fragment_package_with_type_host,
 };
 pub use definition_sources::{
     DefinitionSourceLimits, FragmentDefinitionSource, visit_fragment_definitions_observed,

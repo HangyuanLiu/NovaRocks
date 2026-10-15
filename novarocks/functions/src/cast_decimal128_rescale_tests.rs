@@ -97,13 +97,13 @@ fn compare(
     row: usize,
     physical: usize,
 ) {
-    let DataType::Decimal128(p, s) = r.result.data_type else {
+    let DataType::Decimal128(p, s) = r.result.data_type() else {
         unreachable!()
     };
     let expected = crate::decimal128_rescale::evaluate_legacy(
         &array.slice(physical, 1),
-        p,
-        s,
+        *p,
+        *s,
         r.policy(),
         r.allow_throw_exception(),
     );
@@ -113,7 +113,7 @@ fn compare(
     match expected {
         Ok(out) => {
             let out = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
-            assert_eq!(out.data_type(), &r.result.data_type);
+            assert_eq!(out.data_type(), r.result.data_type());
             assert_eq!(out.is_null(0), matches!(result, CastRowResult::Null));
             if out.is_null(0) {
                 assert_eq!(result, CastRowResult::Null);
@@ -260,8 +260,8 @@ fn decimal128_rescale_recipe_exact_nullable_effects_policy_and_foreign_address_g
                 );
                 assert_eq!(
                     carrier_cast_can_produce_null_with_policy(
-                        &source.data_type,
-                        &result.data_type,
+                        source.data_type(),
+                        result.data_type(),
                         policy,
                         allow
                     ),
@@ -477,10 +477,10 @@ fn decimal128_rescale_recipe_original_extreme_delta_panic_is_not_a_kernel_failur
     });
     for (policy, allow) in modes() {
         let r = recipe(38, 38, 38, i8::MIN, true, policy, allow);
-        let out = std::panic::catch_unwind(|| {
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let a = input(38, 38, vec![Some(1)]);
             r.evaluate_row(EvaluatedArgument::Column(&a), 0, 0, &Control::default())
-        });
+        }));
         if arithmetic.is_err() {
             assert!(out.is_err());
         } else {

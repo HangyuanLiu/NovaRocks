@@ -78,7 +78,7 @@ fn function(kind: FunctionKind, result_type: ValueType) -> BoundFunction {
         function_id: FunctionId::try_new("fixture/frozen-calls/exact-id").unwrap(),
         overload: FunctionOverloadId::try_new("fixture/frozen-calls/exact-overload").unwrap(),
         kind,
-        argument_types: Box::default(),
+        argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::default()),
         result_type,
         legacy_metadata: Some(crate::LegacyBindingMetadata {
             volatility: FunctionVolatility::Immutable,
@@ -314,6 +314,7 @@ fn scalar_fixture(count: usize, fragment_id: u32) -> Fixture {
         .uses()
         .values()
         .map(|invocation| FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
@@ -614,6 +615,7 @@ fn case_fixture() -> Fixture {
         .map(|id| {
             let context = uses.flow().uses()[&ExpressionUseId::new(id)].context;
             FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -763,8 +765,12 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
             function: BoundTableFunction {
                 function_id: scalar_fields.function_id,
                 overload: scalar_fields.overload,
-                argument_types: Box::default(),
-                result_types: Box::from([integer()]),
+                argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    Box::default(),
+                ),
+                result_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from(
+                    [integer()],
+                )),
                 legacy_metadata: Some(crate::LegacyBindingMetadata {
                     volatility: scalar_fields.legacy_metadata.as_ref().unwrap().volatility,
                     argument_evaluation: scalar_fields
@@ -809,6 +815,7 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
     for (call, use_id) in [(0, special_base), (1, special_base + 1)] {
         let context = context(use_id, 0, EvaluationDemand::Value);
         calls.push(FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
@@ -829,6 +836,7 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
         .unwrap()
         .context;
     calls.push(FrozenPhysicalCall {
+        materialized_writer_input: None,
         regexp_count_pattern_source: None,
         to_base64_byte_source: None,
         temporal_source: None,
@@ -839,6 +847,7 @@ fn special_fixture_with_rows(input_rows: usize) -> Fixture {
     });
     let context = context(special_base + 2, u32::MAX, EvaluationDemand::Value);
     calls.push(FrozenPhysicalCall {
+        materialized_writer_input: None,
         regexp_count_pattern_source: None,
         to_base64_byte_source: None,
         temporal_source: None,
@@ -905,7 +914,12 @@ fn real_aggregate_window_table_positions_borrow_selected_bindings() {
                     panic!("actual table")
                 };
                 assert!(std::ptr::eq(actual, function));
-                assert_eq!(actual.result_types, Box::from([integer()]));
+                assert_eq!(
+                    actual.result_types,
+                    novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from(
+                        [integer()]
+                    ))
+                );
             }
             _ => panic!("wrong binding family"),
         }
@@ -1077,7 +1091,10 @@ fn type_only_parent_retains_static_child_binding_without_runtime_child_claim() {
         .unwrap();
     let mut selected_parent = function(FunctionKind::Scalar, boolean());
     selected_parent.function_id = FunctionId::try_new("fixture/frozen-calls/inspect-type").unwrap();
-    selected_parent.argument_types = Box::from([FunctionArgumentType::Value(boolean())]);
+    selected_parent.argument_types =
+        novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+            FunctionArgumentType::Value(boolean()),
+        ]));
     let parent = builder
         .add_expression(
             node,
@@ -1139,6 +1156,7 @@ fn type_only_parent_retains_static_child_binding_without_runtime_child_claim() {
     let mut claimed = effects(FunctionKind::Scalar, current.domain);
     claimed.argument_control = ArgumentControl::TypeOnly;
     let parent_call = FrozenPhysicalCall {
+        materialized_writer_input: None,
         regexp_count_pattern_source: None,
         to_base64_byte_source: None,
         temporal_source: None,
@@ -1165,7 +1183,9 @@ fn type_only_parent_retains_static_child_binding_without_runtime_child_claim() {
     };
     assert_eq!(
         actual.argument_types,
-        Box::from([FunctionArgumentType::Value(boolean())])
+        novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+            FunctionArgumentType::Value(boolean())
+        ]))
     );
     let ExprKind::FunctionCall { args, .. } = &fragment.expressions().get(parent).unwrap().kind
     else {

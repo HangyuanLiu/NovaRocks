@@ -102,7 +102,9 @@ impl Owner {
                 constant: None,
             },
             FunctionArgument::Lambda {
-                parameter_types: Box::from([i64_type(false), i32_type(false)]),
+                parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                    Box::from([i64_type(false), i32_type(false)]),
+                ),
                 result_type: result,
             },
         ];
@@ -111,10 +113,13 @@ impl Owner {
             selected: Arc::new(FunctionBindingSelection {
                 overload: FunctionOverloadId::try_new("fixture/lambda-body/exact-signature")
                     .unwrap(),
-                argument_types: arguments
-                    .iter()
-                    .map(FunctionArgument::argument_type)
-                    .collect(),
+                argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                    arguments
+                        .iter()
+                        .map(FunctionArgument::argument_type)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
                 result_type: FunctionResultType::Scalar(i64_type(false)),
                 aggregate: None,
             }),
@@ -361,7 +366,7 @@ impl BoundLambdaBodyEvaluator for Evaluator {
             Arc::new(Int32Array::from(vec![0; selection.len()]))
         } else if matches!(self.mode, Mode::SuccessNull) {
             Arc::new(Int64Array::from(vec![None; selection.len()]))
-        } else if self.contract.result_type().data_type == DataType::Boolean {
+        } else if self.contract.result_type().data_type() == &DataType::Boolean {
             Arc::new(BooleanArray::from(
                 values
                     .iter()
@@ -565,10 +570,16 @@ fn successful_nullable_null_mints_no_parent_error_and_truth_only_has_exact_boole
     let selection = Selection::try_sparse(5, &rows).unwrap();
     let mut owner = Owner::new(EvaluationDemand::Value);
     if let FunctionArgument::Lambda { result_type, .. } = &mut owner.arguments[1] {
-        result_type.nullable = true;
+        *result_type = result_type
+            .with_nullable(true)
+            .expect("valid function nullability declaration");
     }
-    Arc::get_mut(&mut owner.selected).unwrap().argument_types[1] =
-        owner.arguments[1].argument_type();
+    let selected = Arc::get_mut(&mut owner.selected).unwrap();
+    let mut argument_types = selected.argument_types.as_slice().to_vec();
+    argument_types[1] = owner.arguments[1].argument_type();
+    selected.argument_types = novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+        argument_types.into_boxed_slice(),
+    );
     let body = checked_body(owner.call(), true);
     let input = body_input(&body, selection, &parents, &parameters, &captures);
     let mut evaluator = Evaluator::new(body.clone());
@@ -583,7 +594,7 @@ fn successful_nullable_null_mints_no_parent_error_and_truth_only_has_exact_boole
     let owner = Owner::new(EvaluationDemand::TruthOnly);
     let body = checked_body(owner.call(), true);
     assert_eq!(body.context().demand, EvaluationDemand::TruthOnly);
-    assert_eq!(body.result_type().data_type, DataType::Boolean);
+    assert_eq!(body.result_type().data_type().clone(), DataType::Boolean);
     let input = body_input(&body, selection, &parents, &parameters, &captures);
     let mut evaluator = Evaluator::new(body.clone());
     let output = LambdaBodyInvocation::try_bind(&mut evaluator, input)
@@ -861,18 +872,29 @@ fn body_context_capture_domain_and_compile_observation_are_exact() {
             Err(KernelFailure::InvalidProgram(_))
         ));
     }
-    let mut bad_logical = i64_type(false);
-    bad_logical.logical_type = novarocks_type_contract::ValueLogicalType::LargeInt;
-    assert!(matches!(
-        LambdaBodyContract::try_new(
-            call.clone(),
-            exact,
-            body_effects(exact),
-            Box::from([bad_logical]),
-            &CompileControl::default()
-        ),
-        Err(KernelFailure::InvalidProgram(_))
-    ));
+    assert!(
+        FunctionValueType::try_with_logical_type(
+            DataType::Int64,
+            false,
+            novarocks_type_contract::ValueLogicalType::LargeInt
+        )
+        .is_err()
+    );
+    let different_domain = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        false,
+        novarocks_type_contract::ValueLogicalType::LargeInt,
+    )
+    .unwrap();
+    let body = LambdaBodyContract::try_new(
+        call.clone(),
+        exact,
+        body_effects(exact),
+        Box::from([different_domain.clone()]),
+        &CompileControl::default(),
+    )
+    .unwrap();
+    assert!(body.capture_types()[0].same_semantics(&different_domain));
     assert_eq!(
         LambdaBodyContract::try_new(
             call.clone(),
@@ -971,7 +993,9 @@ fn higher_order_entry_control_precedes_wrong_kind_or_non_higher_order_rejection(
     owner.arguments.truncate(1);
     owner.uses.truncate(1);
     Arc::get_mut(&mut owner.selected).unwrap().argument_types =
-        Box::from([owner.arguments[0].argument_type()]);
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::from([owner
+            .arguments[0]
+            .argument_type()]));
     owner.declaration.argument_control = ArgumentControl::Eager;
     let input = owner.input();
     let receipt = refine_call_effects(&owner, input, &CompileControl::default()).unwrap();

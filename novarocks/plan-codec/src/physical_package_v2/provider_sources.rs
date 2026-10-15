@@ -25,6 +25,7 @@ use super::type_views::{
     TypeViewFacts, capture_source_input_reserve,
 };
 use crate::physical_provider_binding_v2::ProviderBindingSource;
+use crate::physical_public_source_schema_v2::SourceSchemaFactsSource;
 use crate::physical_read_scan_v2::ReadScanSource;
 use crate::physical_relation_v2::RelationSource;
 use crate::physical_schema_v2::SchemaSource;
@@ -115,6 +116,8 @@ struct ScanRow<'source> {
     node: p::NodeId,
     source: &'source c::FrozenConnectorRead,
     schema: u32,
+    source_shape_schema: u32,
+    source_facts: u32,
     expressions: Range<usize>,
 }
 struct WriterRow<'source, 'ids> {
@@ -253,9 +256,27 @@ impl Event<'_> {
             Self::Scan { source, .. } => Counts {
                 providers: 1,
                 payloads: add(2, source.scan().recipe().columns().len())?,
-                schemas: 1,
+                schemas: 2,
                 scans: 1,
-                field_ids: source.public_facts().schema().fields().len(),
+                field_ids: add(
+                    source
+                        .public_facts()
+                        .execution_schema()
+                        .ok_or_else(|| invalid("frozen read has no complete execution schema"))?
+                        .schema()
+                        .fields()
+                        .len(),
+                    source
+                        .public_facts()
+                        .source_schema_facts()
+                        .ok_or_else(|| {
+                            invalid("frozen read has no independent source schema facts")
+                        })?
+                        .shape()
+                        .schema()
+                        .fields()
+                        .len(),
+                )?,
                 expression_ids: usize::from(source.scan().remaining_expression().is_some()),
                 ..Counts::default()
             },
@@ -661,44 +682,51 @@ impl<'source> SourceVisitor<'source> for FillPass<'_, '_, 'source, '_> {
                 for field in recipe.columns() {
                     self.sources.payload(field, work)?;
                 }
-                let schema = source.public_facts().schema();
-                let mut found = None;
-                for original in &self.sources.schemas {
-                    let same = std::ptr::eq(original.source, schema);
-                    work.step()?;
-                    if same {
-                        found = Some(original.id);
-                        break;
-                    }
-                }
-                let schema_id = match found {
-                    Some(id) => id,
-                    None => {
-                        let begin = self.sources.field_ids.len();
-                        for (ordinal, field) in schema.fields().iter().enumerate() {
-                            let id = self.types.field_root_for_in(
-                                PackageTypeOccurrence {
-                                    fragment: self.sources.package.fragment().id(),
-                                    owner: PackageTypeOwner::Scan(node),
-                                    channel: Channel::Field(ordinal),
-                                },
-                                field,
-                                budget,
-                                work,
-                            )?;
-                            self.sources.field_ids.push(id);
-                            work.step()?;
-                        }
-                        let id = id(self.sources.schemas.len())?;
-                        self.sources.schemas.push(SchemaRow {
-                            id,
-                            source: schema,
-                            fields: begin..self.sources.field_ids.len(),
-                        });
+                let public = source.public_facts();
+                let execution = public
+                    .execution_schema()
+                    .ok_or_else(|| invalid("frozen read has no complete execution schema"))?;
+                let source_facts = public
+                    .source_schema_facts()
+                    .ok_or_else(|| invalid("frozen read has no independent source schema facts"))?;
+                // Each occurrence owns its exact role. Pointer-equal Arrow projections
+                // can still have distinct complete value bindings or source authority.
+                let schema_id = id(self.sources.schemas.len())?;
+                let source_shape_schema_id = id(add(self.sources.schemas.len(), 1)?)?;
+                for (schema, channel, schema_id) in [
+                    (
+                        execution.schema(),
+                        Channel::Field as fn(usize) -> Channel,
+                        schema_id,
+                    ),
+                    (
+                        source_facts.shape().schema(),
+                        Channel::ScanSourceField as fn(usize) -> Channel,
+                        source_shape_schema_id,
+                    ),
+                ] {
+                    let begin = self.sources.field_ids.len();
+                    for (ordinal, field) in schema.fields().iter().enumerate() {
+                        let field_id = self.types.field_root_for_in(
+                            PackageTypeOccurrence {
+                                fragment: self.sources.package.fragment().id(),
+                                owner: PackageTypeOwner::Scan(node),
+                                channel: channel(ordinal),
+                            },
+                            field,
+                            budget,
+                            work,
+                        )?;
+                        self.sources.field_ids.push(field_id);
                         work.step()?;
-                        id
                     }
-                };
+                    self.sources.schemas.push(SchemaRow {
+                        id: schema_id,
+                        source: schema,
+                        fields: begin..self.sources.field_ids.len(),
+                    });
+                    work.step()?;
+                }
                 let begin = self.sources.expression_ids.len();
                 if let Some(expression) = source.scan().remaining_expression() {
                     expression.validate_observed::<Error>(|_| {
@@ -712,6 +740,8 @@ impl<'source> SourceVisitor<'source> for FillPass<'_, '_, 'source, '_> {
                     node,
                     source,
                     schema: schema_id,
+                    source_shape_schema: source_shape_schema_id,
+                    source_facts: id(self.sources.scans.len())?,
                     expressions: begin..self.sources.expression_ids.len(),
                 });
                 work.step()?;
@@ -753,6 +783,7 @@ pub(crate) struct PreparedProviderInputs<'rows> {
     relations: Vec<RelationSource<'rows>>,
     schemas: Vec<SchemaSource<'rows>>,
     scans: Vec<ReadScanSource<'rows>>,
+    source_schemas: Vec<SourceSchemaFactsSource<'rows>>,
     writers: Vec<WriterRecipeSource<'rows>>,
 }
 impl PreparedProviderInputs<'_> {
@@ -761,6 +792,9 @@ impl PreparedProviderInputs<'_> {
     }
     pub(crate) fn schemas(&self) -> &[SchemaSource<'_>] {
         &self.schemas
+    }
+    pub(crate) fn source_schemas(&self) -> &[SourceSchemaFactsSource<'_>] {
+        &self.source_schemas
     }
     pub(crate) fn scans(&self) -> &[ReadScanSource<'_>] {
         &self.scans
@@ -780,6 +814,7 @@ impl<'source, 'ids> ProviderSources<'source, 'ids> {
             relations: Vec::new(),
             schemas: Vec::new(),
             scans: Vec::new(),
+            source_schemas: Vec::new(),
             writers: Vec::new(),
         };
         let mut requests = [
@@ -787,16 +822,19 @@ impl<'source, 'ids> ProviderSources<'source, 'ids> {
             capture_source_input_reserve(&out.schemas, self.schemas.len())?,
             capture_source_input_reserve(&out.scans, self.scans.len())?,
             capture_source_input_reserve(&out.writers, self.writers.len())?,
+            capture_source_input_reserve(&out.source_schemas, self.scans.len())?,
         ];
         let n = add(
             add(self.relations.len(), self.schemas.len())?,
             add(self.scans.len(), self.writers.len())?,
         )?;
+        let n = add(n, self.scans.len())?;
         budget.admit_input_reserves_in(&mut requests, add(mul(n, 2)?, 8)?)?;
         budget.reserve_input_in(&mut out.relations, requests[0], work)?;
         budget.reserve_input_in(&mut out.schemas, requests[1], work)?;
         budget.reserve_input_in(&mut out.scans, requests[2], work)?;
         budget.reserve_input_in(&mut out.writers, requests[3], work)?;
+        budget.reserve_input_in(&mut out.source_schemas, requests[4], work)?;
         for row in &self.relations {
             out.relations.push(RelationSource {
                 id: row.id,
@@ -818,7 +856,20 @@ impl<'source, 'ids> ProviderSources<'source, 'ids> {
                 node: row.node,
                 read: row.source,
                 schema_id: row.schema,
+                source_schema_id: row.source_facts,
                 expression_ids: &self.expression_ids[row.expressions.clone()],
+            });
+            work.step()?;
+        }
+        for row in &self.scans {
+            out.source_schemas.push(SourceSchemaFactsSource {
+                id: row.source_facts,
+                source_shape_schema_id: row.source_shape_schema,
+                facts: row
+                    .source
+                    .public_facts()
+                    .source_schema_facts()
+                    .ok_or_else(|| invalid("frozen read has no independent source schema facts"))?,
             });
             work.step()?;
         }

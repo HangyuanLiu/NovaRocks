@@ -328,9 +328,10 @@ fn build_query_result(
         .map(|column| {
             QueryResultColumn::new(
                 column.sql_name(),
-                column.data_type(),
-                column.nullable(),
-                None,
+                novarocks_type_contract::FunctionValueType::new(
+                    column.data_type(),
+                    column.nullable(),
+                ),
             )
         })
         .collect::<Vec<_>>();

@@ -104,7 +104,7 @@ fn array(ty: &FunctionValueType, values: &[Option<i128>]) -> ArrayRef {
             )) as ArrayRef
         };
     }
-    match ty.data_type {
+    match ty.data_type() {
         DataType::FixedSizeBinary(16) => {
             let mut builder = FixedSizeBinaryBuilder::with_capacity(values.len(), 16);
             for value in values {
@@ -130,7 +130,9 @@ fn recipe(
     allow: bool,
 ) -> PreparedArithmeticRecipe {
     let mut result = arithmetic_result_value_type_with_op(left, right, op).unwrap();
-    result.nullable = true;
+    result = result
+        .with_nullable(true)
+        .expect("valid function nullability declaration");
     PreparedArithmeticRecipe::try_new(
         op,
         left,
@@ -271,7 +273,7 @@ fn largeint_wrap_extrema_and_zero_modulo_do_not_become_checked_signed_row_errors
         (DataType::Int32, i128::from(i32::MIN), i128::from(i32::MAX)),
         (DataType::Int64, i128::from(i64::MIN), i128::from(i64::MAX)),
     ] {
-        let signed = FunctionValueType::new(carrier, false);
+        let signed = FunctionValueType::from_legacy_declared_projection(carrier, false);
         for number in [minimum, maximum] {
             for reversed in [false, true] {
                 let (left, right, a, b) = if reversed {
@@ -417,7 +419,7 @@ fn independently_selected_scalar_compact_column_pool_and_sliced_be_addresses_are
     let selected = Selection::try_sparse(5, &rows).unwrap();
     let compact = SelectedValues::try_new(
         selected,
-        &ty.data_type,
+        ty.data_type(),
         array(&ty, &[Some(2), Some(-3)]),
         Box::new([]),
     )
@@ -529,7 +531,7 @@ fn exact_domain_class_null_and_result_checks_precede_any_numeric_admission() {
         let mut work =
             CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
         assert!(
-            LargeIntArithmetic::prepare(ArithmeticOperator::Add, &foreign, &ty, &ty, &mut work)
+            LargeIntArithmetic::prepare(ArithmeticOperator::Add, &foreign, &ty, &mut work)
                 .unwrap()
                 .is_none()
         );
@@ -633,15 +635,9 @@ fn observed_non_null_rows(control: &dyn KernelEvaluationControl) -> Result<(), K
     let mut compile_work =
         CompileCheckpoints::try_new(&compile_control, CompilePhase::FunctionSpecialization)
             .unwrap();
-    let recipe = LargeIntArithmetic::prepare(
-        ArithmeticOperator::Add,
-        &ty,
-        &ty,
-        &large(true),
-        &mut compile_work,
-    )
-    .unwrap()
-    .unwrap();
+    let recipe = LargeIntArithmetic::prepare(ArithmeticOperator::Add, &ty, &ty, &mut compile_work)
+        .unwrap()
+        .unwrap();
     compile_work.finish().unwrap();
     let left = array(&ty, &vec![Some(i128::MAX); 320]);
     let right = array(&ty, &vec![Some(1); 320]);

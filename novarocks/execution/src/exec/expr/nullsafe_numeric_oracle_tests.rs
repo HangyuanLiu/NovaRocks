@@ -66,8 +66,8 @@ fn legacy_result(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String> 
     .unwrap();
     let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
     let mut arena = ExprArena::default();
-    let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), ty.data_type.clone());
-    let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), ty.data_type.clone());
+    let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), ty.data_type().clone());
+    let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), ty.data_type().clone());
     let eq = arena.push_typed(ExprNode::EqForNull(l, r), DataType::Boolean);
     let frozen = arena.into_immutable().unwrap();
     ExprArena::from_immutable(&frozen).unwrap().eval(eq, &chunk)
@@ -283,8 +283,9 @@ fn legacy_nullsafe_floats_match_any_nonnull_nan_and_signed_zero_both_directions(
 fn nullsafe_does_not_infer_nominal_numeric_domains_or_expand_ordinary_flat_capability() {
     use novarocks_type_contract::ValueLogicalType;
     for logical in [ValueLogicalType::LargeInt, ValueLogicalType::Uuid] {
-        let mut source = FunctionValueType::new(DataType::FixedSizeBinary(16), true);
-        source.logical_type = logical;
+        let source =
+            FunctionValueType::try_with_logical_type(DataType::FixedSizeBinary(16), true, logical)
+                .unwrap();
         assert!(
             PreparedNullSafeComparisonRecipe::try_new(&source, &source, &OriginalControl).is_err()
         );
@@ -300,7 +301,8 @@ fn nullsafe_does_not_infer_nominal_numeric_domains_or_expand_ordinary_flat_capab
         );
     }
     let physical = FunctionValueType::new(DataType::Utf8, true);
-    let mut json = physical.clone();
-    json.logical_type = ValueLogicalType::Json;
+    let json =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+            .unwrap();
     assert!(PreparedNullSafeComparisonRecipe::try_new(&physical, &json, &OriginalControl).is_err());
 }

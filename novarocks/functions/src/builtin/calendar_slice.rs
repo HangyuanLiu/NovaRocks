@@ -568,7 +568,7 @@ pub(super) fn exact_profile(
         ));
     };
     let physical = |t: &FunctionValueType, ty: &DataType| {
-        t.logical_type == ValueLogicalType::Physical && &t.data_type == ty
+        t.logical_type() == ValueLogicalType::Physical && t.data_type() == ty
     };
     if !physical(target, &domain.data_type())
         || !physical(value, &domain.data_type())

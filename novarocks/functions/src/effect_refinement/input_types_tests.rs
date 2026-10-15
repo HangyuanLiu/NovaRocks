@@ -140,10 +140,13 @@ impl Fixture {
                 .collect(),
             selected: FunctionBindingSelection {
                 overload: FunctionOverloadId::try_new("fixture/input-types/selected").unwrap(),
-                argument_types: arguments
-                    .iter()
-                    .map(FunctionArgument::argument_type)
-                    .collect(),
+                argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                    arguments
+                        .iter()
+                        .map(FunctionArgument::argument_type)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
                 result_type: FunctionResultType::Scalar(ty(DataType::Int64, false)),
                 aggregate: None,
             },
@@ -176,7 +179,7 @@ impl Fixture {
     }
 }
 fn ty(data_type: DataType, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(data_type, nullable)
+    FunctionValueType::from_legacy_declared_projection(data_type, nullable)
 }
 fn value(value_type: FunctionValueType) -> FunctionArgument {
     FunctionArgument::Value {
@@ -224,7 +227,11 @@ fn value_domains_and_nullable_covariance_are_checked_before_owner() {
         ),
     ] {
         let mut fixture = Fixture::new(vec![value(actual)]);
-        fixture.selected.argument_types[0] = FunctionArgumentType::Value(selected);
+        replace_selected_argument_fixture(
+            &mut fixture.selected.argument_types,
+            0,
+            FunctionArgumentType::Value(selected),
+        );
         if valid {
             let control = Arc::new(Control::default());
             let owner = Owner::new(ArgumentControl::Eager, control.clone());
@@ -248,34 +255,52 @@ fn value_nested_covariance_preserves_the_existing_semantic_domain() {
         DataType::List(field(false, "source")),
         false,
     ))]);
-    fixture.selected.argument_types[0] =
-        FunctionArgumentType::Value(ty(DataType::List(field(true, "parameter")), true));
+    replace_selected_argument_fixture(
+        &mut fixture.selected.argument_types,
+        0,
+        FunctionArgumentType::Value(ty(DataType::List(field(true, "parameter")), true)),
+    );
     let control = Arc::new(Control::default());
     let owner = Owner::new(ArgumentControl::Eager, control.clone());
     refine_call_effects(&owner, fixture.input(), control.as_ref()).unwrap();
     fixture.arguments[0] = value(ty(DataType::List(field(true, "source")), false));
-    fixture.selected.argument_types[0] =
-        FunctionArgumentType::Value(ty(DataType::List(field(false, "parameter")), true));
+    replace_selected_argument_fixture(
+        &mut fixture.selected.argument_types,
+        0,
+        FunctionArgumentType::Value(ty(DataType::List(field(false, "parameter")), true)),
+    );
     reject(&fixture, ArgumentControl::Eager);
 }
 
 #[test]
 fn argument_kind_and_lambda_arity_cannot_reach_owner() {
     let mut value_fixture = Fixture::new(vec![value(ty(DataType::Int64, false))]);
-    value_fixture.selected.argument_types[0] =
-        lambda(ty(DataType::Int64, false), ty(DataType::Boolean, true)).argument_type();
+    replace_selected_argument_fixture(
+        &mut value_fixture.selected.argument_types,
+        0,
+        lambda(ty(DataType::Int64, false), ty(DataType::Boolean, true)).argument_type(),
+    );
     reject(&value_fixture, ArgumentControl::Eager);
     let mut body_fixture = Fixture::new(vec![lambda(
         ty(DataType::Int64, false),
         ty(DataType::Boolean, true),
     )]);
-    body_fixture.selected.argument_types[0] =
-        FunctionArgumentType::Value(ty(DataType::Int64, false));
+    replace_selected_argument_fixture(
+        &mut body_fixture.selected.argument_types,
+        0,
+        FunctionArgumentType::Value(ty(DataType::Int64, false)),
+    );
     reject(&body_fixture, higher_order());
-    body_fixture.selected.argument_types[0] = FunctionArgumentType::Lambda {
-        parameter_types: Box::new([]),
-        result_type: ty(DataType::Boolean, true),
-    };
+    replace_selected_argument_fixture(
+        &mut body_fixture.selected.argument_types,
+        0,
+        FunctionArgumentType::Lambda {
+            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                Box::new([]),
+            ),
+            result_type: ty(DataType::Boolean, true),
+        },
+    );
     reject(&body_fixture, higher_order());
 }
 
@@ -293,23 +318,43 @@ fn dictionary_parameter(id: i64, annotation: &str, nullable: bool) -> FunctionVa
 }
 
 #[test]
-fn lambda_types_require_full_frozen_identity_including_metadata_and_dictionary_ids() {
+fn lambda_types_require_complete_semantics_after_encoding_and_annotation_normalization() {
     let parameter = dictionary_parameter(17, "source", false);
     let result = json(true);
+    for normalized in [
+        dictionary_parameter(18, "source", false),
+        dictionary_parameter(17, "different", false),
+    ] {
+        assert_eq!(normalized, parameter);
+        let mut fixture = Fixture::new(vec![lambda(normalized, result.clone())]);
+        replace_selected_argument_fixture(
+            &mut fixture.selected.argument_types,
+            0,
+            lambda(parameter.clone(), result.clone()).argument_type(),
+        );
+        let control = Arc::new(Control::default());
+        let owner = Owner::new(higher_order(), control.clone());
+        refine_call_effects(&owner, fixture.input(), control.as_ref()).unwrap();
+    }
     for argument in [
-        lambda(dictionary_parameter(18, "source", false), result.clone()),
-        lambda(dictionary_parameter(17, "different", false), result.clone()),
         lambda(dictionary_parameter(17, "source", true), result.clone()),
         lambda(parameter.clone(), ty(DataType::Utf8, true)),
         lambda(parameter.clone(), json(false)),
     ] {
         let mut fixture = Fixture::new(vec![argument]);
-        fixture.selected.argument_types[0] =
-            lambda(parameter.clone(), result.clone()).argument_type();
+        replace_selected_argument_fixture(
+            &mut fixture.selected.argument_types,
+            0,
+            lambda(parameter.clone(), result.clone()).argument_type(),
+        );
         reject(&fixture, higher_order());
     }
     let mut fixture = Fixture::new(vec![lambda(ty(DataType::Utf8, false), result.clone())]);
-    fixture.selected.argument_types[0] = lambda(json(false), result).argument_type();
+    replace_selected_argument_fixture(
+        &mut fixture.selected.argument_types,
+        0,
+        lambda(json(false), result).argument_type(),
+    );
     reject(&fixture, higher_order());
 }
 
@@ -325,18 +370,15 @@ fn exact_lambda_types_remain_valid_on_fresh_and_frozen_refinement() {
     let frozen = receipt.facts().clone();
     validate_frozen_call_effects(&owner, fixture.input(), &frozen, control.as_ref()).unwrap();
     assert_eq!(owner.refinements.load(Ordering::Relaxed), 2);
-    let mut wrong = Fixture::new(vec![lambda(
-        dictionary_parameter(17, "wrong", false),
+    let mut annotated = Fixture::new(vec![lambda(
+        dictionary_parameter(19, "different external annotation", false),
         json(true),
     )]);
-    wrong.selected = fixture.selected.clone();
+    annotated.selected = fixture.selected.clone();
     let control = Arc::new(Control::default());
     let owner = Owner::new(higher_order(), control.clone());
-    assert!(matches!(
-        validate_frozen_call_effects(&owner, wrong.input(), &frozen, control.as_ref()),
-        Err(CallEffectRefinementError::InvalidInput(_))
-    ));
-    owner.untouched();
+    validate_frozen_call_effects(&owner, annotated.input(), &frozen, control.as_ref()).unwrap();
+    assert_eq!(owner.refinements.load(Ordering::Relaxed), 1);
 }
 
 fn metadata_type(size: usize) -> FunctionValueType {
@@ -352,25 +394,27 @@ fn metadata_type(size: usize) -> FunctionValueType {
 }
 
 #[test]
-fn request_selected_result_and_expected_metadata_use_the_shared_resource_gate() {
-    let invalid = metadata_type(novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1);
+fn request_selected_result_and_expected_hold_metadata_free_value_facts() {
+    let annotated =
+        metadata_type(novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1);
+    let plain = metadata_type(0);
+    assert_eq!(annotated, plain);
     for channel in 0..4 {
-        let mut fixture = Fixture::new(vec![value(ty(DataType::Int64, false))]);
+        let mut fixture = Fixture::new(vec![value(plain.clone())]);
         match channel {
-            0 => fixture.arguments[0] = value(invalid.clone()),
-            1 => fixture.selected.argument_types[0] = FunctionArgumentType::Value(invalid.clone()),
-            2 => fixture.selected.result_type = FunctionResultType::Scalar(invalid.clone()),
-            _ => fixture.expected = Some(invalid.clone()),
+            0 => fixture.arguments[0] = value(annotated.clone()),
+            1 => replace_selected_argument_fixture(
+                &mut fixture.selected.argument_types,
+                0,
+                FunctionArgumentType::Value(annotated.clone()),
+            ),
+            2 => fixture.selected.result_type = FunctionResultType::Scalar(annotated.clone()),
+            _ => fixture.expected = Some(annotated.clone()),
         }
         let control = Arc::new(Control::default());
         let owner = Owner::new(ArgumentControl::Eager, control.clone());
-        assert!(matches!(
-            refine_call_effects(&owner, fixture.input(), control.as_ref()),
-            Err(CallEffectRefinementError::Control(
-                CompileControlError::ResourceExhausted
-            ))
-        ));
-        owner.untouched();
+        refine_call_effects(&owner, fixture.input(), control.as_ref()).unwrap();
+        assert_eq!(owner.refinements.load(Ordering::Relaxed), 1);
     }
 }
 
@@ -447,4 +491,16 @@ fn actual_source_work_entry_256_and_gate_finish_keep_original_control_before_own
             }
         }
     }
+}
+
+// Publish a new immutable test declaration after changing one selected fact.
+fn replace_selected_argument_fixture(
+    arguments: &mut novarocks_type_contract::FunctionArgumentTypes,
+    ordinal: usize,
+    argument: FunctionArgumentType,
+) {
+    let mut revised = arguments.as_slice().to_vec();
+    revised[ordinal] = argument;
+    *arguments =
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(revised.into_boxed_slice());
 }

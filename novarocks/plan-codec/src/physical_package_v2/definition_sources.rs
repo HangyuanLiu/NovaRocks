@@ -711,7 +711,7 @@ impl<'source> Visitor<'source> for FillPass<'_, '_, '_, 'source> {
     ) -> Result<(), Error> {
         let owner = Owner::Constant(id);
         let value_type_id = self.root(owner, Channel::Value, pool.value_type(), budget, work)?;
-        let field_id = self.types.field_root_for_in(
+        let field_id = self.types.source_field_root_for_in(
             PackageTypeOccurrence {
                 fragment: self.sources.package.fragment().id(),
                 owner,

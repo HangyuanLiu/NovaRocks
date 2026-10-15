@@ -109,7 +109,7 @@ where
                 })?;
             }
             scalar::build_scalar_array_with_largeint_observation(
-                &contract.final_type().data_type,
+                &contract.final_type().data_type(),
                 values,
                 &mut scalar_work,
             )

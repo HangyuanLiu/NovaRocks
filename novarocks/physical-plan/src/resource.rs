@@ -1688,9 +1688,8 @@ fn distribution_items(distribution: &crate::Distribution) -> usize {
 // remains the original semantic quota; it is not an owned-resource wallet.
 use crate::ValidationErrorCategory;
 use novarocks_type_contract::{
-    ControlOwnedResourceFacts, ControlResourceCounter, ControlResourceError, ValueTypeError,
-    ValueTypeVisit,
-    owned_resources::{copy::reserve_exit, hashmap, type_validation, vec::reserve_for_push_in},
+    ControlOwnedResourceFacts, ControlResourceCounter, ControlResourceError,
+    owned_resources::{copy::reserve_exit, hashmap, vec::reserve_for_push_in},
 };
 
 type TypeAdmission<'a> =
@@ -1865,26 +1864,6 @@ impl CallerTypeValidation<'_, '_> {
     }
 }
 
-enum TypeLogicalError {
-    Logical(ValueTypeError),
-    Resources(ControlResourceError),
-}
-impl From<ValueTypeError> for TypeLogicalError {
-    fn from(error: ValueTypeError) -> Self {
-        Self::Logical(error)
-    }
-}
-impl From<ControlResourceError> for TypeLogicalError {
-    fn from(error: ControlResourceError) -> Self {
-        Self::Resources(error)
-    }
-}
-impl From<CompileControlError> for TypeLogicalError {
-    fn from(error: CompileControlError) -> Self {
-        Self::Resources(error.into())
-    }
-}
-
 impl TypeValidationPolicy for CallerTypeValidation<'_, '_> {
     type Error = ControlResourceError;
     const CALLER: bool = true;
@@ -2017,71 +1996,24 @@ impl TypeValidationPolicy for CallerTypeValidation<'_, '_> {
     fn logical(
         &mut self,
         ty: &ValueType,
-        path: &str,
-        errors: &mut ValidationContext,
+        _path: &str,
+        _errors: &mut ValidationContext,
     ) -> Result<(), Self::Error> {
-        // This is the sole logical owner's real fixed scratch, not a second
-        // carrier validator. Initialization is byte work and no heap request.
-        self.resources
-            .work(type_validation::scratch_work_upper_bound())?;
-        self.gate()?;
-        self.work.flush()?;
-        let mut scratch = [None; novarocks_type_contract::MAX_VALUE_TYPE_NODES];
-        self.work.step()?;
-        self.work.flush()?;
-        let result = ty.validate_with_scratch_observed::<TypeLogicalError>(&mut scratch, |visit| {
-            match visit {
-                ValueTypeVisit::Field(_) => {
-                    // One `get` of the closed logical key. Its probe count is
-                    // bounded by the retained source buckets, but each
-                    // candidate comparison is `str` equality against this
-                    // key: a length mismatch is refused before any byte is
-                    // read, so no comparison reads more than the key. The
-                    // stored keys' lengths never enter this charge; using the
-                    // source as the key length made it quadratic in the
-                    // source and overflowed the meter on a truthful
-                    // multi-GiB invoice.
-                    let key = novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
-                    self.hash_work(hashmap::string_operations_work_upper_bound(
-                        self.source,
-                        1,
-                        key.len(),
-                        key.len(),
-                    ))?;
-                    // The original owner executes its getter after this hook.
-                    self.work.flush()?;
-                }
-                ValueTypeVisit::TypeNode(_) | ValueTypeVisit::ChildEdge(_) => {
+        // The immutable semantic author has already validated shape and
+        // domains. Observe its actual borrowed tree; metadata grants no type.
+        novarocks_type_contract::visit_value_type_observed(ty.value_type(), |visit| {
+            self.resources.work(1)?;
+            self.gate()?;
+            self.work.step()?;
+            if let novarocks_type_contract::ValueSemanticVisit::NamedField(field) = visit {
+                for _ in field.name().bytes() {
                     self.resources.work(1)?;
                     self.gate()?;
                     self.work.step()?;
                 }
             }
-            Ok(())
-        });
-        match result {
-            Ok(()) => Ok(()),
-            Err(TypeLogicalError::Resources(error)) => Err(error),
-            Err(TypeLogicalError::Logical(error)) => {
-                // Display is the original closed ValueTypeError author. The
-                // only dynamic spelling is one closed ValueLogicalType enum.
-                let upper = match error {
-                    ValueTypeError::UnknownLogicalMetadata => "unknown logical type metadata".len(),
-                    ValueTypeError::TooDeep => "value type exceeds the nesting depth limit".len(),
-                    ValueTypeError::TooManyNodes => "value type exceeds the node count limit".len(),
-                    ValueTypeError::InvalidLogicalCarrier(_) => {
-                        "invalid Arrow carrier for ".len() + "Percentile".len()
-                    }
-                };
-                self.formatted(
-                    ValidationErrorCategory::StructuralInvariant,
-                    path,
-                    format_args!("{error}"),
-                    type_message_bound(upper, 3, 0),
-                    errors,
-                )
-            }
-        }
+            Ok::<_, ControlResourceError>(())
+        })
     }
 }
 
@@ -2112,7 +2044,7 @@ fn validate_value_type_core<P: TypeValidationPolicy>(
     errors: &mut ValidationContext,
     policy: &mut P,
 ) -> Result<(), P::Error> {
-    validate_data_type_core(&ty.data_type, path, usage, errors, policy)?;
+    validate_data_type_core(&ty.data_type(), path, usage, errors, policy)?;
     if !usage.exhausted() {
         policy.logical(ty, path, errors)?;
     }
@@ -2522,12 +2454,8 @@ mod tests {
             overload: novarocks_type_contract::FunctionOverloadId::try_new("o".repeat(1024))
                 .unwrap(),
             kind: crate::FunctionKind::Aggregate,
-            argument_types: Box::default(),
-            result_type: ValueType {
-                logical_type: novarocks_type_contract::ValueLogicalType::Physical,
-                data_type: DataType::Int64,
-                nullable: false,
-            },
+            argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::default()),
+            result_type: ValueType::new(DataType::Int64, false),
         };
         let binding = AggregateBinding {
             state_interpretation: None,
@@ -2536,11 +2464,7 @@ mod tests {
             function,
             phase: crate::AggregatePhase::Single,
             logical_argument_count: 0,
-            intermediate_type: ValueType {
-                logical_type: novarocks_type_contract::ValueLogicalType::Physical,
-                data_type: DataType::Int64,
-                nullable: false,
-            },
+            intermediate_type: ValueType::new(DataType::Int64, false),
             state_format: novarocks_type_contract::AggregateStateFormatId::try_new(
                 "s".repeat(1024),
             )

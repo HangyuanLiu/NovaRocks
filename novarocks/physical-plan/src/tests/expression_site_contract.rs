@@ -1031,7 +1031,7 @@ fn positive_source_depth_matches_the_checked_invocation_depth_bound() {
             .get(near.definition())
             .unwrap()
             .ty
-            .nullable
+            .nullable()
     );
     assert_eq!(
         PredicateConjunctSource::try_new(&fragment, &roots, site, vec![0; depth], &control())

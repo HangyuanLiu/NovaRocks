@@ -19,7 +19,7 @@
 
 use arrow::datatypes::DataType;
 use novarocks_query_application::api::ResultField;
-use novarocks_types::schema::SqlType;
+use novarocks_type_contract::ValueLogicalType;
 use opensrv_mysql::{Column, ColumnFlags, ColumnType};
 use std::io;
 
@@ -41,14 +41,6 @@ pub fn mysql_column_for_result_field(field: &ResultField) -> Result<Column, Stri
     if !field.nullable() {
         colflags.insert(ColumnFlags::NOT_NULL_FLAG);
     }
-    if matches!(field.logical_type(), Some(SqlType::Decimal { .. })) {
-        return Ok(Column {
-            table: String::new(),
-            column: field.name().to_string(),
-            coltype: ColumnType::MYSQL_TYPE_NEWDECIMAL,
-            colflags,
-        });
-    }
     let coltype = match field.data_type() {
         DataType::Boolean => ColumnType::MYSQL_TYPE_TINY,
         DataType::Int8 | DataType::Int16 | DataType::Int32 => ColumnType::MYSQL_TYPE_LONG,
@@ -60,7 +52,8 @@ pub fn mysql_column_for_result_field(field: &ResultField) -> Result<Column, Stri
         DataType::Float32 => ColumnType::MYSQL_TYPE_FLOAT,
         DataType::Float64 => ColumnType::MYSQL_TYPE_DOUBLE,
         DataType::FixedSizeBinary(width)
-            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH
+                && field.value_type().logical_type() == ValueLogicalType::LargeInt =>
         {
             ColumnType::MYSQL_TYPE_STRING
         }
@@ -69,6 +62,7 @@ pub fn mysql_column_for_result_field(field: &ResultField) -> Result<Column, Stri
         | DataType::Binary
         | DataType::LargeBinary
         | DataType::List(_)
+        | DataType::LargeList(_)
         | DataType::Map(_, _)
         | DataType::Struct(_) => ColumnType::MYSQL_TYPE_VAR_STRING,
         DataType::Decimal128(_, _) => ColumnType::MYSQL_TYPE_NEWDECIMAL,
@@ -96,15 +90,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decimal_logical_type_selects_mysql_decimal() {
+    fn decimal_scalar_type_selects_mysql_decimal() {
         let field = ResultField::new(
             "amount",
-            DataType::Int64,
-            false,
-            Some(SqlType::Decimal {
-                precision: 18,
-                scale: 2,
-            }),
+            novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(18, 2), false),
         );
 
         let column = mysql_column_for_result_field(&field).expect("column");
@@ -115,12 +104,43 @@ mod tests {
 
     #[test]
     fn unsigned_field_selects_unsigned_mysql_integer() {
-        let field = ResultField::new("id", DataType::UInt64, true, None);
+        let field = ResultField::new(
+            "id",
+            novarocks_type_contract::FunctionValueType::new(DataType::UInt64, true),
+        );
 
         let column = mysql_column_for_result_field(&field).expect("column");
 
         assert_eq!(column.coltype, ColumnType::MYSQL_TYPE_LONGLONG);
         assert!(column.colflags.contains(ColumnFlags::UNSIGNED_FLAG));
         assert!(!column.colflags.contains(ColumnFlags::NOT_NULL_FLAG));
+    }
+    #[test]
+    fn fixed_binary_is_not_an_implicit_large_integer_declaration() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType as L};
+        let physical = ResultField::new(
+            "bytes",
+            FunctionValueType::new(DataType::FixedSizeBinary(16), false),
+        );
+        let uuid = ResultField::new(
+            "uuid",
+            FunctionValueType::try_with_logical_type(DataType::FixedSizeBinary(16), false, L::Uuid)
+                .unwrap(),
+        );
+        assert!(mysql_column_for_result_field(&physical).is_err());
+        assert!(mysql_column_for_result_field(&uuid).is_err());
+        let largeint = ResultField::new(
+            "large",
+            FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                false,
+                L::LargeInt,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            mysql_column_for_result_field(&largeint).unwrap().coltype,
+            ColumnType::MYSQL_TYPE_STRING
+        );
     }
 }

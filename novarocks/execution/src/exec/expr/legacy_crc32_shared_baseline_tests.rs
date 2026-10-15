@@ -154,34 +154,6 @@ fn legacy_crc32_shared_baseline_long_byte_boundaries_have_independent_zlib_oracl
     }
 }
 #[test]
-fn legacy_crc32_shared_baseline_unsupported_null_and_long_dtype_errors_are_full() {
-    for array in [
-        Arc::new(NullArray::new(1)) as ArrayRef,
-        Arc::new(Int64Array::from(vec![None])) as ArrayRef,
-        Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef,
-    ] {
-        let expected = format!(
-            "crc32 expects VARCHAR/BINARY input, got {:?}",
-            array.data_type()
-        );
-        assert_eq!(eval("crc32", vec![array]).unwrap_err(), expected);
-    }
-    let field = Arc::new(Field::new("long_field_".repeat(128), DataType::Int64, true));
-    let array = Arc::new(arrow::array::StructArray::from(vec![(
-        field,
-        Arc::new(Int64Array::from(vec![None])) as ArrayRef,
-    )])) as ArrayRef;
-    let expected = format!(
-        "crc32 expects VARCHAR/BINARY input, got {:?}",
-        array.data_type()
-    );
-    assert!(expected.len() > 512);
-    assert_eq!(
-        eval("crc32", vec![array]).unwrap_err().as_bytes(),
-        expected.as_bytes()
-    );
-}
-#[test]
 fn legacy_crc32_shared_baseline_raw_tail_is_ignored_zero_arity_panics_and_child_error_wins() {
     let mut arena = ExprArena::default();
     let source = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
@@ -228,5 +200,55 @@ fn legacy_crc32_shared_baseline_literal_pool_and_result_metadata_ignore_match() 
     assert_rows(
         eval_string_function("crc32", &arena, output, &[pooled], &source_chunk).unwrap(),
         vec![Some(3421780262); 3],
+    );
+}
+
+#[test]
+fn legacy_crc32_shared_baseline_unsupported_null_and_long_dtype_errors_are_full_layout_boundary_and_complete_diagnostic()
+ {
+    // Keep the original oversized input as a real construction refusal.
+    let oversized = DataType::Struct(
+        vec![Arc::new(Field::new(
+            "long_field_".repeat(128),
+            DataType::Int64,
+            true,
+        ))]
+        .into(),
+    );
+    assert_eq!(
+        novarocks_type_contract::ValueLayout::try_new(
+            &oversized,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap_err(),
+        novarocks_type_contract::ExecutionValueTypeError::Invalid(
+            "value layout field name exceeds the byte limit"
+        ),
+    );
+
+    for array in [
+        Arc::new(NullArray::new(1)) as ArrayRef,
+        Arc::new(Int64Array::from(vec![None])) as ArrayRef,
+        Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef,
+    ] {
+        let expected = format!(
+            "crc32 expects VARCHAR/BINARY input, got {:?}",
+            array.data_type()
+        );
+        assert_eq!(eval("crc32", vec![array]).unwrap_err(), expected);
+    }
+    let field = Arc::new(Field::new("long_field_".repeat(90), DataType::Int64, true));
+    let array = Arc::new(arrow::array::StructArray::from(vec![(
+        field,
+        Arc::new(Int64Array::from(vec![None])) as ArrayRef,
+    )])) as ArrayRef;
+    let expected = format!(
+        "crc32 expects VARCHAR/BINARY input, got {:?}",
+        array.data_type()
+    );
+    assert!(expected.len() > 512);
+    assert_eq!(
+        eval("crc32", vec![array]).unwrap_err().as_bytes(),
+        expected.as_bytes()
     );
 }

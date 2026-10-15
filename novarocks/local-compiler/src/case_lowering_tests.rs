@@ -368,11 +368,14 @@ fn fixture(
     let operand_type = match form {
         Form::Searched => None,
         Form::SimpleInteger => Some(FunctionValueType::new(DataType::Int64, true)),
-        Form::SimpleUuid => Some(FunctionValueType {
-            data_type: DataType::FixedSizeBinary(16),
-            nullable: true,
-            logical_type: ValueLogicalType::Uuid,
-        }),
+        Form::SimpleUuid => Some(
+            FunctionValueType::try_from_legacy_declared_projection(
+                DataType::FixedSizeBinary(16),
+                true,
+                ValueLogicalType::Uuid,
+            )
+            .expect("valid temporary legacy value projection"),
+        ),
     };
     let operand_value = operand_type.as_ref().map(|ty| {
         let input = add_input(&mut builder, ty.clone());
@@ -518,7 +521,7 @@ fn fixture(
         }
     };
     if narrow_no_else {
-        result_type.nullable = false;
+        result_type = result_type.with_nullable(false).unwrap();
     }
     let case = builder
         .add_expression(
@@ -824,6 +827,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
                 )
                 .unwrap();
             frozen.push(FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -1099,11 +1103,12 @@ fn simple_case_retains_exact_nominal_operand_and_when_types_for_later_equality_a
     let snapshot = typed.resolved_calls().snapshot();
     let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
     let invocation = &flow.uses()[&snapshot.bindings()[&root(Mode::Project)]];
-    let uuid = FunctionValueType {
-        data_type: DataType::FixedSizeBinary(16),
-        nullable: true,
-        logical_type: ValueLogicalType::Uuid,
-    };
+    let uuid = FunctionValueType::try_from_legacy_declared_projection(
+        DataType::FixedSizeBinary(16),
+        true,
+        ValueLogicalType::Uuid,
+    )
+    .expect("valid temporary legacy value projection");
     for ordinal in [0, 1, 3] {
         let child = &flow.uses()[&invocation.arguments[ordinal]];
         assert_eq!(child.context.demand, EvaluationDemand::Value);

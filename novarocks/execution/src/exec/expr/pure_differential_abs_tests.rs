@@ -115,10 +115,9 @@ fn check(
     logical: ValueLogicalType,
     policy: DecimalOverflowPolicy,
 ) {
-    let source = FunctionValueType {
-        logical_type: logical,
-        ..FunctionValueType::new(array.data_type().clone(), nullable)
-    };
+    let source =
+        FunctionValueType::try_with_logical_type(array.data_type().clone(), nullable, logical)
+            .unwrap();
     let s = assert_scalar_matches_v1(
         ScalarDiffSpec::new("abs")
             .typed_column(source, array)
@@ -128,7 +127,7 @@ fn check(
     );
     assert_eq!(s.legacy_batch_errors, 0);
     assert_eq!(s.attributed_row_errors, 0);
-    assert_eq!(s.result_type.nullable, nullable);
+    assert_eq!(s.result_type.nullable(), nullable);
 }
 #[test]
 fn pure_differential_abs_all_eight_profiles_nullable_boundaries_and_decimal_scales() {

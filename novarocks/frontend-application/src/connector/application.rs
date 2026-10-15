@@ -16,6 +16,7 @@
 // under the License.
 
 use super::backend;
+use crate::connector::schema_creation::FrontendSchemaLoad;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -577,7 +578,7 @@ pub fn metadata_load_table_with_planning_lease(
     let metadata = binding
         .binding()
         .metadata()
-        .load_table(ConnectorTableRequest {
+        .load_frontend_table(ConnectorTableRequest {
             table: ConnectorTableIdentity {
                 instance_id,
                 namespace: Arc::from(namespace),
@@ -587,7 +588,7 @@ pub fn metadata_load_table_with_planning_lease(
             context,
         })
         .map_err(|error| error.to_string())?;
-    let columns = sql_columns_from_connector_schema(&metadata.schema, &metadata.planning_facts)?;
+    let columns = sql_columns_from_connector_metadata(&metadata)?;
     let schema_id = metadata.version.as_ref().and_then(|version| {
         <[u8; 4]>::try_from(version.as_ref())
             .ok()
@@ -643,7 +644,7 @@ pub(crate) fn metadata_load_connector_table_with_planning_lease_typed(
     binding
         .binding()
         .metadata()
-        .load_table(ConnectorTableRequest {
+        .load_frontend_table(ConnectorTableRequest {
             table: ConnectorTableIdentity {
                 instance_id,
                 namespace: Arc::from(namespace),
@@ -654,39 +655,99 @@ pub(crate) fn metadata_load_connector_table_with_planning_lease_typed(
         })
 }
 
-pub(crate) fn sql_columns_from_connector_schema(
-    schema: &arrow::datatypes::Schema,
-    planning_facts: &novarocks_spi::connector::ConnectorTablePlanningFacts,
+pub(crate) fn sql_columns_from_connector_metadata(
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
 ) -> Result<Vec<novarocks_types::schema::ColumnDef>, String> {
-    schema
+    use novarocks_spi::connector::ConnectorTableColumnVisibility;
+    metadata
+        .schema()
         .fields()
         .iter()
         .enumerate()
-        // Facts and defaults use the original frozen schema ordinal, including
-        // hidden fields that do not occur in this SQL-visible projection.
-        .filter(|(_, field)| {
-            field
-                .metadata()
-                .get(novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL)
-                .is_none_or(|value| !value.eq_ignore_ascii_case("true"))
+        .filter(|(ordinal, _)| {
+            !matches!(
+                metadata
+                    .planning_facts
+                    .column_facts()
+                    .get(*ordinal)
+                    .map(|fact| fact.visibility()),
+                Some(ConnectorTableColumnVisibility::Hidden)
+            )
         })
-        .map(|(ordinal, field)| sql_column_from_connector_field(field, planning_facts, ordinal))
+        .map(|(ordinal, field)| {
+            let binding = metadata
+                .execution_schema()
+                .binding(ordinal)
+                .ok_or_else(|| {
+                    "catalog execution schema is missing an authored column".to_owned()
+                })?;
+            sql_column_from_connector_binding(
+                field.name(),
+                binding,
+                &metadata.planning_facts,
+                ordinal,
+            )
+        })
         .collect()
 }
 
-/// Preserve the provider's authored field identity and exact semantic facts.
-/// A missing field tag declares Physical unless an explicit provider fact
-/// authors the opaque domain. Neither a name nor an Arrow width authors it.
-pub(crate) fn sql_column_from_connector_field(
-    field: &arrow::datatypes::Field,
+/// Project the provider's complete value contract to its declared write layout.
+/// A physical target override changes representation and preserves every
+/// semantic child; it cannot infer or erase a domain from format annotations.
+pub(crate) fn connector_write_column(
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+    ordinal: usize,
+    write_default: Option<novarocks_types::schema::ColumnDefault>,
+) -> Result<novarocks_types::schema::ColumnDef, String> {
+    let field = metadata
+        .schema()
+        .fields()
+        .get(ordinal)
+        .ok_or_else(|| "connector write column is outside its source schema".to_string())?;
+    let binding = metadata
+        .execution_schema()
+        .binding(ordinal)
+        .ok_or_else(|| "connector write column has no complete execution binding".to_string())?;
+    let value_type = if let Some(target) = metadata
+        .planning_facts
+        .column_facts()
+        .get(ordinal)
+        .and_then(|facts| facts.write_target_type())
+    {
+        let layout = novarocks_type_contract::ValueLayout::try_new(
+            target,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .map_err(|error| format!("invalid connector write layout: {error}"))?;
+        novarocks_type_contract::FunctionValueType::try_from_value(
+            binding.value_type().clone(),
+            layout,
+        )
+        .map_err(|error| {
+            format!("connector write layout conflicts with its value contract: {error}")
+        })?
+    } else {
+        binding.clone()
+    };
+    novarocks_types::schema::ColumnDef::from_value_type(
+        field.name().clone(),
+        value_type,
+        write_default,
+    )
+    .map_err(|error| format!("invalid connector write column `{}`: {error}", field.name()))
+}
+
+/// Materialize SQL facts from the provider's complete value declaration. The
+/// source Arrow schema is never a logical-domain author at this boundary.
+pub(crate) fn sql_column_from_connector_binding(
+    name: &str,
+    binding: &novarocks_type_contract::FunctionValueType,
     planning_facts: &novarocks_spi::connector::ConnectorTablePlanningFacts,
     ordinal: usize,
 ) -> Result<novarocks_types::schema::ColumnDef, String> {
     use novarocks_spi::connector::ConnectorTableColumnSemanticKind;
-    use novarocks_type_contract::{FunctionValueType, NR_LOGICAL_TYPE_KEY, ValueLogicalType};
-    let mut value_type = FunctionValueType::try_from_field(field)
-        .map_err(|error| format!("invalid connector field `{}`: {error}", field.name()))?;
-    let fact_domain = match planning_facts
+    use novarocks_type_contract::ValueLogicalType;
+    let declared = match planning_facts
         .column_facts()
         .get(ordinal)
         .map(|fact| fact.semantic_kind())
@@ -696,23 +757,16 @@ pub(crate) fn sql_column_from_connector_field(
         None | Some(ConnectorTableColumnSemanticKind::None) => None,
         Some(_) => return Err("unsupported connector column semantic fact".into()),
     };
-    if let Some(domain) = fact_domain {
-        if field.metadata().contains_key(NR_LOGICAL_TYPE_KEY) && value_type.logical_type != domain {
-            return Err(format!(
-                "connector field `{}` logical identity conflicts with its semantic fact",
-                field.name()
-            ));
-        }
-        value_type = FunctionValueType::try_with_logical_type(
-            value_type.data_type,
-            value_type.nullable,
-            domain,
-        )
-        .map_err(|error| error.to_string())?;
+    if let Some(domain) = declared
+        && binding.logical_type() != domain
+    {
+        return Err(format!(
+            "connector column `{name}` value declaration conflicts with its semantic fact"
+        ));
     }
     novarocks_types::schema::ColumnDef::from_value_type(
-        field.name().to_owned(),
-        value_type,
+        name.to_owned(),
+        binding.clone(),
         connector_write_default_at(planning_facts, ordinal),
     )
     .map_err(|error| error.to_string())
@@ -829,28 +883,23 @@ pub fn acquire_metadata_planning_lease(
 #[cfg(test)]
 mod source_value_type_tests {
     use super::{
-        sql_column_from_connector_field, sql_columns_from_connector_schema, test_request_context,
+        sql_column_from_connector_binding, sql_columns_from_connector_metadata,
+        test_request_context,
     };
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use novarocks_spi::connector::{
-        CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorColumnDefault, ConnectorTableColumnPlanningFact,
-        ConnectorTableColumnRole, ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
+        ConnectorTableColumnPlanningFact, ConnectorTableColumnRole,
+        ConnectorTableColumnSemanticKind as K, ConnectorTableColumnVisibility as V,
         ConnectorTablePlanningFacts,
     };
-    use novarocks_type_contract::{FunctionValueType, NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+    use novarocks_type_contract::{
+        FunctionValueType, ValueField, ValueKind, ValueLayout, ValueLogicalType as L, ValueTypeRef,
+        ValueTypeStorageLifetime as S,
+    };
     use novarocks_types::schema::{ColumnDefault, SqlType};
     use std::sync::Arc;
 
-    fn tagged(name: &str, carrier: DataType, nullable: bool, label: &str) -> Field {
-        Field::new(name, carrier, nullable)
-            .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), label.into())].into())
-    }
-
-    fn facts(
-        schema: &SchemaRef,
-        kinds: &[ConnectorTableColumnSemanticKind],
-    ) -> ConnectorTablePlanningFacts {
-        assert_eq!(schema.fields().len(), kinds.len());
+    fn facts(schema: &SchemaRef, kinds: &[K]) -> ConnectorTablePlanningFacts {
         ConnectorTablePlanningFacts::try_new(
             schema,
             kinds
@@ -858,8 +907,8 @@ mod source_value_type_tests {
                 .enumerate()
                 .map(|(ordinal, kind)| {
                     ConnectorTableColumnPlanningFact::new(
-                        u32::try_from(ordinal).unwrap(),
-                        ConnectorTableColumnVisibility::Sql,
+                        ordinal as u32,
+                        V::Sql,
                         *kind,
                         ConnectorTableColumnRole::Ordinary,
                     )
@@ -875,192 +924,160 @@ mod source_value_type_tests {
 
     #[test]
     fn authored_uuid_and_variant_field_roots_reach_exact_catalog_value_types() {
-        let empty = ConnectorTablePlanningFacts::empty();
-        for (field, logical, sql) in [
-            (
-                tagged("identity", DataType::FixedSizeBinary(16), false, "uuid"),
-                ValueLogicalType::Uuid,
-                Some(SqlType::Uuid),
-            ),
-            (
-                tagged("payload", DataType::LargeBinary, true, "variant"),
-                ValueLogicalType::Variant,
-                Some(SqlType::Variant),
-            ),
-            (
-                Field::new("fixed", DataType::FixedSizeBinary(16), true),
-                ValueLogicalType::Physical,
-                None,
-            ),
-            (
-                Field::new("binary", DataType::LargeBinary, false),
-                ValueLogicalType::Physical,
-                None,
-            ),
+        for (carrier, domain, declaration) in [
+            (DataType::FixedSizeBinary(16), L::Uuid, SqlType::Uuid),
+            (DataType::LargeBinary, L::Variant, SqlType::Variant),
+            (DataType::Binary, L::Physical, SqlType::Binary),
         ] {
-            let column = sql_column_from_connector_field(&field, &empty, 0).unwrap();
-            assert_eq!(column.name, *field.name());
-            assert_eq!(column.logical_type, sql);
-            assert_eq!(column.nullable, field.is_nullable());
-            assert_eq!(
-                column.declared_value_type().unwrap(),
-                FunctionValueType::try_from_field(&field).unwrap()
-            );
-            assert_eq!(column.declared_value_type().unwrap().logical_type, logical);
+            let binding = FunctionValueType::try_with_logical_type(carrier, true, domain).unwrap();
+            let column = sql_column_from_connector_binding(
+                "value",
+                &binding,
+                &ConnectorTablePlanningFacts::empty(),
+                0,
+            )
+            .unwrap();
+            assert_eq!(column.declared_value_type().unwrap(), binding);
+            assert_eq!(column.logical_type, Some(declaration));
         }
     }
 
     #[test]
-    #[allow(deprecated)]
-    fn nested_provider_annotations_logical_roots_and_dictionary_identity_survive() {
-        let nested_uuid = tagged("u", DataType::FixedSizeBinary(16), false, "uuid").with_metadata(
-            [
-                (NR_LOGICAL_TYPE_KEY.into(), "uuid".into()),
-                ("PARQUET:field_id".into(), "71".into()),
-                ("provider.annotation".into(), "nested-fact".into()),
-            ]
-            .into(),
-        );
-        let nested_variant = tagged("item", DataType::LargeBinary, true, "variant").with_metadata(
-            [
-                (NR_LOGICAL_TYPE_KEY.into(), "variant".into()),
-                ("PARQUET:field_id".into(), "72".into()),
-            ]
-            .into(),
-        );
-        let dictionary = Field::new_dict(
-            "codes",
-            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
-            true,
-            93,
-            true,
-        )
-        .with_metadata([("provider.annotation".into(), "dictionary-fact".into())].into());
-        let field = Field::new(
-            "record",
-            DataType::Struct(
+    fn complete_nested_provider_declaration_preserves_domains_and_normalized_dictionary_layout() {
+        let uuid = ValueTypeRef::try_new(ValueKind::Nominal(L::Uuid), false, S::pure()).unwrap();
+        let variant =
+            ValueTypeRef::try_new(ValueKind::Nominal(L::Variant), true, S::pure()).unwrap();
+        let list = ValueTypeRef::try_new(ValueKind::List(variant), false, S::pure()).unwrap();
+        let string = ValueTypeRef::try_new(ValueKind::String, true, S::pure()).unwrap();
+        let declaration = ValueTypeRef::try_new(
+            ValueKind::Struct(
                 vec![
-                    nested_uuid,
-                    Field::new("items", DataType::List(Arc::new(nested_variant)), false),
-                    dictionary,
+                    ValueField::new("u", uuid, S::pure()),
+                    ValueField::new("items", list, S::pure()),
+                    ValueField::new("codes", string, S::pure()),
                 ]
-                .into(),
+                .into_boxed_slice(),
             ),
             true,
+            S::pure(),
+        )
+        .unwrap();
+        let source = DataType::Struct(
+            vec![
+                Field::new("u", DataType::FixedSizeBinary(16), false).with_metadata(
+                    [("nr_logical_type".into(), "unknown-source-attribute".into())].into(),
+                ),
+                Field::new(
+                    "items",
+                    DataType::List(Arc::new(Field::new(
+                        "source_item",
+                        DataType::LargeBinary,
+                        true,
+                    ))),
+                    false,
+                ),
+                Field::new(
+                    "codes",
+                    DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+                    true,
+                ),
+            ]
+            .into(),
         );
-        let column =
-            sql_column_from_connector_field(&field, &ConnectorTablePlanningFacts::empty(), 0)
-                .unwrap();
-        let actual = column.declared_value_type().unwrap();
-        let expected = FunctionValueType::try_from_field(&field).unwrap();
-        assert_eq!(actual, expected);
-        assert!(novarocks_type_contract::arrow_data_types_exact(
-            &actual.data_type,
-            field.data_type()
-        ));
-        assert_eq!(actual.logical_type, ValueLogicalType::Physical);
+        let ty = FunctionValueType::try_from_value(
+            declaration,
+            ValueLayout::try_new(&source, S::pure()).unwrap(),
+        )
+        .unwrap();
+        let column = sql_column_from_connector_binding(
+            "record",
+            &ty,
+            &ConnectorTablePlanningFacts::empty(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(column.declared_value_type().unwrap(), ty);
+        assert_eq!(ty.child_at(0).unwrap().logical_type(), L::Uuid);
+        assert_eq!(
+            ty.child_at(1).unwrap().child_at(0).unwrap().logical_type(),
+            L::Variant
+        );
+        assert_eq!(ty.child_at(2).unwrap().data_type(), &DataType::Utf8);
     }
 
     #[test]
-    fn invalid_authored_field_identity_fails_the_whole_projection() {
-        for invalid in [
-            tagged("bad", DataType::FixedSizeBinary(16), true, "unknown"),
-            tagged("bad", DataType::FixedSizeBinary(15), true, "uuid"),
-            tagged("bad", DataType::Utf8, true, "uuid"),
-            tagged("bad", DataType::Binary, true, "variant"),
+    fn checked_provider_declaration_refuses_wrong_carriers() {
+        for (carrier, domain) in [
+            (DataType::FixedSizeBinary(15), L::Uuid),
+            (DataType::Utf8, L::Uuid),
+            (DataType::Binary, L::Variant),
         ] {
-            let empty = ConnectorTablePlanningFacts::empty();
-            assert!(sql_column_from_connector_field(&invalid, &empty, 0).is_err());
-            let schema = Schema::new(vec![Field::new("good", DataType::Int64, false), invalid]);
-            assert!(sql_columns_from_connector_schema(&schema, &empty).is_err());
+            assert!(FunctionValueType::try_with_logical_type(carrier, true, domain).is_err());
         }
-        let invalid_child = tagged("child", DataType::Int64, true, "uuid");
-        let invalid = Field::new("nested", DataType::List(Arc::new(invalid_child)), true);
-        assert!(
-            sql_column_from_connector_field(&invalid, &ConnectorTablePlanningFacts::empty(), 0)
-                .is_err()
-        );
     }
 
     #[test]
-    fn explicit_bitmap_hll_facts_author_domains_and_conflicting_tags_fail() {
-        for (kind, label, logical, sql, conflict) in [
-            (
-                ConnectorTableColumnSemanticKind::Bitmap,
-                "bitmap",
-                ValueLogicalType::Bitmap,
-                SqlType::Bitmap,
-                "hll",
-            ),
-            (
-                ConnectorTableColumnSemanticKind::Hll,
-                "hll",
-                ValueLogicalType::Hll,
-                SqlType::Hll,
-                "bitmap",
-            ),
-        ] {
-            for carrier in [DataType::Binary, DataType::LargeBinary] {
-                let untagged = Field::new("blob", carrier.clone(), true);
-                let schema = Arc::new(Schema::new(vec![untagged.clone()]));
-                let explicit = facts(&schema, &[kind]);
-                for source in [untagged, tagged("blob", carrier.clone(), true, label)] {
-                    let column = sql_column_from_connector_field(&source, &explicit, 0).unwrap();
-                    assert_eq!(column.logical_type, Some(sql.clone()));
-                    assert_eq!(
-                        column.declared_value_type().unwrap(),
-                        FunctionValueType::try_with_logical_type(carrier.clone(), true, logical)
-                            .unwrap()
-                    );
-                }
-                let conflicting = tagged("blob", carrier, true, conflict);
-                assert!(sql_column_from_connector_field(&conflicting, &explicit, 0).is_err());
-            }
-            let wrong = Field::new("blob", DataType::Int64, false);
-            let schema = Arc::new(Schema::new(vec![wrong.clone()]));
-            let explicit = facts(&schema, &[kind]);
-            assert!(sql_column_from_connector_field(&wrong, &explicit, 0).is_err());
+    fn independent_bitmap_hll_facts_require_the_complete_declaration_to_agree() {
+        for (kind, logical, other) in [(K::Bitmap, L::Bitmap, L::Hll), (K::Hll, L::Hll, L::Bitmap)]
+        {
+            let source = Arc::new(Schema::new(vec![Field::new(
+                "blob",
+                DataType::Binary,
+                true,
+            )]));
+            let signed = facts(&source, &[kind]);
+            let matching =
+                FunctionValueType::try_with_logical_type(DataType::Binary, true, logical).unwrap();
+            assert_eq!(
+                sql_column_from_connector_binding("blob", &matching, &signed, 0)
+                    .unwrap()
+                    .declared_value_type()
+                    .unwrap(),
+                matching
+            );
+            let mismatch =
+                FunctionValueType::try_with_logical_type(DataType::Binary, true, other).unwrap();
+            assert!(sql_column_from_connector_binding("blob", &mismatch, &signed, 0).is_err());
+            assert!(
+                sql_column_from_connector_binding(
+                    "blob",
+                    &FunctionValueType::new(DataType::Binary, true),
+                    &signed,
+                    0
+                )
+                .is_err()
+            );
         }
     }
 
     #[test]
     fn hidden_fields_leave_default_facts_at_their_original_schema_ordinals() {
-        let hidden = Field::new("hidden", DataType::Int64, false)
-            .with_metadata([(CONNECTOR_FIELD_HIDDEN_FROM_SQL.into(), "true".into())].into());
-        let schema = Arc::new(Schema::new(vec![
+        use novarocks_spi::connector::*;
+        let source = Arc::new(Schema::new(vec![
             Field::new("left", DataType::Int64, false),
-            hidden,
-            tagged("right", DataType::FixedSizeBinary(16), true, "uuid"),
+            Field::new("hidden", DataType::Int64, false),
+            Field::new("right", DataType::FixedSizeBinary(16), true),
         ]));
         let uuid = [0x5a; 16];
         let declarations = [
-            (
-                ConnectorTableColumnVisibility::Sql,
-                ConnectorColumnDefault::Int64(11),
-            ),
-            (
-                ConnectorTableColumnVisibility::Hidden,
-                ConnectorColumnDefault::Int64(99),
-            ),
-            (
-                ConnectorTableColumnVisibility::Sql,
-                ConnectorColumnDefault::Uuid(uuid),
-            ),
+            (V::Sql, ConnectorColumnDefault::Int64(11)),
+            (V::Hidden, ConnectorColumnDefault::Int64(99)),
+            (V::Sql, ConnectorColumnDefault::Uuid(uuid)),
         ]
         .into_iter()
         .enumerate()
         .map(|(ordinal, (visibility, default))| {
             ConnectorTableColumnPlanningFact::new(
-                u32::try_from(ordinal).unwrap(),
+                ordinal as u32,
                 visibility,
-                ConnectorTableColumnSemanticKind::None,
+                K::None,
                 ConnectorTableColumnRole::Ordinary,
             )
             .with_write_default(Some(default))
         })
         .collect();
-        let declarations = ConnectorTablePlanningFacts::try_new(
-            &schema,
+        let planning = ConnectorTablePlanningFacts::try_new(
+            &source,
             declarations,
             vec![],
             vec![],
@@ -1068,35 +1085,64 @@ mod source_value_type_tests {
             &test_request_context(),
         )
         .unwrap();
-        let columns = sql_columns_from_connector_schema(&schema, &declarations).unwrap();
+        let instance = ConnectorInstanceId::parse("test").unwrap();
+        let metadata = crate::connector::schema_creation::declared_test_metadata(
+            ConnectorTableMetadataHeader {
+                identity: ConnectorTableIdentity {
+                    instance_id: instance.clone(),
+                    namespace: Arc::from("db"),
+                    table: Arc::from("source"),
+                },
+                planning_facts: planning,
+                definition_facts: ConnectorTableDefinitionFacts::empty(),
+                version: None,
+                statistics_data_version: None,
+                table: ConnectorTableHandle::try_new(instance, bytes::Bytes::from_static(b"table"))
+                    .unwrap(),
+            },
+            source,
+            vec![
+                FunctionValueType::new(DataType::Int64, false),
+                FunctionValueType::new(DataType::Int64, false),
+                FunctionValueType::try_with_logical_type(
+                    DataType::FixedSizeBinary(16),
+                    true,
+                    L::Uuid,
+                )
+                .unwrap(),
+            ],
+        );
+        let columns = sql_columns_from_connector_metadata(&metadata).unwrap();
         assert_eq!(columns.len(), 2);
-        assert_eq!(columns[0].name, "left");
         assert_eq!(columns[0].write_default, Some(ColumnDefault::Int64(11)));
-        assert_eq!(columns[1].name, "right");
         assert_eq!(columns[1].write_default, Some(ColumnDefault::Uuid(uuid)));
-        assert_eq!(columns[1].logical_type, Some(SqlType::Uuid));
         assert_eq!(
-            columns[1].declared_value_type().unwrap(),
-            FunctionValueType::try_from_field(schema.field(2)).unwrap()
+            columns[1].declared_value_type().unwrap().logical_type(),
+            L::Uuid
         );
     }
 
     #[test]
-    fn column_names_never_author_domains_without_field_or_provider_facts() {
+    fn column_names_never_author_domains() {
         for (name, carrier) in [
-            ("uuid", DataType::FixedSizeBinary(16)),
             ("variant", DataType::LargeBinary),
             ("hll", DataType::Binary),
+            ("uuid", DataType::FixedSizeBinary(16)),
         ] {
-            let source = Field::new(name, carrier, true);
-            let column =
-                sql_column_from_connector_field(&source, &ConnectorTablePlanningFacts::empty(), 0)
-                    .unwrap();
-            assert_eq!(column.logical_type, None);
-            assert_eq!(
-                column.declared_value_type().unwrap().logical_type,
-                ValueLogicalType::Physical
-            );
+            let physical = FunctionValueType::new(carrier, true);
+            let column = sql_column_from_connector_binding(
+                name,
+                &physical,
+                &ConnectorTablePlanningFacts::empty(),
+                0,
+            )
+            .unwrap();
+            let declared = column.declared_value_type().unwrap();
+            assert_eq!(declared, physical);
+            assert_eq!(declared.logical_type(), L::Physical);
+            assert_eq!(declared.data_type(), physical.data_type());
+            assert!(declared.nullable());
+            assert_eq!(column.logical_type, Some(SqlType::Binary));
         }
     }
 }

@@ -119,8 +119,12 @@ fn observed_binding_identity_retains_policy_overload_arguments_results_and_aggre
         }),
         changed(&binding, |b| b.logical_argument_count += 1),
         changed(&binding, |b| {
-            b.selected.argument_types[0] =
-                FunctionArgumentType::Value(FunctionValueType::new(DataType::Int32, true))
+            let mut arguments = b.selected.argument_types.to_vec();
+            arguments[0] =
+                FunctionArgumentType::Value(FunctionValueType::new(DataType::Int32, true));
+            b.selected.argument_types = novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                arguments.into_boxed_slice(),
+            );
         }),
         changed(&binding, |b| {
             b.selected.result_type =
@@ -128,12 +132,17 @@ fn observed_binding_identity_retains_policy_overload_arguments_results_and_aggre
         }),
         changed(&binding, |b| {
             b.selected.result_type = FunctionResultType::Relation(
-                vec![FunctionValueType::new(DataType::Int64, true)].into_boxed_slice(),
+                novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    vec![FunctionValueType::new(DataType::Int64, true)].into_boxed_slice(),
+                ),
             )
         }),
         changed(&binding, |b| {
             let state = b.selected.aggregate.as_mut().unwrap();
-            state.intermediate_type.nullable = !state.intermediate_type.nullable;
+            state.intermediate_type = state
+                .intermediate_type
+                .with_nullable(!state.intermediate_type.nullable())
+                .unwrap();
         }),
         changed(&binding, |b| {
             b.selected.aggregate.as_mut().unwrap().state_format =
@@ -165,7 +174,8 @@ fn nested(reverse: bool, altered: bool) -> FunctionValueType {
     let mut ty = DataType::Int64;
     for depth in 0..24 {
         ty = DataType::List(Arc::new(
-            Field::new(format!("child_{depth}"), ty, true).with_metadata(metadata.clone()),
+            Field::new(format!("child_{depth}"), ty, !(altered && depth == 0))
+                .with_metadata(metadata.clone()),
         ));
     }
     FunctionValueType::new(ty, true)
@@ -176,13 +186,20 @@ fn observed_binding_types_cover_lambda_relation_and_deep_metadata_without_order_
     let base = actual();
     let make = |ty: FunctionValueType| {
         changed(&base, |b| {
-            b.selected.argument_types = vec![FunctionArgumentType::Lambda {
-                parameter_types: vec![ty.clone()].into_boxed_slice(),
-                result_type: ty.clone(),
-            }]
-            .into_boxed_slice();
-            b.selected.result_type =
-                FunctionResultType::Relation(vec![ty.clone()].into_boxed_slice());
+            b.selected.argument_types = novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                vec![FunctionArgumentType::Lambda {
+                    parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        vec![ty.clone()].into_boxed_slice(),
+                    ),
+                    result_type: ty.clone(),
+                }]
+                .into_boxed_slice(),
+            );
+            b.selected.result_type = FunctionResultType::Relation(
+                novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    vec![ty.clone()].into_boxed_slice(),
+                ),
+            );
             b.selected.aggregate.as_mut().unwrap().intermediate_type = ty;
         })
     };
@@ -199,22 +216,30 @@ fn observed_binding_types_cover_lambda_relation_and_deep_metadata_without_order_
     );
     assert!(!exact(&first, &make(nested(false, true))));
     let physical = changed(&base, |b| {
-        b.selected.argument_types[0] =
-            FunctionArgumentType::Value(FunctionValueType::new(DataType::FixedSizeBinary(16), true))
+        let mut arguments = b.selected.argument_types.to_vec();
+        arguments[0] = FunctionArgumentType::Value(FunctionValueType::new(
+            DataType::FixedSizeBinary(16),
+            true,
+        ));
+        b.selected.argument_types =
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(arguments.into_boxed_slice());
     });
     let uuid = changed(&physical, |b| {
-        b.selected.argument_types[0] = FunctionArgumentType::Value(
+        let mut arguments = b.selected.argument_types.to_vec();
+        arguments[0] = FunctionArgumentType::Value(
             FunctionValueType::try_with_logical_type(
                 DataType::FixedSizeBinary(16),
                 true,
                 ValueLogicalType::Uuid,
             )
             .unwrap(),
-        )
+        );
+        b.selected.argument_types =
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(arguments.into_boxed_slice());
     });
     assert!(!exact(&physical, &uuid));
     let mut nullable = nested(false, false);
-    nullable.nullable = false;
+    nullable = nullable.with_nullable(false).unwrap();
     assert!(!exact(&first, &make(nullable)));
 }
 
@@ -238,10 +263,12 @@ impl PureCompileControl for Recording {
 #[test]
 fn binding_observation_preserves_every_original_control_prefix_and_false_success_tails() {
     let first = changed(&actual(), |b| {
-        b.selected.argument_types = (0..320)
-            .map(|_| FunctionArgumentType::Value(FunctionValueType::new(DataType::Int64, true)))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        b.selected.argument_types = novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+            (0..320)
+                .map(|_| FunctionArgumentType::Value(FunctionValueType::new(DataType::Int64, true)))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
     });
     let last_mismatch = changed(&first, |b| {
         b.selected.aggregate.as_mut().unwrap().state_format =

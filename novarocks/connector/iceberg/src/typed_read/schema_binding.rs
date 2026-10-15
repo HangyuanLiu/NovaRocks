@@ -760,11 +760,6 @@ fn bind_one_column(
         None => target,
     };
 
-    let target = match handle.nominal_read_domain() {
-        Some(domain) => Arc::new(domain.annotate(&target)?),
-        None => target,
-    };
-
     // 1. a physical field with the same field id in the file schema.
     if let Some(index) = physical.index_of(base_field_id) {
         let _ = index;
@@ -2162,16 +2157,16 @@ mod tests {
 
     #[test]
     fn nominal_targets_preserve_physical_buffers_nulls_and_repeated_occurrences() {
-        use crate::nominal_read_domain::NominalReadDomain;
+        use crate::schema_mapping::nominal_declaration::NominalSourceDomain;
         use arrow::array::{BinaryArray, FixedSizeBinaryArray};
-        use novarocks_type_contract::{ValueLogicalType, field_logical_type};
+
         for domain in [
-            NominalReadDomain::LargeInt,
-            NominalReadDomain::Hll,
-            NominalReadDomain::Bitmap,
+            NominalSourceDomain::LargeInt,
+            NominalSourceDomain::Hll,
+            NominalSourceDomain::Bitmap,
         ] {
             let (primitive, carrier, input): (_, _, ArrayRef) = match domain {
-                NominalReadDomain::LargeInt => {
+                NominalSourceDomain::LargeInt => {
                     let first = i128::MIN.to_be_bytes();
                     let last = i128::MAX.to_be_bytes();
                     (
@@ -2207,28 +2202,44 @@ mod tests {
             let physical = Arc::new(ArrowSchema::new(vec![
                 Field::new("stored", carrier, true).with_metadata(field_id_metadata(17)),
             ]));
-            let plain = handle(&schema, 17);
-            let declared = plain
-                .clone()
-                .with_nominal_read_domain(Some(domain))
-                .unwrap();
-            let columns = [declared.clone(), plain, declared];
+            let columns = [
+                handle(&schema, 17),
+                handle(&schema, 17),
+                handle(&schema, 17),
+            ];
+            // Provider declarations select the complete value domain, while
+            // physical column handles remain domain-free.
+            let mut request = |_: std::alloc::Layout| Ok(());
+            let mut work = |_: usize| Ok(());
+            let mut creation =
+                novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    &mut request,
+                    &mut work,
+                );
+            let value = crate::schema_mapping::typed_value::from_declaration(
+                schema.as_struct().fields()[0].field_type.as_ref(),
+                true,
+                Some(domain.logical_type()),
+                None,
+                &mut creation,
+            )
+            .unwrap();
+            assert_eq!(value.binding.logical_type(), domain.logical_type());
             let binding =
                 bind_scan_columns(empty_binding_request(&schema, &physical, &columns)).unwrap();
             assert_eq!(binding.physical_base_field_ids(), &[17]);
             for ordinal in [0, 2] {
                 assert_eq!(
-                    field_logical_type(binding.columns()[ordinal].target()).unwrap(),
-                    domain.logical()
-                );
-                assert_eq!(
                     binding.columns()[ordinal].target().metadata()[PARQUET_FIELD_ID_META_KEY],
                     "17"
                 );
             }
-            assert_eq!(
-                field_logical_type(binding.columns()[1].target()).unwrap(),
-                ValueLogicalType::Physical
+            assert!(
+                !binding.columns()[1]
+                    .target()
+                    .metadata()
+                    .contains_key(novarocks_type_contract::NR_LOGICAL_TYPE_KEY)
             );
             let batch = RecordBatch::try_new(physical, vec![input.slice(1, 2)]).unwrap();
             let values = binding
@@ -2256,7 +2267,7 @@ mod tests {
     #[test]
     fn nominal_largeint_defaults_keep_original_refusal_and_missing_nulls() {
         use crate::iceberg::spec::PrimitiveLiteral;
-        use crate::nominal_read_domain::NominalReadDomain;
+        use crate::schema_mapping::nominal_declaration::NominalSourceDomain;
         use arrow::array::FixedSizeBinaryArray;
         for default in [Some(i128::MIN.to_be_bytes()), None] {
             let mut field =
@@ -2270,15 +2281,35 @@ mod tests {
                 .with_fields(vec![Arc::new(field)])
                 .build()
                 .unwrap();
-            let columns = [handle(&schema, 23)
-                .with_nominal_read_domain(Some(NominalReadDomain::LargeInt))
-                .unwrap()];
+            let columns = [handle(&schema, 23)];
+            let mut request = |_: std::alloc::Layout| Ok(());
+            let mut work = |_: usize| Ok(());
+            let mut creation =
+                novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    &mut request,
+                    &mut work,
+                );
+            let value = crate::schema_mapping::typed_value::from_declaration(
+                schema.as_struct().fields()[0].field_type.as_ref(),
+                true,
+                Some(NominalSourceDomain::LargeInt.logical_type()),
+                None,
+                &mut creation,
+            )
+            .unwrap();
+            assert_eq!(
+                value.binding.logical_type(),
+                novarocks_type_contract::ValueLogicalType::LargeInt
+            );
             let empty = Arc::new(ArrowSchema::empty());
             let binding =
                 bind_scan_columns(empty_binding_request(&schema, &empty, &columns)).unwrap();
-            assert_eq!(
-                novarocks_type_contract::field_logical_type(binding.columns()[0].target()).unwrap(),
-                novarocks_type_contract::ValueLogicalType::LargeInt
+            assert!(
+                !binding.columns()[0]
+                    .target()
+                    .metadata()
+                    .contains_key(novarocks_type_contract::NR_LOGICAL_TYPE_KEY)
             );
             let batch = RecordBatch::try_new_with_options(
                 empty,

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Project exact completed root occurrences into a bounded client render schema.
+//! Project complete immutable root declarations into a bounded render purpose.
 //! Borrowed preflight covers the whole schema before constructing any output.
 
 use arrow::datatypes::{DataType as D, Field, TimeUnit};
@@ -24,7 +24,7 @@ use novarocks_result_contract::{
     ClientRenderSchema, NamedRenderField, NativeRenderType as N, OpaqueRenderType as O,
     RenderColumn, RenderField, RenderPresentation as R, RenderTimeUnit as U, RootProfileV1 as P,
 };
-use novarocks_type_contract::ValueLogicalType as V;
+use novarocks_type_contract::{ValueKind, ValueLogicalType as V, ValueTypeRef};
 use std::mem::size_of;
 
 /// The application supplies the frontend's frozen presentation offset. No
@@ -36,7 +36,6 @@ pub fn client_render_schema(
     client_render_schema_from_port(plan.result_port(), timezone_offset_seconds)
 }
 
-/// Render the same published SQL public declaration, without using computed nullability.
 pub fn client_render_schema_from_port(
     port: Option<&novarocks_physical_plan::ResultPort>,
     timezone_offset_seconds: i32,
@@ -45,6 +44,20 @@ pub fn client_render_schema_from_port(
     schema(&result.fields, timezone_offset_seconds)
 }
 
+fn root_domain_matches(field: &ResultField) -> bool {
+    // This legacy root summary can check consistency but cannot author or
+    // replace any node of the complete declaration.
+    matches!(
+        (field.domain, field.ty.logical_type()),
+        (Domain::Plain, V::Physical | V::LargeInt | V::Uuid)
+            | (Domain::Json, V::Json)
+            | (Domain::Variant, V::Variant)
+            | (Domain::Hll, V::Hll)
+            | (Domain::Bitmap, V::Bitmap)
+            | (Domain::Object, V::Object)
+            | (Domain::Percentile, V::Percentile)
+    )
+}
 fn schema(fields: &[ResultField], offset: i32) -> Result<ClientRenderSchema, String> {
     validate_public_fields(fields)?;
     if fields.is_empty() || fields.len() > P::MAX_COLUMNS || !(-86_399..=86_399).contains(&offset) {
@@ -63,18 +76,13 @@ fn schema(fields: &[ResultField], offset: i32) -> Result<ClientRenderSchema, Str
         0,
     )?;
     for field in fields {
-        if !field.domain.matches_storage(&field.ty.data_type)
-            || matches!(
-                (&field.domain, &field.ty.data_type),
-                (Domain::Plain, D::LargeBinary)
-            )
-        {
+        if !root_domain_matches(field) {
             return Err(invalid());
         }
         bounds.name(field.alias.as_deref().unwrap_or(&field.name))?;
         preflight(
-            &field.ty.data_type,
-            domain(field.domain),
+            field.ty.value_type(),
+            field.ty.data_type(),
             true,
             1,
             &mut bounds,
@@ -86,20 +94,13 @@ fn schema(fields: &[ResultField], offset: i32) -> Result<ClientRenderSchema, Str
             source_ordinal: u32::try_from(ordinal).map_err(|_| limited())?,
             source_slot: None,
             name: field.alias.as_deref().unwrap_or(&field.name).to_owned(),
-            field: build(
-                &field.ty.data_type,
-                field.ty.nullable,
-                domain(field.domain),
-                true,
-                offset,
-            )?,
+            field: build(field.ty.value_type(), field.ty.data_type(), true, offset)?,
         });
     }
     ClientRenderSchema::try_new(columns, fields.len()).map_err(|error| error.to_string())
 }
-
-/// Qualify complete public identities without imposing ClientRows' carrier
-/// profile on ScalarValue or reconstructing a missing legacy declaration.
+/// Qualify the complete public declaration without imposing a renderer's
+/// carrier profile or recovering domains from source annotations.
 pub fn validate_public_result_logical_identities(
     port: Option<&novarocks_physical_plan::ResultPort>,
 ) -> Result<(), String> {
@@ -110,63 +111,26 @@ pub fn validate_public_result_logical_identities(
 }
 
 fn validate_public_fields(fields: &[ResultField]) -> Result<(), String> {
-    fn uuid() -> String {
-        "public output logical type UUID is unsupported".into()
-    }
-    fn walk(data_type: &D, depth: usize, nodes: &mut usize) -> Result<(), String> {
+    fn walk(value: &ValueTypeRef, depth: usize, nodes: &mut usize) -> Result<(), String> {
         *nodes = nodes.checked_add(1).ok_or_else(limited)?;
         if depth > P::MAX_DEPTH || *nodes > P::SCHEMA_TYPE_NODES {
             return Err(limited());
         }
-        fn check_marker(field: &Field) -> Result<(), String> {
-            // Other invalid metadata still belongs to the original schema
-            // author; this narrow public gate protects complete UUID facts.
-            if field
-                .metadata()
-                .get(novarocks_type_contract::NR_LOGICAL_TYPE_KEY)
-                .is_some_and(|value| {
-                    value.len() <= P::MAX_NAME_BYTES
-                        && V::from_legacy_compatible_metadata_value(value) == Ok(V::Uuid)
-                })
-            {
-                return Err(uuid());
-            }
-            Ok(())
+        if matches!(value.kind(), ValueKind::Nominal(V::Uuid)) {
+            return Err("public output logical type UUID is unsupported".into());
         }
-        fn child(field: &Field, depth: usize, nodes: &mut usize) -> Result<(), String> {
-            check_marker(field)?;
-            walk(field.data_type(), depth, nodes)
-        }
-        match data_type {
-            D::List(field) | D::LargeList(field) | D::FixedSizeList(field, _) => {
-                child(field, depth + 1, nodes)?;
-            }
-            D::Map(entries, _) => {
-                check_marker(entries)?;
-                // Entries is the existing Arrow carrier, not a semantic
-                // render node. Use the original key/value profile geometry.
-                if let D::Struct(fields) = entries.data_type()
-                    && fields.len() == 2
-                {
-                    child(&fields[0], depth + 1, nodes)?;
-                    child(&fields[1], depth + 1, nodes)?;
-                }
-            }
-            D::Struct(fields) => {
-                for field in fields {
-                    child(field, depth + 1, nodes)?;
-                }
-            }
-            _ => {}
+        for index in 0..value.child_count() {
+            walk(
+                value.child_type_at(index).expect("validated child ordinal"),
+                depth + 1,
+                nodes,
+            )?;
         }
         Ok(())
     }
     let mut nodes = 0;
     for field in fields {
-        if field.ty.logical_type == V::Uuid {
-            return Err(uuid());
-        }
-        walk(&field.ty.data_type, 1, &mut nodes)?;
+        walk(field.ty.value_type(), 1, &mut nodes)?;
     }
     Ok(())
 }
@@ -176,16 +140,6 @@ fn invalid() -> String {
 }
 fn limited() -> String {
     "client render schema exceeds its bounded profile".into()
-}
-fn domain(domain: Domain) -> Option<V> {
-    match domain {
-        Domain::Plain | Domain::Variant => None,
-        Domain::Json => Some(V::Json),
-        Domain::Hll => Some(V::Hll),
-        Domain::Bitmap => Some(V::Bitmap),
-        Domain::Object => Some(V::Object),
-        Domain::Percentile => Some(V::Percentile),
-    }
 }
 struct Bounds {
     backing: usize,
@@ -231,95 +185,81 @@ fn unit(unit: TimeUnit) -> U {
         TimeUnit::Nanosecond => U::Nanosecond,
     }
 }
-fn kind(data_type: &D, marker: Option<V>) -> Result<Kind, String> {
-    if let Some(marker) = marker {
-        return Ok(Kind::Leaf(match (marker, data_type) {
+fn kind(value: &ValueTypeRef, layout: &D) -> Result<Kind, String> {
+    Ok(match value.kind() {
+        ValueKind::String if matches!(layout, D::Utf8 | D::LargeUtf8) => Kind::Leaf(N::String),
+        ValueKind::Binary if matches!(layout, D::Binary | D::LargeBinary) => Kind::Leaf(N::Binary),
+        ValueKind::Nominal(domain) => Kind::Leaf(match (domain, layout) {
             (V::Json, D::Utf8) => N::Json,
-            (V::LargeInt, D::FixedSizeBinary(16)) => N::LargeInt,
             (V::Variant, D::LargeBinary) => N::Variant,
-            (V::Uuid, _) => return Err("public output logical type UUID is unsupported".into()),
+            (V::LargeInt, D::FixedSizeBinary(16)) => N::LargeInt,
             (V::Hll, D::Binary) => N::Opaque(O::Hll),
             (V::Bitmap, D::Binary) => N::Opaque(O::Bitmap),
             (V::Object, D::Binary) => N::Opaque(O::Object),
             (V::Percentile, D::Binary) => N::Opaque(O::Percentile),
             _ => return Err(invalid()),
-        }));
-    }
-    Ok(match data_type {
-        D::Null => Kind::Leaf(N::Null),
-        D::Boolean => Kind::Leaf(N::Boolean),
-        D::Int8 => Kind::Leaf(N::SignedInteger(8)),
-        D::Int16 => Kind::Leaf(N::SignedInteger(16)),
-        D::Int32 => Kind::Leaf(N::SignedInteger(32)),
-        D::Int64 => Kind::Leaf(N::SignedInteger(64)),
-        D::UInt8 => Kind::Leaf(N::UnsignedInteger(8)),
-        D::UInt16 => Kind::Leaf(N::UnsignedInteger(16)),
-        D::UInt32 => Kind::Leaf(N::UnsignedInteger(32)),
-        D::UInt64 => Kind::Leaf(N::UnsignedInteger(64)),
-        D::FixedSizeBinary(16) => Kind::Leaf(N::LargeInt),
-        D::Float32 => Kind::Leaf(N::Float32),
-        D::Float64 => Kind::Leaf(N::Float64),
-        D::Decimal128(precision, scale) | D::Decimal256(precision, scale) => {
-            let bits = if matches!(data_type, D::Decimal128(..)) {
-                128
-            } else {
-                256
-            };
-            let max = if bits == 128 { 38 } else { 76 };
-            if *precision == 0 || *precision > max || *scale < 0 || *scale as u8 > *precision {
-                return Err(invalid());
-            }
-            Kind::Leaf(N::Decimal {
-                bits,
+        }),
+        ValueKind::Scalar(scalar) => match scalar {
+            D::Null => Kind::Leaf(N::Null),
+            D::Boolean => Kind::Leaf(N::Boolean),
+            D::Int8 => Kind::Leaf(N::SignedInteger(8)),
+            D::Int16 => Kind::Leaf(N::SignedInteger(16)),
+            D::Int32 => Kind::Leaf(N::SignedInteger(32)),
+            D::Int64 => Kind::Leaf(N::SignedInteger(64)),
+            D::UInt8 => Kind::Leaf(N::UnsignedInteger(8)),
+            D::UInt16 => Kind::Leaf(N::UnsignedInteger(16)),
+            D::UInt32 => Kind::Leaf(N::UnsignedInteger(32)),
+            D::UInt64 => Kind::Leaf(N::UnsignedInteger(64)),
+            D::Float32 => Kind::Leaf(N::Float32),
+            D::Float64 => Kind::Leaf(N::Float64),
+            D::Decimal128(precision, scale) => Kind::Leaf(N::Decimal {
+                bits: 128,
                 precision: *precision,
                 scale: *scale,
-            })
-        }
-        D::Utf8 => Kind::Leaf(N::String),
-        D::Binary => Kind::Leaf(N::Binary),
-        // LargeBinary is Native's frozen Variant carrier. Top-level domains
-        // were checked separately against ResultField; nested slots carry the
-        // Native type codec's existing exact identity.
-        D::LargeBinary => Kind::Leaf(N::Variant),
-        D::Date32 => Kind::Leaf(N::Date),
-        D::Time32(u @ (TimeUnit::Second | TimeUnit::Millisecond))
-        | D::Time64(u @ (TimeUnit::Microsecond | TimeUnit::Nanosecond)) => {
-            Kind::Leaf(N::Time { unit: unit(*u) })
-        }
-        D::Timestamp(u, _) => Kind::Timestamp(unit(*u)),
-        D::List(_) => Kind::List,
-        D::Map(_, false) => Kind::Map,
-        D::Struct(_) => Kind::Struct,
+            }),
+            D::Decimal256(precision, scale) => Kind::Leaf(N::Decimal {
+                bits: 256,
+                precision: *precision,
+                scale: *scale,
+            }),
+            D::Date32 => Kind::Leaf(N::Date),
+            D::Time32(u @ (TimeUnit::Second | TimeUnit::Millisecond))
+            | D::Time64(u @ (TimeUnit::Microsecond | TimeUnit::Nanosecond)) => {
+                Kind::Leaf(N::Time { unit: unit(*u) })
+            }
+            D::Timestamp(u, _) => Kind::Timestamp(unit(*u)),
+            _ => return Err(invalid()),
+        },
+        ValueKind::List(_) if matches!(layout, D::List(_) | D::LargeList(_)) => Kind::List,
+        ValueKind::Map { .. } if matches!(layout, D::Map(_, false)) => Kind::Map,
+        ValueKind::Struct(_) if matches!(layout, D::Struct(_)) => Kind::Struct,
+        // Complete value identity does not install a renderer capability.
+        ValueKind::FixedSizeList { .. } | ValueKind::Union(_) => return Err(invalid()),
         _ => return Err(invalid()),
     })
 }
-fn child_preflight(field: &Field, depth: usize, bounds: &mut Bounds) -> Result<(), String> {
-    preflight(
-        field.data_type(),
-        super::root_scalar_type::marker(field)?,
-        false,
-        depth,
-        bounds,
-    )
+fn list_layout(layout: &D) -> Result<&Field, String> {
+    match layout {
+        D::List(field) | D::LargeList(field) if field.name() == "item" => Ok(field),
+        _ => Err(invalid()),
+    }
 }
 fn preflight(
-    data_type: &D,
-    marker: Option<V>,
+    value: &ValueTypeRef,
+    layout: &D,
     top: bool,
     depth: usize,
     bounds: &mut Bounds,
 ) -> Result<(), String> {
     bounds.node(depth)?;
-    // Existing MySQL metadata/row handling has no top-level Decimal256
-    // support. Nested container formatting does, so preserve that distinction.
-    if top && matches!(data_type, D::Decimal256(..)) {
+    if top && matches!(value.kind(), ValueKind::Scalar(D::Decimal256(..))) {
         return Err(invalid());
     }
-    match kind(data_type, marker)? {
+    match kind(value, layout)? {
         Kind::Leaf(_) => {}
         Kind::Timestamp(_) => {
-            let D::Timestamp(_, zone) = data_type else {
-                unreachable!()
+            let D::Timestamp(_, zone) = layout else {
+                return Err(invalid());
             };
             if let Some(zone) = zone {
                 if zone.is_empty() {
@@ -329,29 +269,28 @@ fn preflight(
             }
         }
         Kind::List => {
-            let D::List(child) = data_type else {
-                unreachable!()
-            };
-            if child.name() != "item" {
+            let ValueKind::List(child) = value.kind() else {
                 return Err(invalid());
-            }
+            };
+            let field = list_layout(layout)?;
             bounds.add(size_of::<RenderField>(), 0)?;
-            child_preflight(child, depth + 1, bounds)?;
+            preflight(child, field.data_type(), false, depth + 1, bounds)?;
         }
         Kind::Map => {
-            let D::Map(entries, _) = data_type else {
-                unreachable!()
+            let (ValueKind::Map { key, value }, D::Map(entries, false)) = (value.kind(), layout)
+            else {
+                return Err(invalid());
             };
-            let (key, value) = super::root_scalar_type::map_children(entries)?;
+            let (key_layout, value_layout) = super::root_scalar_type::map_children(entries)?;
             bounds.add(2 * size_of::<RenderField>(), 0)?;
-            child_preflight(key, depth + 1, bounds)?;
-            child_preflight(value, depth + 1, bounds)?;
+            preflight(key, key_layout.data_type(), false, depth + 1, bounds)?;
+            preflight(value, value_layout.data_type(), false, depth + 1, bounds)?;
         }
         Kind::Struct => {
-            let D::Struct(fields) = data_type else {
-                unreachable!()
+            let (ValueKind::Struct(fields), D::Struct(layouts)) = (value.kind(), layout) else {
+                return Err(invalid());
             };
-            if fields.is_empty() || fields.len() > P::MAX_COLUMNS {
+            if fields.is_empty() || fields.len() > P::MAX_COLUMNS || fields.len() != layouts.len() {
                 return Err(invalid());
             }
             bounds.add(
@@ -361,35 +300,26 @@ fn preflight(
                     .ok_or_else(limited)?,
                 0,
             )?;
-            for field in fields {
+            for (field, layout) in fields.iter().zip(layouts) {
                 bounds.name(field.name())?;
-                child_preflight(field, depth + 1, bounds)?;
+                preflight(
+                    field.value_type(),
+                    layout.data_type(),
+                    false,
+                    depth + 1,
+                    bounds,
+                )?;
             }
         }
     }
     Ok(())
 }
-fn child_build(field: &Field, offset: i32) -> Result<RenderField, String> {
-    build(
-        field.data_type(),
-        field.is_nullable(),
-        super::root_scalar_type::marker(field)?,
-        false,
-        offset,
-    )
-}
-fn build(
-    data_type: &D,
-    nullable: bool,
-    marker: Option<V>,
-    top: bool,
-    offset: i32,
-) -> Result<RenderField, String> {
-    let native_type = match kind(data_type, marker)? {
-        Kind::Leaf(ty) => ty,
+fn build(value: &ValueTypeRef, layout: &D, top: bool, offset: i32) -> Result<RenderField, String> {
+    let native_type = match kind(value, layout)? {
+        Kind::Leaf(value) => value,
         Kind::Timestamp(unit) => {
-            let D::Timestamp(_, zone) = data_type else {
-                unreachable!()
+            let D::Timestamp(_, zone) = layout else {
+                return Err(invalid());
             };
             N::Timestamp {
                 unit,
@@ -397,30 +327,36 @@ fn build(
             }
         }
         Kind::List => {
-            let D::List(child) = data_type else {
-                unreachable!()
+            let ValueKind::List(child) = value.kind() else {
+                return Err(invalid());
             };
-            N::List(Box::new(child_build(child, offset)?))
+            N::List(Box::new(build(
+                child,
+                list_layout(layout)?.data_type(),
+                false,
+                offset,
+            )?))
         }
         Kind::Map => {
-            let D::Map(entries, _) = data_type else {
-                unreachable!()
+            let (ValueKind::Map { key, value }, D::Map(entries, false)) = (value.kind(), layout)
+            else {
+                return Err(invalid());
             };
-            let (key, value) = super::root_scalar_type::map_children(entries)?;
+            let (key_layout, value_layout) = super::root_scalar_type::map_children(entries)?;
             N::Map {
-                key: Box::new(child_build(key, offset)?),
-                value: Box::new(child_build(value, offset)?),
+                key: Box::new(build(key, key_layout.data_type(), false, offset)?),
+                value: Box::new(build(value, value_layout.data_type(), false, offset)?),
             }
         }
         Kind::Struct => {
-            let D::Struct(fields) = data_type else {
-                unreachable!()
+            let (ValueKind::Struct(fields), D::Struct(layouts)) = (value.kind(), layout) else {
+                return Err(invalid());
             };
             let mut out = Vec::with_capacity(fields.len());
-            for field in fields {
+            for (field, layout) in fields.iter().zip(layouts) {
                 out.push(NamedRenderField {
                     name: field.name().to_owned(),
-                    field: child_build(field, offset)?,
+                    field: build(field.value_type(), layout.data_type(), false, offset)?,
                 });
             }
             N::Struct(out)
@@ -439,27 +375,67 @@ fn build(
         _ => R::ScalarText,
     };
     Ok(RenderField {
-        nullable,
+        nullable: value.nullable(),
         presentation,
         native_type,
     })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use novarocks_physical_plan::{ValueId, ValueType};
-    use novarocks_types::logical::LogicalType as L;
-    use novarocks_types::logical::field_with_logical_type;
+    use novarocks_type_contract::{ValueField, ValueLayout, ValueTypeStorageLifetime};
     use std::sync::Arc;
-    fn output(name: &str, data_type: D, domain: Domain) -> ResultField {
+    fn output_type(name: &str, ty: ValueType, domain: Domain) -> ResultField {
         ResultField {
             name: name.into(),
             alias: None,
             value: ValueId::new(1),
             domain,
-            ty: ValueType::new(data_type, true),
+            ty,
         }
+    }
+    fn output(name: &str, data_type: D, domain: Domain) -> ResultField {
+        let logical = match domain {
+            Domain::Plain => V::Physical,
+            Domain::Json => V::Json,
+            Domain::Variant => V::Variant,
+            Domain::Hll => V::Hll,
+            Domain::Bitmap => V::Bitmap,
+            Domain::Object => V::Object,
+            Domain::Percentile => V::Percentile,
+        };
+        output_type(
+            name,
+            ValueType::try_with_logical_type(data_type, true, logical).unwrap(),
+            domain,
+        )
+    }
+    fn structure(children: &[(&str, ValueType)]) -> ValueType {
+        let storage = ValueTypeStorageLifetime::pure();
+        let semantic = ValueTypeRef::try_new(
+            ValueKind::Struct(
+                children
+                    .iter()
+                    .map(|(name, ty)| {
+                        ValueField::new(*name, ty.value_type().clone(), storage.clone())
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
+            true,
+            storage.clone(),
+        )
+        .unwrap();
+        let layout = D::Struct(
+            children
+                .iter()
+                .map(|(name, ty)| Field::new(*name, ty.data_type().clone(), ty.nullable()))
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        ValueType::try_from_value(semantic, ValueLayout::try_new(&layout, storage).unwrap())
+            .unwrap()
     }
     #[test]
     fn public_identity_gate_preserves_original_wide_map_semantic_profile() {
@@ -491,20 +467,24 @@ mod tests {
     #[test]
     fn complete_public_identities_keep_original_declarations_and_refuse_uuid() {
         let mut large = output("large", D::FixedSizeBinary(16), Domain::Plain);
-        large.ty.logical_type = V::LargeInt;
+        large.ty =
+            ValueType::try_with_logical_type(D::FixedSizeBinary(16), true, V::LargeInt).unwrap();
         assert_eq!(
             schema(&[large], 0).unwrap().columns()[0].field.native_type,
             N::LargeInt
         );
-        let physical = output("uuid", D::FixedSizeBinary(16), Domain::Plain);
+        let physical = output_type(
+            "large",
+            ValueType::try_with_logical_type(D::FixedSizeBinary(16), true, V::LargeInt).unwrap(),
+            Domain::Plain,
+        );
         assert_eq!(
             schema(&[physical], 0).unwrap().columns()[0]
                 .field
                 .native_type,
             N::LargeInt
         );
-        let mut json_plain = output("j", D::Utf8, Domain::Plain);
-        json_plain.ty.logical_type = V::Json;
+        let json_plain = output("j", D::Utf8, Domain::Plain);
         assert_eq!(
             schema(&[json_plain], 0).unwrap().columns()[0]
                 .field
@@ -512,21 +492,30 @@ mod tests {
             N::String
         );
         let mut uuid = output("u", D::FixedSizeBinary(16), Domain::Plain);
-        uuid.ty.logical_type = V::Uuid;
+        uuid.ty = ValueType::try_with_logical_type(D::FixedSizeBinary(16), true, V::Uuid).unwrap();
         let error = schema(&[uuid], 0).unwrap_err();
         assert!(error.contains("UUID") && error.contains("unsupported"));
     }
 
     #[test]
     fn complete_nested_variant_uses_original_renderer_and_uuid_is_named_refusal() {
-        use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
-        for (marker, storage) in [
-            ("variant", D::LargeBinary),
-            ("uuid", D::FixedSizeBinary(16)),
+        for (marker, storage, nominal) in [
+            ("variant", D::LargeBinary, V::Variant),
+            ("uuid", D::FixedSizeBinary(16), V::Uuid),
         ] {
-            let child = Field::new("item", storage, true)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into());
-            let field = output("items", D::List(Arc::new(child)), Domain::Plain);
+            let hold = ValueTypeStorageLifetime::pure();
+            let child = ValueType::try_with_logical_type(storage.clone(), true, nominal).unwrap();
+            let semantic = ValueTypeRef::try_new(
+                ValueKind::List(child.value_type().clone()),
+                true,
+                hold.clone(),
+            )
+            .unwrap();
+            let layout = D::List(Arc::new(Field::new("item", storage, true)));
+            let ty =
+                ValueType::try_from_value(semantic, ValueLayout::try_new(&layout, hold).unwrap())
+                    .unwrap();
+            let field = output_type("items", ty, Domain::Plain);
             if marker == "uuid" {
                 let error = schema(&[field], 0).unwrap_err();
                 assert!(error.contains("UUID") && error.contains("unsupported"));
@@ -571,32 +560,31 @@ mod tests {
     }
     #[test]
     fn nested_exact_domains_and_presentation_are_frozen() {
-        let nested = D::Struct(
-            vec![
-                Arc::new(field_with_logical_type(
-                    Field::new("j", D::Utf8, true),
-                    L::Json,
-                )),
-                Arc::new(field_with_logical_type(
-                    Field::new("h", D::Binary, true),
-                    L::Hll,
-                )),
-                Arc::new(Field::new("v", D::LargeBinary, true)),
-                Arc::new(Field::new(
-                    "ts",
-                    D::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                    true,
-                )),
-            ]
-            .into(),
-        );
+        let nested = structure(&[
+            (
+                "j",
+                ValueType::try_with_logical_type(D::Utf8, false, V::Json).unwrap(),
+            ),
+            (
+                "h",
+                ValueType::try_with_logical_type(D::Binary, true, V::Hll).unwrap(),
+            ),
+            (
+                "v",
+                ValueType::try_with_logical_type(D::LargeBinary, true, V::Variant).unwrap(),
+            ),
+            (
+                "ts",
+                ValueType::new(D::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())), true),
+            ),
+        ]);
         let fields = [
             output(
                 "top_ts",
                 D::Timestamp(TimeUnit::Nanosecond, None),
                 Domain::Plain,
             ),
-            output("nested", nested, Domain::Plain),
+            output_type("nested", nested, Domain::Plain),
             output("top_v", D::LargeBinary, Domain::Variant),
         ];
         let actual = schema(&fields, 28_800).unwrap();
@@ -612,6 +600,7 @@ mod tests {
             panic!("struct")
         };
         assert_eq!(children[0].field.native_type, N::Json);
+        assert!(!children[0].field.nullable);
         assert_eq!(children[1].field.presentation, R::OpaqueNull);
         assert_eq!(
             children[2].field.presentation,
@@ -627,18 +616,10 @@ mod tests {
         let nested = D::List(Arc::new(Field::new("item", D::Decimal256(40, 4), true)));
         assert!(schema(&[output("nested", nested, Domain::Plain)], 0).is_ok());
         assert!(
-            schema(
-                &[output(
-                    "invalid_time",
-                    D::Time32(TimeUnit::Microsecond),
-                    Domain::Plain
-                )],
-                0
-            )
-            .is_err()
+            ValueType::try_with_logical_type(D::Time32(TimeUnit::Microsecond), true, V::Physical)
+                .is_err()
         );
     }
-
     #[test]
     fn borrowed_preflight_refuses_the_whole_schema_before_any_owned_build() {
         let mut bounds = Bounds {
@@ -646,8 +627,7 @@ mod tests {
             wire: 0,
             nodes: 0,
         };
-        let oversized = "x".repeat(P::MAX_NAME_BYTES + 1);
-        assert!(bounds.name(&oversized).is_err());
+        assert!(bounds.name(&"x".repeat(P::MAX_NAME_BYTES + 1)).is_err());
         let fields = (0..5)
             .map(|_| output(&"x".repeat(P::MAX_NAME_BYTES), D::Utf8, Domain::Plain))
             .collect::<Vec<_>>();
@@ -656,29 +636,148 @@ mod tests {
         for _ in 0..P::MAX_DEPTH {
             deep = D::List(Arc::new(Field::new("item", deep, true)));
         }
-        assert!(schema(&[output("deep", deep, Domain::Plain)], 0).is_err());
-        assert!(schema(&[output("wrong", D::Binary, Domain::Json)], 0).is_err());
-        assert!(
-            schema(
-                &[output("unproven_variant", D::LargeBinary, Domain::Plain)],
-                0
-            )
-            .is_err()
-        );
+        assert!(ValueType::try_with_logical_type(deep, true, V::Physical).is_err());
+        let wrong = output_type("wrong", ValueType::new(D::Binary, true), Domain::Json);
+        assert!(schema(&[wrong], 0).is_err());
         assert!(schema(&[output("unsupported", D::Utf8View, Domain::Plain)], 0).is_err());
+    }
+    #[test]
+    fn complete_semantics_distinguish_equal_carriers_without_metadata_or_width_guesses() {
+        let raw = ValueType::new(D::FixedSizeBinary(16), true);
+        let integer =
+            ValueType::try_with_logical_type(D::FixedSizeBinary(16), true, V::LargeInt).unwrap();
+        assert_eq!(raw.data_type(), integer.data_type());
+        assert!(schema(&[output_type("bytes", raw, Domain::Plain)], 0).is_err());
+        assert_eq!(
+            schema(&[output_type("integer", integer, Domain::Plain)], 0)
+                .unwrap()
+                .columns()[0]
+                .field
+                .native_type,
+            N::LargeInt
+        );
+        assert_eq!(
+            schema(&[output("bytes", D::LargeBinary, Domain::Plain)], 0)
+                .unwrap()
+                .columns()[0]
+                .field
+                .native_type,
+            N::Binary
+        );
+        assert_eq!(
+            schema(&[output("variant", D::LargeBinary, Domain::Variant)], 0)
+                .unwrap()
+                .columns()[0]
+                .field
+                .native_type,
+            N::Variant
+        );
         let marked = Field::new("item", D::Binary, true).with_metadata(
             [(
-                novarocks_types::logical::NR_LOGICAL_TYPE_KEY.into(),
-                "unknown".into(),
+                novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
+                "unknown-source-attribute".into(),
             )]
             .into(),
         );
-        assert!(
-            schema(
-                &[output("bad", D::List(Arc::new(marked)), Domain::Plain)],
-                0
+        let actual = schema(
+            &[output("source", D::List(Arc::new(marked)), Domain::Plain)],
+            0,
+        )
+        .unwrap();
+        let N::List(child) = &actual.columns()[0].field.native_type else {
+            panic!("list")
+        };
+        assert_eq!(child.native_type, N::Binary);
+    }
+    #[test]
+    fn metadata_free_struct_map_list_children_keep_domains_and_null_contracts() {
+        let storage = ValueTypeStorageLifetime::pure();
+        let json = ValueType::try_with_logical_type(D::Utf8, false, V::Json).unwrap();
+        let key = ValueType::new(D::Utf8, false);
+        let list_layout = D::LargeList(Arc::new(Field::new("item", D::Utf8, false)));
+        let list = ValueType::try_from_value(
+            ValueTypeRef::try_new(
+                ValueKind::List(json.value_type().clone()),
+                true,
+                storage.clone(),
             )
-            .is_err()
+            .unwrap(),
+            ValueLayout::try_new(&list_layout, storage.clone()).unwrap(),
+        )
+        .unwrap();
+        let map_layout = D::Map(
+            Arc::new(Field::new(
+                "entries",
+                D::Struct(
+                    vec![
+                        Field::new("key", D::Utf8, false),
+                        Field::new("value", list_layout, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
         );
+        let map = ValueType::try_from_value(
+            ValueTypeRef::try_new(
+                ValueKind::Map {
+                    key: key.value_type().clone(),
+                    value: list.value_type().clone(),
+                },
+                true,
+                storage.clone(),
+            )
+            .unwrap(),
+            ValueLayout::try_new(&map_layout, storage).unwrap(),
+        )
+        .unwrap();
+        let nested = structure(&[("pairs", map)]);
+        let plain = ValueType::new(nested.data_type().clone(), nested.nullable());
+        assert_eq!(plain.data_type(), nested.data_type());
+        let field = |ty| {
+            schema(&[output_type("container", ty, Domain::Plain)], 0)
+                .unwrap()
+                .columns()[0]
+                .field
+                .clone()
+        };
+        let nominal = field(nested);
+        let physical = field(plain);
+        assert_ne!(nominal, physical);
+        let N::Struct(fields) = nominal.native_type else {
+            panic!("struct")
+        };
+        let N::Map { key, value } = &fields[0].field.native_type else {
+            panic!("map")
+        };
+        assert_eq!(key.native_type, N::String);
+        assert!(!key.nullable);
+        let N::List(child) = &value.native_type else {
+            panic!("list")
+        };
+        assert_eq!(child.native_type, N::Json);
+        assert!(!child.nullable);
+        assert!(value.nullable);
+    }
+
+    #[test]
+    fn typed_uninstalled_uuid_fixed_list_and_union_fail_at_authoring() {
+        let uuid = ValueType::try_with_logical_type(D::FixedSizeBinary(16), true, V::Uuid).unwrap();
+        let fixed = ValueType::new(
+            D::FixedSizeList(Arc::new(Field::new("item", D::Int64, true)), 2),
+            true,
+        );
+        let union = ValueType::new(
+            D::Union(
+                arrow::datatypes::UnionFields::try_new([2], [Field::new("item", D::Int64, true)])
+                    .unwrap(),
+                arrow::datatypes::UnionMode::Dense,
+            ),
+            true,
+        );
+        for ty in [uuid, fixed, union] {
+            assert!(schema(&[output_type("unsupported", ty, Domain::Plain)], 0).is_err());
+        }
     }
 }

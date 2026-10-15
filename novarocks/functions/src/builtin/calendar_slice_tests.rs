@@ -113,7 +113,7 @@ fn prepare(
     control: &dyn PureCompileControl,
 ) -> Result<Arc<dyn crate::PreparedScalarKernel>, crate::FunctionSpecializationFailure> {
     let mut types = vec![
-        FunctionValueType::new(target(date), nullable),
+        FunctionValueType::from_legacy_declared_projection(target(date), nullable),
         FunctionValueType::new(DataType::Int32, nullable),
         FunctionValueType::new(DataType::Utf8, nullable),
     ];
@@ -222,7 +222,7 @@ fn slice_called_on_null_controls_and_exact_declaration_contract_are_preserved() 
                     k.contract().selected().argument_types.len(),
                     if boundary { 4 } else { 3 }
                 );
-                assert_eq!(k.contract().result_type().data_type, target(date));
+                assert_eq!(k.contract().result_type().data_type().clone(), target(date));
             }
         }
     }
@@ -370,7 +370,7 @@ fn pool(array: ArrayRef, ordinal: u32) -> ConstantValue {
         max_library_validation_work: 4096,
         max_library_validation_bytes: 8192,
     };
-    let ty = FunctionValueType::new(array.data_type().clone(), true);
+    let ty = FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true);
     ConstantPool::try_new(
         Arc::new(ty.try_to_field("slice-control").unwrap()),
         ty,

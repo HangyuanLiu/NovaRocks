@@ -96,6 +96,8 @@ fn original_result(
             args: vec![packed],
             return_type: value_type.clone(),
             aggregate_binding: Some(WindowAggregateBinding {
+                // Explicit legacy carrier fixture; this is not frozen-binding admission.
+                frozen: None,
                 function_name: name.into(),
                 resolved,
             }),

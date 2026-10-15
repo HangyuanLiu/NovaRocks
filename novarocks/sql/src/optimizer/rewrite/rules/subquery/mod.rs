@@ -268,7 +268,17 @@ mod tests {
         // ScalarApplyToJoin (CROSS JOIN + pass-through Project). ApplyException
         // is never reached; the pipeline succeeds.
         let mut ctx = ctx_with_arena();
-        let expr = to_opt_expr(&apply_over_values(), &mut ctx);
+        let mut plan = apply_over_values();
+        let LogicalPlanKind::Values(inner) = &mut plan.children[1].kind else {
+            panic!("inner Values")
+        };
+        inner.columns.push(OutputColumn {
+            column_id: ColumnId(5),
+            name: "sq".into(),
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            is_internal: false,
+        });
+        let expr = to_opt_expr(&plan, &mut ctx);
         let result = query_rewrite_pipeline()
             .rewrite(expr, &mut ctx)
             .expect("pipeline must succeed: ScalarApplyToJoin eliminates the Apply");

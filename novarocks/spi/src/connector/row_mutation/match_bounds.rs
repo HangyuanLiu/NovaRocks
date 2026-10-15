@@ -207,3 +207,27 @@ pub(super) fn digest_debug_field(hasher: &mut Sha256, field: &Field) -> Result<(
     }
     Ok(())
 }
+
+/// Independent full value identity is part of the signed match contract.
+/// Existing source Field/attrs hashing stays separate and supplies no meaning.
+/// Reuse the one shared, borrowed type/layout emitter; no formatted shadow
+/// tree, allocation, runtime encoding fingerprint or new receiving limit.
+pub(super) fn digest_execution_type(
+    hasher: &mut Sha256,
+    value: &novarocks_type_contract::FunctionValueType,
+) -> Result<(), ConnectorError> {
+    let mut bytes = 0usize;
+    let mut write = |part: &[u8]| {
+        bytes = bytes.checked_add(part.len()).ok_or_else(exhausted)?;
+        // This stream allocates no formatted workspace. The original source
+        // preflight still bounds Field/name/type shape and Debug projection;
+        // do not impose a second receiving threshold on shared type identity.
+        hasher.update(part);
+        Ok::<(), ConnectorError>(())
+    };
+    novarocks_type_contract::write_value_type_identity_observed(value.value_type(), &mut write)?;
+    novarocks_type_contract::write_value_layout_identity_observed(
+        value.typed_binding().layout(),
+        &mut write,
+    )
+}

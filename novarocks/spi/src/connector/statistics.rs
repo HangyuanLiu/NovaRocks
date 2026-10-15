@@ -978,11 +978,11 @@ impl StatisticsScanColumn {
     }
 
     pub fn data_type(&self) -> &DataType {
-        &self.value_type.data_type
+        &self.value_type.data_type()
     }
 
-    pub const fn nullable(&self) -> bool {
-        self.value_type.nullable
+    pub fn nullable(&self) -> bool {
+        self.value_type.nullable()
     }
 }
 
@@ -1395,7 +1395,7 @@ mod tests {
                 assert_eq!(column.ordinal(), 7);
                 assert_eq!(column.name(), "actual");
                 assert_eq!(column.value_type(), &expected);
-                assert_eq!(column.data_type(), &expected.data_type);
+                assert_eq!(column.data_type(), expected.data_type());
                 assert_eq!(column.nullable(), nullable);
             }
         }
@@ -1422,37 +1422,91 @@ mod tests {
 
     #[test]
     #[allow(deprecated)]
-    fn scan_columns_preserve_nested_field_metadata_and_dictionary_identity() {
+    fn scan_columns_preserve_complete_nested_domains_separately_from_source_encoding_and_attributes()
+     {
         use arrow::datatypes::Field;
-        use novarocks_type_contract::{FunctionValueType, NR_LOGICAL_TYPE_KEY};
-        let json = Field::new("payload", DataType::Utf8, false).with_metadata(
-            [
-                (NR_LOGICAL_TYPE_KEY.into(), "json".into()),
-                ("provider.field-id".into(), "71".into()),
+        use novarocks_type_contract::{
+            FunctionValueType, NR_LOGICAL_TYPE_KEY, ValueField, ValueKind, ValueLayout,
+            ValueLogicalType, ValueTypeRef, ValueTypeStorageLifetime,
+        };
+        let storage = ValueTypeStorageLifetime::pure();
+        let payload =
+            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+                .unwrap();
+        let codes = FunctionValueType::new(DataType::Utf8, true);
+        let source = DataType::Struct(
+            vec![
+                Field::new("payload", DataType::Utf8, false).with_metadata(
+                    [
+                        (
+                            NR_LOGICAL_TYPE_KEY.into(),
+                            "unknown-source-attribute".into(),
+                        ),
+                        ("provider.field-id".into(), "71".into()),
+                    ]
+                    .into(),
+                ),
+                Field::new_dict(
+                    "codes",
+                    DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+                    true,
+                    91,
+                    true,
+                ),
             ]
             .into(),
         );
-        let dictionary = Field::new_dict(
-            "codes",
-            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+        let semantic = ValueTypeRef::try_new(
+            ValueKind::Struct(
+                vec![
+                    ValueField::new("payload", payload.value_type().clone(), storage.clone()),
+                    ValueField::new("codes", codes.value_type().clone(), storage.clone()),
+                ]
+                .into_boxed_slice(),
+            ),
             true,
-            91,
-            true,
-        );
-        let expected =
-            FunctionValueType::new(DataType::Struct(vec![json, dictionary].into()), true);
+            storage.clone(),
+        )
+        .unwrap();
+        let expected = FunctionValueType::try_from_value(
+            semantic,
+            ValueLayout::try_new(&source, storage).unwrap(),
+        )
+        .unwrap();
         let column = StatisticsScanColumn::try_new(3, "nested", expected.clone()).unwrap();
         assert_eq!(column.value_type(), &expected);
-        assert!(novarocks_type_contract::arrow_data_types_exact(
-            column.data_type(),
-            &expected.data_type
-        ));
+        assert_eq!(
+            column
+                .value_type()
+                .value_type()
+                .child_type_at(0)
+                .unwrap()
+                .domain(),
+            Some(ValueLogicalType::Json)
+        );
+        assert_eq!(
+            column
+                .value_type()
+                .value_type()
+                .child_type_at(1)
+                .unwrap()
+                .kind(),
+            &ValueKind::String
+        );
+        let DataType::Struct(fields) = column.data_type() else {
+            panic!("declared struct layout")
+        };
+        assert!(fields.iter().all(|field| field.metadata().is_empty()));
+        assert_eq!(fields[1].data_type(), &DataType::Utf8);
     }
 
     #[test]
-    fn scan_columns_reject_invalid_authored_domains_and_nested_carriers() {
+    fn scan_columns_require_checked_complete_declarations_before_publication() {
         use arrow::datatypes::Field;
-        use novarocks_type_contract::{FunctionValueType, NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+        use novarocks_type_contract::{
+            FunctionValueType, NR_LOGICAL_TYPE_KEY, ValueKind, ValueLayout, ValueLogicalType,
+            ValueTypeError, ValueTypeRef, ValueTypeStorageLifetime,
+        };
         for logical_type in [
             ValueLogicalType::Json,
             ValueLogicalType::Variant,
@@ -1463,26 +1517,46 @@ mod tests {
             ValueLogicalType::LargeInt,
             ValueLogicalType::Uuid,
         ] {
-            let invalid = FunctionValueType {
-                data_type: DataType::Int64,
-                nullable: true,
-                logical_type,
-            };
             assert_eq!(
-                StatisticsScanColumn::try_new(0, "invalid", invalid)
-                    .unwrap_err()
-                    .kind(),
-                ConnectorErrorKind::InvalidRequest
+                FunctionValueType::try_with_logical_type(DataType::Int64, true, logical_type),
+                Err(ValueTypeError::InvalidLogicalCarrier(logical_type))
             );
         }
-        let invalid_child = Field::new("child", DataType::Int64, true)
-            .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "json".into())].into());
-        let invalid = FunctionValueType::new(DataType::List(Arc::new(invalid_child)), true);
+        let storage = ValueTypeStorageLifetime::pure();
+        let json =
+            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+                .unwrap();
+        let semantic = ValueTypeRef::try_new(
+            ValueKind::List(json.value_type().clone()),
+            true,
+            storage.clone(),
+        )
+        .unwrap();
+        let incompatible = ValueLayout::try_new(
+            &DataType::List(Arc::new(Field::new("child", DataType::Int64, true))),
+            storage,
+        )
+        .unwrap();
+        assert!(
+            FunctionValueType::try_from_value(semantic, incompatible).is_err(),
+            "an incompatible complete child declaration cannot be published"
+        );
+
+        let source = DataType::List(Arc::new(
+            Field::new("child", DataType::Int64, true)
+                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "json".into())].into()),
+        ));
+        let physical = FunctionValueType::new(source, true);
+        let column = StatisticsScanColumn::try_new(0, "nested", physical).unwrap();
         assert_eq!(
-            StatisticsScanColumn::try_new(0, "nested", invalid)
-                .unwrap_err()
+            column
+                .value_type()
+                .value_type()
+                .child_type_at(0)
+                .unwrap()
                 .kind(),
-            ConnectorErrorKind::InvalidRequest
+            &ValueKind::Scalar(DataType::Int64),
+            "source attributes cannot replace the explicit physical declaration"
         );
     }
 

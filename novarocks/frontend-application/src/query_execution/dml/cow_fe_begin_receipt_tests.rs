@@ -22,6 +22,7 @@ fn request_bound_uses_original_safe_source_and_real_containers_without_new_admis
         vec![2],
         Arc::new(arrow::array::StringArray::from(vec!["value"])) as ArrayRef,
         DataType::Utf8,
+        novarocks_types::schema::SqlType::String,
     );
     let (control, root, binding, capacity) =
         crate::query_execution::internal_result_cpu::admitted_internal_fixture();
@@ -67,6 +68,7 @@ fn legacy_selection_without_safe_receipts_never_enters_request_construction() {
         vec![2],
         Arc::new(arrow::array::StringArray::from(vec!["value"])) as ArrayRef,
         DataType::Utf8,
+        novarocks_types::schema::SqlType::String,
     );
     assert!(!fixture.selection.has_owned_sources());
     let (control, root, binding, capacity) =
@@ -102,6 +104,7 @@ fn original_control_failure_precedes_missing_source_receipts_at_request_boundary
         vec![2],
         Arc::new(arrow::array::StringArray::from(vec!["value"])) as ArrayRef,
         DataType::Utf8,
+        novarocks_types::schema::SqlType::String,
     );
     let (control, root, binding, capacity) =
         crate::query_execution::internal_result_cpu::admitted_internal_fixture();
@@ -189,6 +192,7 @@ fn real_context_clone_two_vectors_are_counted_before_request_and_strings_shared(
         vec![2],
         Arc::new(arrow::array::StringArray::from(vec!["value"])) as ArrayRef,
         DataType::Utf8,
+        novarocks_types::schema::SqlType::String,
     );
     let (control, root, binding, capacity) =
         crate::query_execution::internal_result_cpu::admitted_internal_fixture();
@@ -291,6 +295,7 @@ fn original_stop_refuses_nonempty_context_before_the_request_clone() {
         vec![2],
         Arc::new(arrow::array::StringArray::from(vec!["value"])) as ArrayRef,
         DataType::Utf8,
+        novarocks_types::schema::SqlType::String,
     );
     let (control, root, binding, capacity) =
         crate::query_execution::internal_result_cpu::admitted_internal_fixture();

@@ -97,7 +97,7 @@ fn same_carrier_keeps_nominal_and_nested_type_identity() {
         let input = source(ty);
         let output = cast_null_preserving_target_type(
             input.clone(),
-            &input.value_type.data_type,
+            input.value_type.data_type(),
             DecimalOverflowPolicy::ReportError,
         );
         assert_eq!(format!("{output:?}"), format!("{input:?}"));

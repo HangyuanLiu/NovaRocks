@@ -16,6 +16,7 @@
 // under the License.
 //! Processor lifecycle probes, independent of compile/source transport tests.
 use super::*;
+use crate::exec::chunk::ChunkSchema;
 use crate::runtime::fragment::ExecutionFailureCause;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -71,7 +72,15 @@ fn instance(values: [i64; 3], control: Arc<Control>) -> (CompiledGenerateSeriesP
         name: "control-fixture".to_owned(),
         input,
         parameters: Arc::from([0, 1, 2]),
-        output,
+        output_layout: novarocks_local_program::StaticLayout::try_new(
+            output.arrow_schema_ref(),
+            Arc::from([SlotId::new(71)]),
+        )
+        .unwrap(),
+        // This fixture isolates legacy lifecycle callbacks; typed construction
+        // ownership is verified through the production factory tests.
+        output: Some(output),
+        construction: None,
         control,
         pending: None,
         offset: 0,

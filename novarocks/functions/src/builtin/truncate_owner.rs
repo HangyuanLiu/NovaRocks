@@ -75,7 +75,7 @@ pub(super) fn definition(
 }
 
 struct TruncateOwner {
-    resolver: BuiltinDynamicScalarResolver,
+    resolver: Arc<BuiltinDynamicScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
@@ -110,7 +110,7 @@ impl TruncateOwner {
             })
             .collect();
         Ok(Self {
-            resolver,
+            resolver: Arc::new(resolver),
             declaration,
             implementations,
         })
@@ -162,6 +162,10 @@ impl FunctionBindingResolver for TruncateOwner {
 }
 
 impl PureFunctionMetadataOwner for TruncateOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::dynamic_scalar(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -190,31 +194,21 @@ impl FunctionEffectOwner for TruncateOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        work.step().map_err(FunctionEffectOwnerError::Control)?;
-        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
-        {
-            return Err(FunctionBindingError::UnknownFunction.into());
-        }
-        if !input.environment.is_empty()
-            || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
-        {
-            return Err(FunctionBindingError::InvalidBinding(
-                "truncate has no environment dependencies and requires an exact proof scope".into(),
-            )
-            .into());
-        }
-        work.flush().map_err(FunctionEffectOwnerError::Control)?;
-        self.validate_selected(input.selected, input.request, control)
-            .map_err(|error| match error {
-                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
-                other => FunctionEffectOwnerError::Owner(other),
-            })?;
-        let result = self.call_effects(input);
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        Ok(result)
+        self.refine_selected_core(input, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_selected_core(input, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -225,44 +219,21 @@ impl PureScalarImplementation for TruncateOwner {
         contract: Arc<ScalarCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        work.step().map_err(compile_failure)?;
-        if input.function_id != self.declaration.function_id()
-            || input.kind != FunctionKind::Scalar
-            || contract.function_id() != input.function_id
-            || !std::ptr::eq(contract.selected(), input.selected)
-            || contract.context() != input.context
-            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-            || contract.effects() != &self.call_effects(input)
-            || !input.environment.is_empty()
-        {
-            return Err(invalid(
-                "truncate preparation differs from its exact checked call",
-            ));
-        }
-        work.flush().map_err(compile_failure)?;
-        self.validate_selected(input.selected, input.request, control)
-            .map_err(|error| match error {
-                FunctionBindingError::Control(error) => compile_failure(error),
-                _ => invalid("truncate preparation has a stale selected binding"),
-            })?;
-        let operation = match input.selected.argument_types.len() {
-            1 => TruncateOp::Unary,
-            2 => TruncateOp::Binary,
-            _ => {
-                return Err(invalid(
-                    "TRUNCATE preparation has an invalid selected arity",
-                ));
-            }
-        };
-        work.finish().map_err(compile_failure)?;
-        // The prepared object retains the same canonical contract. Its body is
-        // a static pure implementation and needs no live resolver or authority.
-        Ok(Arc::new(PreparedTruncate {
-            contract,
-            operation,
-        }))
+        self.prepare_selected_core(input, contract, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn prepare_scalar_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_selected_core(input, contract, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -472,7 +443,12 @@ mod tests {
                 let types = profile
                     .iter()
                     .enumerate()
-                    .map(|(index, ty)| FunctionValueType::new(ty.clone(), mask & (1 << index) != 0))
+                    .map(|(index, ty)| {
+                        FunctionValueType::from_legacy_declared_projection(
+                            ty.clone(),
+                            mask & (1 << index) != 0,
+                        )
+                    })
                     .collect::<Vec<_>>();
                 let arguments = types.iter().cloned().map(argument).collect::<Vec<_>>();
                 let uses = uses(arguments.len());
@@ -498,7 +474,9 @@ mod tests {
                 };
                 assert_eq!(
                     selected.result_type,
-                    FunctionResultType::Scalar(FunctionValueType::new(expected, true))
+                    FunctionResultType::Scalar(FunctionValueType::from_legacy_declared_projection(
+                        expected, true
+                    ))
                 );
                 for policy in [
                     DecimalOverflowPolicy::OutputNull,
@@ -607,7 +585,9 @@ mod tests {
                 DecimalOverflowPolicy::OutputNull,
                 DecimalOverflowPolicy::ReportError,
             ] {
-                let arguments = [argument(FunctionValueType::new(source.clone(), true))];
+                let arguments = [argument(
+                    FunctionValueType::from_legacy_declared_projection(source.clone(), true),
+                )];
                 let selected = Arc::new(
                     owner
                         .resolve(request(&arguments), crate::binding_test_control())
@@ -753,7 +733,9 @@ mod tests {
             .unwrap();
         for wrong in [
             FunctionBindingSelection {
-                argument_types: Box::default(),
+                argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                    Box::default(),
+                ),
                 ..selected.clone()
             },
             FunctionBindingSelection {
@@ -867,7 +849,7 @@ mod tests {
     fn actual_dynamic_resolver_observes_256_and_tail_of_complete_expected_type() {
         let owner = owner();
         let args = [argument(FunctionValueType::new(DataType::Float64, true))];
-        let expected = FunctionValueType::new(
+        let expected = FunctionValueType::from_legacy_declared_projection(
             DataType::Struct(
                 (0..128)
                     .map(|index| {
@@ -907,5 +889,84 @@ mod tests {
                 assert_eq!(control.calls.lock().unwrap().len(), at + 1);
             }
         }
+    }
+}
+
+impl TruncateOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        work.step().map_err(FunctionEffectOwnerError::Control)?;
+        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
+        {
+            return Err(FunctionBindingError::UnknownFunction.into());
+        }
+        if !input.environment.is_empty()
+            || !matches!(input.proof_scope, CallProofScope::Unconditional)
+                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+        {
+            return Err(FunctionBindingError::InvalidBinding(
+                "truncate has no environment dependencies and requires an exact proof scope".into(),
+            )
+            .into());
+        }
+        work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+            other => FunctionEffectOwnerError::Owner(other),
+        })?;
+        let result = self.call_effects(input);
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        Ok(result)
+    }
+    fn prepare_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        work.step().map_err(compile_failure)?;
+        if input.function_id != self.declaration.function_id()
+            || input.kind != FunctionKind::Scalar
+            || contract.function_id() != input.function_id
+            || !std::ptr::eq(contract.selected(), input.selected)
+            || contract.context() != input.context
+            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
+            || contract.effects() != &self.call_effects(input)
+            || !input.environment.is_empty()
+        {
+            return Err(invalid(
+                "truncate preparation differs from its exact checked call",
+            ));
+        }
+        work.flush().map_err(compile_failure)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => compile_failure(error),
+            _ => invalid("truncate preparation has a stale selected binding"),
+        })?;
+        let operation = match input.selected.argument_types.len() {
+            1 => TruncateOp::Unary,
+            2 => TruncateOp::Binary,
+            _ => {
+                return Err(invalid(
+                    "TRUNCATE preparation has an invalid selected arity",
+                ));
+            }
+        };
+        work.finish().map_err(compile_failure)?;
+        // The prepared object retains the same canonical contract. Its body is
+        // a static pure implementation and needs no live resolver or authority.
+        Ok(Arc::new(PreparedTruncate {
+            contract,
+            operation,
+        }))
     }
 }

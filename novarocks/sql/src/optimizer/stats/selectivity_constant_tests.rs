@@ -53,9 +53,7 @@ impl PureCompileControl for Control {
 fn pool(array: ArrayRef, logical: ValueLogicalType) -> ConstantPool {
     let ty =
         FunctionValueType::try_with_logical_type(array.data_type().clone(), true, logical).unwrap();
-    let field = ty
-        .try_to_field("selected.source")
-        .unwrap()
+    let field = Field::new("selected.source", array.data_type().clone(), true)
         .with_metadata(HashMap::from([("source".into(), "preserved".into())]));
     ConstantPool::try_new(
         Arc::new(field),
@@ -425,7 +423,7 @@ fn selected_cv_full_source_type_mismatch_is_typed_and_never_admitted() {
             FunctionValueType::new(
                 DataType::Struct(
                     vec![Arc::new(
-                        Field::new("nested", DataType::Int64, true)
+                        Field::new("different_nested_name", DataType::Int64, true)
                             .with_metadata(HashMap::from([("source".into(), "b".into())])),
                     )]
                     .into(),

@@ -70,7 +70,7 @@ pub fn materialize_aggregate_result_chunks(
 ) -> Result<Vec<Chunk>, String> {
     chunks
         .into_iter()
-        .map(|chunk| materialize_aggregate_result_batch(&chunk.batch, layout))
+        .map(|chunk| materialize_aggregate_result_batch(&chunk.record_batch(), layout))
         .collect()
 }
 
@@ -81,7 +81,7 @@ pub fn load_aggregate_physical_rows(
 ) -> Result<HashMap<String, MvAggregatePhysicalRow>, String> {
     let mut rows = HashMap::new();
     for chunk in chunks {
-        for row in load_rows_from_batch(&chunk.batch, layout, false)? {
+        for row in load_rows_from_batch(&chunk.record_batch(), layout, false)? {
             let row_id = row.row_id.clone();
             if rows.insert(row_id.clone(), row).is_some() {
                 return Err(format!(
@@ -100,7 +100,7 @@ pub fn load_aggregate_physical_rows_for_delta(
 ) -> Result<Vec<MvAggregatePhysicalRow>, String> {
     let mut rows = Vec::new();
     for chunk in chunks {
-        rows.extend(load_rows_from_batch(&chunk.batch, layout, true)?);
+        rows.extend(load_rows_from_batch(&chunk.record_batch(), layout, true)?);
     }
     Ok(rows)
 }
@@ -1031,9 +1031,9 @@ mod tests {
         let merged = merge_aggregate_state_batches_with_retractions(&old, &materialized, &layout)
             .expect("merge");
         assert_eq!(merged.row_delta, 0);
-        assert_eq!(merged.upsert_chunks[0].batch.num_rows(), 1);
+        assert_eq!(merged.upsert_chunks[0].record_batch().num_rows(), 1);
         let counts = merged.upsert_chunks[0]
-            .batch
+            .record_batch()
             .column(2)
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
@@ -1102,33 +1102,39 @@ mod tests {
         )
         .expect("materialize AVG");
         let visible = materialized[0]
-            .batch
+            .record_batch()
             .column(2)
             .as_any()
             .downcast_ref::<Float64Array>()
             .expect("AVG visible column");
         assert_eq!(visible.value(0), 5.0);
-        assert_eq!(materialized[0].batch.schema().field(3).name(), "avg_sum");
-        assert_eq!(materialized[0].batch.schema().field(4).name(), "avg_count");
+        assert_eq!(
+            materialized[0].record_batch().schema().field(3).name(),
+            "avg_sum"
+        );
+        assert_eq!(
+            materialized[0].record_batch().schema().field(4).name(),
+            "avg_count"
+        );
 
         let old = build_old_state_map(&materialized, &layout).expect("old AVG state");
         let merged = merge_aggregate_state_batches_with_retractions(&old, &materialized, &layout)
             .expect("merge AVG");
         let visible = merged.upsert_chunks[0]
-            .batch
+            .record_batch()
             .column(2)
             .as_any()
             .downcast_ref::<Float64Array>()
             .expect("merged AVG visible column");
         assert_eq!(visible.value(0), 5.0);
         let sum = merged.upsert_chunks[0]
-            .batch
+            .record_batch()
             .column(3)
             .as_any()
             .downcast_ref::<LargeBinaryArray>()
             .expect("merged AVG sum state");
         let count = merged.upsert_chunks[0]
-            .batch
+            .record_batch()
             .column(4)
             .as_any()
             .downcast_ref::<LargeBinaryArray>()

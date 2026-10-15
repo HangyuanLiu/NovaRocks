@@ -124,8 +124,14 @@ fn compare_legacy_rows(
     let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
     let mut arena = ExprArena::default();
     arena.set_allow_throw_exception(allow);
-    let lhs = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), left_type.data_type);
-    let rhs = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), right_type.data_type);
+    let lhs = arena.push_typed(
+        ExprNode::SlotId(SlotId::new(1)),
+        left_type.data_type().clone(),
+    );
+    let rhs = arena.push_typed(
+        ExprNode::SlotId(SlotId::new(2)),
+        right_type.data_type().clone(),
+    );
     let expression = match operator {
         ArithmeticOperator::Add => ExprNode::Add(lhs, rhs, policy),
         ArithmeticOperator::Subtract => ExprNode::Sub(lhs, rhs, policy),
@@ -133,7 +139,7 @@ fn compare_legacy_rows(
         ArithmeticOperator::Divide => ExprNode::Div(lhs, rhs, policy),
         ArithmeticOperator::Modulo => ExprNode::Mod(lhs, rhs, policy),
     };
-    let expression = arena.push_typed(expression, result_type.data_type.clone());
+    let expression = arena.push_typed(expression, result_type.data_type().clone());
     let legacy = arena.eval(expression, &chunk);
     let rows = (0..left.len())
         .map(|row| {
@@ -152,7 +158,7 @@ fn compare_legacy_rows(
         .collect::<Vec<_>>();
     match &legacy {
         Ok(array) => {
-            assert_eq!(array.data_type(), &result_type.data_type);
+            assert_eq!(array.data_type().clone(), result_type.data_type().clone());
             for (row, value) in rows.iter().enumerate() {
                 match value {
                     ArithmeticRowResult::Null => assert!(array.is_null(row)),

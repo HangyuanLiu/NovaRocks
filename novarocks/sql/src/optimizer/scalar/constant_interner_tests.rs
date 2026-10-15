@@ -153,9 +153,9 @@ fn dictionary_renumbering_and_unused_entries_are_not_constant_identity() {
         );
         let ty = FunctionValueType::new(array.data_type().clone(), false);
         cv(
-            array,
+            array.clone(),
             ty.clone(),
-            Arc::new(ty.try_to_field("literal").unwrap()),
+            Arc::new(Field::new("literal", array.data_type().clone(), false)),
             ordinal,
         )
     };
@@ -191,14 +191,12 @@ fn float32_nan_payload_and_signed_zero_are_exact_materialized_values() {
 }
 
 #[test]
-fn root_field_metadata_and_authored_logical_domains_remain_identity() {
+fn root_source_metadata_is_independent_and_authored_logical_domains_remain_identity() {
     let mut arena = ScalarArena::with_constant_policy(policy());
     let value = |logical, metadata: &str| {
-        let ty = FunctionValueType {
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: logical,
-        };
+        let ty =
+            FunctionValueType::try_from_legacy_declared_projection(DataType::Utf8, false, logical)
+                .expect("valid temporary legacy value projection");
         let field = Arc::new(
             ty.try_to_field("literal").unwrap().with_metadata(
                 [("provider.fact".into(), metadata.into())]
@@ -218,7 +216,7 @@ fn root_field_metadata_and_authored_logical_domains_remain_identity() {
         &Control::good(),
     )
     .unwrap();
-    assert_ne!(
+    assert_eq!(
         insert(
             &mut arena,
             value(ValueLogicalType::Physical, "b"),
@@ -253,11 +251,12 @@ fn forged_carrier_logical_and_nullable_sources_refuse_before_publication() {
         assert!(arena.nodes.is_empty());
         assert!(arena.intern.is_empty());
     }
-    let ty = FunctionValueType {
-        data_type: DataType::Utf8,
-        nullable: false,
-        logical_type: ValueLogicalType::Json,
-    };
+    let ty = FunctionValueType::try_from_legacy_declared_projection(
+        DataType::Utf8,
+        false,
+        ValueLogicalType::Json,
+    )
+    .expect("valid temporary legacy value projection");
     let value = cv(
         Arc::new(StringArray::from(vec!["x"])),
         ty.clone(),
@@ -278,27 +277,25 @@ fn forged_carrier_logical_and_nullable_sources_refuse_before_publication() {
 }
 
 #[test]
-fn candidate_metadata_quantum_preserves_every_original_refusal_prefix_without_publication() {
-    let ty = FunctionValueType::new(DataType::Utf8, false);
-    let field = Arc::new(
-        ty.try_to_field("literal").unwrap().with_metadata(
-            (0..320)
-                .map(|i| (format!("provider.{i:04}"), "value".into()))
-                .collect(),
-        ),
-    );
-    let a = cv(
-        Arc::new(StringArray::from(vec!["same"])),
-        ty.clone(),
-        field.clone(),
-        0,
-    );
-    let b = cv(
-        Arc::new(StringArray::from(vec!["unused", "same"])),
-        ty,
-        field,
-        1,
-    );
+fn candidate_complete_value_quantum_preserves_every_original_refusal_prefix_without_publication() {
+    let fields = (0..320)
+        .map(|i| Arc::new(Field::new(format!("value_{i:04}"), DataType::Int64, false)))
+        .collect::<Vec<_>>();
+    let array: ArrayRef = Arc::new(arrow::array::StructArray::from(
+        fields
+            .iter()
+            .map(|field| {
+                (
+                    field.clone(),
+                    Arc::new(Int64Array::from(vec![7, 7])) as ArrayRef,
+                )
+            })
+            .collect::<Vec<_>>(),
+    ));
+    let ty = FunctionValueType::new(array.data_type().clone(), false);
+    let field = Arc::new(Field::new("literal", array.data_type().clone(), false));
+    let a = cv(array.clone(), ty.clone(), field.clone(), 0);
+    let b = cv(array, ty, field, 1);
     let make_arena = || {
         let mut arena = ScalarArena::with_constant_policy(policy());
         insert(&mut arena, a.clone(), &Control::good()).unwrap();

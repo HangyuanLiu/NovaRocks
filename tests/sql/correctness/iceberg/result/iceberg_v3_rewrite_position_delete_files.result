@@ -2,12 +2,16 @@
 id	user_id	amount
 1	10	100
 3	30	300
+5	50	500
+7	70	700
 
 -- query 4
 id	user_id	amount
 1	10	100
 3	30	300
+5	50	500
+7	70	700
 
 -- query 5
 puffin_delete_files
-1
+4

@@ -227,8 +227,13 @@ fn fixture(operator: Operator, ordered: bool) -> Fixture {
                         function: BoundTableFunction {
                             function_id: selected.function_id,
                             overload: selected.overload,
-                            argument_types: Box::default(),
-                            result_types: Box::from([result]),
+                            argument_types:
+                                novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                                    Box::default(),
+                                ),
+                            result_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                                Box::from([result]),
+                            ),
                             legacy_metadata: Some(crate::LegacyBindingMetadata {
                                 volatility: selected.legacy_metadata.as_ref().unwrap().volatility,
                                 argument_evaluation: selected
@@ -284,6 +289,7 @@ fn fixture(operator: Operator, ordered: bool) -> Fixture {
             )
         })
         .map(|invocation| FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
@@ -296,6 +302,7 @@ fn fixture(operator: Operator, ordered: bool) -> Fixture {
     if matches!(operator, Operator::Table) {
         let current = context(777, 0, EvaluationDemand::Value);
         calls.push(FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
@@ -581,11 +588,15 @@ fn replica_property_derivation_keeps_final_child_ordering_repeated_columns_and_c
             } else {
                 2
             }];
-            let DataType::Struct(fields) = &fixture.fragment.values()[&output].ty.data_type else {
+            let DataType::Struct(fields) = &fixture.fragment.values()[&output].ty.data_type()
+            else {
                 panic!("full source Struct")
             };
             assert_eq!(fields[0].name(), "exact-child");
-            assert_eq!(fields[0].metadata()["unrecognized-source-key"], "retained");
+            assert!(
+                fields[0].metadata().is_empty(),
+                "provider facts do not become value layout identity"
+            );
             let selected_fields = match &fixture.fragment.nodes()[&fixture.fragment.root()].kind {
                 NodeKind::Project { expressions } => {
                     let ExprKind::FunctionCall { function, .. } = &fixture
@@ -597,13 +608,13 @@ fn replica_property_derivation_keeps_final_child_ordering_repeated_columns_and_c
                     else {
                         panic!()
                     };
-                    let DataType::Struct(fields) = &function.result_type.data_type else {
+                    let DataType::Struct(fields) = &function.result_type.data_type() else {
                         panic!()
                     };
                     fields
                 }
                 NodeKind::TableFunction { function, .. } => {
-                    let DataType::Struct(fields) = &function.result_types[0].data_type else {
+                    let DataType::Struct(fields) = &function.result_types[0].data_type() else {
                         panic!()
                     };
                     fields

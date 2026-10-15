@@ -385,11 +385,12 @@ fn input(program: &LocalProgram, flags: Vec<Option<bool>>, root_null: bool) -> R
             .map(|r| i32::try_from(r).unwrap())
             .collect::<Vec<_>>(),
     ));
-    let DataType::List(item) = input_type().data_type else {
+    let declared_type = input_type();
+    let DataType::List(item) = declared_type.data_type() else {
         unreachable!()
     };
     let list = Arc::new(ListArray::new(
-        item,
+        item.clone(),
         offsets,
         values,
         root_null.then(|| NullBuffer::new_null(rows)),

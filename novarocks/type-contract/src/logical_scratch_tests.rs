@@ -173,3 +173,58 @@ fn borrowed_scratch_every_control_prefix_matches_the_original_walk() {
         }
     }
 }
+
+#[test]
+fn layout_scratch_observes_unknown_annotations_without_authoring_semantics() {
+    let field = Arc::new(
+        Field::new("source", DataType::Utf8, true).with_metadata(HashMap::from([(
+            NR_LOGICAL_TYPE_KEY.into(),
+            "unknown".into(),
+        )])),
+    );
+    let root = DataType::List(Arc::clone(&field));
+    let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+    let mut trace = Vec::new();
+    let mut attributes = 0;
+    validate_arrow_layout_structure_with_scratch_observed::<Error>(&root, &mut scratch, |visit| {
+        trace.push(event(visit));
+        if let ValueTypeVisit::Field(source) = visit {
+            assert!(std::ptr::eq(source, field.as_ref()));
+            assert_eq!(source.metadata()[NR_LOGICAL_TYPE_KEY], "unknown");
+            attributes += 1;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(attributes, 1);
+    assert_eq!(
+        validate_value_type_structure_observed::<Error>(&root, |_| Ok(())),
+        Err(Error::Value(ValueTypeError::UnknownLogicalMetadata))
+    );
+    for at in 0..trace.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let mut scratch = [None; MAX_VALUE_TYPE_NODES];
+            let mut prefix = Vec::new();
+            let result = validate_arrow_layout_structure_with_scratch_observed::<Error>(
+                &root,
+                &mut scratch,
+                |visit| {
+                    let ordinal = prefix.len();
+                    assert!(ordinal <= at, "callback after original refusal");
+                    prefix.push(event(visit));
+                    if ordinal == at {
+                        Err(Error::Control(cause))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(result, Err(Error::Control(cause)));
+            assert_eq!(prefix, trace[..=at]);
+        }
+    }
+}

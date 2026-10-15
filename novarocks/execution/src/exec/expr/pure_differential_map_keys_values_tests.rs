@@ -106,11 +106,11 @@ fn flat_profiles() -> Vec<FunctionValueType> {
     p
 }
 fn values(t: &FunctionValueType, rows: usize, seed: u64) -> ArrayRef {
-    if t.data_type == DataType::FixedSizeBinary(16) {
+    if *t.data_type() == DataType::FixedSizeBinary(16) {
         return novarocks_types::largeint::array_from_i128(
             &(0..rows)
                 .map(|r| {
-                    if t.nullable && r % 7 == 0 {
+                    if t.nullable() && r % 7 == 0 {
                         None
                     } else {
                         Some([i128::MIN, i128::MAX, -1, 0, 1][r % 5])
@@ -120,17 +120,55 @@ fn values(t: &FunctionValueType, rows: usize, seed: u64) -> ArrayRef {
         )
         .unwrap();
     }
-    if t.logical_type != ValueLogicalType::Physical {
-        let physical = FunctionValueType::new(t.data_type.clone(), t.nullable);
+    if t.logical_type() != ValueLogicalType::Physical {
+        let physical = FunctionValueType::new(t.data_type().clone(), t.nullable());
         return InputGenerator::new(seed).column(&physical, rows, &InputProfile::default());
     }
     InputGenerator::new(seed).column(t, rows, &InputProfile::default())
 }
 
-fn map(keys: ArrayRef, value: ArrayRef, nullable: bool, sorted: bool) -> ArrayRef {
-    let key = FunctionValueType::new(keys.data_type().clone(), false);
-    let val = FunctionValueType::new(value.data_type().clone(), true);
-    map_typed(keys, value, &key, &val, nullable, sorted)
+type DeclaredArray = (FunctionValueType, ArrayRef);
+
+fn sliced(source: &DeclaredArray, offset: usize, len: usize) -> DeclaredArray {
+    (source.0.clone(), source.1.slice(offset, len))
+}
+fn declared_map(
+    key: &FunctionValueType,
+    val: &FunctionValueType,
+    nullable: bool,
+    sorted: bool,
+) -> FunctionValueType {
+    use novarocks_type_contract::{ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime};
+    let key = key.with_nullable(false).unwrap();
+    let val = val.with_nullable(true).unwrap();
+    let entries = Field::new(
+        "entries",
+        DataType::Struct(
+            vec![
+                Arc::new(Field::new("key", key.data_type().clone(), false)),
+                Arc::new(Field::new("value", val.data_type().clone(), true)),
+            ]
+            .into(),
+        ),
+        false,
+    );
+    FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(
+            ValueKind::Map {
+                key: key.value_type().clone(),
+                value: val.value_type().clone(),
+            },
+            nullable,
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+        ValueLayout::try_new(
+            &DataType::Map(Arc::new(entries), sorted),
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
 }
 fn map_typed(
     keys: ArrayRef,
@@ -139,27 +177,27 @@ fn map_typed(
     val: &FunctionValueType,
     nullable: bool,
     sorted: bool,
-) -> ArrayRef {
+) -> DeclaredArray {
     let rows = keys.len() / 2;
     assert_eq!(keys.len(), value.len());
-    let mut kf = key.try_to_field("authored-key").unwrap();
-    let mut vf = val.try_to_field("authored-value").unwrap();
-    let mut km = kf.metadata().clone();
-    km.insert("key-fact".into(), "preserved".into());
-    kf = kf.with_metadata(km);
-    let mut vm = vf.metadata().clone();
-    vm.insert("value-fact".into(), "preserved".into());
-    vf = vf.with_metadata(vm);
+    // Canonicalize representation before either consumer. The independently
+    // supplied complete declarations remain the sole semantic source.
+    let keys = crate::exec::chunk::normalize_execution_array(&keys).unwrap();
+    let value = crate::exec::chunk::normalize_execution_array(&value).unwrap();
+    assert_eq!(keys.data_type(), key.data_type());
+    assert_eq!(value.data_type(), val.data_type());
+    let declared = declared_map(key, val, nullable, sorted);
     let entries = StructArray::new(
-        vec![Arc::new(kf), Arc::new(vf)].into(),
+        vec![
+            Arc::new(Field::new("key", key.data_type().clone(), false)),
+            Arc::new(Field::new("value", val.data_type().clone(), true)),
+        ]
+        .into(),
         vec![keys, value],
         None,
     );
-    Arc::new(MapArray::new(
-        Arc::new(
-            Field::new("authored-entries", entries.data_type().clone(), false)
-                .with_metadata([("entry-fact".into(), "preserved".into())].into()),
-        ),
+    let array = Arc::new(MapArray::new(
+        Arc::new(Field::new("entries", entries.data_type().clone(), false)),
         OffsetBuffer::new(
             (0..=rows)
                 .map(|r| (r * 2) as i32)
@@ -169,20 +207,23 @@ fn map_typed(
         entries,
         nullable.then(|| NullBuffer::from((0..rows).map(|r| r % 11 != 0).collect::<Vec<_>>())),
         sorted,
-    ))
+    )) as ArrayRef;
+    assert_eq!(array.data_type(), declared.data_type());
+    (declared, array)
 }
-fn check(name: &str, a: ArrayRef, nullable: bool) {
+fn check(name: &str, a: DeclaredArray, nullable: bool) {
+    assert_eq!(a.0.nullable(), nullable);
     let s = assert_scalar_matches_v1(
         ScalarDiffSpec::new(name)
-            .typed_column(FunctionValueType::new(a.data_type().clone(), nullable), a)
+            .typed_column(a.0, a.1)
             .float_comparison(super::FloatComparison::Exact)
             .sparse_selections(7, 6031),
     );
-    assert!(s.result_type.nullable);
+    assert!(s.result_type.nullable());
 }
 fn supported(t: &FunctionValueType) -> bool {
     matches!(
-        t.data_type,
+        t.data_type(),
         DataType::Boolean
             | DataType::Int8
             | DataType::Int16
@@ -221,9 +262,9 @@ fn pure_differential_map_parts_every_generic_flat_key_value_and_error_domain() {
                         ),
                         nullable,
                     );
-                    if t.data_type != DataType::Null {
+                    if *t.data_type() != DataType::Null {
                         let mut k = t.clone();
-                        k.nullable = false;
+                        k = k.with_nullable(false).expect("valid test root nullability");
                         check(
                             name,
                             map_typed(
@@ -246,18 +287,18 @@ fn pure_differential_map_parts_every_generic_flat_key_value_and_error_domain() {
 fn pure_differential_map_parts_unsupported_key_single_entry_and_null_demand_succeed() {
     for name in ["map_keys", "map_values"] {
         for t in flat_profiles() {
-            if supported(&t) || t.data_type == DataType::Null {
+            if supported(&t) || *t.data_type() == DataType::Null {
                 continue;
             }
             let mut k = t.clone();
-            k.nullable = false;
+            k = k.with_nullable(false).expect("valid test root nullability");
             let keys = values(&k, ROWS, 6035);
             let val: ArrayRef = Arc::new(Int32Array::from(
                 (0..ROWS).map(|r| r as i32).collect::<Vec<_>>(),
             ));
             let entries = StructArray::new(
                 vec![
-                    Arc::new(k.try_to_field("key").unwrap()),
+                    Arc::new(Field::new("key", k.data_type().clone(), false)),
                     Arc::new(Field::new("value", DataType::Int32, true)),
                 ]
                 .into(),
@@ -273,13 +314,31 @@ fn pure_differential_map_parts_unsupported_key_single_entry_and_null_demand_succ
                 )),
                 false,
             ));
-            check(name, a, true);
+            check(
+                name,
+                (
+                    declared_map(
+                        &k,
+                        &FunctionValueType::new(DataType::Int32, true),
+                        true,
+                        false,
+                    ),
+                    a,
+                ),
+                true,
+            );
         }
     }
 }
 
 #[test]
 fn pure_differential_map_parts_nested_children_complete_fields_and_slices() {
+    let nested_type = super::array_append_tests::declared_list(
+        &FunctionValueType::new(DataType::Int32, true),
+        true,
+    );
+    let structure_type =
+        super::array_append_tests::declared_struct(&[("nested-x", nested_type.clone())], true);
     let nested: ArrayRef = Arc::new(ListArray::new(
         Arc::new(Field::new("nested-item", DataType::Int32, true)),
         OffsetBuffer::new((0..=ROWS * 2).map(|r| r as i32).collect::<Vec<_>>().into()),
@@ -308,10 +367,24 @@ fn pure_differential_map_parts_nested_children_complete_fields_and_slices() {
     for name in ["map_keys", "map_values"] {
         for sorted in [false, true] {
             for a in [
-                map(keys.clone(), structure.clone(), true, sorted),
-                map(nested.clone(), structure.clone(), true, sorted),
+                map_typed(
+                    keys.clone(),
+                    structure.clone(),
+                    &FunctionValueType::new(DataType::Int32, false),
+                    &structure_type,
+                    true,
+                    sorted,
+                ),
+                map_typed(
+                    nested.clone(),
+                    structure.clone(),
+                    &nested_type,
+                    &structure_type,
+                    true,
+                    sorted,
+                ),
             ] {
-                check(name, a.slice(1, ROWS - 1), true);
+                check(name, sliced(&a, 1, ROWS - 1), true);
             }
         }
     }
@@ -322,11 +395,14 @@ fn pure_differential_map_parts_empty_null_parents_and_null_key_empty_domain() {
         for t in flat_profiles() {
             let entries = StructArray::new(
                 vec![
-                    Arc::new(Field::new("key", t.data_type.clone(), false)),
-                    Arc::new(Field::new("value", t.data_type.clone(), true)),
+                    Arc::new(Field::new("key", t.data_type().clone(), false)),
+                    Arc::new(Field::new("value", t.data_type().clone(), true)),
                 ]
                 .into(),
-                vec![new_empty_array(&t.data_type), new_empty_array(&t.data_type)],
+                vec![
+                    new_empty_array(&t.data_type()),
+                    new_empty_array(&t.data_type()),
+                ],
                 None,
             );
             let field = Arc::new(Field::new("entries", entries.data_type().clone(), false));
@@ -339,8 +415,19 @@ fn pure_differential_map_parts_empty_null_parents_and_null_key_empty_domain() {
                         None,
                         sorted,
                     ));
-                    check(name, a.clone(), false);
-                    check(name, new_null_array(a.data_type(), rows), true);
+                    check(
+                        name,
+                        (declared_map(&t, &t, false, sorted), a.clone()),
+                        false,
+                    );
+                    check(
+                        name,
+                        (
+                            declared_map(&t, &t, true, sorted),
+                            new_null_array(a.data_type(), rows),
+                        ),
+                        true,
+                    );
                 }
             }
         }
@@ -353,13 +440,14 @@ fn pure_differential_map_parts_actual_pool_constants_and_sparse() {
             .map(|r| ((ROWS * 2 - r) % 19) as i32)
             .collect::<Vec<_>>(),
     ));
-    let a = map(keys.clone(), keys, true, false);
-    let source = FunctionValueType::new(a.data_type().clone(), true);
+    let key_type = FunctionValueType::new(DataType::Int32, false);
+    let a = map_typed(keys.clone(), keys, &key_type, &key_type, true, false);
+    let source = a.0.clone();
     for name in ["map_values", "map_keys"] {
         for row in [0, 1] {
             let s = assert_scalar_matches_v1(
                 ScalarDiffSpec::new(name)
-                    .constant(constant(source.clone(), a.slice(row, 1)))
+                    .constant(constant(source.clone(), a.1.slice(row, 1)))
                     .constant_rows(ROWS)
                     .legacy_constants(LegacyConstantForm::Pool)
                     .sparse_selections(7, 6036),

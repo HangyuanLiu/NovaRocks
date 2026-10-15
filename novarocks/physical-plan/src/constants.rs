@@ -36,6 +36,7 @@ pub struct ConstantReference {
 #[derive(Clone, Debug)]
 pub struct ConstantPools {
     entries: BTreeMap<ConstantPoolId, ConstantPool>,
+    storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 
 /// Materialize a legacy literal using the original compiler's sole CV factory.
@@ -60,7 +61,11 @@ where
     use crate::LiteralValue;
     use std::sync::Arc;
     work.flush()?;
-    let field = Arc::new(value_type.try_to_field("constant")?);
+    let field = Arc::new(arrow_schema::Field::new(
+        "constant",
+        value_type.data_type().clone(),
+        value_type.nullable(),
+    ));
     work.flush()?;
     macro_rules! scalar {
         ($factory:ident, $value:expr) => {
@@ -106,7 +111,17 @@ impl ConstantPools {
     pub fn empty() -> Self {
         Self {
             entries: BTreeMap::new(),
+            storage: novarocks_type_contract::ValueTypeStorageLifetime::pure(),
         }
+    }
+    /// The map's finite construction responsibility is independent of each pool.
+    /// Moving this marker neither allocates nor authorizes another map request.
+    pub fn with_storage_lifetime(
+        mut self,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+    ) -> Self {
+        self.storage = storage;
+        self
     }
     pub fn entries(&self) -> &BTreeMap<ConstantPoolId, ConstantPool> {
         &self.entries
@@ -522,8 +537,11 @@ fn unpivot_collection_usage_core(
     )?;
     let source = pools.resolve_source_observed(reference, work)?;
     let ty = source.value_type();
-    let valid = !ty.nullable
-        && crate::validation::unpivot_collection_carrier_matches(constant, &ty.data_type);
+    let valid = !ty.nullable()
+        && crate::validation::unpivot_collection_binding_matches(constant, ty)
+        // Actual encoding/source annotations are checked against the retained
+        // source Field; the semantic binding cannot authorize an encoding.
+        && crate::validation::unpivot_collection_carrier_matches(constant, source.field().data_type());
     work.step()?;
     if !valid {
         return Err(ConstantReferenceError::InvalidConsumer(
@@ -535,6 +553,11 @@ fn unpivot_collection_usage_core(
     ))?;
     if !ty
         .same_value_domain_observed(output, || work.step().map_err(ConstantReferenceError::from))?
+        || !novarocks_type_contract::arrow_data_types_exact_observed(
+            ty.data_type(),
+            output.data_type(),
+            || work.step().map_err(ConstantReferenceError::from),
+        )?
     {
         return Err(ConstantReferenceError::InvalidConsumer(
             "Unpivot collection source differs from its complete output domain",
@@ -778,14 +801,14 @@ pub fn window_offset_observed(
         return Ok(crate::validation::window_row_offset(fragment, id));
     };
     let value = pools.resolve_observed(reference, &node.ty, work)?;
-    if node.ty.nullable
-        || node.ty.logical_type != novarocks_type_contract::ValueLogicalType::Physical
+    if node.ty.nullable()
+        || node.ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
     {
         return Err(ConstantReferenceError::InvalidConsumer(
             "window constant offset must be an exact non-null physical integer",
         ));
     }
-    let offset = match node.ty.data_type {
+    let offset = match node.ty.data_type() {
         arrow_schema::DataType::UInt64 => value.try_u64()?,
         arrow_schema::DataType::Int64 => {
             value.try_i64()?.and_then(|value| u64::try_from(value).ok())

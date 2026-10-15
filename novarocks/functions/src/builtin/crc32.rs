@@ -46,11 +46,11 @@ pub(super) fn evaluate_crc32<'a>(
         return Err(invalid("crc32 requires exactly one checked value argument"));
     };
     let target = input.contract().result_type();
-    if source.logical_type != ValueLogicalType::Physical
-        || source.data_type != DataType::Utf8
-        || target.logical_type != ValueLogicalType::Physical
-        || target.data_type != DataType::Int64
-        || !target.nullable
+    if source.logical_type() != ValueLogicalType::Physical
+        || source.data_type() != &DataType::Utf8
+        || target.logical_type() != ValueLogicalType::Physical
+        || target.data_type() != &DataType::Int64
+        || !target.nullable()
     {
         return Err(invalid("crc32 differs from its exact installed profile"));
     }
@@ -64,14 +64,13 @@ pub(super) fn evaluate_crc32<'a>(
         .ok_or_else(|| internal("crc32 selected Utf8 carrier cannot be downcast"))?;
     let selection = input.selection();
     output_capacity(selection.len())?;
-    let output =
-        evaluate_bytes(*argument, selection, source.nullable, true, control).map_err(|error| {
-            match error {
-                CoreError::Legacy(message) => internal(&message),
-                CoreError::Kernel(failure) => failure,
-            }
-        })?;
-    SelectedValues::try_new(selection, &target.data_type, output, Box::default())
+    let output = evaluate_bytes(*argument, selection, source.nullable(), true, control).map_err(
+        |error| match error {
+            CoreError::Legacy(message) => internal(&message),
+            CoreError::Kernel(failure) => failure,
+        },
+    )?;
+    SelectedValues::try_new(selection, target.data_type(), output, Box::default())
         .map_err(|_| internal("crc32 compact output violates its selected contract"))
 }
 

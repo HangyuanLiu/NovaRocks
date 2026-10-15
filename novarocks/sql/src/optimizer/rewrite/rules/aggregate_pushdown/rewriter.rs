@@ -97,7 +97,9 @@ fn column_ref_scalar(
 fn aggregate_result_type(spec: &ScalarAggregateSpec) -> novarocks_type_contract::FunctionValueType {
     let mut value_type = crate::functions::aggregate_result_type(spec.source.binding()).clone();
     // Preserve the existing pushdown-output root nullability widening.
-    value_type.nullable = true;
+    value_type = value_type
+        .with_nullable(true)
+        .expect("validated root NULL contract");
     value_type
 }
 
@@ -914,7 +916,7 @@ mod tests {
             )
             .unwrap();
             let mut expected = crate::functions::aggregate_result_type(&resolved).clone();
-            expected.nullable = true;
+            expected = expected.with_nullable(true).unwrap();
             let spec = ScalarAggregateSpec {
                 output_column_id: ColumnId(2),
                 name: name.into(),

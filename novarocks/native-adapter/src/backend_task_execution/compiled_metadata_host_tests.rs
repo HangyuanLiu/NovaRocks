@@ -23,6 +23,7 @@ use super::super::project_materialization::{
     CompiledProjectMetadataHost, ProjectMetadataHost, ProjectMetadataJournal, ProjectMetadataPhase,
 };
 use super::*;
+use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::{
     exec::chunk::ChunkSchema,
     runtime::{
@@ -34,9 +35,12 @@ use novarocks_execution::{
         query_memory::QueryMemoryBinding,
     },
 };
-use novarocks_local_compiler::{ProjectMetadataScope, ProjectOutputRequestFacts};
+use novarocks_local_compiler::{
+    FragmentCompileError, ProjectMetadataScope, ProjectOutputRequestFacts,
+};
 use novarocks_local_program::{ProgramNodeId, ProgramNodeKind, StaticLayout};
 use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority};
+use novarocks_plan_codec::physical_package_v2::decode_fragment_package_with_type_host;
 use novarocks_type_contract::{CompleteMetadataRequestFacts, MetadataRequestError};
 use novarocks_types::{
     QueryId, SlotId,
@@ -77,18 +81,19 @@ fn compile(
     let mut type_journal = super::super::TypeMaterializationJournal::default();
     let mut type_host = TypeMaterializationHost::new(binding, preparation, &mut type_journal);
     let mut project_host = ProjectMetadataHost::new(binding, preparation, journal);
-    interpreter()
-        .compile(
-            &bytes,
-            CompiledTaskOptions {
-                pipeline_dop: NonZeroUsize::MIN,
-                exchange_wait: Duration::from_millis(50),
-            },
-            &Control,
-            &mut type_host,
-            &mut project_host,
-        )
-        .unwrap()
+    compile_native_package_with_funding_for_test(
+        &interpreter(),
+        &bytes,
+        CompiledTaskOptions {
+            pipeline_dop: NonZeroUsize::MIN,
+            exchange_wait: Duration::from_millis(50),
+        },
+        MemTracker::new_root("native funded compile fixture"),
+        &Control,
+        &mut type_host,
+        &mut project_host,
+    )
+    .unwrap()
 }
 fn project(program: &LocalProgram) -> ProgramNodeId {
     program
@@ -122,29 +127,23 @@ fn project_metadata_real_native_compile_and_schema_share_one_binding() {
         )
     );
     assert_eq!(journal.body.settlement.as_ref().unwrap().next_step, Ok(()));
-    let output = output.into_preparation();
-    let program = output.program();
-    let node = project(program);
-    let layout = program.graph().nodes()[node.index()].output_layout();
-    let expected = ChunkSchema::from_compiled_layout(layout).unwrap();
-    let calls = Cell::new(0);
-    let mut host = CompiledProjectMetadataHost::new(
-        output.native_metadata_loan().unwrap(),
+    let node = project(output.program());
+    let prepared = super::super::prepare_project_metadata_for_test(
+        output,
+        CompiledSchemaSite::Project(node),
         &binding,
+        MemTracker::new_root("actual prepared Project fixture"),
         &loan,
         &Control,
         &mut journal,
+    )
+    .unwrap();
+    let layout = prepared.program.graph().nodes()[node.index()].output_layout();
+    assert_eq!(prepared.schema.slot_ids(), layout.slots());
+    assert_eq!(
+        prepared.schema.arrow_schema_ref().as_ref(),
+        layout.schema().as_ref()
     );
-    let actual = host
-        .materialize(program, CompiledSchemaSite::Project(node), layout, || {
-            calls.set(calls.get() + 1);
-            ChunkSchema::from_compiled_layout(layout)
-        })
-        .unwrap();
-    assert_eq!(calls.get(), 1);
-    assert_eq!(actual.slot_ids(), expected.slot_ids());
-    assert_eq!(actual.arrow_schema_ref(), expected.arrow_schema_ref());
-    drop(host);
     assert_eq!(journal.phase, Some(ProjectMetadataPhase::Prepare(node)));
     assert!(journal.facts.is_some());
     assert_eq!(journal.body.settlement.as_ref().unwrap().next_step, Ok(()));
@@ -296,7 +295,7 @@ fn project_metadata_original_worker_stop_refuses_compile_body_with_exact_cause()
             },
         };
         let failure = host
-            .materialize(&facts, || {
+            .materialize::<FragmentCompileError, _>(&facts, || {
                 calls.set(calls.get() + 1);
                 panic!("stopped metadata must not execute")
             })
@@ -334,7 +333,7 @@ fn project_metadata_real_capacity_and_arithmetic_refuse_before_compile_body() {
         let mut host = ProjectMetadataHost::new(&binding, &loan, &mut journal);
         let calls = Cell::new(0);
         let error = host
-            .materialize(
+            .materialize::<FragmentCompileError, _>(
                 &ProjectOutputRequestFacts {
                     node: novarocks_physical_plan::NodeId::new(7),
                     requests,
@@ -367,19 +366,17 @@ struct BoundedFirstProjectQualification<'a> {
 }
 impl ProjectMetadataScope for BoundedFirstProjectQualification<'_> {
     type HostError = PreparationMemoryRefusal;
-    fn materialize<B>(
+    fn materialize<C, B>(
         &mut self,
         facts: &ProjectOutputRequestFacts,
         body: B,
     ) -> Result<
         novarocks_local_compiler::ProjectMetadataOutput,
-        novarocks_local_compiler::ProjectMetadataFailure<Self::HostError>,
+        novarocks_local_compiler::ProjectMetadataFailure<Self::HostError, C>,
     >
     where
-        B: FnOnce() -> Result<
-            novarocks_local_compiler::ProjectMetadataOutput,
-            novarocks_local_compiler::FragmentCompileError,
-        >,
+        C: From<FragmentCompileError>,
+        B: FnOnce() -> Result<novarocks_local_compiler::ProjectMetadataOutput, C>,
     {
         use novarocks_execution::runtime::kernel_memory::{
             KernelMemoryAdmission, KernelMemoryRequest, request, request_complete_operation,
@@ -447,18 +444,30 @@ fn project_metadata_real_pending_requalifies_one_original_compiler_body() {
         admissions: 0,
         calls: &calls,
     };
-    let program = compile_fragment_with_project_metadata_host(
-        validated,
-        &interpreter.functions,
-        LocalCompileOptions {
-            pipeline_dop: NonZeroUsize::MIN,
-            root_sink_dop: Some(NonZeroUsize::MIN),
-            kernel_abi: KernelAbiVersion::CURRENT,
-            constants: interpreter.constants,
-            exchange_wait: Duration::from_millis(50),
-        },
+    let program = with_native_type_construction_for_test(
+        MemTracker::new_root("native Pending Project fixture"),
         &Control,
-        &mut host,
+        |creation, scopes| {
+            use novarocks_type_contract::ValueSchemaCreationFactory;
+            let mut temporary = scopes.begin_scope().unwrap();
+            novarocks_local_compiler::compile_fragment_with_creation_and_project_metadata_host(
+                validated,
+                &interpreter.functions,
+                LocalCompileOptions {
+                    pipeline_dop: NonZeroUsize::MIN,
+                    root_sink_dop: Some(NonZeroUsize::MIN),
+                    kernel_abi: KernelAbiVersion::CURRENT,
+                    constants: interpreter.constants,
+                    exchange_wait: Duration::from_millis(50),
+                },
+                creation,
+                &mut temporary,
+                scopes,
+                &Control,
+                &mut host,
+            )
+            .unwrap()
+        },
     )
     .unwrap();
     let projects = program
@@ -488,18 +497,19 @@ fn compile_window(
     let mut type_journal = super::super::TypeMaterializationJournal::default();
     let mut type_host = TypeMaterializationHost::new(binding, preparation, &mut type_journal);
     let mut project_host = ProjectMetadataHost::new(binding, preparation, journal);
-    window_interpreter()
-        .compile(
-            &window_producer(),
-            CompiledTaskOptions {
-                pipeline_dop: NonZeroUsize::MIN,
-                exchange_wait: Duration::from_millis(50),
-            },
-            &Control,
-            &mut type_host,
-            &mut project_host,
-        )
-        .unwrap()
+    compile_native_package_with_funding_for_test(
+        &window_interpreter(),
+        &window_producer(),
+        CompiledTaskOptions {
+            pipeline_dop: NonZeroUsize::MIN,
+            exchange_wait: Duration::from_millis(50),
+        },
+        MemTracker::new_root("native funded compile fixture"),
+        &Control,
+        &mut type_host,
+        &mut project_host,
+    )
+    .unwrap()
 }
 fn analytic(program: &LocalProgram) -> ProgramNodeId {
     ProgramNodeId::new(
@@ -517,34 +527,24 @@ fn analytic_schema_real_native_compile_and_original_schema_share_one_binding() {
     let owner = TestPreparationControl::new(Duration::from_millis(1));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
-    let prepared = compile_window(&binding, &loan, &mut journal).into_preparation();
-    let program = prepared.program();
-    let node = analytic(program);
-    let layout = program.graph().nodes()[node.index()].output_layout();
-    let expected = ChunkSchema::from_compiled_layout(layout).unwrap();
-    let calls = Cell::new(0);
-    let mut host = CompiledProjectMetadataHost::new(
-        prepared.native_metadata_loan().unwrap(),
+    let compiled = compile_window(&binding, &loan, &mut journal);
+    let node = analytic(compiled.program());
+    let prepared = super::super::prepare_window_metadata_for_test(
+        compiled,
+        node,
         &binding,
+        MemTracker::new_root("actual prepared Analytic fixture"),
         &loan,
         &Control,
-        &mut journal,
+    )
+    .unwrap();
+    let layout = prepared.program.graph().nodes()[node.index()].output_layout();
+    assert_eq!(prepared.occurrence.schema.slot_ids(), layout.slots());
+    assert_eq!(
+        prepared.occurrence.schema.arrow_schema_ref().as_ref(),
+        layout.schema().as_ref()
     );
-    let actual = host
-        .materialize(
-            program,
-            CompiledSchemaSite::AnalyticOutput(node),
-            layout,
-            || {
-                calls.set(calls.get() + 1);
-                ChunkSchema::from_compiled_layout(layout)
-            },
-        )
-        .unwrap();
-    assert_eq!(calls.get(), 1);
-    assert_eq!(actual.slot_ids(), expected.slot_ids());
-    assert_eq!(actual.arrow_schema_ref(), expected.arrow_schema_ref());
-    drop(host);
+    let journal = prepared.occurrence.journal;
     assert_eq!(journal.phase, Some(ProjectMetadataPhase::Prepare(node)));
     let facts = journal.facts.unwrap();
     assert_eq!(
@@ -790,4 +790,161 @@ fn analytic_schema_actual_policy_refuses_before_original_body() {
     drop(host);
     assert!(journal.capacity.is_some());
     assert!(journal.body.settlement.is_none());
+}
+
+/// Numeric diagnostics use the actual Native creator, never a test grant. The
+/// recorder checks the already frozen invoice against actual request callbacks;
+/// GLOBAL capacity/origin qualification remains in the Server targets.
+#[test]
+fn type_tail_frozen_invoice_covers_actual_native_factory_callbacks() {
+    use novarocks_plan_codec::{
+        host_projection_v2::ProjectionFailure,
+        physical_type_v2::{
+            DecodedTypeTable, PackageTypeFundingScope, PackageTypeProjectionFacts, TypeCodecError,
+            TypeMaterializationNamespace,
+        },
+    };
+    use novarocks_type_contract::{
+        ValueSchemaCreationFactory, ValueSchemaCreationScope, ValueSchemaScopeBeginFailure,
+    };
+    use std::alloc::Layout;
+    type Counts = Cell<(usize, usize)>;
+    fn record(counts: &Counts, bytes: usize) {
+        if bytes != 0 {
+            let (requests, previous) = counts.get();
+            counts.set((
+                requests.checked_add(1).unwrap(),
+                previous.checked_add(bytes).unwrap(),
+            ));
+        }
+    }
+    struct Scope<'a> {
+        inner: super::CompiledTypeScope<'a>,
+        counts: &'a Counts,
+    }
+    impl ValueSchemaCreationScope<NativeTypeConstructionError> for Scope<'_> {
+        fn storage_lifetime(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+            self.inner.storage_lifetime()
+        }
+        fn request_layout(&mut self, layout: Layout) -> Result<(), NativeTypeConstructionError> {
+            self.inner.request_layout(layout)?;
+            record(self.counts, layout.size());
+            Ok(())
+        }
+        fn observe_opaque_upper_bound(
+            &mut self,
+            bytes: usize,
+        ) -> Result<(), NativeTypeConstructionError> {
+            self.inner.observe_opaque_upper_bound(bytes)?;
+            record(self.counts, bytes);
+            Ok(())
+        }
+    }
+    struct Factory<'a, 'control> {
+        inner: &'a CompiledTypeScopes<'a, 'control>,
+        counts: &'a Counts,
+    }
+    impl ValueSchemaCreationFactory<NativeTypeConstructionError> for Factory<'_, '_> {
+        type Scope<'a>
+            = Scope<'a>
+        where
+            Self: 'a;
+        fn visit_scope_allocation_layouts<E>(
+            &self,
+            visit: &mut dyn FnMut(Layout) -> Result<(), E>,
+        ) -> Result<(), E>
+        where
+            E: From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+        {
+            self.inner.visit_scope_allocation_layouts(visit)
+        }
+        fn begin_scope(&self) -> Result<Self::Scope<'_>, NativeTypeConstructionError> {
+            self.begin_scope_observed(&mut |_| Ok::<_, NativeTypeConstructionError>(()))
+                .map_err(|error| match error {
+                    ValueSchemaScopeBeginFailure::Observer(error)
+                    | ValueSchemaScopeBeginFailure::Creator(error) => error,
+                })
+        }
+        fn begin_scope_observed<O>(
+            &self,
+            observe: &mut dyn FnMut(Layout) -> Result<(), O>,
+        ) -> Result<Self::Scope<'_>, ValueSchemaScopeBeginFailure<O, NativeTypeConstructionError>>
+        {
+            let inner = self.inner.begin_scope_observed(&mut |layout| {
+                observe(layout)?;
+                record(self.counts, layout.size());
+                Ok(())
+            })?;
+            Ok(Scope {
+                inner,
+                counts: self.counts,
+            })
+        }
+    }
+    struct Invoices<'a> {
+        counts: &'a Counts,
+        calls: usize,
+        scopes: usize,
+    }
+    impl PackageTypeFundingScope<NativeTypeConstructionError> for Invoices<'_> {
+        fn materialize(
+            &mut self,
+            _: TypeMaterializationNamespace,
+            facts: &PackageTypeProjectionFacts,
+            body: &mut dyn FnMut() -> Result<
+                DecodedTypeTable,
+                ProjectionFailure<TypeCodecError, NativeTypeConstructionError>,
+            >,
+        ) -> Result<DecodedTypeTable, ProjectionFailure<TypeCodecError, NativeTypeConstructionError>>
+        {
+            let frozen = *facts;
+            let before = self.counts.get();
+            self.calls += 1;
+            let result = body();
+            let after = self.counts.get();
+            let requests = after.0.checked_sub(before.0).unwrap();
+            let bytes = after.1.checked_sub(before.1).unwrap();
+            self.scopes += requests;
+            assert!(
+                requests <= frozen.allocation_requests_upper_bound,
+                "actual request callbacks exceed the frozen tail invoice"
+            );
+            assert!(
+                bytes <= frozen.allocation_request_bytes_upper_bound,
+                "actual request bytes exceed the frozen tail invoice"
+            );
+            result
+        }
+    }
+    let tracker = MemTracker::new_root("actual Native tail invoice diagnostic");
+    let output = with_native_type_construction_for_test(Arc::clone(&tracker), &Control, |creation, scopes| {
+        let counts = Counts::new((0, 0));
+        let factory = Factory { inner: scopes, counts: &counts };
+        let mut invoices = Invoices { counts: &counts, calls: 0, scopes: 0 };
+        let interpreter = interpreter();
+        let storage = creation.storage_lifetime();
+        let output = creation.with_request_ports(|request, opaque| {
+            let mut request = |layout: Layout| {
+                request(layout)?;
+                record(&counts, layout.size());
+                Ok(())
+            };
+            let mut opaque = |bytes| {
+                opaque(bytes)?;
+                record(&counts, bytes);
+                Ok(())
+            };
+            let mut observed = novarocks_type_contract::ValueSchemaCreation::new(storage, &mut request, &mut opaque);
+            novarocks_plan_codec::physical_package_v2::decode_fragment_package_with_factory_and_funding(
+                &select_one_producer().0, &interpreter.model, &interpreter.decode_limits,
+                &mut observed, &factory, &Control, &mut invoices,
+            )
+        }).unwrap();
+        assert_eq!(invoices.calls, 2, "each original namespace body executes once");
+        assert!(invoices.scopes > 0, "the actual tail must open scopes and issue real requests");
+        output
+    }).unwrap();
+    assert!(tracker.current() > 0);
+    drop(output);
+    assert_eq!(tracker.current(), 0);
 }

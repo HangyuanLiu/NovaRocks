@@ -2086,36 +2086,6 @@ fn lambda_parameter_type_is_part_of_its_declaration() {
     assert!(error.contains("lambda parameter does not reference a matching lambda owner"));
 }
 
-fn finish_fragment_with_declared_type(data_type: DataType) -> Result<Fragment, ValidationErrors> {
-    let mut builder = FragmentBuilder::new(FragmentId::new(30));
-    let node = builder.reserve_node_id().unwrap();
-    let value = builder
-        .add_value(
-            ty(data_type, true),
-            ValueOrigin::NodeOutput {
-                node,
-                output_ordinal: 0,
-            },
-        )
-        .unwrap();
-    builder
-        .insert_node_unchecked(PhysicalNode {
-            id: node,
-            inputs: Box::default(),
-            required_inputs: Box::default(),
-            output_properties: unconstrained(),
-            output: OutputPort {
-                node,
-                columns: Box::from([value]),
-            },
-            kind: NodeKind::Values {
-                rows: Box::default(),
-            },
-        })
-        .unwrap();
-    builder.finish_definition(node, FragmentSink::Noop, dop())
-}
-
 #[test]
 fn arrow_data_type_depth_is_bounded_iteratively() {
     use std::sync::Arc;
@@ -2126,10 +2096,15 @@ fn arrow_data_type_depth_is_bounded_iteratively() {
     for _ in 0..MAX_DATA_TYPE_DEPTH {
         data_type = DataType::List(Arc::new(Field::new_list_field(data_type, true)));
     }
-    let error = finish_fragment_with_declared_type(data_type)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("Arrow data type depth exceeds"));
+    assert_eq!(
+        ValueType::try_with_logical_type(
+            data_type,
+            true,
+            novarocks_type_contract::ValueLogicalType::Physical
+        )
+        .unwrap_err(),
+        novarocks_type_contract::ValueTypeError::TooDeep
+    );
 }
 
 #[test]
@@ -2141,46 +2116,40 @@ fn arrow_data_type_node_count_is_bounded_before_stack_growth() {
     let fields = (0..MAX_DATA_TYPE_NODES)
         .map(|index| Arc::new(Field::new(index.to_string(), DataType::Int64, true)))
         .collect::<Vec<_>>();
-    let error = finish_fragment_with_declared_type(DataType::Struct(Fields::from(fields)))
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("Arrow data type contains more than"));
+    assert_eq!(
+        ValueType::try_with_logical_type(
+            DataType::Struct(Fields::from(fields)),
+            true,
+            novarocks_type_contract::ValueLogicalType::Physical
+        )
+        .unwrap_err(),
+        novarocks_type_contract::ValueTypeError::TooManyNodes
+    );
 }
 
 #[test]
-fn arrow_data_type_rejects_invalid_decimal_and_fixed_size_parameters() {
-    let decimal_error = finish_fragment_with_declared_type(DataType::Decimal128(0, 0))
-        .unwrap_err()
-        .to_string();
-    assert!(decimal_error.contains("Arrow decimal precision/scale"));
-
-    let fixed_error = finish_fragment_with_declared_type(DataType::FixedSizeBinary(-1))
-        .unwrap_err()
-        .to_string();
-    assert!(fixed_error.contains("Arrow fixed-size length -1"));
-
-    let time_error =
-        finish_fragment_with_declared_type(DataType::Time32(arrow_schema::TimeUnit::Nanosecond))
-            .unwrap_err()
-            .to_string();
-    assert!(time_error.contains("Arrow Time32 must use second or millisecond units"));
-
-    let dictionary_error = finish_fragment_with_declared_type(DataType::Dictionary(
-        Box::new(DataType::Utf8),
-        Box::new(DataType::Int64),
-    ))
-    .unwrap_err()
-    .to_string();
-    assert!(dictionary_error.contains("Arrow dictionary key must be an integer type"));
+fn declared_value_type_author_rejects_invalid_carrier_parameters() {
+    for data_type in [
+        DataType::Decimal128(0, 0),
+        DataType::FixedSizeBinary(-1),
+        DataType::Time32(arrow_schema::TimeUnit::Nanosecond),
+        DataType::Dictionary(Box::new(DataType::Utf8), Box::new(DataType::Int64)),
+    ] {
+        assert!(
+            ValueType::try_with_logical_type(
+                data_type,
+                true,
+                novarocks_type_contract::ValueLogicalType::Physical
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
-fn arrow_field_name_and_metadata_are_bounded() {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
+fn declared_value_names_are_bounded_and_provider_metadata_is_not_execution_semantics() {
     use arrow_schema::Field;
-
+    use std::{collections::HashMap, sync::Arc};
     let mut metadata = HashMap::new();
     metadata.insert(
         "key".to_owned(),
@@ -2191,12 +2160,26 @@ fn arrow_field_name_and_metadata_are_bounded() {
         DataType::Int64,
         true,
     )
-    .with_metadata(metadata);
-    let error = finish_fragment_with_declared_type(DataType::List(Arc::new(field)))
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("Arrow field name exceeds"));
-    assert!(error.contains("Arrow field metadata key or value exceeds"));
+    .with_metadata(metadata.clone());
+    assert!(
+        ValueType::try_with_logical_type(
+            DataType::Struct(vec![Arc::new(field)].into()),
+            true,
+            novarocks_type_contract::ValueLogicalType::Physical
+        )
+        .is_err()
+    );
+    let list = ValueType::new(
+        DataType::List(Arc::new(
+            Field::new("role", DataType::Int64, true).with_metadata(metadata),
+        )),
+        true,
+    );
+    let DataType::List(item) = list.data_type() else {
+        unreachable!()
+    };
+    assert_eq!(item.name(), "item");
+    assert!(item.metadata().is_empty());
 }
 
 #[test]
@@ -2227,7 +2210,7 @@ fn annotation_count_and_value_bytes_are_bounded() {
 }
 
 #[test]
-fn independent_fragment_cut_types_share_the_same_resource_validation() {
+fn independent_fragment_cut_checks_complete_valid_value_binding() {
     let (fragment, value) = literal_fragment(FragmentId::new(33), FragmentSink::Noop, false);
     let cuts = FragmentCuts {
         inbound: Box::default(),
@@ -2238,7 +2221,7 @@ fn independent_fragment_cut_types_share_the_same_resource_validation() {
             destination_node: NodeId::new(34),
             projection: Box::from([CutValue {
                 value,
-                ty: ty(DataType::Decimal128(0, 0), false),
+                ty: ty(DataType::Boolean, false),
             }]),
             destination_imports: Box::default(),
             partitioning: EdgePartitioning {
@@ -2254,7 +2237,7 @@ fn independent_fragment_cut_types_share_the_same_resource_validation() {
         runtime_filter_bindings: Box::default(),
     };
     let error = validate_fragment(&fragment, &cuts).unwrap_err().to_string();
-    assert!(error.contains("Arrow decimal precision/scale"));
+    assert!(error.contains("outbound cut type differs from its source value"));
 }
 
 #[test]
@@ -2383,7 +2366,7 @@ fn physical_nested_decimal_cast_requires_a_supported_frozen_policy() {
                             novarocks_type_contract::SemanticParameterKey::AllowThrowException,
                     },
                     expr: operand,
-                    target: result_type.clone(),
+                    target: ty(result_type.clone(), true).data_type().clone(),
                     decimal_overflow_policy: policy,
                 },
             )

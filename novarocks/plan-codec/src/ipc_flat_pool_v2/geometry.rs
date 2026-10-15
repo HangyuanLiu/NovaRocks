@@ -120,6 +120,39 @@ pub(crate) fn inspect_span_core<H>(
     max_rows: usize,
     max_buffers: usize,
     max_body_bytes: usize,
+    capture: Option<&mut GeometryCapture<'_, H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Geometry, HostError<H>> {
+    inspect_span_policy_core(
+        data,
+        start,
+        rows,
+        Some((max_rows, max_buffers, max_body_bytes)),
+        capture,
+        work,
+    )
+}
+pub(crate) fn inspect_span_pure<H>(
+    data: &ArrayData,
+    start: usize,
+    rows: usize,
+    capture: Option<&mut GeometryCapture<'_, H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Geometry, HostError<H>> {
+    inspect_span_policy_core(data, start, rows, None, capture, work)
+}
+pub(crate) fn inspect_pure(
+    pool: &ConstantPool,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Geometry, TypeCodecError> {
+    inspect_span_pure::<std::convert::Infallible>(pool.data(), 0, pool.data().len(), None, work)
+        .map_err(ProjectionFailure::without_host)
+}
+fn inspect_span_policy_core<H>(
+    data: &ArrayData,
+    start: usize,
+    rows: usize,
+    receiving: Option<(usize, usize, usize)>,
     mut capture: Option<&mut GeometryCapture<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Geometry, HostError<H>> {
@@ -132,7 +165,7 @@ pub(crate) fn inspect_span_core<H>(
         return Err((invalid()).into());
     }
     let offset = add(data.offset(), start)?;
-    if rows > max_rows || i64::try_from(rows).is_err() {
+    if receiving.is_some_and(|profile| rows > profile.0) || i64::try_from(rows).is_err() {
         return Err((if policy.0 {
             novarocks_type_contract::CompileControlError::ResourceExhausted.into()
         } else {
@@ -152,7 +185,7 @@ pub(crate) fn inspect_span_core<H>(
         Layout::Views => add(2, variadic)?,
         _ => 2,
     };
-    if buffers > max_buffers || i64::try_from(variadic).is_err() {
+    if receiving.is_some_and(|profile| buffers > profile.1) || i64::try_from(variadic).is_err() {
         return Err((if policy.0 {
             novarocks_type_contract::CompileControlError::ResourceExhausted.into()
         } else {
@@ -181,7 +214,9 @@ pub(crate) fn inspect_span_core<H>(
     let mut charge = |bytes: usize| -> Result<(), HostError<H>> {
         result.body_bytes = add(result.body_bytes, aligned(bytes)?)?;
         result.payload_bytes = add(result.payload_bytes, bytes)?;
-        if result.body_bytes > max_body_bytes || i64::try_from(result.body_bytes).is_err() {
+        if receiving.is_some_and(|profile| result.body_bytes > profile.2)
+            || i64::try_from(result.body_bytes).is_err()
+        {
             return Err((if policy.0 {
                 novarocks_type_contract::CompileControlError::ResourceExhausted.into()
             } else {

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Real Server GLOBAL, production Type host and original Arrow producer.
+//! Real Server GLOBAL, production Type host and original source-field producer.
 //! This target is isolated and run with --test-threads=1. It proves the bounded
 //! birth/last-free protocol; production query retirement and MEM cost stay open.
 
@@ -71,31 +71,38 @@ fn source() -> package::FragmentPackage {
         })
         .collect();
     package::FragmentPackage {
-        types: Some(wire::TypeTable {
-            carriers: vec![wire::CarrierTypeDefinition {
-                id: 1,
-                kind: Some(wire::carrier_type_definition::Kind::Primitive(
-                    plan::ArrowPrimitiveType::Int64 as i32,
-                )),
-            }],
-            fields: vec![wire::FieldDefinition {
-                id: 2,
-                name: "f".repeat(1024),
-                nullable: false,
-                carrier_type_id: Some(1),
+        types: Some(wire::TypeTable::default()),
+        source_fields: Some(wire::SourceFieldTable {
+            shape: Some(wire::TypeTable {
+                carriers: vec![wire::CarrierTypeDefinition {
+                    id: 1,
+                    kind: Some(wire::carrier_type_definition::Kind::Primitive(
+                        plan::ArrowPrimitiveType::Int64 as i32,
+                    )),
+                }],
+                fields: vec![wire::FieldDefinition {
+                    id: 2,
+                    name: "f".repeat(1024),
+                    nullable: false,
+                    carrier_type_id: Some(1),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            field_facts: vec![wire::SourceArrowFieldFacts {
+                field_id: Some(2),
                 metadata,
-                dictionary_id: None,
-                dictionary_is_ordered: None,
+                ..Default::default()
             }],
-            value_types: vec![],
         }),
         writes: vec![package::FrozenWriterRecipe {
             input: Some(package::ConnectorWriteInputShape {
                 kind: Some(package::connector_write_input_shape::Kind::Data(
                     package::ConnectorWriteDataInput {
                         fields: vec![package::ConnectorWriteFieldBinding {
-                            field_id: Some(2),
+                            source_field_id: Some(2),
                             field_token: vec![],
+                            value_type_id: None,
                         }],
                     },
                 )),
@@ -121,7 +128,17 @@ fn original_large_field_alias_keeps_real_origin_to_cross_thread_last_free() {
     let _ = novarocks_server::memory_observation::snapshot();
     let binding = binding(64 << 20);
     let source = source();
-    let source_token = token(&source.types.as_ref().unwrap().fields[0].name);
+    let source_token = token(
+        &source
+            .source_fields
+            .as_ref()
+            .unwrap()
+            .shape
+            .as_ref()
+            .unwrap()
+            .fields[0]
+            .name,
+    );
     let owner = TestPreparationControl::new(Duration::from_millis(1));
     let mut journal = TypeMaterializationJournal::default();
     let table = materialize_package_types_for_test(
@@ -155,11 +172,21 @@ fn original_large_field_alias_keeps_real_origin_to_cross_thread_last_free() {
     assert!(receipt.accepted_live > 0 && receipt.debt == 0);
     assert_eq!(receipt.next_step, Ok(()));
     assert_eq!(journal.body.stopped, Some(Ok(())));
-    let field = Arc::clone(table.field(2).unwrap());
+    let field = Arc::clone(table.source_field(2).unwrap());
     let reference = token(field.name());
     assert_ne!(reference, source_token);
     assert_eq!(
-        token(&source.types.as_ref().unwrap().fields[0].name),
+        token(
+            &source
+                .source_fields
+                .as_ref()
+                .unwrap()
+                .shape
+                .as_ref()
+                .unwrap()
+                .fields[0]
+                .name
+        ),
         source_token,
         "old source was never retagged"
     );

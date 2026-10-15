@@ -482,8 +482,12 @@ fn broadcast_table_fixture() -> Fixture {
             function: BoundTableFunction {
                 function_id: fields.function_id,
                 overload: fields.overload,
-                argument_types: Box::from([FunctionArgumentType::Value(boolean())]),
-                result_types: Box::from([integer()]),
+                argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    Box::from([FunctionArgumentType::Value(boolean())]),
+                ),
+                result_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from(
+                    [integer()],
+                )),
                 legacy_metadata: Some(crate::LegacyBindingMetadata {
                     volatility: fields.legacy_metadata.as_ref().unwrap().volatility,
                     argument_evaluation: fields
@@ -573,6 +577,7 @@ fn broadcast_table_fixture() -> Fixture {
         uses,
         calls: vec![
             FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -582,6 +587,7 @@ fn broadcast_table_fixture() -> Fixture {
                 effects: effects(FunctionKind::Scalar, scalar_context.domain),
             },
             FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,

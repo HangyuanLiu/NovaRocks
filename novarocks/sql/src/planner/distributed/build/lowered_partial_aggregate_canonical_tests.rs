@@ -48,20 +48,20 @@ pub(super) fn chain(
     let mut state = column(
         91,
         "partial_state",
-        intermediate.data_type.clone(),
-        intermediate.nullable,
+        intermediate.data_type().clone(),
+        intermediate.nullable(),
     );
     state.value_type = intermediate;
     spec.mode = AggMode::Local;
-    spec.aggregates[0].result_type = state.value_type.data_type.clone();
+    spec.aggregates[0].result_type = state.value_type.clone();
     spec.output_layout = AggregateOutputLayout::new(vec![], vec![state.clone()]);
     spec.output_columns = vec![state.clone()];
     local.output_columns = vec![state.clone()];
     let mut output = column(
         92,
         "final_result",
-        result.data_type.clone(),
-        result.nullable,
+        result.data_type().clone(),
+        result.nullable(),
     );
     output.value_type = result.clone();
     let gather = PhysicalPlanNode {
@@ -83,7 +83,7 @@ pub(super) fn chain(
                 name: name.into(),
                 source,
                 distinct: false,
-                result_type: result.data_type.clone(),
+                result_type: result.clone(),
                 output_column_id: output.column_id,
             }],
             is_merge: vec![true],
@@ -144,9 +144,24 @@ fn verify_update_and_final(owner: &SqlAuthoredPhysicalPlan) {
     let canonical = partial.canonical().unwrap();
     assert!(canonical.belongs_to(partial.captured()));
     assert_eq!(partial.runtime(), AggregateRuntimeDemand::Update);
+    let final_canonical = final_entry.canonical().unwrap();
+    assert!(final_canonical.belongs_to(final_entry.captured()));
     assert!(
-        final_entry.canonical().is_none(),
-        "Final does not borrow an update canonical receipt"
+        !Arc::ptr_eq(final_canonical, canonical),
+        "Final authors its own canonical receipt from its original capture"
+    );
+    assert_eq!(
+        final_canonical.selected().argument_types.as_ref(),
+        final_entry
+            .source()
+            .binding
+            .function
+            .argument_types
+            .as_ref()
+    );
+    assert_eq!(
+        final_canonical.selected().result_type,
+        FunctionResultType::Scalar(final_entry.source().binding.function.result_type.clone())
     );
     assert!(
         partial
@@ -318,14 +333,15 @@ fn partial_avg_local_output_uses_intermediate_utf8_not_final_float64() {
             .as_ref()
             .unwrap()
             .intermediate_type
-            .data_type,
+            .data_type()
+            .clone(),
         DataType::Utf8
     );
     let FunctionResultType::Scalar(result) = &selected.result_type else {
         unreachable!()
     };
-    assert_eq!(result.data_type, DataType::Float64);
-    assert!(result.nullable);
+    assert_eq!(result.data_type().clone(), DataType::Float64);
+    assert!(result.nullable());
     assert_ne!(
         result,
         &selected.aggregate.as_ref().unwrap().intermediate_type

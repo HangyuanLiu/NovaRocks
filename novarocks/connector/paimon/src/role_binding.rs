@@ -404,15 +404,19 @@ impl ProviderReadMetadata for PaimonReadRuntime {
         &self,
         _session: &ConnectorSession,
         table: &Self::Table,
-        columns: &[Self::Column],
-    ) -> Result<ConnectorReadPublicSchema, ConnectorError> {
+        columns: &[&Self::Column],
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorReadPublicSchema,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         // Only the frontend freeze holds the table's catalog-visible columns.
         // A relation decoded from the wire carries none, so it has no column
         // set against which to publish a schema.
         let recipe = table.recipe.as_ref().ok_or_else(|| {
             unsupported("Paimon publishes a public read schema only for a frontend-frozen read")
         })?;
-        program_recipe::public_read_schema(recipe.columns(), columns)
+        program_recipe::public_read_schema(recipe.columns(), columns, creation)
     }
 
     fn apply_filter(
@@ -774,10 +778,26 @@ impl ConnectorMetadata for PaimonGenericControl {
     fn load_table(
         &self,
         request: ConnectorTableRequest,
-    ) -> Result<ConnectorTableMetadata, ConnectorError> {
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        creation.work(1)?;
         self.ensure_instance(&request.table.instance_id)?;
         let name = SchemaTableName::try_new(&request.table.namespace, &request.table.table)?;
         let frozen = self.prepare_read(name, &request.context)?;
+        let mut columns = creation.reserve(frozen.columns().len())?;
+        for column in frozen.columns() {
+            creation.work(1)?;
+            columns.push(column);
+        }
+        let public = program_recipe::public_read_schema(frozen.columns(), &columns, creation)?;
+        let execution = public.execution_schema().ok_or_else(|| {
+            unsupported("Paimon catalog author did not provide complete execution types")
+        })?;
+        creation.work(2)?;
+        let execution = execution.clone();
         let schema = paimon::arrow::build_target_arrow_schema(frozen.output_schema().fields())
             .map_err(map_sdk_error)?;
         let payload = novarocks_spi::connector::ConnectorPrivateEncoder::encode_private(
@@ -786,17 +806,21 @@ impl ConnectorMetadata for PaimonGenericControl {
         )
         .map_err(codec_as_connector_error)?;
         let table = ConnectorTableHandle::try_new(self.descriptor.instance_id.clone(), payload)?;
-        Ok(ConnectorTableMetadata {
-            identity: request.table,
+        ConnectorTableMetadata::try_new_typed(
+            novarocks_spi::connector::ConnectorTableMetadataHeader {
+                identity: request.table,
+                planning_facts: ConnectorTablePlanningFacts::empty(),
+                definition_facts: ConnectorTableDefinitionFacts::empty(),
+                version: Some(Bytes::copy_from_slice(
+                    &frozen.view().schema_id().to_be_bytes(),
+                )),
+                statistics_data_version: None,
+                table,
+            },
             schema,
-            planning_facts: ConnectorTablePlanningFacts::empty(),
-            definition_facts: ConnectorTableDefinitionFacts::empty(),
-            version: Some(Bytes::copy_from_slice(
-                &frozen.view().schema_id().to_be_bytes(),
-            )),
-            statistics_data_version: None,
-            table,
-        })
+            execution,
+            creation,
+        )
     }
 }
 
@@ -2076,10 +2100,20 @@ mod tests {
         let column = PaimonColumn::try_new(1, "id", crate::schema::PaimonDataType::Int64, false, 0)
             .expect("id column");
 
+        let mut request = |_| Ok(());
+        let mut work = |_| Ok(());
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
         let error = runtime
-            .read_public_schema(&session, &bound, &[column])
+            .read_public_schema(&session, &bound, &[&column], &mut creation)
             .expect_err("a wire-decoded relation has no catalog-visible column set");
-        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert!(
+            matches!(error, novarocks_connector_contract::PureProviderCompileError::Provider(error)
+            if error.kind() == ConnectorErrorKind::Unsupported)
+        );
     }
 
     #[test]

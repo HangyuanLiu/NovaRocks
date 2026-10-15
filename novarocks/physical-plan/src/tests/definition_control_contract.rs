@@ -106,7 +106,7 @@ fn function(arguments: Box<[FunctionArgumentType]>, result: ValueType) -> BoundF
         function_id: FunctionId::try_new("fixture/definition-control/exact-shape").unwrap(),
         overload: FunctionOverloadId::try_new("fixture/definition-control/selected-shape").unwrap(),
         kind: FunctionKind::Scalar,
-        argument_types: arguments,
+        argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(arguments),
         result_type: result,
     }
 }
@@ -504,7 +504,10 @@ fn higher_fixture() -> Fixture {
                         Box::from([
                             FunctionArgumentType::Value(bool_type.clone()),
                             FunctionArgumentType::Lambda {
-                                parameter_types: Box::from([bool_type.clone()]),
+                                parameter_types:
+                                    novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                                        Box::from([bool_type.clone()]),
+                                    ),
                                 result_type: bool_type.clone(),
                             },
                         ]),

@@ -35,7 +35,7 @@ fn largeint() -> FunctionValueType {
     .unwrap()
 }
 fn scalar_literal(ty: &FunctionValueType, value: i128) -> LiteralValue {
-    match (&ty.data_type, ty.logical_type) {
+    match (&ty.data_type(), ty.logical_type()) {
         (DataType::Decimal128(..), ValueLogicalType::Physical) => LiteralValue::Decimal128(value),
         (DataType::Decimal256(..), ValueLogicalType::Physical) => {
             LiteralValue::Decimal256(i256::from_i128(value).to_be_bytes())
@@ -110,7 +110,9 @@ fn typed_program(
     };
     let mut result_type =
         arithmetic_result_value_type_with_op(&left_type, &right_type, operation(op)).unwrap();
-    result_type.nullable = true;
+    result_type = result_type
+        .with_nullable(true)
+        .expect("valid test root nullability");
     let computed = builder
         .add_expression(
             output,
@@ -243,24 +245,24 @@ fn typed_program(
     compile_arithmetic(&functions, fragment, &authors, result, allow)
 }
 fn d128(ty: &FunctionValueType, values: &[Option<i128>]) -> ArrayRef {
-    let DataType::Decimal128(p, s) = ty.data_type else {
+    let DataType::Decimal128(p, s) = ty.data_type() else {
         panic!("exact Decimal128 source")
     };
     // Arrow deliberately accepts coefficients outside declared input precision.
     // Production arithmetic checks its result, not an invented input bound.
     Arc::new(
         Decimal128Array::from(values.to_vec())
-            .with_precision_and_scale(p, s)
+            .with_precision_and_scale(*p, *s)
             .unwrap(),
     )
 }
 fn d256(ty: &FunctionValueType, values: &[Option<i256>]) -> ArrayRef {
-    let DataType::Decimal256(p, s) = ty.data_type else {
+    let DataType::Decimal256(p, s) = ty.data_type() else {
         panic!("exact Decimal256 source")
     };
     Arc::new(
         Decimal256Array::from(values.to_vec())
-            .with_precision_and_scale(p, s)
+            .with_precision_and_scale(*p, *s)
             .unwrap(),
     )
 }
@@ -376,7 +378,7 @@ fn decimal_and_signed_five_operators_preserve_exact_scale_and_sparse_coefficient
             let output = instance(&program)
                 .evaluate(&batch, selected, &Control)
                 .unwrap();
-            let negative = match (op, &right.data_type) {
+            let negative = match (op, &right.data_type()) {
                 (BinaryOperator::Add, DataType::Decimal128(..)) => -12_095,
                 (BinaryOperator::Subtract, DataType::Decimal128(..)) => -12_595,
                 (BinaryOperator::Add, _) => -12_145,
@@ -392,7 +394,10 @@ fn decimal_and_signed_five_operators_preserve_exact_scale_and_sparse_coefficient
             let recipe = exact_recipe(&program);
             assert_eq!(recipe.left_type(), &left);
             assert_eq!(recipe.right_type(), &right);
-            assert_eq!(output.values().data_type(), &recipe.result_type().data_type);
+            assert_eq!(
+                output.values().data_type().clone(),
+                recipe.result_type().data_type().clone()
+            );
             assert_eq!(
                 recipe.decimal_overflow_policy(),
                 DecimalOverflowPolicy::ReportError
@@ -614,11 +619,11 @@ fn accurate_largeint_wraps_four_integral_operations_and_divides_fractionally() {
             assert_eq!(large_values(&output), expected);
             assert!(output.errors().is_empty());
             assert_eq!(
-                exact_recipe(&program).left_type().logical_type,
+                exact_recipe(&program).left_type().logical_type(),
                 ValueLogicalType::LargeInt
             );
             assert_eq!(
-                exact_recipe(&program).result_type().logical_type,
+                exact_recipe(&program).result_type().logical_type(),
                 ValueLogicalType::LargeInt
             );
         }
@@ -658,7 +663,7 @@ fn accurate_largeint_wraps_four_integral_operations_and_divides_fractionally() {
         ]
     );
     assert_eq!(
-        exact_recipe(&program).result_type().logical_type,
+        exact_recipe(&program).result_type().logical_type(),
         ValueLogicalType::Physical
     );
     assert!(output.errors().is_empty());
@@ -732,7 +737,7 @@ fn decimal128_and_decimal256_largeint_add_subtract_keep_full_domains_and_slices(
                     DecimalOverflowPolicy::ReportError,
                     None,
                 );
-                let decimal_values = match decimal_type.data_type {
+                let decimal_values = match decimal_type.data_type() {
                     DataType::Decimal128(..) => {
                         d128(&decimal_type, &[None, Some(123), Some(123), None, Some(99)])
                     }

@@ -64,7 +64,7 @@ impl KernelEvaluationControl for Control {
     }
 }
 fn ty(dtype: DataType, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(dtype, nullable)
+    FunctionValueType::from_legacy_declared_projection(dtype, nullable)
 }
 fn large_type(nullable: bool) -> FunctionValueType {
     FunctionValueType::try_with_logical_type(
@@ -122,12 +122,15 @@ fn signed_values(array: &ArrayRef) -> Vec<Option<i128>> {
 fn dense(name: &str, source: FunctionValueType, left: ArrayRef, right: ArrayRef) -> ArrayRef {
     let sources = [source.clone(), ty(DataType::Int64, true)];
     let mut kernel = instance(name, &sources);
-    assert!(kernel.contract().result_type().nullable);
+    assert!(kernel.contract().result_type().nullable());
     assert_eq!(
-        kernel.contract().result_type().logical_type,
-        source.logical_type
+        kernel.contract().result_type().logical_type(),
+        source.logical_type()
     );
-    assert_eq!(kernel.contract().result_type().data_type, source.data_type);
+    assert_eq!(
+        kernel.contract().result_type().data_type(),
+        source.data_type()
+    );
     let args = [
         EvaluatedArgument::Column(&left),
         EvaluatedArgument::Column(&right),
@@ -169,7 +172,7 @@ fn all_fifteen_installed_records_preserve_the_exact_output_domain() {
                 left.clone(),
                 Arc::new(Int64Array::from(vec![2])),
             );
-            assert_eq!(output.data_type(), &source.data_type);
+            assert_eq!(output.data_type(), source.data_type());
             assert_eq!(signed_values(&output), [Some(expected)]);
             records += 1;
         }
@@ -766,7 +769,7 @@ fn representability_overflow_is_rejected_before_allocation_and_any_row_work() {
         ty(DataType::Int64, true),
         large_type(true),
     ] {
-        let left: ArrayRef = match source.data_type {
+        let left: ArrayRef = match source.data_type() {
             DataType::Int8 => Arc::new(Int8Array::from(vec![None])),
             DataType::Int64 => Arc::new(Int64Array::from(vec![None])),
             _ => large_array(&[None]),
@@ -868,7 +871,7 @@ fn signed_minimum_bits_wrap_only_at_the_widened_width() {
             )),
             [Some(half), Some(half * 2)]
         );
-        let first = if source.data_type == DataType::Int64 {
+        let first = if source.data_type() == &DataType::Int64 {
             Some(0)
         } else {
             None

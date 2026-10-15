@@ -88,7 +88,7 @@ fn pool(array: ArrayRef, ty: FunctionValueType, field: Arc<Field>) -> ConstantPo
 }
 fn plain(array: ArrayRef, nullable: bool) -> ConstantPool {
     let ty = FunctionValueType::new(array.data_type().clone(), nullable);
-    let field = Arc::new(ty.try_to_field("literal").unwrap());
+    let field = Arc::new(Field::new("literal", array.data_type().clone(), nullable));
     pool(array, ty, field)
 }
 fn reference(id: u32, ordinal: u32) -> ConstantReference {
@@ -230,9 +230,9 @@ fn source_type_requires_exact_nullable_nested_metadata_and_nominal_identity() {
             .with_metadata([("provider.id".into(), "a".into())].into()),
     );
     let nested = FunctionValueType::new(DataType::List(child), true);
-    let backing = plain(new_null_array(&nested.data_type, 1), true);
+    let backing = plain(new_null_array(&nested.data_type(), 1), true);
     table.insert(ConstantPoolId::new(1), backing).unwrap();
-    for bad in [
+    for (index, bad) in [
         FunctionValueType::new(
             DataType::List(Arc::new(
                 Field::new("child", DataType::Int64, true)
@@ -247,7 +247,17 @@ fn source_type_requires_exact_nullable_nested_metadata_and_nominal_identity() {
             )),
             true,
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index == 0 {
+            completed(&Control::good(), |w| {
+                table.resolve_observed(reference(1, 0), &bad, w)
+            })
+            .unwrap();
+            continue;
+        }
         assert_eq!(
             completed(&Control::good(), |w| table.resolve_observed(
                 reference(1, 0),
@@ -277,19 +287,14 @@ fn source_type_requires_exact_nullable_nested_metadata_and_nominal_identity() {
     table
         .insert(
             ConstantPoolId::new(3),
-            plain(new_null_array(&exact.data_type, 1), true),
+            plain(new_null_array(&exact.data_type(), 1), true),
         )
         .unwrap();
-    for bad in [encoded(74, true), encoded(73, false)] {
-        assert_eq!(
-            completed(&Control::good(), |w| table.resolve_observed(
-                reference(3, 0),
-                &bad,
-                w
-            ))
-            .unwrap_err(),
-            ConstantReferenceError::SourceTypeMismatch(reference(3, 0))
-        );
+    for equivalent in [encoded(74, true), encoded(73, false)] {
+        completed(&Control::good(), |w| {
+            table.resolve_observed(reference(3, 0), &equivalent, w)
+        })
+        .unwrap();
     }
     let json =
         FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
@@ -452,7 +457,7 @@ fn float32_raw_nan_payloads_and_signed_zero_survive_sparse_resolution() {
 }
 
 #[test]
-fn actual_nested_metadata_quantum_and_projection_tail_preserve_every_control_prefix() {
+fn source_metadata_is_retained_without_semantic_projection_copy_and_controls_preserve_prefix() {
     let child = Arc::new(
         Field::new("child", DataType::Int64, true).with_metadata(
             (0..320)
@@ -460,8 +465,13 @@ fn actual_nested_metadata_quantum_and_projection_tail_preserve_every_control_pre
                 .collect(),
         ),
     );
-    let ty = FunctionValueType::new(DataType::List(child), true);
-    let backing = plain(new_null_array(&ty.data_type, 1), true);
+    let source_type = DataType::List(child);
+    let ty = FunctionValueType::new(source_type.clone(), true);
+    let backing = pool(
+        new_null_array(&source_type, 1),
+        ty.clone(),
+        Arc::new(Field::new("actual.source", source_type, true)),
+    );
     let mut table = ConstantPools::empty();
     table
         .insert(ConstantPoolId::new(u32::MAX), backing.clone())
@@ -476,8 +486,16 @@ fn actual_nested_metadata_quantum_and_projection_tail_preserve_every_control_pre
     .unwrap();
     assert_eq!(projected.entries().len(), 1);
     let trace = baseline.trace();
-    assert!(trace.iter().any(|(_, units)| *units == 256));
-    assert!(trace.len() > 2);
+    let DataType::List(original_child) = backing.field().data_type() else {
+        unreachable!()
+    };
+    assert_eq!(original_child.metadata().len(), 320);
+    let DataType::List(layout_child) = ty.data_type() else {
+        unreachable!()
+    };
+    assert!(layout_child.metadata().is_empty());
+    assert!(trace.len() >= 2);
+    assert!(trace.last().is_some_and(|(_, units)| *units > 0));
     for cause in [
         CompileControlError::Cancelled,
         CompileControlError::DeadlineExceeded,

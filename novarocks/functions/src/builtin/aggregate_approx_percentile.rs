@@ -279,7 +279,7 @@ impl ApproxPercentileKernel {
         else {
             unreachable!("checked scalar result")
         };
-        &output.data_type
+        output.data_type()
     }
     fn check_emit(
         &self,
@@ -808,8 +808,9 @@ impl PreparedAggregateKernel for ApproxPercentileKernel {
     }
 }
 pub(super) fn validate_contract(
+    operation: ApproxPercentileOperation,
     contract: &AggregateCallContract,
-    signature: &ResolvedAggregateSignature,
+    original_arguments: &[FunctionArgument],
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), KernelFailure> {
     let FunctionResultType::Scalar(output) = &contract.call().selected().result_type else {
@@ -817,12 +818,37 @@ pub(super) fn validate_contract(
             "approximate percentile requires original scalar result",
         ));
     };
-    if !FunctionValueType::new(signature.output_type.clone(), true)
-        .exactly_equals_observed::<KernelFailure>(output, || work.step().map_err(compile_failure))?
-        || !FunctionValueType::new(signature.intermediate_type.clone(), true)
-            .exactly_equals_observed::<KernelFailure>(contract.intermediate_type(), || {
-                work.step().map_err(compile_failure)
-            })?
+    let domain = match operation {
+        ApproxPercentileOperation::Union => novarocks_type_contract::ValueLogicalType::Percentile,
+        ApproxPercentileOperation::Unweighted | ApproxPercentileOperation::Weighted => {
+            novarocks_type_contract::ValueLogicalType::Physical
+        }
+    };
+    // The immutable installed operation was authored from this exact name.
+    // Both owning signature resolution and this borrowed comparison consume
+    // the same aggregate_type_recipes decision, including List quantiles.
+    let name = match operation {
+        ApproxPercentileOperation::Unweighted => "percentile_approx",
+        ApproxPercentileOperation::Weighted => "percentile_approx_weighted",
+        ApproxPercentileOperation::Union => "percentile_union",
+    };
+    let (expected_output, expected_state) = crate::aggregate_types::aggregate_type_recipes(
+        name,
+        crate::aggregate_types::AggregateTypeArguments::Values(original_arguments),
+    )
+    .map_err(|_| invalid("approximate percentile original signature is stale"))?;
+    let matches = |expected: &crate::aggregate_types::AggregateTypeRecipe<'_>,
+                   actual: &FunctionValueType,
+                   work: &mut CompileCheckpoints<'_>| {
+        expected
+            .matches_value_observed(actual.typed_binding().borrowed(), true, domain, work)
+            .map_err(|error| match error {
+                FunctionBindingError::Control(cause) => compile_failure(cause),
+                _ => invalid("approximate percentile original signature is stale"),
+            })
+    };
+    if !matches(&expected_output, output, work)?
+        || !matches(&expected_state, contract.intermediate_type(), work)?
     {
         return Err(invalid(
             "approximate percentile full return/state differ from original resolver",

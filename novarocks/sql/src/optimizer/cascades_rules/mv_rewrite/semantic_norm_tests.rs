@@ -115,7 +115,7 @@ fn normalization_keeps_original_selected_ordinal_backing_and_nested_field_facts(
         null.is_null_observed(CompilePhase::LowerProgram, &control())
             .unwrap()
     );
-    assert!(null_norm.value_type().nullable);
+    assert!(null_norm.value_type().nullable());
 
     let original_list = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
         Some(vec![Some(7)]),
@@ -133,7 +133,7 @@ fn normalization_keeps_original_selected_ordinal_backing_and_nested_field_facts(
     );
     let ty = FunctionValueType::new(list.data_type().clone(), false);
     let pool = ConstantPool::try_new(
-        Arc::new(Field::new("nested", ty.data_type.clone(), false)),
+        Arc::new(Field::new("nested", list.data_type().clone(), false)),
         ty.clone(),
         list.to_data(),
         crate::constant::test_constant_policy(),
@@ -151,8 +151,12 @@ fn normalization_keeps_original_selected_ordinal_backing_and_nested_field_facts(
     assert_eq!(value.ordinal(), 1);
     assert!(Arc::ptr_eq(value.pool().array(), source.pool().array()));
     assert!(
-        matches!(value.value_type().data_type,DataType::List(ref f) if f.metadata()==field.metadata())
+        matches!(value.value_type().data_type(),DataType::List(f) if f.name()=="item" && f.metadata().is_empty())
     );
+    assert!(
+        matches!(value.field().data_type(),DataType::List(f) if std::sync::Arc::ptr_eq(f, &field))
+    );
+    assert_eq!(field.metadata()["provider-child"], "retained");
 }
 
 #[test]
@@ -163,20 +167,29 @@ fn coarse_constant_collisions_require_exact_field_identity_and_last_exact_overwr
     let equivalent = constant(selected("left", "one", vec![Some(42), Some(-9)], 0));
     assert_eq!(key(&first), key(&name_changed));
     assert_eq!(key(&first), key(&metadata_changed));
-    assert!(!same(&first, &name_changed));
-    assert!(!same(&first, &metadata_changed));
+    assert!(same(&first, &name_changed));
+    assert!(same(&first, &metadata_changed));
+    let value_changed = constant(selected("left", "one", vec![Some(43)], 0));
+    assert_ne!(
+        key(&first),
+        key(&value_changed),
+        "the original constant fingerprint includes its selected value"
+    );
+    assert!(!same(&first, &value_changed));
     let mut index = NormIndex::new();
     index.insert(first.clone(), 10, &control()).unwrap();
     index.insert(name_changed.clone(), 20, &control()).unwrap();
     index
         .insert(metadata_changed.clone(), 30, &control())
         .unwrap();
+    index.insert(value_changed.clone(), 50, &control()).unwrap();
     index.insert(equivalent, 40, &control()).unwrap();
-    assert_eq!(index.buckets.len(), 1);
-    assert_eq!(index.buckets.values().next().unwrap().len(), 3);
+    assert_eq!(index.buckets.len(), 2);
+    assert!(index.buckets.values().all(|bucket| bucket.len() == 1));
     assert_eq!(index.get(&first, &control()).unwrap(), Some(&40));
-    assert_eq!(index.get(&name_changed, &control()).unwrap(), Some(&20));
-    assert_eq!(index.get(&metadata_changed, &control()).unwrap(), Some(&30));
+    assert_eq!(index.get(&name_changed, &control()).unwrap(), Some(&40));
+    assert_eq!(index.get(&metadata_changed, &control()).unwrap(), Some(&40));
+    assert_eq!(index.get(&value_changed, &control()).unwrap(), Some(&50));
     let ty = FunctionValueType::new(DataType::Int64, false);
     assert!(!same(&col("a", ty.clone()), &col("b", ty)));
 }
@@ -284,7 +297,7 @@ fn normalized_types_policy_and_authored_ordering_are_complete_identity() {
     ))]);
     let mut nullable = base.clone();
     if let NormExpr::Call { value_type, .. } = &mut nullable {
-        value_type.nullable = true;
+        *value_type = value_type.with_nullable(true).unwrap();
     }
     assert!(!same(&base, &nullable));
     let mut policy = base.clone();
@@ -312,7 +325,7 @@ fn normalized_types_policy_and_authored_ordering_are_complete_identity() {
     let nested = |value: &str| {
         FunctionValueType::new(
             DataType::List(Arc::new(
-                Field::new("item", DataType::Int64, true)
+                Field::new("item", DataType::Int64, value == "one")
                     .with_metadata([("provider".into(), value.into())].into()),
             )),
             true,
@@ -461,7 +474,7 @@ fn mv_dimension_mapping_requires_exact_source_and_output_types_before_publicatio
     let nested = |metadata: &str| {
         FunctionValueType::new(
             DataType::List(Arc::new(
-                Field::new("item", DataType::Int64, true)
+                Field::new("item", DataType::Int64, metadata == "source")
                     .with_metadata([("provider".into(), metadata.into())].into()),
             )),
             true,

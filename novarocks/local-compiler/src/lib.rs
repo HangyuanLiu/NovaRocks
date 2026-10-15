@@ -19,12 +19,16 @@
 //! phase; its result is not a complete semantic validation or a LocalProgram.
 
 mod aggregate;
+mod array_projection;
 mod assert_rows;
 mod change_events;
+mod typed_layout;
 
 #[cfg(test)]
 mod change_events_lowering_tests;
 mod channels;
+mod creation;
+pub use creation::FragmentCreationError;
 mod exchange;
 mod expressions;
 mod generate_series;
@@ -61,7 +65,8 @@ mod unpivot_lowering_tests;
 mod assert_rows_lowering_tests;
 
 pub use lowering::{
-    FragmentCompileError, LocalCompileOptions, compile_fragment,
+    FragmentCompileError, LocalCompileOptions, compile_fragment, compile_fragment_with_creation,
+    compile_fragment_with_creation_and_project_metadata_host,
     compile_fragment_with_project_metadata_host,
 };
 pub use project_metadata::{

@@ -375,7 +375,7 @@ impl Frame {
     fn attach_between(
         &mut self,
         child: Child,
-        program: &novarocks_local_program::LocalProgram,
+        program: &novarocks_local_program::ExpressionProgram,
         negated: bool,
         batch_rows: usize,
         work: &mut Work<'_, '_>,
@@ -494,7 +494,7 @@ impl Frame {
     fn attach_membership(
         &mut self,
         child: Child,
-        program: &novarocks_local_program::LocalProgram,
+        program: &novarocks_local_program::ExpressionProgram,
         batch_rows: usize,
         work: &mut Work<'_, '_>,
     ) -> Result<(), KernelFailure> {
@@ -568,8 +568,8 @@ impl Frame {
             between_comparison_operand(left, &parents, &self.rows, selection, batch_rows, work)?;
         let right =
             between_comparison_operand(right, &parents, &self.rows, selection, batch_rows, work)?;
-        let left = left.materialize(selection, &expected.data_type, work)?;
-        let right = right.materialize(selection, &expected.data_type, work)?;
+        let left = left.materialize(selection, &expected.data_type(), work)?;
+        let right = right.materialize(selection, &expected.data_type(), work)?;
         let state = self
             .membership
             .as_mut()
@@ -579,7 +579,7 @@ impl Frame {
             &parents,
             &mut |event| in_event(event, work),
         ))?;
-        let equalities = if expected.data_type == DataType::Utf8 {
+        let equalities = if expected.data_type() == &DataType::Utf8 {
             in_observed(crate::exec::expr::in_pred::utf8_equality_observed(
                 left.values(),
                 right.values(),
@@ -613,7 +613,7 @@ impl Frame {
     fn attach(
         &mut self,
         child: Child,
-        program: &novarocks_local_program::LocalProgram,
+        program: &novarocks_local_program::ExpressionProgram,
         shape: ControlShape,
         demand: EvaluationDemand,
         child_is_pure: bool,
@@ -894,7 +894,7 @@ impl Frame {
     reason = "Keep the checked root, exact input port, selected domain, use-owned state/effects and caller control explicit"
 )]
 pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
-    program: &novarocks_local_program::LocalProgram,
+    program: &novarocks_local_program::ExpressionProgram,
     root: ProgramExpressionRootSite,
     input: CompiledInputLoan<'_>,
     input_node: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
@@ -1035,7 +1035,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
             && frame.activation == novarocks_functions::ScalarInvocationActivation::ValidateOnly
         {
             work.flush()?;
-            let array = new_empty_array(&result_type.data_type);
+            let array = new_empty_array(&result_type.data_type());
             work.flush()?;
             OwnedValue::Selected(array, Box::default())
         } else {
@@ -1126,7 +1126,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                     let source = source.value.into_value(local_selection, work)?;
                     let output = source.materialize(
                         local_selection,
-                        &recipe.source_type().data_type,
+                        &recipe.source_type().data_type(),
                         work,
                     )?;
                     let mut failed = Vec::with_capacity(frame.errors.len());
@@ -1153,7 +1153,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                     work.flush()?;
                     OwnedValue::from_selected(SelectedValues::try_new_observed(
                         local_selection,
-                        &result_type.data_type,
+                        &result_type.data_type(),
                         Arc::new(result),
                         errors.into_boxed_slice(),
                         || work.step(),
@@ -1175,7 +1175,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                     )?;
                     OwnedValue::from_selected(SelectedValues::try_new_observed(
                         local_selection,
-                        &result_type.data_type,
+                        &result_type.data_type(),
                         array,
                         errors,
                         || work.step(),
@@ -1194,7 +1194,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                     )?;
                     OwnedValue::from_selected(SelectedValues::try_new_observed(
                         local_selection,
-                        &result_type.data_type,
+                        &result_type.data_type(),
                         array,
                         errors,
                         || work.step(),
@@ -1218,7 +1218,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                         // only the frozen nullability widens.
                         OwnedValue::from_selected(child.materialize(
                             local_selection,
-                            &recipe.result_type().data_type,
+                            &recipe.result_type().data_type(),
                             work,
                         )?)
                     } else {
@@ -1358,7 +1358,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                     &frame.children,
                     &frame.choices,
                     &mut frame.errors,
-                    &result_type.data_type,
+                    &result_type.data_type(),
                     local_selection,
                     work,
                 )?,
@@ -1430,7 +1430,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                             &frame.children,
                             &frame.choices,
                             &mut frame.errors,
-                            &result_type.data_type,
+                            &result_type.data_type(),
                             local_selection,
                             work,
                         )?,
@@ -1685,7 +1685,7 @@ fn evaluate_arithmetic<'a>(
     };
     use arrow_buffer::i256;
     use novarocks_functions::ArithmeticRowResult as R;
-    let ty = &recipe.result_type().data_type;
+    let ty = &recipe.result_type().data_type();
     // This is a checked representation bound and fallible capacity reservation,
     // not a host Account grant or an Arrow allocation-origin receipt.
     let bitmap = selection
@@ -1724,7 +1724,7 @@ fn evaluate_arithmetic<'a>(
         DataType::Decimal128(..) => Output::Decimal128(Vec::new()),
         DataType::Decimal256(..) => Output::Decimal256(Vec::new()),
         DataType::FixedSizeBinary(16)
-            if recipe.result_type().logical_type
+            if recipe.result_type().logical_type()
                 == novarocks_type_contract::ValueLogicalType::LargeInt =>
         {
             Output::LargeInt(FixedSizeBinaryBuilder::with_capacity(selection.len(), 16))
@@ -1858,7 +1858,7 @@ fn evaluate_cast<'a>(
         Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
     };
     use novarocks_functions::CastRowResult as R;
-    let ty = &recipe.result_type().data_type;
+    let ty = &recipe.result_type().data_type();
     if recipe.is_collection() {
         work.flush()?;
         return recipe.evaluate_collection(
@@ -1872,8 +1872,8 @@ fn evaluate_cast<'a>(
     // widest Chrono year and nanosecond fraction. Check Arrow's i32 offset
     // extent before producing text. This is not a host memory grant.
     let variable_binary_text =
-        ty == &DataType::Utf8 && recipe.source_type().data_type == DataType::Binary;
-    if ty == &DataType::Utf8 && !variable_binary_text {
+        *ty == &DataType::Utf8 && *recipe.source_type().data_type() == DataType::Binary;
+    if *ty == &DataType::Utf8 && !variable_binary_text {
         selection
             .len()
             .checked_mul(64)
@@ -2103,7 +2103,7 @@ fn evaluate_cast<'a>(
             };
             Arc::new(
                 Decimal128Array::from(v)
-                    .with_precision_and_scale(precision, scale)
+                    .with_precision_and_scale(*precision, *scale)
                     .map_err(|_| {
                         internal(
                             "Decimal128 cast output differs from its frozen precision and scale",
@@ -2514,7 +2514,7 @@ fn validate_membership_phase(
     let values = gather(output.values(), &indices, work)?;
     let successful = SelectedValues::try_new_observed(
         selected,
-        &expected.data_type,
+        &expected.data_type(),
         values,
         Box::default(),
         || work.step(),

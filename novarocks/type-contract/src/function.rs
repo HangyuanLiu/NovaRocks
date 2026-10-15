@@ -16,82 +16,187 @@
 
 use std::fmt;
 
+use crate::ValueTypeRef;
 use arrow_schema::{DataType, Field};
 
 const MAX_FUNCTION_IDENTITY_BYTES: usize = 1024;
 
+// Each independently retained identity owns its text and only the lifetime of
+// that storage. Neither catalog services nor runtime controls are retained.
+struct FunctionIdentityText {
+    text: Box<str>,
+    // Drop text before releasing its creator responsibility.
+    storage: crate::ValueTypeStorageLifetime,
+}
+
 macro_rules! stable_identity {
-    ($name:ident, $kind:literal) => {
-        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub struct $name(Box<str>);
+    ($name:ident, $kind:literal, $strict:literal) => {
+        #[derive(Clone)]
+        pub struct $name(std::sync::Arc<FunctionIdentityText>);
 
         impl $name {
-            /// Validate a borrowed identity with the constructor's exact grammar.
-            /// This performs no allocation and does not retain the input.
-            pub fn validate_str(value: &str) -> Result<(), FunctionIdentityError> {
-                validate_identity($kind, value)
+            /// Actual Arc request for this module's private immutable backing.
+            /// The text Box is a separate request of its exact byte length.
+            pub fn storage_allocation_layout()
+            -> Result<std::alloc::Layout, crate::owned_resources::layout::LayoutResourceError> {
+                crate::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+                    FunctionIdentityText,
+                >())
             }
 
+            /// Validate the original borrowed grammar without allocating.
+            pub fn validate_str(value: &str) -> Result<(), FunctionIdentityError> {
+                Self::validate_str_observed(value, || Ok(()))
+            }
+
+            /// Observe only the bytes the original identity grammar inspects.
+            /// Function/overload identities retain their length-only grammar.
+            pub fn validate_str_observed<E: From<FunctionIdentityError>>(
+                value: &str,
+                mut observe: impl FnMut() -> Result<(), E>,
+            ) -> Result<(), E> {
+                validate_identity($kind, value)?;
+                if $strict {
+                    for byte in value.bytes() {
+                        let allowed = byte.is_ascii_graphic() && !matches!(byte, b'|' | b',');
+                        observe()?;
+                        if !allowed {
+                            return Err(
+                                FunctionIdentityError::InvalidCharacters { kind: $kind }.into()
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            /// Pure declaration author, using ordinary references and no grant.
             pub fn try_new(value: impl AsRef<str>) -> Result<Self, FunctionIdentityError> {
                 let value = value.as_ref();
                 Self::validate_str(value)?;
-                Ok(Self(value.into()))
+                Ok(Self::from_validated_boxed(
+                    value.into(),
+                    crate::ValueTypeStorageLifetime::pure(),
+                ))
+            }
+
+            pub fn try_from_boxed(value: Box<str>) -> Result<Self, FunctionIdentityError> {
+                Self::try_from_boxed_in(value, crate::ValueTypeStorageLifetime::pure())
+            }
+
+            /// Consume the actual author's text without copying it. Runtime
+            /// callers admit the text and backing requests before this call.
+            pub fn try_from_boxed_in(
+                value: Box<str>,
+                storage: crate::ValueTypeStorageLifetime,
+            ) -> Result<Self, FunctionIdentityError> {
+                Self::validate_str(&value)?;
+                Ok(Self::from_validated_boxed(value, storage))
+            }
+
+            /// Create both actual text and private backing under the original
+            /// creator. A callback refusal returns directly, with no footer.
+            pub fn try_new_observed<E>(
+                value: &str,
+                storage: crate::ValueTypeStorageLifetime,
+                mut request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
+                mut work: impl FnMut(usize) -> Result<(), E>,
+            ) -> Result<Self, E>
+            where
+                E: From<FunctionIdentityError>
+                    + From<crate::owned_resources::layout::LayoutResourceError>,
+            {
+                Self::validate_str_observed(value, || work(1))?;
+                let text = std::alloc::Layout::array::<u8>(value.len())
+                    .map_err(|_| crate::owned_resources::layout::LayoutResourceError::Arithmetic)?;
+                request(text)?;
+                // The locked str-to-Box operation copies the bounded original
+                // byte span; it is not an exact allocator block-size fact.
+                work(value.len())?;
+                let value: Box<str> = value.into();
+                request(Self::storage_allocation_layout()?)?;
+                Ok(Self::from_validated_boxed(value, storage))
+            }
+
+            /// The text was already constructed by this creator. Validation
+            /// and the sole actual Arc request do not allocate a second label.
+            pub fn try_from_boxed_observed<E>(
+                value: Box<str>,
+                storage: crate::ValueTypeStorageLifetime,
+                mut request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
+                mut work: impl FnMut(usize) -> Result<(), E>,
+            ) -> Result<Self, E>
+            where
+                E: From<FunctionIdentityError>
+                    + From<crate::owned_resources::layout::LayoutResourceError>,
+            {
+                Self::validate_str_observed(&value, || work(1))?;
+                request(Self::storage_allocation_layout()?)?;
+                Ok(Self::from_validated_boxed(value, storage))
+            }
+
+            fn from_validated_boxed(
+                text: Box<str>,
+                storage: crate::ValueTypeStorageLifetime,
+            ) -> Self {
+                Self(std::sync::Arc::new(FunctionIdentityText { text, storage }))
             }
 
             pub fn as_str(&self) -> &str {
-                &self.0
+                &self.0.text
+            }
+
+            /// Independent identity clones retain the same actual text owner.
+            pub fn clone_observed<E>(
+                &self,
+                mut observe: impl FnMut() -> Result<(), E>,
+            ) -> Result<Self, E> {
+                observe()?;
+                Ok(self.clone())
+            }
+
+            pub fn storage_lifetime(&self) -> crate::ValueTypeStorageLifetime {
+                self.0.storage.clone()
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_tuple(stringify!($name))
+                    .field(&self.as_str())
+                    .finish()
+            }
+        }
+        impl PartialEq for $name {
+            fn eq(&self, other: &Self) -> bool {
+                std::sync::Arc::ptr_eq(&self.0, &other.0) || self.as_str() == other.as_str()
+            }
+        }
+        impl Eq for $name {}
+        impl PartialOrd for $name {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for $name {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.as_str().cmp(other.as_str())
+            }
+        }
+        impl std::hash::Hash for $name {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                std::hash::Hash::hash(self.as_str(), state)
             }
         }
     };
 }
 
-stable_identity!(FunctionId, "function");
-stable_identity!(FunctionOverloadId, "function overload");
+stable_identity!(FunctionId, "function", false);
+stable_identity!(FunctionOverloadId, "function overload", false);
 
-/// Stable identity of an aggregate's serialized intermediate state.
-///
-/// The delimiter exclusions keep catalog digests structurally unambiguous.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct AggregateStateFormatId(Box<str>);
-
-impl AggregateStateFormatId {
-    /// Validate a borrowed state identity with the constructor's exact grammar.
-    /// This performs no allocation and does not retain the input.
-    pub fn validate_str(value: &str) -> Result<(), FunctionIdentityError> {
-        Self::validate_str_observed(value, || Ok(()))
-    }
-
-    /// Observe each byte actually inspected by the same identity grammar.
-    /// Length rejection precedes the scan; a callback refusal is returned
-    /// directly before any later byte or identity error is produced.
-    pub fn validate_str_observed<E: From<FunctionIdentityError>>(
-        value: &str,
-        mut observe: impl FnMut() -> Result<(), E>,
-    ) -> Result<(), E> {
-        validate_identity("aggregate state format", value)?;
-        for byte in value.bytes() {
-            let allowed = byte.is_ascii_graphic() && !matches!(byte, b'|' | b',');
-            observe()?;
-            if !allowed {
-                return Err(FunctionIdentityError::InvalidCharacters {
-                    kind: "aggregate state format",
-                }
-                .into());
-            }
-        }
-        Ok(())
-    }
-
-    pub fn try_new(value: impl AsRef<str>) -> Result<Self, FunctionIdentityError> {
-        let value = value.as_ref();
-        Self::validate_str(value)?;
-        Ok(Self(value.into()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+// Stable identity of an aggregate's serialized intermediate state. Its
+// delimiter exclusions preserve the original unambiguous digest grammar.
+stable_identity!(AggregateStateFormatId, "aggregate state format", true);
 
 /// Original overload owner's constraints on the logical argument types used
 /// to interpret its intermediate state. This does not change any call's exact
@@ -102,64 +207,102 @@ pub enum AggregateStateArgumentContract {
     /// Every complete argument type must be identical across state phases.
     ExactSignature,
     /// Only logical scalar arguments' root nullability may differ. Nested
-    /// nullability, field metadata, nominal domains and ORDER BY remain exact.
+    /// nullability, nominal domains, normalized layouts and ORDER BY remain exact.
     ValueRootNullabilityIndependent,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct FunctionValueType {
-    pub data_type: DataType,
-    pub nullable: bool,
-    pub logical_type: crate::ValueLogicalType,
+    binding: crate::TypedValueBinding,
 }
 
-impl PartialEq for FunctionValueType {
-    fn eq(&self, other: &Self) -> bool {
-        self.nullable == other.nullable
-            && self.logical_type == other.logical_type
-            && crate::arrow_data_types_exact(&self.data_type, &other.data_type)
-    }
-}
-impl Eq for FunctionValueType {}
-impl std::hash::Hash for FunctionValueType {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Arrow's coarser dictionary equality/hash may collide for different
-        // frozen dictionary identities; exact equality still distinguishes them.
-        std::hash::Hash::hash(&self.data_type, state);
-        std::hash::Hash::hash(&self.nullable, state);
-        std::hash::Hash::hash(&self.logical_type, state);
-    }
-}
+#[path = "function/typed_value.rs"]
+pub(crate) mod typed_value;
 
 impl FunctionValueType {
-    pub const fn new(data_type: DataType, nullable: bool) -> Self {
-        Self {
-            data_type,
-            nullable,
-            logical_type: crate::ValueLogicalType::Physical,
+    /// Declare a physical value from a metadata-free exact value layout.
+    /// Nested annotations are discarded without interpretation. Authors with
+    /// semantic children construct and pass the complete ValueTypeRef instead.
+    pub fn new(data_type: DataType, nullable: bool) -> Self {
+        Self::try_with_logical_type(data_type, nullable, crate::ValueLogicalType::Physical)
+            .expect("valid declared physical function value")
+    }
+
+    pub fn try_from_typed_binding(
+        binding: crate::TypedValueBinding,
+    ) -> Result<Self, crate::ValueTypeError> {
+        Ok(Self { binding })
+    }
+
+    pub fn try_from_value(
+        value_type: crate::ValueTypeRef,
+        layout: crate::ValueLayout,
+    ) -> Result<Self, crate::ValueTypeError> {
+        Self::try_from_typed_binding(crate::TypedValueBinding::try_new(value_type, layout)?)
+    }
+
+    /// Observe the two actual shared-handle clones; no tree or allocation work.
+    pub fn clone_observed<E>(&self, observe: impl FnMut() -> Result<(), E>) -> Result<Self, E> {
+        Ok(Self {
+            binding: self.binding.clone_observed(observe)?,
+        })
+    }
+
+    pub fn value_type(&self) -> &crate::ValueTypeRef {
+        self.binding.value_type()
+    }
+    pub fn typed_binding(&self) -> &crate::TypedValueBinding {
+        &self.binding
+    }
+    /// Pure catalog projection of one existing semantic child. Runtime authors
+    /// use `child_at_in` after covering the new fixed projection holder.
+    pub fn child_at(&self, index: usize) -> Option<Self> {
+        self.child_at_in(index, crate::ValueTypeStorageLifetime::pure())
+    }
+    pub fn child_at_in(
+        &self,
+        index: usize,
+        storage: crate::ValueTypeStorageLifetime,
+    ) -> Option<Self> {
+        self.binding
+            .child_at(index, storage)
+            .map(|binding| Self { binding })
+    }
+    pub fn data_type(&self) -> &DataType {
+        self.binding.data_type()
+    }
+    pub fn nullable(&self) -> bool {
+        self.binding.nullable()
+    }
+    pub fn logical_type(&self) -> crate::ValueLogicalType {
+        match self.value_type().kind() {
+            crate::ValueKind::Nominal(logical) => *logical,
+            _ => crate::ValueLogicalType::Physical,
         }
     }
 
-    /// Read an explicitly authored root domain from its actual Arrow field.
-    /// Missing metadata declares Physical; no carrier confers another identity.
-    pub fn try_from_field(field: &arrow_schema::Field) -> Result<Self, crate::ValueTypeError> {
-        Self::try_with_logical_type(
-            field.data_type().clone(),
-            field.is_nullable(),
-            crate::field_logical_type(field)?,
-        )
+    pub fn with_nullable(&self, nullable: bool) -> Result<Self, crate::ValueTypeError> {
+        self.with_nullable_in(nullable, crate::ValueTypeStorageLifetime::pure())
     }
 
-    /// Materialize a new schema field from this exact authored value type.
-    /// Root identity is explicit metadata; nested fields remain unchanged.
-    pub fn try_to_field(&self, name: impl Into<String>) -> Result<Field, crate::ValueTypeError> {
-        self.validate()?;
-        let field = Field::new(name, self.data_type.clone(), self.nullable);
-        Ok(match self.logical_type.metadata_value() {
-            Some(tag) => field
-                .with_metadata([(crate::NR_LOGICAL_TYPE_KEY.to_owned(), tag.to_owned())].into()),
-            None => field,
-        })
+    pub fn with_nullable_in(
+        &self,
+        nullable: bool,
+        storage: crate::ValueTypeStorageLifetime,
+    ) -> Result<Self, crate::ValueTypeError> {
+        Self::try_from_typed_binding(self.binding.with_nullable(nullable, storage)?)
+    }
+
+    pub fn with_nullable_observed<E: From<crate::owned_resources::layout::LayoutResourceError>>(
+        &self,
+        nullable: bool,
+        storage: crate::ValueTypeStorageLifetime,
+        request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
+        work: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<Self, E> {
+        self.binding
+            .with_nullable_observed(nullable, storage, request, work)
+            .map(|binding| Self { binding })
     }
 
     pub fn try_with_logical_type(
@@ -167,61 +310,219 @@ impl FunctionValueType {
         nullable: bool,
         logical_type: crate::ValueLogicalType,
     ) -> Result<Self, crate::ValueTypeError> {
-        let value = Self {
+        Self::try_with_logical_type_with_construction::<std::convert::Infallible>(
             data_type,
             nullable,
             logical_type,
-        };
-        value.validate()?;
-        Ok(value)
+            crate::ValueTypeStorageLifetime::pure(),
+            None,
+        )
+        .map_err(|error| crate::ValueTypeError::from(error.into_pure()))
+    }
+    pub fn try_with_logical_type_with_construction<E>(
+        data_type: DataType,
+        nullable: bool,
+        logical_type: crate::ValueLogicalType,
+        storage: crate::ValueTypeStorageLifetime,
+        observer: Option<&mut dyn FnMut(crate::ValueConstructionRequest) -> Result<(), E>>,
+    ) -> Result<Self, crate::ValueConstructionFailure<E>> {
+        let mut creation = crate::value_construction::ValueConstruction::new(observer);
+        let layout = crate::ValueLayout::try_new_with_construction(
+            &data_type,
+            storage.clone(),
+            creation.observer(),
+        )?;
+        let value = crate::ValueTypeRef::try_from_declared_arrow_with_construction(
+            layout.data_type(),
+            nullable,
+            logical_type,
+            storage,
+            creation.observer(),
+        )?;
+        Self::try_from_value(value, layout).map_err(Into::into)
+    }
+    pub fn child_at_with_construction<E>(
+        &self,
+        index: usize,
+        storage: crate::ValueTypeStorageLifetime,
+        observer: Option<&mut dyn FnMut(crate::ValueConstructionRequest) -> Result<(), E>>,
+    ) -> Result<Option<Self>, crate::ValueConstructionFailure<E>> {
+        self.binding
+            .child_at_with_construction(index, storage, observer)
+            .map(|binding| binding.map(|binding| Self { binding }))
+    }
+    pub fn with_nullable_with_construction<E>(
+        &self,
+        nullable: bool,
+        storage: crate::ValueTypeStorageLifetime,
+        observer: Option<&mut dyn FnMut(crate::ValueConstructionRequest) -> Result<(), E>>,
+    ) -> Result<Self, crate::ValueConstructionFailure<E>> {
+        self.binding
+            .with_nullable_with_construction(nullable, storage, observer)
+            .map(|binding| Self { binding })
+    }
+
+    /// Temporary expansion-only import of a positively authored legacy field.
+    /// Execution callers must pass an existing complete typed binding instead.
+    pub fn try_from_legacy_field_projection(field: &Field) -> Result<Self, crate::ValueTypeError> {
+        let storage = crate::ValueTypeStorageLifetime::pure();
+        let value = crate::ValueTypeRef::try_from_external_field(field, storage.clone())?;
+        let layout = crate::ValueLayout::try_new(field.data_type(), storage)?;
+        Self::try_from_value(value, layout)
+    }
+
+    /// Temporary declared-root projection for old nested semantic authors.
+    pub fn try_from_legacy_declared_projection(
+        data_type: DataType,
+        nullable: bool,
+        logical_type: crate::ValueLogicalType,
+    ) -> Result<Self, crate::ValueTypeError> {
+        let storage = crate::ValueTypeStorageLifetime::pure();
+        let value = crate::ValueTypeRef::try_from_declared_arrow(
+            &data_type,
+            nullable,
+            logical_type,
+            storage.clone(),
+        )?;
+        let layout = crate::ValueLayout::try_new(&data_type, storage)?;
+        Self::try_from_value(value, layout)
+    }
+
+    pub fn from_legacy_declared_projection(data_type: DataType, nullable: bool) -> Self {
+        Self::try_from_legacy_declared_projection(
+            data_type,
+            nullable,
+            crate::ValueLogicalType::Physical,
+        )
+        .expect("valid temporary legacy function value declaration")
+    }
+
+    /// Temporary outward projection for the old production chain. All recursive
+    /// nominal semantics come from the typed tree, never from layout metadata.
+    pub fn try_to_legacy_field_projection(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<Field, crate::ValueTypeError> {
+        typed_value::legacy_field(self.value_type(), self.data_type(), name.into())
+    }
+
+    // Expansion aliases remain until the existing Chunk/wire chain flips.
+    pub fn try_from_field(field: &Field) -> Result<Self, crate::ValueTypeError> {
+        Self::try_from_legacy_field_projection(field)
+    }
+    pub fn try_to_field(&self, name: impl Into<String>) -> Result<Field, crate::ValueTypeError> {
+        self.try_to_legacy_field_projection(name)
     }
 
     pub fn validate(&self) -> Result<(), crate::ValueTypeError> {
-        self.validate_core(crate::validate_nested_logical_types)
+        // Construction checked the complete immutable semantics/layout pair.
+        Ok(())
     }
 
-    /// Validate the original root carrier and nested logical grammar using
-    /// caller-owned scratch and borrowed events. The caller admits scratch
-    /// initialization before this call; this method owns no scope or footer.
+    /// Borrow the exact layout using the legacy resource visitor while the
+    /// expansion chain still uses its scratch vocabulary. It cannot rediscover
+    /// semantics; those are already checked and held in the immutable binding.
     pub fn validate_with_scratch_observed<'a, E: From<crate::ValueTypeError>>(
         &'a self,
         scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
         observe: impl FnMut(crate::ValueTypeVisit<'a>) -> Result<(), E>,
     ) -> Result<(), E> {
-        self.validate_core(|root| {
-            crate::validate_value_type_structure_with_scratch_observed(root, scratch, observe)
-        })
+        crate::validate_value_type_structure_with_scratch_observed(
+            self.data_type(),
+            scratch,
+            observe,
+        )
     }
 
-    fn validate_core<'a, E: From<crate::ValueTypeError>>(
-        &'a self,
-        validate_nested: impl FnOnce(&'a DataType) -> Result<(), E>,
-    ) -> Result<(), E> {
-        self.logical_type.validate_carrier(&self.data_type)?;
-        validate_nested(&self.data_type)
+    /// Observe the existing logical NULL-widening rule on validated holders.
+    pub fn fits_value_type_observed<E>(
+        &self,
+        expected: &Self,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        typed_value::compatible(
+            self.value_type(),
+            expected.value_type(),
+            typed_value::Nullability::Fits,
+            &mut observe,
+        )
+    }
+
+    /// Match the complete immutable declaration and the installed physical
+    /// port, permitting only the owner's existing NULL widening rule.
+    /// No raw annotations or unvalidated Arrow grammar enter this comparison.
+    pub fn fits_physical_binding_observed<E>(
+        &self,
+        expected: &Self,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        if !self.fits_value_type_observed(expected, &mut observe)? {
+            return Ok(false);
+        }
+        nested_layout_fits(self.data_type(), expected.data_type(), &mut observe)
     }
 
     pub fn fits_value_type(&self, expected: &Self) -> bool {
-        self.logical_type == expected.logical_type
-            && (expected.nullable || !self.nullable)
-            && fits_nested_nullability(&self.data_type, &expected.data_type)
-            && self.validate().is_ok()
-            && expected.validate().is_ok()
+        typed_value::compatible(
+            self.value_type(),
+            expected.value_type(),
+            typed_value::Nullability::Fits,
+            &mut || Ok::<(), crate::ValueTypeError>(()),
+        )
+        .unwrap_or(false)
     }
 
-    /// Compare the exact frozen value type, including nested provider and
-    /// dictionary facts. This observes the borrowed traversal; it does not
-    /// replace the owner's metadata admission or allocation policy.
+    pub fn comparison_work_upper_bound(&self) -> Result<usize, crate::ExecutionValueTypeError> {
+        self.binding.comparison_work_upper_bound()
+    }
+    pub fn exactly_equals_weighted_observed<E: From<crate::ValueTypeError>>(
+        &self,
+        other: &Self,
+        observe: impl FnMut(crate::TypeComparisonStep) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        self.binding
+            .exactly_equals_weighted_observed(&other.binding, observe)
+    }
+
     pub fn exactly_equals_observed<E: From<crate::ValueTypeError>>(
+        &self,
+        other: &Self,
+        observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        self.binding
+            .exactly_equals_observed(&other.binding, observe)
+    }
+
+    /// Compare complete already validated immutable semantics and exact layout.
+    /// Replay exposes only the caller's original observation error.
+    pub fn exactly_equals_checked_observed<E>(
         &self,
         other: &Self,
         mut observe: impl FnMut() -> Result<(), E>,
     ) -> Result<bool, E> {
-        observe()?;
-        if self.nullable != other.nullable || self.logical_type != other.logical_type {
+        if !typed_value::compatible(
+            self.value_type(),
+            other.value_type(),
+            typed_value::Nullability::Exact,
+            &mut observe,
+        )? {
             return Ok(false);
         }
-        crate::arrow_data_types_exact_observed(&self.data_type, &other.data_type, observe)
+        self.binding
+            .layout()
+            .equals_observed(other.binding.layout(), observe)
+    }
+
+    pub fn same_semantics(&self, other: &Self) -> bool {
+        self.binding.same_semantics(&other.binding)
+    }
+    pub fn same_semantics_observed<E: From<crate::ValueTypeError>>(
+        &self,
+        other: &Self,
+        observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        self.binding
+            .same_semantics_observed(&other.binding, observe)
     }
 
     pub fn same_value_domain_observed<E: From<crate::ValueTypeError>>(
@@ -229,28 +530,64 @@ impl FunctionValueType {
         other: &Self,
         mut observe: impl FnMut() -> Result<(), E>,
     ) -> Result<bool, E> {
-        observe()?;
-        self.logical_type.validate_carrier(&self.data_type)?;
-        other.logical_type.validate_carrier(&other.data_type)?;
-        if self.logical_type != other.logical_type {
+        typed_value::compatible(
+            self.value_type(),
+            other.value_type(),
+            typed_value::Nullability::IgnoreRoot,
+            &mut observe,
+        )
+    }
+
+    /// Compare immutable complete semantics and physical binding while ignoring
+    /// only root nullability. Nested NULL promises and every layout fact remain.
+    /// The observer's original error is the sole failure channel.
+    pub fn same_physical_binding_ignoring_root_nullability_observed<E>(
+        &self,
+        other: &Self,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        if !typed_value::compatible(
+            self.value_type(),
+            other.value_type(),
+            typed_value::Nullability::IgnoreRoot,
+            &mut observe,
+        )? {
             return Ok(false);
         }
-        Ok(
-            fits_nested_nullability_observed(&self.data_type, &other.data_type, &mut observe)?
-                && fits_nested_nullability_observed(
-                    &other.data_type,
-                    &self.data_type,
-                    &mut observe,
-                )?,
+        self.binding
+            .layout()
+            .equals_observed(other.binding.layout(), observe)
+    }
+    /// Compare borrowed child semantics without allocating a child binding.
+    /// Only the selected child root nullability is ignored.
+    pub fn borrowed_value_domains_equal_observed<E: From<crate::ValueTypeError>>(
+        left: &ValueTypeRef,
+        right: &ValueTypeRef,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        typed_value::compatible(
+            left,
+            right,
+            typed_value::Nullability::IgnoreRoot,
+            &mut observe,
         )
     }
 
     pub fn same_value_domain(&self, other: &Self) -> bool {
-        self.logical_type == other.logical_type
-            && fits_nested_nullability(&self.data_type, &other.data_type)
-            && fits_nested_nullability(&other.data_type, &self.data_type)
-            && self.validate().is_ok()
-            && other.validate().is_ok()
+        self.same_value_domain_observed(other, || Ok::<(), crate::ValueTypeError>(()))
+            .unwrap_or(false)
+    }
+
+    /// Logical overload rule that explicitly permits nested NULL widening.
+    /// Scalar parameters, nominal identities and semantic field names remain.
+    pub fn same_semantics_ignoring_nullability(&self, other: &Self) -> bool {
+        typed_value::compatible(
+            self.value_type(),
+            other.value_type(),
+            typed_value::Nullability::IgnoreAll,
+            &mut || Ok::<(), crate::ValueTypeError>(()),
+        )
+        .unwrap_or(false)
     }
 }
 
@@ -262,7 +599,7 @@ impl FunctionValueType {
 pub enum FunctionArgumentType {
     Value(FunctionValueType),
     Lambda {
-        parameter_types: Box<[FunctionValueType]>,
+        parameter_types: crate::FunctionParameterTypes,
         result_type: FunctionValueType,
     },
 }
@@ -372,28 +709,11 @@ fn validate_identity(kind: &'static str, value: &str) -> Result<(), FunctionIden
     Ok(())
 }
 
-/// Whether a value of `actual` stands where `expected` is asked for, allowing
-/// only that its nested fields admit less.
-///
-/// The two are the same type, except that a nested field the value never
-/// writes null into may stand where one that may be null is asked for -- the
-/// same direction nullability travels everywhere else. A field that may be
-/// null standing where a non-null one is asked for is the mismatch.
-pub fn fits_nested_nullability(actual: &DataType, expected: &DataType) -> bool {
-    fits_nested_nullability_observed::<crate::ValueTypeError>(actual, expected, || Ok(()))
-        .unwrap_or(false)
-}
-
-/// Preserve the same value-domain/nullability rule while observing recursive
-/// schemas and pair comparisons. Nonlogical field annotations do not change
-/// this semantic domain; exact physical-carrier comparison remains separate.
-pub fn fits_nested_nullability_observed<E: From<crate::ValueTypeError>>(
+fn nested_layout_fits<E>(
     actual: &DataType,
     expected: &DataType,
-    mut observe: impl FnMut() -> Result<(), E>,
+    observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
-    crate::validate_nested_logical_types_observed(actual, &mut observe)?;
-    crate::validate_nested_logical_types_observed(expected, &mut observe)?;
     #[allow(deprecated)]
     fn field_fits<E>(
         actual: &Field,
@@ -405,7 +725,6 @@ pub fn fits_nested_nullability_observed<E: From<crate::ValueTypeError>>(
             || (!expected.is_nullable() && actual.is_nullable())
             || actual.dict_id() != expected.dict_id()
             || actual.dict_is_ordered() != expected.dict_is_ordered()
-            || crate::field_logical_type(actual) != crate::field_logical_type(expected)
         {
             return Ok(false);
         }
@@ -469,7 +788,7 @@ pub fn fits_nested_nullability_observed<E: From<crate::ValueTypeError>>(
             (actual, expected) => Ok(actual == expected),
         }
     }
-    fits(actual, expected, &mut observe)
+    fits(actual, expected, observe)
 }
 
 #[cfg(test)]
@@ -482,7 +801,7 @@ mod tests {
         use arrow_schema::{DataType, Field};
         #[allow(deprecated)]
         let nested = |dict_id, ordered, nullable, annotation: &str, logical: &str| {
-            FunctionValueType::new(
+            FunctionValueType::from_legacy_declared_projection(
                 DataType::Struct(
                     vec![
                         Field::new_dict(
@@ -527,7 +846,7 @@ mod tests {
         }
         let physical = FunctionValueType::new(DataType::FixedSizeBinary(16), false);
         let uuid = FunctionValueType::try_with_logical_type(
-            physical.data_type.clone(),
+            physical.data_type().clone(),
             false,
             ValueLogicalType::Uuid,
         )
@@ -540,7 +859,10 @@ mod tests {
         assert!(
             !physical
                 .exactly_equals_observed::<ValueTypeError>(
-                    &FunctionValueType::new(physical.data_type.clone(), true),
+                    &FunctionValueType::from_legacy_declared_projection(
+                        physical.data_type().clone(),
+                        true
+                    ),
                     || Ok(()),
                 )
                 .unwrap()
@@ -561,7 +883,7 @@ mod tests {
                 Self::Type(value)
             }
         }
-        let value = FunctionValueType::new(
+        let value = FunctionValueType::from_legacy_declared_projection(
             DataType::Struct(
                 (0..320)
                     .map(|index| Field::new(index.to_string(), DataType::Int32, false))
@@ -613,7 +935,7 @@ mod tests {
             .clone()
             .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), "uuid".to_owned())].into());
         let exact_uuid = FunctionValueType::try_from_field(&uuid).unwrap();
-        assert_eq!(exact_uuid.logical_type, ValueLogicalType::Uuid);
+        assert_eq!(exact_uuid.logical_type(), ValueLogicalType::Uuid);
         assert_eq!(
             FunctionValueType::try_from_field(&exact_uuid.try_to_field("roundtrip").unwrap())
                 .unwrap(),
@@ -640,7 +962,7 @@ mod tests {
         );
         assert_eq!(
             FunctionValueType::try_from_field(&nested).unwrap(),
-            FunctionValueType::new(nested.data_type().clone(), true)
+            FunctionValueType::from_legacy_declared_projection(nested.data_type().clone(), true)
         );
     }
 
@@ -679,3 +1001,7 @@ mod identity_tests;
 #[cfg(test)]
 #[path = "function/value_type_scratch_tests.rs"]
 mod value_type_scratch_tests;
+
+#[cfg(test)]
+#[path = "function/typed_binding_tests.rs"]
+mod typed_binding_tests;

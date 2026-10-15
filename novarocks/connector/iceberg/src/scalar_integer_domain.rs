@@ -597,13 +597,17 @@ fn apply_source_logical_schema(
             .validate_carrier(field.data_type())
             .map_err(|error| corrupt(error.to_string()))?;
         if declared.contains_key(&ordinal) {
-            let domain = crate::nominal_read_domain::NominalReadDomain::from_logical(logical)
-                .expect("only declared opaque domains reach field authoring");
-            fields.push(Arc::new(
-                domain
-                    .annotate(field)
-                    .map_err(|error| corrupt(error.to_string()))?,
-            ));
+            // This is the provider's SQL schema projection. Runtime value
+            // domains are authored separately from frozen source declarations.
+            let mut authored = field.as_ref().clone();
+            authored.metadata_mut().insert(
+                NR_LOGICAL_TYPE_KEY.into(),
+                logical
+                    .metadata_value()
+                    .expect("declared opaque domain")
+                    .into(),
+            );
+            fields.push(Arc::new(authored));
         } else {
             fields.push(field.clone());
         }

@@ -90,14 +90,14 @@ fn n_results(chunks: &[Chunk]) -> Vec<NOutput> {
     let mut result = Vec::new();
     for chunk in chunks {
         let keys = chunk
-            .batch
+            .record_batch()
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
         let read_list = |column: usize, row| {
             let lists = chunk
-                .batch
+                .record_batch()
                 .column(column)
                 .as_any()
                 .downcast_ref::<ListArray>()
@@ -111,10 +111,16 @@ fn n_results(chunks: &[Chunk]) -> Vec<NOutput> {
             };
             assert_eq!(item.data_type(), &DataType::FixedSizeBinary(16));
             assert!(item.is_nullable());
-            assert_eq!(
-                item.metadata().get("nr_logical_type").map(String::as_str),
-                Some("largeint")
-            );
+            let novarocks_type_contract::ValueKind::List(child) = chunk.chunk_schema().slots()
+                [column]
+                .typed_binding()
+                .value_type()
+                .kind()
+            else {
+                panic!("complete LARGEINT list declaration")
+            };
+            assert_eq!(child.domain(), Some(ValueLogicalType::LargeInt));
+            assert_eq!(item.metadata().capacity(), 0);
             let values = lists.value(row);
             let binary = values
                 .as_any()
@@ -208,10 +214,10 @@ fn compiled_grouped_topn_actual_n_intermediate_buffer_keeps_original_stock_until
     let output = drain(&mut processor);
     let populated = output
         .iter()
-        .find(|chunk| !chunk.batch.column(0).is_null(0))
+        .find(|chunk| !chunk.record_batch().column(0).is_null(0))
         .unwrap();
     let states = populated
-        .batch
+        .record_batch()
         .column(1)
         .as_any()
         .downcast_ref::<BinaryArray>()
@@ -241,7 +247,7 @@ fn compiled_grouped_topn_actual_n_final_child_keeps_original_stock_until_last_al
         .iter()
         .map(|chunk| {
             chunk
-                .batch
+                .record_batch()
                 .column(1)
                 .as_any()
                 .downcast_ref::<ListArray>()

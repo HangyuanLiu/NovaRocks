@@ -67,12 +67,12 @@ impl OrderedComparisonAlgorithm {
     /// Capability for a complete logical value domain. A signed LARGEINT
     /// comparison cannot be borrowed by an unrelated binary carrier.
     pub fn supports_value_type(self, ty: &crate::FunctionValueType) -> bool {
-        let identity = if crate::is_largeint_data_type(&ty.data_type) {
-            ty.logical_type == crate::ValueLogicalType::LargeInt
+        let identity = if crate::is_largeint_data_type(ty.data_type()) {
+            ty.logical_type() == crate::ValueLogicalType::LargeInt
         } else {
-            ty.logical_type == crate::ValueLogicalType::Physical
+            ty.logical_type() == crate::ValueLogicalType::Physical
         };
-        identity && self.supports_order_key(&ty.data_type)
+        identity && self.supports_order_key(ty.data_type())
     }
 
     /// Reports the exact Arrow scalar domain frozen by this revision.

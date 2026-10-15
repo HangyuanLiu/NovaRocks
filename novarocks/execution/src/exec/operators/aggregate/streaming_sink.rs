@@ -48,7 +48,11 @@ use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::hash_table::key_builder::build_group_key_views;
+#[cfg(test)]
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
+use crate::exec::hash_table::key_column::{
+    AggregateOutputCreation, validate_typed_aggregate_output,
+};
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
 use crate::exec::node::aggregate::{AggFunction, AggregateTopNRuntimeFilterProducerBinding};
@@ -181,6 +185,7 @@ impl OperatorFactory for AggregateStreamingSinkFactory {
             data_initialized: false,
             finishing: false,
             finished: false,
+            construction: None,
             output_schema: None,
             output_chunk_schema: Arc::clone(&self.output_chunk_schema),
             observed_group_key_nullable: vec![false; self.group_by.len()],
@@ -223,6 +228,7 @@ struct AggregateStreamingSinkOperator {
     data_initialized: bool,
     finishing: bool,
     finished: bool,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     output_schema: Option<SchemaRef>,
     output_chunk_schema: ChunkSchemaRef,
     observed_group_key_nullable: Vec<bool>,
@@ -240,6 +246,16 @@ struct AggregateStreamingSinkOperator {
 }
 
 impl Operator for AggregateStreamingSinkOperator {
+    fn creates_typed_storage(&self) -> bool {
+        self.output_chunk_schema.is_typed()
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.construction = Some(factory);
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -280,6 +296,25 @@ impl Operator for AggregateStreamingSinkOperator {
         }
         self.operator_vectors_memory
             .ensure_bound(&mut self.group_states, &mut self.state_ptrs)?;
+        if self.output_chunk_schema.is_typed() {
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+            let kernels = self
+                .kernels
+                .as_ref()
+                .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
+            validate_typed_aggregate_output(
+                &self.output_chunk_schema,
+                &self.arena,
+                &self.group_by,
+                &kernels.entries,
+                self.output_intermediate,
+                |units| factory.observe_input_work(units),
+            )?;
+        }
+
         Ok(self.init_from_plan()?)
     }
 
@@ -320,23 +355,46 @@ impl Operator for AggregateStreamingSinkOperator {
 
 impl AggregateStreamingSinkOperator {
     fn rebuild_output_schema(&mut self, group_key_nullable: Option<&[bool]>) -> Result<(), String> {
-        let kernels = self
-            .kernels
-            .as_ref()
-            .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
-        let key_columns = self
-            .key_table
-            .as_ref()
-            .map(|table| table.key_columns())
-            .unwrap_or(&[]);
-        self.output_schema = Some(build_output_schema_from_kernels(
-            key_columns,
-            &kernels.entries,
-            self.output_intermediate,
-            &self.output_chunk_schema,
-            group_key_nullable,
-        )?);
-        Ok(())
+        if self.output_chunk_schema.is_typed() {
+            if let Some(actual) = group_key_nullable {
+                for (index, has_nulls) in actual.iter().enumerate() {
+                    let slot = self
+                        .output_chunk_schema
+                        .slots()
+                        .get(index)
+                        .ok_or("aggregate group output declaration is absent")?;
+                    if *has_nulls && !slot.nullable() {
+                        return Err("aggregate required group output contains NULL".into());
+                    }
+                }
+            }
+            self.output_schema = Some(self.output_chunk_schema.arrow_schema_ref());
+            return Ok(());
+        }
+        #[cfg(not(test))]
+        {
+            Err("aggregate output requires its complete value bindings".into())
+        }
+        #[cfg(test)]
+        {
+            let kernels = self
+                .kernels
+                .as_ref()
+                .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
+            let key_columns = self
+                .key_table
+                .as_ref()
+                .map(|table| table.key_columns())
+                .unwrap_or(&[]);
+            self.output_schema = Some(build_output_schema_from_kernels(
+                key_columns,
+                &kernels.entries,
+                self.output_intermediate,
+                &self.output_chunk_schema,
+                group_key_nullable,
+            )?);
+            Ok(())
+        }
     }
 
     fn try_submit_native_topn_bound(&mut self) -> Result<(), String> {
@@ -608,13 +666,13 @@ impl AggregateStreamingSinkOperator {
         Ok(())
     }
 
-    fn finish_to_chunks(&mut self) -> Result<Vec<Chunk>, String> {
+    fn finish_to_chunks(&mut self) -> ExecutionResult<Vec<Chunk>> {
         if self.finished {
             return Ok(vec![]);
         }
 
         if !self.initialized {
-            return Err("aggregate operator not prepared".to_string());
+            return Err("aggregate operator not prepared".into());
         }
 
         if !self.group_by.is_empty() {
@@ -642,7 +700,7 @@ impl AggregateStreamingSinkOperator {
         if self.group_states.is_empty() {
             if self.group_by.is_empty() {
                 self.ensure_scalar_group().map_err(|e| e.to_string())?;
-            } else {
+            } else if !self.output_chunk_schema.is_typed() {
                 let schema = self
                     .output_schema
                     .clone()
@@ -665,6 +723,27 @@ impl AggregateStreamingSinkOperator {
             .as_ref()
             .map(|table| table.key_columns().len())
             .unwrap_or(0);
+        let output_creation = if self.output_chunk_schema.is_typed() {
+            if key_count != self.group_by.len() {
+                return Err(
+                    "aggregate actual group channel count differs from its declaration".into(),
+                );
+            }
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+            Some(AggregateOutputCreation::begin(
+                &self.output_chunk_schema,
+                &self.arena,
+                &self.group_by,
+                &kernels.entries,
+                self.output_intermediate,
+                factory.as_ref(),
+            )?)
+        } else {
+            None
+        };
         let mut arrays = Vec::with_capacity(key_count + kernels.entries.len());
         if let Some(table) = self.key_table.as_ref() {
             for col in table.key_columns() {
@@ -677,6 +756,11 @@ impl AggregateStreamingSinkOperator {
                 &self.group_states,
                 || kernel.build_array(&self.group_states, self.output_intermediate),
             )?);
+        }
+        if let Some(creation) = output_creation {
+            let chunk = creation.finish(arrays, self.group_states.len())?;
+            self.drop_group_states();
+            return Ok(vec![chunk]);
         }
         let schema = align_schema_with_arrays(&schema, &arrays, "aggregate streaming output")?;
 
@@ -1058,6 +1142,12 @@ impl AggregateStreamingSinkOperator {
 }
 
 impl ProcessorOperator for AggregateStreamingSinkOperator {
+    fn input_construction_factory(
+        &self,
+    ) -> Option<&dyn crate::exec::pipeline::operator::InputConstructionFactory> {
+        self.construction.as_deref()
+    }
+
     fn need_input(&self) -> bool {
         !self.finishing && !self.finished
     }
@@ -1197,6 +1287,8 @@ mod retained_memory_tests {
             DataType::Int64
         };
         let function = AggFunction {
+            // Explicit legacy carrier fixture; this is not frozen-binding admission.
+            frozen: None,
             name: "multi_distinct_count".to_string(),
             inputs: vec![input],
             input_is_intermediate,

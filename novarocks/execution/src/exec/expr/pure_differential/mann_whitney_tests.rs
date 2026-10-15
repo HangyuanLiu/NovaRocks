@@ -431,7 +431,7 @@ fn mann_whitney_owner_non_numeric_null_reachability_and_full_type_data_are_exact
         sources.push(FunctionValueType::try_with_logical_type(carrier, true, logical).unwrap());
     }
     for source in sources {
-        let values = new_null_array(&source.data_type, 2);
+        let values = new_null_array(source.data_type(), 2);
         for treatment in [
             boolean(vec![None; 2]),
             boolean(vec![Some(false), Some(true)]),

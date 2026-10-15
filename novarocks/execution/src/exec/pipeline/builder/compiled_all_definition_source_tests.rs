@@ -494,32 +494,20 @@ fn all_definition_source_uses_real_unnest_relational_binding_author() {
 #[test]
 #[allow(deprecated)]
 fn all_definition_source_borrowed_type_encoder_keeps_nested_provider_and_nominal_identity() {
-    let dictionary = Arc::new(
-        Field::new_dict(
-            "dictionary",
-            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
-            false,
-            -37,
-            true,
-        )
-        .with_metadata([("provider.field_id".into(), "17".into())].into()),
-    );
+    // Provider attributes and dictionary descriptors use SourceFieldTable.
+    // Their exact original (-37, ordered=true) source round-trip is covered by
+    // physical_type_v2::source_fields_tests::original_nested_provider_source_attributes_and_dictionary_identity.
+    let dictionary = Arc::new(Field::new("dictionary", DataType::Utf8, false));
     let nested = Arc::new(Field::new(
         "nested",
-        DataType::List(Arc::new(
-            Field::new("item", dictionary.data_type().clone(), true)
-                .with_metadata([("provider.source".into(), "nested-original".into())].into()),
-        )),
+        DataType::List(Arc::new(Field::new("", DataType::Utf8, true))),
         true,
     ));
-    let root = Arc::new(
-        Field::new(
-            "original_root",
-            DataType::Struct(vec![dictionary.clone(), nested].into()),
-            false,
-        )
-        .with_metadata([("provider.schema".into(), "frozen".into())].into()),
-    );
+    let root = Arc::new(Field::new(
+        "original_root",
+        DataType::Struct(vec![dictionary.clone(), nested].into()),
+        false,
+    ));
     let physical = FunctionValueType::new(root.data_type().clone(), false);
     let nominal = FunctionValueType::try_with_logical_type(
         DataType::FixedSizeBinary(16),
@@ -557,7 +545,9 @@ fn all_definition_source_borrowed_type_encoder_keeps_nested_provider_and_nominal
     });
     work.finish().unwrap();
     let facts = last_admission.expect("original encoder must admit its completed projection");
-    assert!(facts.expanded_node_count > 64);
+    // The old >64 count included retired inline source descriptors. Keep
+    // the real recursive expansion and the same numeric receiving ceiling.
+    assert!(facts.expanded_node_count > values.len() + fields.len());
     assert!(facts.expanded_node_count <= limits.max_expanded_nodes);
     let decoded = decode_type_table(
         encoded.as_wire(),
@@ -579,8 +569,22 @@ fn all_definition_source_borrowed_type_encoder_keeps_nested_provider_and_nominal
         &dictionary,
         decoded.field(9).unwrap()
     ));
-    assert_eq!(decoded.field(9).unwrap().dict_id(), Some(-37));
-    assert_eq!(decoded.field(9).unwrap().dict_is_ordered(), Some(true));
+    assert_eq!(decoded.field(9).unwrap().dict_id(), None);
+    assert_eq!(decoded.field(9).unwrap().dict_is_ordered(), None);
+    assert_eq!(decoded.field(17).unwrap().metadata().capacity(), 0);
+    assert_eq!(decoded.field(9).unwrap().metadata().capacity(), 0);
+    assert_eq!(
+        decoded.value_type(900).unwrap().logical_type(),
+        ValueLogicalType::LargeInt
+    );
+    assert!(!decoded.field(17).unwrap().is_nullable());
+    let DataType::Struct(children) = decoded.field(17).unwrap().data_type() else {
+        panic!("Struct")
+    };
+    assert_eq!(children[0].name(), "dictionary");
+    assert!(!children[0].is_nullable());
+    assert_eq!(children[1].name(), "nested");
+    assert!(children[1].is_nullable());
 }
 
 #[test]

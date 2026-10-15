@@ -89,7 +89,7 @@ fn checked_slot_pairs_exact_column_and_original_chunk_authority() {
     let mut chunk = input_chunk(&program, vec![Some(11), Some(42), None]);
     chunk.try_transfer_to(&tracker).unwrap();
     let owners = chunk.source_authority().owner_identity();
-    let original_array = Arc::clone(chunk.batch.column(1));
+    let original_array = Arc::clone(chunk.record_batch().column(1));
     let observed = Arc::new(Mutex::new(0));
     let seen = Arc::clone(&observed);
     let observer: Arc<SlotSourceObserver> = Arc::new(move |column| {
@@ -110,7 +110,7 @@ fn checked_slot_pairs_exact_column_and_original_chunk_authority() {
         Selection::all(3),
     )
     .unwrap();
-    assert!(Arc::ptr_eq(result.values(), chunk.batch.column(1)));
+    assert!(Arc::ptr_eq(result.values(), chunk.record_batch().column(1)));
     assert_eq!(*observed.lock().unwrap(), 1);
     assert_eq!(chunk.source_authority().strong_counts(), (Some(1), None));
     assert!(
@@ -125,7 +125,7 @@ fn record_batch_without_chunk_and_chunk_without_authority_are_distinct() {
     let program = program(SeedMode::Input, false);
     let chunk = input_chunk(&program, vec![Some(42)]);
     assert!(matches!(
-        CompiledInputLoan::RecordBatch(&chunk.batch)
+        CompiledInputLoan::RecordBatch(&chunk.record_batch())
             .checked_column(1)
             .unwrap()
             .into_parts()
@@ -141,7 +141,7 @@ fn record_batch_without_chunk_and_chunk_without_authority_are_distinct() {
         BorrowedInputSource::NoAttachedAuthority
     ));
     let results = [
-        CompiledInputLoan::RecordBatch(&chunk.batch),
+        CompiledInputLoan::RecordBatch(&chunk.record_batch()),
         CompiledInputLoan::from_chunk(&chunk),
     ]
     .map(|input| {
@@ -170,7 +170,7 @@ fn chunk_and_batch_entries_keep_full_sparse_empty_null_results() {
         let mut actual = evaluator(&program);
         let before = old
             .evaluate_evaluation(
-                &chunk.batch,
+                &chunk.record_batch(),
                 selection,
                 if selection.is_empty() {
                     ScalarInvocationActivation::ValidateOnly
@@ -223,7 +223,7 @@ fn chunk_entry_keeps_original_validation_and_failed_instance_latch() {
         Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("wrong", DataType::Int64, true),
         ])),
-        vec![Arc::clone(chunk.batch.column(1))],
+        vec![Arc::clone(chunk.record_batch().column(1))],
     )
     .unwrap();
     let bad_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
@@ -236,7 +236,7 @@ fn chunk_entry_keeps_original_validation_and_failed_instance_latch() {
     let mut actual = evaluator(&program);
     let a = old
         .evaluate_evaluation(
-            &bad.batch,
+            &bad.record_batch(),
             Selection::all(1),
             ScalarInvocationActivation::Activated,
             &Control,
@@ -251,7 +251,7 @@ fn chunk_entry_keeps_original_validation_and_failed_instance_latch() {
     assert_eq!(format!("{a:?}"), format!("{b:?}"));
     let a = old
         .evaluate_evaluation(
-            &chunk.batch,
+            &chunk.record_batch(),
             Selection::all(1),
             ScalarInvocationActivation::Activated,
             &Control,
@@ -279,7 +279,7 @@ fn project_and_writer_entries_reach_original_checked_slot_without_capture() {
         chunk.try_transfer_to(&tracker).unwrap();
         let bytes = tracker.current();
         let expected_owner = chunk.source_authority().owner_identity();
-        let expected_array = Arc::as_ptr(chunk.batch.column(1)) as *const () as usize;
+        let expected_array = Arc::as_ptr(chunk.record_batch().column(1)) as *const () as usize;
         let seen = Arc::new(Mutex::new(0));
         let observed = Arc::clone(&seen);
         let observer: Arc<SlotSourceObserver> = Arc::new(move |column| {

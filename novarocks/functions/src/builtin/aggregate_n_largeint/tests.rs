@@ -321,17 +321,21 @@ fn private_profile_validates_all_declarations_and_actual_four_phase_contracts() 
                                 && kernel.requires_emission_context()
                         );
                         assert!(kernel.requires_empty_update_preparation());
-                        let DataType::List(field) = &kernel.contract.final_type().data_type else {
+                        let DataType::List(field) = kernel.contract.final_type().data_type() else {
                             panic!("List result")
                         };
                         assert_eq!(field.data_type(), &DataType::FixedSizeBinary(16));
                         assert!(field.is_nullable());
+                        assert_eq!(field.metadata().capacity(), 0);
                         assert_eq!(
-                            field.metadata(),
-                            &std::collections::HashMap::from([(
-                                "nr_logical_type".to_owned(),
-                                "largeint".to_owned(),
-                            )])
+                            kernel
+                                .contract
+                                .final_type()
+                                .value_type()
+                                .child_type_at(0)
+                                .unwrap()
+                                .domain(),
+                            Some(ValueLogicalType::LargeInt),
                         );
                         assert_eq!(
                             kernel.contract.intermediate_type(),
@@ -363,7 +367,7 @@ fn sparse_selection_and_independent_scalar_limit_preserve_original_result() {
         .unwrap();
         let output = emit(&kernel, &state, &host).unwrap();
         assert_eq!(read_list(&output), vec![-7, 3]);
-        assert_eq!(output.data_type(), &kernel.contract.final_type().data_type);
+        assert_eq!(output.data_type(), kernel.contract.final_type().data_type());
     }
     clean(&host);
 }
@@ -504,9 +508,9 @@ fn zero_rows_final_and_intermediate_are_real_outputs_with_prior_transfer_funding
             assert_eq!(
                 output.data_type(),
                 if phase_id.produces_final_result() {
-                    &kernel.contract.final_type().data_type
+                    kernel.contract.final_type().data_type()
                 } else {
-                    &kernel.contract.intermediate_type().data_type
+                    kernel.contract.intermediate_type().data_type()
                 }
             );
             output

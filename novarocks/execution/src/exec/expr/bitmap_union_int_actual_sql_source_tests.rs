@@ -60,11 +60,17 @@ fn bitmap_union_int_actual_original_required_sql_full_signature_source() {
                     panic!("original selected argument")
                 };
                 assert_eq!(selected, value_type);
-                assert_eq!(value_type.data_type, DataType::Int32);
-                assert!(value_type.nullable);
-                assert_eq!(call.binding.intermediate_type.data_type, DataType::Binary);
-                assert_eq!(call.binding.function.result_type.data_type, DataType::Int64);
-                assert!(call.binding.function.result_type.nullable);
+                assert_eq!(value_type.data_type().clone(), DataType::Int32);
+                assert!(value_type.nullable());
+                assert_eq!(
+                    call.binding.intermediate_type.data_type().clone(),
+                    DataType::Binary
+                );
+                assert_eq!(
+                    call.binding.function.result_type.data_type().clone(),
+                    DataType::Int64
+                );
+                assert!(call.binding.function.result_type.nullable());
                 eprintln!(
                     "BITMAP_UNION_INT actual source fragment={:?} definition={definition:?} binding={:?} request={request:?}",
                     fragment.id(),

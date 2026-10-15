@@ -49,17 +49,17 @@ enum DatetimeInput<'a> {
 }
 impl<'a> DatetimeInput<'a> {
     fn checked(source: &FunctionValueType, array: &'a dyn Array) -> Result<Self, KernelFailure> {
-        if source.logical_type != ValueLogicalType::Physical {
+        if source.logical_type() != ValueLogicalType::Physical {
             return Err(invalid(
                 "calendar period difference requires its exact Physical source domain",
             ));
         }
-        if array.data_type() != &source.data_type {
+        if array.data_type() != source.data_type() {
             return Err(internal(
                 "calendar period difference carrier differs from its exact selected source",
             ));
         }
-        match &source.data_type {
+        match source.data_type() {
             DataType::Date32 => array.as_any().downcast_ref().map(Self::Date),
             DataType::Timestamp(TimeUnit::Microsecond, None) => {
                 array.as_any().downcast_ref().map(Self::Timestamp)
@@ -157,10 +157,10 @@ pub(super) fn evaluate_calendar_period_diff<'a>(
             ));
         };
         let target = input.contract().result_type();
-        let exact = target.logical_type == ValueLogicalType::Physical
-            && target.data_type == DataType::Int64
-            && target.nullable
-            && left_type.data_type == right_type.data_type;
+        let exact = target.logical_type() == ValueLogicalType::Physical
+            && target.data_type() == &DataType::Int64
+            && target.nullable()
+            && left_type.data_type() == right_type.data_type();
         work.step()?;
         if !exact {
             return Err(invalid(
@@ -201,7 +201,7 @@ pub(super) fn evaluate_calendar_period_diff<'a>(
                 }
                 let source_null = argument.array().is_null(row);
                 work.step()?;
-                if source_null && !types[index].nullable {
+                if source_null && !types[index].nullable() {
                     return Err(internal(
                         "calendar period difference non-null argument contains selected SQL NULL",
                     ));
@@ -239,7 +239,7 @@ pub(super) fn evaluate_calendar_period_diff<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

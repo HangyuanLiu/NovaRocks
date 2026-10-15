@@ -299,7 +299,7 @@ fn expr_bound_child(node: &PhysicalPlanNode, expr: &TypedExpr) -> Option<usize> 
 }
 
 fn rf_key_types_match(eq: &PhysicalHashJoinEqCondition) -> bool {
-    eq.left.value_type.data_type == eq.right.value_type.data_type
+    eq.left.value_type.data_type() == eq.right.value_type.data_type()
 }
 
 #[derive(Clone, Debug)]
@@ -395,10 +395,13 @@ fn bind_expression_to_columns(
         match &mut bound.kind {
             ExprKind::ColumnRef { column_id, .. } => {
                 let input = columns_by_id.get(column_id)?;
-                if expression.value_type.data_type != input.value_type.data_type {
+                if expression.value_type.data_type() != input.value_type.data_type() {
                     return None;
                 }
-                bound.value_type.nullable = input.value_type.nullable;
+                bound.value_type = bound
+                    .value_type
+                    .with_nullable(input.value_type.nullable())
+                    .expect("validated root NULL contract");
             }
             ExprKind::BinaryOp { left, right, .. } => {
                 **left = bind(left, columns_by_id)?;
@@ -1562,17 +1565,15 @@ mod tests {
         );
         boundary.output_columns = vec![
             OutputColumn {
-                value_type: novarocks_type_contract::FunctionValueType {
-                    nullable: true,
-                    ..out_col(1, "left_key").value_type
-                },
+                value_type: (out_col(1, "left_key").value_type)
+                    .with_nullable(true)
+                    .expect("valid value root nullability transform"),
                 ..out_col(1, "left_key")
             },
             OutputColumn {
-                value_type: novarocks_type_contract::FunctionValueType {
-                    nullable: true,
-                    ..out_col(3, "right_key").value_type
-                },
+                value_type: (out_col(3, "right_key").value_type)
+                    .with_nullable(true)
+                    .expect("valid value root nullability transform"),
                 ..out_col(3, "right_key")
             },
         ];
@@ -1611,7 +1612,7 @@ mod tests {
         else {
             panic!("coalesced probe expression")
         };
-        assert!(args.iter().all(|argument| argument.value_type.nullable));
+        assert!(args.iter().all(|argument| argument.value_type.nullable()));
     }
 
     #[test]
@@ -1648,7 +1649,7 @@ mod tests {
     #[test]
     fn probe_binding_preserves_logical_name_with_direct_input_nullability() {
         let mut input_column = out_col(1, "input_key");
-        input_column.value_type.nullable = true;
+        input_column.value_type = input_column.value_type.with_nullable(true).unwrap();
         let child = leaf(vec![input_column]);
         let mut parent = values_node(1.0, vec![child]);
         parent.output_columns = vec![out_col(1, "outer_alias")];
@@ -1656,7 +1657,7 @@ mod tests {
         assert!(place_probe(&mut parent, 9, &[col_ref(1, "outer_alias")]));
         let probe = &parent.probe_runtime_filters[0];
         assert!(
-            probe.probe_expr.value_type.nullable,
+            probe.probe_expr.value_type.nullable(),
             "binding metadata must match the exact direct-input schema"
         );
         let ExprKind::ColumnRef { column, .. } = &probe.probe_expr.kind else {

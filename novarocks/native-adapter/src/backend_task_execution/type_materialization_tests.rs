@@ -47,13 +47,31 @@ struct BoundedFirstQualification<'a> {
 }
 impl PackageTypeMaterializationScope for BoundedFirstQualification<'_> {
     type HostError = TypeMaterializationRefusal;
-    fn materialize<B>(
+    fn materialize_namespace<C, B>(
+        &mut self,
+        namespace: novarocks_plan_codec::physical_type_v2::TypeMaterializationNamespace,
+        facts: &PackageTypeProjectionFacts,
+        body: B,
+    ) -> Result<DecodedTypeTable, ProjectionFailure<C, Self::HostError>>
+    where
+        C: From<TypeCodecError>,
+        B: FnOnce() -> Result<DecodedTypeTable, C>,
+    {
+        if namespace == novarocks_plan_codec::physical_type_v2::TypeMaterializationNamespace::ExecutionPhysical {
+            self.host.materialize_namespace(namespace, facts, body)
+        } else {
+            self.host.journal.begin_namespace(namespace);
+            self.materialize(facts, body)
+        }
+    }
+    fn materialize<C, B>(
         &mut self,
         facts: &PackageTypeProjectionFacts,
         body: B,
-    ) -> Result<DecodedTypeTable, ProjectionFailure<TypeCodecError, Self::HostError>>
+    ) -> Result<DecodedTypeTable, ProjectionFailure<C, Self::HostError>>
     where
-        B: FnOnce() -> Result<DecodedTypeTable, TypeCodecError>,
+        C: From<TypeCodecError>,
+        B: FnOnce() -> Result<DecodedTypeTable, C>,
     {
         let occupied = &mut self.occupied;
         let admissions = &mut self.admissions;
@@ -108,30 +126,36 @@ fn type_materialization_real_pending_requalifies_without_replaying_the_original_
     )
     .unwrap();
     let source = package::FragmentPackage {
-        types: Some(wire::TypeTable {
-            carriers: vec![wire::CarrierTypeDefinition {
-                id: 1,
-                kind: Some(wire::carrier_type_definition::Kind::Primitive(
-                    plan::ArrowPrimitiveType::Int64 as i32,
-                )),
+        types: Some(wire::TypeTable::default()),
+        source_fields: Some(wire::SourceFieldTable {
+            shape: Some(wire::TypeTable {
+                carriers: vec![wire::CarrierTypeDefinition {
+                    id: 1,
+                    kind: Some(wire::carrier_type_definition::Kind::Primitive(
+                        plan::ArrowPrimitiveType::Int64 as i32,
+                    )),
+                }],
+                fields: vec![wire::FieldDefinition {
+                    id: 2,
+                    name: "original".into(),
+                    nullable: false,
+                    carrier_type_id: Some(1),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            field_facts: vec![wire::SourceArrowFieldFacts {
+                field_id: Some(2),
+                ..Default::default()
             }],
-            fields: vec![wire::FieldDefinition {
-                id: 2,
-                name: "original".into(),
-                nullable: false,
-                carrier_type_id: Some(1),
-                metadata: vec![],
-                dictionary_id: None,
-                dictionary_is_ordered: None,
-            }],
-            value_types: vec![],
         }),
         writes: vec![package::FrozenWriterRecipe {
             input: Some(package::ConnectorWriteInputShape {
                 kind: Some(package::connector_write_input_shape::Kind::Data(
                     package::ConnectorWriteDataInput {
                         fields: vec![package::ConnectorWriteFieldBinding {
-                            field_id: Some(2),
+                            source_field_id: Some(2),
+                            value_type_id: None,
                             field_token: vec![],
                         }],
                     },
@@ -165,7 +189,7 @@ fn type_materialization_real_pending_requalifies_without_replaying_the_original_
     work.finish().unwrap();
     assert_eq!(scope.admissions, 2);
     assert_eq!(calls.get(), 1);
-    assert_eq!(table.field(2).unwrap().name(), "original");
+    assert_eq!(table.source_field(2).unwrap().name(), "original");
     drop(scope);
     assert!(!journal.pending.unwrap().complete);
     assert!(journal.shortage.is_none() && journal.capacity.is_none());

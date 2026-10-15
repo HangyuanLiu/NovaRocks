@@ -125,7 +125,8 @@ pub(super) fn evaluate_string_find_in_set<'a>(
             let FunctionArgumentType::Value(ty) = ty else {
                 return Err(invalid("find_in_set requires checked values"));
             };
-            if ty.logical_type != ValueLogicalType::Physical || ty.data_type != DataType::Utf8 {
+            if ty.logical_type() != ValueLogicalType::Physical || ty.data_type() != &DataType::Utf8
+            {
                 return Err(invalid(
                     "find_in_set differs from its installed argument profile",
                 ));
@@ -133,9 +134,9 @@ pub(super) fn evaluate_string_find_in_set<'a>(
             work.step()?;
         }
         let target = input.contract().result_type();
-        if target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Int32
-            || !target.nullable
+        if target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Int32
+            || !target.nullable()
         {
             return Err(invalid(
                 "find_in_set differs from its installed result profile",
@@ -176,7 +177,7 @@ pub(super) fn evaluate_string_find_in_set<'a>(
                     let FunctionArgumentType::Value(ty) = &types[index] else {
                         return Err(invalid("find_in_set requires checked values"));
                     };
-                    if !ty.nullable {
+                    if !ty.nullable() {
                         return Err(internal(
                             "find_in_set non-null source contains selected SQL NULL",
                         ));
@@ -206,7 +207,7 @@ pub(super) fn evaluate_string_find_in_set<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

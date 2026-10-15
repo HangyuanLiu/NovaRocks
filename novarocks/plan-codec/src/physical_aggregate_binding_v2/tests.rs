@@ -84,7 +84,9 @@ fn function(value: &FunctionValueType) -> BoundFunction {
         function_id: FunctionId::try_new("test.aggregate/full-signature").unwrap(),
         overload: FunctionOverloadId::try_new("test.aggregate/full-signature/one").unwrap(),
         kind: FunctionKind::Aggregate,
-        argument_types: Box::from([FunctionArgumentType::Value(value.clone())]),
+        argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+            FunctionArgumentType::Value(value.clone()),
+        ])),
         result_type: value.clone(),
 
         legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
@@ -264,17 +266,12 @@ fn aggregate_signature_checks_complete_phase_format_function_and_nested_type() {
     right.function.overload = FunctionOverloadId::try_new("test/other-overload").unwrap();
     assert!(!compare(&right));
     right = left.clone();
-    right.intermediate_type.nullable = true;
+    right.intermediate_type = right.intermediate_type.with_nullable(true).unwrap();
     assert!(!compare(&right));
     right = left.clone();
-    right.intermediate_type.data_type = DataType::Struct(
-        vec![Arc::new(
-            Field::new("original", DataType::Int64, false).with_metadata(HashMap::from([(
-                "source.identity".into(),
-                "changed".into(),
-            )])),
-        )]
-        .into(),
+    right.intermediate_type = FunctionValueType::new(
+        DataType::Struct(vec![Arc::new(Field::new("changed", DataType::Int64, false))].into()),
+        right.intermediate_type.nullable(),
     );
     assert!(!compare(&right));
     right = left.clone();
@@ -379,7 +376,7 @@ fn aggregate_refuses_foreign_type_emission_missing_ids_and_wrong_source_facts() 
         .is_err()
     );
     let mut wrong = source.clone();
-    wrong.function.result_type.nullable = false;
+    wrong.function.result_type = wrong.function.result_type.with_nullable(false).unwrap();
     assert!(
         encode_aggregate_bindings(
             &types,

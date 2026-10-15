@@ -158,28 +158,26 @@ impl Error for ChannelLoweringError {
 // It is an actual column ordinal, not an ordinal inferred from a ValueId.
 type Port = BTreeMap<ValueId, usize>;
 
-pub(crate) fn resolve_tree_channels(
+pub(crate) fn resolve_tree_channels_with_creation<H>(
     package: &FragmentPackage,
     root_first: &[NodeId],
     control: &dyn PureCompileControl,
-) -> Result<PlannedChannels, ChannelLoweringError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<PlannedChannels, crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = resolve_core(package, root_first, &mut work);
-    if matches!(&result, Err(ChannelLoweringError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    let result = resolve_core_with_creation(package, root_first, &mut work, creation);
+    crate::creation::finish_attempt(result, work)
 }
 
-fn resolve_core(
+fn resolve_core_with_creation<H>(
     package: &FragmentPackage,
     root_first: &[NodeId],
     work: &mut CompileCheckpoints<'_>,
-) -> Result<PlannedChannels, ChannelLoweringError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<PlannedChannels, crate::FragmentCreationError<H>> {
     let fragment = package.fragment();
     if root_first.first() != Some(&fragment.root()) || root_first.len() != fragment.nodes().len() {
-        return Err(ChannelLoweringError::Invalid("tree node coverage differs"));
+        return Err((ChannelLoweringError::Invalid("tree node coverage differs")).into());
     }
     let mut nodes = BTreeMap::<NodeId, NodeChannels>::new();
     let mut ports = BTreeMap::<NodeId, Port>::new();
@@ -199,14 +197,14 @@ fn resolve_core(
             .get(&source)
             .ok_or(ChannelLoweringError::Invalid("missing physical node"))?;
         if nodes.contains_key(&source) {
-            return Err(ChannelLoweringError::Invalid("duplicate tree node"));
+            return Err((ChannelLoweringError::Invalid("duplicate tree node")).into());
         }
         // A join whose physical output is not its canonical output publishes
         // it through a selection Project that directly follows the join.
         let mut join_shape = match node.kind {
-            NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. } => {
-                Some(crate::join::shape_join(fragment, node, &ports, work)?)
-            }
+            NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. } => Some(
+                crate::join::shape_join_with_creation(fragment, node, &ports, work, creation)?,
+            ),
             _ => None,
         };
         let additional = if matches!(
@@ -264,9 +262,10 @@ fn resolve_core(
                             // at every row. Values materialization separately admits
                             // constant cells, so it cannot merge independent calls.
                             if row.get(representative) != Some(&expression) {
-                                return Err(ChannelLoweringError::Invalid(
+                                return Err((ChannelLoweringError::Invalid(
                                     "independent Values cells share a produced value",
-                                ));
+                                ))
+                                .into());
                             }
                         }
                     }
@@ -292,9 +291,10 @@ fn resolve_core(
                 let mut port = Port::new();
                 for (ordinal, &value) in node.output.columns.iter().enumerate() {
                     if !fragment.values().contains_key(&value) {
-                        return Err(ChannelLoweringError::Invalid(
+                        return Err((ChannelLoweringError::Invalid(
                             "missing ExchangeSource output value",
-                        ));
+                        ))
+                        .into());
                     }
                     let slot = u32::try_from(next_slot)
                         .map_err(|_| ChannelLoweringError::Invalid("slot identity exhausted"))?;
@@ -319,7 +319,9 @@ fn resolve_core(
                 let mut port = Port::new();
                 for (ordinal, &value) in node.output.columns.iter().enumerate() {
                     if !fragment.values().contains_key(&value) {
-                        return Err(ChannelLoweringError::Invalid("missing Scan output value"));
+                        return Err(
+                            (ChannelLoweringError::Invalid("missing Scan output value")).into()
+                        );
                     }
                     let slot = u32::try_from(next_slot)
                         .map_err(|_| ChannelLoweringError::Invalid("slot identity exhausted"))?;
@@ -340,9 +342,10 @@ fn resolve_core(
                 input_mappings,
             } => {
                 if node.inputs.len() < 2 || input_mappings.len() != node.inputs.len() {
-                    return Err(ChannelLoweringError::Invalid(
+                    return Err((ChannelLoweringError::Invalid(
                         "UnionAll input occurrence shape differs",
-                    ));
+                    ))
+                    .into());
                 }
                 let mut slots = Vec::new();
                 reserve_vec(&mut slots, node.output.columns.len(), work)?;
@@ -356,9 +359,10 @@ fn resolve_core(
                                 .is_some_and(|(a, b)| a == b);
                             work.step()?;
                             if !same {
-                                return Err(ChannelLoweringError::Invalid(
+                                return Err((ChannelLoweringError::Invalid(
                                     "independent UnionAll mappings share one produced value",
-                                ));
+                                ))
+                                .into());
                             }
                         }
                     } else {
@@ -384,9 +388,10 @@ fn resolve_core(
                         "UnionAll child port is missing",
                     ))?;
                     if mapping.len() != node.output.columns.len() {
-                        return Err(ChannelLoweringError::Invalid(
+                        return Err((ChannelLoweringError::Invalid(
                             "UnionAll mapping width differs",
-                        ));
+                        ))
+                        .into());
                     }
                     let mut sources = Vec::new();
                     reserve_vec(&mut sources, mapping.len(), work)?;
@@ -407,15 +412,22 @@ fn resolve_core(
                                 "UnionAll output value missing",
                             ))?
                             .ty;
-                        if source_ty.nullable && !target_ty.nullable {
-                            return Err(ChannelLoweringError::Invalid(
+                        if source_ty.nullable() && !target_ty.nullable() {
+                            return Err((ChannelLoweringError::Invalid(
                                 "UnionAll narrows nullable input",
-                            ));
+                            ))
+                            .into());
                         }
                         work.flush()?;
-                        let mut widened = source_ty.clone();
-                        widened.nullable = target_ty.nullable;
-                        exact_type(&widened, target_ty, work)?;
+                        if !source_ty.same_physical_binding_ignoring_root_nullability_observed(
+                            target_ty,
+                            || work.step().map_err(ChannelLoweringError::from),
+                        )? {
+                            return Err((ChannelLoweringError::Invalid(
+                                "UnionAll complete value types differ",
+                            ))
+                            .into());
+                        }
                         sources.push(UnionChannelSource {
                             input,
                             ty: source_ty.clone(),
@@ -442,18 +454,20 @@ fn resolve_core(
                     .ok_or(ChannelLoweringError::Invalid("missing lowered child"))?;
                 let child_port = &ports[&child];
                 if expressions.len() != node.output.columns.len() {
-                    return Err(ChannelLoweringError::Invalid(
+                    return Err((ChannelLoweringError::Invalid(
                         "project occurrence width differs",
-                    ));
+                    ))
+                    .into());
                 }
                 let mut slots = Vec::with_capacity(expressions.len());
                 let mut port = Port::new();
                 let mut producers = BTreeMap::<ValueId, Option<ResolvedInput>>::new();
                 for (ordinal, &(expression, value)) in expressions.iter().enumerate() {
                     if node.output.columns[ordinal] != value {
-                        return Err(ChannelLoweringError::Invalid(
+                        return Err((ChannelLoweringError::Invalid(
                             "ordered project values differ",
-                        ));
+                        ))
+                        .into());
                     }
                     let definition = fragment
                         .expressions()
@@ -464,9 +478,10 @@ fn resolve_core(
                         .get(&value)
                         .ok_or(ChannelLoweringError::Invalid("missing project value"))?;
                     if definition.owner != source {
-                        return Err(ChannelLoweringError::Invalid(
+                        return Err((ChannelLoweringError::Invalid(
                             "project expression has a foreign owner",
-                        ));
+                        ))
+                        .into());
                     }
                     work.step()?;
                     exact_type(&definition.ty, &output.ty, work)?;
@@ -483,9 +498,10 @@ fn resolve_core(
                             // The child port is complete before this node is
                             // visited; a duplicate source was already proved.
                             if child_node.output.columns[input_ordinal(input)?] != value {
-                                return Err(ChannelLoweringError::Invalid(
+                                return Err((ChannelLoweringError::Invalid(
                                     "input representative differs",
-                                ));
+                                ))
+                                .into());
                             }
                             Some(input)
                         }
@@ -560,9 +576,10 @@ fn resolve_core(
                             == Some(&value);
                         work.step()?;
                         if !matches {
-                            return Err(ChannelLoweringError::Invalid(
+                            return Err((ChannelLoweringError::Invalid(
                                 "assertion key representative differs",
-                            ));
+                            ))
+                            .into());
                         }
                         keys.push(resolved.slot);
                         work.step()?;
@@ -587,9 +604,10 @@ fn resolve_core(
                 reserve_vec(&mut slots, node.output.columns.len(), work)?;
                 for (ordinal, &value) in node.output.columns.iter().enumerate() {
                     if !fragment.values().contains_key(&value) {
-                        return Err(ChannelLoweringError::Invalid(
+                        return Err((ChannelLoweringError::Invalid(
                             "missing Aggregate output value",
-                        ));
+                        ))
+                        .into());
                     }
                     let slot = u32::try_from(next_slot)
                         .map_err(|_| ChannelLoweringError::Invalid("slot identity exhausted"))?;
@@ -755,7 +773,7 @@ fn resolve_core(
                 (planned.slots, planned.port)
             }
             _ => {
-                return Err(ChannelLoweringError::Invalid("unsupported channel node"));
+                return Err((ChannelLoweringError::Invalid("unsupported channel node")).into());
             }
         };
         nodes.insert(source, NodeChannels { local, slots });
@@ -796,9 +814,10 @@ fn resolve_core(
                 definition.owner
             } else {
                 if owner.inputs.len() != 1 {
-                    return Err(ChannelLoweringError::Invalid(
+                    return Err((ChannelLoweringError::Invalid(
                         "value reference requires one exact input",
-                    ));
+                    ))
+                    .into());
                 }
                 owner.inputs[0]
             };

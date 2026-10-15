@@ -512,7 +512,7 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
                 ExchangeTransmitRejection::Failed(FragmentIoError::new(
                     FragmentIoOperation::ExchangeTransmit,
                     FragmentIoErrorKind::RemoteRejected,
-                    error,
+                    error.to_string(),
                 ))
             })
     }
@@ -525,7 +525,9 @@ fn runtime_state() -> Arc<RuntimeState> {
         None,
         None,
         None,
-        None,
+        Some(crate::runtime::mem_tracker::MemTracker::new_root(
+            "compiled exchange tests",
+        )),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ))
 }
@@ -574,6 +576,7 @@ fn receivers_at(
         instance,
         &assignments(programs.receiver),
         Arc::clone(port),
+        Some(&crate::runtime::fragment::exchange::test_receiver_creation_factory()),
     )
     .expect("compiled receivers")
 }
@@ -623,7 +626,7 @@ fn prepare_error(
 
 fn int64_column(chunk: &Chunk, column: usize) -> Vec<i64> {
     chunk
-        .batch
+        .record_batch()
         .column(column)
         .as_any()
         .downcast_ref::<Int64Array>()
@@ -777,12 +780,13 @@ fn compiled_exchange_source_requires_exactly_its_own_receiver_binding() {
         CONSUMER_FINST,
         &ExchangeInputAssignments::default(),
         Arc::clone(&port),
+        Some(&crate::runtime::fragment::exchange::test_receiver_creation_factory()),
     ) {
         Ok(_) => panic!("a receiver without an assignment must be refused"),
         Err(error) => error,
     };
     assert!(
-        uncovered.contains("missing exchange assignment"),
+        uncovered.detail().contains("missing exchange assignment"),
         "{uncovered}"
     );
     let mut surplus = BTreeMap::from([(
@@ -798,12 +802,13 @@ fn compiled_exchange_source_requires_exactly_its_own_receiver_binding() {
         CONSUMER_FINST,
         &ExchangeInputAssignments::new(surplus),
         Arc::clone(&port),
+        Some(&crate::runtime::fragment::exchange::test_receiver_creation_factory()),
     ) {
         Ok(_) => panic!("an assignment without a receiver must be refused"),
         Err(error) => error,
     };
     assert!(
-        surplus.contains("has no compiled exchange source"),
+        surplus.detail().contains("has no compiled exchange source"),
         "{surplus}"
     );
 }
@@ -912,8 +917,8 @@ fn compiled_hash_stream_places_rows_by_the_exchange_hash_of_its_key_roots() {
         "the Values port is (a, b)"
     );
     let keys: Vec<ArrayRef> = vec![
-        Arc::clone(chunk.batch.column(1)),
-        Arc::clone(chunk.batch.column(0)),
+        Arc::clone(chunk.record_batch().column(1)),
+        Arc::clone(chunk.record_batch().column(0)),
     ];
     let expected = partition_chunk_by_hash_arrays(&chunk, &keys, 2, false)
         .expect("oracle placement")
@@ -1199,4 +1204,88 @@ fn unknown_exchange_source_does_not_gain_project_placement() {
     assert!(
         matches!(result, Err(novarocks_local_compiler::FragmentCompileError::Unsupported { node: Some(node), feature: "unconstrained distribution without a runtime-split scan placement" }) if node == receiver)
     );
+}
+
+#[test]
+fn compiled_receiver_schema_uses_real_creator_until_last_slot_after_program_exit() {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    let programs = programs();
+    let weak = Arc::downgrade(&programs.consumer);
+    let port = in_process_test_exchange_receiver_port();
+    let assignment = assignments(programs.receiver);
+    let missing = match materialize_compiled_exchange_receivers(
+        &programs.consumer,
+        CONSUMER_FINST,
+        &assignment,
+        port.clone(),
+        None,
+    ) {
+        Ok(_) => panic!("receiver schema needs its actual creator"),
+        Err(cause) => cause,
+    };
+    assert!(matches!(missing, ConstructionFailure::MissingOwner));
+    let tracker = MemTracker::new_root("compiled receiver independent schema");
+    let factory = super::aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        Arc::new(RuntimeErrorState::default()),
+    );
+    let receivers = materialize_compiled_exchange_receivers(
+        &programs.consumer,
+        CONSUMER_FINST,
+        &assignment,
+        port,
+        Some(&factory),
+    )
+    .unwrap();
+    let schema = receivers.registrations[0].expected_chunk_schema.clone();
+    let slot = schema.slots()[0].clone();
+    assert!(schema.is_typed());
+    assert!(
+        schema
+            .slots()
+            .iter()
+            .all(|slot| slot.field_ref().metadata().capacity() == 0)
+    );
+    drop(receivers);
+    drop(factory);
+    drop(programs);
+    assert!(weak.upgrade().is_none());
+    assert!(tracker.current() > 0);
+    drop(schema);
+    assert!(tracker.current() > 0);
+    drop(slot);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn compiled_receiver_schema_first_memory_refusal_rolls_back_without_registration() {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    let programs = programs();
+    let port = in_process_test_exchange_receiver_port();
+    let tracker = MemTracker::new_root("compiled receiver first schema refusal");
+    let factory = super::aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        Arc::new(RuntimeErrorState::default()),
+    );
+    let baseline = tracker.current();
+    assert!(baseline > 0);
+    tracker.install_limit_once(baseline + 1).unwrap();
+    let error = match materialize_compiled_exchange_receivers(
+        &programs.consumer,
+        CONSUMER_FINST,
+        &assignments(programs.receiver),
+        port,
+        Some(&factory),
+    ) {
+        Ok(_) => panic!("actual schema allocation crosses its installed tracker limit"),
+        Err(cause) => cause,
+    };
+    assert!(matches!(error, ConstructionFailure::Memory(_)));
+    assert_eq!(tracker.current(), baseline);
+    drop(factory);
+    assert_eq!(tracker.current(), 0);
 }

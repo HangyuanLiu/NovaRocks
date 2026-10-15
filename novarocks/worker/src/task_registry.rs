@@ -1473,7 +1473,9 @@ impl TaskExecutionRegistry {
         let prepared = match self.task_host.install_receiver(
             &transaction.descriptor,
             input,
-            &crate::PreparationControlLoan::new(&transaction.cell, self.config.gate_poll_interval),
+            transaction
+                .cell
+                .preparation_stop_view(self.config.gate_poll_interval),
         ) {
             Ok(prepared) => prepared,
             Err(rejection) => {
@@ -4594,7 +4596,7 @@ mod preparation_snapshot_tests {
             &self,
             _: &TaskDescriptor,
             _: TaskCreationInput,
-            _preparation: &crate::PreparationControlLoan<'_>,
+            _preparation_stop: crate::TaskPreparationStopView,
         ) -> Result<crate::PreparedTaskInstallation, crate::HostRejection> {
             panic!("preparation observation installed receiver")
         }

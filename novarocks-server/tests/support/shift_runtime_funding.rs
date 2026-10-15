@@ -395,7 +395,7 @@ fn source_for_arguments(
         fragment: id,
         output: fragment.nodes()[&project].output.clone(),
         fields: Box::from([ResultField {
-            domain: match result_type.logical_type {
+            domain: match result_type.logical_type() {
                 ValueLogicalType::Physical => ResultValueDomain::Plain,
                 ValueLogicalType::Json => ResultValueDomain::Json,
                 _ => panic!("fixture requires its authored integer or JSON result domain"),
@@ -481,13 +481,18 @@ pub(super) fn program_for_arguments(
     let mut projects = ProjectMetadataJournal::default();
     let mut type_host = TypeMaterializationHost::new(binding, &loan, &mut types);
     let mut project_host = ProjectMetadataHost::new(binding, &loan, &mut projects);
-    let compiled = interpreter
-        .compile(
+    let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+        "shift funding type construction",
+    );
+    tracker.install_limit_once(64 << 20).unwrap();
+    let compiled = novarocks_native_adapter::backend_task_execution::compile_native_package_with_funding_for_test(
+            &interpreter,
             &bytes,
             CompiledTaskOptions {
                 pipeline_dop: NonZeroUsize::MIN,
                 exchange_wait: Duration::from_millis(50),
             },
+            Arc::clone(&tracker),
             &Control,
             &mut type_host,
             &mut project_host,
@@ -502,6 +507,7 @@ pub(super) fn program_for_arguments(
         compiled,
         CompiledSchemaSite::Project(root),
         binding,
+        Arc::clone(&tracker),
         &loan,
         &Control,
         &mut projects,

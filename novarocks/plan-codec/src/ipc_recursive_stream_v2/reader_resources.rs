@@ -21,6 +21,7 @@
 
 use super::{reader_allocations, reader_diagnostics, reader_work};
 use crate::ipc_flat_stream_v2::{
+    ReaderResourceFailure,
     progress::Admission,
     resource_work::{CapturedWork, ResourceCountFacts, ResourceWork},
 };
@@ -62,6 +63,10 @@ pub struct RecursiveReaderResourceFacts {
     pub source_retained_bytes: usize,
     pub payload_request_bytes_upper_bound: usize,
     pub structural_request_bytes_upper_bound: usize,
+    pub constant_owner_request_bytes_upper_bound: usize,
+    pub retained_reader_request_bytes_upper_bound: usize,
+    pub retained_pool_data_request_bytes_upper_bound: usize,
+    pub retained_payload_request_bytes_upper_bound: usize,
     pub diagnostic_request_bytes_upper_bound: usize,
     pub allocation_request_count_upper_bound: usize,
     pub new_allocation_request_bytes_upper_bound: usize,
@@ -130,10 +135,10 @@ pub(super) fn descriptor(
     Ok((offset, length))
 }
 
-pub(super) fn payload(
+pub(super) fn payload<W: ResourceWork>(
     input: &ReaderInput<'_, '_>,
-    work: &mut impl ResourceWork,
-) -> Result<PayloadRequests, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<PayloadRequests, W::Error> {
     let mut requests = PayloadRequests {
         body_capacity: work.numeric(capacity(input.body.len()))?,
         ..Default::default()
@@ -244,15 +249,15 @@ pub(crate) fn preflight(
         work,
     )
 }
-pub(crate) fn preflight_in(
+pub(crate) fn preflight_in<E: ReaderResourceFailure>(
     input: &ReaderInput<'_, '_>,
     value_type: &FunctionValueType,
     source_retained_bytes: usize,
     policy: ConstantPolicy,
     limits: RecursiveReaderProjectionLimits,
-    admission: &mut Admission<'_, '_>,
+    admission: &mut Admission<'_, '_, E>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<RecursiveReaderResourceFacts, FlatPoolResourceError> {
+) -> Result<RecursiveReaderResourceFacts, E> {
     preflight_core(
         input,
         value_type,
@@ -263,26 +268,48 @@ pub(crate) fn preflight_in(
         work,
     )
 }
-fn preflight_core(
+fn preflight_core<E: ReaderResourceFailure>(
     input: &ReaderInput<'_, '_>,
     value_type: &FunctionValueType,
     source_retained_bytes: usize,
     policy: ConstantPolicy,
     limits: RecursiveReaderProjectionLimits,
-    mut admission: Option<&mut Admission<'_, '_>>,
+    admission: Option<&mut Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<RecursiveReaderResourceFacts, FlatPoolResourceError> {
+) -> Result<RecursiveReaderResourceFacts, E> {
+    preflight_profile_core(
+        input,
+        value_type,
+        source_retained_bytes,
+        Some(policy),
+        Some(limits),
+        admission,
+        work,
+    )
+    .map(|(facts, _)| facts)
+}
+pub(crate) fn preflight_profile_core<E: ReaderResourceFailure>(
+    input: &ReaderInput<'_, '_>,
+    value_type: &FunctionValueType,
+    source_retained_bytes: usize,
+    policy: Option<ConstantPolicy>,
+    limits: Option<RecursiveReaderProjectionLimits>,
+    mut admission: Option<&mut Admission<'_, '_, E>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(RecursiveReaderResourceFacts, ConstantPolicy), E> {
     cap(
         input.body.len(),
         source_retained_bytes,
         "recursive reader source retention below body",
     )?;
     if let Some(a) = admission.as_deref_mut() {
-        a.limits(
-            limits.max_new_allocation_request_bytes,
-            limits.max_coexisting_source_and_request_bytes,
-            limits.max_cumulative_library_work,
-        )?;
+        if let Some(limits) = limits {
+            a.limits(
+                limits.max_new_allocation_request_bytes,
+                limits.max_coexisting_source_and_request_bytes,
+                limits.max_cumulative_library_work,
+            )?;
+        }
         a.requests(
             0,
             input.geometry_scratch_request_bytes,
@@ -302,11 +329,13 @@ fn preflight_core(
     } else {
         reader_work::source_metadata_work(input.nodes, source_retained_bytes, work)?
     };
-    cap(
-        source_work.total,
-        limits.max_cumulative_library_work,
-        "recursive reader source metadata work envelope exceeded",
-    )?;
+    if let Some(limits) = limits {
+        cap(
+            source_work.total,
+            limits.max_cumulative_library_work,
+            "recursive reader source metadata work envelope exceeded",
+        )?;
+    }
     let payload = if let Some(a) = admission.as_deref_mut() {
         let mut observed = CapturedWork {
             work,
@@ -347,7 +376,7 @@ fn preflight_core(
         view_validation_bytes_upper_bound: u64_extent(input.geometry.view_validation_bytes)?,
         utf8_fallback_validation_bytes_upper_bound: u64_extent(payload.utf8_fallback)?,
     };
-    let pool = if let Some(a) = admission.as_deref_mut() {
+    let (pool, sealed) = if let Some(a) = admission.as_deref_mut() {
         let mut capture = |f: &novarocks_constant_contract::ConstantOwnerResourceFacts| {
             a.constant(
                 f.allocation_request_bytes_upper_bound,
@@ -355,25 +384,45 @@ fn preflight_core(
                 f.cumulative_work_upper_bound,
             )
         };
-        novarocks_constant_contract::preflight_recursive_pool_resources_in(
-            input.field,
-            value_type,
-            input.nodes.iter().map(|node| node.rows as u64),
-            constant_input,
-            policy,
-            &mut capture,
-            work,
-        )?
+        if let Some(policy) = policy {
+            novarocks_constant_contract::preflight_recursive_pool_resources_observed(
+                input.field,
+                value_type,
+                input.nodes.iter().map(|node| node.rows as u64),
+                constant_input,
+                policy,
+                &mut capture,
+                work,
+            )
+            .map(|facts| (facts, policy))
+            .map_err(crate::ipc_flat_stream_v2::pool_resources::flatten_constant_failure)?
+        } else {
+            novarocks_constant_contract::preflight_recursive_pool_resources_input_derived_observed(
+                input.field,
+                value_type,
+                input.nodes.iter().map(|node| node.rows as u64),
+                constant_input,
+                &mut capture,
+                work,
+            )
+            .map_err(crate::ipc_flat_stream_v2::pool_resources::flatten_constant_failure)?
+        }
     } else {
-        preflight_recursive_pool_resources(
-            input.field,
-            value_type,
-            input.nodes.iter().map(|node| node.rows as u64),
-            constant_input,
+        let policy = policy.ok_or_else(|| {
+            invalid("input-derived recursive resources require original observation")
+        })?;
+        (
+            preflight_recursive_pool_resources(
+                input.field,
+                value_type,
+                input.nodes.iter().map(|node| node.rows as u64),
+                constant_input,
+                policy,
+                CompilePhase::Decode,
+                work.control(),
+            )?,
             policy,
-            CompilePhase::Decode,
-            work.control(),
-        )?
+        )
     };
     let structures = if let Some(a) = admission.as_deref_mut() {
         let mut observed = CapturedWork {
@@ -465,33 +514,51 @@ fn preflight_core(
             work,
         )?
     };
-    cap(
-        requested,
-        limits.max_new_allocation_request_bytes,
-        "recursive reader allocation request envelope exceeded",
-    )?;
-    cap(
-        coexisting,
-        limits.max_coexisting_source_and_request_bytes,
-        "recursive reader coexistence envelope exceeded",
-    )?;
-    cap(
-        cumulative,
-        limits.max_cumulative_library_work,
-        "recursive reader library work envelope exceeded",
-    )?;
+    if let Some(limits) = limits {
+        cap(
+            requested,
+            limits.max_new_allocation_request_bytes,
+            "recursive reader allocation request envelope exceeded",
+        )?;
+        cap(
+            coexisting,
+            limits.max_coexisting_source_and_request_bytes,
+            "recursive reader coexistence envelope exceeded",
+        )?;
+        cap(
+            cumulative,
+            limits.max_cumulative_library_work,
+            "recursive reader library work envelope exceeded",
+        )?;
+    }
     work.step()?;
-    Ok(RecursiveReaderResourceFacts {
-        source_retained_bytes,
-        payload_request_bytes_upper_bound: requested_payload,
-        structural_request_bytes_upper_bound: structural,
-        diagnostic_request_bytes_upper_bound: diagnostics.request_bytes_upper_bound,
-        allocation_request_count_upper_bound: count,
-        new_allocation_request_bytes_upper_bound: requested,
-        coexisting_source_and_request_bytes_upper_bound: coexisting,
-        cumulative_library_work_upper_bound: cumulative,
-        pool,
-    })
+    Ok((
+        RecursiveReaderResourceFacts {
+            source_retained_bytes,
+            payload_request_bytes_upper_bound: requested_payload,
+            retained_payload_request_bytes_upper_bound: if input.geometry.buffer_descriptors != 0
+                || payload.empty_offsets_count != 0
+            {
+                requested_payload
+            } else {
+                0
+            },
+            structural_request_bytes_upper_bound: structural,
+            retained_reader_request_bytes_upper_bound: structures
+                .retained_reader_request_bytes_upper_bound,
+            retained_pool_data_request_bytes_upper_bound: structures
+                .retained_pool_data_request_bytes_upper_bound,
+            constant_owner_request_bytes_upper_bound: structures
+                .constant_owner_request_bytes_upper_bound,
+            diagnostic_request_bytes_upper_bound: diagnostics.request_bytes_upper_bound,
+            allocation_request_count_upper_bound: count,
+            new_allocation_request_bytes_upper_bound: requested,
+            coexisting_source_and_request_bytes_upper_bound: coexisting,
+            cumulative_library_work_upper_bound: cumulative,
+            pool,
+        },
+        sealed,
+    ))
 }
 
 #[cfg(test)]

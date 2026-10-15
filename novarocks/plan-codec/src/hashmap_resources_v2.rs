@@ -17,7 +17,4 @@
 
 //! The shared std source author; caller model and codec errors stay local.
 
-pub(crate) use novarocks_type_contract::owned_resources::hashmap::{
-    HashMapResourceError, fresh_string_table_work_upper_bound, fresh_table_layout,
-    source_iterator_work_upper_bound,
-};
+pub(crate) use novarocks_type_contract::owned_resources::hashmap::HashMapResourceError;

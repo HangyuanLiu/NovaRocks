@@ -14,8 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Independent original SQL completion metadata. This does not call a new
-//! nullable helper, clone/re-lower a physical graph, or claim runtime execution.
+//! Independent original SQL completion over non-null Connector input facts.
+//! The completed public guarantee follows the existing NULL-policy author;
+//! these declarations neither replay runtime data nor claim runtime execution.
 use arrow::datatypes::DataType;
 use arrow::datatypes::{Field, Schema};
 use novarocks_physical_plan::{
@@ -336,8 +337,10 @@ fn numeric_unary_original_nonnull_sql_baseline_three_narrow_widths_remain_nonnul
         assert_original_same_owner(port, &source);
         assert_eq!(port.fields.len(), 1);
         assert_eq!(port.fields[0].alias.as_deref(), Some("original_negated"));
-        assert_eq!(port.fields[0].ty.data_type, dtype);
-        assert!(!port.fields[0].ty.nullable);
+        assert_eq!(port.fields[0].ty.data_type().clone(), dtype);
+        // The required input remains required. Negating its minimum may yield
+        // NULL under the original checked arithmetic policy in either mode.
+        assert!(port.fields[0].ty.nullable());
         let mut actual_minus = 0;
         for fragment in source.plan().fragments().values() {
             for (_, expr) in fragment.expressions().iter() {
@@ -349,8 +352,14 @@ fn numeric_unary_original_nonnull_sql_baseline_three_narrow_widths_remain_nonnul
                     }
                 ) {
                     actual_minus += 1;
-                    assert_eq!(expr.ty.data_type, dtype);
-                    assert!(!expr.ty.nullable);
+                    assert_eq!(expr.ty.data_type().clone(), dtype);
+                    assert!(expr.ty.nullable());
+                    let ExprKind::Unary { expr: input, .. } = &expr.kind else {
+                        unreachable!();
+                    };
+                    let input = fragment.expressions().get(*input).unwrap();
+                    assert_eq!(input.ty.data_type(), &dtype);
+                    assert!(!input.ty.nullable());
                 }
             }
         }
@@ -370,14 +379,15 @@ fn numeric_unary_original_nonnull_sql_baseline_ordered_labels_and_values_are_act
     let port = source.plan().result_port().unwrap();
     assert_original_same_owner(port, &source);
     assert_eq!(port.fields.len(), 3);
-    for (field, alias) in
-        port.fields
-            .iter()
-            .zip(["first_alias", "original_source", "repeated_alias"])
+    for (ordinal, (field, alias)) in port
+        .fields
+        .iter()
+        .zip(["first_alias", "original_source", "repeated_alias"])
+        .enumerate()
     {
         assert_eq!(field.alias.as_deref(), Some(alias));
-        assert_eq!(field.ty.data_type, DataType::Int8);
-        assert!(!field.ty.nullable);
+        assert_eq!(field.ty.data_type().clone(), DataType::Int8);
+        assert_eq!(field.ty.nullable(), ordinal != 1);
     }
     // Whether optimization reused an expression/ValueId is the actual plan's
     // choice. Each ordered output occurrence above is checked individually.

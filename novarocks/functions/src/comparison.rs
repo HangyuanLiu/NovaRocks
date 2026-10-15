@@ -205,28 +205,28 @@ impl PreparedComparisonRecipe {
         let result = (|| {
             validate_type_observed(left, &mut work).map_err(ComparisonPrepareError::Kernel)?;
             validate_type_observed(right, &mut work).map_err(ComparisonPrepareError::Kernel)?;
-            if left.logical_type != right.logical_type {
+            if left.logical_type() != right.logical_type() {
                 return Err(ComparisonPrepareError::TypeMismatch);
             }
-            let allowed = match left.logical_type {
+            let allowed = match left.logical_type() {
                 ValueLogicalType::Physical => true,
                 ValueLogicalType::LargeInt | ValueLogicalType::Uuid => {
-                    left.data_type == DataType::FixedSizeBinary(16)
-                        && right.data_type == DataType::FixedSizeBinary(16)
+                    left.data_type() == &DataType::FixedSizeBinary(16)
+                        && right.data_type() == &DataType::FixedSizeBinary(16)
                 }
                 _ => false,
             };
             if !allowed {
                 return Err(ComparisonPrepareError::Unsupported);
             }
-            let leaf = if left.logical_type == ValueLogicalType::LargeInt {
+            let leaf = if left.logical_type() == ValueLogicalType::LargeInt {
                 FlatLeaf::LargeInt
             } else {
-                FlatLeaf::from_type(&left.data_type).ok_or(ComparisonPrepareError::Unsupported)?
+                FlatLeaf::from_type(left.data_type()).ok_or(ComparisonPrepareError::Unsupported)?
             };
             if !arrow_data_types_exact_observed::<ComparisonPrepareError>(
-                &left.data_type,
-                &right.data_type,
+                left.data_type(),
+                right.data_type(),
                 || work.step().map_err(Into::into),
             )? {
                 return Err(ComparisonPrepareError::TypeMismatch);
@@ -263,7 +263,7 @@ impl PreparedComparisonRecipe {
         &self.right
     }
     pub fn nullable_result(&self) -> bool {
-        self.left.nullable || self.right.nullable || self.leaf == FlatLeaf::Null
+        self.left.nullable() || self.right.nullable() || self.leaf == FlatLeaf::Null
     }
     /// Only an admitted ordinary comparison recipe supplies its own pure summary.
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
@@ -302,7 +302,8 @@ impl PreparedComparisonRecipe {
             let ra = right.array();
             // Check both operands before a successful SQL NULL can short-circuit.
             if self.leaf != FlatLeaf::Null
-                && (la.is_null(l) && !self.left.nullable || ra.is_null(r) && !self.right.nullable)
+                && (la.is_null(l) && !self.left.nullable()
+                    || ra.is_null(r) && !self.right.nullable())
             {
                 return Err(invalid(
                     "non-null comparison argument contains a selected NULL",
@@ -508,13 +509,13 @@ fn checked_row(
 ) -> Result<usize, KernelFailure> {
     if let EvaluatedArgument::Constant(value) = argument {
         let ty = value.value_type();
-        if ty.logical_type != expected.logical_type || (ty.nullable && !expected.nullable) {
+        if ty.logical_type() != expected.logical_type() || (ty.nullable() && !expected.nullable()) {
             return Err(invalid(
                 "comparison constant differs from its frozen value type",
             ));
         }
     }
-    if !flat_type_matches(&expected.data_type, argument.array().data_type(), work)? {
+    if !flat_type_matches(expected.data_type(), argument.array().data_type(), work)? {
         return Err(invalid(
             "comparison argument differs from its frozen flat carrier",
         ));

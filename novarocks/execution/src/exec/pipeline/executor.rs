@@ -28,9 +28,6 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
-use crate::runtime::preparation_metadata::{
-    CompiledMetadataMode, CompiledSchemaMetadataScope, DirectCompiledSchemaMetadataScope,
-};
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -43,7 +40,7 @@ use crate::runtime::runtime_state::RuntimeState;
 use tracing::{info, warn};
 
 use super::builder::{
-    PipelineGraph, build_compiled_pipeline_graph, build_compiled_pipeline_graph_with_metadata_host,
+    PipelineGraph, build_compiled_pipeline_graph,
     build_native_pipeline_graph_for_exec_plan_with_runtime_settings,
     build_native_pipeline_graph_for_local_program_with_runtime_settings,
 };
@@ -353,6 +350,7 @@ pub(crate) fn prepare_pipeline_execution(
         runtime_filter_session,
         event_sink,
         false,
+        None,
     )
 }
 
@@ -390,6 +388,7 @@ pub fn prepare_report_neutral_pipeline_execution(
         runtime_filter_session,
         event_sink,
         true,
+        None,
     )
 }
 
@@ -412,6 +411,9 @@ fn prepare_pipeline_execution_inner(
     runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
     event_sink: Arc<dyn FragmentEventSink>,
     report_neutral: bool,
+    mut schema_preparation: Option<
+        &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
+    >,
 ) -> ExecutionResult<PreparedPipelineExecution> {
     let dep_manager = DependencyManager::new();
     let terminal_scan_ops = scan_bindings.terminal_ops();
@@ -461,6 +463,7 @@ fn prepare_pipeline_execution_inner(
         backend_num,
         event_sink,
         report_neutral,
+        schema_preparation,
     )
 }
 
@@ -543,6 +546,7 @@ pub(crate) fn prepare_report_neutral_local_program_pipeline_execution(
         None,
         event_sink,
         true,
+        None,
     )
 }
 
@@ -609,7 +613,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
     runtime_state: Arc<RuntimeState>,
     event_sink: Arc<dyn FragmentEventSink>,
 ) -> ExecutionResult<PreparedPipelineExecution> {
-    prepare_compiled_program_pipeline_execution_in(
+    prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation(
         program,
         time_slice,
         sink,
@@ -621,17 +625,11 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
         pipeline_dop,
         runtime_state,
         event_sink,
-        &mut CompiledMetadataMode::<DirectCompiledSchemaMetadataScope>::Direct,
+        None,
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The compiled program and its Task capabilities are independent inputs"
-)]
-pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_metadata_host<
-    H: CompiledSchemaMetadataScope,
->(
+pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation(
     program: Arc<novarocks_local_program::LocalProgram>,
     time_slice: Duration,
     sink: Box<dyn OperatorFactory>,
@@ -643,41 +641,9 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_meta
     pipeline_dop: i32,
     runtime_state: Arc<RuntimeState>,
     event_sink: Arc<dyn FragmentEventSink>,
-    host: &mut H,
-) -> ExecutionResult<PreparedPipelineExecution> {
-    prepare_compiled_program_pipeline_execution_in(
-        program,
-        time_slice,
-        sink,
-        exchange_bindings,
-        scan_bindings,
-        writer_bindings,
-        exchange_finst_id,
-        profiler,
-        pipeline_dop,
-        runtime_state,
-        event_sink,
-        &mut CompiledMetadataMode::Hosted(host),
-    )
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The compiled program and its Task capabilities are independent inputs"
-)]
-pub(crate) fn prepare_compiled_program_pipeline_execution_in<H: CompiledSchemaMetadataScope>(
-    program: Arc<novarocks_local_program::LocalProgram>,
-    time_slice: Duration,
-    sink: Box<dyn OperatorFactory>,
-    exchange_bindings: ExchangeBindings,
-    scan_bindings: ScanBindings,
-    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
-    exchange_finst_id: Option<(i64, i64)>,
-    profiler: Option<Profiler>,
-    pipeline_dop: i32,
-    runtime_state: Arc<RuntimeState>,
-    event_sink: Arc<dyn FragmentEventSink>,
-    metadata: &mut CompiledMetadataMode<'_, H>,
+    schema_preparation: Option<
+        &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
+    >,
 ) -> ExecutionResult<PreparedPipelineExecution> {
     for node_id in exchange_bindings.node_ids() {
         let binding = exchange_bindings
@@ -716,33 +682,18 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_in<H: CompiledSchemaMe
         .execution_runtime()
         .ok_or_else(|| "compiled program execution requires an execution runtime".to_string())?;
     let terminal_scan_ops = scan_bindings.terminal_ops();
-    let graph = match metadata {
-        CompiledMetadataMode::Direct => build_compiled_pipeline_graph(
-            &program,
-            exchange_bindings,
-            scan_bindings,
-            writer_bindings,
-            runtime_state.runtime_filter_session().cloned(),
-            DependencyManager::new(),
-            pipeline_dop,
-            root_sink_dop,
-            execution_runtime.function_set().clone(),
-            runtime_state.error_state(),
-        )?,
-        CompiledMetadataMode::Hosted(host) => build_compiled_pipeline_graph_with_metadata_host(
-            &program,
-            exchange_bindings,
-            scan_bindings,
-            writer_bindings,
-            runtime_state.runtime_filter_session().cloned(),
-            DependencyManager::new(),
-            pipeline_dop,
-            root_sink_dop,
-            execution_runtime.function_set().clone(),
-            runtime_state.error_state(),
-            *host,
-        )?,
-    };
+    let graph = build_compiled_pipeline_graph(
+        &program,
+        exchange_bindings,
+        scan_bindings,
+        writer_bindings,
+        runtime_state.runtime_filter_session().cloned(),
+        DependencyManager::new(),
+        pipeline_dop,
+        root_sink_dop,
+        execution_runtime.function_set().clone(),
+        runtime_state.error_state(),
+    )?;
     prepare_pipeline_execution_from_graph(
         graph,
         time_slice,
@@ -757,6 +708,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_in<H: CompiledSchemaMe
         None,
         event_sink,
         true,
+        schema_preparation,
     )
 }
 
@@ -778,6 +730,9 @@ fn prepare_pipeline_execution_from_graph(
     backend_num: Option<i32>,
     event_sink: Arc<dyn FragmentEventSink>,
     report_neutral: bool,
+    mut schema_preparation: Option<
+        &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
+    >,
 ) -> ExecutionResult<PreparedPipelineExecution> {
     let ctx = Arc::new(if report_neutral {
         FragmentContext::new_report_neutral(
@@ -815,7 +770,12 @@ fn prepare_pipeline_execution_from_graph(
         }
 
         let pipeline = Pipeline::new(pipeline_plan.id, factories, pipeline_plan.dop);
-        let drivers = pipeline.instantiate_drivers(&ctx)?;
+        let drivers = match schema_preparation.as_mut() {
+            Some(observer) => {
+                pipeline.instantiate_drivers_with_schema_preparation(&ctx, Some(*observer))?
+            }
+            None => pipeline.instantiate_drivers(&ctx)?,
+        };
         all_drivers.extend(drivers);
     }
 
@@ -1411,6 +1371,23 @@ mod tests {
         );
     }
 
+    fn created_fixture_schema(
+        schema: &Arc<Schema>,
+        slots: &[SlotId],
+        types: &[novarocks_functions::FunctionValueType],
+    ) -> ChunkSchemaRef {
+        let declared = crate::exec::chunk::typed_fixture::layout(Arc::clone(schema), slots, types);
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("executor complete fixture schema"),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        )
+        .expect("actual fixture schema host");
+        factory
+            .create_compiled_chunk_schema(&declared)
+            .expect("created fixture schema")
+    }
+
     #[test]
     fn cancelled_sleep_physically_joins_before_the_next_single_thread_pipeline() {
         use crate::exec::expr::LiteralValue;
@@ -1419,7 +1396,6 @@ mod tests {
         use crate::exec::node::ExternalSinkRequirement;
         use crate::exec::node::project::ProjectNode;
         use novarocks_local_program as lp;
-        use std::collections::BTreeMap;
         use std::num::NonZeroUsize;
 
         // This dedicated executor has exactly one physical execution thread.
@@ -1438,22 +1414,27 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1; 4096]))],
         )
         .unwrap();
-        let chunk =
-            Chunk::try_new_with_chunk_schema(batch, chunk_schema_of(&input_schema, &[slot]))
-                .unwrap();
+        let input_type = novarocks_functions::FunctionValueType::new(DataType::Int64, false);
+        let chunk = crate::exec::chunk::typed_fixture::chunk(batch, &[slot], &[input_type]);
+        // SLEEP's installed scalar declaration is nullable; it is not a member
+        // of the total-scalar family even when this literal is non-null.
+        let sleep_type = novarocks_functions::FunctionValueType::new(DataType::Boolean, true);
         let output_schema = Arc::new(Schema::new(vec![Field::new(
             "sleep",
             DataType::Boolean,
-            false,
+            true,
         )]));
         let mut arena = ExprArena::default();
-        let seconds = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(60)), DataType::Int64);
-        let sleep = arena.push_typed(
+        let seconds = arena.push_value_typed(
+            ExprNode::Literal(LiteralValue::Int64(60)),
+            novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+        );
+        let sleep = arena.push_value_typed(
             ExprNode::FunctionCall {
                 kind: FunctionKind::Object("sleep"),
                 args: vec![seconds],
             },
-            DataType::Boolean,
+            sleep_type.clone(),
         );
         let plan = ExecPlan {
             arena,
@@ -1469,38 +1450,39 @@ mod tests {
                     expr_slot_ids: vec![slot],
                     expr_slot_schemas: None,
                     output_indices: None,
-                    output_chunk_schema: chunk_schema_of(&output_schema, &[slot]),
+                    output_chunk_schema: created_fixture_schema(
+                        &output_schema,
+                        &[slot],
+                        &[sleep_type.clone()],
+                    ),
                 }),
             },
         };
-        let prepare = |plan: ExecPlan, schema: Arc<Schema>| {
-            let layout = lp::StaticLayout::try_new_exact(
-                schema,
-                Arc::from([slot]),
-                vec![(lp::StaticFieldSchema::new(None, vec![]), None)],
-            )
-            .unwrap();
+        let prepare = |plan: ExecPlan,
+                       schema: Arc<Schema>,
+                       output_type: novarocks_functions::FunctionValueType| {
+            let layout = crate::exec::chunk::typed_fixture::layout(schema, &[slot], &[output_type]);
             let profile = lp::CompileProfile::new(
                 NonZeroUsize::new(1).unwrap(),
                 None,
                 layout.identity().unwrap(),
                 lp::KernelAbiVersion::CURRENT,
             );
-            let (program, bindings) = plan
-                .into_local_program_and_bindings(
-                    profile,
-                    BTreeMap::new(),
-                    vec![ExternalSinkRequirement::Result],
-                    FragmentSinkProgram::Result.into_static().unwrap(),
-                )
-                .unwrap();
+            let (program, bindings) = crate::exec::chunk::typed_fixture::lower(
+                plan,
+                profile,
+                vec![ExternalSinkRequirement::Result],
+                FragmentSinkProgram::Result.into_static().unwrap(),
+            );
             let state = Arc::new(RuntimeState::new(
                 None,
                 None,
                 None,
                 None,
                 None,
-                None,
+                Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                    "cancellation pipeline actual construction",
+                )),
                 Some(Arc::clone(&runtime)),
             ));
             let output = ResultSinkHandle::new();
@@ -1523,7 +1505,7 @@ mod tests {
             .unwrap();
             (prepared, state, output)
         };
-        let (prepared, state, output) = prepare(plan, output_schema);
+        let (prepared, state, output) = prepare(plan, output_schema, sleep_type);
         let running = prepared.start();
         let deadline = Instant::now() + Duration::from_secs(2);
         while state.error_state().waiting_count() == 0 && Instant::now() < deadline {
@@ -1548,12 +1530,31 @@ mod tests {
             "cancelled expression must publish no partial chunk"
         );
 
-        let next = single_values_plan();
-        let schema = match &next.root.kind {
-            ExecNodeKind::Values(values) => values.chunk.batch.schema(),
-            _ => unreachable!(),
+        let next_type = novarocks_functions::FunctionValueType::new(DataType::Int32, false);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![7]))],
+        )
+        .unwrap();
+        let next = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::Values(ValuesNode {
+                    chunk: crate::exec::chunk::typed_fixture::chunk(
+                        batch,
+                        &[slot],
+                        &[next_type.clone()],
+                    ),
+                    node_id: 1,
+                }),
+            },
         };
-        let (prepared, _, output) = prepare(next, schema);
+        let (prepared, _, output) = prepare(next, schema, next_type);
         let running = prepared.start();
         let (tx, rx) = mpsc::channel();
         let join = std::thread::spawn(move || tx.send(running.join()).unwrap());
@@ -2804,6 +2805,8 @@ mod tests {
                             args: vec![v_expr],
                             return_type: DataType::Int64,
                             aggregate_binding: Some(WindowAggregateBinding {
+                                // Explicit legacy carrier fixture; this is not frozen-binding admission.
+                                frozen: None,
                                 function_name: "sum".to_string(),
                                 resolved:
                                     crate::exec::expr::agg::test_builtin_execution_function_set()
@@ -2902,21 +2905,58 @@ mod tests {
                 .expect("decimal state"),
         ) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![c1, sum_state]).expect("record batch");
-        let chunk = {
-            let batch = batch;
-            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &[SlotId::new(1), SlotId::new(2)],
-            )
-            .expect("chunk schema");
-            Chunk::new_with_chunk_schema(batch, chunk_schema)
-        };
-
+        let input_types = [
+            novarocks_functions::FunctionValueType::new(DataType::Int32, false),
+            novarocks_functions::FunctionValueType::new(DataType::Decimal128(38, 0), false),
+        ];
+        let chunk = crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[SlotId::new(1), SlotId::new(2)],
+            &input_types,
+        );
         let mut arena = ExprArena::default();
-        let c1_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let sum_expr = arena.push_typed(
-            ExprNode::SlotId(SlotId::new(2)),
-            DataType::Decimal128(38, 0),
+        let c1_expr =
+            arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), input_types[0].clone());
+        let sum_expr =
+            arena.push_value_typed(ExprNode::SlotId(SlotId::new(2)), input_types[1].clone());
+        let output_types = [
+            novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+            novarocks_functions::FunctionValueType::new(DataType::Int64, true),
+        ];
+
+        let function_set = crate::exec::expr::agg::test_builtin_execution_function_set();
+        let count = crate::exec::chunk::typed_fixture::frozen_aggregate(
+            function_set.catalog(),
+            "count",
+            &input_types[..1],
+        );
+        // The original SUM is over required INT32, while this occurrence reads
+        // its DECIMAL(38, 0) state. Do not resolve SUM over the state carrier.
+        let sum = crate::exec::chunk::typed_fixture::frozen_aggregate(
+            function_set.catalog(),
+            "sum",
+            &input_types[..1],
+        );
+        for (frozen, output) in [(&count, &output_types[0]), (&sum, &output_types[1])] {
+            assert_eq!(
+                frozen.selected().argument_types.as_ref(),
+                &[novarocks_functions::FunctionArgumentType::Value(
+                    input_types[0].clone()
+                )]
+            );
+            assert_eq!(
+                frozen.selected().result_type,
+                novarocks_functions::FunctionResultType::Scalar(output.clone())
+            );
+            assert_eq!(frozen.logical_argument_count(), 1);
+        }
+        assert_eq!(arena.value_type(c1_expr), Some(&input_types[0]));
+        assert_eq!(arena.value_type(sum_expr), Some(&input_types[1]));
+        // Required state rows fit the catalog's nullable SUM state without
+        // changing the input expression's complete declaration or its buffers.
+        assert_eq!(
+            sum.selected().aggregate.as_ref().unwrap().intermediate_type,
+            input_types[1].with_nullable(true).unwrap()
         );
 
         let plan = ExecPlan {
@@ -2930,6 +2970,7 @@ mod tests {
                     group_by: vec![],
                     functions: vec![
                         AggFunction {
+                            frozen: Some(count),
                             name: "count".to_string(),
                             inputs: vec![c1_expr],
                             input_is_intermediate: false,
@@ -2941,6 +2982,7 @@ mod tests {
                             ..Default::default()
                         },
                         AggFunction {
+                            frozen: Some(sum),
                             name: "sum".to_string(),
                             inputs: vec![sum_expr],
                             input_is_intermediate: true,
@@ -2964,12 +3006,13 @@ mod tests {
                     ],
                     need_finalize: true,
                     input_is_intermediate: false,
-                    output_chunk_schema: chunk_schema_of(
+                    output_chunk_schema: created_fixture_schema(
                         &Arc::new(Schema::new(vec![
-                            Field::new("k", DataType::Int32, true),
+                            Field::new("k", DataType::Int64, false),
                             Field::new("sum", DataType::Int64, true),
                         ])),
                         &[SlotId::new(3), SlotId::new(4)],
+                        &output_types,
                     ),
                     runtime_filter_spec: crate::exec::node::aggregate::AggregateRuntimeFilterSpec {
                         topn_producers: Vec::new(),
@@ -2980,7 +3023,17 @@ mod tests {
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = test_runtime_state();
+        let runtime_state = Arc::new(RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                "mixed merge/update aggregate actual construction",
+            )),
+            Some(test_execution_runtime()),
+        ));
         execute_native_plan_with_pipeline(
             plan,
             false,

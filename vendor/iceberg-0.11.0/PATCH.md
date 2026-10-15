@@ -72,25 +72,6 @@ No patches applied in the initial source commit.
 - Exit: IRU-6a removes this patch after the catalog storage boundary owns directory discovery without the SDK extension.
 - Coverage: existing connector Hadoop catalog discovery tests; V2 standalone core check. Old core has no dedicated directory-listing tests.
 
-## U2 — add-schema last-column-id
-
-- Purpose: preserve the optional REST `TableUpdate::AddSchema.last_column_id` field, including omitted-field serde behavior.
-- Files: `src/catalog/mod.rs`, `src/spec/table_metadata_builder.rs`, `src/transaction/update_schema.rs`.
-- Upstream status: no tracked upstream issue; rc.2 omits the high-watermark field.
-- Production dependency: FrozenRequest and authoritative staged-create initialization preserve catalog metadata high-watermarks.
-- Exit: IRU-13b removes this patch when the connector owns the REST update vocabulary.
-- Coverage: migrated `catalog::tests::test_add_schema` serde expectations for Some(3)/None; existing table metadata builder and update-schema tests adapted to the additive field.
-- Port adaptation: the new 0.11 SDK update-schema action emits `last_column_id: None`; its schema-match tests ignore the new field. No SDK mutation semantics changed.
-
-## P8 — authoritative staged-create initialization
-
-- Purpose: preserve `TableMetadata::staged_create_initialization_updates` verbatim from 0.9. It reconstructs initial updates solely from authoritative REST response metadata and rejects unrepresentable state.
-- Files: `src/spec/table_metadata.rs`.
-- Upstream status: no tracked upstream issue; rc.2 has no equivalent helper.
-- Production dependency: REST staged-create publication preserves UUID, location, IDs, format, properties, and high-watermarks supplied by the catalog; depends on U2.
-- Exit: IRU-13b removes this patch when the connector owns authoritative REST initialization.
-- Coverage: old core had no dedicated test. The old REST `catalog.rs:4383` test `test_staged_create_initialization_updates_preserve_v2_and_v3_format` and related authoritative staged-create tests are migrated by T3; existing connector staged-create tests cover consumption.
-
 ## U8 — physical Arrow writer schema override
 
 - Purpose: preserve the 0.9 `ParquetWriterBuilder::with_arrow_schema_override` API and the schema used for lazy Parquet writer initialization.
@@ -100,13 +81,3 @@ No patches applied in the initial source commit.
 - Exit: IRU-9 reviews and replaces the physical-layout boundary, then removes this patch.
 - Coverage: existing Parquet writer tests and connector writer tests; old core has no dedicated schema-override test.
 - Port adaptation: preserve rc.2 encryption-manager/key-metadata initialization while carrying the optional Arrow schema.
-
-## View API — catalog view boundary
-
-- Purpose: preserve the 0.9 Catalog view methods with default FeatureUnsupported results, public ViewCommit/ViewRequirement vocabulary, optional ViewCreation.location, and public ViewRepresentations constructor.
-- Files: `src/catalog/mod.rs`, `src/spec/{view_metadata_builder,view_metadata,view_version}.rs`.
-- Upstream status: no tracked upstream issue; rc.2 lacks Catalog view methods and commit vocabulary.
-- Production dependency: REST-backed view control operations; filesystem-backed view metadata construction explicitly rejects an absent location.
-- Exit: IRU-13b removes this patch when the connector owns the REST view protocol boundary.
-- Coverage: existing view metadata builder/serde tests (creation location adapted to Some), existing connector view tests, and the REST view tests migrated by T3.
-- Port adaptation: SessionCatalog remains upstream; Catalog public signatures are identical to the 0.9 patch.

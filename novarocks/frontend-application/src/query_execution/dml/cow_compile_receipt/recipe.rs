@@ -239,6 +239,19 @@ impl Recipe {
         TargetAccumulator::new(template, self.remaining_for_target()?)
     }
 
+    /// Actual new compact constant owners. Each caller observes its request
+    /// before construction against peak()+pending; original source B is not
+    /// charged by this contribution. The existing numeric profile is unchanged.
+    pub fn add_materialized_owned(&mut self, upper: u64) -> Result<()> {
+        self.all_targets_owned_metadata = add(self.all_targets_owned_metadata, upper)?;
+        self.check()
+    }
+
+    pub fn observe_materialized_transient(&mut self, upper: u64) -> Result<()> {
+        self.maximum_current_cell_transient = self.maximum_current_cell_transient.max(upper);
+        self.check()
+    }
+
     pub fn remaining_for_target(&self) -> Result<u64> {
         self.check()?;
         ORIGINAL_INTERNAL_PEAK

@@ -67,6 +67,7 @@ pub(crate) mod hive;
 pub(crate) mod hms_listing_observer;
 pub(crate) mod listing_admission;
 pub(crate) mod rest;
+pub(crate) mod view_request;
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -615,7 +616,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     async fn create_view(
         &self,
         namespace: CatalogNamespaceName,
-        _creation: crate::iceberg::ViewCreation,
+        _creation: view_request::ViewCreate,
     ) -> CatalogOutcome<CatalogTableName> {
         CatalogOutcome::unsupported(format!(
             "{} Iceberg catalog does not support views (namespace {})",
@@ -624,15 +625,15 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         ))
     }
 
-    /// Replace a view's definition; the commit freezes the view UUID.
+    /// Replace a view's definition; the replacement freezes the view UUID.
     async fn replace_view(
         &self,
-        commit: crate::iceberg::ViewCommit,
+        replace: view_request::ValidatedViewReplace,
     ) -> CatalogOutcome<CatalogTableName> {
         CatalogOutcome::unsupported(format!(
             "{} Iceberg catalog does not support views ({})",
             self.implementation_name(),
-            commit.identifier()
+            replace.ident()
         ))
     }
 
@@ -780,6 +781,15 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         &self,
         request: transaction::CreateTableTransactionRequest,
     ) -> CatalogTransactionStart;
+}
+
+/// The answer of a catalog that cannot hold views. It is given by the owner
+/// itself: no listing admission, no SDK call.
+pub(super) fn views_unsupported(operation: &str) -> ConnectorError {
+    ConnectorError::new(
+        novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+        format!("{operation} is not supported by this catalog"),
+    )
 }
 
 pub(crate) mod transaction;

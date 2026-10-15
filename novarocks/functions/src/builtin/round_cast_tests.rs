@@ -46,10 +46,12 @@ impl KernelEvaluationControl for Control {
     }
 }
 fn prepared(array: &ArrayRef, target: CastTarget) -> CastRecipe {
-    let source = FunctionValueType::new(array.data_type().clone(), true);
+    let source =
+        FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true);
     binding_control::scope(crate::binding_test_control(), |work| {
         binding_control::value_type(&source, work)?;
-        CastRecipe::prepare(&source, target, work)
+        // Raw Arrow recipe behavior is independent of installed Plain kernels.
+        CastRecipe::prepare_typed(array.data_type(), source.value_type(), target, work)
     })
     .unwrap()
 }

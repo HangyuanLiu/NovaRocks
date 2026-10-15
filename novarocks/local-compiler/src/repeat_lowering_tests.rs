@@ -270,7 +270,7 @@ fn fixture(
                 Case::BadReplacementType => FunctionValueType::new(DataType::Float64, true),
                 _ => {
                     let mut ty = items[source_index].1.clone();
-                    ty.nullable = true;
+                    ty = ty.with_nullable(true).unwrap();
                     ty
                 }
             };
@@ -450,10 +450,7 @@ fn repeat_nullable_replacement_preserves_nested_field_metadata_and_complete_chan
             panic!("actual nested source carrier");
         };
         assert_eq!(children[0].name(), "nested-source");
-        assert_eq!(
-            children[0].metadata().get("source-fidelity").unwrap(),
-            "kept-exact"
-        );
+        assert!(children[0].metadata().is_empty());
         assert!(children[0].is_nullable());
         assert!(field.is_nullable());
         let expected = &source.package.fragment().values()[&source.package.fragment().nodes()
@@ -646,17 +643,21 @@ fn repeat_static_gates_refuse_empty_sets_noninteger_grouping_and_nullable_source
         ),
         (
             Case::BadGroupingCarrier,
-            "Repeat complete value types differ",
+            "GROUPING output must be required physical Int64",
         ),
         (
             Case::BadGroupingNullable,
-            "Repeat complete value types differ",
+            "GROUPING output must be required physical Int64",
         ),
     ] {
         let source =
             fixture(2, 4, false, case).expect("complete valid source reaches compiler gate");
-        assert!(matches!(compile(&source, &functions, &Control),
-            Err(FragmentCompileError::Invalid(actual)) if actual == expected));
+        let result = compile(&source, &functions, &Control);
+        assert!(
+            matches!(&result,
+            Err(FragmentCompileError::Invalid(actual)) if *actual == expected),
+            "expected {expected}, actual {result:?}"
+        );
     }
     for case in [Case::BadReplacementNullable, Case::BadReplacementType] {
         let error = match fixture(2, 4, false, case) {

@@ -52,8 +52,13 @@ fn source() -> (SchemaMetadataMaterializations, Arc<Field>) {
         .into_shared();
     let child_ref = child.field().clone();
     let namespace = MaterializedFieldNamespace::from_original_loans(Arc::from([child.loan()]));
-    let ty = FunctionValueType::new(DataType::Struct(vec![child_ref.clone()].into()), false);
-    let root = materialize_value_field(&ty, "payload").unwrap();
+    // Provider metadata belongs to its actual source Field, independently of
+    // the normalized execution value layout used by FunctionValueType.
+    let root = MaterializedMetadataMap::new_for_original_reserve().into_field(Field::new(
+        "payload",
+        DataType::Struct(vec![child_ref.clone()].into()),
+        false,
+    ));
     (
         TypedSchemaMaterializations::new(vec![root], namespace).into_original_schema(),
         child_ref,
@@ -491,17 +496,17 @@ impl From<novarocks_type_contract::ControlResourceError> for KernelCloneProbeErr
 }
 
 #[test]
-fn by_schema_origin_semantic_child_clone_requests_follow_original_owned_vecs() {
-    let value = ChunkFieldSchema::new(
-        Some(LogicalType::Json),
-        vec![
-            ChunkFieldSchema::empty(),
-            ChunkFieldSchema::new(
-                None,
-                vec![ChunkFieldSchema::empty(), ChunkFieldSchema::empty()],
-            ),
-        ],
-    );
+fn by_schema_origin_semantic_clone_shares_immutable_storage_without_requests() {
+    use novarocks_type_contract::{ValueKind, ValueTypeRef, ValueTypeStorageLifetime};
+    let item =
+        ValueTypeRef::try_new(ValueKind::String, true, ValueTypeStorageLifetime::pure()).unwrap();
+    let tree = ValueTypeRef::try_new(
+        ValueKind::List(item),
+        true,
+        ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    let value = ChunkFieldSchema::from_value_type(tree);
     let mut visits = 0;
     let facts = value
         .original_clone_request_observed::<CloneProbeError>(&mut || {
@@ -509,24 +514,21 @@ fn by_schema_origin_semantic_child_clone_requests_follow_original_owned_vecs() {
             Ok(())
         })
         .unwrap();
-    assert_eq!(visits, 5);
-    assert_eq!(facts.allocation_requests, 2);
-    assert_eq!(
-        facts.request_bytes,
-        4 * std::mem::size_of::<ChunkFieldSchema>()
+    assert_eq!(visits, 1);
+    assert_eq!(facts.allocation_requests, 0);
+    assert_eq!(facts.request_bytes, 0);
+    assert!(
+        value
+            .value_type()
+            .shares_storage(value.clone().value_type())
     );
-    assert_eq!(value.clone(), value);
     let mut calls = 0;
     let refused = value.original_clone_request_observed::<CloneProbeError>(&mut || {
         calls += 1;
-        if calls == 3 {
-            Err(CloneProbeError::Refused)
-        } else {
-            Ok(())
-        }
+        Err(CloneProbeError::Refused)
     });
     assert_eq!(refused, Err(CloneProbeError::Refused));
-    assert_eq!(calls, 3);
+    assert_eq!(calls, 1);
 }
 
 #[test]
@@ -783,7 +785,7 @@ fn project_original_metadata_materialization_survives_actual_output_and_nullable
         );
         assert_eq!(
             schema.field(0).unwrap().is_nullable(),
-            output.batch.column(0).null_count() > 0
+            output.record_batch().column(0).null_count() > 0
         );
         assert!(borrowed_root_chunk_storage(&output, limits).is_ok());
     }

@@ -187,21 +187,21 @@ fn receiving_headers_borrow_all_kinds_original_arguments_results_and_complete_ty
         assert_eq!(original.arguments.len(), 2);
     }
     assert_eq!(
-        types.value_type(u32::MAX).unwrap().logical_type,
+        types.value_type(u32::MAX).unwrap().logical_type(),
         ValueLogicalType::Json
     );
-    assert!(types.value_type(u32::MAX).unwrap().nullable);
-    assert_eq!(types.value_type(0).unwrap().data_type, DataType::Int64);
-    assert!(!types.value_type(0).unwrap().nullable);
-    let DataType::Struct(fields) = &token.type_table().value_type(7).unwrap().data_type else {
+    assert!(types.value_type(u32::MAX).unwrap().nullable());
+    assert_eq!(types.value_type(0).unwrap().data_type(), &DataType::Int64);
+    assert!(!types.value_type(0).unwrap().nullable());
+    let DataType::Struct(fields) = &token.type_table().value_type(7).unwrap().data_type() else {
         panic!("not original Struct")
     };
     assert_eq!(fields[0].name(), "actual_child");
-    assert_eq!(fields[0].metadata()["author"], "original");
+    assert!(fields[0].metadata().is_empty());
     #[allow(deprecated)]
     {
-        assert_eq!(fields[0].dict_id(), Some(i64::MIN));
-        assert_eq!(fields[0].dict_is_ordered(), Some(true));
+        assert_eq!(fields[0].dict_id(), None);
+        assert_eq!(fields[0].dict_is_ordered(), None);
     }
     assert!(std::ptr::eq(
         token.type_table().value_type(7).unwrap(),

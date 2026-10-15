@@ -566,7 +566,10 @@ fn scalar_requests_legacy_effect_fields_do_not_author_effects_and_real_owner_rej
     let ExprKind::FunctionCall { function, .. } = &mut wrong.kind else {
         unreachable!()
     };
-    function.argument_types = Box::from([FunctionArgumentType::Value(ty(DataType::Int64, true))]);
+    function.argument_types =
+        novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+            FunctionArgumentType::Value(ty(DataType::Int64, true)),
+        ]));
     let authored = invoke(
         &wrong,
         &expressions,
@@ -689,6 +692,25 @@ fn scalar_requests_reject_wrong_kind_shape_missing_argument_and_excess_before_ex
     }
 }
 
+fn declared_json_list(nullable: bool, child_nullable: bool) -> FunctionValueType {
+    let child = FunctionValueType::try_with_logical_type(
+        DataType::Utf8,
+        child_nullable,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    let layout = FunctionValueType::new(
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, child_nullable))),
+        nullable,
+    );
+    let value = novarocks_type_contract::ValueTypeRef::try_new(
+        novarocks_type_contract::ValueKind::List(child.value_type().clone()),
+        nullable,
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    FunctionValueType::try_from_value(value, layout.typed_binding().layout().clone()).unwrap()
+}
 #[test]
 fn scalar_requests_lambda_preserves_full_static_signature_and_observes_actual_parameter_quantum() {
     let catalog = build_builtin_engine_function_catalog().unwrap();
@@ -698,7 +720,11 @@ fn scalar_requests_lambda_preserves_full_static_signature_and_observes_actual_pa
             ("provider.id".into(), "71".into()),
         ]),
     ));
-    let parameter = ty(DataType::List(item.clone()), true);
+    let parameter = declared_json_list(true, true);
+    let DataType::List(original_layout) = parameter.data_type() else {
+        unreachable!()
+    };
+    let original_layout = original_layout.clone();
     let result =
         FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
             .unwrap();
@@ -719,10 +745,15 @@ fn scalar_requests_lambda_preserves_full_static_signature_and_observes_actual_pa
             },
         )]);
         let mut function = binding(&catalog, "lower", &[ty(DataType::Utf8, true)]);
-        function.argument_types = Box::from([FunctionArgumentType::Lambda {
-            parameter_types: parameters.clone().into_boxed_slice(),
-            result_type: result.clone(),
-        }]);
+        function.argument_types =
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                FunctionArgumentType::Lambda {
+                    parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        parameters.clone().into_boxed_slice(),
+                    ),
+                    result_type: result.clone(),
+                },
+            ]));
         let source = call(function, &[u32::MAX]);
         let pools = ConstantPools::empty();
         let authored = invoke(&source, &expressions, &pools, &Control::default()).unwrap();
@@ -735,10 +766,16 @@ fn scalar_requests_lambda_preserves_full_static_signature_and_observes_actual_pa
         };
         assert_eq!(parameter_types.as_ref(), parameters.as_slice());
         assert_eq!(result_type, &result);
-        let DataType::List(actual) = &parameter_types[1].data_type else {
+        let DataType::List(actual) = &parameter_types[1].data_type() else {
             unreachable!()
         };
-        assert!(Arc::ptr_eq(actual, &item));
+        assert!(Arc::ptr_eq(&actual, &original_layout));
+        assert!(actual.metadata().is_empty());
+        assert_eq!(
+            parameter_types[1].child_at(0).unwrap().logical_type(),
+            ValueLogicalType::Json
+        );
+        assert_eq!(item.metadata()["provider.id"], "71");
         assert_eq!(
             authored.selected.argument_types[0],
             authored.request().arguments[0].argument_type()
@@ -892,7 +929,9 @@ fn scalar_requests_wide_actual_values_and_exact_4096_boundary_preserve_count_and
     let ExprKind::FunctionCall { function, args } = &mut boundary.kind else {
         unreachable!()
     };
-    function.argument_types = vec![FunctionArgumentType::Value(text); 4096].into_boxed_slice();
+    function.argument_types = novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+        vec![FunctionArgumentType::Value(text); 4096].into_boxed_slice(),
+    );
     *args = vec![ExprId::new(319); 4096].into_boxed_slice();
     let authored = invoke(&boundary, &expressions, &pools, &Control::default()).unwrap();
     assert_eq!(authored.request().logical_argument_count, 4096);

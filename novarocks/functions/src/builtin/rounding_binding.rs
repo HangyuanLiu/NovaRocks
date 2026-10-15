@@ -23,7 +23,7 @@ use super::binding_control;
 use crate::{FunctionArgument, FunctionBindingError, FunctionBindingRequest, FunctionValueType};
 use arrow_schema::{DataType, Field, UnionFields};
 use novarocks_type_contract::{
-    CompileCheckpoints, MAX_VALUE_TYPE_DEPTH, ValueLogicalType, field_logical_type,
+    CompileCheckpoints, MAX_VALUE_TYPE_DEPTH, ValueLogicalType, ValueTypeRef,
 };
 
 /// A cast can select a nominal path even though its carrier is castable.
@@ -68,13 +68,8 @@ impl CastTarget {
     }
 }
 
-fn nominal_field(field: &Field) -> Result<ValueLogicalType, FunctionBindingError> {
-    // The shared observed preflight has already validated the full metadata.
-    field_logical_type(field)
-        .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))
-}
-fn mark(capability: CastCapability, logical: ValueLogicalType) -> CastCapability {
-    if capability != CastCapability::Unavailable && logical != ValueLogicalType::Physical {
+fn mark(capability: CastCapability, semantic: &ValueTypeRef) -> CastCapability {
+    if capability != CastCapability::Unavailable && semantic.domain().is_some() {
         CastCapability::NonPhysical
     } else {
         capability
@@ -82,47 +77,46 @@ fn mark(capability: CastCapability, logical: ValueLogicalType) -> CastCapability
 }
 fn field_probe(
     field: &Field,
+    semantic: &ValueTypeRef,
     target: CastTarget,
     depth: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<CastCapability, FunctionBindingError> {
     work.step()?;
-    cast_capability(
-        field.data_type(),
-        nominal_field(field)?,
-        target,
-        depth,
-        work,
-    )
+    cast_capability_typed(field.data_type(), semantic, target, depth, work)
 }
 
 /// The single Union-path author for binding and immutable cast recipes.
 /// `child_depth` is the depth of each field, including nested encoded fields.
 /// The result borrows the selected field and reports nominal identity after
 /// Arrow's carrier choice; nominal identity never chooses another sibling.
-pub(super) fn select_union_cast_field<'a>(
+pub(super) fn select_union_cast_field_typed<'a, 's>(
     fields: &'a UnionFields,
+    semantic: &'s ValueTypeRef,
     target: CastTarget,
     child_depth: usize,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Option<(i8, &'a Field, CastCapability)>, FunctionBindingError> {
+) -> Result<Option<(i8, &'a Field, &'s ValueTypeRef, CastCapability)>, FunctionBindingError> {
     // Arrow iterates declaration order, including non-monotonic type IDs.
     for pass in 0..3 {
         work.step()?;
-        for (type_id, field) in fields.iter() {
+        for (index, (type_id, field)) in fields.iter().enumerate() {
+            let child = semantic.child_type_at(index).ok_or_else(|| {
+                FunctionBindingError::InvalidBinding("union semantic child is absent".into())
+            })?;
             work.step()?;
             let capability = match pass {
                 0 if target.exact(field.data_type()) => {
-                    field_probe(field, target, child_depth, work)?
+                    field_probe(field, child, target, child_depth, work)?
                 }
                 1 if target.same_family(field.data_type()) => {
-                    field_probe(field, target, child_depth, work)?
+                    field_probe(field, child, target, child_depth, work)?
                 }
-                2 => field_probe(field, target, child_depth, work)?,
+                2 => field_probe(field, child, target, child_depth, work)?,
                 _ => CastCapability::Unavailable,
             };
             if capability != CastCapability::Unavailable {
-                return Ok(Some((type_id, field, capability)));
+                return Ok(Some((type_id, field, child, capability)));
             }
         }
     }
@@ -132,9 +126,9 @@ pub(super) fn select_union_cast_field<'a>(
 /// Mirrors Arrow's scalar cast-path choice, ignoring nominal metadata while
 /// choosing a child, then retaining the selected path's logical identity.
 /// The caller must first run the shared observed full-type preflight.
-pub(super) fn cast_capability(
+pub(super) fn cast_capability_typed(
     source: &DataType,
-    logical: ValueLogicalType,
+    semantic: &ValueTypeRef,
     target: CastTarget,
     depth: usize,
     work: &mut CompileCheckpoints<'_>,
@@ -145,12 +139,24 @@ pub(super) fn cast_capability(
     }
     let capability = match source {
         DataType::Dictionary(_, value) => {
-            cast_capability(value, ValueLogicalType::Physical, target, depth + 1, work)?
+            cast_capability_typed(value, semantic, target, depth + 1, work)?
         }
-        DataType::RunEndEncoded(_, value) => field_probe(value, target, depth + 1, work)?,
-        DataType::FixedSizeList(value, 1) => field_probe(value, target, depth + 1, work)?,
-        DataType::Union(fields, _) => select_union_cast_field(fields, target, depth + 1, work)?
-            .map_or(CastCapability::Unavailable, |(_, _, capability)| capability),
+        DataType::RunEndEncoded(_, value) => field_probe(value, semantic, target, depth + 1, work)?,
+        DataType::FixedSizeList(value, 1) => field_probe(
+            value,
+            semantic
+                .child_type_at(0)
+                .ok_or(FunctionBindingError::NoMatchingOverload)?,
+            target,
+            depth + 1,
+            work,
+        )?,
+        DataType::Union(fields, _) => {
+            select_union_cast_field_typed(fields, semantic, target, depth + 1, work)?
+                .map_or(CastCapability::Unavailable, |(_, _, _, capability)| {
+                    capability
+                })
+        }
         // No recursive Arrow probe or nominal carrier inference for containers.
         DataType::List(_)
         | DataType::LargeList(_)
@@ -169,7 +175,39 @@ pub(super) fn cast_capability(
             }
         }
     };
-    Ok(mark(capability, logical))
+    Ok(mark(capability, semantic))
+}
+
+#[cfg(test)]
+fn cast_capability(
+    source: &DataType,
+    logical: ValueLogicalType,
+    target: CastTarget,
+    depth: usize,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<CastCapability, FunctionBindingError> {
+    let value =
+        FunctionValueType::try_from_legacy_declared_projection(source.clone(), true, logical)
+            .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
+    cast_capability_typed(source, value.value_type(), target, depth, work)
+}
+#[cfg(test)]
+fn select_union_cast_field<'a>(
+    fields: &'a UnionFields,
+    target: CastTarget,
+    depth: usize,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<(i8, &'a Field, CastCapability)>, FunctionBindingError> {
+    let value = FunctionValueType::try_from_legacy_declared_projection(
+        DataType::Union(fields.clone(), arrow_schema::UnionMode::Sparse),
+        true,
+        ValueLogicalType::Physical,
+    )
+    .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
+    Ok(
+        select_union_cast_field_typed(fields, value.value_type(), target, depth, work)?
+            .map(|(id, field, _, capability)| (id, field, capability)),
+    )
 }
 
 fn truncate_input(source: &DataType) -> bool {
@@ -191,8 +229,17 @@ pub(super) fn bind_result(
     request: FunctionBindingRequest<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<FunctionValueType, FunctionBindingError> {
+    bind_result_with_creation::<std::convert::Infallible>(name, request, work, None)
+        .map_err(crate::FunctionBindingCreationFailure::into_pure)
+}
+pub(super) fn bind_result_with_creation<H>(
+    name: &str,
+    request: FunctionBindingRequest<'_>,
+    work: &mut CompileCheckpoints<'_>,
+    creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<FunctionValueType, crate::FunctionBindingCreationFailure<H>> {
     if !matches!(name, "round" | "truncate") {
-        return Err(FunctionBindingError::UnknownFunction);
+        return Err(FunctionBindingError::UnknownFunction.into());
     }
     if !(1..=2).contains(&request.arguments.len())
         || request.logical_argument_count != request.arguments.len()
@@ -201,7 +248,7 @@ pub(super) fn bind_result(
             .iter()
             .any(|arg| !matches!(arg, FunctionArgument::Value { .. }))
     {
-        return Err(FunctionBindingError::NoMatchingOverload);
+        return Err(FunctionBindingError::NoMatchingOverload.into());
     }
     super::catalogue::request_types_with_constants(request, work)?;
     let value = |index: usize| match &request.arguments[index] {
@@ -211,19 +258,19 @@ pub(super) fn bind_result(
     for (index, argument) in request.arguments.iter().enumerate() {
         work.step()?;
         let FunctionArgument::Value { value_type, .. } = argument else {
-            return Err(FunctionBindingError::NoMatchingOverload);
+            return Err(FunctionBindingError::NoMatchingOverload.into());
         };
-        if value_type.logical_type != ValueLogicalType::Physical {
-            return Err(FunctionBindingError::NoMatchingOverload);
+        if value_type.logical_type() != ValueLogicalType::Physical {
+            return Err(FunctionBindingError::NoMatchingOverload.into());
         }
         let accepted = if name == "truncate" {
-            truncate_input(&value_type.data_type)
-        } else if index == 0 && matches!(value_type.data_type, DataType::Decimal128(_, _)) {
+            truncate_input(value_type.data_type())
+        } else if index == 0 && matches!(value_type.data_type(), DataType::Decimal128(_, _)) {
             true
         } else {
-            cast_capability(
-                &value_type.data_type,
-                value_type.logical_type,
+            cast_capability_typed(
+                value_type.data_type(),
+                value_type.value_type(),
                 if index == 0 {
                     CastTarget::Float64
                 } else {
@@ -234,20 +281,22 @@ pub(super) fn bind_result(
             )? == CastCapability::Physical
         };
         if !accepted {
-            return Err(FunctionBindingError::NoMatchingOverload);
+            return Err(FunctionBindingError::NoMatchingOverload.into());
         }
     }
-    let result = match &value(0).data_type {
+    let result = match &value(0).data_type() {
         DataType::Decimal128(_, scale) => {
             let scale = if request.arguments.len() == 2 {
                 let digits = if let Some(value) =
                     super::catalogue::constant_source(request.arguments.get(1), work)?
                 {
                     work.flush()?;
-                    value.signed_integer_observed(
-                        novarocks_type_contract::CompilePhase::FunctionSpecialization,
-                        work.control(),
-                    )?
+                    value
+                        .signed_integer_observed(
+                            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+                            work.control(),
+                        )
+                        .map_err(FunctionBindingError::from)?
                 } else {
                     None
                 };
@@ -261,7 +310,9 @@ pub(super) fn bind_result(
         _ => DataType::Int64,
     };
     work.step()?;
-    Ok(FunctionValueType::new(result, true))
+    super::scalar_construction::with_binding_creation(creation, work, |cx| {
+        cx.value(result, true, ValueLogicalType::Physical)
+    })
 }
 
 #[cfg(test)]
@@ -296,7 +347,7 @@ mod tests {
     }
     fn arg(ty: DataType) -> FunctionArgument {
         FunctionArgument::Value {
-            value_type: FunctionValueType::new(ty, true),
+            value_type: FunctionValueType::from_legacy_declared_projection(ty, true),
             constant: None,
         }
     }
@@ -329,7 +380,10 @@ mod tests {
     }
     fn probe(source: &DataType, target: CastTarget) -> CastCapability {
         binding_control::scope(crate::binding_test_control(), |work| {
-            binding_control::value_type(&FunctionValueType::new(source.clone(), true), work)?;
+            binding_control::value_type(
+                &FunctionValueType::from_legacy_declared_projection(source.clone(), true),
+                work,
+            )?;
             cast_capability(source, ValueLogicalType::Physical, target, 1, work)
         })
         .unwrap()
@@ -363,7 +417,7 @@ mod tests {
             let (tag, chosen, capability) =
                 binding_control::scope(crate::binding_test_control(), |work| {
                     binding_control::value_type(
-                        &FunctionValueType::new(source.clone(), true),
+                        &FunctionValueType::from_legacy_declared_projection(source.clone(), true),
                         work,
                     )?;
                     select_union_cast_field(fields, target, 2, work)
@@ -385,7 +439,10 @@ mod tests {
         };
         let (tag, chosen, capability) =
             binding_control::scope(crate::binding_test_control(), |work| {
-                binding_control::value_type(&FunctionValueType::new(source.clone(), true), work)?;
+                binding_control::value_type(
+                    &FunctionValueType::from_legacy_declared_projection(source.clone(), true),
+                    work,
+                )?;
                 select_union_cast_field(fields, CastTarget::Float64, 2, work)
             })
             .unwrap()
@@ -406,7 +463,10 @@ mod tests {
             unreachable!()
         };
         let choice = binding_control::scope(crate::binding_test_control(), |work| {
-            binding_control::value_type(&FunctionValueType::new(source.clone(), true), work)?;
+            binding_control::value_type(
+                &FunctionValueType::from_legacy_declared_projection(source.clone(), true),
+                work,
+            )?;
             select_union_cast_field(fields, CastTarget::Int64, 2, work)
         })
         .unwrap();
@@ -467,7 +527,7 @@ mod tests {
                 "{ty:?}"
             );
             if let Ok(result) = result {
-                assert!(result.nullable);
+                assert!(result.nullable());
             }
         }
     }
@@ -492,11 +552,13 @@ mod tests {
             DataType::Float16,
             DataType::Utf8,
             DataType::Decimal256(76, 3),
-            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Float64)),
         ] {
             assert!(bind("truncate", &[arg(ty.clone())]).is_err());
             assert!(bind("truncate", &[arg(DataType::Float64), arg(ty)]).is_err());
         }
+        let encoded_projection =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Float64));
+        assert!(bind("truncate", &[arg(encoded_projection)]).is_ok());
     }
     #[test]
     fn decimal_result_literal_scale_is_original_recipe_not_expected_override() {
@@ -529,7 +591,8 @@ mod tests {
             assert_eq!(
                 bind(name, &[arg(DataType::Decimal128(12, -2))])
                     .unwrap()
-                    .data_type,
+                    .data_type()
+                    .clone(),
                 DataType::Decimal128(38, -2)
             );
             assert_eq!(
@@ -538,7 +601,8 @@ mod tests {
                     &[arg(DataType::Decimal128(12, 5)), arg(DataType::Int64)]
                 )
                 .unwrap()
-                .data_type,
+                .data_type()
+                .clone(),
                 DataType::Decimal128(38, 5)
             );
             assert_eq!(
@@ -557,7 +621,9 @@ mod tests {
             vec![],
             vec![arg(DataType::Int64); 3],
             vec![FunctionArgument::Lambda {
-                parameter_types: Box::default(),
+                parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                    Box::default(),
+                ),
                 result_type: FunctionValueType::new(DataType::Float64, true),
             }],
         ] {
@@ -583,20 +649,29 @@ mod tests {
     }
     #[test]
     fn encoded_cast_paths_are_recursive_without_changing_outer_result_recipe() {
-        for ty in [
-            DataType::Dictionary(
-                Box::new(DataType::Int32),
-                Box::new(DataType::Decimal128(18, 2)),
+        for (ty, expected) in [
+            (
+                DataType::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(DataType::Decimal128(18, 2)),
+                ),
+                DataType::Decimal128(38, 2),
             ),
-            DataType::RunEndEncoded(
-                Arc::new(Field::new("ends", DataType::Int32, false)),
-                Arc::new(Field::new("values", DataType::Float64, true)),
+            (
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("ends", DataType::Int32, false)),
+                    Arc::new(Field::new("values", DataType::Float64, true)),
+                ),
+                DataType::Int64,
             ),
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 1),
+            (
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 1),
+                DataType::Int64,
+            ),
         ] {
             assert_eq!(
                 bind("round", &[arg(ty)]).unwrap(),
-                FunctionValueType::new(DataType::Int64, true)
+                FunctionValueType::new(expected, true)
             );
         }
         let unsupported =
@@ -668,22 +743,20 @@ mod tests {
         let field = Field::new("bad", DataType::Float64, true)
             .with_metadata(HashMap::from([("nr_logical_type".into(), "Json".into())]));
         let source = DataType::FixedSizeList(Arc::new(field), 1);
-        assert!(bind("round", &[arg(source)]).is_err());
-        let args = [arg(DataType::Int64)];
-        let expected = FunctionValueType {
-            data_type: DataType::Float64,
-            nullable: true,
-            logical_type: ValueLogicalType::Json,
-        };
         assert!(
-            binding_control::scope(crate::binding_test_control(), |work| bind_result(
-                "round",
-                FunctionBindingRequest {
-                    expected_result_type: Some(&expected),
-                    ..request(&args)
-                },
-                work
-            ))
+            FunctionValueType::try_from_legacy_declared_projection(
+                source,
+                true,
+                ValueLogicalType::Physical
+            )
+            .is_err()
+        );
+        assert!(
+            FunctionValueType::try_with_logical_type(
+                DataType::Float64,
+                true,
+                ValueLogicalType::Json,
+            )
             .is_err()
         );
     }

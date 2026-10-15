@@ -358,7 +358,7 @@ fn every_actual_small_success_and_ordinary_caller_tail_preserves_first_cause() {
     let good = Input::array(Arc::new(Int64Array::from(vec![1, 2])), false);
     prefixes(&good, policy(), false);
     let mut bad = Input::array(Arc::new(Int64Array::from(vec![1, 2])), true);
-    bad.ty.nullable = false;
+    bad.ty = bad.ty.with_nullable(false).unwrap();
     let plain = bad.plain(&Control::new(None), policy()).unwrap_err();
     assert_eq!(
         plain,
@@ -544,7 +544,7 @@ fn captured_nested_struct_and_dictionary_metric_requests_precede_late_control() 
             .size();
         let control = Control::new(None);
         let mut work = CompileCheckpoints::try_new(&control, PHASE).unwrap();
-        let plain = scan_child(
+        let plain = scan_child::<ConstantError>(
             &input.data,
             2,
             0,
@@ -562,7 +562,7 @@ fn captured_nested_struct_and_dictionary_metric_requests_precede_late_control() 
             last = *facts;
             Ok(())
         };
-        let actual = scan_child(
+        let actual = scan_child::<ConstantError>(
             &input.data,
             2,
             0,
@@ -584,18 +584,19 @@ fn captured_nested_struct_and_dictionary_metric_requests_precede_late_control() 
                     for _ in 0..pending {
                         work.step().unwrap();
                     }
-                    let mut admit = |facts: &ConstantOwnerResourceFacts| {
-                        let exceeded = if axis == 0 {
-                            facts.allocation_requests_upper_bound > 0
-                        } else {
-                            facts.allocation_request_bytes_upper_bound > expected_request - 1
+                    let mut admit =
+                        |facts: &ConstantOwnerResourceFacts| -> Result<(), ConstantError> {
+                            let exceeded = if axis == 0 {
+                                facts.allocation_requests_upper_bound > 0
+                            } else {
+                                facts.allocation_request_bytes_upper_bound > expected_request - 1
+                            };
+                            if exceeded {
+                                Err(CompileControlError::ResourceExhausted.into())
+                            } else {
+                                Ok(())
+                            }
                         };
-                        if exceeded {
-                            Err(CompileControlError::ResourceExhausted)
-                        } else {
-                            Ok(())
-                        }
-                    };
                     let result = scan_child(
                         &input.data,
                         2,
@@ -616,4 +617,119 @@ fn captured_nested_struct_and_dictionary_metric_requests_precede_late_control() 
             }
         }
     }
+}
+
+#[test]
+fn actual_nested_unknown_source_attributes_are_retained_counted_and_never_semantic_authors() {
+    use novarocks_type_contract::{
+        ValueField, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    let attributes = HashMap::from([
+        (
+            novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
+            "provider.unknown.future-type".into(),
+        ),
+        ("provider.large.fact".into(), "x".repeat(2049)),
+    ]);
+    let child =
+        Arc::new(Field::new("payload", DataType::Utf8, false).with_metadata(attributes.clone()));
+    let array: ArrayRef = Arc::new(StructArray::new(
+        vec![child].into(),
+        vec![Arc::new(arrow_array::StringArray::from(vec![
+            "{}",
+            "{\"a\":1}",
+        ]))],
+        None,
+    ));
+    let field =
+        Arc::new(Field::new("source", array.data_type().clone(), false).with_metadata(attributes));
+    let child_type =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+            .unwrap();
+    let storage = ValueTypeStorageLifetime::pure();
+    let semantic = ValueTypeRef::try_new(
+        ValueKind::Struct(
+            vec![ValueField::new(
+                "payload",
+                child_type.value_type().clone(),
+                storage.clone(),
+            )]
+            .into(),
+        ),
+        false,
+        storage.clone(),
+    )
+    .unwrap();
+    let binding = FunctionValueType::try_from_value(
+        semantic,
+        ValueLayout::try_new(field.data_type(), storage).unwrap(),
+    )
+    .unwrap();
+    let input = Input {
+        field,
+        ty: binding,
+        data: array.to_data(),
+    };
+    let plain = input.plain(&Control::new(None), policy()).unwrap();
+    let mut snapshots = Vec::new();
+    let parent = input
+        .parent(&Control::new(None), policy(), &mut snapshots)
+        .unwrap();
+    assert_eq!(plain.resource_facts(), parent.resource_facts());
+    assert!(Arc::ptr_eq(parent.field_ref(), &input.field));
+    let source_bytes = |field: &Field| {
+        field.name().len() as u64
+            + field
+                .metadata()
+                .iter()
+                .map(|(key, value)| (key.len() + value.len()) as u64)
+                .sum::<u64>()
+    };
+    let root_bytes = source_bytes(&input.field);
+    let DataType::Struct(fields) = input.field.data_type() else {
+        panic!()
+    };
+    let child_bytes = source_bytes(&fields[0]);
+    assert_eq!(
+        parent.resource_facts().metadata_bytes,
+        root_bytes + child_bytes
+    );
+    assert!(child_bytes > 2048);
+    assert!(
+        snapshots.last().unwrap().cumulative_work_upper_bound
+            >= ConstantPool::type_validation_scratch_work_upper_bound()
+    );
+    assert_eq!(
+        parent.value_type().value_type().child_type_at(0).unwrap(),
+        child_type.value_type()
+    );
+    prefixes(&input, policy(), false);
+    let capped = ConstantPolicy {
+        max_metadata_bytes: root_bytes + child_bytes - 1,
+        ..policy()
+    };
+    assert!(matches!(
+        input.plain(&Control::new(None), capped),
+        Err(ConstantError::Limit(_))
+    ));
+    prefixes(&input, capped, true);
+    // The same physical source can be independently declared as plain text;
+    // that complete semantic declaration never equals this JSON descendant.
+    let physical_type = FunctionValueType::new(input.field.data_type().clone(), false);
+    let physical = ConstantPool::try_new(
+        input.field.clone(),
+        physical_type,
+        input.data.clone(),
+        policy(),
+        PHASE,
+        &Control::new(None),
+    )
+    .unwrap();
+    assert!(
+        !parent
+            .value(0)
+            .unwrap()
+            .equals_observed(&physical.value(0).unwrap(), PHASE, &Control::new(None))
+            .unwrap()
+    );
 }

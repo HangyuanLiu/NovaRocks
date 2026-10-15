@@ -450,14 +450,14 @@ impl PreparedCastRecipe {
                 validate_type_observed(ty, &mut work).map_err(CastPrepareError::Kernel)?;
             }
             if operation == CastOperation::Carrier
-                && source.logical_type == ValueLogicalType::Physical
-                && result.logical_type == ValueLogicalType::Physical
-                && source.data_type == DataType::Float64
-                && let DataType::Decimal128(precision, scale) = result.data_type
+                && source.logical_type() == ValueLogicalType::Physical
+                && result.logical_type() == ValueLogicalType::Physical
+                && source.data_type() == &DataType::Float64
+                && let DataType::Decimal128(precision, scale) = result.data_type()
             {
                 // Original successful NULLs occur for nonfinite/overflow input
                 // under every policy/ALLOW mode, even with a non-null source.
-                if !result.nullable {
+                if !result.nullable() {
                     return Err(CastPrepareError::TypeMismatch);
                 }
                 work.step()?;
@@ -465,33 +465,36 @@ impl PreparedCastRecipe {
                     operation,
                     source: source.clone(),
                     result: result.clone(),
-                    body: CastBody::FloatDecimal { precision, scale },
+                    body: CastBody::FloatDecimal {
+                        precision: *precision,
+                        scale: *scale,
+                    },
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
             }
             if operation == CastOperation::Carrier
-                && source.logical_type == ValueLogicalType::Physical
-                && result.logical_type == ValueLogicalType::Physical
+                && source.logical_type() == ValueLogicalType::Physical
+                && result.logical_type() == ValueLogicalType::Physical
                 && matches!(
-                    source.data_type,
+                    source.data_type(),
                     DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
                 )
-                && let DataType::Decimal128(precision, scale) = result.data_type
+                && let DataType::Decimal128(precision, scale) = result.data_type()
             {
                 if !crate::integral_decimal128::selected_shape_supported(
-                    &source.data_type,
-                    &result.data_type,
+                    source.data_type(),
+                    result.data_type(),
                 ) {
                     return Err(CastPrepareError::Unsupported);
                 }
-                if (source.nullable
+                if (source.nullable()
                     || crate::integral_decimal128::can_produce_null(
-                        &source.data_type,
-                        &result.data_type,
+                        source.data_type(),
+                        result.data_type(),
                         policy,
                     ))
-                    && !result.nullable
+                    && !result.nullable()
                 {
                     return Err(CastPrepareError::TypeMismatch);
                 }
@@ -500,7 +503,10 @@ impl PreparedCastRecipe {
                     operation,
                     source: source.clone(),
                     result: result.clone(),
-                    body: CastBody::IntegralDecimal { precision, scale },
+                    body: CastBody::IntegralDecimal {
+                        precision: *precision,
+                        scale: *scale,
+                    },
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -508,14 +514,14 @@ impl PreparedCastRecipe {
             // Decimal128's original same-metadata path enforces actual precision.
             // It is not an identity, even when only nullability differs.
             if operation == CastOperation::Carrier
-                && source.logical_type == ValueLogicalType::Physical
-                && result.logical_type == ValueLogicalType::Physical
-                && matches!(source.data_type, DataType::Decimal128(..))
-                && let DataType::Decimal128(precision, scale) = result.data_type
+                && source.logical_type() == ValueLogicalType::Physical
+                && result.logical_type() == ValueLogicalType::Physical
+                && matches!(source.data_type(), DataType::Decimal128(..))
+                && let DataType::Decimal128(precision, scale) = result.data_type()
             {
-                if (source.nullable
+                if (source.nullable()
                     || crate::decimal128_rescale::can_produce_null(policy, allow_throw_exception))
-                    && !result.nullable
+                    && !result.nullable()
                 {
                     return Err(CastPrepareError::TypeMismatch);
                 }
@@ -524,7 +530,10 @@ impl PreparedCastRecipe {
                     operation,
                     source: source.clone(),
                     result: result.clone(),
-                    body: CastBody::DecimalRescale { precision, scale },
+                    body: CastBody::DecimalRescale {
+                        precision: *precision,
+                        scale: *scale,
+                    },
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -534,14 +543,19 @@ impl PreparedCastRecipe {
             // the frozen nullability may widen. Nominal identities are not a
             // Physical scalar profile and stay refused.
             let identity = operation == CastOperation::Carrier
-                && source.data_type == result.data_type
-                && source.logical_type == ValueLogicalType::Physical
-                && result.logical_type == ValueLogicalType::Physical
-                && (Source::from_type(&source.data_type).is_none()
-                    || Target::from_type(&result.data_type).is_none());
+                && source.data_type() == result.data_type()
+                && source
+                    .same_value_domain_observed::<KernelFailure>(result, || {
+                        work.step().map_err(crate::kernel_control::compile_failure)
+                    })
+                    .map_err(CastPrepareError::Kernel)?
+                && source.logical_type() == ValueLogicalType::Physical
+                && result.logical_type() == ValueLogicalType::Physical
+                && (Source::from_type(source.data_type()).is_none()
+                    || Target::from_type(result.data_type()).is_none());
             work.step()?;
             if identity {
-                if source.nullable && !result.nullable {
+                if source.nullable() && !result.nullable() {
                     return Err(CastPrepareError::TypeMismatch);
                 }
                 return Ok(Self {
@@ -553,13 +567,13 @@ impl PreparedCastRecipe {
                     allow_throw_exception,
                 });
             }
-            let physical = source.logical_type == ValueLogicalType::Physical
-                && result.logical_type == ValueLogicalType::Physical;
+            let physical = source.logical_type() == ValueLogicalType::Physical
+                && result.logical_type() == ValueLogicalType::Physical;
             work.step()?;
             if operation == CastOperation::Carrier
                 && crate::list_cast_selected::profile(source, result)
             {
-                if source.nullable && !result.nullable {
+                if source.nullable() && !result.nullable() {
                     return Err(CastPrepareError::TypeMismatch);
                 }
                 return Ok(Self {
@@ -573,14 +587,14 @@ impl PreparedCastRecipe {
             }
             if physical
                 && matches!(
-                    source.data_type,
+                    source.data_type(),
                     DataType::Date32 | DataType::Timestamp(_, _)
                 )
-                && result.data_type == DataType::Time64(TimeUnit::Microsecond)
+                && result.data_type() == &DataType::Time64(TimeUnit::Microsecond)
             {
-                if (source.nullable
-                    || crate::time_calendar_cast::can_produce_null(&source.data_type))
-                    && !result.nullable
+                if (source.nullable()
+                    || crate::time_calendar_cast::can_produce_null(source.data_type()))
+                    && !result.nullable()
                 {
                     return Err(CastPrepareError::TypeMismatch);
                 }
@@ -595,12 +609,12 @@ impl PreparedCastRecipe {
             }
             if physical
                 && matches!(
-                    source.data_type,
+                    source.data_type(),
                     DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
                 )
-                && result.data_type == DataType::Time64(TimeUnit::Microsecond)
+                && result.data_type() == &DataType::Time64(TimeUnit::Microsecond)
             {
-                if !result.nullable {
+                if !result.nullable() {
                     return Err(CastPrepareError::TypeMismatch);
                 }
                 let mode = match operation {
@@ -623,9 +637,9 @@ impl PreparedCastRecipe {
             if operation != CastOperation::Carrier || !physical {
                 return Err(CastPrepareError::Unsupported);
             }
-            if source.data_type == DataType::Binary && result.data_type == DataType::Utf8 {
+            if source.data_type() == &DataType::Binary && result.data_type() == &DataType::Utf8 {
                 work.step()?;
-                if !result.nullable {
+                if !result.nullable() {
                     return Err(CastPrepareError::TypeMismatch);
                 }
                 return Ok(Self {
@@ -637,20 +651,20 @@ impl PreparedCastRecipe {
                     allow_throw_exception,
                 });
             }
-            if result.data_type == DataType::Utf8
+            if result.data_type() == &DataType::Utf8
                 && matches!(
-                    source.data_type,
+                    source.data_type(),
                     DataType::Decimal128(..) | DataType::Decimal256(..)
                 )
             {
-                let decimal = match source.data_type {
+                let decimal = match source.data_type() {
                     DataType::Decimal128(_, scale) => Some((DecimalTextSource::Decimal128, scale)),
                     DataType::Decimal256(_, scale) => Some((DecimalTextSource::Decimal256, scale)),
                     _ => None,
                 };
                 work.step()?;
                 if let Some((decimal, scale)) = decimal {
-                    if source.nullable && !result.nullable {
+                    if source.nullable() && !result.nullable() {
                         return Err(CastPrepareError::TypeMismatch);
                     }
                     return Ok(Self {
@@ -659,31 +673,31 @@ impl PreparedCastRecipe {
                         result: result.clone(),
                         body: CastBody::DecimalText {
                             source: decimal,
-                            scale,
+                            scale: *scale,
                         },
                         decimal_overflow_policy: policy,
                         allow_throw_exception,
                     });
                 }
             }
-            if matches!(result.data_type, DataType::Float32 | DataType::Float64)
+            if matches!(result.data_type(), DataType::Float32 | DataType::Float64)
                 && matches!(
-                    source.data_type,
+                    source.data_type(),
                     DataType::Decimal128(..) | DataType::Decimal256(..)
                 )
             {
-                let decimal = match source.data_type {
+                let decimal = match source.data_type() {
                     DataType::Decimal128(_, scale) => Some((DecimalTextSource::Decimal128, scale)),
                     DataType::Decimal256(_, scale) => Some((DecimalTextSource::Decimal256, scale)),
                     _ => None,
                 };
                 work.step()?;
                 if let Some((decimal, scale)) = decimal {
-                    if !result.nullable
-                        && (source.nullable
+                    if !result.nullable()
+                        && (source.nullable()
                             || carrier_cast_can_produce_null(
-                                &source.data_type,
-                                &result.data_type,
+                                source.data_type(),
+                                result.data_type(),
                                 allow_throw_exception,
                             ))
                     {
@@ -695,8 +709,8 @@ impl PreparedCastRecipe {
                         result: result.clone(),
                         body: CastBody::DecimalFloat {
                             source: decimal,
-                            scale,
-                            target: if result.data_type == DataType::Float32 {
+                            scale: *scale,
+                            target: if result.data_type() == &DataType::Float32 {
                                 Target::F32
                             } else {
                                 Target::F64
@@ -707,11 +721,11 @@ impl PreparedCastRecipe {
                     });
                 }
             }
-            if source.data_type == DataType::FixedSizeBinary(16)
-                && result.data_type == DataType::Utf8
+            if source.data_type() == &DataType::FixedSizeBinary(16)
+                && result.data_type() == &DataType::Utf8
             {
                 work.step()?;
-                if source.nullable && !result.nullable {
+                if source.nullable() && !result.nullable() {
                     return Err(CastPrepareError::TypeMismatch);
                 }
                 return Ok(Self {
@@ -724,14 +738,14 @@ impl PreparedCastRecipe {
                 });
             }
             let source_kind =
-                Source::from_type(&source.data_type).ok_or(CastPrepareError::Unsupported)?;
+                Source::from_type(source.data_type()).ok_or(CastPrepareError::Unsupported)?;
             if source_kind == Source::Date32
-                && matches!(result.data_type, DataType::Float32 | DataType::Float64)
+                && matches!(result.data_type(), DataType::Float32 | DataType::Float64)
             {
-                if source.nullable && !result.nullable {
+                if source.nullable() && !result.nullable() {
                     return Err(CastPrepareError::TypeMismatch);
                 }
-                let target = if result.data_type == DataType::Float32 {
+                let target = if result.data_type() == &DataType::Float32 {
                     Target::F32
                 } else {
                     Target::F64
@@ -745,8 +759,8 @@ impl PreparedCastRecipe {
                     allow_throw_exception,
                 });
             }
-            if crate::temporal_carrier::supports(&source.data_type, &result.data_type) {
-                if source.nullable && !result.nullable {
+            if crate::temporal_carrier::supports(source.data_type(), result.data_type()) {
+                if source.nullable() && !result.nullable() {
                     return Err(CastPrepareError::TypeMismatch);
                 }
                 return Ok(Self {
@@ -760,8 +774,8 @@ impl PreparedCastRecipe {
                     allow_throw_exception,
                 });
             }
-            if result.data_type == DataType::Utf8 && source_kind != Source::Utf8 {
-                if source.nullable && !result.nullable {
+            if result.data_type() == &DataType::Utf8 && source_kind != Source::Utf8 {
+                if source.nullable() && !result.nullable() {
                     return Err(CastPrepareError::TypeMismatch);
                 }
                 return Ok(Self {
@@ -775,8 +789,8 @@ impl PreparedCastRecipe {
                     allow_throw_exception,
                 });
             }
-            if source_kind.is_float() && result.data_type == DataType::Date32 {
-                if source.nullable && !result.nullable {
+            if source_kind.is_float() && result.data_type() == &DataType::Date32 {
+                if source.nullable() && !result.nullable() {
                     return Err(CastPrepareError::TypeMismatch);
                 }
                 return Ok(Self {
@@ -792,14 +806,14 @@ impl PreparedCastRecipe {
             }
             if !matches!(source_kind, Source::Timestamp(_))
                 && matches!(
-                    result.data_type,
+                    result.data_type(),
                     DataType::Date32 | DataType::Timestamp(_, None)
                 )
             {
-                if !result.nullable {
+                if !result.nullable() {
                     return Err(CastPrepareError::TypeMismatch);
                 }
-                let unit = match result.data_type {
+                let unit = match result.data_type() {
                     DataType::Timestamp(unit, None) => Some(unit),
                     _ => None,
                 };
@@ -809,14 +823,14 @@ impl PreparedCastRecipe {
                     result: result.clone(),
                     body: CastBody::Calendar {
                         source: source_kind,
-                        unit,
+                        unit: unit.copied(),
                     },
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
             }
             let target =
-                Target::from_type(&result.data_type).ok_or(CastPrepareError::Unsupported)?;
+                Target::from_type(result.data_type()).ok_or(CastPrepareError::Unsupported)?;
             if source_kind == Source::Utf8 && !matches!(target, Target::Signed(_) | Target::Boolean)
             {
                 return Err(CastPrepareError::Unsupported);
@@ -828,11 +842,11 @@ impl PreparedCastRecipe {
                 return Err(CastPrepareError::Unsupported);
             }
             let successful_null = carrier_cast_can_produce_null(
-                &source.data_type,
-                &result.data_type,
+                source.data_type(),
+                result.data_type(),
                 allow_throw_exception,
             );
-            let valid_nullable = result.nullable || (!source.nullable && !successful_null);
+            let valid_nullable = result.nullable() || (!source.nullable() && !successful_null);
             work.step()?;
             if !valid_nullable {
                 return Err(CastPrepareError::TypeMismatch);
@@ -912,16 +926,16 @@ impl PreparedCastRecipe {
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
         let may_raise_row_error = match self.body {
             CastBody::IntegralDecimal { .. } => crate::integral_decimal128::may_raise(
-                &self.source.data_type,
-                &self.result.data_type,
+                self.source.data_type(),
+                self.result.data_type(),
                 self.decimal_overflow_policy,
             ),
             CastBody::DecimalRescale { scale, .. } => {
-                let DataType::Decimal128(_, source_scale) = self.source.data_type else {
+                let DataType::Decimal128(_, source_scale) = self.source.data_type() else {
                     unreachable!("prepared exact Decimal128 source")
                 };
                 crate::decimal128_rescale::may_raise(
-                    source_scale,
+                    *source_scale,
                     scale,
                     self.decimal_overflow_policy,
                     self.allow_throw_exception,
@@ -947,7 +961,7 @@ impl PreparedCastRecipe {
             // retains the separate carrier NULL projection without a row error.
             CastBody::DecimalFloat { .. } => false,
             CastBody::TemporalCarrier { .. } => {
-                matches!(self.result.data_type, DataType::Date32 | DataType::Utf8)
+                matches!(self.result.data_type(), DataType::Date32 | DataType::Utf8)
             }
             CastBody::FloatDate { .. } => true,
             CastBody::Calendar { unit, .. } => unit == Some(TimeUnit::Nanosecond),
@@ -1010,7 +1024,8 @@ impl PreparedCastRecipe {
                     Err(recipe) => {
                         let message = format!(
                             "CAST failed: from {:?} to {:?}: {recipe}",
-                            self.source.data_type, self.result.data_type,
+                            self.source.data_type(),
+                            self.result.data_type(),
                         );
                         return Ok(CastRowResult::RowError(RowDataError::new(
                             ordinal, &message,
@@ -1019,7 +1034,7 @@ impl PreparedCastRecipe {
                 };
                 work.flush()?;
                 if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
-                    return if self.source.nullable {
+                    return if self.source.nullable() {
                         Ok(CastRowResult::Null)
                     } else {
                         Err(invalid(
@@ -1050,13 +1065,13 @@ impl PreparedCastRecipe {
                 );
             }
             if let CastBody::IntegralDecimal { precision, scale } = self.body {
-                let source_kind = Source::from_type(&self.source.data_type).ok_or_else(|| {
+                let source_kind = Source::from_type(self.source.data_type()).ok_or_else(|| {
                     internal("integral Decimal source lost its exact signed carrier")
                 })?;
                 let row =
                     self.checked_row(source_kind, argument, ordinal, logical_row, &mut work)?;
                 if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
-                    return if self.source.nullable {
+                    return if self.source.nullable() {
                         Ok(CastRowResult::Null)
                     } else {
                         Err(invalid(
@@ -1113,7 +1128,7 @@ impl PreparedCastRecipe {
                     |array| array.as_any().is::<Decimal128Array>(),
                 )?;
                 if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
-                    return if self.source.nullable {
+                    return if self.source.nullable() {
                         Ok(CastRowResult::Null)
                     } else {
                         Err(invalid(
@@ -1167,7 +1182,7 @@ impl PreparedCastRecipe {
                     ordinal,
                     logical_row,
                     &mut work,
-                    |array| match self.source.data_type {
+                    |array| match self.source.data_type() {
                         DataType::Date32 => array.as_any().is::<Date32Array>(),
                         DataType::Timestamp(TimeUnit::Second, _) => {
                             array.as_any().is::<TimestampSecondArray>()
@@ -1185,7 +1200,7 @@ impl PreparedCastRecipe {
                     },
                 )?;
                 if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
-                    return if self.source.nullable {
+                    return if self.source.nullable() {
                         Ok(CastRowResult::Null)
                     } else {
                         Err(invalid(
@@ -1202,7 +1217,7 @@ impl PreparedCastRecipe {
                 };
                 let output = crate::time_calendar_cast::evaluate_arrays_observed(
                     &selected,
-                    &self.result.data_type,
+                    self.result.data_type(),
                     Some(&mut observe),
                 )?;
                 let output = match output {
@@ -1232,7 +1247,7 @@ impl PreparedCastRecipe {
                     ordinal,
                     logical_row,
                     &mut work,
-                    |array| match self.source.data_type {
+                    |array| match self.source.data_type() {
                         DataType::Utf8 => array.as_any().is::<StringArray>(),
                         DataType::LargeUtf8 => array.as_any().is::<arrow_array::LargeStringArray>(),
                         DataType::Utf8View => array.as_any().is::<arrow_array::StringViewArray>(),
@@ -1240,7 +1255,7 @@ impl PreparedCastRecipe {
                     },
                 )?;
                 if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
-                    return if self.source.nullable {
+                    return if self.source.nullable() {
                         Ok(CastRowResult::Null)
                     } else {
                         Err(invalid(
@@ -1257,7 +1272,7 @@ impl PreparedCastRecipe {
                 };
                 let output = crate::time_text_cast::evaluate_arrays_observed(
                     &selected,
-                    &self.result.data_type,
+                    self.result.data_type(),
                     mode,
                     Some(&mut observe),
                 )?;
@@ -1289,7 +1304,7 @@ impl PreparedCastRecipe {
                     |array| array.as_any().is::<BinaryArray>(),
                 )?;
                 if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
-                    return if self.source.nullable {
+                    return if self.source.nullable() {
                         Ok(CastRowResult::Null)
                     } else {
                         Err(invalid("non-null cast argument contains a selected NULL"))
@@ -1320,7 +1335,7 @@ impl PreparedCastRecipe {
                     |array| array.as_any().is::<FixedSizeBinaryArray>(),
                 )?;
                 if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
-                    return if self.source.nullable {
+                    return if self.source.nullable() {
                         Ok(CastRowResult::Null)
                     } else {
                         Err(invalid("non-null cast argument contains a selected NULL"))
@@ -1346,7 +1361,7 @@ impl PreparedCastRecipe {
                     |array| source.validate(array),
                 )?;
                 if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
-                    return if self.source.nullable {
+                    return if self.source.nullable() {
                         Ok(CastRowResult::Null)
                     } else {
                         Err(invalid("non-null cast argument contains a selected NULL"))
@@ -1398,7 +1413,7 @@ impl PreparedCastRecipe {
                     |array| source.validate(array),
                 )?;
                 if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
-                    return if self.source.nullable {
+                    return if self.source.nullable() {
                         Ok(CastRowResult::Null)
                     } else {
                         Err(invalid("non-null cast argument contains a selected NULL"))
@@ -1474,7 +1489,7 @@ impl PreparedCastRecipe {
                 let row =
                     self.checked_row(Source::Date32, argument, ordinal, logical_row, &mut work)?;
                 if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
-                    return if self.source.nullable {
+                    return if self.source.nullable() {
                         Ok(CastRowResult::Null)
                     } else {
                         Err(invalid("non-null cast argument contains a selected NULL"))
@@ -1503,7 +1518,8 @@ impl PreparedCastRecipe {
                         ordinal,
                         &format!(
                             "CAST failed: from {:?} to {:?}: {message}",
-                            self.source.data_type, self.result.data_type
+                            self.source.data_type(),
+                            self.result.data_type()
                         ),
                     )),
                 });
@@ -1511,7 +1527,7 @@ impl PreparedCastRecipe {
             if let CastBody::TemporalCarrier { source } = self.body {
                 let row = self.checked_row(source, argument, ordinal, logical_row, &mut work)?;
                 let is_null = logical_is_null(argument.array().as_ref(), row, 1, &mut work)?;
-                if is_null && !self.source.nullable {
+                if is_null && !self.source.nullable() {
                     return Err(invalid("non-null cast argument contains a selected NULL"));
                 }
                 // The original Arrow body controls NULL visitation. Do not mask
@@ -1519,7 +1535,7 @@ impl PreparedCastRecipe {
                 work.flush()?;
                 let selected = argument.array().slice(row, 1);
                 let converted =
-                    crate::temporal_carrier::cast(selected.as_ref(), &self.result.data_type);
+                    crate::temporal_carrier::cast(selected.as_ref(), self.result.data_type());
                 work.flush()?;
                 let converted = match converted {
                     Ok(array) => array,
@@ -1530,7 +1546,7 @@ impl PreparedCastRecipe {
                     }
                 };
                 if converted.is_null(0) {
-                    return if self.result.nullable {
+                    return if self.result.nullable() {
                         Ok(CastRowResult::Null)
                     } else {
                         Err(internal("temporal cast NULL contradicts its exact result"))
@@ -1545,7 +1561,7 @@ impl PreparedCastRecipe {
                             .value(0)
                     };
                 }
-                return Ok(match &self.result.data_type {
+                return Ok(match self.result.data_type() {
                     DataType::Date32 => CastRowResult::Signed(i64::from(value!(Date32Array))),
                     DataType::Utf8 => CastRowResult::Text(value!(StringArray).to_owned()),
                     DataType::Timestamp(TimeUnit::Second, None) => {
@@ -1566,7 +1582,7 @@ impl PreparedCastRecipe {
             if let CastBody::Text { source } = self.body {
                 let row = self.checked_row(source, argument, ordinal, logical_row, &mut work)?;
                 if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
-                    return if self.source.nullable {
+                    return if self.source.nullable() {
                         Ok(CastRowResult::Null)
                     } else {
                         Err(invalid("non-null cast argument contains a selected NULL"))
@@ -1581,7 +1597,7 @@ impl PreparedCastRecipe {
             if let CastBody::FloatDate { source } = self.body {
                 let row = self.checked_row(source, argument, ordinal, logical_row, &mut work)?;
                 if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
-                    return if self.source.nullable {
+                    return if self.source.nullable() {
                         Ok(CastRowResult::Null)
                     } else {
                         Err(invalid("non-null cast argument contains a selected NULL"))
@@ -1614,7 +1630,7 @@ impl PreparedCastRecipe {
                         ordinal,
                         &format!(
                             "CAST failed: from {:?} to Date32: {message}",
-                            self.source.data_type
+                            self.source.data_type()
                         ),
                     )),
                 });
@@ -1622,7 +1638,7 @@ impl PreparedCastRecipe {
             if let CastBody::Calendar { source, unit } = self.body {
                 let row = self.checked_row(source, argument, ordinal, logical_row, &mut work)?;
                 if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
-                    return if self.source.nullable {
+                    return if self.source.nullable() {
                         Ok(CastRowResult::Null)
                     } else {
                         Err(invalid("non-null cast argument contains a selected NULL"))
@@ -1648,7 +1664,7 @@ impl PreparedCastRecipe {
             };
             let row = self.checked_row(source_kind, argument, ordinal, logical_row, &mut work)?;
             if logical_is_null(argument.array().as_ref(), row, 1, &mut work)? {
-                return if self.source.nullable {
+                return if self.source.nullable() {
                     Ok(CastRowResult::Null)
                 } else {
                     Err(invalid("non-null cast argument contains a selected NULL"))
@@ -1747,7 +1763,9 @@ impl PreparedCastRecipe {
                         // The original special error precedes ALLOW handling.
                         let message = format!(
                             "CAST failed: from {:?} to {:?}: CAST timestamp microsecond->nanosecond overflow: value {} cannot be represented as nanoseconds in i64",
-                            self.source.data_type, self.result.data_type, value,
+                            self.source.data_type(),
+                            self.result.data_type(),
+                            value,
                         );
                         let error = RowDataError::new(ordinal, &message);
                         work.flush()?;
@@ -1851,7 +1869,7 @@ impl PreparedCastRecipe {
                             // formal host memory grant or an internal work proof.
                             let message = format!(
                                 "Expr evaluate meet error: CAST failed: from {:?} to {:?}: {} conflict with range of {}",
-                                self.source.data_type, self.result.data_type, source as f64, name,
+                                self.source.data_type(), self.result.data_type(), source as f64, name,
                             );
                             let error = RowDataError::new(ordinal, &message);
                             work.flush()?;
@@ -1932,15 +1950,14 @@ impl PreparedCastRecipe {
     ) -> Result<usize, KernelFailure> {
         if let EvaluatedArgument::Constant(value) = argument {
             let actual = value.value_type();
-            let matches = actual.logical_type == self.source.logical_type
-                && (!actual.nullable || self.source.nullable);
+            let matches = actual.fits_value_type_observed(&self.source, || work.step())?;
             work.step()?;
             if !matches {
                 return Err(invalid("cast constant differs from its frozen value type"));
             }
         }
         let array = argument.array();
-        let matches = array.data_type() == &self.source.data_type;
+        let matches = array.data_type() == self.source.data_type();
         work.step()?;
         if !matches {
             return Err(invalid(
@@ -2059,3 +2076,7 @@ mod observed_list_tests;
 #[cfg(test)]
 #[path = "cast_float_decimal128_tests.rs"]
 mod float_decimal128_tests;
+
+#[cfg(test)]
+#[path = "cast_nested_identity_tests.rs"]
+mod nested_identity_tests;

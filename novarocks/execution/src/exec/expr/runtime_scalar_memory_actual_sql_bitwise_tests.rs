@@ -172,10 +172,10 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
             source_calls += 1;
             assert_eq!(args.len(), arity(name));
             assert_eq!(function.argument_types.len(), arity(name));
-            assert_eq!(function.result_type.data_type, ty);
-            assert!(function.result_type.nullable);
+            assert_eq!(function.result_type.data_type(), &ty);
+            assert!(function.result_type.nullable());
             assert_eq!(
-                function.result_type.logical_type,
+                function.result_type.logical_type(),
                 ValueLogicalType::Physical
             );
             let request = fragment
@@ -201,8 +201,8 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
                     panic!("actual typed column, not folded constant")
                 };
                 assert_eq!(bound, value_type);
-                assert_eq!(value_type.data_type, ty);
-                assert_eq!(value_type.logical_type, ValueLogicalType::Physical);
+                assert_eq!(value_type.data_type(), &ty);
+                assert_eq!(value_type.logical_type(), ValueLogicalType::Physical);
                 assert_eq!(&fragment.expressions().get(*child).unwrap().ty, bound);
                 let ExprKind::Value(value) = fragment.expressions().get(*child).unwrap().kind
                 else {
@@ -255,11 +255,11 @@ fn actual(name: &str, ty: DataType, filter: bool, guarded: bool) {
             assert!(kernel.invocation_resource_profile().is_some());
             assert_eq!(kernel.contract().value_argument_types().len(), arity(name));
             for argument in kernel.contract().value_argument_types() {
-                assert_eq!(argument.data_type, ty);
-                assert_eq!(argument.logical_type, ValueLogicalType::Physical);
+                assert_eq!(argument.data_type(), &ty);
+                assert_eq!(argument.logical_type(), ValueLogicalType::Physical);
             }
-            assert_eq!(kernel.contract().result_type().data_type, ty);
-            assert!(kernel.contract().result_type().nullable);
+            assert_eq!(kernel.contract().result_type().data_type(), &ty);
+            assert!(kernel.contract().result_type().nullable());
             assert_eq!(kernel.contract().call(), call.call_contract());
             assert_eq!(kernel.contract().effects(), call.call_contract().effects());
             assert!(found.replace((program.clone(), scope.root)).is_none());

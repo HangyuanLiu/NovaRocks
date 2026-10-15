@@ -323,8 +323,11 @@ mod tests {
             .find(|column| column.column_id == descriptor.synthetic_column_id())
             .expect("synthetic scan output");
         assert_eq!(synthetic_output.name, descriptor.synthetic_column());
-        assert_eq!(synthetic_output.value_type.data_type, DataType::Int64);
-        assert!(synthetic_output.value_type.nullable);
+        assert_eq!(
+            synthetic_output.value_type.data_type().clone(),
+            DataType::Int64
+        );
+        assert!(synthetic_output.value_type.nullable());
         assert!(synthetic_output.is_internal);
 
         let rewritten_left = binary_column_ref_side(&filter.predicate);
@@ -332,8 +335,11 @@ mod tests {
             column_ref_id(rewritten_left),
             descriptor.synthetic_column_id()
         );
-        assert_eq!(rewritten_left.value_type.data_type, DataType::Int64);
-        assert!(rewritten_left.value_type.nullable);
+        assert_eq!(
+            rewritten_left.value_type.data_type().clone(),
+            DataType::Int64
+        );
+        assert!(rewritten_left.value_type.nullable());
     }
 
     #[test]

@@ -174,7 +174,7 @@ fn format_value_with<R: DiagnosticRenderer>(
     if logical_null(source.data, source.index, work)? {
         return renderer.render(work, |writer| write_text(writer, format_args!("NULL")));
     }
-    if value.value_type().logical_type == ValueLogicalType::LargeInt {
+    if value.value_type().logical_type() == ValueLogicalType::LargeInt {
         let selected = value.try_largeint()?.ok_or(ConstantError::Invalid(
             "non-NULL LARGEINT diagnostic lacks a value",
         ))?;

@@ -120,7 +120,7 @@ use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::operators::compiled_expression::CompiledProjectProcessorFactory;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailureCause, ExecutionResult};
-use crate::runtime::preparation_metadata::{CompiledSchemaMetadataScope, CompiledSchemaSite};
+use crate::runtime::preparation_metadata::{CompiledSchemaPreparationScope, CompiledSchemaSite};
 use crate::runtime::runtime_state::RuntimeErrorState;
 use novarocks_local_program::{ProgramNodeId, StaticLayout};
 
@@ -132,17 +132,14 @@ struct RecordingSchemaScope {
     bodies: usize,
     output: Option<ChunkSchemaRef>,
 }
-impl CompiledSchemaMetadataScope for RecordingSchemaScope {
-    fn materialize<B>(
+impl CompiledSchemaPreparationScope for RecordingSchemaScope {
+    fn prepare(
         &mut self,
         program: &Arc<LocalProgram>,
         site: CompiledSchemaSite,
         layout: &StaticLayout,
-        body: B,
-    ) -> ExecutionResult<ChunkSchemaRef>
-    where
-        B: FnOnce() -> Result<ChunkSchemaRef, String>,
-    {
+        body: &mut dyn FnMut() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
         self.calls += 1;
         assert!(Arc::ptr_eq(program, &self.program));
         assert_eq!(site, self.expected);
@@ -158,12 +155,7 @@ impl CompiledSchemaMetadataScope for RecordingSchemaScope {
             return Err(novarocks_functions::KernelFailure::ResourceExhausted.into());
         }
         self.bodies += 1;
-        let output = body()?;
-        let direct = ChunkSchema::from_compiled_layout(layout).unwrap();
-        assert_eq!(output.slot_ids(), direct.slot_ids());
-        assert_eq!(output.arrow_schema_ref(), direct.arrow_schema_ref());
-        self.output = Some(Arc::clone(&output));
-        Ok(output)
+        body()
     }
 }
 
@@ -176,6 +168,58 @@ fn schema_scope(program: &Arc<LocalProgram>, site: CompiledSchemaSite) -> Record
         bodies: 0,
         output: None,
     }
+}
+
+fn hosted_project_factory(
+    program: Arc<LocalProgram>,
+    node: ProgramNodeId,
+    error: Arc<RuntimeErrorState>,
+    host: &mut RecordingSchemaScope,
+) -> ExecutionResult<Box<dyn crate::exec::pipeline::operator::Operator>> {
+    let factory = CompiledProjectProcessorFactory::try_new(program, node, error)?;
+    prepare_project(factory, host)
+}
+fn hosted_final_factory(
+    program: Arc<LocalProgram>,
+    error: Arc<RuntimeErrorState>,
+    host: &mut RecordingSchemaScope,
+) -> ExecutionResult<Box<dyn crate::exec::pipeline::operator::Operator>> {
+    let factory = CompiledProjectProcessorFactory::try_new_final_result_boundary(program, error)?;
+    prepare_project(factory, host)
+}
+fn prepare_project(
+    factory: CompiledProjectProcessorFactory,
+    host: &mut RecordingSchemaScope,
+) -> ExecutionResult<Box<dyn crate::exec::pipeline::operator::Operator>> {
+    let mut operator = factory.create(1, 0);
+    let tracker =
+        crate::runtime::mem_tracker::MemTracker::new_root("Project schema observer fixture");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    operator.set_construction_factory(
+        super::super::aggregate_fixture::runtime_construction_factory(
+            tracker,
+            Arc::new(RuntimeErrorState::default()),
+        ),
+    );
+    crate::runtime::preparation_metadata::prepare_operator_schema_for_test(
+        operator.as_mut(),
+        host,
+    )?;
+    let output = operator
+        .prepared_schema_for_test()
+        .expect("the real Project prepared its output");
+    let node = match host.expected {
+        CompiledSchemaSite::Project(node) | CompiledSchemaSite::AnalyticOutput(node) => node,
+        CompiledSchemaSite::FinalResult => host.program.graph().root(),
+    };
+    let direct = ChunkSchema::from_compiled_layout(
+        host.program.graph().nodes()[node.index()].output_layout(),
+    )
+    .unwrap();
+    assert_eq!(output.slot_ids(), direct.slot_ids());
+    assert_eq!(output.arrow_schema_ref(), direct.arrow_schema_ref());
+    host.output = Some(output);
+    Ok(operator)
 }
 
 #[test]
@@ -191,13 +235,9 @@ fn compiled_project_schema_scope_preserves_both_actual_factory_sites() {
             Arc::clone(&error),
         )
         .unwrap();
-        let hosted = CompiledProjectProcessorFactory::try_new_with_metadata_host(
-            Arc::clone(&program),
-            node,
-            Arc::clone(&error),
-            &mut host,
-        )
-        .unwrap();
+        let hosted =
+            hosted_project_factory(Arc::clone(&program), node, Arc::clone(&error), &mut host)
+                .unwrap();
         assert_eq!(hosted.name(), direct.name());
         assert_eq!((host.calls, host.bodies), (1, 1));
         assert!(host.output.is_some());
@@ -208,11 +248,7 @@ fn compiled_project_schema_scope_preserves_both_actual_factory_sites() {
             Arc::clone(&error),
         )
         .unwrap();
-        let hosted =
-            CompiledProjectProcessorFactory::try_new_final_result_boundary_with_metadata_host(
-                program, error, &mut host,
-            )
-            .unwrap();
+        let hosted = hosted_final_factory(program, error, &mut host).unwrap();
         assert_eq!(hosted.name(), direct.name());
         assert_eq!((host.calls, host.bodies), (1, 1));
     }
@@ -220,12 +256,7 @@ fn compiled_project_schema_scope_preserves_both_actual_factory_sites() {
     // Project constructor merely because its schema uses the same port.
     let program = boundary_program(None);
     let mut host = schema_scope(&program, CompiledSchemaSite::FinalResult);
-    CompiledProjectProcessorFactory::try_new_final_result_boundary_with_metadata_host(
-        program,
-        Arc::new(RuntimeErrorState::default()),
-        &mut host,
-    )
-    .unwrap();
+    hosted_final_factory(program, Arc::new(RuntimeErrorState::default()), &mut host).unwrap();
     assert_eq!((host.calls, host.bodies), (1, 1));
 }
 
@@ -241,19 +272,10 @@ fn compiled_project_schema_scope_refusal_runs_neither_original_body() {
         let error = Arc::new(RuntimeErrorState::default());
         let result = match site {
             CompiledSchemaSite::Project(node) => {
-                CompiledProjectProcessorFactory::try_new_with_metadata_host(
-                    Arc::clone(&program),
-                    node,
-                    error,
-                    &mut host,
-                )
+                hosted_project_factory(Arc::clone(&program), node, error, &mut host)
             }
             CompiledSchemaSite::FinalResult => {
-                CompiledProjectProcessorFactory::try_new_final_result_boundary_with_metadata_host(
-                    Arc::clone(&program),
-                    error,
-                    &mut host,
-                )
+                hosted_final_factory(Arc::clone(&program), error, &mut host)
             }
             CompiledSchemaSite::AnalyticOutput(_) => {
                 panic!("the Project fixture contains no Analytic schema site")
@@ -290,14 +312,9 @@ fn compiled_project_schema_scope_keeps_original_early_factory_errors() {
         )
         .err()
         .unwrap();
-        let failure = CompiledProjectProcessorFactory::try_new_with_metadata_host(
-            Arc::clone(&program),
-            node,
-            error,
-            &mut host,
-        )
-        .err()
-        .unwrap();
+        let failure = hosted_project_factory(Arc::clone(&program), node, error, &mut host)
+            .err()
+            .unwrap();
         assert_eq!(direct, expected);
         assert_eq!(failure.cause(), &ExecutionFailureCause::Pipeline(direct));
         assert_eq!((host.calls, host.bodies), (0, 0));
@@ -314,10 +331,7 @@ fn compiled_project_schema_scope_keeps_original_early_factory_errors() {
     )
     .err()
     .unwrap();
-    let failure =
-        CompiledProjectProcessorFactory::try_new_final_result_boundary_with_metadata_host(
-            program, error, &mut host,
-        )
+    let failure = hosted_final_factory(program, error, &mut host)
         .err()
         .unwrap();
     assert_eq!(

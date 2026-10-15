@@ -71,7 +71,7 @@ fn dense(arrays: Vec<ArrayRef>) -> ArrayRef {
     let rows = arrays[0].len();
     let types = arrays
         .iter()
-        .map(|a| FunctionValueType::new(a.data_type().clone(), true))
+        .map(|a| FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true))
         .collect::<Vec<_>>();
     let mut instance = instance(&types, DecimalOverflowPolicy::OutputNull);
     let arguments = arrays
@@ -367,7 +367,7 @@ fn legal_decimal_precision_overflow_is_successful_null_under_both_policies() {
         )
         .unwrap();
         assert_eq!(
-            prepared.contract().result_type().data_type,
+            prepared.contract().result_type().data_type().clone(),
             DataType::Decimal128(38, -46)
         );
         let mut instance = ScalarEvaluationInstance::instantiate(prepared).unwrap();
@@ -495,7 +495,9 @@ fn control_fixture(arity: usize) -> (Vec<FunctionValueType>, Vec<ArrayRef>) {
     }
     let types = arrays
         .iter()
-        .map(|array| FunctionValueType::new(array.data_type().clone(), true))
+        .map(|array| {
+            FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true)
+        })
         .collect();
     (types, arrays)
 }

@@ -23,6 +23,7 @@
 //! JoinScope exposes complete actual field facts only. This is not a proof of
 //! every outer-join output NULL rule or of an arbitrary source/capture path.
 
+use crate::creation::{ProgramCreation, ProgramCreationFailure};
 use crate::{
     AnalyticOutputColumn, ProgramCallSite, ProgramExpressionArena, ProgramNodeId, ProgramNodeKind,
     ProgramTypedExpressions, StaticLayout, TableFunctionOutputSlot,
@@ -31,8 +32,11 @@ use novarocks_functions::{
     AggregateCallContract, FunctionArgumentType, FunctionValueType, KernelFailure,
     PreparedPureKernel, validate_function_value_type_observed,
 };
+#[cfg(test)]
+use novarocks_type_contract::ValueSchemaCreation;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, ValueTypeError,
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+    ValueSchemaCreationScope, ValueTypeError, ValueTypeStorageLifetime,
     arrow_data_types_exact_observed,
 };
 use novarocks_types::SlotId;
@@ -95,12 +99,49 @@ impl fmt::Display for ProgramChannelTypeError {
 }
 impl std::error::Error for ProgramChannelTypeError {}
 
+#[derive(Debug)]
+struct ChannelFacts<T> {
+    value: T,
+    _storage: ValueTypeStorageLifetime,
+}
+impl<T> std::ops::Deref for ChannelFacts<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<H> From<ProgramChannelTypeError> for ProgramCreationFailure<ProgramChannelTypeError, H> {
+    fn from(error: ProgramChannelTypeError) -> Self {
+        match error {
+            ProgramChannelTypeError::Control(error) => Self::Control(error),
+            error => Self::Owner(error),
+        }
+    }
+}
+fn pure_programchanneltypeerror(
+    error: ProgramCreationFailure<ProgramChannelTypeError, std::convert::Infallible>,
+) -> ProgramChannelTypeError {
+    match error {
+        ProgramCreationFailure::Control(error) => ProgramChannelTypeError::Control(error),
+        ProgramCreationFailure::Owner(error) => error,
+        ProgramCreationFailure::Resource(_) | ProgramCreationFailure::Capacity(_) => {
+            ProgramChannelTypeError::Control(CompileControlError::ResourceExhausted)
+        }
+        ProgramCreationFailure::Creator(never) => match never {},
+    }
+}
+impl<H> From<ValueTypeError> for ProgramCreationFailure<ProgramChannelTypeError, H> {
+    fn from(error: ValueTypeError) -> Self {
+        Self::Owner(ProgramChannelTypeError::ValueType(error))
+    }
+}
 type SlotPosition = (ProgramNodeId, ProgramChannelLayoutRole, SlotId);
 #[derive(Clone, Debug)]
 pub struct ProgramTypedChannels {
     expressions: ProgramTypedExpressions,
-    channels: Arc<BTreeMap<ProgramChannelSite, FunctionValueType>>,
-    slots: Arc<BTreeMap<SlotPosition, u32>>,
+    channels: Arc<ChannelFacts<BTreeMap<ProgramChannelSite, FunctionValueType>>>,
+    slots: Arc<ChannelFacts<BTreeMap<SlotPosition, u32>>>,
 }
 impl ProgramTypedChannels {
     pub fn try_new(
@@ -108,9 +149,27 @@ impl ProgramTypedChannels {
         channels: Vec<(ProgramChannelSite, FunctionValueType)>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ProgramChannelTypeError> {
+        Self::try_new_core::<std::convert::Infallible>(expressions, channels, None, control)
+            .map_err(pure_programchanneltypeerror)
+    }
+    pub fn try_new_with_creator_in<H>(
+        expressions: ProgramTypedExpressions,
+        channels: Vec<(ProgramChannelSite, FunctionValueType)>,
+        creation: &mut dyn ValueSchemaCreationScope<H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ProgramCreationFailure<ProgramChannelTypeError, H>> {
+        Self::try_new_core(expressions, channels, Some(creation), control)
+    }
+    fn try_new_core<H>(
+        expressions: ProgramTypedExpressions,
+        channels: Vec<(ProgramChannelSite, FunctionValueType)>,
+        creator: Option<&mut dyn ValueSchemaCreationScope<H>>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ProgramCreationFailure<ProgramChannelTypeError, H>> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        let mut creation = ProgramCreation { creator };
         if channels.len() > MAX_PROGRAM_TYPED_CHANNELS {
-            return Err(ProgramChannelTypeError::TooManyChannels);
+            return Err(ProgramChannelTypeError::TooManyChannels.into());
         }
         let program = expressions.resolved_calls().snapshot().program();
         let mut expected_count = 0usize;
@@ -131,13 +190,17 @@ impl ProgramTypedChannels {
             }
         }
         let mut entries = BTreeMap::new();
+        let mut entry_insertions = 0usize;
         for (site, ty) in channels {
             work.step()?;
+            creation.before_tree_insert::<ProgramChannelTypeError, ProgramChannelSite, FunctionValueType>(entry_insertions, &mut work)?;
+            entry_insertions += 1;
             if entries.insert(site, ty).is_some() {
-                return Err(ProgramChannelTypeError::DuplicateSite);
+                return Err(ProgramChannelTypeError::DuplicateSite.into());
             }
         }
         let mut slots = BTreeMap::new();
+        let mut slot_insertions = 0usize;
         for (index, node) in program.nodes().iter().enumerate() {
             let node_id = ProgramNodeId::new(index);
             visit_layouts(node.kind(), node.output_layout(), |role, layout| {
@@ -158,20 +221,51 @@ impl ProgramTypedChannels {
                         .get(&site)
                         .ok_or(ProgramChannelTypeError::MissingSite(site))?;
                     validate(ty, &mut work)?;
-                    same_carrier(field.data_type(), &ty.data_type, &mut work)?;
-                    if field.is_nullable() != ty.nullable {
-                        return Err(ProgramChannelTypeError::TypeMismatch);
+                    if layout.is_typed() {
+                        let binding = layout
+                            .value_binding_at(ordinal as usize)
+                            .ok_or(ProgramChannelTypeError::TypeMismatch)?;
+                        if !binding.exactly_equals_observed(ty.typed_binding(), || {
+                            work.step().map_err(ProgramChannelTypeError::from)
+                        })? {
+                            return Err(ProgramChannelTypeError::TypeMismatch.into());
+                        }
+                    } else if !novarocks_type_contract::value_layout_matches_carrier_observed::<
+                        ProgramChannelTypeError,
+                    >(
+                        ty.typed_binding().layout(),
+                        field.data_type(),
+                        |units| {
+                            for _ in 0..units {
+                                work.step()?;
+                            }
+                            Ok(())
+                        },
+                    )? {
+                        // Expansion-only source projection. It validates actual
+                        // encoding/layout against the explicit supplied type;
+                        // it never authors a semantic tree from annotations.
+                        return Err(ProgramChannelTypeError::TypeMismatch.into());
                     }
-                    if field
-                        .metadata()
-                        .contains_key(novarocks_type_contract::NR_LOGICAL_TYPE_KEY)
-                        && novarocks_type_contract::field_logical_type(field)? != ty.logical_type
+                    if field.is_nullable() != ty.nullable() {
+                        return Err(ProgramChannelTypeError::TypeMismatch.into());
+                    }
+                    if !layout.is_typed()
+                        && field
+                            .metadata()
+                            .contains_key(novarocks_type_contract::NR_LOGICAL_TYPE_KEY)
+                        && novarocks_type_contract::field_logical_type(field)? != ty.logical_type()
                     {
-                        return Err(ProgramChannelTypeError::TypeMismatch);
+                        return Err(ProgramChannelTypeError::TypeMismatch.into());
                     }
+                    creation.before_tree_insert::<ProgramChannelTypeError, SlotPosition, u32>(
+                        slot_insertions,
+                        &mut work,
+                    )?;
+                    slot_insertions += 1;
                     slots.insert((node_id, role, *slot), ordinal);
                 }
-                Ok(())
+                Ok::<(), ProgramCreationFailure<ProgramChannelTypeError, H>>(())
             })?;
             match node.kind() {
                 ProgramNodeKind::TableFinish {
@@ -208,12 +302,27 @@ impl ProgramTypedChannels {
             }
         }
         if entries.len() != expected_count {
-            return Err(ProgramChannelTypeError::InvalidSite);
+            return Err(ProgramChannelTypeError::InvalidSite.into());
         }
+        let storage = creation.storage();
+        let channels = creation.arc::<ProgramChannelTypeError, _>(
+            ChannelFacts {
+                value: entries,
+                _storage: storage.clone(),
+            },
+            &mut work,
+        )?;
+        let slots = creation.arc::<ProgramChannelTypeError, _>(
+            ChannelFacts {
+                value: slots,
+                _storage: storage,
+            },
+            &mut work,
+        )?;
         let checked = Self {
             expressions,
-            channels: Arc::new(entries),
-            slots: Arc::new(slots),
+            channels,
+            slots,
         };
         checked.validate_operators(&mut work)?;
         work.finish()?;
@@ -431,7 +540,7 @@ impl ProgramTypedChannels {
                             }
                             let ty = self.definition(ProgramExpressionArena::Main, id)?;
                             if !comparator.supports_value_type(ty)
-                                || !novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1.supports_partition_key(&ty.data_type)
+                                || !novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1.supports_partition_key(ty.data_type())
                             { return Err(ProgramChannelTypeError::TypeMismatch); }
                             same_value(
                                 ty,
@@ -773,10 +882,10 @@ impl ProgramTypedChannels {
                         {
                             let actual = self.output(node_id, ordinal)?;
                             work.step()?;
-                            if !actual.nullable || actual.logical_type != expected.logical_type {
+                            if !actual.nullable() {
                                 return Err(ProgramChannelTypeError::TypeMismatch);
                             }
-                            same_carrier(&actual.data_type, &expected.data_type, work)?;
+                            same_value(expected, actual, true, work)?;
                         } else {
                             same_value(self.output(node_id, ordinal)?, expected, false, work)?;
                         }
@@ -866,14 +975,11 @@ fn layout_for<'a>(
         _ => None,
     }
 }
-fn visit_layouts(
+fn visit_layouts<E>(
     kind: &ProgramNodeKind,
     output: &StaticLayout,
-    mut visit: impl FnMut(
-        ProgramChannelLayoutRole,
-        &StaticLayout,
-    ) -> Result<(), ProgramChannelTypeError>,
-) -> Result<(), ProgramChannelTypeError> {
+    mut visit: impl FnMut(ProgramChannelLayoutRole, &StaticLayout) -> Result<(), E>,
+) -> Result<(), E> {
     use ProgramChannelLayoutRole as Role;
     for role in [
         Role::NodeOutput,
@@ -950,14 +1056,18 @@ fn same_value(
 ) -> Result<(), ProgramChannelTypeError> {
     work.step()?;
     let nullable = if argument {
-        expected.nullable || !actual.nullable
+        expected.nullable() || !actual.nullable()
     } else {
-        expected.nullable == actual.nullable
+        expected.nullable() == actual.nullable()
     };
-    if !nullable || actual.logical_type != expected.logical_type {
+    if !nullable
+        || !actual.same_value_domain_observed(expected, || {
+            work.step().map_err(ProgramChannelTypeError::from)
+        })?
+    {
         return Err(ProgramChannelTypeError::TypeMismatch);
     };
-    same_carrier(&actual.data_type, &expected.data_type, work)
+    same_carrier(&actual.data_type(), &expected.data_type(), work)
 }
 
 #[cfg(test)]

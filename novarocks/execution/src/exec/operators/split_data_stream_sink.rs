@@ -220,6 +220,18 @@ impl SplitDataStreamSinkOperator {
 }
 
 impl Operator for SplitDataStreamSinkOperator {
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        for sink in &mut self.sinks {
+            sink.op.set_construction_factory(factory.clone());
+        }
+    }
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -490,7 +502,7 @@ fn filter_chunk_by_mask(chunk: &Chunk, mask: &[bool]) -> Result<Option<Chunk>, S
     }
 
     let predicate = BooleanArray::from(mask.to_vec());
-    let filtered = filter_record_batch(&chunk.batch, &predicate)
+    let filtered = filter_record_batch(&chunk.record_batch(), &predicate)
         .map_err(|e| format!("split sink filter chunk failed: {e}"))?;
     Ok(Some(Chunk::new_like(filtered, chunk)))
 }
@@ -673,7 +685,7 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         let values = selected
-            .batch
+            .record_batch()
             .column(1)
             .as_any()
             .downcast_ref::<Int32Array>()

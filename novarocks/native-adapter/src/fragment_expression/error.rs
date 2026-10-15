@@ -89,7 +89,10 @@ impl fmt::Display for NativeExpressionLeafDecodeError {
 }
 
 #[derive(Debug)]
-pub struct NativeExpressionDecodeError(ProtocolError);
+pub enum NativeExpressionDecodeError {
+    Protocol(ProtocolError),
+    Construction(crate::fragment_error::NativeTypeConstructionError),
+}
 
 impl NativeExpressionDecodeError {
     pub(crate) fn missing(path: FieldPath, detail: impl fmt::Display) -> Self {
@@ -111,15 +114,21 @@ impl NativeExpressionDecodeError {
         Self::new(path, ProtocolErrorKind::Unsupported, detail)
     }
     fn new(path: FieldPath, kind: ProtocolErrorKind, detail: impl fmt::Display) -> Self {
-        Self(ProtocolError::new(path, kind, detail.to_string()))
+        Self::Protocol(ProtocolError::new(path, kind, detail.to_string()))
     }
-    pub fn into_protocol(self) -> ProtocolError {
-        self.0
+    pub fn into_native(self) -> crate::fragment_error::NativeFragmentDecodeError {
+        match self {
+            Self::Protocol(error) => error.into(),
+            Self::Construction(error) => error.into(),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn protocol(&self) -> &ProtocolError {
-        &self.0
+        match self {
+            Self::Protocol(error) => error,
+            Self::Construction(_) => panic!("construction error has no protocol diagnostic"),
+        }
     }
 
     #[cfg(test)]
@@ -130,12 +139,35 @@ impl NativeExpressionDecodeError {
 
 impl From<ProtocolError> for NativeExpressionDecodeError {
     fn from(error: ProtocolError) -> Self {
-        Self(error)
+        Self::Protocol(error)
     }
 }
 
 impl fmt::Display for NativeExpressionDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+        match self {
+            Self::Protocol(error) => error.fmt(f),
+            Self::Construction(error) => error.fmt(f),
+        }
+    }
+}
+
+impl From<crate::fragment_error::NativeTypeConstructionError> for NativeExpressionDecodeError {
+    fn from(error: crate::fragment_error::NativeTypeConstructionError) -> Self {
+        Self::Construction(error)
+    }
+}
+
+impl From<crate::fragment_error::NativeFragmentDecodeError> for NativeExpressionDecodeError {
+    fn from(error: crate::fragment_error::NativeFragmentDecodeError) -> Self {
+        match error {
+            crate::fragment_error::NativeFragmentDecodeError::Protocol(error) => {
+                Self::Protocol(error)
+            }
+            crate::fragment_error::NativeFragmentDecodeError::Construction(error) => {
+                Self::Construction(error)
+            }
+            error => Self::invalid_value(FieldPath::root("expr"), error),
+        }
     }
 }

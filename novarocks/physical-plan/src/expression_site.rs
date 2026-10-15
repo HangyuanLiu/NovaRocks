@@ -1127,8 +1127,8 @@ fn validate_definition_correspondence(
             .get(invocation.definition)
             .ok_or(RootUseBindingError::WrongDefinition)?;
         if invocation.context.demand == novarocks_type_contract::EvaluationDemand::TruthOnly
-            && (definition.ty.data_type != arrow_schema::DataType::Boolean
-                || definition.ty.logical_type
+            && (*definition.ty.data_type() != arrow_schema::DataType::Boolean
+                || definition.ty.logical_type()
                     != novarocks_type_contract::ValueLogicalType::Physical)
         {
             return Err(RootUseBindingError::WrongDemand);

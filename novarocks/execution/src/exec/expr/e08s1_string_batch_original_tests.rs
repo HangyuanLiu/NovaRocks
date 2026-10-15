@@ -114,7 +114,8 @@ fn original(index: usize) {
         let FunctionResultType::Scalar(target) = &mut stale.selected.result_type else {
             unreachable!()
         };
-        target.data_type = DataType::Binary;
+        *target =
+            novarocks_type_contract::FunctionValueType::new(DataType::Binary, target.nullable());
         catalog
             .admit_bound_lifecycle_observed(&stale, PureCallLifecycle::Scalar, &control)
             .unwrap();

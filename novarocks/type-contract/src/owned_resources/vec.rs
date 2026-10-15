@@ -35,16 +35,16 @@ fn resource() -> ControlResourceError {
     CompileControlError::ResourceExhausted.into()
 }
 
-fn push_geometry<T>(
+fn amortized_geometry<T>(
     len: usize,
     capacity: usize,
+    next_len: usize,
 ) -> Result<VecPushGrowthFacts, ControlResourceError> {
     if !LOCKED_TOOLCHAIN {
         return Err(ControlResourceError::SourceModel(
             "Vec growth source model drift",
         ));
     }
-    let next_len = len.checked_add(1).ok_or_else(resource)?;
     if len > capacity {
         return Err(ControlResourceError::SourceModel(
             "Vec length exceeds actual capacity",
@@ -98,6 +98,29 @@ fn push_geometry<T>(
         old_backing,
         requested_backing,
     })
+}
+
+fn push_geometry<T>(
+    len: usize,
+    capacity: usize,
+) -> Result<VecPushGrowthFacts, ControlResourceError> {
+    if !LOCKED_TOOLCHAIN {
+        return Err(ControlResourceError::SourceModel(
+            "Vec growth source model drift",
+        ));
+    }
+    amortized_geometry::<T>(len, capacity, len.checked_add(1).ok_or_else(resource)?)
+}
+
+/// The original locked `Vec::resize` operation's reserve, from its actual
+/// previous length/capacity. This only projects the same RawVec amortized
+/// growth body; it supplies no source origin, retained-byte fact or grant.
+pub fn original_resize_growth<T>(
+    len: usize,
+    capacity: usize,
+    target_len: usize,
+) -> Result<VecPushGrowthFacts, ControlResourceError> {
+    amortized_geometry::<T>(len, capacity, target_len)
 }
 
 /// Cumulative requests for the declared original `Vec::new` followed by exactly

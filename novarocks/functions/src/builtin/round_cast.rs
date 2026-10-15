@@ -18,7 +18,7 @@
 //! Frozen scalar Arrow cast paths used by ROUND. Encodings are followed only
 //! at selected rows; no dictionary, run, list or Union is expanded into a batch.
 
-use super::rounding_binding::{CastCapability, CastTarget, select_union_cast_field};
+use super::rounding_binding::{CastCapability, CastTarget, select_union_cast_field_typed};
 use crate::{
     FunctionBindingError, FunctionValueType, KernelDiagnostic, KernelFailure,
     kernel_control::internal, kernel_input::EvaluationCheckpoints,
@@ -26,7 +26,9 @@ use crate::{
 use arrow_array::{types::*, *};
 use arrow_cast::cast::DecimalCast;
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
-use novarocks_type_contract::{CompileCheckpoints, MAX_VALUE_TYPE_DEPTH, ValueLogicalType};
+#[cfg(test)]
+use novarocks_type_contract::ValueLogicalType;
+use novarocks_type_contract::{CompileCheckpoints, MAX_VALUE_TYPE_DEPTH};
 use num_traits::ToPrimitive;
 
 type Wide = <Decimal256Type as ArrowPrimitiveType>::Native;
@@ -134,21 +136,37 @@ impl CastRecipe {
         target: CastTarget,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, FunctionBindingError> {
-        Self::prepare_type(&source.data_type, source.logical_type, target, work)
+        Self::prepare_typed(source.data_type(), source.value_type(), target, work)
     }
 
     /// Borrow an already admitted source type without cloning its field tree.
     /// The caller supplies the exact authored root identity and the same
     /// observed full-type preflight used by `prepare`.
+    #[cfg(test)]
     pub(super) fn prepare_type(
         source: &DataType,
         logical_type: ValueLogicalType,
         target: CastTarget,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, FunctionBindingError> {
-        if logical_type != ValueLogicalType::Physical {
+        let value = FunctionValueType::try_from_legacy_declared_projection(
+            source.clone(),
+            true,
+            logical_type,
+        )
+        .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
+        Self::prepare_typed(source, value.value_type(), target, work)
+    }
+    fn prepare_typed(
+        source: &DataType,
+        semantic: &novarocks_type_contract::ValueTypeRef,
+        target: CastTarget,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, FunctionBindingError> {
+        if semantic.domain().is_some() {
             return Err(unsupported());
         }
+        let mut semantic = semantic;
         let mut steps = [Step::Done; MAX_VALUE_TYPE_DEPTH];
         let mut count = 0;
         let mut ty = source;
@@ -165,14 +183,21 @@ impl CastRecipe {
                 DataType::RunEndEncoded(key, value) => {
                     (Step::RunEnd(key_kind(key.data_type())?), value.data_type())
                 }
-                DataType::FixedSizeList(value, 1) => (Step::FixedSizeList, value.data_type()),
+                DataType::FixedSizeList(value, 1) => {
+                    semantic = semantic.child_type_at(0).ok_or_else(unsupported)?;
+                    if semantic.domain().is_some() {
+                        return Err(unsupported());
+                    }
+                    (Step::FixedSizeList, value.data_type())
+                }
                 DataType::Union(fields, _) => {
-                    let (tag, field, capability) =
-                        select_union_cast_field(fields, target, depth + 1, work)?
+                    let (tag, field, selected_semantic, capability) =
+                        select_union_cast_field_typed(fields, semantic, target, depth + 1, work)?
                             .ok_or_else(unsupported)?;
                     if capability != CastCapability::Physical {
                         return Err(unsupported());
                     }
+                    semantic = selected_semantic;
                     (Step::Union(tag), field.data_type())
                 }
                 _ => {

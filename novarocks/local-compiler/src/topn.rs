@@ -129,16 +129,17 @@ fn lower_core(
 }
 
 /// Lower a grouped reduction through the original aggregate call/layout leaves.
-pub(crate) fn lower_grouped_topn(
+pub(crate) fn lower_grouped_topn_with_creation<H>(
     package: &novarocks_physical_plan::FragmentPackage,
     node: &PhysicalNode,
     input: ProgramNodeId,
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     slots: &[novarocks_types::SlotId],
     control: &dyn PureCompileControl,
-) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = (|| {
+    let result = (|| -> Result<_, crate::FragmentCreationError<H>> {
         let NodeKind::TopN {
             reduction:
                 TopNReduction::GroupedStates {
@@ -152,18 +153,19 @@ pub(crate) fn lower_grouped_topn(
             phase,
         } = &node.kind
         else {
-            return Err(FragmentCompileError::Invalid(
-                "GroupedTopN physical kind differs",
-            ));
+            return Err(
+                (FragmentCompileError::Invalid("GroupedTopN physical kind differs")).into(),
+            );
         };
         if *offset != 0
             || !matches!(phase, TopNPhase::Partial { .. })
             || group_by.is_empty()
             || node.inputs.len() != 1
         {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "GroupedTopN requires complete keys and a partial zero-offset input",
-            ));
+            ))
+            .into());
         }
         let width = group_by
             .len()
@@ -173,9 +175,10 @@ pub(crate) fn lower_grouped_topn(
             || slots.len() != width
             || order_by.len() != group_by.len()
         {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "GroupedTopN output or complete key width differs",
-            ));
+            ))
+            .into());
         }
         let expected = group_by
             .iter()
@@ -184,9 +187,10 @@ pub(crate) fn lower_grouped_topn(
         for (actual, expected) in node.output.columns.iter().zip(expected) {
             work.step()?;
             if actual != expected {
-                return Err(FragmentCompileError::Invalid(
+                return Err((FragmentCompileError::Invalid(
                     "GroupedTopN output differs from its keys and new state calls",
-                ));
+                ))
+                .into());
             }
         }
         let definitions = package.fragment().expressions();
@@ -200,9 +204,10 @@ pub(crate) fn lower_grouped_topn(
             if !matches!(definition.kind, novarocks_physical_plan::ExprKind::Value(source) if source == *value)
                 || !comparator.supports_value_type(&definition.ty)
             {
-                return Err(FragmentCompileError::Invalid(
+                return Err((FragmentCompileError::Invalid(
                     "GroupedTopN key is not an exact supported direct value",
-                ));
+                ))
+                .into());
             }
             groups.push(*expressions.get(id).ok_or(FragmentCompileError::Invalid(
                 "missing lowered GroupedTopN key",
@@ -215,9 +220,10 @@ pub(crate) fn lower_grouped_topn(
                 .get(key.expr)
                 .ok_or(FragmentCompileError::Invalid("missing GroupedTopN rank"))?;
             let novarocks_physical_plan::ExprKind::Value(value) = definition.kind else {
-                return Err(FragmentCompileError::Invalid(
+                return Err((FragmentCompileError::Invalid(
                     "GroupedTopN rank is not a direct value",
-                ));
+                ))
+                .into());
             };
             let mut ordinal = None;
             for (index, (_, group)) in group_by.iter().enumerate() {
@@ -230,9 +236,9 @@ pub(crate) fn lower_grouped_topn(
                 "GroupedTopN rank is not a complete key",
             ))?;
             if permutation.contains(&ordinal) {
-                return Err(FragmentCompileError::Invalid(
-                    "GroupedTopN rank repeats a key",
-                ));
+                return Err(
+                    (FragmentCompileError::Invalid("GroupedTopN rank repeats a key")).into(),
+                );
             }
             permutation.push(ordinal);
         }
@@ -248,24 +254,27 @@ pub(crate) fn lower_grouped_topn(
                 || call.distinct
                 || !call.order_by.is_empty()
             {
-                return Err(FragmentCompileError::Invalid(
+                return Err((FragmentCompileError::Invalid(
                     "GroupedTopN call is not an exact Intermediate merge",
-                ));
+                ))
+                .into());
             }
             functions.push(crate::aggregate::lower_call(
                 node,
                 call,
                 expressions,
                 &mut work,
+                creation,
             )?);
         }
-        let layout = crate::aggregate::lower_output_layout(
+        let layout = crate::aggregate::lower_output_layout_with_creation(
             package,
             node,
             slots,
             width,
-            "grouped_topn",
+            "local_grouped_topn",
             &mut work,
+            creation,
         )?;
         let limit = usize::try_from(*limit)
             .map_err(|_| FragmentCompileError::Invalid("GroupedTopN limit exceeds host range"))?;
@@ -282,9 +291,5 @@ pub(crate) fn lower_grouped_topn(
             layout,
         ))
     })();
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    crate::creation::finish_attempt(result, work)
 }

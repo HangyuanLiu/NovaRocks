@@ -193,7 +193,12 @@ fn run(
             } else {
                 source.chunk_schema_ref()
             };
-            let result = stages::split(output, source.batch.columns(), &[source.clone()], work)?;
+            let result = stages::split(
+                output,
+                source.record_batch().columns(),
+                &[source.clone()],
+                work,
+            )?;
             assert_eq!(result.stage, stage);
             drop(result);
         }
@@ -267,7 +272,7 @@ fn original_error(stage: AnalyticInputStage) -> String {
         .expect("original unsupported key Data"),
         AnalyticInputStage::OutputSplit => super::split_analytic_output_chunks(
             schema(DataType::Int64),
-            source.batch.columns(),
+            source.record_batch().columns(),
             &[source.clone()],
         )
         .err()
@@ -343,7 +348,7 @@ fn analytic_input_stage_default_values_metadata_null_stability_and_split_boundar
     let reordered =
         super::reorder_chunk_by_partition_keys(&gathered, &[keys]).expect("original regroup");
     let actual = reordered
-        .batch
+        .record_batch()
         .column(0)
         .as_any()
         .downcast_ref::<Int32Array>()
@@ -355,18 +360,18 @@ fn analytic_input_stage_default_values_metadata_null_stability_and_split_boundar
     assert_eq!(reordered.chunk_schema_ref(), gathered.chunk_schema_ref());
     let split = super::split_analytic_output_chunks(
         reordered.chunk_schema_ref(),
-        reordered.batch.columns(),
+        reordered.record_batch().columns(),
         &input,
     )
     .expect("original split");
     assert_eq!(split.iter().map(Chunk::len).collect::<Vec<_>>(), vec![2, 2]);
     assert_eq!(
-        split[0].batch.column(0).to_data(),
-        reordered.batch.column(0).slice(0, 2).to_data()
+        split[0].record_batch().column(0).to_data(),
+        reordered.record_batch().column(0).slice(0, 2).to_data()
     );
     assert_eq!(
-        split[1].batch.column(0).to_data(),
-        reordered.batch.column(0).slice(2, 2).to_data()
+        split[1].record_batch().column(0).to_data(),
+        reordered.record_batch().column(0).slice(2, 2).to_data()
     );
     let original: ArrayRef = Arc::new(StringArray::from(vec![
         Some("prefix"),
@@ -376,11 +381,14 @@ fn analytic_input_stage_default_values_metadata_null_stability_and_split_boundar
     ]));
     let sliced = chunk(original.slice(1, 3));
     let single = super::concat_original_analytic_input(std::slice::from_ref(&sliced)).unwrap();
-    assert!(Arc::ptr_eq(single.batch.column(0), sliced.batch.column(0)));
+    assert!(Arc::ptr_eq(
+        single.record_batch().column(0),
+        sliced.record_batch().column(0)
+    ));
     let unchanged = super::reorder_chunk_by_partition_keys(&single, &[]).unwrap();
     assert!(Arc::ptr_eq(
-        unchanged.batch.column(0),
-        single.batch.column(0)
+        unchanged.record_batch().column(0),
+        single.record_batch().column(0)
     ));
 }
 

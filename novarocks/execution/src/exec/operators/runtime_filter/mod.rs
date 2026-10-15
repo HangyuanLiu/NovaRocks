@@ -374,8 +374,8 @@ impl NativeOrderedLiveConsumerSet {
             } else if mask.iter().all(|value| value != Some(true)) {
                 current = None;
             } else {
-                let filtered =
-                    filter_record_batch(&input.batch, &mask).map_err(|error| error.to_string())?;
+                let filtered = filter_record_batch(&input.record_batch(), &mask)
+                    .map_err(|error| error.to_string())?;
                 current = Some(Chunk::try_new_like(filtered, &input)?);
             }
         }
@@ -816,7 +816,7 @@ impl RuntimeFilterConsumerState {
                 current = None;
             } else {
                 let filtered =
-                    filter_record_batch(&input.batch, &mask).map_err(|e| e.to_string())?;
+                    filter_record_batch(&input.record_batch(), &mask).map_err(|e| e.to_string())?;
                 current = Some(Chunk::try_new_like(filtered, &input)?);
             }
         }
@@ -1752,7 +1752,10 @@ mod tests {
             .apply_chunk(input.clone())
             .expect("apply")
             .expect("pass-through output");
-        assert!(Arc::ptr_eq(output.batch.column(0), input.batch.column(0)));
+        assert!(Arc::ptr_eq(
+            output.record_batch().column(0),
+            input.record_batch().column(0)
+        ));
     }
 
     /// A blocking subscription whose outcome the test publishes, keeping what

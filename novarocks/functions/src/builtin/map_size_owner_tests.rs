@@ -131,7 +131,10 @@ fn map_size_only_real_map_signature_preserves_full_source_identity() {
                 Field::new("authored-entries", DataType::Struct(fields.clone()), false)
                     .with_metadata([("entry-fact".into(), "preserved".into())].into()),
             );
-            let source = FunctionValueType::new(DataType::Map(field.clone(), sorted), nullable);
+            let source = FunctionValueType::from_legacy_declared_projection(
+                DataType::Map(field.clone(), sorted),
+                nullable,
+            );
             let p = prepared_for_test("map_size", std::slice::from_ref(&source)).unwrap();
             assert_eq!(
                 p.contract().selected().argument_types.as_ref(),
@@ -154,10 +157,11 @@ fn map_size_only_real_map_signature_preserves_full_source_identity() {
             else {
                 unreachable!()
             };
-            let DataType::Map(actual, flag) = &selected.data_type else {
+            let DataType::Map(actual, flag) = selected.data_type() else {
                 unreachable!()
             };
-            assert!(Arc::ptr_eq(actual, &field));
+            assert!(actual.metadata().is_empty());
+            assert!(matches!(actual.data_type(), DataType::Struct(fields) if fields.len() == 2));
             assert_eq!(*flag, sorted);
         }
     }

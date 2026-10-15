@@ -16,29 +16,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_schema::{DataType, Field, TimeUnit};
+use arrow_schema::{DataType, TimeUnit};
 
 use crate::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use crate::largeint;
-use crate::logical::{LogicalType, logical_type_of_field};
 use crate::primitive::PrimitiveType;
-
-pub(crate) fn logical_type_to_primitive(logical_type: LogicalType) -> PrimitiveType {
-    match logical_type {
-        LogicalType::Json => PrimitiveType::Json,
-        LogicalType::Hll => PrimitiveType::Hll,
-        LogicalType::Bitmap | LogicalType::Object => PrimitiveType::Object,
-        LogicalType::Percentile => PrimitiveType::Percentile,
-    }
-}
-
-pub(crate) fn field_logical_primitive(field: &Field) -> Option<PrimitiveType> {
-    logical_type_of_field(field).map(logical_type_to_primitive)
-}
-
-pub fn arrow_field_to_primitive(field: &Field) -> Option<PrimitiveType> {
-    field_logical_primitive(field).or_else(|| arrow_type_to_primitive(field.data_type()).ok())
-}
 
 /// Returns the Arrow storage type when `primitive` carries enough type detail.
 pub fn primitive_to_arrow_type(primitive: PrimitiveType) -> Option<DataType> {
@@ -103,30 +85,9 @@ pub(crate) fn arrow_type_to_primitive(data_type: &DataType) -> Result<PrimitiveT
 
 #[cfg(test)]
 mod tests {
-    use arrow_schema::{DataType, Field};
+    use arrow_schema::DataType;
 
     use super::*;
-    use crate::logical::{LogicalType, field_with_logical_type};
-
-    #[test]
-    fn arrow_field_to_primitive_honors_json_metadata() {
-        let field = field_with_logical_type(
-            Field::new("payload", DataType::Utf8, true),
-            LogicalType::Json,
-        );
-
-        assert_eq!(arrow_field_to_primitive(&field), Some(PrimitiveType::Json));
-    }
-
-    #[test]
-    fn arrow_field_to_primitive_falls_back_to_storage_type() {
-        let field = Field::new("plain", DataType::Utf8, true);
-
-        assert_eq!(
-            arrow_field_to_primitive(&field),
-            Some(PrimitiveType::Varchar)
-        );
-    }
 
     #[test]
     fn primitive_to_arrow_type_preserves_the_complete_legacy_mapping() {

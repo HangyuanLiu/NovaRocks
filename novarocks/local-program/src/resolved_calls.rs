@@ -24,6 +24,7 @@
 //! never select or authenticate an implementation here. No mutable instance,
 //! Task capability, memory grant or runtime name resolver is stored.
 
+use crate::creation::{ProgramCreation, ProgramCreationFailure};
 use crate::{
     ProgramExpressionArena, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
     ProgramNodeKind, ProgramRootControlBindings, StaticAggregateCall, StaticExprKind, StaticLayout,
@@ -35,11 +36,13 @@ use novarocks_functions::{
     PreparedScalarKernel, PreparedTableKernel, PreparedWindowKernel, PureCallSpecialization,
     PureImplementationDeclaration, PurePreparationSource, ScopedExpressionEffects,
 };
+#[cfg(test)]
+use novarocks_type_contract::ValueSchemaCreation;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDemand,
     ExpressionUseId, FunctionValueType, MAX_CONTROL_USE_REFERENCES, PureCompileControl,
-    ValueTypeError, WindowBound, WindowFrameExclusion, WindowFrameUnits,
-    arrow_data_types_exact_observed,
+    ValueSchemaCreationScope, ValueTypeError, ValueTypeStorageLifetime, WindowBound,
+    WindowFrameExclusion, WindowFrameUnits, arrow_data_types_exact_observed,
 };
 use novarocks_types::SlotId;
 use std::{
@@ -174,6 +177,7 @@ impl ProgramResolvedCall {
 pub struct ProgramResolvedCalls {
     snapshot: ProgramRootControlBindings,
     calls: Arc<BTreeMap<ProgramCallSite, ProgramResolvedCall>>,
+    _storage: ValueTypeStorageLifetime,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,24 +219,66 @@ impl From<ValueTypeError> for ProgramResolvedCallsError {
     }
 }
 
+impl<H> From<ProgramResolvedCallsError> for ProgramCreationFailure<ProgramResolvedCallsError, H> {
+    fn from(error: ProgramResolvedCallsError) -> Self {
+        match error {
+            ProgramResolvedCallsError::Control(error) => Self::Control(error),
+            other => Self::Owner(other),
+        }
+    }
+}
 impl ProgramResolvedCalls {
     pub fn try_new(
         snapshot: ProgramRootControlBindings,
         calls: Vec<(ProgramCallSite, PureCallSpecialization)>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ProgramResolvedCallsError> {
+        Self::try_new_created::<std::convert::Infallible>(snapshot, calls, None, None, control)
+            .map_err(|error| match error {
+                ProgramCreationFailure::Control(error) => ProgramResolvedCallsError::Control(error),
+                ProgramCreationFailure::Owner(error) => error,
+                ProgramCreationFailure::Resource(_) | ProgramCreationFailure::Capacity(_) => {
+                    ProgramResolvedCallsError::Control(CompileControlError::ResourceExhausted)
+                }
+                ProgramCreationFailure::Creator(never) => match never {},
+            })
+    }
+    pub fn try_new_with_creator_in<H>(
+        snapshot: ProgramRootControlBindings,
+        calls: Vec<(ProgramCallSite, PureCallSpecialization)>,
+        temporary: &mut dyn ValueSchemaCreationScope<H>,
+        retained: &mut dyn ValueSchemaCreationScope<H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ProgramCreationFailure<ProgramResolvedCallsError, H>> {
+        Self::try_new_created(snapshot, calls, Some(temporary), Some(retained), control)
+    }
+    fn try_new_created<H>(
+        snapshot: ProgramRootControlBindings,
+        calls: Vec<(ProgramCallSite, PureCallSpecialization)>,
+        temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
+        retained: Option<&mut dyn ValueSchemaCreationScope<H>>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ProgramCreationFailure<ProgramResolvedCallsError, H>> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        let mut temporary = ProgramCreation { creator: temporary };
+        let mut retained = ProgramCreation { creator: retained };
         if calls.len() > MAX_CONTROL_USE_REFERENCES {
-            return Err(ProgramResolvedCallsError::TooManyItems);
+            return Err(ProgramResolvedCallsError::TooManyItems.into());
         }
         let mut pending = BTreeMap::new();
         for (site, call) in calls {
             work.step()?;
             if call.source() != PurePreparationSource::Frozen {
-                return Err(ProgramResolvedCallsError::WrongSource);
+                return Err(ProgramResolvedCallsError::WrongSource.into());
+            }
+            // Requests follow actual insertions, including a duplicate's
+            // replacement operation. Removal later never resets the allowance.
+            if !pending.contains_key(&site) {
+                temporary.before_tree_insert::<ProgramResolvedCallsError,
+                    ProgramCallSite, PureCallSpecialization>(pending.len(), &mut work)?;
             }
             if pending.insert(site, call).is_some() {
-                return Err(ProgramResolvedCallsError::DuplicateSite);
+                return Err(ProgramResolvedCallsError::DuplicateSite.into());
             }
         }
         let mut references = 0usize;
@@ -261,12 +307,14 @@ impl ProgramResolvedCalls {
                             &projection.layout,
                             call.input_slot_id,
                             &mut references,
+                            &mut temporary,
                             &mut work,
                         )?;
                         slots.request(
                             writer_multiplex_layout,
                             call.intermediate_slot_id,
                             &mut references,
+                            &mut temporary,
                             &mut work,
                         )?;
                     }
@@ -281,6 +329,7 @@ impl ProgramResolvedCalls {
                             writer_multiplex_layout,
                             call.intermediate_input_slot_id,
                             &mut references,
+                            &mut temporary,
                             &mut work,
                         )?;
                     }
@@ -290,7 +339,7 @@ impl ProgramResolvedCalls {
                 } => {
                     let layout = snapshot.program().nodes()[input.index()].output_layout();
                     for slot in param_slots {
-                        slots.request(layout, *slot, &mut references, &mut work)?;
+                        slots.request(layout, *slot, &mut references, &mut temporary, &mut work)?;
                     }
                 }
                 _ => {}
@@ -303,18 +352,26 @@ impl ProgramResolvedCalls {
         for (root, use_id) in snapshot.bindings() {
             let arena = root.arena();
             let flow = &snapshot.flows()[&arena];
-            let mut stack = vec![*use_id];
+            let mut stack =
+                temporary.reserve::<ProgramResolvedCallsError, ExpressionUseId>(1, &mut work)?;
+            stack.push(*use_id);
             while let Some(use_id) = stack.pop() {
                 work.step()?;
+                let key = ProgramUseRef { arena, use_id };
+                if !owners.contains_key(&key) {
+                    temporary.before_tree_insert::<ProgramResolvedCallsError,
+                        ProgramUseRef, ProgramExpressionRootSite>(owners.len(), &mut work)?;
+                }
                 if owners
                     .insert(ProgramUseRef { arena, use_id }, *root)
                     .is_some()
                 {
-                    return Err(ProgramResolvedCallsError::SharedUse);
+                    return Err(ProgramResolvedCallsError::SharedUse.into());
                 }
                 let invocation = &flow.uses()[&use_id];
                 for child in invocation.arguments.iter().rev() {
                     work.step()?;
+                    before_stack_push(&mut temporary, &stack, &mut work)?;
                     stack.push(*child);
                 }
             }
@@ -350,6 +407,8 @@ impl ProgramResolvedCalls {
                         .ok_or(ProgramResolvedCallsError::InvalidSite)?,
                     occurrence,
                 };
+                retained.before_tree_insert::<ProgramResolvedCallsError,
+                    ProgramCallSite, ProgramResolvedCall>(checked.len(), &mut work)?;
                 checked.insert(
                     site,
                     ProgramResolvedCall {
@@ -370,7 +429,10 @@ impl ProgramResolvedCalls {
                 &mut CompileCheckpoints<'_>,
             )
                 -> Result<(), ProgramResolvedCallsError>|
-             -> Result<(), ProgramResolvedCallsError> {
+             -> Result<
+                (),
+                ProgramCreationFailure<ProgramResolvedCallsError, H>,
+            > {
                 work.step()?;
                 references = references
                     .checked_add(1)
@@ -379,8 +441,16 @@ impl ProgramResolvedCalls {
                 let call = pending
                     .remove(&site)
                     .ok_or(ProgramResolvedCallsError::MissingSite(site))?;
-                validate_relational_context(&snapshot, &call, &mut relational_ids)?;
+                validate_relational_context(
+                    &snapshot,
+                    &call,
+                    &mut relational_ids,
+                    &mut temporary,
+                    &mut work,
+                )?;
                 validate(&call, &mut work)?;
+                retained.before_tree_insert::<ProgramResolvedCallsError,
+                    ProgramCallSite, ProgramResolvedCall>(checked.len(), &mut work)?;
                 checked.insert(
                     site,
                     ProgramResolvedCall {
@@ -491,7 +561,12 @@ impl ProgramResolvedCalls {
                                 {
                                     return Err(ProgramResolvedCallsError::WrongPhase);
                                 }
-                                check_aggregate_source(&function.resolved, aggregate, work)?;
+                                check_aggregate_source(
+                                    function.frozen.as_deref(),
+                                    &function.resolved,
+                                    aggregate,
+                                    work,
+                                )?;
                                 let argument = aggregate
                                     .logical_argument_types()
                                     .next()
@@ -534,7 +609,12 @@ impl ProgramResolvedCalls {
                                 if aggregate.phase() != AggregateKernelPhase::Final {
                                     return Err(ProgramResolvedCallsError::WrongPhase);
                                 }
-                                check_aggregate_source(&function.resolved, aggregate, work)?;
+                                check_aggregate_source(
+                                    function.frozen.as_deref(),
+                                    &function.resolved,
+                                    aggregate,
+                                    work,
+                                )?;
                                 slots.check(
                                     writer_multiplex_layout,
                                     function.intermediate_input_slot_id,
@@ -581,10 +661,10 @@ impl ProgramResolvedCalls {
                                 .zip(contract.argument_types())
                             {
                                 slots.check(layout, *slot, ty, work)?;
-                                check_arrow(old_type, &ty.data_type, work)?;
+                                check_arrow(old_type, &ty.data_type(), work)?;
                             }
                             for (old_type, ty) in ret_types.iter().zip(contract.result_types()) {
-                                check_arrow(old_type, &ty.data_type, work)?;
+                                check_arrow(old_type, &ty.data_type(), work)?;
                             }
                             Ok(())
                         },
@@ -594,12 +674,16 @@ impl ProgramResolvedCalls {
             }
         }
         if !pending.is_empty() {
-            return Err(ProgramResolvedCallsError::InvalidSite);
+            return Err(ProgramResolvedCallsError::InvalidSite.into());
         }
+        let storage = retained.storage();
+        retained.before_arc::<ProgramResolvedCallsError,
+            BTreeMap<ProgramCallSite, ProgramResolvedCall>>(&mut work)?;
         work.finish()?;
         Ok(Self {
             snapshot,
             calls: Arc::new(checked),
+            _storage: storage,
         })
     }
     pub const fn snapshot(&self) -> &ProgramRootControlBindings {
@@ -688,7 +772,7 @@ fn validate_expression(
                     .node(child.definition)
                     .ok_or(ProgramResolvedCallsError::InvalidSite)?
                     .data_type(),
-                &source.value_type.data_type,
+                &source.value_type.data_type(),
                 work,
             )?;
         }
@@ -714,7 +798,7 @@ fn validate_expression(
                         .node(*definition)
                         .ok_or(ProgramResolvedCallsError::InvalidSite)?
                         .data_type(),
-                    &ty.data_type,
+                    &ty.data_type(),
                     work,
                 )?;
             }
@@ -740,7 +824,7 @@ fn validate_expression(
                         .node(*definition)
                         .ok_or(ProgramResolvedCallsError::InvalidSite)?
                         .data_type(),
-                    &ty.data_type,
+                    &ty.data_type(),
                     work,
                 )?,
                 FunctionArgumentType::Lambda { .. } => {
@@ -794,7 +878,7 @@ fn validate_expression(
                 .node(*body)
                 .ok_or(ProgramResolvedCallsError::InvalidSite)?
                 .data_type(),
-            &contract.body_result_type().data_type,
+            &contract.body_result_type().data_type(),
             work,
         )?;
     }
@@ -802,8 +886,8 @@ fn validate_expression(
         return Err(ProgramResolvedCallsError::WrongLifecycle);
     };
     if invocation.context.demand == EvaluationDemand::TruthOnly
-        && (!matches!(result.data_type, arrow_schema::DataType::Boolean)
-            || result.logical_type != novarocks_type_contract::ValueLogicalType::Physical)
+        && (!matches!(result.data_type(), arrow_schema::DataType::Boolean)
+            || result.logical_type() != novarocks_type_contract::ValueLogicalType::Physical)
     {
         return Err(ProgramResolvedCallsError::TypeMismatch);
     }
@@ -812,30 +896,38 @@ fn validate_expression(
             .node(invocation.definition)
             .ok_or(ProgramResolvedCallsError::InvalidSite)?
             .data_type(),
-        &result.data_type,
+        &result.data_type(),
         work,
     )
 }
 
-fn validate_relational_context(
+fn validate_relational_context<H>(
     snapshot: &ProgramRootControlBindings,
     token: &PureCallSpecialization,
     ids: &mut BTreeSet<ExpressionUseId>,
-) -> Result<(), ProgramResolvedCallsError> {
+    temporary: &mut ProgramCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ProgramCreationFailure<ProgramResolvedCallsError, H>> {
     let context = token.call_contract().context();
     if context.demand != EvaluationDemand::Value || token.effects().context() != context {
-        return Err(ProgramResolvedCallsError::WrongContext);
+        return Err(ProgramResolvedCallsError::WrongContext.into());
     }
     let flow = &snapshot.flows()[&ProgramExpressionArena::Main];
+    if !flow.uses().contains_key(&context.use_id) && !ids.contains(&context.use_id) {
+        temporary.before_tree_insert::<ProgramResolvedCallsError, ExpressionUseId, ()>(
+            ids.len(),
+            work,
+        )?;
+    }
     if flow.uses().contains_key(&context.use_id) || !ids.insert(context.use_id) {
-        return Err(ProgramResolvedCallsError::SharedUse);
+        return Err(ProgramResolvedCallsError::SharedUse.into());
     }
     let domain = flow
         .domains()
         .get(&context.domain)
         .ok_or(ProgramResolvedCallsError::InvalidDomain)?;
     if domain.parent.is_some() || domain.guard.is_some() {
-        return Err(ProgramResolvedCallsError::InvalidDomain);
+        return Err(ProgramResolvedCallsError::InvalidDomain.into());
     }
     Ok(())
 }
@@ -875,7 +967,7 @@ fn validate_aggregate(
         },
     };
     let contract = aggregate_contract(token)?;
-    check_aggregate_source(&source.resolved, contract, work)?;
+    check_aggregate_source(source.frozen.as_deref(), &source.resolved, contract, work)?;
     let same_interpretation = match (
         &source.state_interpretation,
         contract.state_interpretation(),
@@ -937,13 +1029,28 @@ fn validate_aggregate(
     Ok(())
 }
 
-/// Compare mandatory legacy carriers only. Optional types and display names
-/// never establish logical identity or an exact selected implementation.
+/// Compare the complete frozen source against the actual kernel owner. The
+/// legacy carrier-only representation remains an explicit expansion adapter.
 fn check_aggregate_source(
+    frozen: Option<&crate::FrozenAggregateSelection>,
     source: &novarocks_functions::ResolvedAggregateSignature,
     contract: &AggregateCallContract,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProgramResolvedCallsError> {
+    if let Some(frozen) = frozen {
+        return if frozen.matches_selection_observed::<ProgramResolvedCallsError>(
+            contract.call().function_id(),
+            contract.call().selected(),
+            contract.call().logical_argument_count(),
+            || work.step().map_err(Into::into),
+        )? {
+            Ok(())
+        } else {
+            Err(ProgramResolvedCallsError::TypeMismatch)
+        };
+    }
+    // Expansion-only carrier representation. Strong lowered calls retain the
+    // original complete selection above; this adapter is retired with P07.
     if &source.state_format != contract.state_format() {
         return Err(ProgramResolvedCallsError::WrongStateFormat);
     }
@@ -955,14 +1062,18 @@ fn check_aggregate_source(
             .logical_argument_types()
             .chain(contract.order_argument_types()),
     ) {
-        check_arrow(source, &ty.data_type, work)?;
+        check_arrow(source, &ty.data_type(), work)?;
     }
     check_arrow(
         &source.intermediate_type,
-        &contract.intermediate_type().data_type,
+        &contract.intermediate_type().data_type(),
         work,
     )?;
-    check_arrow(&source.output_type, &contract.final_type().data_type, work)
+    check_arrow(
+        &source.output_type,
+        &contract.final_type().data_type(),
+        work,
+    )
 }
 
 fn check_order(
@@ -1014,7 +1125,7 @@ fn check_argument_root(
     let definition = snapshot.roots().arenas()[&ProgramExpressionArena::Main]
         .node(invocation.definition)
         .ok_or(ProgramResolvedCallsError::InvalidSite)?;
-    check_arrow(definition.data_type(), &ty.data_type, work)
+    check_arrow(definition.data_type(), &ty.data_type(), work)
 }
 
 /// Each call carries its own frame and NULL treatment. A legacy call's frame
@@ -1038,9 +1149,9 @@ fn validate_window(
     if contract.aggregate().is_some() != source.aggregate_binding.is_some() {
         return Err(ProgramResolvedCallsError::WrongLifecycle);
     }
-    if let (Some(aggregate), Some((_, source))) = (contract.aggregate(), &source.aggregate_binding)
+    if let (Some(aggregate), Some((_, legacy))) = (contract.aggregate(), &source.aggregate_binding)
     {
-        check_aggregate_source(source, aggregate, work)?;
+        check_aggregate_source(source.frozen_aggregate.as_deref(), legacy, aggregate, work)?;
     }
     if source.ignore_nulls != contract.options().ignore_nulls() {
         return Err(ProgramResolvedCallsError::WrongWindow);
@@ -1091,7 +1202,11 @@ fn validate_window(
             work,
         )?;
     }
-    check_arrow(&source.return_type, &contract.result_type().data_type, work)
+    check_arrow(
+        &source.return_type,
+        &contract.result_type().data_type(),
+        work,
+    )
 }
 
 fn convert_frame(
@@ -1130,6 +1245,23 @@ fn convert_frame(
     })
 }
 
+fn before_stack_push<H>(
+    temporary: &mut ProgramCreation<'_, H>,
+    source: &Vec<ExpressionUseId>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ProgramCreationFailure<ProgramResolvedCallsError, H>> {
+    let facts = novarocks_type_contract::owned_resources::vec::push_growth(source)
+        .map_err(|e| match e {
+            novarocks_type_contract::ControlResourceError::Control(e) => ProgramCreationFailure::Control(e),
+            novarocks_type_contract::ControlResourceError::SourceModel(_) =>
+                ProgramCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
+        })?;
+    if let Some(layout) = facts.requested_backing {
+        temporary.request::<ProgramResolvedCallsError>(layout, work)?;
+    }
+    Ok(())
+}
+
 /// Keys identify the exact borrowed layout object, never a schema digest or
 /// equal-width surrogate. No pointer is dereferenced through an integer key.
 #[derive(Default)]
@@ -1137,24 +1269,36 @@ struct RequestedSlots<'a> {
     layouts: BTreeMap<usize, (&'a StaticLayout, BTreeMap<SlotId, Option<usize>>)>,
 }
 impl<'a> RequestedSlots<'a> {
-    fn request(
+    fn request<H>(
         &mut self,
         layout: &'a StaticLayout,
         slot: SlotId,
         references: &mut usize,
+        temporary: &mut ProgramCreation<'_, H>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), ProgramResolvedCallsError> {
+    ) -> Result<(), ProgramCreationFailure<ProgramResolvedCallsError, H>> {
         work.step()?;
         *references = references
             .checked_add(1)
             .filter(|n| *n <= MAX_CONTROL_USE_REFERENCES)
             .ok_or(ProgramResolvedCallsError::TooManyItems)?;
-        self.layouts
-            .entry(layout as *const StaticLayout as usize)
+        let key = layout as *const StaticLayout as usize;
+        if !self.layouts.contains_key(&key) {
+            temporary.before_tree_insert::<ProgramResolvedCallsError, usize,
+                (&'a StaticLayout, BTreeMap<SlotId, Option<usize>>)>(self.layouts.len(), work)?;
+        }
+        let requested = &mut self
+            .layouts
+            .entry(key)
             .or_insert_with(|| (layout, BTreeMap::new()))
-            .1
-            .entry(slot)
-            .or_insert(None);
+            .1;
+        if !requested.contains_key(&slot) {
+            temporary.before_tree_insert::<ProgramResolvedCallsError, SlotId, Option<usize>>(
+                requested.len(),
+                work,
+            )?;
+        }
+        requested.entry(slot).or_insert(None);
         Ok(())
     }
     fn index(
@@ -1189,7 +1333,7 @@ impl<'a> RequestedSlots<'a> {
             .ok_or(ProgramResolvedCallsError::WrongArguments)?;
         check_arrow(
             layout.schema().field(ordinal).data_type(),
-            &ty.data_type,
+            &ty.data_type(),
             work,
         )
     }

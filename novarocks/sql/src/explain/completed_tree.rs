@@ -550,7 +550,7 @@ impl<'a> TreeContext<'a> {
                     out.push(format_args!("  runtime filter"))?;
                     out.push(format_args!(
                         "    domain = OrderedBound(key={} {} NULLS {}, inclusive={inclusive})",
-                        key.ty.data_type,
+                        key.ty.data_type(),
                         match key.direction {
                             novarocks_physical_plan::SortDirection::Ascending => "ASC",
                             novarocks_physical_plan::SortDirection::Descending => "DESC",
@@ -751,7 +751,7 @@ fn scan_admits_min_max_stats(
         fragment
             .values()
             .get(value)
-            .is_some_and(|definition| type_states_bounds(&definition.ty.data_type))
+            .is_some_and(|definition| type_states_bounds(&definition.ty.data_type()))
     })
 }
 

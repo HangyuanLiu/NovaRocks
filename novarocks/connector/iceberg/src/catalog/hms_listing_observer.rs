@@ -29,7 +29,6 @@ pub(super) const JOURNAL_CAPACITY: usize = 1024;
 pub(crate) enum HmsListingOperation {
     Namespaces,
     Tables,
-    Views,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -485,7 +484,7 @@ mod internal_tests {
             state.used = JOURNAL_CAPACITY;
             state.in_flight = 0;
         });
-        let extra = observer.begin(HmsListingOperation::Views, None, Instant::now());
+        let extra = observer.begin(HmsListingOperation::Namespaces, None, Instant::now());
         assert!(extra.slot.is_none());
         observer.with_state(|state| {
             assert_eq!(state.records[0].unwrap().ordinal, first.ordinal);

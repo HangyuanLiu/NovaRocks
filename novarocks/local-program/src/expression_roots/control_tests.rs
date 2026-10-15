@@ -833,6 +833,7 @@ fn three_scope_program(
                     },
                     writer_multiplex_layout: layout.clone(),
                     partial_aggregates: vec![],
+                    partial_preparation: None,
                 },
                 layout.clone(),
             ),
@@ -1184,4 +1185,143 @@ fn root_collection_and_flow_binding_observe_control_at_256_work() {
                 .all(|(phase, units)| *phase == CompilePhase::LowerProgram && *units <= 256)
         );
     }
+}
+
+// The supplied owner is lifetime-only. Its observer records actual public
+// requests and locked opaque operation bounds, without manufacturing a grant.
+struct CreationHold(Arc<std::sync::atomic::AtomicUsize>);
+impl novarocks_type_contract::ValueTypeStorageHold for CreationHold {}
+impl Drop for CreationHold {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CreationEvent {
+    Layout(usize, usize),
+    Opaque(usize),
+}
+#[derive(Debug, Eq, PartialEq)]
+struct CallerRefusal {
+    operation: usize,
+    original: u64,
+}
+fn creation_storage(drops: &Arc<std::sync::atomic::AtomicUsize>) -> ValueTypeStorageLifetime {
+    ValueTypeStorageLifetime::held(Arc::new(CreationHold(drops.clone())))
+}
+
+#[test]
+fn root_binding_temporary_set_exits_while_created_binding_map_stays_live() {
+    let program = mixed_program(bool_arena(), 0);
+    let flows = main_flow(mixed_flow(0, EvaluationDemand::TruthOnly));
+    let bindings = mixed_bindings();
+    let expected = ProgramRootControlBindings::try_new(
+        program.clone(),
+        flows.clone(),
+        bindings.clone(),
+        &Control::default(),
+    )
+    .unwrap();
+    let temporary_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let retained_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let temp_events = Arc::new(Mutex::new(Vec::new()));
+    let events = temp_events.clone();
+    let mut temp_request = move |layout: std::alloc::Layout| -> Result<(), CallerRefusal> {
+        events
+            .lock()
+            .unwrap()
+            .push(CreationEvent::Layout(layout.size(), layout.align()));
+        Ok(())
+    };
+    let events = temp_events.clone();
+    let mut temp_opaque = move |bytes| -> Result<(), CallerRefusal> {
+        events.lock().unwrap().push(CreationEvent::Opaque(bytes));
+        Ok(())
+    };
+    let mut retained_request = |_: std::alloc::Layout| -> Result<(), CallerRefusal> { Ok(()) };
+    let mut retained_opaque = |_: usize| -> Result<(), CallerRefusal> { Ok(()) };
+    let mut temporary = ValueSchemaCreation::new(
+        creation_storage(&temporary_drops),
+        &mut temp_request,
+        &mut temp_opaque,
+    );
+    let mut retained = ValueSchemaCreation::new(
+        creation_storage(&retained_drops),
+        &mut retained_request,
+        &mut retained_opaque,
+    );
+    let snapshot = ProgramRootControlBindings::try_new_with_creator_in(
+        program,
+        flows,
+        bindings,
+        &mut temporary,
+        &mut retained,
+        &Control::default(),
+    )
+    .unwrap();
+    assert_eq!(snapshot.bindings(), expected.bindings());
+    assert_eq!(snapshot.roots().sites(), expected.roots().sites());
+    assert!(
+        temp_events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|event| matches!(event,CreationEvent::Opaque(bytes) if *bytes > 0))
+    );
+    assert_eq!(temp_events.lock().unwrap().len(), 2);
+    drop(temporary);
+    assert_eq!(temporary_drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let late = snapshot.bindings.clone();
+    drop(snapshot);
+    drop(retained);
+    assert_eq!(retained_drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(late.len(), 2);
+    drop(late);
+    assert_eq!(retained_drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // A scratch refusal is returned before the corresponding Set insertion;
+    // no later retained construction request or footer may follow it.
+    let rejected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut request = |_| -> Result<(), CallerRefusal> { Ok(()) };
+    let rejection = rejected.clone();
+    let mut opaque = move |_| -> Result<(), CallerRefusal> {
+        rejection.store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(CallerRefusal {
+            operation: 0,
+            original: 71,
+        })
+    };
+    let mut temporary =
+        ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+    let no_tail = rejected.clone();
+    let mut request = move |_| -> Result<(), CallerRefusal> {
+        assert!(
+            !no_tail.load(std::sync::atomic::Ordering::SeqCst),
+            "retained request after scratch refusal"
+        );
+        Ok(())
+    };
+    let no_tail = rejected.clone();
+    let mut opaque = move |_| -> Result<(), CallerRefusal> {
+        assert!(
+            !no_tail.load(std::sync::atomic::Ordering::SeqCst),
+            "retained opaque request after scratch refusal"
+        );
+        Ok(())
+    };
+    let mut retained =
+        ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+    assert!(matches!(
+        ProgramRootControlBindings::try_new_with_creator_in(
+            mixed_program(bool_arena(), 0),
+            main_flow(mixed_flow(0, EvaluationDemand::TruthOnly)),
+            mixed_bindings(),
+            &mut temporary,
+            &mut retained,
+            &Control::default()
+        ),
+        Err(ProgramCreationFailure::Creator(CallerRefusal {
+            original: 71,
+            ..
+        }))
+    ));
 }

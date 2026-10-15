@@ -80,15 +80,19 @@ fn e08s1_percentile_static_rejects_unprepared_wrong_full_fields_and_logical_chan
         let FunctionResultType::Scalar(output) = &mut bad_result.selected.result_type else {
             unreachable!()
         };
-        output.nullable = false;
+        *output = output
+            .with_nullable(false)
+            .expect("valid test root nullability");
         let mut bad_state = binding.clone();
-        bad_state
+        let intermediate = &mut bad_state
             .selected
             .aggregate
             .as_mut()
             .unwrap()
-            .intermediate_type
-            .nullable = false;
+            .intermediate_type;
+        *intermediate = intermediate
+            .with_nullable(false)
+            .expect("valid test root nullability");
         let mut no_state = binding.clone();
         no_state.selected.aggregate = None;
         let mut bad_logical = binding.clone();

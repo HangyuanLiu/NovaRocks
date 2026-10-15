@@ -46,6 +46,19 @@ use novarocks_physical_plan::{
 use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueLogicalType};
 use std::collections::BTreeMap;
 
+// Isolate the new typed-construction requests from the original candidate
+// allocator oracle. Both use explicit finite hosts; this is not a combined
+// physical-peak assertion or an unbounded process-default creator.
+fn prepare_typed_fixture_operator(operator: &mut dyn Operator) {
+    let tracker = MemTracker::new_root("grouped-fixture-typed-construction");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker,
+        Arc::new(RuntimeErrorState::default()),
+    ));
+    operator.prepare().unwrap();
+}
+
 type Input = (Option<i64>, Option<i64>);
 type Output = (Option<i64>, i64, Option<i64>, Option<i64>, Option<i64>);
 const ROWS: &[Input] = &[
@@ -411,7 +424,7 @@ fn declared_values(
 ) -> (Vec<novarocks_physical_plan::ValueId>, ConstantPools) {
     if !types.iter().any(|ty| {
         matches!(
-            ty.data_type,
+            ty.data_type(),
             DataType::Int8 | DataType::Int16 | DataType::Int32
         )
     }) {
@@ -421,7 +434,7 @@ fn declared_values(
     let mut pool_ids = Vec::new();
     for (column, ty) in types.iter().enumerate() {
         if !matches!(
-            ty.data_type,
+            ty.data_type(),
             DataType::Int8 | DataType::Int16 | DataType::Int32
         ) {
             pool_ids.push(None);
@@ -445,7 +458,7 @@ fn declared_values(
             .map(|value| u32::try_from(distinct.binary_search(value).unwrap()).unwrap())
             .collect::<Vec<_>>();
         let values = distinct.into_iter();
-        let array: ArrayRef = match ty.data_type {
+        let array: ArrayRef = match ty.data_type() {
             DataType::Int8 => Arc::new(Int8Array::from_iter(
                 values.map(|value| value.map(|value| i8::try_from(value).unwrap())),
             )),
@@ -521,12 +534,13 @@ fn partial_chunks(f: &Fixture, offset: usize, len: usize) -> Vec<Chunk> {
     .unwrap();
     let mut operator = factory.create(1, 0);
     operator.set_mem_tracker(MemTracker::new_root("grouped-fixture-partial"));
+    prepare_typed_fixture_operator(operator.as_mut());
     let state = RuntimeState::default();
     let processor = operator.as_processor_mut().unwrap();
     processor
         .push_chunk(
             &state,
-            Chunk::new_like(f.input.batch.slice(offset, len), &f.input),
+            Chunk::new_like(f.input.record_batch().slice(offset, len), &f.input),
         )
         .unwrap();
     processor.set_finishing(&state).unwrap();
@@ -596,6 +610,7 @@ fn try_final_chunks_tracked(
     )?;
     let mut operator = factory.create(1, 0);
     operator.set_mem_tracker(tracker);
+    prepare_typed_fixture_operator(operator.as_mut());
     let state = RuntimeState::default();
     let processor = operator.as_processor_mut().unwrap();
     for chunk in chunks {
@@ -616,7 +631,7 @@ fn read_final_rows(chunks: Vec<Chunk>) -> Vec<Output> {
     let mut result = Vec::new();
     for chunk in chunks {
         let columns = chunk
-            .batch
+            .record_batch()
             .columns()
             .iter()
             .map(|array| array.as_any().downcast_ref::<Int64Array>().unwrap())
@@ -660,6 +675,7 @@ fn compiled_grouped_topn_keeps_all_contributions_within_its_distinct_key_bound()
         let mut processor = factory.processor();
         let tracker = MemTracker::new_root("grouped-fixture-consumer");
         processor.set_mem_tracker(tracker.clone());
+        prepare_typed_fixture_operator(&mut processor);
         let state = RuntimeState::default();
         for (offset, len) in [(0, 3), (3, 2), (5, 4), (9, 2), (11, 4)] {
             for chunk in partial_chunks(&f, offset, len) {
@@ -701,6 +717,7 @@ fn compiled_grouped_topn_cancel_destroys_live_owners_and_keeps_the_first_cause()
     let mut processor = factory.processor();
     let tracker = MemTracker::new_root("grouped-fixture-cancel");
     processor.set_mem_tracker(tracker.clone());
+    prepare_typed_fixture_operator(&mut processor);
     let state = RuntimeState::default();
     for chunk in partial_chunks(&f, 0, 3) {
         processor.push_chunk(&state, chunk).unwrap();
@@ -982,6 +999,7 @@ fn compiled_grouped_topn_complete_key_domains_preserve_order_types_and_contribut
             let mut processor = factory.processor();
             let tracker = MemTracker::new_root("grouped-complete-key-domain");
             processor.set_mem_tracker(tracker.clone());
+            prepare_typed_fixture_operator(&mut processor);
             let state = RuntimeState::default();
             let batch_size = rows.len() / 3;
             for offset in (0..rows.len()).step_by(batch_size) {
@@ -1007,7 +1025,7 @@ fn compiled_grouped_topn_complete_key_domains_preserve_order_types_and_contribut
                 .flat_map(|chunk| {
                     (0..chunk.len()).map(|row| {
                         (0..2)
-                            .map(|column| array_key(chunk.batch.column(column), row))
+                            .map(|column| array_key(chunk.record_batch().column(column), row))
                             .collect::<KeyRow>()
                     })
                 })
@@ -1023,19 +1041,19 @@ fn compiled_grouped_topn_complete_key_domains_preserve_order_types_and_contribut
             let mut actual = Vec::new();
             for chunk in final_chunks(&f, intermediate) {
                 for ordinal in 0..2 {
-                    let input_field = f.input.batch.schema().field(ordinal).clone();
-                    let output_field = chunk.batch.schema().field(ordinal).clone();
+                    let input_field = f.input.record_batch().schema().field(ordinal).clone();
+                    let output_field = chunk.record_batch().schema().field(ordinal).clone();
                     assert_eq!(output_field.data_type(), input_field.data_type());
                     assert_eq!(output_field.metadata(), input_field.metadata());
                     assert_eq!(output_field.is_nullable(), input_field.is_nullable());
                 }
                 for row in 0..chunk.len() {
                     let key = (0..2)
-                        .map(|column| array_key(chunk.batch.column(column), row))
+                        .map(|column| array_key(chunk.record_batch().column(column), row))
                         .collect();
                     let measure = |column| {
                         let array = chunk
-                            .batch
+                            .record_batch()
                             .column(column)
                             .as_any()
                             .downcast_ref::<Int64Array>()

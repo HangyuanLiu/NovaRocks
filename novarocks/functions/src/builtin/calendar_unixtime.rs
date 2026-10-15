@@ -387,20 +387,20 @@ pub(super) fn evaluate_selected<'a>(
         let [FunctionArgumentType::Value(source), rest @ ..] = types.as_ref() else {
             return Err(invalid("from_unixtime requires its exact value arguments"));
         };
-        if source.logical_type != ValueLogicalType::Physical
-            || target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
+        if source.logical_type() != ValueLogicalType::Physical
+            || target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Utf8
+            || !target.nullable()
         {
             return Err(invalid(
                 "from_unixtime differs from its exact declared profile",
             ));
         }
-        let has_format = match (source.data_type.clone(), rest, format_proof) {
+        let has_format = match (source.data_type().clone(), rest, format_proof) {
             (DataType::Int64, [], None) => false,
             (DataType::Utf8, [FunctionArgumentType::Value(format)], Some(_))
-                if format.logical_type == ValueLogicalType::Physical
-                    && format.data_type == DataType::Utf8 =>
+                if format.logical_type() == ValueLogicalType::Physical
+                    && format.data_type() == &DataType::Utf8 =>
             {
                 true
             }
@@ -494,7 +494,7 @@ pub(super) fn evaluate_selected<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             output,
             Box::default(),
             || work.step(),

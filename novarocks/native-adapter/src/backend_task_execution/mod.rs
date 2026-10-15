@@ -50,7 +50,7 @@ mod tests;
 
 pub use compiled_package::{
     CompiledPackageCompiler, CompiledPackageError, CompiledPackageInterpreter, CompiledTaskOptions,
-    CompiledTaskProgram,
+    CompiledTaskProgram, CompiledTypeScope, CompiledTypeScopes, NativeTypeConstructionError,
 };
 pub use context_host::NativeQueryContextHost;
 pub use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};
@@ -66,18 +66,24 @@ pub use project_materialization::{
     ProjectMetadataHost, ProjectMetadataJournal, ProjectMetadataPhase,
 };
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 mod project_metadata_test_support;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub use project_metadata_test_support::{
     PreparedProjectMetadataForTest, prepare_project_metadata_for_test,
 };
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 mod window_metadata_test_support;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub use window_metadata_test_support::{
     PreparedWindowMetadataForTest, PreparedWindowMetadataGraphForTest,
     WindowSchemaOccurrenceForTest, prepare_window_metadata_for_test,
     prepare_window_metadata_graph_for_test,
 };
+
+#[cfg(any(test, feature = "test-support"))]
+pub use compiled_package::compile_native_package_with_funding_for_test;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use compiled_package::with_native_type_construction_for_test;

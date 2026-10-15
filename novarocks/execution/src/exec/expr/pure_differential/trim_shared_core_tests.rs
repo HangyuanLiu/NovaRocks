@@ -407,7 +407,7 @@ fn c12_p1_trim_actual_compiled_slot_and_sparse_strict_null_match_v1() {
                     .evaluate(&batch, selection, &HarnessControl)
                     .unwrap();
                 assert_eq!(actual.selection(), selection);
-                assert_eq!(actual.values().data_type(), &ty.data_type);
+                assert_eq!(actual.values().data_type(), ty.data_type());
                 assert!(actual.errors().is_empty());
                 assert_eq!(actual.values().len(), expected.len());
                 for i in 0..expected.len() {

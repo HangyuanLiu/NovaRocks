@@ -72,26 +72,23 @@ fn type_only_scalar_preparation_retains_lambda_types_without_body_value_demand()
 
 #[test]
 fn type_only_preparation_rejects_malformed_or_unbounded_lambda_metadata() {
-    let malformed = FunctionValueType {
-        data_type: DataType::Boolean,
-        nullable: true,
-        logical_type: novarocks_type_contract::ValueLogicalType::LargeInt,
-    };
-    for (parameter_types, result_type, resource_failure) in [
-        (
-            vec![malformed.clone()],
-            FunctionValueType::new(DataType::Boolean, true),
-            false,
-        ),
-        (vec![], malformed, false),
-        (
-            vec![FunctionValueType::new(DataType::Int64, false); MAX_CALL_EFFECT_ARGUMENTS + 1],
-            FunctionValueType::new(DataType::Boolean, true),
+    assert!(
+        FunctionValueType::try_with_logical_type(
+            DataType::Boolean,
             true,
-        ),
-    ] {
+            novarocks_type_contract::ValueLogicalType::LargeInt
+        )
+        .is_err()
+    );
+    for (parameter_types, result_type, resource_failure) in [(
+        vec![FunctionValueType::new(DataType::Int64, false); MAX_CALL_EFFECT_ARGUMENTS + 1],
+        FunctionValueType::new(DataType::Boolean, true),
+        true,
+    )] {
         let mut fixture = Fixture::new(vec![FunctionArgument::Lambda {
-            parameter_types: parameter_types.into_boxed_slice(),
+            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                parameter_types.into_boxed_slice(),
+            ),
             result_type,
         }]);
         fixture.uses.fill(None);
@@ -122,7 +119,9 @@ fn type_only_preparation_rejects_malformed_or_unbounded_lambda_metadata() {
 
 fn lambda(result_type: FunctionValueType) -> FunctionArgument {
     FunctionArgument::Lambda {
-        parameter_types: vec![FunctionValueType::new(DataType::Int64, false)].into_boxed_slice(),
+        parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+            vec![FunctionValueType::new(DataType::Int64, false)].into_boxed_slice(),
+        ),
         result_type,
     }
 }
@@ -134,10 +133,13 @@ impl Fixture {
             selected: FunctionBindingSelection {
                 overload: FunctionOverloadId::try_new("fixture/higher-order/exact-signature")
                     .unwrap(),
-                argument_types: arguments
-                    .iter()
-                    .map(FunctionArgument::argument_type)
-                    .collect(),
+                argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                    arguments
+                        .iter()
+                        .map(FunctionArgument::argument_type)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
                 // The body demand is independent of the outer call result.
                 result_type: FunctionResultType::Scalar(FunctionValueType::new(
                     DataType::Int64,

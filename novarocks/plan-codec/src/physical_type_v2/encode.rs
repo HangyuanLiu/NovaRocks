@@ -22,23 +22,28 @@
 use super::encode_resources::Model;
 use super::{
     FieldRootSources, PackageTypeProjectionFacts, PackageTypeProjectionLimits, TypeCodecError,
-    TypeProjectionLimits, ValueRootSources, WriterTypeSource, encode_logical, validate_field,
-    validate_type_visit,
+    TypeProjectionLimits, ValueRootSources, WriterTypeSource,
+    semantic::{self, Children},
+    validate_field, validate_type_visit,
 };
 use crate::allocation_exit_v2::reserve_exit;
 use crate::arrow_metadata_v2::{copy_string, encode_metadata};
-use arrow::datatypes::{DataType, Field, UnionMode};
-use novarocks_proto_models::{physical_type_v2 as wire, plan};
-use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, FunctionValueType, ValueTypeVisit, field_logical_type,
-    validate_arrow_carrier_parameters_observed, validate_value_type_structure_observed,
+use crate::value_type_table::{
+    LogicalTypeRoot, LogicalTypeTableBuilder, resources as shared_resources,
 };
+use arrow::datatypes::{DataType, Field, UnionMode};
+use novarocks_proto_models::{physical_type_v2 as wire, plan, value_type as logical_wire};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, FunctionValueType, ValueTypeVisit,
+    validate_arrow_carrier_parameters_observed, validate_arrow_layout_structure_observed,
+};
+use std::alloc::Layout;
 use std::{collections::BTreeSet, sync::Arc};
 use wire::carrier_type_definition::Kind;
 
 type Error = TypeCodecError;
 type HostError<H> = crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>;
-use crate::host_projection_v2::AdmissionRefusal;
+use crate::host_projection_v2::{AdmissionRefusal, ProjectionFailure};
 
 /// The only non-strict selector carries an actual checked recipe source.
 /// It is never constructed from a DTO, nominal carrier or caller boolean.
@@ -306,7 +311,15 @@ fn validate_strict_type<H>(
     resources: &mut Option<Admission<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), HostError<H>> {
-    validate_value_type_structure_observed(ty, |visit| {
+    validate_arrow_layout_structure_observed(ty, |visit| {
+        if let Some(resources) = resources {
+            match visit {
+                ValueTypeVisit::TypeNode(node) => resources.model.strict_carrier(node)?,
+                ValueTypeVisit::Field(field) => resources.model.strict_field(field)?,
+                ValueTypeVisit::ChildEdge(_) => {}
+            }
+            resources.gate()?;
+        }
         if let ValueTypeVisit::TypeNode(node) = visit {
             admit_strict_nodes(resources, strict_children(node))?;
         }
@@ -405,17 +418,20 @@ fn preflight<'a, H>(
         if !unique {
             return Err(Error::InvalidShape("duplicate value type definition ID").into());
         }
-        value.logical_type.validate_carrier(&value.data_type)?;
-        validate_strict_type(&value.data_type, &mut counts.resources, work)?;
-        let nodes = count_type(&value.data_type, &mut counts, work, SourceLaw::Strict)?;
+        value.logical_type().validate_carrier(value.data_type())?;
+        validate_strict_type(value.data_type(), &mut counts.resources, work)?;
+        let nodes = count_type(value.data_type(), &mut counts, work, SourceLaw::Strict)?;
         counts.expansion(nodes)?;
     }
     for (_, field) in fields.iter() {
         // The root node, whose visit pair is this root Field and its carrier.
         admit_strict_nodes(&mut counts.resources, 1)?;
         work.step()?;
+        if let Some(resources) = &mut counts.resources {
+            resources.model.strict_field(field)?;
+            resources.gate()?;
+        }
         validate_field(field, work)?;
-        field_logical_type(field)?;
         validate_strict_type(field.data_type(), &mut counts.resources, work)?;
         #[allow(deprecated)]
         let dictionary_id = field.dict_id();
@@ -488,40 +504,281 @@ fn output_vec<T>(
     Ok(output)
 }
 
+#[derive(Clone, Copy)]
+enum Projection {
+    Source,
+    Node(u32),
+    MapEntries(u32, u32),
+    EncodingValues(u32),
+}
+impl Projection {
+    fn id(self) -> Option<u32> {
+        match self {
+            Self::Node(id) => Some(id),
+            _ => None,
+        }
+    }
+    fn semantic_id(self) -> Option<u32> {
+        match self {
+            Self::Node(id) | Self::EncodingValues(id) => Some(id),
+            _ => None,
+        }
+    }
+    fn children<'a>(
+        self,
+        defs: &'a [logical_wire::LogicalTypeDefinition],
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Children<'a>, Error> {
+        match self {
+            Self::Source => Ok(Children::Scalar),
+            Self::MapEntries(key, value) => Ok(Children::Map(key, value)),
+            Self::Node(id) | Self::EncodingValues(id) => {
+                semantic::children(semantic::definition(defs, id, work)?)
+            }
+        }
+    }
+}
+fn request<H>(
+    resources: &mut Option<Admission<'_, H>>,
+    allocation: Layout,
+) -> Result<(), AdmissionRefusal<H>> {
+    if let Some(resources) = resources {
+        resources.model.request(allocation, 1)?;
+        let facts = resources.model.facts(resources.limits)?;
+        (resources.admit)(&facts)?;
+    }
+    Ok(())
+}
+fn borrowed_roots<'source, H>(
+    values: ValueRootSources<'source>,
+    writers: &[WriterTypeSource<'source>],
+    resources: &mut Option<Admission<'_, H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(Vec<(u32, &'source FunctionValueType)>, Vec<(u32, u32)>), HostError<H>> {
+    let mut writer_count = 0usize;
+    for source in writers {
+        work.step()?;
+        for binding in source.recipe.input().fields_iter() {
+            work.step()?;
+            if binding.execution_type().is_some() {
+                writer_count = writer_count
+                    .checked_add(1)
+                    .ok_or(CompileControlError::ResourceExhausted)?;
+            }
+        }
+    }
+    let total = values
+        .len()
+        .checked_add(writer_count)
+        .ok_or(CompileControlError::ResourceExhausted)?;
+    if let Some(resources) = resources {
+        resources.model.additional_value_roots(writer_count)?;
+        resources.gate()?;
+    }
+    let mut callback = |allocation| request(resources, allocation);
+    let mut context = shared_resources::Context {
+        observe_scope: None,
+        request: &mut callback,
+        work,
+    };
+    let mut all = context
+        .vector::<(u32, &FunctionValueType)>(total)
+        .map_err(semantic::failure)?;
+    let mut reserved = context
+        .vector::<u32>(values.len())
+        .map_err(semantic::failure)?;
+    for (id, value) in values.iter() {
+        context.step().map_err(semantic::failure)?;
+        all.push((id, value));
+        reserved.push(id);
+    }
+    shared_resources::sort_by_id(&mut reserved, |id| *id, &mut context)
+        .map_err(semantic::failure)?;
+    let mut pairs = context
+        .vector::<(u32, u32)>(writer_count)
+        .map_err(semantic::failure)?;
+    let mut next = 0u64;
+    for source in writers {
+        for (field_id, binding) in source
+            .field_ids
+            .iter()
+            .zip(source.recipe.input().fields_iter())
+        {
+            context.step().map_err(semantic::failure)?;
+            if let Some(value) = binding.execution_type() {
+                let id = loop {
+                    let id = u32::try_from(next)
+                        .map_err(|_| Error::InvalidShape("writer binding IDs exhausted"))?;
+                    next += 1;
+                    context.step().map_err(semantic::failure)?;
+                    if shared_resources::find(&reserved, id, |id| *id, context.work)?.is_none() {
+                        break id;
+                    }
+                };
+                all.push((id, value));
+                pairs.push((*field_id, id));
+            }
+        }
+    }
+    shared_resources::sort_by_id(&mut pairs, |pair| pair.0, &mut context)
+        .map_err(semantic::failure)?;
+    Ok((all, pairs))
+}
+
+/// Resolve explicit associations against an entry-count index of the real
+/// value roots. Neither sparse IDs nor repeated source fields allocate by ID.
+fn associated_roots<'source, H>(
+    values: ValueRootSources<'source>,
+    fields: FieldRootSources<'source>,
+    resources: &mut Option<Admission<'_, H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<(u32, &'source FunctionValueType)>, HostError<H>> {
+    let mut count = 0usize;
+    for ordinal in 0..fields.len() {
+        work.step()?;
+        count += usize::from(fields.value_binding(ordinal).is_some());
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut callback = |layout| request(resources, layout);
+    let mut context = shared_resources::Context {
+        observe_scope: None,
+        request: &mut callback,
+        work,
+    };
+    let mut indexed = context
+        .vector::<(u32, &FunctionValueType)>(values.len())
+        .map_err(semantic::failure)?;
+    for root in values.iter() {
+        context.step().map_err(semantic::failure)?;
+        indexed.push(root);
+    }
+    shared_resources::sort_by_id(&mut indexed, |root| root.0, &mut context)
+        .map_err(semantic::failure)?;
+    Ok(indexed)
+}
+
+fn validate_associated_field<H>(
+    field: &Field,
+    value: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), HostError<H>> {
+    work.step()?;
+    #[allow(deprecated)]
+    if field.is_nullable() != value.nullable()
+        || !field.metadata().is_empty()
+        || field.dict_id().is_some()
+        || field.dict_is_ordered().is_some()
+    {
+        return Err(
+            Error::InvalidShape("execution field differs from its explicit value binding").into(),
+        );
+    }
+    if !novarocks_type_contract::arrow_data_types_exact_borrowed_observed::<Error>(
+        field.data_type(),
+        value.data_type(),
+        || work.step().map_err(Into::into),
+    )? {
+        return Err(Error::InvalidShape(
+            "execution field layout differs from its explicit value binding",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The actual output DTO under construction. Source attributes are emitted
+/// directly beside this shape, never into an intermediate legacy TypeTable.
+struct EmitTarget {
+    shape: wire::TypeTable,
+    source_facts: Option<Vec<wire::SourceArrowFieldFacts>>,
+}
+impl std::ops::Deref for EmitTarget {
+    type Target = wire::TypeTable;
+    fn deref(&self) -> &Self::Target {
+        &self.shape
+    }
+}
+impl std::ops::DerefMut for EmitTarget {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.shape
+    }
+}
+
 fn emit_field(
     field: &Field,
     explicit_id: Option<u32>,
-    table: &mut wire::TypeTable,
+    table: &mut EmitTarget,
     ids: &mut FieldIds,
     work: &mut CompileCheckpoints<'_>,
     law: SourceLaw<'_>,
+    projection: Projection,
+    definitions: &[logical_wire::LogicalTypeDefinition],
 ) -> Result<u32, Error> {
+    #[allow(deprecated)]
+    if table.source_facts.is_none()
+        && (!field.metadata().is_empty()
+            || field.dict_id().is_some()
+            || field.dict_is_ordered().is_some())
+    {
+        return Err(Error::InvalidShape(
+            "execution field cannot carry source Arrow attributes",
+        ));
+    }
     work.step()?;
-    let carrier_type_id = emit_type(field.data_type(), table, ids, work, law)?;
+    let carrier_type_id = emit_type(
+        field.data_type(),
+        table,
+        ids,
+        work,
+        law,
+        projection,
+        definitions,
+    )?;
     let id = match explicit_id {
         Some(id) => id,
         None => ids.next(work)?,
     };
-    #[allow(deprecated)]
-    let dictionary_id = field.dict_id();
+    if table.source_facts.is_some() {
+        if projection.id().is_some() {
+            return Err(Error::InvalidShape(
+                "source field cannot reference execution identity",
+            ));
+        }
+        #[allow(deprecated)]
+        let dictionary_id = field.dict_id();
+        let facts = wire::SourceArrowFieldFacts {
+            field_id: Some(id),
+            metadata: encode_metadata(field.metadata(), work)?,
+            dictionary_id,
+            dictionary_is_ordered: field.dict_is_ordered(),
+        };
+        table
+            .source_facts
+            .as_mut()
+            .expect("source emitter has its facts target")
+            .push(facts);
+    }
     table.fields.push(wire::FieldDefinition {
         id,
         name: copy_string(field.name(), work)?,
         nullable: field.is_nullable(),
         carrier_type_id: Some(carrier_type_id),
-        metadata: encode_metadata(field.metadata(), work)?,
-        dictionary_id,
-        dictionary_is_ordered: field.dict_is_ordered(),
+        logical_type_id: projection.id(),
+        value_binding_id: None,
     });
     Ok(id)
 }
 
 fn emit_type(
     ty: &DataType,
-    table: &mut wire::TypeTable,
+    table: &mut EmitTarget,
     ids: &mut FieldIds,
     work: &mut CompileCheckpoints<'_>,
     law: SourceLaw<'_>,
+    projection: Projection,
+    definitions: &[logical_wire::LogicalTypeDefinition],
 ) -> Result<u32, Error> {
     work.step()?;
     let position = table.carriers.len();
@@ -532,34 +789,117 @@ fn emit_type(
     table
         .carriers
         .push(wire::CarrierTypeDefinition { id, kind: None });
+    let children = projection.children(definitions, work)?;
+    let item = match children {
+        Children::Item(id) => Projection::Node(id),
+        _ => Projection::Source,
+    };
     let kind = match ty {
-        DataType::List(field) => Kind::ListFieldId(emit_field(field, None, table, ids, work, law)?),
-        DataType::ListView(field) => {
-            Kind::ListViewFieldId(emit_field(field, None, table, ids, work, law)?)
-        }
-        DataType::LargeList(field) => {
-            Kind::LargeListFieldId(emit_field(field, None, table, ids, work, law)?)
-        }
-        DataType::LargeListView(field) => {
-            Kind::LargeListViewFieldId(emit_field(field, None, table, ids, work, law)?)
-        }
+        DataType::List(field) => Kind::ListFieldId(emit_field(
+            field,
+            None,
+            table,
+            ids,
+            work,
+            law,
+            item,
+            definitions,
+        )?),
+        DataType::ListView(field) => Kind::ListViewFieldId(emit_field(
+            field,
+            None,
+            table,
+            ids,
+            work,
+            law,
+            item,
+            definitions,
+        )?),
+        DataType::LargeList(field) => Kind::LargeListFieldId(emit_field(
+            field,
+            None,
+            table,
+            ids,
+            work,
+            law,
+            item,
+            definitions,
+        )?),
+        DataType::LargeListView(field) => Kind::LargeListViewFieldId(emit_field(
+            field,
+            None,
+            table,
+            ids,
+            work,
+            law,
+            item,
+            definitions,
+        )?),
         DataType::FixedSizeList(field, length) => Kind::FixedSizeList(wire::FixedSizeList {
-            item_field_id: Some(emit_field(field, None, table, ids, work, law)?),
+            item_field_id: Some(emit_field(
+                field,
+                None,
+                table,
+                ids,
+                work,
+                law,
+                item,
+                definitions,
+            )?),
             length: *length,
         }),
         DataType::Struct(fields) => {
             let mut field_ids = output_vec(fields.len(), ids.observed, work)?;
-            for field in fields {
-                field_ids.push(emit_field(field, None, table, ids, work, law)?);
+            for (ordinal, field) in fields.iter().enumerate() {
+                let child = match &children {
+                    Children::Struct(fields) => Projection::Node(
+                        fields[ordinal]
+                            .value_type_id
+                            .ok_or(Error::InvalidShape("logical named child absent"))?,
+                    ),
+                    Children::Map(key, value) => {
+                        Projection::Node(if ordinal == 0 { *key } else { *value })
+                    }
+                    _ => Projection::Source,
+                };
+                field_ids.push(emit_field(
+                    field,
+                    None,
+                    table,
+                    ids,
+                    work,
+                    law,
+                    child,
+                    definitions,
+                )?);
             }
             Kind::StructType(wire::StructFields { field_ids })
         }
         DataType::Union(fields, mode) => {
             let mut output = output_vec(fields.len(), ids.observed, work)?;
-            for (type_id, field) in fields.iter() {
+            for (ordinal, (type_id, field)) in fields.iter().enumerate() {
+                let child = match &children {
+                    Children::Union(fields) => Projection::Node(
+                        fields[ordinal]
+                            .field
+                            .as_ref()
+                            .and_then(|field| field.value_type_id)
+                            .ok_or(Error::InvalidShape("logical union child absent"))?,
+                    ),
+                    _ => Projection::Source,
+                };
                 output.push(wire::UnionField {
                     type_id: i32::from(type_id),
-                    field_id: Some(emit_field(field, None, table, ids, work, law)?),
+                    field_id: Some(emit_field(
+                        field,
+                        None,
+                        table,
+                        ids,
+                        work,
+                        law,
+                        child,
+                        definitions,
+                    )?),
                 });
             }
             Kind::UnionType(wire::UnionFields {
@@ -571,16 +911,65 @@ fn emit_type(
             })
         }
         DataType::Dictionary(key, value) => Kind::Dictionary(wire::DictionaryTypes {
-            key_type_id: Some(emit_type(key, table, ids, work, law)?),
-            value_type_id: Some(emit_type(value, table, ids, work, law)?),
+            key_type_id: Some(emit_type(
+                key,
+                table,
+                ids,
+                work,
+                law,
+                Projection::Source,
+                definitions,
+            )?),
+            value_type_id: Some(emit_type(
+                value,
+                table,
+                ids,
+                work,
+                law,
+                projection,
+                definitions,
+            )?),
         }),
         DataType::Map(entries, ordered) => Kind::Map(wire::MapField {
-            entries_field_id: Some(emit_field(entries, None, table, ids, work, law)?),
+            entries_field_id: Some(emit_field(
+                entries,
+                None,
+                table,
+                ids,
+                work,
+                law,
+                match children {
+                    Children::Map(k, v) => Projection::MapEntries(k, v),
+                    _ => Projection::Source,
+                },
+                definitions,
+            )?),
             ordered: *ordered,
         }),
         DataType::RunEndEncoded(ends, values) => Kind::RunEndEncoded(wire::RunEndEncodedFields {
-            run_ends_field_id: Some(emit_field(ends, None, table, ids, work, law)?),
-            values_field_id: Some(emit_field(values, None, table, ids, work, law)?),
+            run_ends_field_id: Some(emit_field(
+                ends,
+                None,
+                table,
+                ids,
+                work,
+                law,
+                Projection::Source,
+                definitions,
+            )?),
+            values_field_id: Some(emit_field(
+                values,
+                None,
+                table,
+                ids,
+                work,
+                law,
+                match projection.semantic_id() {
+                    Some(id) => Projection::EncodingValues(id),
+                    None => Projection::Source,
+                },
+                definitions,
+            )?),
         }),
         _ => if ids.observed {
             super::scalars::encode_scalar_from_source(ty, law, work)?
@@ -606,6 +995,7 @@ pub(super) fn encode_with_fields(
         limits,
         None,
         work,
+        &mut None,
     )
     .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
 }
@@ -615,53 +1005,165 @@ fn encode_roots<'a, H>(
     fields: FieldRootSources<'_>,
     writers: &[WriterTypeSource<'_>],
     limits: TypeProjectionLimits,
-    resources: Option<Admission<'a, H>>,
+    mut resources: Option<Admission<'a, H>>,
     work: &mut CompileCheckpoints<'_>,
+    source_output: &mut Option<Vec<wire::SourceArrowFieldFacts>>,
 ) -> Result<wire::TypeTable, HostError<H>> {
+    let source_mode = source_output.is_some();
+    let (all_values, writer_pairs) = borrowed_roots(
+        values,
+        if source_mode { &[] } else { writers },
+        &mut resources,
+        work,
+    )?;
+    let values = ValueRootSources::Borrowed(&all_values);
+    let associated_values = associated_roots(values, fields, &mut resources, work)?;
     let (mut counts, reserved) = preflight(values, fields, writers, limits, resources, work)?;
+    for (ordinal, (_, field)) in fields.iter().enumerate() {
+        work.step()?;
+        if let Some(binding_id) = fields.value_binding(ordinal) {
+            let position =
+                shared_resources::find(&associated_values, binding_id, |root| root.0, work)?
+                    .ok_or(Error::InvalidShape(
+                        "dangling execution field value binding",
+                    ))?;
+            let value = associated_values[position].1;
+            let mut comparison = semantic::Profile::default();
+            comparison.value(value.value_type(), work)?;
+            if let Some(resources) = &mut counts.resources {
+                resources.model.associated_field_work(comparison.work)?;
+                resources.gate()?;
+            }
+            validate_associated_field(field, value, work)?;
+        }
+    }
     if let Some(resources) = &mut counts.resources {
         resources
             .model
             .output(counts.carriers, counts.fields, values.len())?;
+        if source_mode {
+            resources.model.source_output(counts.fields)?;
+        }
         resources.gate()?;
     }
+    let mut profile = semantic::Profile::default();
+    for (_, value) in values.iter() {
+        profile.value(value.value_type(), work)?;
+    }
+    add(
+        &mut counts.definitions,
+        profile.definitions,
+        limits.max_definitions,
+    )?;
+    add(
+        &mut counts.expanded,
+        profile.expanded,
+        limits.max_expanded_nodes,
+    )?;
+    add(
+        &mut counts.strings,
+        profile.strings,
+        limits.max_string_bytes,
+    )?;
+    if let Some(resources) = &mut counts.resources {
+        resources.model.semantic_profile(&profile)?;
+        resources.gate()?;
+    }
+    let mut callback = |allocation| request(&mut counts.resources, allocation);
+    let mut context = shared_resources::Context {
+        observe_scope: None,
+        request: &mut callback,
+        work,
+    };
+    let mut roots = context
+        .vector::<LogicalTypeRoot>(values.len())
+        .map_err(semantic::failure)?;
+    for (id, value) in values.iter() {
+        context.step().map_err(semantic::failure)?;
+        roots.push(LogicalTypeRoot {
+            id,
+            value: value.value_type(),
+        });
+    }
+    let logical_types = LogicalTypeTableBuilder::new(&roots)
+        .encode_observed(
+            semantic::limits(limits),
+            &mut |layout| (context.request)(layout),
+            context.work,
+        )
+        .map_err(semantic::failure)?;
+    drop(context);
+    drop(callback);
     work.flush()?;
     let mut ids = FieldIds {
         reserved,
         cursor: 0,
         observed: counts.resources.is_some(),
     };
-    let mut table = wire::TypeTable {
-        carriers: output_vec(counts.carriers, ids.observed, work)?,
-        fields: output_vec(counts.fields, ids.observed, work)?,
-        value_types: output_vec(values.len(), ids.observed, work)?,
+    let mut table = EmitTarget {
+        shape: wire::TypeTable {
+            carriers: output_vec(counts.carriers, ids.observed, work)?,
+            fields: output_vec(counts.fields, ids.observed, work)?,
+            value_types: output_vec(values.len(), ids.observed, work)?,
+            logical_types: Vec::new(),
+        },
+        source_facts: if source_mode {
+            Some(output_vec(counts.fields, ids.observed, work)?)
+        } else {
+            None
+        },
     };
     for (id, value) in values.iter() {
         work.step()?;
         let carrier_type_id = emit_type(
-            &value.data_type,
+            value.data_type(),
             &mut table,
             &mut ids,
             work,
             SourceLaw::Strict,
+            Projection::Node(id),
+            &logical_types,
         )?;
         table.value_types.push(wire::ValueTypeDefinition {
             id,
             carrier_type_id: Some(carrier_type_id),
-            nullable: value.nullable,
-            logical_type: encode_logical(value.logical_type),
+
+            logical_type_id: Some(id),
         });
     }
-    for (id, field) in fields.iter() {
+    for (ordinal, (id, field)) in fields.iter().enumerate() {
         work.step()?;
-        emit_field(
+        let binding_id = fields.value_binding(ordinal);
+        let projection = match binding_id {
+            Some(binding_id) => {
+                let position =
+                    shared_resources::find(&associated_values, binding_id, |root| root.0, work)?
+                        .ok_or(Error::InvalidShape(
+                            "dangling execution field value binding",
+                        ))?;
+                validate_associated_field(field, associated_values[position].1, work)?;
+                Projection::Node(binding_id)
+            }
+            None => Projection::Source,
+        };
+        let emitted = emit_field(
             field,
             Some(id),
             &mut table,
             &mut ids,
             work,
             SourceLaw::Strict,
+            projection,
+            &logical_types,
         )?;
+        if let Some(binding_id) = binding_id {
+            let output = table
+                .fields
+                .last_mut()
+                .expect("just emitted associated field");
+            debug_assert_eq!(output.id, emitted);
+            output.value_binding_id = Some(binding_id);
+        }
     }
     for source in writers {
         for (id, binding) in source
@@ -669,17 +1171,117 @@ fn encode_roots<'a, H>(
             .iter()
             .zip(source.recipe.input().fields_iter())
         {
-            emit_field(
+            let projection = if source_mode {
+                Projection::Source
+            } else {
+                match shared_resources::find(&writer_pairs, *id, |pair| pair.0, work)? {
+                    Some(position) => Projection::Node(writer_pairs[position].1),
+                    None => Projection::Source,
+                }
+            };
+            let emitted = emit_field(
                 binding.field(),
                 Some(*id),
                 &mut table,
                 &mut ids,
                 work,
                 SourceLaw::Writer(source.recipe),
+                projection,
+                &logical_types,
             )?;
+            if let Some(binding_id) = projection.id() {
+                // The field facts and the explicitly supplied execution binding
+                // are separate roots with an exact source-owned pairing.
+                let field = table.fields.last_mut().expect("just emitted writer field");
+                debug_assert_eq!(field.id, emitted);
+                field.value_binding_id = Some(binding_id);
+            }
         }
     }
-    Ok(table)
+    table.logical_types = logical_types;
+    *source_output = table.source_facts;
+    Ok(table.shape)
+}
+
+pub(super) fn encode_associated_sources_pure_in(
+    values: &[(u32, &FunctionValueType)],
+    fields: &[super::BorrowedFieldTypeRoot<'_>],
+    limits: TypeProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::TypeTable, Error> {
+    encode_roots::<std::convert::Infallible>(
+        ValueRootSources::Borrowed(values),
+        FieldRootSources::Associated(fields),
+        &[],
+        limits,
+        None,
+        work,
+        &mut None,
+    )
+    .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+}
+
+/// A distinct source-only owner uses the same borrowed field emitter. Its
+/// attributes never create logical/value definitions or projection references.
+pub(super) fn encode_source_fields_pure_in(
+    fields: &[(u32, &Arc<Field>)],
+    limits: TypeProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::SourceFieldTable, Error> {
+    let mut facts = Some(Vec::new());
+    let shape = encode_roots::<std::convert::Infallible>(
+        ValueRootSources::Borrowed(&[]),
+        FieldRootSources::Borrowed(fields),
+        &[],
+        limits,
+        None,
+        work,
+        &mut facts,
+    )
+    .map_err(crate::host_projection_v2::ProjectionFailure::without_host)?;
+    Ok(wire::SourceFieldTable {
+        shape: Some(shape),
+        field_facts: facts.expect("source facts emitted in the sole body"),
+    })
+}
+
+pub(super) fn encode_source_fields_with_creator<H>(
+    fields: &[(u32, &Arc<Field>)],
+    source: usize,
+    limits: PackageTypeProjectionLimits,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::SourceFieldTable, HostError<H>> {
+    let mut previous = 0usize;
+    let mut facts = Some(Vec::new());
+    let shape = encode_writer_sources_with_host_core(
+        ValueRootSources::Borrowed(&[]),
+        FieldRootSources::Borrowed(fields),
+        &[],
+        source,
+        limits,
+        &mut |facts| {
+            let additional = facts
+                .allocation_request_bytes_upper_bound
+                .checked_sub(previous)
+                .ok_or(AdmissionRefusal::Control(
+                    CompileControlError::ResourceExhausted,
+                ))?;
+            if additional != 0 {
+                creation
+                    .observe_opaque_upper_bound(additional)
+                    .map_err(AdmissionRefusal::Host)?;
+            }
+            previous = facts.allocation_request_bytes_upper_bound;
+            Ok(())
+        },
+        work,
+        &mut facts,
+    )?;
+    Ok(wire::SourceFieldTable {
+        shape: Some(shape),
+        field_facts: facts.expect("source facts emitted in the sole body"),
+    })
 }
 
 pub(super) fn encode_writer_sources(
@@ -711,6 +1313,28 @@ pub(super) fn encode_writer_sources_with_host<H>(
     limits: PackageTypeProjectionLimits,
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), AdmissionRefusal<H>>,
     work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::TypeTable, HostError<H>> {
+    encode_writer_sources_with_host_core(
+        values,
+        fields,
+        writers,
+        source_retained_bytes,
+        limits,
+        admit,
+        work,
+        &mut None,
+    )
+}
+
+fn encode_writer_sources_with_host_core<H>(
+    values: ValueRootSources<'_>,
+    fields: FieldRootSources<'_>,
+    writers: &[WriterTypeSource<'_>],
+    source_retained_bytes: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), AdmissionRefusal<H>>,
+    work: &mut CompileCheckpoints<'_>,
+    source_output: &mut Option<Vec<wire::SourceArrowFieldFacts>>,
 ) -> Result<wire::TypeTable, HostError<H>> {
     let writer_fields = writers
         .iter()
@@ -745,5 +1369,34 @@ pub(super) fn encode_writer_sources_with_host<H>(
         },
         Some(resources),
         work,
+        source_output,
     )
+}
+
+pub(super) fn encode_source_writer_sources(
+    fields: &[(u32, &Arc<Field>)],
+    writers: &[WriterTypeSource<'_>],
+    source: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), Error>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::SourceFieldTable, Error> {
+    let mut facts = Some(Vec::new());
+    let shape = encode_writer_sources_with_host_core(
+        ValueRootSources::Borrowed(&[]),
+        FieldRootSources::Borrowed(fields),
+        writers,
+        source,
+        limits,
+        &mut |f| admit(f).map_err(AdmissionRefusal::Host),
+        work,
+        &mut facts,
+    )
+    .map_err(|error| match error {
+        ProjectionFailure::Codec(error) | ProjectionFailure::Host(error) => error,
+    })?;
+    Ok(wire::SourceFieldTable {
+        shape: Some(shape),
+        field_facts: facts.expect("source emitter publishes actual facts"),
+    })
 }

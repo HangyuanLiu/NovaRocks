@@ -63,11 +63,34 @@ fn extent_mul(a: usize, b: usize) -> Result<usize, ScalarResourceError> {
     a.checked_mul(b).ok_or(ScalarResourceError::Arithmetic)
 }
 
-/// Conservative metadata peak of the pinned Arrow 58.4.0 custom-buffer route.
+/// Conservative private Bytes Arc header upper for the pinned Arrow 58.4.0
+/// immutable Buffer constructor; it excludes payload and custom custodians.
 /// Its private Bytes contains pointer, length and the three-word Deallocation
 /// (Arrow's own alloc::tests::test_size_of_deallocation proves that bound).
 /// Arc headers are two atomic usize counters; padding is covered by one extra
 /// machine word per object. No amount here authorizes an allocation itself.
+pub(crate) fn original_buffer_header_upper_bound() -> Result<usize, KernelFailure> {
+    // Same pinned Bytes + Arc arithmetic used by the original custody route:
+    // pointer, length, three-word Deallocation, two counters and padding.
+    checked_mul(size_of::<usize>(), 8)
+}
+/// Prefund ONLY the private immutable Buffer header created by the original
+/// `Buffer::from_vec` adoption. Existing payload backing, public Array headers,
+/// and ArrayData tables keep their separate actual creator/accounting ports.
+/// The caller moves the original Vec only after this succeeds, and retains this
+/// finite construction lifetime alongside the resulting Buffer aliases.
+pub fn preflight_buffer_adoption_structure<H>(
+    retained: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut impl FnMut(bool) -> Result<(), H>,
+) -> Result<(), crate::selected_copy::CopyConstructionError<H>> {
+    use crate::selected_copy::{CopyConstructionError, CopyError};
+    work(true).map_err(CopyConstructionError::Creator)?;
+    let header = original_buffer_header_upper_bound().map_err(CopyError::Control)?;
+    retained
+        .observe_opaque_upper_bound(header)
+        .map_err(CopyConstructionError::Creator)
+}
+
 fn custom_buffer_metadata() -> Result<usize, KernelFailure> {
     custom_buffer_metadata_facts().map_err(model_failure)
 }
@@ -1103,5 +1126,72 @@ pub fn retain_source_backing<C: Send + Sync + 'static>(
             observation.finish(Ok(value))
         }
         Err(cause) => observation.finish(Err(cause)),
+    }
+}
+
+#[cfg(test)]
+mod buffer_adoption_structure_tests {
+    use super::*;
+    use crate::selected_copy::CopyConstructionError;
+    use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
+    use std::alloc::Layout;
+
+    #[test]
+    fn original_buffer_adoption_keeps_vec_payload_and_first_refusal_before_consumption() {
+        let values = vec![11_i32, 23, 37];
+        let original_payload = values.as_ptr().cast::<u8>();
+        let mut boundaries = 0;
+        let mut opaque = Vec::new();
+        let mut exact = |_: Layout| -> Result<(), &'static str> {
+            panic!("Buffer-only preflight must not invent a public Array or payload Layout")
+        };
+        let mut observe = |bytes| {
+            opaque.push(bytes);
+            Ok::<_, &'static str>(())
+        };
+        let mut creation =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut observe);
+        preflight_buffer_adoption_structure(&mut creation, &mut |boundary| {
+            assert!(boundary);
+            boundaries += 1;
+            Ok(())
+        })
+        .unwrap();
+        // Execute the SAME pinned constructor. Adoption preserves the actual
+        // original payload allocation; no ArrayData/Array wrapper is built here.
+        let buffer = Buffer::from_vec(values);
+        assert_eq!(buffer.as_ptr(), original_payload);
+        assert_eq!(buffer.typed_data::<i32>(), &[11, 23, 37]);
+        assert_eq!(boundaries, 1);
+        assert_eq!(opaque, [original_buffer_header_upper_bound().unwrap()]);
+
+        let values = vec![41_i32, 43];
+        let original_payload = values.as_ptr();
+        let mut calls = 0;
+        let mut observe = |_: usize| {
+            calls += 1;
+            Err("original header Host")
+        };
+        let mut creation =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut observe);
+        let mut work_calls = 0;
+        assert!(matches!(
+            preflight_buffer_adoption_structure(&mut creation, &mut |_| {
+                work_calls += 1;
+                Ok(())
+            }),
+            Err(CopyConstructionError::Creator("original header Host"))
+        ));
+        assert_eq!(values.as_ptr(), original_payload);
+        assert_eq!(values, [41, 43]);
+        assert_eq!(work_calls, 1);
+        // A boundary refusal happens before any opaque constructor request.
+        assert!(matches!(
+            preflight_buffer_adoption_structure(&mut creation, &mut |_| {
+                Err("original caller boundary")
+            }),
+            Err(CopyConstructionError::Creator("original caller boundary"))
+        ));
+        assert_eq!(calls, 1);
     }
 }

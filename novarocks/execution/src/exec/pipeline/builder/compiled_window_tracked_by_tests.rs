@@ -70,6 +70,12 @@ fn operator(
     .unwrap();
     let mut operator = factory.create(1, 0);
     if let Some(tracker) = tracker {
+        operator.set_construction_factory(
+            super::super::aggregate_fixture::runtime_construction_factory(
+                tracker.clone(),
+                Arc::new(RuntimeErrorState::default()),
+            ),
+        );
         operator.set_mem_tracker(tracker);
     }
     operator
@@ -98,6 +104,7 @@ fn by_window_compiled_actual_owner_frame_null_winner_and_last_array_drop() {
             let tracker = MemTracker::new_root("actual tracked BY window");
             tracker.install_limit_once(64 * 1024 * 1024).unwrap();
             let mut operator = operator(&program, Some(Arc::clone(&tracker)));
+            operator.prepare().unwrap();
             let processor = operator.as_processor_mut().unwrap();
             let state = RuntimeState::default();
             for offset in (0..3).step_by(step) {
@@ -125,7 +132,7 @@ fn by_window_compiled_actual_owner_frame_null_winner_and_last_array_drop() {
                     .iter()
                     .flat_map(|output| {
                         output
-                            .batch
+                            .record_batch()
                             .column(column)
                             .as_any()
                             .downcast_ref::<Int64Array>()
@@ -145,7 +152,7 @@ fn by_window_compiled_actual_owner_frame_null_winner_and_last_array_drop() {
             assert_eq!(values(4), vec![Some(4); 3]);
             let output = outputs.pop().unwrap();
             drop(outputs);
-            let data = output.batch.column(3).to_data();
+            let data = output.record_batch().column(3).to_data();
             let payload = data.buffers()[0].clone();
             drop(operator);
             drop(output);
@@ -161,39 +168,74 @@ fn by_window_compiled_actual_owner_frame_null_winner_and_last_array_drop() {
     }
 }
 #[test]
-fn by_window_compiled_actual_missing_and_refused_allocator_latch_no_prefix_replay() {
+fn window_output_schema_outlives_program_and_releases_at_last_schema_reference() {
+    let (program, batch) = source(&[vec![Some(1), Some(1), Some(4)]], false);
+    let program_weak = Arc::downgrade(&program);
+    let tracker = MemTracker::new_root("independent window output schema");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    let mut operator = operator(&program, Some(tracker.clone()));
+    operator.prepare().unwrap();
+    let processor = operator.as_processor_mut().unwrap();
+    let state = RuntimeState::default();
+    processor
+        .push_chunk(&state, chunk(&program, batch))
+        .unwrap();
+    processor.set_finishing(&state).unwrap();
+    let output = processor.pull_chunk(&state).unwrap().unwrap();
+    let schema = output.chunk_schema_ref();
+    assert!(schema.is_typed());
+    assert!(schema.arrow_schema_ref().metadata().capacity() == 0);
+    assert!(
+        schema
+            .slots()
+            .iter()
+            .all(|slot| slot.field_ref().metadata().capacity() == 0)
+    );
+    drop(output);
+    drop(operator);
+    drop(program);
+    assert!(
+        program_weak.upgrade().is_none(),
+        "schema does not retain the program"
+    );
+    assert!(
+        tracker.current() > 0,
+        "schema retains its original creation responsibility"
+    );
+    let last = schema.clone();
+    drop(schema);
+    assert!(tracker.current() > 0);
+    drop(last);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn by_window_prepare_refusal_precedes_input_and_preserves_original_cause() {
+    use crate::exec::pipeline::operator::ConstructionFailure;
     let (program, batch) = source(&[vec![Some(1), Some(1), Some(4)]], false);
     for install in [false, true] {
-        let tracker = MemTracker::new_root("refused actual BY window");
-        tracker.install_limit_once(1).unwrap();
+        let tracker = MemTracker::new_root("refused actual window schema");
         let mut operator = operator(&program, install.then(|| tracker.clone()));
-        let processor = operator.as_processor_mut().unwrap();
-        let state = RuntimeState::default();
-        // Structural input ownership now obtains its real host grant at the
-        // push stage. Keep the first actual refusal wherever it is authored.
-        let first = match processor.push_chunk(&state, chunk(&program, batch.clone())) {
-            Err(first) => first,
-            Ok(()) => processor.set_finishing(&state).unwrap_err(),
-        };
+        tracker.install_limit_once(tracker.current() + 1).unwrap();
+        let first = operator.prepare().unwrap_err();
         match first.cause() {
-            ExecutionFailureCause::Kernel(
-                novarocks_functions::KernelFailure::ResourceExhausted,
-            ) if install => {}
-            ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::InvalidProgram(
-                _,
-            )) if !install => {}
-            other => panic!("exact actual host refusal: {other:?}"),
+            ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner) if !install => {}
+            ExecutionFailureCause::Construction(ConstructionFailure::Memory(_)) if install => {}
+            other => panic!("exact original construction refusal: {other:?}"),
         }
+        assert_eq!(operator.prepare().unwrap_err(), first);
+        let processor = operator.as_processor_mut().unwrap();
         assert!(!processor.need_input());
         assert!(!processor.has_output());
-        assert_eq!(processor.pull_chunk(&state).unwrap_err(), first);
-        assert_eq!(processor.set_finishing(&state).unwrap_err(), first);
+        let state = RuntimeState::default();
         assert_eq!(
             processor
                 .push_chunk(&state, chunk(&program, batch.clone()))
                 .unwrap_err(),
             first
         );
+        assert_eq!(processor.pull_chunk(&state).unwrap_err(), first);
+        assert_eq!(processor.set_finishing(&state).unwrap_err(), first);
         drop(operator);
         assert_eq!(tracker.current(), 0);
     }

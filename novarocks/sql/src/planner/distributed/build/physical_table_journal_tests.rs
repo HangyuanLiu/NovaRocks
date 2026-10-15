@@ -177,9 +177,47 @@ fn genuine_sql_unnest_journal_borrows_original_whole_relation_and_same_selected_
     work.finish().unwrap();
 }
 
+fn original_list_value(ordinal: u32) -> crate::analysis::TypedExpr {
+    use arrow::array::Array;
+    let field = std::sync::Arc::new(
+        arrow::datatypes::Field::new("original.element", arrow::datatypes::DataType::Int64, true)
+            .with_metadata([("source.child".into(), "kept".into())].into()),
+    );
+    let array = arrow::array::ListArray::new(
+        field,
+        arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(vec![0i32, 1, 3, 3])),
+        std::sync::Arc::new(arrow::array::Int64Array::from(vec![
+            Some(999),
+            Some(7),
+            None,
+        ])),
+        Some(arrow::buffer::NullBuffer::from(vec![true, true, false])),
+    );
+    let ty = novarocks_type_contract::FunctionValueType::new(array.data_type().clone(), true);
+    let source_field = std::sync::Arc::new(arrow::datatypes::Field::new(
+        "original.list",
+        array.data_type().clone(),
+        true,
+    ));
+    let pool = novarocks_functions::ConstantPool::try_new(
+        source_field,
+        ty.clone(),
+        array.to_data(),
+        policy(),
+        CompilePhase::Validate,
+        &Control::default(),
+    )
+    .unwrap();
+    crate::analysis::TypedExpr {
+        kind: ExprKind::Constant(pool.value(ordinal).unwrap()),
+        value_type: ty,
+    }
+}
+
 #[test]
 fn table_journal_selected_nonzero_cv_ordinals_keep_field_backing_metadata_and_left_outputs() {
-    let (source_plan, original_binding) = table_fixture(vec![list_value(1), list_value(2)], true);
+    let (source_plan, original_binding) =
+        table_fixture(vec![original_list_value(1), original_list_value(2)], true);
     let owner = finish(&source_plan);
     let (fragment, node) = table_source(&owner);
     let request = run(&owner, fragment, node, &Control::default()).unwrap();
@@ -250,11 +288,16 @@ fn table_journal_selected_nonzero_cv_ordinals_keep_field_backing_metadata_and_le
             actual.pool().field_ref()
         ));
         assert_eq!(original.value_type(), operational.value_type());
-        let arrow::datatypes::DataType::List(field) = &original.value_type().data_type else {
+        let arrow::datatypes::DataType::List(field) = &original.value_type().data_type() else {
             panic!("original nested field");
         };
-        assert_eq!(field.name(), "original.element");
-        assert_eq!(field.metadata()["source.child"], "kept");
+        assert_eq!(field.name(), "item");
+        assert!(field.metadata().is_empty());
+        let arrow::datatypes::DataType::List(source_field) = original.field().data_type() else {
+            panic!("source nested field")
+        };
+        assert_eq!(source_field.name(), "original.element");
+        assert_eq!(source_field.metadata()["source.child"], "kept");
     }
     for output in outputs {
         if let TableFunctionOutput::FunctionResult {
@@ -263,7 +306,7 @@ fn table_journal_selected_nonzero_cv_ordinals_keep_field_backing_metadata_and_le
         } = output
         {
             let mut expected = results[*result_ordinal as usize].clone();
-            expected.nullable = true;
+            expected = expected.with_nullable(true).unwrap();
             assert_eq!(fragment.values()[value].ty, expected);
         }
     }
@@ -333,7 +376,7 @@ fn table_journal_typed_null_is_original_cv_not_relation_or_scalar_retagging() {
             .unwrap()
     );
     assert!(matches!(
-        selected.value_type().data_type,
+        selected.value_type().data_type(),
         arrow::datatypes::DataType::List(_)
     ));
     assert!(request.request().expected_result_type.is_none());

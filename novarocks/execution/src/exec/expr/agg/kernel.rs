@@ -48,6 +48,8 @@ pub struct AggStateLayout {
 
 #[derive(Clone, Debug)]
 pub struct AggKernelEntry {
+    // Independent kernel-set loans retain the complete selected type creator.
+    _frozen: Option<Arc<novarocks_local_program::FrozenAggregateSelection>>,
     selected: ResolvedAggregateSignature,
     kernel: PreparedAggregateKernel,
     pub(super) state: AggStateDesc,
@@ -261,6 +263,7 @@ pub fn build_kernel_set(
         )
         .map_err(|error| format!("bind aggregate `{}` options: {error}", func.name))?;
         let context = AggregatePrepareContext {
+            frozen: func.frozen.as_deref(),
             selected,
             options: &options,
             legacy: Some(LegacyAggregateBindContext {
@@ -290,6 +293,7 @@ pub fn build_kernel_set(
             .ok_or_else(|| "aggregate state layout size overflow".to_string())?;
         descs.push(state.clone());
         entries.push(AggKernelEntry {
+            _frozen: func.frozen.clone(),
             selected: selected.clone(),
             kernel,
             state,
@@ -306,6 +310,22 @@ pub fn build_kernel_set(
 }
 
 impl AggKernelEntry {
+    /// Borrow the original complete selected author; no carrier can sign a domain.
+    pub(crate) fn frozen_output_value_type(
+        &self,
+        output_intermediate: bool,
+    ) -> Option<&novarocks_type_contract::FunctionValueType> {
+        let selected = self._frozen.as_ref()?.selected();
+        if output_intermediate {
+            Some(&selected.aggregate.as_ref()?.intermediate_type)
+        } else {
+            match &selected.result_type {
+                novarocks_functions::FunctionResultType::Scalar(value) => Some(value),
+                _ => None,
+            }
+        }
+    }
+
     pub fn output_type(&self, output_intermediate: bool) -> DataType {
         if output_intermediate {
             self.selected.intermediate_type.clone()

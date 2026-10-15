@@ -80,7 +80,7 @@ fn list_source(nullable: bool) -> (Arc<Field>, FunctionValueType) {
 fn map_source(nullable: bool) -> (Arc<Field>, FunctionValueType) {
     let fields = vec![
         Arc::new(
-            Field::new("authored_key", DataType::Utf8, true).with_metadata(HashMap::from([(
+            Field::new("authored_key", DataType::Utf8, false).with_metadata(HashMap::from([(
                 "key.annotation".into(),
                 "original".into(),
             )])),
@@ -306,7 +306,7 @@ fn collection_factories_success_and_ordinary_errors_preserve_every_callback_firs
         |c| ConstantValue::from_utf8_map(mf.clone(), wrong.clone(), &entries(), policy(), PHASE, c),
         true,
     );
-    let wrong_field = Arc::new(Field::new("wrong_root", lt.data_type.clone(), true));
+    let wrong_field = Arc::new(Field::new("wrong_root", lt.data_type().clone(), true));
     prefixes(
         |c| {
             ConstantValue::from_int32_list(

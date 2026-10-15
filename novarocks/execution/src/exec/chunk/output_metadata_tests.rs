@@ -68,6 +68,19 @@ fn schema() -> crate::exec::chunk::ChunkSchemaRef {
     )
     .unwrap()
 }
+fn construction_owner(
+    schema: &ChunkSchema,
+) -> Box<dyn crate::exec::pipeline::operator::InputConstructionOwner> {
+    let tracker = MemTracker::new_root("column-metadata-typed-construction");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+        crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+        tracker,
+        Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+    ).unwrap();
+    factory.begin_typed_construction(schema).unwrap()
+}
+
 fn paid_chunk(host: Arc<dyn AggregateStateAllocator>) -> Chunk {
     let output = schema();
     let metadata = OutputColumnMetadata::try_new(1, host, &Control::running()).unwrap();
@@ -75,7 +88,8 @@ fn paid_chunk(host: Arc<dyn AggregateStateAllocator>) -> Chunk {
     columns.try_reserve_exact(1).unwrap();
     columns.push(Arc::new(Int64Array::from(vec![Some(7), None])) as ArrayRef);
     let batch = RecordBatch::try_new(output.arrow_schema_ref(), columns).unwrap();
-    Chunk::try_new_with_output_column_metadata(batch, output, metadata).unwrap()
+    let owner = construction_owner(&output);
+    Chunk::try_new_with_output_column_metadata(batch, output, metadata, owner.as_ref()).unwrap()
 }
 
 #[test]
@@ -95,7 +109,7 @@ fn original_column_charge_is_shared_until_the_last_chunk_alias_exits() {
     );
     let clone = chunk.clone();
     let slice = chunk.slice(1, 1);
-    let like = Chunk::try_new_like(chunk.batch.slice(0, 1), &chunk).unwrap();
+    let like = Chunk::try_new_like(chunk.record_batch().slice(0, 1), &chunk).unwrap();
     assert_eq!(tracker.current(), charged, "sharing creates no new grant");
     drop(chunk);
     drop(clone);
@@ -192,7 +206,10 @@ impl AggregateStateAllocator for DropOrderHost {
     }
 }
 
-fn publication(host: Arc<DropOrderHost>, metadata_columns: usize) -> Result<Chunk, KernelFailure> {
+fn publication(
+    host: Arc<DropOrderHost>,
+    metadata_columns: usize,
+) -> crate::runtime::fragment::ExecutionResult<Chunk> {
     let output = schema();
     let metadata =
         OutputColumnMetadata::try_new(metadata_columns, host.clone(), &Control::running())?;
@@ -207,7 +224,8 @@ fn publication(host: Arc<DropOrderHost>, metadata_columns: usize) -> Result<Chun
         Ordering::SeqCst,
     );
     host.armed.store(true, Ordering::SeqCst);
-    Chunk::try_new_with_output_column_metadata(batch, output, metadata)
+    let owner = construction_owner(&output);
+    Chunk::try_new_with_output_column_metadata(batch, output, metadata, owner.as_ref())
 }
 
 #[test]
@@ -237,7 +255,7 @@ fn unpublished_container_refusal_drops_the_batch_and_all_original_charges() {
     });
     assert!(matches!(
         publication(host.clone(), 2),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(failure) if matches!(failure.cause(), crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::InvalidProgram(_)))
     ));
     assert!(
         host.weak

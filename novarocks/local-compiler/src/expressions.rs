@@ -53,7 +53,7 @@ use novarocks_type_contract::{
 pub(crate) struct LoweredExpressions {
     pub arena: Arc<ImmutableExpressions>,
     pub ids: BTreeMap<ExprId, ProgramExprId>,
-    pub types: Vec<FunctionArgumentType>,
+    pub types: novarocks_type_contract::FunctionArgumentTypes,
     pub union_ids: BTreeMap<novarocks_physical_plan::NodeId, Vec<Vec<ProgramExprId>>>,
     /// Each scan's runtime-filter consumer key reads, in its binding order.
     pub runtime_filter_key_ids: BTreeMap<novarocks_physical_plan::NodeId, Vec<ProgramExprId>>,
@@ -236,7 +236,7 @@ pub(crate) fn lower_expressions(
     control: &dyn PureCompileControl,
 ) -> Result<LoweredExpressions, ExpressionLoweringError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(
+    let result = lower_core::<std::convert::Infallible, crate::creation::NoFactory>(
         package,
         policy,
         inputs,
@@ -244,8 +244,13 @@ pub(crate) fn lower_expressions(
         &BTreeMap::new(),
         control,
         &mut work,
+        None::<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<std::convert::Infallible>>,
+        None,
     );
-    finish(result, &mut work)
+    finish(
+        result.map_err(ExpressionCreationFailure::into_pure),
+        &mut work,
+    )
 }
 
 /// Lower every actual definition, then author one slot-read definition per
@@ -263,7 +268,7 @@ pub(crate) fn lower_expressions_with_unions(
     control: &dyn PureCompileControl,
 ) -> Result<LoweredExpressions, ExpressionLoweringError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(
+    let result = lower_core::<std::convert::Infallible, crate::creation::NoFactory>(
         package,
         policy,
         inputs,
@@ -271,8 +276,13 @@ pub(crate) fn lower_expressions_with_unions(
         runtime_filter_keys,
         control,
         &mut work,
+        None::<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<std::convert::Infallible>>,
+        None,
     );
-    finish(result, &mut work)
+    finish(
+        result.map_err(ExpressionCreationFailure::into_pure),
+        &mut work,
+    )
 }
 
 fn case_arity(
@@ -317,7 +327,303 @@ fn case_child(
     }
 }
 
-fn lower_core(
+#[derive(Debug)]
+pub(crate) enum ExpressionCreationFailure<H> {
+    Control(CompileControlError),
+    Creator(H),
+    Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+    Owner(ExpressionLoweringError),
+}
+impl<H> From<CompileControlError> for ExpressionCreationFailure<H> {
+    fn from(e: CompileControlError) -> Self {
+        Self::Control(e)
+    }
+}
+impl<H> From<ExpressionLoweringError> for ExpressionCreationFailure<H> {
+    fn from(e: ExpressionLoweringError) -> Self {
+        match e {
+            ExpressionLoweringError::Control(c) => Self::Control(c),
+            e => Self::Owner(e),
+        }
+    }
+}
+macro_rules! expression_creation_cause {
+    ($t:ty) => {
+        impl<H> From<$t> for ExpressionCreationFailure<H> {
+            fn from(e: $t) -> Self {
+                ExpressionLoweringError::from(e).into()
+            }
+        }
+    };
+}
+expression_creation_cause!(ValueTypeError);
+expression_creation_cause!(ConstantError);
+expression_creation_cause!(ConstantReferenceError);
+expression_creation_cause!(ExpressionsCompileError);
+expression_creation_cause!(novarocks_functions::ArithmeticPrepareError);
+expression_creation_cause!(novarocks_functions::CastPrepareError);
+expression_creation_cause!(novarocks_functions::ComparisonPrepareError);
+impl<H> From<EffectContractError> for ExpressionCreationFailure<H> {
+    fn from(error: EffectContractError) -> Self {
+        ExpressionLoweringError::from(error).into()
+    }
+}
+impl<H> From<FunctionBindingError> for ExpressionCreationFailure<H> {
+    fn from(error: FunctionBindingError) -> Self {
+        ExpressionLoweringError::from(error).into()
+    }
+}
+impl<H> From<FunctionSpecializationFailure> for ExpressionCreationFailure<H> {
+    fn from(error: FunctionSpecializationFailure) -> Self {
+        ExpressionLoweringError::from(error).into()
+    }
+}
+impl<H> From<novarocks_functions::FunctionBindingCreationFailure<H>>
+    for ExpressionCreationFailure<H>
+{
+    fn from(error: novarocks_functions::FunctionBindingCreationFailure<H>) -> Self {
+        use novarocks_functions::{
+            FunctionBindingConstructionResource as R, FunctionBindingCreationFailure as F,
+        };
+        use novarocks_type_contract::{
+            ControlResourceError,
+            owned_resources::{hashmap::HashMapResourceError, layout::LayoutResourceError as L},
+        };
+        match error {
+            F::Binding(error) => error.into(),
+            F::Creator(cause) => Self::Creator(cause),
+            F::Resource(R::Layout(cause)) => Self::Resource(cause),
+            F::Resource(R::Vec(ControlResourceError::Control(cause))) => Self::Control(cause),
+            F::Resource(R::Vec(ControlResourceError::SourceModel(_)))
+            | F::Resource(R::HashMap(HashMapResourceError::SourceModel(_))) => {
+                Self::Resource(L::SourceModel)
+            }
+            F::Resource(R::HashMap(HashMapResourceError::Arithmetic(_))) => {
+                Self::Resource(L::Arithmetic)
+            }
+            F::UnconvertedResolverOwner => Self::Owner(ExpressionLoweringError::Invalid(
+                "binding construction owner is not converted",
+            )),
+        }
+    }
+}
+impl<H> From<novarocks_functions::CheckedCallPreparationFailure<H>>
+    for ExpressionCreationFailure<H>
+{
+    fn from(error: novarocks_functions::CheckedCallPreparationFailure<H>) -> Self {
+        use novarocks_functions::{CheckedCallPreparationFailure as F, CheckedOwnerFailure as O};
+        match error {
+            F::Binding(cause) => cause.into(),
+            F::Preparation(O::Original(cause)) => cause.into(),
+            F::Preparation(O::UnconvertedOwner) => Self::Owner(ExpressionLoweringError::Invalid(
+                "installed preparation owner is not converted",
+            )),
+        }
+    }
+}
+
+pub(crate) type CallCreation<'a, F> = Option<(&'a F, &'a ConstantPolicy)>;
+pub(crate) fn validate_call_created<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
+    catalog: &novarocks_functions::EngineFunctionCatalog,
+    function: &novarocks_functions::FunctionId,
+    kind: FunctionKind,
+    selected: &FunctionBindingSelection,
+    request: novarocks_functions::FunctionBindingRequest<'_>,
+    control: &dyn PureCompileControl,
+    creation: CallCreation<'_, F>,
+) -> Result<(), ExpressionCreationFailure<H>> {
+    match creation {
+        Some((factory, _)) => catalog
+            .validate_frozen_selection_with_factory_in(
+                function, kind, selected, request, factory, control,
+            )
+            .map_err(Into::into),
+        None => catalog
+            .validate_frozen_selection(function, kind, selected, request, control)
+            .map_err(Into::into),
+    }
+}
+pub(crate) fn prepare_call_created<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
+    catalog: &PureEngineFunctionCatalog,
+    input: CallEffectInput<'_>,
+    selected: Arc<FunctionBindingSelection>,
+    frozen: &novarocks_type_contract::CallEffects,
+    options: PureCallPreparation,
+    control: &dyn PureCompileControl,
+    creation: CallCreation<'_, F>,
+) -> Result<PureCallSpecialization, ExpressionCreationFailure<H>> {
+    match creation {
+        Some((factory, policy)) => {
+            // The definition was fully validated by this immutable compiler's
+            // first pass. Expected types in this preparation get a separate
+            // temporary owner; they never enlarge a published type invoice.
+            let mut scope = factory
+                .begin_scope()
+                .map_err(ExpressionCreationFailure::Creator)?;
+            catalog
+                .prepare_frozen_with_creator_in(
+                    input, selected, frozen, options, policy, &mut scope, control,
+                )
+                .map_err(Into::into)
+        }
+        None => catalog
+            .prepare_frozen(input, selected, frozen, options, control)
+            .map_err(Into::into),
+    }
+}
+impl<H> From<novarocks_functions::ArithmeticCreationFailure<H>> for ExpressionCreationFailure<H> {
+    fn from(error: novarocks_functions::ArithmeticCreationFailure<H>) -> Self {
+        use novarocks_functions::{
+            ArithmeticCreationFailure as F, ArithmeticTypeCreationFailure as T,
+        };
+        use novarocks_type_contract::{
+            ControlResourceError, ValueConstructionFailure as C,
+            owned_resources::{hashmap::HashMapResourceError, layout::LayoutResourceError as L},
+        };
+        match error {
+            F::Prepare(cause) => cause.into(),
+            F::Construction(C::Observer(T::Control(cause))) => Self::Control(cause),
+            F::Construction(C::Observer(T::Creator(cause))) => Self::Creator(cause),
+            F::Construction(C::Layout(cause)) => Self::Resource(cause),
+            F::Construction(C::Vec(ControlResourceError::Control(cause))) => Self::Control(cause),
+            F::Construction(C::Vec(ControlResourceError::SourceModel(_)))
+            | F::Construction(C::HashMap(HashMapResourceError::SourceModel(_))) => {
+                Self::Resource(L::SourceModel)
+            }
+            F::Construction(C::HashMap(HashMapResourceError::Arithmetic(_))) => {
+                Self::Resource(L::Arithmetic)
+            }
+            F::Construction(C::ValueType(_) | C::Rule(_)) => {
+                novarocks_functions::ArithmeticPrepareError::TypeMismatch.into()
+            }
+        }
+    }
+}
+fn prepare_arithmetic_created<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
+    operator: novarocks_type_contract::ArithmeticOperator,
+    left: &novarocks_type_contract::FunctionValueType,
+    right: &novarocks_type_contract::FunctionValueType,
+    result: &novarocks_type_contract::FunctionValueType,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    allow: bool,
+    control: &dyn PureCompileControl,
+    factory: Option<&F>,
+) -> Result<novarocks_functions::PreparedArithmeticRecipe, ExpressionCreationFailure<H>> {
+    match factory {
+        Some(factory) => novarocks_functions::PreparedArithmeticRecipe::try_new_with_creator_in(
+            operator, left, right, result, policy, allow, factory, control,
+        )
+        .map_err(Into::into),
+        None => novarocks_functions::PreparedArithmeticRecipe::try_new(
+            operator, left, right, result, policy, allow, control,
+        )
+        .map_err(Into::into),
+    }
+}
+impl ExpressionCreationFailure<std::convert::Infallible> {
+    fn into_pure(self) -> ExpressionLoweringError {
+        match self {
+            Self::Control(c) => ExpressionLoweringError::Control(c),
+            Self::Creator(never) => match never {},
+            Self::Resource(_) => {
+                ExpressionLoweringError::Control(CompileControlError::ResourceExhausted)
+            }
+            Self::Owner(e) => e,
+        }
+    }
+}
+fn observe_type_layout<H>(
+    layout: std::alloc::Layout,
+    creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ExpressionCreationFailure<H>> {
+    if let Some(c) = creation {
+        work.flush()?;
+        c.request_layout(layout)
+            .map_err(ExpressionCreationFailure::Creator)?;
+    }
+    Ok(())
+}
+fn observe_type_push<H>(
+    types: &Vec<FunctionArgumentType>,
+    creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ExpressionCreationFailure<H>> {
+    if creation.is_none() {
+        return Ok(());
+    }
+    let facts =
+        novarocks_type_contract::owned_resources::vec::push_growth::<FunctionArgumentType>(types)
+            .map_err(|e| {
+            match e {
+        novarocks_type_contract::ControlResourceError::Control(c) => {
+            ExpressionCreationFailure::Control(c)
+        }
+        novarocks_type_contract::ControlResourceError::SourceModel(_) => {
+            ExpressionCreationFailure::Resource(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
+            )
+        }
+    }
+        })?;
+    if let Some(layout) = facts.requested_backing {
+        observe_type_layout(layout, creation, work)?;
+    }
+    Ok(())
+}
+#[expect(
+    clippy::too_many_arguments,
+    reason = "actual input type sources remain explicit"
+)]
+pub(crate) fn lower_expressions_with_unions_with_creator<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
+    package: &FragmentPackage,
+    policy: ConstantPolicy,
+    inputs: &BTreeMap<ExprId, crate::channels::ResolvedInput>,
+    unions: &BTreeMap<novarocks_physical_plan::NodeId, Vec<crate::channels::UnionChannelBranch>>,
+    runtime_filter_keys: &BTreeMap<
+        novarocks_physical_plan::NodeId,
+        Vec<crate::channels::UnionChannelSource>,
+    >,
+    creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+    factory: &F,
+    control: &dyn PureCompileControl,
+) -> Result<LoweredExpressions, crate::FragmentCreationError<H>> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = lower_core(
+        package,
+        policy,
+        inputs,
+        unions,
+        runtime_filter_keys,
+        control,
+        &mut work,
+        Some(creation),
+        Some(factory),
+    )
+    .map_err(|e| match e {
+        ExpressionCreationFailure::Control(c) => crate::FragmentCreationError::Control(c),
+        ExpressionCreationFailure::Creator(c) => crate::FragmentCreationError::Creator(c),
+        ExpressionCreationFailure::Resource(c) => crate::FragmentCreationError::Resource(c),
+        ExpressionCreationFailure::Owner(c) => crate::FragmentCreationError::from(c),
+    });
+    if matches!(
+        &result,
+        Err(crate::FragmentCreationError::Control(_)
+            | crate::FragmentCreationError::Creator(_)
+            | crate::FragmentCreationError::Resource(_))
+    ) {
+        return result;
+    }
+    work.flush()?;
+    result
+}
+fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     policy: ConstantPolicy,
     inputs: &BTreeMap<ExprId, crate::channels::ResolvedInput>,
@@ -328,7 +634,9 @@ fn lower_core(
     >,
     control: &dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<LoweredExpressions, ExpressionLoweringError> {
+    mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
+) -> Result<LoweredExpressions, ExpressionCreationFailure<H>> {
     let source = package.fragment().expressions();
     let mut count = source.len();
     for branches in unions.values() {
@@ -346,9 +654,9 @@ fn lower_core(
         work.step()?;
     }
     if count > MAX_CONTROL_DEFINITIONS {
-        return Err(ExpressionLoweringError::Invalid(
-            "expression definition limit exceeded",
-        ));
+        return Err(
+            ExpressionLoweringError::Invalid("expression definition limit exceeded").into(),
+        );
     }
     let mut ids = BTreeMap::new();
     let mut nodes = Vec::new();
@@ -374,7 +682,8 @@ fn lower_core(
             if node.id != id {
                 return Err(ExpressionLoweringError::Invalid(
                     "physical expression key differs from ID",
-                ));
+                )
+                .into());
             }
             let child = match &node.kind {
                 ExprKind::Literal(_) | ExprKind::Constant(_) | ExprKind::Value(_) => None,
@@ -424,7 +733,7 @@ fn lower_core(
                     when_then,
                     else_expr,
                 } => case_child(*operand, when_then, *else_expr, next),
-                _ => return Err(ExpressionLoweringError::UnsupportedExpression(id)),
+                _ => return Err(ExpressionLoweringError::UnsupportedExpression(id).into()),
             };
             if let Some(child) = child {
                 let frame = stack
@@ -433,14 +742,15 @@ fn lower_core(
                 frame.1 += 1;
                 if !ids.contains_key(&child) {
                     if !active.insert(child) {
-                        return Err(ExpressionLoweringError::Invalid(
-                            "cyclic physical expression",
-                        ));
+                        return Err(
+                            ExpressionLoweringError::Invalid("cyclic physical expression").into(),
+                        );
                     }
                     if stack.len() >= MAX_CONTROL_DEPTH {
                         return Err(ExpressionLoweringError::Invalid(
                             "expression dependency depth exceeded",
-                        ));
+                        )
+                        .into());
                     }
                     stack.push((child, 0));
                 }
@@ -475,26 +785,28 @@ fn lower_core(
                 }
                 ExprKind::Conjunction { args } | ExprKind::Disjunction { args } => {
                     if args.is_empty()
-                        || node.ty.data_type != arrow_schema::DataType::Boolean
-                        || node.ty.logical_type
+                        || node.ty.data_type() != &arrow_schema::DataType::Boolean
+                        || node.ty.logical_type()
                             != novarocks_type_contract::ValueLogicalType::Physical
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "Boolean connective has an invalid exact result or arity",
-                        ));
+                        )
+                        .into());
                     }
                     let mut local_args = Vec::with_capacity(args.len());
                     for child in args {
                         let child_source = source
                             .get(*child)
                             .ok_or(ExpressionLoweringError::Invalid("missing Boolean operand"))?;
-                        if child_source.ty.data_type != arrow_schema::DataType::Boolean
-                            || child_source.ty.logical_type
+                        if child_source.ty.data_type() != &arrow_schema::DataType::Boolean
+                            || child_source.ty.logical_type()
                                 != novarocks_type_contract::ValueLogicalType::Physical
                         {
                             return Err(ExpressionLoweringError::Invalid(
                                 "Boolean operand differs from its exact physical Boolean type",
-                            ));
+                            )
+                            .into());
                         }
                         local_args.push(*ids.get(child).ok_or(
                             ExpressionLoweringError::Invalid("Boolean operand was not lowered"),
@@ -581,16 +893,18 @@ fn lower_core(
                     else {
                         return Err(ExpressionLoweringError::Invalid(
                             "cast parameter has a foreign key",
-                        ));
+                        )
+                        .into());
                     };
                     if !novarocks_type_contract::arrow_data_types_exact_observed::<
                         ExpressionLoweringError,
-                    >(target, &node.ty.data_type, || {
+                    >(target, &node.ty.data_type(), || {
                         work.step().map_err(ExpressionLoweringError::Control)
                     })? {
                         return Err(ExpressionLoweringError::Invalid(
                             "cast target differs from result",
-                        ));
+                        )
+                        .into());
                     }
                     work.flush()?;
                     novarocks_functions::PreparedCastRecipe::try_new(
@@ -636,14 +950,15 @@ fn lower_core(
                     else {
                         return Err(ExpressionLoweringError::Invalid(
                             "arithmetic ALLOW_THROW key differs",
-                        ));
+                        )
+                        .into());
                     };
                     let operator = arithmetic_operator(*op).expect("checked arithmetic operator");
                     work.step()?;
                     work.flush()?;
                     // Every definition is prepared, even when it has no actual use.
                     // The source table, never the legacy arena flag, authors this value.
-                    novarocks_functions::PreparedArithmeticRecipe::try_new(
+                    prepare_arithmetic_created(
                         operator,
                         &source
                             .get(*left)
@@ -661,6 +976,7 @@ fn lower_core(
                         *decimal_overflow_policy,
                         *authored_allow,
                         control,
+                        factory,
                     )?;
                     StaticExprKind::PreparedArithmetic {
                         operator,
@@ -682,14 +998,15 @@ fn lower_core(
                     let local_right = *ids.get(right).ok_or(ExpressionLoweringError::Invalid(
                         "null-safe right operand was not lowered",
                     ))?;
-                    if node.ty.data_type != arrow_schema::DataType::Boolean
-                        || node.ty.logical_type
+                    if node.ty.data_type() != &arrow_schema::DataType::Boolean
+                        || node.ty.logical_type()
                             != novarocks_type_contract::ValueLogicalType::Physical
-                        || node.ty.nullable
+                        || node.ty.nullable()
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "null-safe comparison requires nonnullable Physical Boolean result",
-                        ));
+                        )
+                        .into());
                     }
                     work.flush()?;
                     novarocks_functions::PreparedNullSafeComparisonRecipe::try_new(
@@ -833,11 +1150,15 @@ fn lower_core(
                     }
                     StaticExprKind::BoundCall { args: local_args }
                 }
-                _ => return Err(ExpressionLoweringError::UnsupportedExpression(id)),
+                _ => return Err(ExpressionLoweringError::UnsupportedExpression(id).into()),
             };
             work.flush()?;
-            let ty = node.ty.clone();
-            nodes.push(StaticExprNode::new(kind, ty.data_type.clone(), None));
+            let ty = node.ty.clone_observed(|| work.step())?;
+            nodes.push(StaticExprNode::new_value_typed(
+                kind,
+                ty.clone_observed(|| work.step())?,
+            ));
+            observe_type_push(&types, crate::creation::borrow_scope(&mut creation), work)?;
             types.push(FunctionArgumentType::Value(ty));
             work.flush()?;
             ids.insert(id, ProgramExprId::new(nodes.len() - 1));
@@ -855,6 +1176,14 @@ fn lower_core(
     nodes
         .try_reserve_exact(count - nodes.len())
         .map_err(|_| CompileControlError::ResourceExhausted)?;
+    if count > types.capacity() {
+        observe_type_layout(
+            std::alloc::Layout::array::<FunctionArgumentType>(count)
+                .map_err(|_| CompileControlError::ResourceExhausted)?,
+            crate::creation::borrow_scope(&mut creation),
+            work,
+        )?;
+    }
     types
         .try_reserve_exact(count - types.len())
         .map_err(|_| CompileControlError::ResourceExhausted)?;
@@ -870,12 +1199,14 @@ fn lower_core(
             for source in &branch.sources {
                 work.flush()?;
                 definitions.push(ProgramExprId::new(nodes.len()));
-                nodes.push(StaticExprNode::new(
+                nodes.push(StaticExprNode::new_value_typed(
                     StaticExprKind::SlotId(source.input.slot),
-                    source.ty.data_type.clone(),
-                    None,
+                    source.ty.clone_observed(|| work.step())?,
                 ));
-                types.push(FunctionArgumentType::Value(source.ty.clone()));
+                observe_type_push(&types, crate::creation::borrow_scope(&mut creation), work)?;
+                types.push(FunctionArgumentType::Value(
+                    source.ty.clone_observed(|| work.step())?,
+                ));
                 work.step()?;
                 work.flush()?;
             }
@@ -895,12 +1226,14 @@ fn lower_core(
         for key in keys {
             work.flush()?;
             definitions.push(ProgramExprId::new(nodes.len()));
-            nodes.push(StaticExprNode::new(
+            nodes.push(StaticExprNode::new_value_typed(
                 StaticExprKind::SlotId(key.input.slot),
-                key.ty.data_type.clone(),
-                None,
+                key.ty.clone_observed(|| work.step())?,
             ));
-            types.push(FunctionArgumentType::Value(key.ty.clone()));
+            observe_type_push(&types, crate::creation::borrow_scope(&mut creation), work)?;
+            types.push(FunctionArgumentType::Value(
+                key.ty.clone_observed(|| work.step())?,
+            ));
             work.step()?;
             work.flush()?;
         }
@@ -918,6 +1251,23 @@ fn lower_core(
         control,
     )?);
     work.flush()?;
+    let types = crate::creation::publish_argument_types(
+        types,
+        crate::creation::borrow_scope(&mut creation),
+        work,
+    )
+    .map_err(|e| {
+        use novarocks_local_program::ProgramCreationFailure as Failure;
+        match e {
+            Failure::Control(c) => ExpressionCreationFailure::Control(c),
+            Failure::Creator(c) => ExpressionCreationFailure::Creator(c),
+            Failure::Resource(c) => ExpressionCreationFailure::Resource(c),
+            Failure::Capacity(_) => {
+                ExpressionCreationFailure::Control(CompileControlError::ResourceExhausted)
+            }
+            Failure::Owner(never) => match never {},
+        }
+    })?;
     Ok(LoweredExpressions {
         arena,
         ids,
@@ -939,7 +1289,10 @@ pub(crate) fn prepare_calls(
     control: &dyn PureCompileControl,
 ) -> Result<Vec<(ProgramCallSite, PureCallSpecialization)>, ExpressionLoweringError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-    let result = prepare_core(package, lowered, functions, None, control, &mut work);
+    let result = prepare_core::<std::convert::Infallible, crate::creation::NoFactory>(
+        package, lowered, functions, None, control, &mut work, None,
+    )
+    .map_err(ExpressionCreationFailure::into_pure);
     finish(result, &mut work)
 }
 
@@ -954,11 +1307,51 @@ pub(crate) fn prepare_calls_with_aggregates(
     control: &dyn PureCompileControl,
 ) -> Result<Vec<(ProgramCallSite, PureCallSpecialization)>, ExpressionLoweringError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-    let result = prepare_core(package, lowered, functions, Some(nodes), control, &mut work);
+    let result = prepare_core::<std::convert::Infallible, crate::creation::NoFactory>(
+        package,
+        lowered,
+        functions,
+        Some(nodes),
+        control,
+        &mut work,
+        None,
+    )
+    .map_err(ExpressionCreationFailure::into_pure);
     finish(result, &mut work)
 }
 
-fn prepare_core(
+pub(crate) fn prepare_calls_with_aggregates_with_creator<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
+    package: &FragmentPackage,
+    lowered: &LoweredExpressions,
+    functions: &PureEngineFunctionCatalog,
+    nodes: &BTreeMap<novarocks_physical_plan::NodeId, novarocks_local_program::ProgramNodeId>,
+    policy: &ConstantPolicy,
+    factory: &F,
+    control: &dyn PureCompileControl,
+) -> Result<Vec<(ProgramCallSite, PureCallSpecialization)>, crate::FragmentCreationError<H>> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let result = prepare_core(
+        package,
+        lowered,
+        functions,
+        Some(nodes),
+        control,
+        &mut work,
+        Some((factory, policy)),
+    )
+    .map_err(|error| match error {
+        ExpressionCreationFailure::Control(cause) => crate::FragmentCreationError::Control(cause),
+        ExpressionCreationFailure::Creator(cause) => crate::FragmentCreationError::Creator(cause),
+        ExpressionCreationFailure::Resource(cause) => crate::FragmentCreationError::Resource(cause),
+        ExpressionCreationFailure::Owner(cause) => crate::FragmentCreationError::from(cause),
+    });
+    crate::creation::finish_attempt(result, work)
+}
+
+fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     lowered: &LoweredExpressions,
     functions: &PureEngineFunctionCatalog,
@@ -967,7 +1360,8 @@ fn prepare_core(
     >,
     control: &dyn PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<(ProgramCallSite, PureCallSpecialization)>, ExpressionLoweringError> {
+    creation: CallCreation<'_, F>,
+) -> Result<Vec<(ProgramCallSite, PureCallSpecialization)>, ExpressionCreationFailure<H>> {
     // The private intermediate is checked against this exact borrowed source
     // again. A same-sized mapping from a foreign package is not authority.
     // Window calls are the only definitions without a scalar local owner.
@@ -981,9 +1375,7 @@ fn prepare_core(
     if lowered.ids.len().checked_add(window_calls) != Some(package.fragment().expressions().len())
         || lowered.types.len() != lowered.arena.nodes().len()
     {
-        return Err(ExpressionLoweringError::Invalid(
-            "lowered definition coverage differs",
-        ));
+        return Err(ExpressionLoweringError::Invalid("lowered definition coverage differs").into());
     }
     let mut local_ids = BTreeSet::new();
     for (&physical, definition) in package.fragment().expressions().iter() {
@@ -991,7 +1383,8 @@ fn prepare_core(
             if lowered.ids.contains_key(&physical) {
                 return Err(ExpressionLoweringError::Invalid(
                     "window call was lowered as a scalar definition",
-                ));
+                )
+                .into());
             }
             work.step()?;
             continue;
@@ -1003,14 +1396,14 @@ fn prepare_core(
                 "missing lowered definition",
             ))?;
         if !local_ids.insert(local_id) {
-            return Err(ExpressionLoweringError::Invalid(
-                "distinct definitions share a local ID",
-            ));
+            return Err(
+                ExpressionLoweringError::Invalid("distinct definitions share a local ID").into(),
+            );
         }
         let Some(FunctionArgumentType::Value(ty)) = lowered.types.get(local_id.index()) else {
-            return Err(ExpressionLoweringError::Invalid(
-                "missing complete local value type",
-            ));
+            return Err(
+                ExpressionLoweringError::Invalid("missing complete local value type").into(),
+            );
         };
         // The shared walker observes borrowed work before its operations.
         // These are cancellation observations, not fabricated completed units.
@@ -1024,9 +1417,9 @@ fn prepare_core(
             })?;
         work.flush()?;
         if !same {
-            return Err(ExpressionLoweringError::Invalid(
-                "lowered full type differs from source",
-            ));
+            return Err(
+                ExpressionLoweringError::Invalid("lowered full type differs from source").into(),
+            );
         }
         if let ExprKind::Constant(reference) = &definition.kind {
             let node = lowered
@@ -1038,7 +1431,8 @@ fn prepare_core(
             let StaticExprKind::Constant(value) = node.kind() else {
                 return Err(ExpressionLoweringError::Invalid(
                     "constant reference lost its checked source",
-                ));
+                )
+                .into());
             };
             let source = package
                 .constants()
@@ -1077,7 +1471,7 @@ fn prepare_core(
                 return Err(CompileControlError::ResourceExhausted.into());
             }
             if function.kind != FunctionKind::Scalar {
-                return Err(ExpressionLoweringError::UnsupportedExpression(id));
+                return Err(ExpressionLoweringError::UnsupportedExpression(id).into());
             }
             let local_id = *lowered
                 .ids
@@ -1088,14 +1482,10 @@ fn prepare_core(
             let Some(StaticExprKind::BoundCall { args: local_args }) =
                 lowered.arena.node(local_id).map(StaticExprNode::kind)
             else {
-                return Err(ExpressionLoweringError::Invalid(
-                    "lowered call shape differs",
-                ));
+                return Err(ExpressionLoweringError::Invalid("lowered call shape differs").into());
             };
             if args.len() != local_args.len() || args.len() != function.argument_types.len() {
-                return Err(ExpressionLoweringError::Invalid(
-                    "static call arity differs",
-                ));
+                return Err(ExpressionLoweringError::Invalid("static call arity differs").into());
             }
             work.flush()?;
             let result_matches = function
@@ -1109,7 +1499,8 @@ fn prepare_core(
             if !result_matches {
                 return Err(ExpressionLoweringError::Invalid(
                     "static call result differs from its definition",
-                ));
+                )
+                .into());
             }
             for (ordinal, child) in args.iter().enumerate() {
                 let child_id = *lowered
@@ -1121,7 +1512,8 @@ fn prepare_core(
                 if local_args[ordinal] != child_id {
                     return Err(ExpressionLoweringError::Invalid(
                         "ordered static arguments differ",
-                    ));
+                    )
+                    .into());
                 }
                 let child_source = package.fragment().expressions().get(*child).ok_or(
                     ExpressionLoweringError::Invalid("missing physical static argument"),
@@ -1148,10 +1540,11 @@ fn prepare_core(
             let source_request = source_request.ok_or(ExpressionLoweringError::Invalid(
                 "missing original static call request",
             ))?;
-            let request = crate::original_requests::materialize_call_request_observed(
+            let request = crate::original_requests::materialize_call_request_created(
                 source_request,
                 package.constants(),
                 work,
+                creation,
             )?;
             work.flush()?;
             let selection = Arc::new(FunctionBindingSelection {
@@ -1161,12 +1554,14 @@ fn prepare_core(
                 aggregate: None,
             });
             work.flush()?;
-            functions.metadata().validate_frozen_selection(
+            validate_call_created(
+                functions.metadata(),
                 &function.function_id,
                 function.kind,
                 selection.as_ref(),
                 request.request(),
                 control,
+                creation,
             )?;
             work.flush()?;
             selected.insert(id, selection);
@@ -1202,7 +1597,7 @@ fn prepare_core(
             | PhysicalCallSite::WriterFinal { .. } => aggregate_nodes.is_some(),
         };
         if !admitted {
-            return Err(ExpressionLoweringError::UnsupportedCall(site));
+            return Err(ExpressionLoweringError::UnsupportedCall(site).into());
         }
         work.step()?;
     }
@@ -1234,12 +1629,14 @@ fn prepare_core(
                     if !active.insert(child) {
                         return Err(ExpressionLoweringError::Invalid(
                             "cyclic expression occurrence",
-                        ));
+                        )
+                        .into());
                     }
                     if stack.len() >= MAX_CONTROL_DEPTH {
                         return Err(ExpressionLoweringError::Invalid(
                             "expression occurrence depth exceeded",
-                        ));
+                        )
+                        .into());
                     }
                     stack.push((child, 0));
                 }
@@ -1277,7 +1674,8 @@ fn prepare_core(
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "input occurrence has arguments or control",
-                        ));
+                        )
+                        .into());
                     }
                     ScopedExpressionEffects::pure_value(invocation.context)
                 }
@@ -1286,7 +1684,8 @@ fn prepare_core(
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "literal occurrence has arguments or control",
-                        ));
+                        )
+                        .into());
                     }
                     ScopedExpressionEffects::pure_value(invocation.context)
                 }
@@ -1310,7 +1709,8 @@ fn prepare_core(
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "LIKE differs from original Eager2 source",
-                        ));
+                        )
+                        .into());
                     }
                     let definitions = package.fragment().expressions();
                     let ty = |id| {
@@ -1333,7 +1733,8 @@ fn prepare_core(
                         if flow.uses()[&child].definition != *definition {
                             return Err(ExpressionLoweringError::Invalid(
                                 "LIKE source use differs",
-                            ));
+                            )
+                            .into());
                         }
                         combined = combined.join_control_argument(
                             *effects.get(&child).ok_or(ExpressionLoweringError::Invalid(
@@ -1366,7 +1767,8 @@ fn prepare_core(
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "IN differs from its original ordered source",
-                        ));
+                        )
+                        .into());
                     }
                     let definitions = package.fragment().expressions();
                     let source_type = |id| {
@@ -1375,7 +1777,6 @@ fn prepare_core(
                             .map(|n| &n.ty)
                             .ok_or(ExpressionLoweringError::Invalid("missing IN source"))
                     };
-                    let mut candidates = Vec::with_capacity(list.len());
                     for (ordinal, id) in std::iter::once(expr).chain(list.iter()).enumerate() {
                         let local = lowered.ids.get(id).ok_or(ExpressionLoweringError::Invalid(
                             "missing lowered IN source",
@@ -1383,28 +1784,31 @@ fn prepare_core(
                         if flow.uses()[&invocation.arguments[ordinal]].definition != *id {
                             return Err(ExpressionLoweringError::Invalid(
                                 "IN source occurrence differs",
-                            ));
+                            )
+                            .into());
                         }
                         if ordinal > 0 {
                             if values[ordinal - 1] != *local {
                                 return Err(ExpressionLoweringError::Invalid(
                                     "IN candidate definition differs",
-                                ));
+                                )
+                                .into());
                             }
-                            candidates.push(source_type(*id)?);
+                            source_type(*id)?;
                         }
                         work.step()?;
                     }
                     work.flush()?;
-                    let recipe = novarocks_functions::PreparedNativeInListRecipe::try_new(
-                        *negated,
-                        source_type(*expr)?,
-                        &candidates,
-                        &source.ty,
-                        control,
-                    )?;
+                    let mut combined =
+                        novarocks_functions::PreparedNativeInListRecipe::refine_borrowed_profile(
+                            source_type(*expr)?,
+                            list.iter()
+                                .map(|id| source_type(*id).expect("checked immutable IN source")),
+                            &source.ty,
+                            invocation.context,
+                            control,
+                        )?;
                     work.flush()?;
-                    let mut combined = recipe.own_effects(invocation.context);
                     for (ordinal, use_id) in invocation.arguments.iter().enumerate() {
                         let child = *effects.get(use_id).ok_or(
                             ExpressionLoweringError::Invalid("missing IN candidate effects"),
@@ -1443,7 +1847,8 @@ fn prepare_core(
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "BETWEEN differs from its frozen source",
-                        ));
+                        )
+                        .into());
                     }
                     let definitions = package.fragment().expressions();
                     let source_type = |id| {
@@ -1473,7 +1878,8 @@ fn prepare_core(
                         if flow.uses()[&child_use].definition != expected {
                             return Err(ExpressionLoweringError::Invalid(
                                 "BETWEEN ordered source use differs",
-                            ));
+                            )
+                            .into());
                         }
                         combined = combined.join_control_argument(
                             *effects
@@ -1502,7 +1908,8 @@ fn prepare_core(
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "native negate differs from its actual ordered source",
-                        ));
+                        )
+                        .into());
                     }
                     let child = package.fragment().expressions().get(*expr).ok_or(
                         ExpressionLoweringError::Invalid("missing native negate source"),
@@ -1538,7 +1945,8 @@ fn prepare_core(
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "native BitwiseNot differs from its actual ordered source",
-                        ));
+                        )
+                        .into());
                     }
                     let child = package.fragment().expressions().get(*expr).ok_or(
                         ExpressionLoweringError::Invalid("missing native BitwiseNot source"),
@@ -1587,13 +1995,15 @@ fn prepare_core(
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "actual unary control or operand differs",
-                        ));
+                        )
+                        .into());
                     }
                     let child = invocation.arguments[0];
                     if flow.uses()[&child].definition != *expr {
                         return Err(ExpressionLoweringError::Invalid(
                             "actual unary operand occurrence differs",
-                        ));
+                        )
+                        .into());
                     }
                     ScopedExpressionEffects::pure_value(invocation.context).join_control_argument(
                         *effects.get(&child).ok_or(ExpressionLoweringError::Invalid(
@@ -1636,16 +2046,18 @@ fn prepare_core(
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "cast occurrence differs from its frozen source",
-                        ));
+                        )
+                        .into());
                     }
                     if !novarocks_type_contract::arrow_data_types_exact_observed::<
                         ExpressionLoweringError,
-                    >(target, &source.ty.data_type, || {
+                    >(target, &source.ty.data_type(), || {
                         work.step().map_err(ExpressionLoweringError::Control)
                     })? {
                         return Err(ExpressionLoweringError::Invalid(
                             "cast result differs from frozen target",
-                        ));
+                        )
+                        .into());
                     }
                     work.flush()?;
                     let recipe = novarocks_functions::PreparedCastRecipe::try_new(
@@ -1710,11 +2122,12 @@ fn prepare_core(
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "arithmetic occurrence differs from its frozen source",
-                        ));
+                        )
+                        .into());
                     }
                     let definitions = package.fragment().expressions();
                     work.flush()?;
-                    let recipe = novarocks_functions::PreparedArithmeticRecipe::try_new(
+                    let recipe = prepare_arithmetic_created(
                         *operator,
                         &definitions
                             .get(*left)
@@ -1732,6 +2145,7 @@ fn prepare_core(
                         *local_policy,
                         *local_allow,
                         control,
+                        creation.map(|(factory, _)| factory),
                     )?;
                     let mut combined = recipe.own_effects(invocation.context);
                     for (ordinal, physical) in [*left, *right].into_iter().enumerate() {
@@ -1739,7 +2153,8 @@ fn prepare_core(
                         if flow.uses()[&child_use].definition != physical {
                             return Err(ExpressionLoweringError::Invalid(
                                 "actual ordered arithmetic use differs",
-                            ));
+                            )
+                            .into());
                         }
                         combined = combined.join_control_argument(
                             *effects
@@ -1782,7 +2197,8 @@ fn prepare_core(
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "actual comparison control or operands differ",
-                        ));
+                        )
+                        .into());
                     }
                     let mut combined =
                         if matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. }) {
@@ -1836,7 +2252,8 @@ fn prepare_core(
                         if flow.uses()[&child_use].definition != physical {
                             return Err(ExpressionLoweringError::Invalid(
                                 "actual ordered comparison use differs",
-                            ));
+                            )
+                            .into());
                         }
                         combined = combined.join_control_argument(
                             *effects
@@ -1879,7 +2296,8 @@ fn prepare_core(
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "actual CASE control or children differ",
-                        ));
+                        )
+                        .into());
                     }
                     let mut combined = ScopedExpressionEffects::pure_value(invocation.context);
                     for (ordinal, local_child) in children.iter().enumerate() {
@@ -1893,7 +2311,8 @@ fn prepare_core(
                         {
                             return Err(ExpressionLoweringError::Invalid(
                                 "ordered CASE occurrence differs",
-                            ));
+                            )
+                            .into());
                         }
                         combined = combined.join_control_argument(
                             *effects
@@ -1922,7 +2341,8 @@ fn prepare_core(
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "actual Boolean connective control or arity differs",
-                        ));
+                        )
+                        .into());
                     }
                     let mut combined = ScopedExpressionEffects::pure_value(invocation.context);
                     for (ordinal, &child) in args.iter().enumerate() {
@@ -1930,7 +2350,8 @@ fn prepare_core(
                         if flow.uses()[&child_use].definition != child {
                             return Err(ExpressionLoweringError::Invalid(
                                 "ordered Boolean operand occurrences differ",
-                            ));
+                            )
+                            .into());
                         }
                         combined = combined.join_control_argument(
                             *effects
@@ -1951,7 +2372,7 @@ fn prepare_core(
                 ) => {
                     let site = PhysicalCallSite::Expression(id);
                     if function.kind != FunctionKind::Scalar {
-                        return Err(ExpressionLoweringError::UnsupportedCall(site));
+                        return Err(ExpressionLoweringError::UnsupportedCall(site).into());
                     }
                     let frozen = package.calls().entries().get(&site).ok_or(
                         ExpressionLoweringError::Invalid("missing frozen expression call"),
@@ -1959,7 +2380,8 @@ fn prepare_core(
                     if frozen.context != invocation.context {
                         return Err(ExpressionLoweringError::Invalid(
                             "frozen occurrence context differs",
-                        ));
+                        )
+                        .into());
                     }
                     let (type_only, control_intrinsic) =
                         match (invocation.control, frozen.effects.argument_control) {
@@ -1974,7 +2396,7 @@ fn prepare_core(
                                 ControlShape::TemporalSource(shape),
                                 ArgumentControl::TemporalSource(kind),
                             ) if shape.kind() == kind => (false, true),
-                            _ => return Err(ExpressionLoweringError::UnsupportedCall(site)),
+                            _ => return Err(ExpressionLoweringError::UnsupportedCall(site).into()),
                         };
                     if args.len() != local_args.len()
                         || function.argument_types.len() != args.len()
@@ -1990,7 +2412,8 @@ fn prepare_core(
                     {
                         return Err(ExpressionLoweringError::Invalid(
                             "call argument arity differs",
-                        ));
+                        )
+                        .into());
                     }
                     let request =
                         requests
@@ -2034,7 +2457,8 @@ fn prepare_core(
                             if child_invocation.definition != child {
                                 return Err(ExpressionLoweringError::Invalid(
                                     "ordered physical call arguments differ",
-                                ));
+                                )
+                                .into());
                             }
                             children = children.join_control_argument(
                                 *effects.get(&child_use).ok_or(
@@ -2050,7 +2474,8 @@ fn prepare_core(
                                 if source.use_id != child_use {
                                     return Err(ExpressionLoweringError::Invalid(
                                         "temporal source use differs from ordered child edge",
-                                    ));
+                                    )
+                                    .into());
                                 }
                                 let source_node =
                                     package.fragment().expressions().get(child).ok_or(
@@ -2088,47 +2513,48 @@ fn prepare_core(
                         if frozen.regexp_count_pattern_source != Some(expected) {
                             return Err(ExpressionLoweringError::Invalid(
                                 "regexp_count frozen source differs from actual native-v1 projection",
-                            ));
+                            ).into());
                         }
                         Some(expected)
                     } else {
                         if frozen.regexp_count_pattern_source.is_some() {
                             return Err(ExpressionLoweringError::Invalid(
                                 "foreign regexp_count pattern source",
-                            ));
+                            )
+                            .into());
                         }
                         None
                     };
-                    let to_base64_byte_source = if function.function_id.as_str()
-                        == "builtin.scalar/to_base64/v1"
-                    {
-                        let expected = novarocks_physical_plan::to_base64_byte_source_observed(
-                            package.fragment().expressions(),
-                            args,
-                            work,
-                        )
-                        .map_err(|error| match error {
-                            novarocks_physical_plan::TemporalSourceProjectionError::Control(
-                                cause,
-                            ) => ExpressionLoweringError::Control(cause),
-                            novarocks_physical_plan::TemporalSourceProjectionError::Invalid(
-                                message,
-                            ) => ExpressionLoweringError::Invalid(message),
-                        })?;
-                        if frozen.to_base64_byte_source != Some(expected) {
-                            return Err(ExpressionLoweringError::Invalid(
+                    let to_base64_byte_source =
+                        if function.function_id.as_str() == "builtin.scalar/to_base64/v1" {
+                            let expected = novarocks_physical_plan::to_base64_byte_source_observed(
+                                package.fragment().expressions(),
+                                args,
+                                work,
+                            )
+                            .map_err(|error| match error {
+                                novarocks_physical_plan::TemporalSourceProjectionError::Control(
+                                    cause,
+                                ) => ExpressionLoweringError::Control(cause),
+                                novarocks_physical_plan::TemporalSourceProjectionError::Invalid(
+                                    message,
+                                ) => ExpressionLoweringError::Invalid(message),
+                            })?;
+                            if frozen.to_base64_byte_source != Some(expected) {
+                                return Err(ExpressionLoweringError::Invalid(
                                 "to_base64 frozen source differs from actual native-v1 projection",
-                            ));
-                        }
-                        Some(expected)
-                    } else {
-                        if frozen.to_base64_byte_source.is_some() {
-                            return Err(ExpressionLoweringError::Invalid(
-                                "foreign to_base64 byte source",
-                            ));
-                        }
-                        None
-                    };
+                            ).into());
+                            }
+                            Some(expected)
+                        } else {
+                            if frozen.to_base64_byte_source.is_some() {
+                                return Err(ExpressionLoweringError::Invalid(
+                                    "foreign to_base64 byte source",
+                                )
+                                .into());
+                            }
+                            None
+                        };
                     let input = CallEffectInput {
                         context: frozen.context,
                         argument_uses: match &frozen.temporal_source {
@@ -2179,12 +2605,14 @@ fn prepare_core(
                             arguments: children,
                         }
                     };
-                    let token = functions.prepare_frozen(
+                    let token = prepare_call_created(
+                        functions,
                         input,
                         Arc::clone(selection),
                         &frozen.effects,
                         options,
                         control,
+                        creation,
                     )?;
                     work.flush()?;
                     let result = token.effects();
@@ -2200,7 +2628,8 @@ fn prepare_core(
                 _ => {
                     return Err(ExpressionLoweringError::Invalid(
                         "lowered expression shape differs from source",
-                    ));
+                    )
+                    .into());
                 }
             };
             effects.insert(id, scoped);
@@ -2217,6 +2646,7 @@ fn prepare_core(
             nodes,
             &mut tokens,
             work,
+            creation,
         )?;
         crate::table_function::prepare_table_calls(
             package,
@@ -2225,6 +2655,7 @@ fn prepare_core(
             nodes,
             &mut tokens,
             work,
+            creation,
         )?;
         crate::window::prepare_window_calls(
             package,
@@ -2233,6 +2664,7 @@ fn prepare_core(
             nodes,
             &mut tokens,
             work,
+            creation,
         )?;
         crate::writer_statistics::prepare_writer_calls(
             package,
@@ -2240,6 +2672,7 @@ fn prepare_core(
             nodes,
             &mut tokens,
             work,
+            creation,
         )?;
     }
     let mut result = Vec::with_capacity(tokens.len());

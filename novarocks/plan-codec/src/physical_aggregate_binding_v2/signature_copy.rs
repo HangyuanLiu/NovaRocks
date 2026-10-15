@@ -18,7 +18,7 @@
 use crate::physical_binding_v2::owner_admission::Admit;
 use crate::{
     physical_binding_v2::{
-        BindingCodecError, BindingProjectionLimits, MaterializationModel, add, completed,
+        BindingCodecError, BindingProjectionLimits, MaterializationModel, add,
         copy_scalar_signature_observed, preflight_scalar_signature_copy_counts,
         preflight_scalar_signature_copy_counts_in, preflight_scalar_signature_copy_types,
         preflight_scalar_signature_copy_types_in,
@@ -26,7 +26,9 @@ use crate::{
     physical_type_v2::clone_value_type_observed,
 };
 use novarocks_physical_plan::AggregateBinding;
-use novarocks_type_contract::{AggregateStateFormatId, CompileCheckpoints, FunctionKind};
+#[cfg(test)]
+use novarocks_type_contract::AggregateStateFormatId;
+use novarocks_type_contract::{CompileCheckpoints, FunctionKind};
 
 fn header(
     source: &AggregateBinding,
@@ -96,15 +98,8 @@ fn counts_core(
     mut admit: Option<&mut Admit<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
-    if let Some(receipt) = &source.state_interpretation {
-        model.request::<novarocks_type_contract::AggregateStateOrderKey>(
-            receipt.order_keys.len(),
-            2,
-        )?;
-    }
     if admit.is_some() {
         model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
-        model.request::<u8>(source.state_format.as_str().len(), 1)?;
     }
     model.check(limits)?;
     if let Some(parent) = admit.as_mut() {
@@ -113,7 +108,6 @@ fn counts_core(
     header(source, work)?;
     if admit.is_none() {
         model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
-        model.request::<u8>(source.state_format.as_str().len(), 1)?;
     }
     model.check(limits)?;
     if let Some(parent) = admit {
@@ -171,13 +165,9 @@ pub(crate) fn copy_aggregate_binding_observed(
     let intermediate_type = clone_value_type_observed(&source.intermediate_type, work)?;
     work.step()?;
     work.flush()?;
-    // AggregateStateFormatId owns the bounded identity grammar and allocation.
-    let state_format = completed(
-        AggregateStateFormatId::try_new(source.state_format.as_str()).map_err(|_| {
-            BindingCodecError::InvalidShape("copied aggregate state format is invalid")
-        }),
-        work,
-    )?;
+    // A cheap clone retains the original immutable identity creator. It
+    // constructs neither a text Box nor a private backing Arc.
+    let state_format = source.state_format.clone_observed(|| work.step())?;
     work.flush()?;
     let output = AggregateBinding {
         state_interpretation: source

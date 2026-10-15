@@ -429,13 +429,12 @@ mod unified_tests {
     use super::*;
 
     fn column(name: &str) -> ColumnDef {
-        ColumnDef {
-            name: name.into(),
-            data_type: DataType::Int64,
-            nullable: true,
-            write_default: None,
-            logical_type: None,
-        }
+        ColumnDef::from_value_type(
+            name.into(),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            None,
+        )
+        .expect("declared statistics fixture column")
     }
 
     fn local_binding(catalog: &str, namespace: &str, table: &str, seed: u64) -> QueryTableBinding {
@@ -506,8 +505,12 @@ mod unified_tests {
         fn load_table(
             &self,
             _request: ConnectorTableRequest,
-        ) -> Result<ConnectorTableMetadata, ConnectorError> {
-            Err(Self::unsupported())
+            _creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
+            Err(Self::unsupported().into())
         }
     }
 

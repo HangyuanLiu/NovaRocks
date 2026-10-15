@@ -18,7 +18,7 @@
 //! Exact grouping-set projection into the existing local Repeat vocabulary.
 //! This is a pure compiler author, not an operator implementation or MEM grant.
 
-use arrow_schema::{DataType, Schema};
+use arrow_schema::DataType;
 use novarocks_local_program::{LayoutCompileError, ProgramNodeId, ProgramNodeKind, StaticLayout};
 use novarocks_physical_plan::{
     Fragment, FragmentPackage, GroupingOutput, NodeKind, PhysicalNode, ValueId, ValueOrigin,
@@ -190,7 +190,7 @@ fn shape<'a>(
         };
         let valid = old.is_none()
             && keys.contains(&input)
-            && target.ty.nullable
+            && target.ty.nullable()
             && matches!(target.origin, ValueOrigin::NullExtended { node: owner, of } if owner == node.id && of == input);
         work.step()?;
         if !valid {
@@ -199,12 +199,17 @@ fn shape<'a>(
             ));
         }
         work.flush()?;
-        // Full type clones may recursively own dictionary boxes. Their
-        // internal work/allocation is an honest opaque boundary here.
-        let mut expected = source.ty.clone();
-        expected.nullable = true;
+        if !source
+            .ty
+            .same_physical_binding_ignoring_root_nullability_observed(&target.ty, || {
+                work.step().map_err(RepeatLoweringError::from)
+            })?
+        {
+            return Err(RepeatLoweringError::Invalid(
+                "Repeat complete value types differ",
+            ));
+        }
         work.flush()?;
-        exact_type(&expected, &target.ty, work)?;
     }
     for key in &keys {
         let mut absent = false;
@@ -256,11 +261,18 @@ fn shape<'a>(
                 "GROUPING output source or argument count differs",
             ));
         }
-        exact_type(
-            &definition.ty,
-            &FunctionValueType::new(DataType::Int64, false),
-            work,
-        )?;
+        work.step()?;
+        if definition.ty.nullable()
+            || !matches!(
+                definition.ty.value_type().kind(),
+                novarocks_type_contract::ValueKind::Scalar(DataType::Int64)
+            )
+            || definition.ty.data_type() != &DataType::Int64
+        {
+            return Err(RepeatLoweringError::Invalid(
+                "GROUPING output must be required physical Int64",
+            ));
+        }
         for argument in &output.arguments {
             let valid = visible.contains(argument);
             work.step()?;
@@ -343,40 +355,46 @@ pub(crate) fn plan_repeat_channels(
     Ok(RepeatChannelPlan { slots, port })
 }
 
-pub(crate) fn lower_repeat(
+pub(crate) fn lower_repeat_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     local: ProgramNodeId,
     input: (ProgramNodeId, &StaticLayout),
     planned_slots: &[SlotId],
     control: &dyn PureCompileControl,
-) -> Result<(ProgramNodeKind, StaticLayout), RepeatLoweringError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(package, node, local, input, planned_slots, &mut work);
-    if matches!(&result, Err(RepeatLoweringError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    let result = lower_core_with_creation(
+        package,
+        node,
+        local,
+        input,
+        planned_slots,
+        &mut work,
+        creation,
+    );
+    crate::creation::finish_attempt(result, work)
 }
 
-fn lower_core(
+fn lower_core_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     local: ProgramNodeId,
     input: (ProgramNodeId, &StaticLayout),
     planned_slots: &[SlotId],
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(ProgramNodeKind, StaticLayout), RepeatLoweringError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
     let fragment = package.fragment();
     let shape = shape(fragment, node, work)?;
     let (child, layout) = input;
     if layout.slots().len() != shape.child.output.columns.len()
         || planned_slots.len() != node.output.columns.len()
     {
-        return Err(RepeatLoweringError::Invalid(
-            "Repeat materialized channel width differs",
-        ));
+        return Err(
+            (RepeatLoweringError::Invalid("Repeat materialized channel width differs")).into(),
+        );
     }
     let mut result_names = package
         .result()
@@ -391,8 +409,11 @@ fn lower_core(
             }
         }
     }
-    let mut fields = Vec::new();
-    let mut original_fields = layout.metadata_materializations().map(|_| Vec::new());
+    let mut typed_layout = crate::typed_layout::TypedLayoutBuilder::new_with_creation(
+        planned_slots.len(),
+        work,
+        creation,
+    )?;
     for (ordinal, value) in shape.child.output.columns.iter().enumerate() {
         let source = fragment
             .values()
@@ -404,15 +425,25 @@ fn lower_core(
             .get(ordinal)
             .ok_or(RepeatLoweringError::Invalid("missing Repeat input field"))?;
         work.flush()?;
-        let actual = FunctionValueType::try_from_field(field)?;
+        let actual = layout
+            .value_binding_at(ordinal)
+            .ok_or(RepeatLoweringError::Invalid(
+                "Repeat child has no complete value binding",
+            ))?;
+        if !actual
+            .exactly_equals_observed::<RepeatLoweringError>(source.ty.typed_binding(), || {
+                work.step().map_err(Into::into)
+            })?
+        {
+            return Err(
+                (RepeatLoweringError::Invalid("Repeat complete value types differ")).into(),
+            );
+        }
         work.flush()?;
-        exact_type(&actual, &source.ty, work)?;
         let same_slot = planned_slots[ordinal] == layout.slots()[ordinal];
         work.step()?;
         if !same_slot {
-            return Err(RepeatLoweringError::Invalid(
-                "Repeat passthrough slot changed",
-            ));
+            return Err((RepeatLoweringError::Invalid("Repeat passthrough slot changed")).into());
         }
         let output_type = &fragment
             .values()
@@ -423,21 +454,16 @@ fn lower_core(
             .and_then(|result| result.fields.get(ordinal))
             .map(|field| field.alias.as_deref().unwrap_or(&field.name));
         work.flush()?;
-        // Preserve the original header/metadata, changing only the authored
-        // nullable root and, when exact result binding applies, its label.
-        if let Some(original_fields) = original_fields.as_mut() {
-            let mut output_field = novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::clone_from_source(field, layout.metadata_materializations()).with_nullable_owned(output_type.nullable);
-            if let Some(name) = name {
-                output_field = output_field.with_name_owned(name);
-            }
-            original_fields.push(output_field);
-        } else {
-            let mut output_field = field.as_ref().clone().with_nullable(output_type.nullable);
-            if let Some(name) = name {
-                output_field = output_field.with_name(name);
-            }
-            fields.push(output_field);
-        }
+        typed_layout.push_with_creation(
+            output_type,
+            crate::typed_layout::copy_name_with_creation(
+                name.unwrap_or(field.name()),
+                work,
+                creation,
+            )?,
+            work,
+            creation,
+        )?;
         work.flush()?;
         work.step()?;
     }
@@ -465,20 +491,22 @@ fn lower_core(
                 .fields
                 .get(ordinal)
                 .ok_or(RepeatLoweringError::Invalid("missing Repeat result field"))?;
-            field.alias.as_deref().unwrap_or(&field.name).to_owned()
+            crate::typed_layout::copy_name_with_creation(
+                field.alias.as_deref().unwrap_or(&field.name),
+                work,
+                creation,
+            )?
         } else {
-            format!("local_{}_{}", local.index(), ordinal)
+            crate::typed_layout::local_name_with_creation(
+                "local",
+                local.index(),
+                ordinal,
+                work,
+                creation,
+            )?
         };
         work.flush()?;
-        if let Some(original_fields) = original_fields.as_mut() {
-            let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(ty, name);
-            work.flush()?;
-            original_fields.push(novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::Materialized(field?));
-        } else {
-            let field = ty.try_to_field(name);
-            work.flush()?;
-            fields.push(field?);
-        }
+        typed_layout.push_with_creation(ty, name, work, creation)?;
         work.step()?;
     }
     let mut null_slot_ids = Vec::new();
@@ -495,26 +523,7 @@ fn lower_core(
         work.step()?;
     }
     work.flush()?;
-    let (schema, original_schema) = match (original_fields, layout.metadata_materializations()) {
-        (Some(fields), Some(source)) => {
-            let inherited = source.field_namespace();
-            let namespace = match package.original_metadata_namespace() {
-                Some(package_source) => inherited.join_original_observed(package_source, work)?,
-                None => inherited,
-            };
-            let original = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::from_original_fields(fields, namespace).into_original_schema();
-            (original.schema_owner().schema().clone(), Some(original))
-        }
-        _ => (Arc::new(Schema::new(fields)), None),
-    };
-    let slots: Arc<[SlotId]> = Arc::from(planned_slots);
-    work.flush()?;
-    let output_layout = match original_schema {
-        Some(source) => {
-            StaticLayout::try_new_materialized_for_compile(source, slots, work.control())?
-        }
-        None => StaticLayout::try_new_for_compile(schema, slots, work.control())?,
-    };
+    let output_layout = typed_layout.finish_with_creation(planned_slots, work, creation)?;
     let kind = ProgramNodeKind::Repeat {
         input: child,
         repeat_times: shape.sets.len(),

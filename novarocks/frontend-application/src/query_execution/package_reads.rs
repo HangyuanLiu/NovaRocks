@@ -235,13 +235,27 @@ fn author_read(
         ),
     };
     work.flush().map_err(PackageFreezeError::Control)?;
-    let public = ConnectorReadPublicFacts::try_new(
+    let execution = schema
+        .execution_schema()
+        .ok_or_else(|| refused("the provider published no complete execution schema".into()))?;
+    let source_schema = schema
+        .source_schema_facts()
+        .ok_or_else(|| refused("the provider published no frozen source schema facts".into()))?;
+    let public = ConnectorReadPublicFacts::try_new_typed_with_control(
         source,
         metadata_kind,
-        (**schema.schema()).clone(),
-        schema.logical_types().to_vec(),
+        execution,
+        source_schema,
+        work.control(),
     )
-    .map_err(|error| refused(format!("public read facts: {error}")))?;
+    .map_err(|error| match error {
+        novarocks_connector_contract::PureProviderCompileError::Control(cause) => {
+            PackageFreezeError::Control(cause)
+        }
+        novarocks_connector_contract::PureProviderCompileError::Provider(error) => {
+            refused(format!("public read facts: {error}"))
+        }
+    })?;
     work.step().map_err(PackageFreezeError::Control)?;
     FrozenConnectorRead::try_new(frozen_scan, public).map_err(|error| refused(error.to_string()))
 }

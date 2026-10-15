@@ -58,8 +58,10 @@ use novarocks_local_program::{
 use novarocks_types::SlotId;
 
 use super::compiled_expression::RuntimeKernelControl;
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
+use crate::exec::pipeline::operator::{
+    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
@@ -79,10 +81,11 @@ pub struct CompiledTableFunctionProcessorFactory {
     kernel: Arc<dyn PreparedTableKernel>,
     /// The frozen input port; channels are read by position.
     input: SchemaRef,
+    input_layout: novarocks_local_program::StaticLayout,
     params: Arc<[usize]>,
     producers: Arc<[Producer]>,
     left_outer: bool,
-    output: ChunkSchemaRef,
+    output_layout: novarocks_local_program::StaticLayout,
     error: Arc<RuntimeErrorState>,
 }
 
@@ -151,11 +154,18 @@ impl CompiledTableFunctionProcessorFactory {
         let mut params = Vec::with_capacity(param_slots.len());
         for (slot, expected) in param_slots.iter().zip(&argument_types) {
             let ordinal = input_ordinal(*slot)?;
-            if input_type(ordinal) != &expected.data_type {
+            if input_layout.is_typed()
+                && input_layout.value_binding_at(ordinal) != Some(expected.typed_binding())
+            {
+                return Err(invalid(format!(
+                    "parameter slot {slot} differs from its complete frozen binding"
+                )));
+            }
+            if input_type(ordinal) != expected.data_type() {
                 return Err(invalid(format!(
                     "parameter slot {slot} has type {:?}, not {:?}",
                     input_type(ordinal),
-                    expected.data_type
+                    expected.data_type()
                 )));
             }
             params.push(ordinal);
@@ -182,7 +192,7 @@ impl CompiledTableFunctionProcessorFactory {
                     let result = result_types.get(*index).ok_or_else(|| {
                         invalid(format!("publishes result {index} outside its relation"))
                     })?;
-                    (Producer::Result(*index), &result.data_type)
+                    (Producer::Result(*index), result.data_type())
                 }
             };
             if source_type != output_type {
@@ -190,18 +200,46 @@ impl CompiledTableFunctionProcessorFactory {
                     "output channel {ordinal} has type {output_type:?}, not {source_type:?}"
                 )));
             }
+            if layout.is_typed() {
+                let target = layout
+                    .value_binding_at(ordinal)
+                    .ok_or_else(|| invalid("has an output without a complete binding".into()))?;
+                let source = match producer {
+                    Producer::Outer(input) => {
+                        input_layout.value_binding_at(input).ok_or_else(|| {
+                            invalid("has an outer input without a complete binding".into())
+                        })?
+                    }
+                    Producer::Result(index) => result_types[index].typed_binding(),
+                };
+                if (source.nullable() && !target.nullable())
+                    || !source
+                        .borrowed()
+                        .same_physical_binding_ignoring_root_nullability_observed(
+                            target.borrowed(),
+                            || Ok::<(), String>(()),
+                        )?
+                {
+                    return Err(invalid(format!(
+                        "output channel {ordinal} differs from its complete source binding"
+                    )));
+                }
+            } else if input_layout.is_typed() {
+                return Err(invalid("is missing its complete output bindings".into()));
+            }
             producers.push(producer);
         }
-        let output = ChunkSchema::from_compiled_layout(layout)?;
+        let output_layout = layout.clone();
         Ok(Self {
             name: format!("COMPILED_TABLE_FUNCTION (node={at})"),
             node: at,
             kernel,
             input: input_layout.schema().clone(),
+            input_layout: input_layout.clone(),
             params: Arc::from(params),
             producers: Arc::from(producers),
             left_outer: *is_left_join,
-            output,
+            output_layout,
             error,
         })
     }
@@ -218,14 +256,18 @@ impl OperatorFactory for CompiledTableFunctionProcessorFactory {
             node: self.node,
             kernel: Arc::clone(&self.kernel),
             input_schema: Arc::clone(&self.input),
+            input_layout: self.input_layout.clone(),
             params: Arc::clone(&self.params),
             producers: Arc::clone(&self.producers),
             left_outer: self.left_outer,
-            output: Arc::clone(&self.output),
+            output_layout: self.output_layout.clone(),
+            output: None,
+            construction: None,
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             pending: VecDeque::new(),
             finishing: false,
             finished: false,
+            failed: false,
         })
     }
 }
@@ -235,15 +277,19 @@ struct CompiledTableFunctionProcessor {
     node: usize,
     kernel: Arc<dyn PreparedTableKernel>,
     input_schema: SchemaRef,
+    input_layout: novarocks_local_program::StaticLayout,
     params: Arc<[usize]>,
     producers: Arc<[Producer]>,
     left_outer: bool,
-    output: ChunkSchemaRef,
+    output_layout: novarocks_local_program::StaticLayout,
+    output: Option<ChunkSchemaRef>,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
     control: RuntimeKernelControl,
     /// Output chunks of the current input batch, in output order.
     pending: VecDeque<Chunk>,
     finishing: bool,
     finished: bool,
+    failed: bool,
 }
 
 /// The rows one invocation produced, in arrival order, with their parents.
@@ -257,6 +303,18 @@ struct Produced {
 }
 
 impl CompiledTableFunctionProcessor {
+    fn alive(&self) -> ExecutionResult<()> {
+        if self.failed {
+            Err(novarocks_functions::KernelFailure::InstanceFailed.into())
+        } else {
+            Ok(())
+        }
+    }
+    fn prepared_output(&self) -> ExecutionResult<&ChunkSchemaRef> {
+        self.output
+            .as_ref()
+            .ok_or_else(|| ConstructionFailure::MissingOwner.into())
+    }
     fn failure(&self, what: impl std::fmt::Display) -> ExecutionFailure {
         ExecutionFailure::from(format!(
             "compiled TableFunction at local node {} {what}",
@@ -334,7 +392,7 @@ impl CompiledTableFunctionProcessor {
         let mut columns = Vec::with_capacity(contract.result_types().len());
         for (index, result) in contract.result_types().iter().enumerate() {
             let column = if pages.is_empty() {
-                new_empty_array(&result.data_type)
+                new_empty_array(&result.data_type())
             } else {
                 let parts = pages
                     .iter()
@@ -392,13 +450,25 @@ impl CompiledTableFunctionProcessor {
                 next[parent] += 1;
             }
         }
-        let schema = self.output.arrow_schema_ref();
+        let output = self.prepared_output()?;
         let mut chunks = VecDeque::new();
         let mut start = 0usize;
         while start < total {
             let end = total.min(start + chunk_rows.max(1));
             let outer = UInt64Array::from(parent_rows[start..end].to_vec());
             let results = UInt64Array::from(result_rows[start..end].to_vec());
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?;
+            let owner = factory.begin_typed_construction(output)?;
+            owner.observe(
+                0,
+                &[],
+                crate::exec::chunk::ArrayNormalizationStep::CreateChunkColumns {
+                    channels: self.producers.len(),
+                },
+            )?;
             let mut columns = Vec::with_capacity(self.producers.len());
             for producer in self.producers.iter() {
                 let column = match producer {
@@ -410,11 +480,15 @@ impl CompiledTableFunctionProcessor {
                 .map_err(|error| self.failure(format!("output gather: {error}")))?;
                 columns.push(column);
             }
-            let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
-                .map_err(|error| self.failure(format!("output: {error}")))?;
-            chunks.push_back(Chunk::try_new_with_chunk_schema(
-                batch,
-                Arc::clone(&self.output),
+            chunks.push_back(Chunk::try_new_typed_with_columns_owned_observed::<
+                ConstructionFailure,
+                _,
+            >(
+                Arc::clone(output),
+                columns,
+                end - start,
+                owner.storage_lifetime(),
+                |step| owner.observe(0, &[], step),
             )?);
             start = end;
         }
@@ -423,11 +497,44 @@ impl CompiledTableFunctionProcessor {
 }
 
 impl Operator for CompiledTableFunctionProcessor {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.construction = Some(factory);
+    }
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        self.alive()?;
+        if self.output.is_some() {
+            return Ok(());
+        }
+        let result = (|| -> ExecutionResult<ChunkSchemaRef> {
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?;
+            Ok(factory.create_compiled_chunk_schema(&self.output_layout)?)
+        })();
+        match result {
+            Ok(output) => {
+                self.output = Some(output);
+                Ok(())
+            }
+            Err(cause) => {
+                self.failed = true;
+                Err(cause)
+            }
+        }
+    }
     fn name(&self) -> &str {
         &self.name
     }
     fn is_finished(&self) -> bool {
-        self.finished
+        self.failed || self.finished
+    }
+    fn cancel(&mut self) {
+        self.failed = true;
+        self.pending.clear();
     }
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
         Some(self)
@@ -439,27 +546,52 @@ impl Operator for CompiledTableFunctionProcessor {
 
 impl ProcessorOperator for CompiledTableFunctionProcessor {
     fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.pending.is_empty()
+        !self.failed && !self.finishing && !self.finished && self.pending.is_empty()
     }
     fn has_output(&self) -> bool {
-        !self.pending.is_empty()
+        !self.failed && !self.pending.is_empty()
     }
     fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+        self.alive()?;
+        self.prepared_output()?;
         if !self.pending.is_empty() {
             return Err(self.failure("received input while output is pending"));
         }
         if chunk.is_empty() {
             return Ok(());
         }
-        if chunk.batch.schema().as_ref() != self.input_schema.as_ref() {
+        if chunk.record_batch().schema().as_ref() != self.input_schema.as_ref() {
             return Err(self.failure("input differs from its frozen input port"));
         }
+        if self.input_layout.is_typed() {
+            let schema = chunk.chunk_schema();
+            if !schema.is_typed()
+                || schema.slots().len() != self.input_layout.slots().len()
+                || schema.slots().iter().enumerate().any(|(ordinal, slot)| {
+                    self.input_layout.value_binding_at(ordinal) != Some(slot.typed_binding())
+                })
+            {
+                return Err(self.failure("input differs from its complete frozen value bindings"));
+            }
+        }
         let chunk_rows = state.chunk_size();
-        let produced = self.invoke(&chunk.batch, chunk_rows)?;
-        self.pending = self.assemble(&chunk.batch, produced, chunk_rows)?;
-        Ok(())
+        let result = self
+            .invoke(chunk.record_batch(), chunk_rows)
+            .and_then(|produced| self.assemble(chunk.record_batch(), produced, chunk_rows));
+        match result {
+            Ok(pending) => {
+                self.pending = pending;
+                Ok(())
+            }
+            Err(cause) => {
+                self.failed = true;
+                self.pending.clear();
+                Err(cause)
+            }
+        }
     }
     fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+        self.alive()?;
         let output = self.pending.pop_front();
         if self.finishing && self.pending.is_empty() {
             self.finished = true;
@@ -467,6 +599,7 @@ impl ProcessorOperator for CompiledTableFunctionProcessor {
         Ok(output)
     }
     fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+        self.alive()?;
         self.finishing = true;
         if self.pending.is_empty() {
             self.finished = true;

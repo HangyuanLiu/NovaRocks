@@ -955,19 +955,10 @@ mod scan_split {
         )
     }
     fn public_schema() -> Schema {
-        Schema::new_with_metadata(
-            ["v0", "v1"]
-                .into_iter()
-                .enumerate()
-                .map(|(id, name)| {
-                    Field::new(name, DataType::Int64, false).with_metadata(HashMap::from([(
-                        "provider.field-id".into(),
-                        (id + 1).to_string(),
-                    )]))
-                })
-                .collect::<Vec<_>>(),
-            HashMap::new(),
-        )
+        Schema::new(vec![
+            Field::new("v0", DataType::Int64, false),
+            Field::new("v1", DataType::Int64, false),
+        ])
     }
 
     /// Canonicalizes private bytes only; the public facts are borrowed.
@@ -1278,13 +1269,7 @@ mod scan_split {
             vec![],
         )
         .unwrap();
-        let public = ConnectorReadPublicFacts::try_new(
-            source,
-            None,
-            public_schema(),
-            vec![ValueLogicalType::Physical; 2],
-        )
-        .unwrap();
+        let public = crate::scan_lowering_tests::typed_public_schema(source, None, public_schema());
         let scans = BTreeMap::from([(
             ProviderReadOccurrenceId::new(0),
             FrozenConnectorRead::try_new(scan, public).unwrap(),

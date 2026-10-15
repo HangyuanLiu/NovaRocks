@@ -129,12 +129,38 @@ fn bytes<T>(count: usize) -> Result<usize, BindingCodecError> {
 fn height(count: usize) -> usize {
     (usize::BITS - count.leading_zeros()) as usize
 }
+#[derive(Clone, Copy)]
+enum HeaderProfile {
+    Receiving(BindingProjectionLimits),
+    // Same role as the original default call-request reader. This is checked
+    // source geometry, not a made-up unlimited receiving profile or grant.
+    InputDerived,
+}
+impl HeaderProfile {
+    fn receiving(self) -> Option<BindingProjectionLimits> {
+        match self {
+            Self::Receiving(limits) => Some(limits),
+            Self::InputDerived => None,
+        }
+    }
+    fn gate(
+        self,
+        policy: Policy,
+        facts: &BindingProjectionFacts,
+        admit: &mut Admit<'_>,
+    ) -> Result<(), BindingCodecError> {
+        match self {
+            Self::Receiving(limits) => policy.gate(facts, limits, admit),
+            Self::InputDerived => admit(facts).map_err(Into::into),
+        }
+    }
+}
 fn admit_work(
     facts: &mut BindingProjectionFacts,
     count: usize,
     arguments: usize,
     type_lookup_work: usize,
-    limits: BindingProjectionLimits,
+    profile: HeaderProfile,
     policy: Policy,
     admit: &mut Admit<'_>,
 ) -> Result<(), BindingCodecError> {
@@ -157,11 +183,17 @@ fn admit_work(
             add(references, mul(facts.request_bytes_upper_bound, 4)?)?,
         )?,
     )?;
-    policy.gate(facts, limits, admit)?;
-    if facts.cumulative_work_upper_bound > limits.max_work {
+    profile.gate(policy, facts, admit)?;
+    if profile
+        .receiving()
+        .is_some_and(|limits| facts.cumulative_work_upper_bound > limits.max_work)
+    {
         return Err(invalid("binding header work exceeds its envelope"));
     }
-    if facts.type_reference_count > limits.max_type_references {
+    if profile
+        .receiving()
+        .is_some_and(|limits| facts.type_reference_count > limits.max_type_references)
+    {
         return Err(invalid(
             "binding header type references exceed their envelope",
         ));
@@ -185,15 +217,44 @@ fn preflight(
     admit: &mut Admit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BindingProjectionFacts, BindingCodecError> {
+    preflight_namespace(
+        definitions,
+        types.value_types().len(),
+        size_of::<DecodedTypeTable>(),
+        source,
+        HeaderProfile::Receiving(limits),
+        policy,
+        admit,
+        work,
+    )
+}
+fn preflight_namespace(
+    definitions: &[wire::FunctionBindingDefinition],
+    type_count: usize,
+    type_header_bytes: usize,
+    source: usize,
+    profile: HeaderProfile,
+    policy: Policy,
+    admit: &mut Admit<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<BindingProjectionFacts, BindingCodecError> {
     let add = |a, b| policy.add(a, b, "binding header arithmetic overflow");
     let mul = |a, b| policy.mul(a, b, "binding header arithmetic overflow");
-    if !policy.0 && definitions.len() > limits.max_definitions {
+    if !policy.0
+        && profile
+            .receiving()
+            .is_some_and(|limits| definitions.len() > limits.max_definitions)
+    {
         return Err(invalid(
             "binding header definition count exceeds its envelope",
         ));
     }
     let request_bytes = policy.bytes::<usize>(
-        definitions.len(),
+        if matches!(profile, HeaderProfile::Receiving(_)) {
+            definitions.len()
+        } else {
+            0
+        },
         "binding header layout is unrepresentable",
     )?;
     let mut facts = BindingProjectionFacts {
@@ -209,29 +270,29 @@ fn preflight(
             &mut facts,
             definitions.len(),
             0,
-            add(types.value_types().len(), 1)?,
-            limits,
+            add(type_count, 1)?,
+            profile,
             policy,
             admit,
         )?;
     }
-    if request_bytes > limits.max_request_bytes
-        || facts.allocation_requests_upper_bound > limits.max_allocation_requests
-        || facts.coexisting_source_and_request_bytes_upper_bound
-            > limits.max_coexisting_source_and_request_bytes
-    {
+    if profile.receiving().is_some_and(|limits| {
+        request_bytes > limits.max_request_bytes
+            || facts.allocation_requests_upper_bound > limits.max_allocation_requests
+            || facts.coexisting_source_and_request_bytes_upper_bound
+                > limits.max_coexisting_source_and_request_bytes
+    }) {
         return Err(invalid(
             "binding header index requests exceed their envelope",
         ));
     }
-    let type_count = types.value_types().len();
     // A map lookup cannot compare more keys than the whole map holds. This
     // conservative bound does not assume Rust's private BTree branching.
     let type_lookup_work = add(type_count, 1)?;
     let mut known = add(
         bytes::<wire::FunctionBindingDefinition>(definitions.len())?,
         add(
-            size_of::<DecodedTypeTable>(),
+            type_header_bytes,
             mul(
                 type_count,
                 add(size_of::<u32>(), size_of::<FunctionValueType>())?,
@@ -247,7 +308,7 @@ fn preflight(
         definitions.len(),
         0,
         type_lookup_work,
-        limits,
+        profile,
         policy,
         admit,
     )?;
@@ -274,7 +335,7 @@ fn preflight(
             definitions.len(),
             argument_count,
             type_lookup_work,
-            limits,
+            profile,
             policy,
             admit,
         )?;
@@ -303,7 +364,7 @@ fn preflight(
                 definitions.len(),
                 argument_count,
                 type_lookup_work,
-                limits,
+                profile,
                 policy,
                 admit,
             )?;
@@ -329,7 +390,7 @@ fn preflight(
             definitions.len(),
             argument_count,
             type_lookup_work,
-            limits,
+            profile,
             policy,
             admit,
         )?;
@@ -345,7 +406,7 @@ fn validate(
     types: &DecodedTypeTable,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
-    let value = |id, work: &mut CompileCheckpoints<'_>| {
+    let mut value = |id, work: &mut CompileCheckpoints<'_>| {
         // The lookup is an admitted opaque standard-library operation; these
         // boundaries do not claim cooperation inside BTreeMap::get.
         work.flush()?;
@@ -358,6 +419,14 @@ fn validate(
             Err(invalid("binding header value type is absent"))
         }
     };
+    validate_definitions_with_lookup(definitions, &mut value, work)
+}
+
+pub(super) fn validate_definitions_with_lookup(
+    definitions: &[wire::FunctionBindingDefinition],
+    value: &mut impl FnMut(u32, &mut CompileCheckpoints<'_>) -> Result<(), BindingCodecError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), BindingCodecError> {
     for definition in definitions {
         FunctionId::validate_str(&definition.function_id)
             .map_err(|_| invalid("binding header function identity is invalid"))?;
@@ -476,6 +545,39 @@ pub fn prepare_function_binding_headers_in<'loan, 'control: 'loan>(
         limits,
         Policy(true),
         admit,
+        work,
+    )
+}
+
+/// Preflight one actual default scalar occurrence in the execution namespace.
+/// The original header arithmetic/work/source walker is shared. No index is
+/// created for this already-addressed occurrence and no installed owner proof
+/// is implied. The caller supplies its one real coexisting source invoice.
+pub fn preflight_execution_binding_header_input_derived_in(
+    definition: &wire::FunctionBindingDefinition,
+    types: &crate::execution_type_table::DecodedExecutionTypeTable,
+    original_source_bytes: usize,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<BindingProjectionFacts, BindingCodecError> {
+    let mut last_work = 0usize;
+    let mut observe = |facts: &BindingProjectionFacts| {
+        // All source/request/work arithmetic has already run in the sole
+        // model. Preserve its monotone completed snapshots; this grants no
+        // construction capacity and is not a receiving-profile author.
+        if facts.cumulative_work_upper_bound < last_work {
+            return Err(CompileControlError::ResourceExhausted);
+        }
+        last_work = facts.cumulative_work_upper_bound;
+        Ok(())
+    };
+    preflight_namespace(
+        std::slice::from_ref(definition),
+        types.len(),
+        size_of::<crate::execution_type_table::DecodedExecutionTypeTable>(),
+        original_source_bytes,
+        HeaderProfile::InputDerived,
+        Policy(true),
+        &mut observe,
         work,
     )
 }

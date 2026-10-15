@@ -43,14 +43,19 @@ pub fn native_negate_computed_result_type(
         work.flush()?;
         let mut result = source.clone();
         work.step()?;
-        result.nullable |= matches!(
-            source.data_type,
-            DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Decimal128(_, _)
-                | DataType::Decimal256(_, _)
-        );
+        result = result
+            .with_nullable(
+                result.nullable()
+                    || matches!(
+                        source.data_type(),
+                        DataType::Int8
+                            | DataType::Int16
+                            | DataType::Int32
+                            | DataType::Decimal128(_, _)
+                            | DataType::Decimal256(_, _)
+                    ),
+            )
+            .map_err(|_| ArithmeticPrepareError::TypeMismatch)?;
         work.step()?;
         let prepared = PreparedNativeNegateRecipe::try_new(source, &result, control)?;
         Ok(prepared.result)
@@ -91,25 +96,25 @@ impl PreparedNativeNegateRecipe {
                 .map_err(ArithmeticPrepareError::Kernel)?;
             // The original native zero author supplies both supported types and
             // full refusal messages. Numeric classification alone is not admission.
-            let zero = native_negate_zero(&source.data_type)
+            let zero = native_negate_zero(source.data_type())
                 .map_err(|message| ArithmeticPrepareError::Kernel(invalid(&message)))?;
-            let actual_domain = source.logical_type == ValueLogicalType::Physical
-                && !matches!(source.data_type, DataType::FixedSizeBinary(_))
-                || source.logical_type == ValueLogicalType::LargeInt
-                    && source.data_type == DataType::FixedSizeBinary(16);
+            let actual_domain = source.logical_type() == ValueLogicalType::Physical
+                && !matches!(source.data_type(), DataType::FixedSizeBinary(_))
+                || source.logical_type() == ValueLogicalType::LargeInt
+                    && source.data_type() == &DataType::FixedSizeBinary(16);
             work.step()?;
             if !actual_domain
-                || source.logical_type != result.logical_type
-                || source.data_type != result.data_type
-                || (source.nullable && !result.nullable)
+                || source.logical_type() != result.logical_type()
+                || source.data_type() != result.data_type()
+                || (source.nullable() && !result.nullable())
             {
                 return Err(ArithmeticPrepareError::TypeMismatch);
             }
             // Original narrow MIN produces a successful NULL on Arrow output
             // cast. Its nonnullable physical result receipt is not truthful.
-            if !result.nullable
+            if !result.nullable()
                 && matches!(
-                    source.data_type,
+                    source.data_type(),
                     DataType::Int8 | DataType::Int16 | DataType::Int32
                 )
             {
@@ -117,9 +122,9 @@ impl PreparedNativeNegateRecipe {
                     "native NEGATE narrow signed result requires its actual nullable output domain",
                 )));
             }
-            if !result.nullable
+            if !result.nullable()
                 && matches!(
-                    source.data_type,
+                    source.data_type(),
                     DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
                 )
             {
@@ -154,7 +159,7 @@ impl PreparedNativeNegateRecipe {
         ScopedExpressionEffects::primitive(
             context,
             ExpressionEffects {
-                may_raise_row_error: self.source.data_type == DataType::Int64,
+                may_raise_row_error: self.source.data_type() == &DataType::Int64,
                 ..ExpressionEffects::PURE_VALUE
             },
         )
@@ -205,7 +210,7 @@ impl PreparedNativeNegateRecipe {
                         .next()
                         .ok_or_else(|| invalid("native NEGATE inherited error is missing"))?;
                     errors.push(error.clone());
-                    rows.push(arrow_array::new_null_array(&self.result.data_type, 1));
+                    rows.push(arrow_array::new_null_array(self.result.data_type(), 1));
                     work.step()?;
                 } else {
                     work.flush()?;
@@ -213,7 +218,7 @@ impl PreparedNativeNegateRecipe {
                         NativeNegateRowResult::Value(value) => rows.push(value),
                         NativeNegateRowResult::RowError(error) => {
                             errors.push(error);
-                            rows.push(arrow_array::new_null_array(&self.result.data_type, 1));
+                            rows.push(arrow_array::new_null_array(self.result.data_type(), 1));
                         }
                     }
                     work.step()?;
@@ -221,7 +226,7 @@ impl PreparedNativeNegateRecipe {
             }
             work.flush()?;
             let output = if rows.is_empty() {
-                arrow_array::new_empty_array(&self.result.data_type)
+                arrow_array::new_empty_array(self.result.data_type())
             } else {
                 let mut arrays = Vec::with_capacity(rows.len());
                 for array in &rows {
@@ -238,7 +243,7 @@ impl PreparedNativeNegateRecipe {
             work.flush()?;
             crate::SelectedValues::try_new_observed(
                 selection,
-                &self.result.data_type,
+                self.result.data_type(),
                 output,
                 errors.into_boxed_slice(),
                 || work.step(),
@@ -285,7 +290,7 @@ impl PreparedNativeNegateRecipe {
             let answer = crate::legacy_arithmetic::eval_sub_arrays(
                 zero,
                 operand,
-                self.result.data_type.clone(),
+                self.result.data_type().clone(),
                 false,
                 DecimalOverflowPolicy::OutputNull,
             );

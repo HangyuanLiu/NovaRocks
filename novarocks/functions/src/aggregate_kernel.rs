@@ -107,6 +107,11 @@ pub trait PreparedAggregateKernel: Send + Sync + fmt::Debug + 'static {
         Self: 'batch;
 
     fn contract(&self) -> &Arc<AggregateCallContract>;
+    /// Local implementation input fact, separate from pure frozen semantics.
+    fn argument_encoding(&self, ordinal: usize) -> crate::AggregateArgumentEncoding<'_> {
+        crate::AggregateArgumentEncoding::plain(self.contract().as_ref(), ordinal)
+    }
+
     /// Explicit same-owner phase construction. The framework supplies only
     /// its authenticated local-stage contracts; semantic fields stay owned
     /// by this concrete implementation. No old contract pointer is reused.
@@ -312,6 +317,15 @@ pub trait PureAggregateImplementation:
         contract: Arc<AggregateCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<Self::Kernel>, KernelFailure>;
+    fn prepare_aggregate_checked(
+        &self,
+        _input: CallEffectInput<'_>,
+        _checked: &crate::CheckedCallEffectInput<'_>,
+        _contract: Arc<AggregateCallContract>,
+        _control: &dyn PureCompileControl,
+    ) -> Result<Arc<Self::Kernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        Err(crate::CheckedOwnerFailure::UnconvertedOwner)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -398,6 +412,114 @@ pub(crate) fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>
     control: &dyn PureCompileControl,
 ) -> Result<AggregateSpecialization<O::Kernel>, FunctionSpecializationFailure> {
     let (owner, prepare) = preparation;
+    specialize_aggregate_once_core(
+        owner,
+        input,
+        selected,
+        frozen,
+        arguments,
+        options,
+        control,
+        |arguments| {
+            crate::specialization::refine_once_for_specialization(
+                owner, input, frozen, arguments, control,
+            )
+        },
+        |contract| {
+            prepare(owner, input, contract, control).map_err(FunctionSpecializationFailure::Kernel)
+        },
+    )
+}
+
+pub(crate) fn specialize_aggregate_once_checked<O: PureAggregateImplementation + ?Sized>(
+    owner: &O,
+    checked: &crate::CheckedCallEffectInput<'_>,
+    input: CallEffectInput<'_>,
+    selected: Arc<FunctionBindingSelection>,
+    frozen: Option<&CallEffects>,
+    arguments: ScopedExpressionEffects,
+    options: AggregatePreparationOptions,
+    control: &dyn PureCompileControl,
+) -> Result<
+    AggregateSpecialization<O::Kernel>,
+    crate::CheckedOwnerFailure<FunctionSpecializationFailure>,
+> {
+    specialize_aggregate_once_checked_with_preparation(
+        owner,
+        checked,
+        input,
+        selected,
+        frozen,
+        arguments,
+        options,
+        control,
+        |contract| owner.prepare_aggregate_checked(input, checked, contract, control),
+    )
+}
+
+pub(crate) fn specialize_aggregate_once_checked_with_preparation<
+    O: PureAggregateImplementation + ?Sized,
+>(
+    owner: &O,
+    checked: &crate::CheckedCallEffectInput<'_>,
+    input: CallEffectInput<'_>,
+    selected: Arc<FunctionBindingSelection>,
+    frozen: Option<&CallEffects>,
+    arguments: ScopedExpressionEffects,
+    options: AggregatePreparationOptions,
+    control: &dyn PureCompileControl,
+    prepare: impl FnOnce(
+        Arc<AggregateCallContract>,
+    ) -> Result<Arc<O::Kernel>, crate::CheckedOwnerFailure<KernelFailure>>,
+) -> Result<
+    AggregateSpecialization<O::Kernel>,
+    crate::CheckedOwnerFailure<FunctionSpecializationFailure>,
+> {
+    specialize_aggregate_once_core(
+        owner,
+        input,
+        selected,
+        frozen,
+        arguments,
+        options,
+        control,
+        |arguments| {
+            crate::specialization::refine_once_checked(
+                owner, checked, input, frozen, arguments, control,
+            )
+        },
+        |contract| {
+            prepare(contract).map_err(|error| match error {
+                crate::CheckedOwnerFailure::Original(error) => {
+                    crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::Kernel(
+                        error,
+                    ))
+                }
+                crate::CheckedOwnerFailure::UnconvertedOwner => {
+                    crate::CheckedOwnerFailure::UnconvertedOwner
+                }
+            })
+        },
+    )
+}
+
+fn specialize_aggregate_once_core<
+    'a,
+    O: PureAggregateImplementation + ?Sized,
+    E: From<FunctionSpecializationFailure>,
+>(
+    _owner: &O,
+    input: CallEffectInput<'a>,
+    selected: Arc<FunctionBindingSelection>,
+    _frozen: Option<&CallEffects>,
+    arguments: ScopedExpressionEffects,
+    options: AggregatePreparationOptions,
+    control: &dyn PureCompileControl,
+    refine: impl FnOnce(
+        ScopedExpressionEffects,
+    ) -> Result<(crate::RefinedCallEffects<'a>, ScopedExpressionEffects), E>,
+    prepare: impl FnOnce(Arc<AggregateCallContract>) -> Result<Arc<O::Kernel>, E>,
+) -> Result<AggregateSpecialization<O::Kernel>, E> {
     let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
         control,
         CompilePhase::FunctionSpecialization,
@@ -464,7 +586,8 @@ pub(crate) fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>
                     novarocks_type_contract::CompileControlError::ResourceExhausted,
                 ),
                 other => FunctionSpecializationFailure::Kernel(other),
-            });
+            }
+            .into());
         }
         result => {
             work.finish()
@@ -472,9 +595,7 @@ pub(crate) fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>
             result.map_err(FunctionSpecializationFailure::Kernel)?
         }
     };
-    let (receipt, effects) = crate::specialization::refine_once_for_specialization(
-        owner, input, frozen, arguments, control,
-    )?;
+    let (receipt, effects) = refine(arguments)?;
     let call = Arc::new(
         FunctionCallContract::from_refined(input, &receipt, selected, control)
             .map_err(FunctionSpecializationFailure::Kernel)?,
@@ -492,12 +613,12 @@ pub(crate) fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>
         )
         .map_err(FunctionSpecializationFailure::Kernel)?,
     );
-    let prepared = prepare(owner, input, contract.clone(), control)
-        .map_err(FunctionSpecializationFailure::Kernel)?;
+    let prepared = prepare(contract.clone())?;
     if !Arc::ptr_eq(prepared.contract(), &contract) {
         return Err(FunctionSpecializationFailure::Kernel(internal(
             "aggregate preparation replaced its exact immutable contract",
-        )));
+        ))
+        .into());
     }
     state_retained_bound(prepared.as_ref()).map_err(FunctionSpecializationFailure::Kernel)?;
     control
@@ -596,7 +717,28 @@ impl<'batch, K: PreparedAggregateKernel> AggregateUpdateInvocation<'batch, K> {
         allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<Self, crate::EvaluationFailure> {
+        Self::try_new_evaluation_with_owner(None, kernel, input, mapping, allocator, control)
+    }
+    pub(crate) fn try_new_evaluation_for_installed(
+        owner: &'batch dyn crate::aggregate_erasure::ErasedAggregateOps,
+        kernel: &'batch K,
+        input: SelectedAggregateUpdateInput<'batch, 'batch>,
+        mapping: &[usize],
+        allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, crate::EvaluationFailure> {
+        Self::try_new_evaluation_with_owner(Some(owner), kernel, input, mapping, allocator, control)
+    }
+    fn try_new_evaluation_with_owner(
+        owner: Option<&'batch dyn crate::aggregate_erasure::ErasedAggregateOps>,
+        kernel: &'batch K,
+        input: SelectedAggregateUpdateInput<'batch, 'batch>,
+        mapping: &[usize],
+        allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self, crate::EvaluationFailure> {
         control.checkpoint(0)?;
+        input.validate_installed_owner(owner)?;
         if !std::ptr::eq(input.contract(), kernel.contract().as_ref()) {
             return Err(
                 invalid("aggregate update input differs from exact prepared contract").into(),

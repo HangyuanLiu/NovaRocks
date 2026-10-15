@@ -122,7 +122,15 @@ mod owner_tests {
     };
 
     fn noop_submission(finst_id: UniqueId) -> FragmentSubmission {
-        submission(finst_id, Chunk::default(), FragmentSinkProgram::Noop)
+        submission(
+            finst_id,
+            crate::exec::chunk::typed_fixture::chunk(
+                arrow::record_batch::RecordBatch::new_empty(Arc::new(Schema::empty())),
+                &[],
+                &[],
+            ),
+            FragmentSinkProgram::Noop,
+        )
     }
 
     fn submission(
@@ -144,9 +152,11 @@ mod owner_tests {
                 kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 19 }),
             },
         };
-        let profile = plan
-            .local_compile_profile(NonZeroUsize::new(1).expect("one driver"), None)
-            .expect("local profile");
+        let profile = crate::exec::chunk::typed_fixture::profile(
+            &plan,
+            NonZeroUsize::new(1).expect("one driver"),
+            None,
+        );
         let sink_requirements = if matches!(
             &sink,
             novarocks_local_program::StaticSinkProgram::Result
@@ -156,9 +166,8 @@ mod owner_tests {
         } else {
             Vec::new()
         };
-        let (local, bindings) = plan
-            .into_local_program_and_bindings(profile, BTreeMap::new(), sink_requirements, sink)
-            .expect("local program");
+        let (local, bindings) =
+            crate::exec::chunk::typed_fixture::lower(plan, profile, sink_requirements, sink);
         let program = Arc::new(
             FragmentProgram::try_new(
                 Arc::new(local),
@@ -194,10 +203,14 @@ mod owner_tests {
             vec![Arc::new(Int32Array::from(vec![7]))],
         )
         .expect("one row batch");
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
-                .expect("one row chunk schema");
-        Chunk::new_with_chunk_schema(batch, chunk_schema)
+        crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[SlotId::new(1)],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                false,
+            )],
+        )
     }
 
     struct RejectLegacyRootWriter;
@@ -465,7 +478,9 @@ mod owner_tests {
             &self,
             chunk: Chunk,
             credit: crate::runtime::fragment::io::ResultWriteCredit,
-        ) -> Result<(), FragmentIoError> {
+            _factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+            _control: &dyn novarocks_functions::KernelEvaluationControl,
+        ) -> Result<(), crate::runtime::fragment::io::ResultWriteFailure> {
             debug_assert_eq!(credit.bytes(), chunk.logical_bytes());
             self.entered.store(true, Ordering::Release);
             let mut released = self.released.lock().expect("result release lock");
@@ -1454,9 +1469,6 @@ pub fn prepare_fragment(
         )?;
         resources.acquire_result(program, &context.result_writer, result_spec)?;
         context.fail_if_injected(PrepareFailurePoint::AfterResult)?;
-        resources.acquire_exchange(program, instance)?;
-        context.fail_if_injected(PrepareFailurePoint::AfterExchange)?;
-
         let runtime_state = build_runtime_state(RuntimeStateInputs {
             query_options: apply_query_option_overrides(
                 Some(instance.runtime_options().query_options().clone()),
@@ -1480,6 +1492,30 @@ pub fn prepare_fragment(
                 error,
             )
         })?;
+        let receiver_creation = if program.exchange_inputs().is_empty() {
+            None
+        } else {
+            let construction_error =
+                |cause: crate::exec::pipeline::operator::ConstructionFailure| {
+                    FragmentLaunchError::from_failure(
+                        FragmentLaunchStage::Register,
+                        FragmentLaunchErrorKind::ResourceUnavailable,
+                        cause.into(),
+                    )
+                };
+            let tracker = runtime_state.mem_tracker().ok_or_else(|| {
+                construction_error(
+                    crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                )
+            })?;
+            let profile = crate::exec::pipeline::pipeline::representation_construction_profile()
+                .map_err(crate::exec::pipeline::operator::ConstructionFailure::from)
+                .map_err(construction_error)?;
+            Some(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(profile, tracker, runtime_state.error_state()).map_err(construction_error)?)
+        };
+        resources.acquire_exchange(program, instance, receiver_creation)?;
+        context.fail_if_injected(PrepareFailurePoint::AfterExchange)?;
+
         let materialized_sink = materialize_fragment_sink_with_result(
             program,
             instance,

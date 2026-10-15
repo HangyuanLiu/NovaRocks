@@ -18,6 +18,7 @@
 //! Mandatory primitive recipes derived from the same checked use/type chain.
 //! No external side table, name resolver or runtime preparation is accepted.
 
+use crate::creation::{ProgramCreation, ProgramCreationFailure};
 use crate::{ProgramLexicalBindings, ProgramUseRef, StaticExprKind};
 use novarocks_functions::{
     ComparisonOperator, ComparisonPrepareError, FunctionArgumentType, FunctionValueType,
@@ -25,7 +26,8 @@ use novarocks_functions::{
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, PureCompileControl,
-    ValueLogicalType,
+    ValueLogicalType, ValueSchemaCreationFactory, ValueSchemaCreationScope,
+    ValueTypeStorageLifetime,
 };
 use std::{collections::BTreeMap, fmt};
 
@@ -82,23 +84,157 @@ impl std::error::Error for ProgramPrimitiveError {
     }
 }
 
-pub(crate) fn compile_comparisons(
+#[derive(Debug)]
+pub(crate) struct CreatedPrimitiveMap<K, V> {
+    pub(crate) entries: BTreeMap<K, V>,
+    pub(crate) _storage: ValueTypeStorageLifetime,
+}
+impl<K, V> std::ops::Deref for CreatedPrimitiveMap<K, V> {
+    type Target = BTreeMap<K, V>;
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+impl<H> From<ProgramPrimitiveError> for ProgramCreationFailure<ProgramPrimitiveError, H> {
+    fn from(error: ProgramPrimitiveError) -> Self {
+        match error {
+            ProgramPrimitiveError::Control(error) => Self::Control(error),
+            error => Self::Owner(error),
+        }
+    }
+}
+impl<H> From<ComparisonPrepareError> for ProgramCreationFailure<ProgramPrimitiveError, H> {
+    fn from(error: ComparisonPrepareError) -> Self {
+        ProgramPrimitiveError::from(error).into()
+    }
+}
+impl<H> From<novarocks_functions::ArithmeticPrepareError>
+    for ProgramCreationFailure<ProgramPrimitiveError, H>
+{
+    fn from(error: novarocks_functions::ArithmeticPrepareError) -> Self {
+        ProgramPrimitiveError::from(error).into()
+    }
+}
+impl<H> From<novarocks_functions::CastPrepareError>
+    for ProgramCreationFailure<ProgramPrimitiveError, H>
+{
+    fn from(error: novarocks_functions::CastPrepareError) -> Self {
+        ProgramPrimitiveError::from(error).into()
+    }
+}
+pub(crate) fn pure_primitive_failure(
+    error: ProgramCreationFailure<ProgramPrimitiveError, std::convert::Infallible>,
+) -> ProgramPrimitiveError {
+    match error {
+        ProgramCreationFailure::Control(error) => ProgramPrimitiveError::Control(error),
+        ProgramCreationFailure::Owner(error) => error,
+        ProgramCreationFailure::Resource(_) | ProgramCreationFailure::Capacity(_) => {
+            ProgramPrimitiveError::Control(CompileControlError::ResourceExhausted)
+        }
+        ProgramCreationFailure::Creator(never) => match never {},
+    }
+}
+fn arithmetic_creation_failure<H>(
+    error: novarocks_functions::ArithmeticCreationFailure<H>,
+) -> ProgramCreationFailure<ProgramPrimitiveError, H> {
+    use novarocks_functions::{
+        ArithmeticCreationFailure as Failure, ArithmeticTypeCreationFailure as TypeFailure,
+    };
+    use novarocks_type_contract::ValueConstructionFailure as Construction;
+    match error {
+        Failure::Prepare(error) => ProgramPrimitiveError::from(error).into(),
+        Failure::Construction(Construction::Observer(TypeFailure::Control(error))) => ProgramCreationFailure::Control(error),
+        Failure::Construction(Construction::Observer(TypeFailure::Creator(error))) => ProgramCreationFailure::Creator(error),
+        Failure::Construction(Construction::Layout(error)) => ProgramCreationFailure::Resource(error),
+        Failure::Construction(Construction::Vec(error)) => match error {
+            novarocks_type_contract::ControlResourceError::Control(error) => ProgramCreationFailure::Control(error),
+            // Canonical Float64 has no collection construction. A future
+            // unknown collection route must fail its original source model.
+            novarocks_type_contract::ControlResourceError::SourceModel(_) =>
+                ProgramCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
+        },
+        Failure::Construction(Construction::HashMap(error)) => match error {
+            novarocks_type_contract::owned_resources::hashmap::HashMapResourceError::Arithmetic(_) =>
+                ProgramCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic),
+            novarocks_type_contract::owned_resources::hashmap::HashMapResourceError::SourceModel(_) =>
+                ProgramCreationFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
+        },
+        Failure::Construction(Construction::ValueType(_) | Construction::Rule(_)) =>
+            ProgramPrimitiveError::Arithmetic(novarocks_functions::ArithmeticPrepareError::TypeMismatch).into(),
+    }
+}
+fn native_inlist_creation_failure<H>(
+    error: novarocks_functions::NativeInListCreationFailure<H>,
+) -> ProgramCreationFailure<ProgramPrimitiveError, H> {
+    match error {
+        novarocks_functions::NativeInListCreationFailure::Control(error) => {
+            ProgramCreationFailure::Control(error)
+        }
+        novarocks_functions::NativeInListCreationFailure::Creator(error) => {
+            ProgramCreationFailure::Creator(error)
+        }
+        novarocks_functions::NativeInListCreationFailure::Resource(error) => {
+            ProgramCreationFailure::Resource(error)
+        }
+        novarocks_functions::NativeInListCreationFailure::Owner(error) => {
+            ProgramPrimitiveError::from(error).into()
+        }
+    }
+}
+fn before_recipe_insert<K: Ord, V, H>(
+    recipes: &BTreeMap<K, V>,
+    retained: &mut ProgramCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ProgramCreationFailure<ProgramPrimitiveError, H>> {
+    retained.before_tree_insert::<ProgramPrimitiveError, K, V>(recipes.len(), work)
+}
+
+pub(crate) fn compile_comparisons_with_factory<H, F: ValueSchemaCreationFactory<H>>(
     checked: &ProgramLexicalBindings,
+    _temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
     control: &dyn PureCompileControl,
-) -> Result<BTreeMap<ProgramComparisonSite, PreparedComparisonRecipe>, ProgramPrimitiveError> {
+) -> Result<
+    CreatedPrimitiveMap<ProgramComparisonSite, PreparedComparisonRecipe>,
+    ProgramCreationFailure<ProgramPrimitiveError, H>,
+> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = compile_core(checked, control, &mut work);
-    if matches!(result, Err(ProgramPrimitiveError::Control(_))) {
-        return result;
+    let mut scope = match factory {
+        Some(factory) => Some(
+            factory
+                .begin_scope()
+                .map_err(ProgramCreationFailure::Creator)?,
+        ),
+        None => None,
+    };
+    let mut retained = ProgramCreation {
+        creator: scope
+            .as_mut()
+            .map(|scope| scope as &mut dyn ValueSchemaCreationScope<H>),
+    };
+    let result = compile_core(checked, control, &mut retained, &mut work);
+    if !matches!(result, Ok(_) | Err(ProgramCreationFailure::Owner(_))) {
+        return result.map(|entries| CreatedPrimitiveMap {
+            entries,
+            _storage: retained.storage(),
+        });
     }
     work.finish()?;
-    result
+    Ok(CreatedPrimitiveMap {
+        entries: result?,
+        _storage: retained.storage(),
+    })
 }
-fn compile_core(
+
+fn compile_core<H>(
     checked: &ProgramLexicalBindings,
     control: &dyn PureCompileControl,
+    retained: &mut ProgramCreation<'_, H>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<BTreeMap<ProgramComparisonSite, PreparedComparisonRecipe>, ProgramPrimitiveError> {
+) -> Result<
+    BTreeMap<ProgramComparisonSite, PreparedComparisonRecipe>,
+    ProgramCreationFailure<ProgramPrimitiveError, H>,
+> {
     let typed = checked.channels().expressions();
     let snapshot = typed.resolved_calls().snapshot();
     let mut recipes = BTreeMap::new();
@@ -138,7 +274,8 @@ fn compile_core(
                     {
                         return Err(ProgramPrimitiveError::Invalid(
                             "BETWEEN differs from its four ordered uses",
-                        ));
+                        )
+                        .into());
                     }
                     for (ordinal, role) in plan.sources().into_iter().enumerate() {
                         let expected = match role {
@@ -149,7 +286,8 @@ fn compile_core(
                         if flow.uses()[&invocation.arguments[ordinal]].definition != expected {
                             return Err(ProgramPrimitiveError::Invalid(
                                 "BETWEEN source occurrence differs",
-                            ));
+                            )
+                            .into());
                         }
                         work.step()?;
                     }
@@ -163,10 +301,12 @@ fn compile_core(
                         control,
                     )?;
                     work.flush()?;
+                    before_recipe_insert(&recipes, retained, work)?;
                     recipes.insert(
                         ProgramComparisonSite::BetweenLower(occurrence),
                         recipe.lower().clone(),
                     );
+                    before_recipe_insert(&recipes, retained, work)?;
                     recipes.insert(
                         ProgramComparisonSite::BetweenUpper(occurrence),
                         recipe.upper().clone(),
@@ -183,7 +323,8 @@ fn compile_core(
                     {
                         return Err(ProgramPrimitiveError::Invalid(
                             "comparison differs from its actual ordered occurrence",
-                        ));
+                        )
+                        .into());
                     }
                     work.flush()?;
                     let recipe = PreparedComparisonRecipe::try_new(
@@ -193,14 +334,16 @@ fn compile_core(
                         control,
                     )?;
                     let result = value(invocation.definition)?;
-                    if result.data_type != arrow_schema::DataType::Boolean
-                        || result.logical_type != ValueLogicalType::Physical
-                        || (recipe.nullable_result() && !result.nullable)
+                    if *result.data_type() != arrow_schema::DataType::Boolean
+                        || result.logical_type() != ValueLogicalType::Physical
+                        || (recipe.nullable_result() && !result.nullable())
                     {
                         return Err(ProgramPrimitiveError::Invalid(
                             "comparison result loses successful SQL NULL or its Boolean domain",
-                        ));
+                        )
+                        .into());
                     }
+                    before_recipe_insert(&recipes, retained, work)?;
                     recipes.insert(ProgramComparisonSite::Binary(occurrence), recipe);
                     work.step()?;
                 }
@@ -217,7 +360,8 @@ fn compile_core(
                     else {
                         return Err(ProgramPrimitiveError::Invalid(
                             "simple CASE differs from actual control shape",
-                        ));
+                        )
+                        .into());
                     };
                     let count = (arms as usize)
                         .checked_mul(2)
@@ -230,13 +374,15 @@ fn compile_core(
                     {
                         return Err(ProgramPrimitiveError::Invalid(
                             "simple CASE differs from its ordered children",
-                        ));
+                        )
+                        .into());
                     }
                     for (ordinal, definition) in children.iter().enumerate() {
                         if flow.uses()[&invocation.arguments[ordinal]].definition != *definition {
                             return Err(ProgramPrimitiveError::Invalid(
                                 "simple CASE child differs from actual use",
-                            ));
+                            )
+                            .into());
                         }
                         work.step()?;
                     }
@@ -248,6 +394,7 @@ fn compile_core(
                             value(children[1 + arm as usize * 2])?,
                             control,
                         )?;
+                        before_recipe_insert(&recipes, retained, work)?;
                         recipes.insert(ProgramComparisonSite::CaseWhen { occurrence, arm }, recipe);
                         work.step()?;
                     }
@@ -269,14 +416,29 @@ impl From<novarocks_functions::ArithmeticPrepareError> for ProgramPrimitiveError
     }
 }
 
-pub(crate) fn compile_arithmetic(
+pub(crate) fn compile_arithmetic_with_factory<H, F: ValueSchemaCreationFactory<H>>(
     checked: &ProgramLexicalBindings,
+    _temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
     control: &dyn PureCompileControl,
 ) -> Result<
-    BTreeMap<ProgramUseRef, novarocks_functions::PreparedArithmeticRecipe>,
-    ProgramPrimitiveError,
+    CreatedPrimitiveMap<ProgramUseRef, novarocks_functions::PreparedArithmeticRecipe>,
+    ProgramCreationFailure<ProgramPrimitiveError, H>,
 > {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let mut scope = match factory {
+        Some(factory) => Some(
+            factory
+                .begin_scope()
+                .map_err(ProgramCreationFailure::Creator)?,
+        ),
+        None => None,
+    };
+    let mut retained = ProgramCreation {
+        creator: scope
+            .as_mut()
+            .map(|scope| scope as &mut dyn ValueSchemaCreationScope<H>),
+    };
     let result = (|| {
         let typed = checked.channels().expressions();
         let snapshot = typed.resolved_calls().snapshot();
@@ -315,29 +477,52 @@ pub(crate) fn compile_arithmetic(
                 {
                     return Err(ProgramPrimitiveError::Invalid(
                         "arithmetic differs from its actual ordered occurrence",
-                    ));
+                    )
+                    .into());
                 }
                 work.flush()?;
-                let recipe = novarocks_functions::PreparedArithmeticRecipe::try_new(
-                    *operator,
-                    value(*left)?,
-                    value(*right)?,
-                    value(invocation.definition)?,
-                    *decimal_overflow_policy,
-                    *allow_throw_exception,
-                    control,
-                )?;
+                let recipe = match factory {
+                    Some(factory) => {
+                        novarocks_functions::PreparedArithmeticRecipe::try_new_with_creator_in(
+                            *operator,
+                            value(*left)?,
+                            value(*right)?,
+                            value(invocation.definition)?,
+                            *decimal_overflow_policy,
+                            *allow_throw_exception,
+                            factory,
+                            control,
+                        )
+                        .map_err(arithmetic_creation_failure)?
+                    }
+                    None => novarocks_functions::PreparedArithmeticRecipe::try_new(
+                        *operator,
+                        value(*left)?,
+                        value(*right)?,
+                        value(invocation.definition)?,
+                        *decimal_overflow_policy,
+                        *allow_throw_exception,
+                        control,
+                    )?,
+                };
+                before_recipe_insert(&recipes, &mut retained, &mut work)?;
                 recipes.insert(ProgramUseRef { arena, use_id }, recipe);
                 work.step()?;
             }
         }
         Ok(recipes)
     })();
-    if matches!(result, Err(ProgramPrimitiveError::Control(_))) {
-        return result;
+    if !matches!(result, Ok(_) | Err(ProgramCreationFailure::Owner(_))) {
+        return result.map(|entries| CreatedPrimitiveMap {
+            entries,
+            _storage: retained.storage(),
+        });
     }
     work.finish()?;
-    result
+    Ok(CreatedPrimitiveMap {
+        entries: result?,
+        _storage: retained.storage(),
+    })
 }
 
 impl From<novarocks_functions::CastPrepareError> for ProgramPrimitiveError {
@@ -350,12 +535,29 @@ impl From<novarocks_functions::CastPrepareError> for ProgramPrimitiveError {
     }
 }
 
-pub(crate) fn compile_casts(
+pub(crate) fn compile_casts_with_factory<H, F: ValueSchemaCreationFactory<H>>(
     checked: &ProgramLexicalBindings,
+    _temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
     control: &dyn PureCompileControl,
-) -> Result<BTreeMap<ProgramUseRef, novarocks_functions::PreparedCastRecipe>, ProgramPrimitiveError>
-{
+) -> Result<
+    CreatedPrimitiveMap<ProgramUseRef, novarocks_functions::PreparedCastRecipe>,
+    ProgramCreationFailure<ProgramPrimitiveError, H>,
+> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let mut scope = match factory {
+        Some(factory) => Some(
+            factory
+                .begin_scope()
+                .map_err(ProgramCreationFailure::Creator)?,
+        ),
+        None => None,
+    };
+    let mut retained = ProgramCreation {
+        creator: scope
+            .as_mut()
+            .map(|scope| scope as &mut dyn ValueSchemaCreationScope<H>),
+    };
     let result = (|| {
         let typed = checked.channels().expressions();
         let snapshot = typed.resolved_calls().snapshot();
@@ -390,7 +592,8 @@ pub(crate) fn compile_casts(
                 {
                     return Err(ProgramPrimitiveError::Invalid(
                         "cast differs from its actual operand occurrence",
-                    ));
+                    )
+                    .into());
                 }
                 work.flush()?;
                 let recipe = novarocks_functions::PreparedCastRecipe::try_new(
@@ -401,27 +604,49 @@ pub(crate) fn compile_casts(
                     *allow_throw_exception,
                     control,
                 )?;
+                before_recipe_insert(&recipes, &mut retained, &mut work)?;
                 recipes.insert(ProgramUseRef { arena, use_id }, recipe);
                 work.step()?;
             }
         }
         Ok(recipes)
     })();
-    if matches!(result, Err(ProgramPrimitiveError::Control(_))) {
-        return result;
+    if !matches!(result, Ok(_) | Err(ProgramCreationFailure::Owner(_))) {
+        return result.map(|entries| CreatedPrimitiveMap {
+            entries,
+            _storage: retained.storage(),
+        });
     }
     work.finish()?;
-    result
+    Ok(CreatedPrimitiveMap {
+        entries: result?,
+        _storage: retained.storage(),
+    })
 }
 
-pub(crate) fn compile_null_safe_comparisons(
+pub(crate) fn compile_null_safe_comparisons_with_factory<H, F: ValueSchemaCreationFactory<H>>(
     checked: &ProgramLexicalBindings,
+    _temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
     control: &dyn PureCompileControl,
 ) -> Result<
-    BTreeMap<ProgramUseRef, novarocks_functions::PreparedNullSafeComparisonRecipe>,
-    ProgramPrimitiveError,
+    CreatedPrimitiveMap<ProgramUseRef, novarocks_functions::PreparedNullSafeComparisonRecipe>,
+    ProgramCreationFailure<ProgramPrimitiveError, H>,
 > {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let mut scope = match factory {
+        Some(factory) => Some(
+            factory
+                .begin_scope()
+                .map_err(ProgramCreationFailure::Creator)?,
+        ),
+        None => None,
+    };
+    let mut retained = ProgramCreation {
+        creator: scope
+            .as_mut()
+            .map(|scope| scope as &mut dyn ValueSchemaCreationScope<H>),
+    };
     let result = (|| {
         let typed = checked.channels().expressions();
         let snapshot = typed.resolved_calls().snapshot();
@@ -453,16 +678,18 @@ pub(crate) fn compile_null_safe_comparisons(
                 {
                     return Err(ProgramPrimitiveError::Invalid(
                         "null-safe comparison differs from its actual ordered occurrence",
-                    ));
+                    )
+                    .into());
                 }
                 let result = value(invocation.definition)?;
-                if result.data_type != arrow_schema::DataType::Boolean
-                    || result.logical_type != ValueLogicalType::Physical
-                    || result.nullable
+                if *result.data_type() != arrow_schema::DataType::Boolean
+                    || result.logical_type() != ValueLogicalType::Physical
+                    || result.nullable()
                 {
                     return Err(ProgramPrimitiveError::Invalid(
                         "null-safe comparison requires nonnullable Physical Boolean result",
-                    ));
+                    )
+                    .into());
                 }
                 work.flush()?;
                 let recipe = novarocks_functions::PreparedNullSafeComparisonRecipe::try_new(
@@ -470,27 +697,49 @@ pub(crate) fn compile_null_safe_comparisons(
                     value(*right)?,
                     control,
                 )?;
+                before_recipe_insert(&recipes, &mut retained, &mut work)?;
                 recipes.insert(ProgramUseRef { arena, use_id }, recipe);
                 work.step()?;
             }
         }
         Ok(recipes)
     })();
-    if matches!(result, Err(ProgramPrimitiveError::Control(_))) {
-        return result;
+    if !matches!(result, Ok(_) | Err(ProgramCreationFailure::Owner(_))) {
+        return result.map(|entries| CreatedPrimitiveMap {
+            entries,
+            _storage: retained.storage(),
+        });
     }
     work.finish()?;
-    result
+    Ok(CreatedPrimitiveMap {
+        entries: result?,
+        _storage: retained.storage(),
+    })
 }
 
-pub(crate) fn compile_native_negate(
+pub(crate) fn compile_native_negate_with_factory<H, F: ValueSchemaCreationFactory<H>>(
     checked: &ProgramLexicalBindings,
+    _temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
     control: &dyn PureCompileControl,
 ) -> Result<
-    BTreeMap<ProgramUseRef, novarocks_functions::PreparedNativeNegateRecipe>,
-    ProgramPrimitiveError,
+    CreatedPrimitiveMap<ProgramUseRef, novarocks_functions::PreparedNativeNegateRecipe>,
+    ProgramCreationFailure<ProgramPrimitiveError, H>,
 > {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let mut scope = match factory {
+        Some(factory) => Some(
+            factory
+                .begin_scope()
+                .map_err(ProgramCreationFailure::Creator)?,
+        ),
+        None => None,
+    };
+    let mut retained = ProgramCreation {
+        creator: scope
+            .as_mut()
+            .map(|scope| scope as &mut dyn ValueSchemaCreationScope<H>),
+    };
     let result = (|| {
         let typed = checked.channels().expressions();
         let snapshot = typed.resolved_calls().snapshot();
@@ -521,7 +770,8 @@ pub(crate) fn compile_native_negate(
                 {
                     return Err(ProgramPrimitiveError::Invalid(
                         "native negate differs from its actual ordered occurrence",
-                    ));
+                    )
+                    .into());
                 }
                 work.flush()?;
                 let recipe = novarocks_functions::PreparedNativeNegateRecipe::try_new(
@@ -529,27 +779,49 @@ pub(crate) fn compile_native_negate(
                     value(invocation.definition)?,
                     control,
                 )?;
+                before_recipe_insert(&recipes, &mut retained, &mut work)?;
                 recipes.insert(ProgramUseRef { arena, use_id }, recipe);
                 work.step()?;
             }
         }
         Ok(recipes)
     })();
-    if matches!(result, Err(ProgramPrimitiveError::Control(_))) {
-        return result;
+    if !matches!(result, Ok(_) | Err(ProgramCreationFailure::Owner(_))) {
+        return result.map(|entries| CreatedPrimitiveMap {
+            entries,
+            _storage: retained.storage(),
+        });
     }
     work.finish()?;
-    result
+    Ok(CreatedPrimitiveMap {
+        entries: result?,
+        _storage: retained.storage(),
+    })
 }
 
-pub(crate) fn compile_native_bitnot(
+pub(crate) fn compile_native_bitnot_with_factory<H, F: ValueSchemaCreationFactory<H>>(
     checked: &ProgramLexicalBindings,
+    _temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
     control: &dyn PureCompileControl,
 ) -> Result<
-    BTreeMap<ProgramUseRef, novarocks_functions::PreparedNativeBitNotRecipe>,
-    ProgramPrimitiveError,
+    CreatedPrimitiveMap<ProgramUseRef, novarocks_functions::PreparedNativeBitNotRecipe>,
+    ProgramCreationFailure<ProgramPrimitiveError, H>,
 > {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let mut scope = match factory {
+        Some(factory) => Some(
+            factory
+                .begin_scope()
+                .map_err(ProgramCreationFailure::Creator)?,
+        ),
+        None => None,
+    };
+    let mut retained = ProgramCreation {
+        creator: scope
+            .as_mut()
+            .map(|scope| scope as &mut dyn ValueSchemaCreationScope<H>),
+    };
     let result = (|| {
         let typed = checked.channels().expressions();
         let snapshot = typed.resolved_calls().snapshot();
@@ -580,7 +852,8 @@ pub(crate) fn compile_native_bitnot(
                 {
                     return Err(ProgramPrimitiveError::Invalid(
                         "native BitwiseNot differs from its actual ordered occurrence",
-                    ));
+                    )
+                    .into());
                 }
                 work.flush()?;
                 let recipe = novarocks_functions::PreparedNativeBitNotRecipe::try_new(
@@ -588,27 +861,50 @@ pub(crate) fn compile_native_bitnot(
                     value(invocation.definition)?,
                     control,
                 )?;
+                before_recipe_insert(&recipes, &mut retained, &mut work)?;
                 recipes.insert(ProgramUseRef { arena, use_id }, recipe);
                 work.step()?;
             }
         }
         Ok(recipes)
     })();
-    if matches!(result, Err(ProgramPrimitiveError::Control(_))) {
-        return result;
+    if !matches!(result, Ok(_) | Err(ProgramCreationFailure::Owner(_))) {
+        return result.map(|entries| CreatedPrimitiveMap {
+            entries,
+            _storage: retained.storage(),
+        });
     }
     work.finish()?;
-    result
+    Ok(CreatedPrimitiveMap {
+        entries: result?,
+        _storage: retained.storage(),
+    })
 }
 
-pub(crate) fn compile_native_inlist(
+pub(crate) fn compile_native_inlist_with_factory<H, F: ValueSchemaCreationFactory<H>>(
     checked: &ProgramLexicalBindings,
+    temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
     control: &dyn PureCompileControl,
 ) -> Result<
-    BTreeMap<ProgramUseRef, novarocks_functions::PreparedNativeInListRecipe>,
-    ProgramPrimitiveError,
+    CreatedPrimitiveMap<ProgramUseRef, novarocks_functions::PreparedNativeInListRecipe>,
+    ProgramCreationFailure<ProgramPrimitiveError, H>,
 > {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let mut scope = match factory {
+        Some(factory) => Some(
+            factory
+                .begin_scope()
+                .map_err(ProgramCreationFailure::Creator)?,
+        ),
+        None => None,
+    };
+    let mut retained = ProgramCreation {
+        creator: scope
+            .as_mut()
+            .map(|scope| scope as &mut dyn ValueSchemaCreationScope<H>),
+    };
+    let mut temporary = ProgramCreation { creator: temporary };
     let result = (|| {
         let typed = checked.channels().expressions();
         let snapshot = typed.resolved_calls().snapshot();
@@ -644,14 +940,19 @@ pub(crate) fn compile_native_inlist(
                 {
                     return Err(ProgramPrimitiveError::Invalid(
                         "IN differs from its ordered occurrence",
-                    ));
+                    )
+                    .into());
                 }
-                let mut candidates = Vec::with_capacity(values.len());
+                let mut candidates = temporary
+                    .reserve::<ProgramPrimitiveError, &FunctionValueType>(
+                        values.len(),
+                        &mut work,
+                    )?;
                 for (ordinal, expected) in std::iter::once(child).chain(values.iter()).enumerate() {
                     if flow.uses()[&invocation.arguments[ordinal]].definition != *expected {
-                        return Err(ProgramPrimitiveError::Invalid(
-                            "IN source occurrence differs",
-                        ));
+                        return Err(
+                            ProgramPrimitiveError::Invalid("IN source occurrence differs").into(),
+                        );
                     }
                     if ordinal > 0 {
                         candidates.push(value(*expected)?);
@@ -659,34 +960,76 @@ pub(crate) fn compile_native_inlist(
                     work.step()?;
                 }
                 work.flush()?;
-                let recipe = novarocks_functions::PreparedNativeInListRecipe::try_new(
-                    *is_not_in,
-                    value(*child)?,
-                    &candidates,
-                    value(invocation.definition)?,
-                    control,
-                )?;
+                let source = value(*child)?;
+                let result_type = value(invocation.definition)?;
+                let recipe = match factory {
+                    Some(factory) => {
+                        // The parameter collection may be cloned independently
+                        // of this map. Only its own scope follows that loan.
+                        let mut recipe_scope = factory
+                            .begin_scope()
+                            .map_err(ProgramCreationFailure::Creator)?;
+                        novarocks_functions::PreparedNativeInListRecipe::try_new_with_creator_in(
+                            *is_not_in,
+                            source,
+                            &candidates,
+                            result_type,
+                            &mut recipe_scope,
+                            control,
+                        )
+                        .map_err(native_inlist_creation_failure)?
+                    }
+                    None => novarocks_functions::PreparedNativeInListRecipe::try_new(
+                        *is_not_in,
+                        source,
+                        &candidates,
+                        result_type,
+                        control,
+                    )?,
+                };
+                before_recipe_insert(&recipes, &mut retained, &mut work)?;
                 recipes.insert(ProgramUseRef { arena, use_id }, recipe);
                 work.step()?;
             }
         }
         Ok(recipes)
     })();
-    if matches!(result, Err(ProgramPrimitiveError::Control(_))) {
-        return result;
+    if !matches!(result, Ok(_) | Err(ProgramCreationFailure::Owner(_))) {
+        return result.map(|entries| CreatedPrimitiveMap {
+            entries,
+            _storage: retained.storage(),
+        });
     }
     work.finish()?;
-    result
+    Ok(CreatedPrimitiveMap {
+        entries: result?,
+        _storage: retained.storage(),
+    })
 }
 
-pub(crate) fn compile_native_like(
+pub(crate) fn compile_native_like_with_factory<H, F: ValueSchemaCreationFactory<H>>(
     checked: &ProgramLexicalBindings,
+    _temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
     control: &dyn PureCompileControl,
 ) -> Result<
-    BTreeMap<ProgramUseRef, novarocks_functions::PreparedNativeLikeRecipe>,
-    ProgramPrimitiveError,
+    CreatedPrimitiveMap<ProgramUseRef, novarocks_functions::PreparedNativeLikeRecipe>,
+    ProgramCreationFailure<ProgramPrimitiveError, H>,
 > {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let mut scope = match factory {
+        Some(factory) => Some(
+            factory
+                .begin_scope()
+                .map_err(ProgramCreationFailure::Creator)?,
+        ),
+        None => None,
+    };
+    let mut retained = ProgramCreation {
+        creator: scope
+            .as_mut()
+            .map(|scope| scope as &mut dyn ValueSchemaCreationScope<H>),
+    };
     let result = (|| {
         let typed = checked.channels().expressions();
         let snapshot = typed.resolved_calls().snapshot();
@@ -717,13 +1060,15 @@ pub(crate) fn compile_native_like(
                 if invocation.control != ControlShape::Eager || invocation.arguments.len() != 2 {
                     return Err(ProgramPrimitiveError::Invalid(
                         "LIKE differs from original Eager2",
-                    ));
+                    )
+                    .into());
                 }
                 for (ordinal, id) in [text, pattern].into_iter().enumerate() {
                     if flow.uses()[&invocation.arguments[ordinal]].definition != *id {
                         return Err(ProgramPrimitiveError::Invalid(
                             "LIKE original ordered use differs",
-                        ));
+                        )
+                        .into());
                     }
                     work.step()?;
                 }
@@ -735,15 +1080,22 @@ pub(crate) fn compile_native_like(
                     value(invocation.definition)?,
                     control,
                 )?;
+                before_recipe_insert(&recipes, &mut retained, &mut work)?;
                 recipes.insert(ProgramUseRef { arena, use_id }, recipe);
                 work.step()?;
             }
         }
         Ok(recipes)
     })();
-    if matches!(result, Err(ProgramPrimitiveError::Control(_))) {
-        return result;
+    if !matches!(result, Ok(_) | Err(ProgramCreationFailure::Owner(_))) {
+        return result.map(|entries| CreatedPrimitiveMap {
+            entries,
+            _storage: retained.storage(),
+        });
     }
     work.finish()?;
-    result
+    Ok(CreatedPrimitiveMap {
+        entries: result?,
+        _storage: retained.storage(),
+    })
 }

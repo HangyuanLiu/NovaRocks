@@ -25,6 +25,7 @@
 //! assembly work, not a connector fact.  Its owner is therefore injected
 //! through [`DistributedRewriteSealing`] rather than named from here.
 
+use crate::connector::schema_creation::FrontendSchemaLoad;
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteLease, ConnectorDistributedRewriteOperation,
     ConnectorDistributedRewritePlan, ConnectorDistributedRewriteResolver, ConnectorInstanceId,
@@ -161,7 +162,7 @@ pub fn plan_distributed_rewrite_session<S: DistributedRewriteSealing>(
         .map_err(|error| format!("acquire distributed rewrite exact lease: {error}"))?;
     let metadata = lease
         .metadata()
-        .load_table(ConnectorTableRequest {
+        .load_frontend_table(ConnectorTableRequest {
             table: table.clone(),
             resolution: ConnectorTableResolution::StrictBaseTable,
             context: context.clone(),
@@ -186,9 +187,11 @@ pub fn plan_distributed_rewrite_session<S: DistributedRewriteSealing>(
             min_input_files,
         },
     };
-    let plan = lease
-        .plan_operation(operation_id, operation, context.clone())
-        .map_err(|error| format!("plan distributed rewrite: {error}"))?;
+    let plan = crate::connector::schema_creation::with_schema_creation(&context, |creation| {
+        lease.plan_operation(operation_id, operation, context.clone(), creation)
+    })
+    .map_err(crate::connector::schema_creation::connector_schema_error)
+    .map_err(|error| format!("plan distributed rewrite: {error}"))?;
     // A rewrite that froze no group writes nothing, so it must not acquire a
     // write-stack lease at all -- there would be nothing for one to admit. The
     // lease is derived only on the writing path, on the same generation that

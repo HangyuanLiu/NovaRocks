@@ -410,43 +410,6 @@ mod application_document_publication_trace_tests {
                 )
                 .await
         }
-
-        async fn create_view(
-            &self,
-            namespace: &NamespaceIdent,
-            creation: crate::iceberg::ViewCreation,
-        ) -> crate::iceberg::Result<crate::iceberg::spec::ViewMetadata> {
-            self.inner.create_view(namespace, creation).await
-        }
-
-        async fn load_view(
-            &self,
-            view: &TableIdent,
-        ) -> crate::iceberg::Result<crate::iceberg::spec::ViewMetadata> {
-            self.inner.load_view(view).await
-        }
-
-        async fn update_view(
-            &self,
-            commit: crate::iceberg::ViewCommit,
-        ) -> crate::iceberg::Result<crate::iceberg::spec::ViewMetadata> {
-            self.inner.update_view(commit).await
-        }
-
-        async fn drop_view(&self, view: &TableIdent) -> crate::iceberg::Result<()> {
-            self.inner.drop_view(view).await
-        }
-
-        async fn view_exists(&self, view: &TableIdent) -> crate::iceberg::Result<bool> {
-            self.inner.view_exists(view).await
-        }
-
-        async fn list_views(
-            &self,
-            namespace: &NamespaceIdent,
-        ) -> crate::iceberg::Result<Vec<TableIdent>> {
-            self.inner.list_views(namespace).await
-        }
     }
 
     fn requirement_kind(requirement: &TableRequirement) -> &'static str {
@@ -897,24 +860,36 @@ mod application_document_publication_trace_tests {
 
     fn data_input() -> ConnectorWriteInputRequest {
         ConnectorWriteInputRequest::Data {
-            fields: vec![ConnectorWriteFieldRequest::new(Field::new(
-                "id",
-                DataType::Int64,
-                false,
-            ))],
+            fields: vec![
+                ConnectorWriteFieldRequest::try_new_typed(
+                    Field::new("id", DataType::Int64, false),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                )
+                .expect("publication caller declares required Int64 id"),
+            ],
         }
     }
 
     fn row_mutation_input() -> ConnectorWriteInputRequest {
         ConnectorWriteInputRequest::RowLineage {
-            data_fields: vec![ConnectorWriteFieldRequest::new(Field::new(
-                "id",
-                DataType::Int64,
-                false,
-            ))],
+            data_fields: vec![
+                ConnectorWriteFieldRequest::try_new_typed(
+                    Field::new("id", DataType::Int64, false),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                )
+                .expect("publication caller declares required Int64 id"),
+            ],
             row_identity_fields: vec![
-                ConnectorWriteFieldRequest::new(Field::new("_file", DataType::Utf8, false)),
-                ConnectorWriteFieldRequest::new(Field::new("_pos", DataType::Int64, false)),
+                ConnectorWriteFieldRequest::try_new_typed(
+                    Field::new("_file", DataType::Utf8, false),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+                )
+                .expect("publication caller declares required file identity"),
+                ConnectorWriteFieldRequest::try_new_typed(
+                    Field::new("_pos", DataType::Int64, false),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                )
+                .expect("publication caller declares required position identity"),
             ],
         }
     }

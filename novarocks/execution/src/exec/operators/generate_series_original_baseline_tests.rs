@@ -147,7 +147,12 @@ fn actual(array: &ArrayRef) -> Vec<Option<i128>> {
                 is_left_join: false,
                 param_types: vec![],
                 ret_types: vec![],
-                output_chunk_schema: dummy.output_chunk_schema,
+                output_chunk_schema: match &dummy.schema_source {
+                    super::TableFunctionSchemaSource::Legacy(schema) => Some(schema.clone()),
+                    super::TableFunctionSchemaSource::Typed { .. } => None,
+                },
+                schema_source: dummy.schema_source,
+                construction: None,
                 output_slot_sources: vec![],
                 output_chunk: None,
                 output_offset: 0,

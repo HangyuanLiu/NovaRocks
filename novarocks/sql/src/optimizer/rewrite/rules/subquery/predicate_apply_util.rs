@@ -464,14 +464,14 @@ mod legacy {
                         value_type: value_type,
                     },
                     (false, true) => {
-                        let inner_type = left.value_type.data_type.clone();
+                        let inner_type = left.value_type.data_type().clone();
                         let inner_expr = *left;
                         let mut outer_expr = *right;
-                        if outer_expr.value_type.data_type != inner_type {
+                        if *outer_expr.value_type.data_type() != inner_type {
                             outer_expr = TypedExpr {
                                 value_type: novarocks_type_contract::FunctionValueType::new(
                                     inner_type.clone(),
-                                    outer_expr.value_type.nullable,
+                                    outer_expr.value_type.nullable(),
                                 ),
 
                                 kind: ExprKind::Cast {

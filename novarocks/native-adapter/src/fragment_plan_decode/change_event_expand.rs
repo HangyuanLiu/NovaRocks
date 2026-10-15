@@ -21,8 +21,8 @@
 mod tests {
     use arrow::datatypes::DataType;
 
-    use super::super::tests::{one_col_values_node, output_column, physical_node};
-    use super::super::{NativePlanDecodeContext, decode_node};
+    use super::super::NativePlanDecodeContext;
+    use super::super::tests::{decode_node, one_col_values_node, output_column, physical_node};
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_proto_models::plan;
 

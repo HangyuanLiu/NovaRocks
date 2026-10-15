@@ -67,7 +67,7 @@ fn fixture(
     for (ordinal, value) in children.into_iter().enumerate() {
         nodes.push(StaticExprNode::new(
             StaticExprKind::SlotId(SlotId::new(ordinal as u32 + 1)),
-            value.data_type.clone(),
+            value.data_type().clone(),
             None,
         ));
         types.push(FunctionArgumentType::Value(value));
@@ -79,7 +79,7 @@ fn fixture(
             has_else_expr: has_else,
             children: (0..nodes.len()).map(ProgramExprId::new).collect(),
         },
-        result.data_type.clone(),
+        result.data_type().clone(),
         None,
     ));
     types.push(FunctionArgumentType::Value(result.clone()));
@@ -394,27 +394,30 @@ fn simple_case_labels_ignore_only_outer_nullable_and_keep_actual_value_demand() 
 
 #[allow(deprecated)]
 fn nested(id: i64, annotation: &str, child_nullable: bool, child_json: bool) -> FunctionValueType {
-    let mut json_field = Field::new("payload", DataType::Utf8, true);
-    if child_json {
-        json_field =
-            json_field.with_metadata(HashMap::from([("nr_logical_type".into(), "json".into())]));
-    }
-    FunctionValueType::new(
-        DataType::Struct(
-            vec![
-                Field::new_dict(
-                    "dictionary",
-                    DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
-                    child_nullable,
-                    id,
-                    true,
-                )
-                .with_metadata(HashMap::from([("annotation".into(), annotation.into())])),
-                json_field,
-            ]
-            .into(),
-        ),
+    let source = DataType::Struct(
+        vec![
+            Field::new_dict(
+                "dictionary",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                child_nullable,
+                id,
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                "provider.annotation".into(),
+                annotation.into(),
+            )])),
+            Field::new("payload", DataType::Utf8, true),
+        ]
+        .into(),
+    );
+    crate::test_value_types::string_structure_from_source(
+        &[
+            ("dictionary", child_nullable, false),
+            ("payload", true, child_json),
+        ],
         true,
+        &source,
     )
 }
 
@@ -435,8 +438,6 @@ fn case_domains_compare_nested_metadata_dictionary_identity_nullability_and_logi
         Some(&FunctionArgumentType::Value(exact.clone()))
     );
     for changed in [
-        nested(0, "kept", true, true),
-        nested(-91, "changed", true, true),
         nested(-91, "kept", false, true),
         nested(-91, "kept", true, false),
     ] {
@@ -470,6 +471,21 @@ fn case_domains_compare_nested_metadata_dictionary_identity_nullability_and_logi
             ),
             Err(ProgramExpressionTypeError::TypeMismatch)
         ));
+    }
+    for encoding_only in [
+        nested(0, "kept", true, true),
+        nested(-91, "changed", true, true),
+    ] {
+        assert!(
+            checked(
+                true,
+                true,
+                vec![exact.clone(), encoding_only, exact.clone(), exact.clone()],
+                exact.clone(),
+                EvaluationDemand::Value
+            )
+            .is_ok()
+        );
     }
     assert!(matches!(
         checked(
@@ -589,7 +605,10 @@ fn actual_case_value_positions_reject_lambda_wrappers_in_operand_labels_and_resu
                         None,
                     ));
                     types.push(FunctionArgumentType::Lambda {
-                        parameter_types: Box::default(),
+                        parameter_types:
+                            novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                                Box::default(),
+                            ),
                         result_type: boolean(false),
                     });
                 } else {

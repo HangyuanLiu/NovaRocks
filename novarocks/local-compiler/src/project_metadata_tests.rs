@@ -41,13 +41,14 @@ struct Host<'a> {
 }
 impl ProjectMetadataScope for Host<'_> {
     type HostError = Refusal;
-    fn materialize<B>(
+    fn materialize<C, B>(
         &mut self,
         facts: &ProjectOutputRequestFacts,
         body: B,
-    ) -> Result<ProjectMetadataOutput, ProjectMetadataFailure<Refusal>>
+    ) -> Result<ProjectMetadataOutput, ProjectMetadataFailure<Refusal, C>>
     where
-        B: FnOnce() -> Result<ProjectMetadataOutput, FragmentCompileError>,
+        C: From<FragmentCompileError>,
+        B: FnOnce() -> Result<ProjectMetadataOutput, C>,
     {
         self.calls += 1;
         self.requests = Some(*facts);
@@ -63,9 +64,9 @@ impl ProjectMetadataScope for Host<'_> {
             if let Some(stop) = self.stop {
                 stop.store(true, Ordering::SeqCst);
             }
-            return Err(ProjectMetadataFailure::Body(FragmentCompileError::Invalid(
-                "original body error",
-            )));
+            return Err(ProjectMetadataFailure::Body(
+                FragmentCompileError::Invalid("original body error").into(),
+            ));
         }
         Ok(output)
     }
@@ -119,8 +120,10 @@ fn project_metadata_hosted_original_output_matches_direct_names_slots_and_types(
     assert_eq!(host.calls, 1);
     let facts = host.requests.unwrap();
     assert_eq!(facts.node, NodeId::new(41));
-    assert!(facts.requests.allocation_request_bytes_upper_bound >= 3 * 131024);
-    assert!(facts.requests.allocation_requests_upper_bound >= 3 * 12);
+    // Typed projection shares immutable child bindings instead of cloning
+    // retired recursive metadata tables; its actual scaffolds remain covered.
+    assert!(facts.requests.allocation_request_bytes_upper_bound > 0);
+    assert!(facts.requests.allocation_requests_upper_bound >= 3);
     assert_eq!(direct.graph().nodes().len(), hosted.graph().nodes().len());
     for (left, right) in direct.graph().nodes().iter().zip(hosted.graph().nodes()) {
         assert_eq!(left.output_layout().slots(), right.output_layout().slots());
@@ -230,13 +233,14 @@ fn project_metadata_original_body_failure_retains_original_compiler_footer_prior
 struct RecordingHost(Vec<ProjectOutputRequestFacts>);
 impl ProjectMetadataScope for RecordingHost {
     type HostError = Refusal;
-    fn materialize<B>(
+    fn materialize<C, B>(
         &mut self,
         facts: &ProjectOutputRequestFacts,
         body: B,
-    ) -> Result<ProjectMetadataOutput, ProjectMetadataFailure<Refusal>>
+    ) -> Result<ProjectMetadataOutput, ProjectMetadataFailure<Refusal, C>>
     where
-        B: FnOnce() -> Result<ProjectMetadataOutput, FragmentCompileError>,
+        C: From<FragmentCompileError>,
+        B: FnOnce() -> Result<ProjectMetadataOutput, C>,
     {
         self.0.push(*facts);
         body().map_err(ProjectMetadataFailure::Body)
@@ -410,7 +414,6 @@ fn recipe(
     value: &FunctionValueType,
     count: usize,
 ) -> novarocks_type_contract::CompleteMetadataRequestFacts {
-    let namespace = MaterializedFieldNamespace::from_original_loans(Arc::from([]));
     let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
         &FixtureControl,
         CompilePhase::LowerProgram,
@@ -418,9 +421,9 @@ fn recipe(
     .unwrap();
     let facts = crate::project_metadata::project_output_requests(
         NodeId::new(41),
+        0,
         count,
         std::iter::repeat_n((value, Some("same")), count).map(Ok),
-        &namespace,
         &mut work,
     )
     .unwrap();
@@ -428,91 +431,59 @@ fn recipe(
     facts.requests
 }
 #[test]
-fn project_metadata_recipe_counts_shared_type_occurrences_dictionary_boxes_and_metadata_buckets() {
-    use novarocks_type_contract::owned_resources::{hashmap, vec};
-    let plain = FunctionValueType::new(DataType::Int64, true);
+fn project_metadata_recipe_counts_typed_occurrences_without_external_metadata_or_dictionary_boxes()
+{
+    let physical = FunctionValueType::new(DataType::Utf8, true);
     let dictionary = FunctionValueType::new(
-        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int64)),
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
         true,
     );
-    let metadata = std::collections::HashMap::from([("key".to_string(), "value".to_string())]);
-    let physical_text = FunctionValueType::new(DataType::Utf8, true);
     let json = FunctionValueType::try_with_logical_type(
         DataType::Utf8,
         true,
         novarocks_type_contract::ValueLogicalType::Json,
     )
     .unwrap();
-    let logical_table = hashmap::fresh_table_layout::<String, String>(1).unwrap();
-    let empty_child = FunctionValueType::new(
-        DataType::Struct(
-            vec![Arc::new(arrow_schema::Field::new(
-                "child",
-                DataType::Int64,
-                true,
-            ))]
-            .into(),
-        ),
-        true,
-    );
-    let metadata_child = FunctionValueType::new(
-        DataType::Struct(
-            vec![Arc::new(
-                arrow_schema::Field::new("child", DataType::Int64, true).with_metadata(metadata),
-            )]
-            .into(),
-        ),
-        true,
-    );
-    let mut bucket_bytes = 0;
-    let mut bucket_requests = 0;
-    hashmap::original_fresh_insertion_allocation_requests_observed::<
-        u64,
-        Vec<(&str, &str)>,
-        novarocks_type_contract::MetadataRequestError,
-    >(1, &mut |layout| {
-        bucket_bytes += layout.size();
-        bucket_requests += 1;
-        Ok(())
-    })
-    .unwrap();
-    let collision = vec::original_partitioned_fresh_push_request_bound::<(&str, &str)>(1).unwrap();
-    for count in [1, 3] {
-        let base = recipe(&plain, count);
-        let boxes = recipe(&dictionary, count);
+    let child = |metadata: std::collections::HashMap<String, String>| {
+        FunctionValueType::new(
+            DataType::Struct(
+                vec![Arc::new(
+                    arrow_schema::Field::new("child", DataType::Int64, true)
+                        .with_metadata(metadata),
+                )]
+                .into(),
+            ),
+            true,
+        )
+    };
+    let plain_child = child(Default::default());
+    let external_child = child(std::collections::HashMap::from([(
+        "source-key".into(),
+        "source-value".into(),
+    )]));
+    for count in [0, 1, 3, 128] {
+        let physical = recipe(&physical, count);
         assert_eq!(
-            boxes.allocation_request_bytes_upper_bound - base.allocation_request_bytes_upper_bound,
-            count * 2 * std::mem::size_of::<DataType>()
+            recipe(&dictionary, count),
+            physical,
+            "runtime dictionary encoding does not recreate logical layout boxes"
         );
         assert_eq!(
-            boxes.allocation_requests_upper_bound - base.allocation_requests_upper_bound,
-            count * 2
-        );
-        let no_metadata = recipe(&empty_child, count);
-        let with_metadata = recipe(&metadata_child, count);
-        assert_eq!(
-            with_metadata.allocation_request_bytes_upper_bound
-                - no_metadata.allocation_request_bytes_upper_bound,
-            count * (bucket_bytes + collision.request_bytes_upper_bound)
+            recipe(&json, count),
+            physical,
+            "complete nominal binding is shared without an execution metadata map"
         );
         assert_eq!(
-            with_metadata.allocation_requests_upper_bound
-                - no_metadata.allocation_requests_upper_bound,
-            count * (bucket_requests + collision.allocation_requests_upper_bound)
+            recipe(&plain_child, count),
+            recipe(&external_child, count),
+            "external metadata belongs to the source owner, not the execution projection"
         );
-        let physical = recipe(&physical_text, count);
-        let nominal = recipe(&json, count);
-        assert_eq!(
-            nominal.allocation_request_bytes_upper_bound
-                - physical.allocation_request_bytes_upper_bound,
-            count
-                * (logical_table.request_bytes_upper_bound
-                    + novarocks_type_contract::NR_LOGICAL_TYPE_KEY.len()
-                    + "json".len())
-        );
-        assert_eq!(
-            nominal.allocation_requests_upper_bound - physical.allocation_requests_upper_bound,
-            count * (logical_table.allocation_requests_upper_bound + 2)
-        );
+        if count > 0 {
+            assert!(physical.allocation_requests_upper_bound > 0);
+        }
     }
+    assert!(
+        recipe(&physical, 128).allocation_request_bytes_upper_bound
+            > recipe(&physical, 3).allocation_request_bytes_upper_bound
+    );
 }

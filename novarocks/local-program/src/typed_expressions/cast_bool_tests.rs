@@ -41,7 +41,7 @@ fn cast_fixture(
                     decimal_overflow_policy: policy,
                     allow_throw_exception: allow,
                 },
-                result.data_type.clone(),
+                result.data_type().clone(),
                 None,
             ),
             slot(2, &boolean(false)),

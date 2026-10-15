@@ -14,7 +14,12 @@ use novarocks_execution::runtime_filter::{
     RuntimeFilterMembershipSchema,
     RuntimeFilterNullSemantics as ExecutionRuntimeFilterNullSemantics,
 };
+use novarocks_plan_codec::execution_type_table::{
+    EncodedExecutionTypeTable, ExecutionTypeRoot, ExecutionTypeTableBuilder,
+    ExecutionTypeTableLimits,
+};
 use novarocks_proto_models::{common, plan};
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 use sha2::{Digest, Sha256};
 
@@ -24,6 +29,7 @@ const CONTRACT_VERSION: u16 = 1;
 
 pub(crate) struct EncodedRuntimeFilterDomain {
     value_type: common::TypeDesc,
+    execution_types: plan::ExecutionTypeTable,
     contract: plan::RuntimeFilterContract,
     order_contract_digest: Option<[u8; 32]>,
     membership_schema_digest: Option<[u8; 32]>,
@@ -32,6 +38,10 @@ pub(crate) struct EncodedRuntimeFilterDomain {
 impl EncodedRuntimeFilterDomain {
     pub(crate) fn value_type(&self) -> common::TypeDesc {
         self.value_type.clone()
+    }
+
+    pub(crate) fn execution_types(&self) -> plan::ExecutionTypeTable {
+        self.execution_types.clone()
     }
 
     pub(crate) fn contract(&self) -> plan::RuntimeFilterContract {
@@ -101,7 +111,7 @@ pub(crate) fn encode_logical_domain(
             value_type,
             null_semantics,
         } => {
-            let value_type_wire = encode_type(&value_type)?;
+            validate_native_type(value_type.data_type())?;
             let execution_null_semantics = match null_semantics {
                 RuntimeFilterNullSemantics::NeverMatches => {
                     ExecutionRuntimeFilterNullSemantics::NeverMatches
@@ -110,17 +120,26 @@ pub(crate) fn encode_logical_domain(
                     ExecutionRuntimeFilterNullSemantics::NullSafeEqual
                 }
             };
-            let membership_schema_digest =
-                RuntimeFilterMembershipSchema::new(&value_type, execution_null_semantics)
-                    .map_err(|error| {
-                        contract_error(format!(
-                            "runtime filter membership execution schema is invalid: {error}"
-                        ))
-                    })?
-                    .digest();
+            let membership_schema_digest = RuntimeFilterMembershipSchema::new(
+                value_type.data_type(),
+                execution_null_semantics,
+            )
+            .map_err(|error| {
+                contract_error(format!(
+                    "runtime filter membership execution schema is invalid: {error}"
+                ))
+            })?
+            .digest();
+            let (table, references) = encode_domain_type_refs(&[&value_type])?;
+            let value_type_wire = references[0].clone();
             Ok(EncodedRuntimeFilterDomain {
-                value_type: value_type_wire,
+                value_type: value_type_wire.clone(),
+                execution_types: table.clone(),
                 contract: plan::RuntimeFilterContract {
+                    logical_domain: Some(plan::RuntimeFilterTypeDomain {
+                        value_type: Some(value_type_wire),
+                        execution_types: Some(table),
+                    }),
                     kind: Some(Kind::Membership(plan::RuntimeFilterMembershipContract {
                         null_semantics: match null_semantics {
                             RuntimeFilterNullSemantics::NeverMatches => {
@@ -157,14 +176,14 @@ pub(crate) fn encode_logical_domain(
                     .map_err(|_| contract_error("runtime filter ordered key count overflows u32"))?
                     .to_be_bytes(),
             );
-            let mut wire_keys = Vec::with_capacity(keys.len());
-            for key in keys {
-                if !ordered_key_type_supported(&key.data_type) {
+            for key in &keys {
+                if !ordered_key_type_supported(key.value_type.data_type()) {
                     return Err(contract_error(
                         "runtime filter ordered contract has unsupported key type",
                     ));
                 }
-                encode_membership_schema_type(&key.data_type, &mut canonical_keys)?;
+                encode_membership_schema_type(key.value_type.data_type(), &mut canonical_keys)?;
+                validate_native_type(key.value_type.data_type())?;
                 canonical_keys.push(match key.direction {
                     RuntimeFilterSortDirection::Ascending => 1,
                     RuntimeFilterSortDirection::Descending => 2,
@@ -173,8 +192,13 @@ pub(crate) fn encode_logical_domain(
                     RuntimeFilterNullOrder::First => 1,
                     RuntimeFilterNullOrder::Last => 2,
                 });
+            }
+            let values = keys.iter().map(|key| &key.value_type).collect::<Vec<_>>();
+            let (table, references) = encode_domain_type_refs(&values)?;
+            let mut wire_keys = Vec::with_capacity(keys.len());
+            for (key, reference) in keys.into_iter().zip(references) {
                 wire_keys.push(plan::RuntimeFilterOrderKey {
-                    r#type: Some(encode_type(&key.data_type)?),
+                    r#type: Some(reference),
                     direction: match key.direction {
                         RuntimeFilterSortDirection::Ascending => {
                             plan::RuntimeFilterSortDirection::Ascending as i32
@@ -205,8 +229,13 @@ pub(crate) fn encode_logical_domain(
                 .and_then(|key| key.r#type.clone())
                 .expect("ordered keys are nonempty and encoded");
             Ok(EncodedRuntimeFilterDomain {
-                value_type,
+                value_type: value_type.clone(),
+                execution_types: table.clone(),
                 contract: plan::RuntimeFilterContract {
+                    logical_domain: Some(plan::RuntimeFilterTypeDomain {
+                        value_type: Some(value_type),
+                        execution_types: Some(table),
+                    }),
                     kind: Some(Kind::Ordered(plan::RuntimeFilterOrderedContract {
                         keys: wire_keys,
                         comparator_digest: comparator_digest.to_vec(),
@@ -220,62 +249,84 @@ pub(crate) fn encode_logical_domain(
     }
 }
 
-pub(crate) fn encode_type(data_type: &DataType) -> Result<common::TypeDesc, DistributedQueryError> {
-    use common::{PrimitiveType, type_desc::Kind};
-
-    let (primitive, precision, scale, time_unit) = match data_type {
-        DataType::Boolean => (PrimitiveType::Boolean, None, None, None),
-        DataType::Int8 => (PrimitiveType::Tinyint, None, None, None),
-        DataType::Int16 => (PrimitiveType::Smallint, None, None, None),
-        DataType::Int32 => (PrimitiveType::Int, None, None, None),
-        DataType::Int64 => (PrimitiveType::Bigint, None, None, None),
-        DataType::Float32 => (PrimitiveType::Float, None, None, None),
-        DataType::Float64 => (PrimitiveType::Double, None, None, None),
-        DataType::FixedSizeBinary(width) if *width == LARGEINT_BYTE_WIDTH => {
-            (PrimitiveType::Largeint, None, None, None)
-        }
-        DataType::Utf8 => (PrimitiveType::Varchar, None, None, None),
-        DataType::Date32 => (PrimitiveType::Date, None, None, None),
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            (PrimitiveType::Datetime, None, None, None)
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            (PrimitiveType::Datetime, None, None, Some(3))
-        }
-        DataType::Timestamp(unit, _) => {
-            return Err(contract_error(format!(
-                "runtime filter native type does not support timestamp unit {unit:?}"
-            )));
-        }
+// The original native RF carrier capability is independent of its complete
+// declaration. Retain that capability gate without authoring semantics from it.
+fn validate_native_type(data_type: &DataType) -> Result<(), DistributedQueryError> {
+    match data_type {
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Utf8
+        | DataType::Date32 => Ok(()),
+        DataType::FixedSizeBinary(width) if *width == LARGEINT_BYTE_WIDTH => Ok(()),
+        DataType::Timestamp(TimeUnit::Microsecond | TimeUnit::Nanosecond, _) => Ok(()),
+        DataType::Timestamp(unit, _) => Err(contract_error(format!(
+            "runtime filter native type does not support timestamp unit {unit:?}"
+        ))),
         DataType::Decimal128(precision, scale)
             if *precision != 0
                 && *precision <= DECIMAL128_MAX_PRECISION
                 && *scale <= DECIMAL128_MAX_SCALE
                 && (*scale <= 0 || (*scale as u8) <= *precision) =>
         {
-            (
-                PrimitiveType::Decimal128,
-                Some(i32::from(*precision)),
-                Some(i32::from(*scale)),
-                None,
-            )
+            Ok(())
         }
-        _ => {
-            return Err(contract_error(format!(
-                "runtime filter native type does not support {data_type:?}"
-            )));
-        }
-    };
-    Ok(common::TypeDesc {
-        kind: Some(Kind::Scalar(common::ScalarType {
-            r#type: primitive as i32,
-            len: None,
-            precision,
-            scale,
-            time_unit,
-            time_zone: None,
-        })),
-    })
+        _ => Err(contract_error(format!(
+            "runtime filter native type does not support {data_type:?}"
+        ))),
+    }
+}
+
+fn encode_domain_type_refs(
+    values: &[&novarocks_physical_plan::ValueType],
+) -> Result<(plan::ExecutionTypeTable, Vec<common::TypeDesc>), DistributedQueryError> {
+    let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode)
+        .map_err(|error| contract_error(error.to_string()))?;
+    let roots = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            Ok(ExecutionTypeRoot {
+                id: u32::try_from(index)
+                    .map_err(|_| contract_error("runtime filter type ID overflows"))?,
+                value: *value,
+            })
+        })
+        .collect::<Result<Vec<_>, DistributedQueryError>>()?;
+    let limits = ExecutionTypeTableLimits::for_validated_root_count(roots.len())
+        .map_err(|error| contract_error(error.to_string()))?;
+    // FE observes the existing structural model only. No memory factory or
+    // allocation authority is introduced by this pure encoding path.
+    let table: EncodedExecutionTypeTable = ExecutionTypeTableBuilder::new(&roots)
+        .encode_observed(
+            limits,
+            &mut |_| {
+                Ok::<
+                    _,
+                    novarocks_plan_codec::host_projection_v2::AdmissionRefusal<
+                        std::convert::Infallible,
+                    >,
+                >(())
+            },
+            &mut work,
+        )
+        .map_err(|error| contract_error(error.to_string()))?;
+    let references = roots
+        .iter()
+        .map(|root| {
+            table
+                .type_reference_observed(root.id, &mut work)
+                .map_err(|error| contract_error(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    work.flush()
+        .map_err(|error| contract_error(error.to_string()))?;
+    Ok((table.into_wire(), references))
 }
 
 fn encode_membership_schema_type(
@@ -356,6 +407,56 @@ mod tests {
     use super::*;
     use crate::query_execution::preparation::runtime_filter_view::RuntimeFilterOrderKeyFacts;
 
+    fn assert_complete_domain(
+        encoded: &EncodedRuntimeFilterDomain,
+        expected: &[novarocks_physical_plan::ValueType],
+    ) {
+        use novarocks_plan_codec::execution_type_table::decode_execution_type_table_observed;
+        use novarocks_type_contract::ValueTypeStorageLifetime;
+        let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let table = decode_execution_type_table_observed(
+            &encoded.execution_types,
+            ExecutionTypeTableLimits::for_validated_root_count(expected.len()).unwrap(),
+            ValueTypeStorageLifetime::pure(),
+            &mut |_| {
+                Ok::<
+                    _,
+                    novarocks_plan_codec::host_projection_v2::AdmissionRefusal<
+                        std::convert::Infallible,
+                    >,
+                >(())
+            },
+            &mut work,
+        )
+        .expect("the standalone RF table is complete");
+        let domain = encoded
+            .contract
+            .logical_domain
+            .as_ref()
+            .expect("independent typed owner");
+        assert_eq!(
+            domain.execution_types.as_ref(),
+            Some(&encoded.execution_types)
+        );
+        assert_eq!(domain.value_type.as_ref(), Some(&encoded.value_type));
+        for (index, expected) in expected.iter().enumerate() {
+            let actual = table
+                .get_observed(index as u32, &mut work)
+                .unwrap()
+                .unwrap();
+            assert!(
+                actual
+                    .exactly_equals_checked_observed(
+                        expected,
+                        || Ok::<_, std::convert::Infallible>(())
+                    )
+                    .unwrap()
+            );
+        }
+        work.flush().unwrap();
+    }
+
     fn digest(hex: &str) -> [u8; 32] {
         hex::decode(hex)
             .expect("fixture is hexadecimal")
@@ -375,15 +476,28 @@ mod tests {
                 plan::RuntimeFilterMembershipNullSemantics::NullSafeEqual,
             ),
         ] {
+            let source = novarocks_physical_plan::ValueType::new(DataType::Int32, true);
             let encoded = encode_logical_domain(RuntimeFilterLogicalDomainFacts::Membership {
-                value_type: DataType::Int32,
+                value_type: source.clone(),
                 null_semantics,
             })
             .expect("membership facts are encodable");
+            assert_complete_domain(&encoded, std::slice::from_ref(&source));
+            assert_eq!(encoded.value_type().value_binding_id, Some(0));
+            let domain = encoded
+                .contract
+                .logical_domain
+                .as_ref()
+                .expect("independent typed owner");
+            assert_eq!(domain.value_type.as_ref(), Some(&encoded.value_type()));
             assert_eq!(
-                encoded.value_type(),
-                encode_type(&DataType::Int32).expect("type is encodable")
+                domain.execution_types.as_ref(),
+                Some(&encoded.execution_types)
             );
+            let binding = &encoded.execution_types.value_bindings[0];
+            assert_eq!(binding.id, Some(0));
+            let logical = &encoded.execution_types.logical_types[0];
+            assert!(logical.nullable);
             let Some(plan::runtime_filter_contract::Kind::Membership(contract)) =
                 encoded.contract().kind
             else {
@@ -412,9 +526,10 @@ mod tests {
     #[test]
     fn ordered_and_topk_keep_the_v1_digest_fixtures() {
         let comparator = digest("9e2c6e473c04c9113cb7bfe6c5a5d961fc086bc11e0b404764e27679fabc8afe");
+        let source = novarocks_physical_plan::ValueType::new(DataType::Int64, true);
         let encoded = encode_logical_domain(RuntimeFilterLogicalDomainFacts::Ordered {
             keys: vec![RuntimeFilterOrderKeyFacts {
-                data_type: DataType::Int64,
+                value_type: source.clone(),
                 direction: RuntimeFilterSortDirection::Ascending,
                 null_order: RuntimeFilterNullOrder::First,
             }],
@@ -422,6 +537,7 @@ mod tests {
             comparator_digest: comparator,
         })
         .expect("ordered facts are encodable");
+        assert_complete_domain(&encoded, std::slice::from_ref(&source));
         let Some(plan::runtime_filter_contract::Kind::Ordered(contract)) =
             encoded.contract.kind.as_ref()
         else {
@@ -447,6 +563,30 @@ mod tests {
     }
 
     #[test]
+    fn standalone_domain_preserves_same_carrier_declarations_and_root_null_guarantees() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        for (carrier, logical) in [
+            (DataType::Int32, ValueLogicalType::Physical),
+            (DataType::Utf8, ValueLogicalType::Physical),
+            (DataType::Utf8, ValueLogicalType::Json),
+            (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
+            (DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
+        ] {
+            for nullable in [false, true] {
+                let source =
+                    FunctionValueType::try_with_logical_type(carrier.clone(), nullable, logical)
+                        .expect("explicit complete same-carrier declaration");
+                let encoded = encode_logical_domain(RuntimeFilterLogicalDomainFacts::Membership {
+                    value_type: source.clone(),
+                    null_semantics: RuntimeFilterNullSemantics::NeverMatches,
+                })
+                .expect("the original scalar RF carrier is supported");
+                assert_complete_domain(&encoded, std::slice::from_ref(&source));
+            }
+        }
+    }
+
+    #[test]
     fn invalid_semantic_contracts_fail_before_submission() {
         let Err(err) = encode_logical_domain(RuntimeFilterLogicalDomainFacts::Ordered {
             keys: Vec::new(),
@@ -456,9 +596,27 @@ mod tests {
             panic!("empty ordered contract must fail");
         };
         assert_eq!(err.kind(), DistributedQueryErrorKind::ContractViolation);
+        let opaque = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            DataType::Binary,
+            true,
+            novarocks_type_contract::ValueLogicalType::Hll,
+        )
+        .expect("complete original opaque declaration");
+        let error = encode_logical_domain(RuntimeFilterLogicalDomainFacts::Membership {
+            value_type: opaque,
+            null_semantics: RuntimeFilterNullSemantics::NeverMatches,
+        })
+        .err()
+        .expect("the original RF Binary capability remains unsupported");
+        assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+        assert!(
+            error
+                .to_string()
+                .contains("runtime filter native type does not support Binary")
+        );
 
         let membership = encode_logical_domain(RuntimeFilterLogicalDomainFacts::Membership {
-            value_type: DataType::Int32,
+            value_type: novarocks_physical_plan::ValueType::new(DataType::Int32, true),
             null_semantics: RuntimeFilterNullSemantics::NeverMatches,
         })
         .expect("membership facts are encodable");

@@ -19,11 +19,10 @@
 
 use crate::query_execution::attempt_runtime_filter_facts as attempt_facts;
 use crate::query_execution::schedule::SchedulingPlan;
-use arrow::datatypes::DataType;
 
 pub enum RuntimeFilterLogicalDomainFacts {
     Membership {
-        value_type: DataType,
+        value_type: novarocks_physical_plan::ValueType,
         null_semantics: RuntimeFilterNullSemantics,
     },
     Ordered {
@@ -51,7 +50,7 @@ impl RuntimeFilterLogicalDomainFacts {
                 keys: keys
                     .iter()
                     .map(|key| RuntimeFilterOrderKeyFacts {
-                        data_type: key.data_type.clone(),
+                        value_type: key.value_type.clone(),
                         direction: RuntimeFilterSortDirection::from_attempt(key.direction),
                         null_order: RuntimeFilterNullOrder::from_attempt(key.null_order),
                     })
@@ -64,7 +63,7 @@ impl RuntimeFilterLogicalDomainFacts {
 }
 
 pub struct RuntimeFilterOrderKeyFacts {
-    pub data_type: DataType,
+    pub value_type: novarocks_physical_plan::ValueType,
     pub direction: RuntimeFilterSortDirection,
     pub null_order: RuntimeFilterNullOrder,
 }

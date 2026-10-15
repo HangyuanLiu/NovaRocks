@@ -69,12 +69,15 @@ fn approx_top_k_actual_original_required_sql_ordered_full_binding_source() {
                         req.logical_argument_count,
                         call.binding.function.argument_types.len()
                     );
-                    assert_eq!(call.binding.intermediate_type.data_type, DataType::Binary);
+                    assert_eq!(
+                        call.binding.intermediate_type.data_type().clone(),
+                        DataType::Binary
+                    );
                     assert!(matches!(
-                        call.binding.function.result_type.data_type,
+                        call.binding.function.result_type.data_type(),
                         DataType::List(_)
                     ));
-                    assert!(call.binding.function.result_type.nullable);
+                    assert!(call.binding.function.result_type.nullable());
                     eprintln!(
                         "APPROX_TOP_K actual mode={mode:?} fragment={:?} site={site:?} binding={:?} request={req:?}",
                         fragment.id(),

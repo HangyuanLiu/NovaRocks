@@ -60,8 +60,8 @@ fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
             } = &node.kind
             {
                 assert_eq!(relation.schema().len(), 1);
-                assert_eq!(relation.schema()[0].ty.data_type, DataType::Int32);
-                assert!(relation.schema()[0].ty.nullable);
+                assert_eq!(relation.schema()[0].ty.data_type().clone(), DataType::Int32);
+                assert!(relation.schema()[0].ty.nullable());
                 assert!(relation.predicate_guarantees().is_empty());
                 for (ordinal, id) in residuals.iter().enumerate() {
                     let e = fragment.expressions().get(*id).unwrap();
@@ -69,7 +69,7 @@ fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
                         "original scan residual ordinal={ordinal} id={id:?} type={:?} kind={:?}",
                         e.ty, e.kind
                     );
-                    assert_eq!(e.ty.data_type, DataType::Boolean);
+                    assert_eq!(e.ty.data_type().clone(), DataType::Boolean);
                 }
                 counts.push(residuals.len());
             }

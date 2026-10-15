@@ -182,6 +182,10 @@ impl AggregateSignatureResolver for TopKOwner {
     }
 }
 impl PureFunctionMetadataOwner for TopKOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::borrowed_aggregate(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -250,6 +254,60 @@ impl FunctionEffectOwner for TopKOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
+        self.refine_core(input, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_core(input, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
+    }
+}
+impl PureAggregateImplementation for TopKOwner {
+    type Kernel = TopKKernel;
+    fn prepare_aggregate(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<TopKKernel>, KernelFailure> {
+        self.prepare_core(input, contract, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn prepare_aggregate_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<Self::Kernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_core(input, contract, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
+    }
+}
+
+fn original_logical_profile(logical_count: usize, selected_count: usize, ordered: bool) -> bool {
+    (1..=3).contains(&logical_count) && selected_count == logical_count && !ordered
+}
+
+impl TopKOwner {
+    fn refine_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(FunctionEffectOwnerError::Control)?;
         let result = (|| {
@@ -270,13 +328,10 @@ impl FunctionEffectOwner for TopKOwner {
                 .into());
             }
             work.flush().map_err(FunctionEffectOwnerError::Control)?;
-            self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => {
-                        FunctionEffectOwnerError::Control(error)
-                    }
-                    other => FunctionEffectOwnerError::Owner(other),
-                })?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+                other => FunctionEffectOwnerError::Owner(other),
+            })?;
             Ok(self.call_effects(input.proof_scope))
         })();
         if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
@@ -285,14 +340,12 @@ impl FunctionEffectOwner for TopKOwner {
         work.finish().map_err(FunctionEffectOwnerError::Control)?;
         result
     }
-}
-impl PureAggregateImplementation for TopKOwner {
-    type Kernel = TopKKernel;
-    fn prepare_aggregate(
+    fn prepare_core(
         &self,
         input: CallEffectInput<'_>,
         contract: Arc<AggregateCallContract>,
         control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
     ) -> Result<Arc<TopKKernel>, KernelFailure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(compile_failure)?;
@@ -325,11 +378,10 @@ impl PureAggregateImplementation for TopKOwner {
                 ));
             }
             work.flush().map_err(compile_failure)?;
-            self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => compile_failure(error),
-                    _ => invalid("approx_top_k aggregate preparation has a stale selected binding"),
-                })?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => compile_failure(error),
+                _ => invalid("approx_top_k aggregate preparation has a stale selected binding"),
+            })?;
             for (actual, selected) in input
                 .request
                 .arguments
@@ -373,8 +425,4 @@ impl PureAggregateImplementation for TopKOwner {
         work.finish().map_err(compile_failure)?;
         result
     }
-}
-
-fn original_logical_profile(logical_count: usize, selected_count: usize, ordered: bool) -> bool {
-    (1..=3).contains(&logical_count) && selected_count == logical_count && !ordered
 }

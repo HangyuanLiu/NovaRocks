@@ -87,7 +87,7 @@ fn effects() -> FunctionEffectDeclaration {
 }
 
 struct ThetaPureOwner {
-    resolver: Arc<dyn FunctionBindingResolver>,
+    resolver: novarocks_functions::FunctionBindingResolverOwner,
     family: Arc<IcebergThetaAggregateFamily>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
@@ -101,7 +101,7 @@ impl ThetaPureOwner {
             subject: "Iceberg Theta original binding owner",
             value: ICEBERG_THETA_AGGREGATE_NAME.into(),
         };
-        let resolver = Arc::clone(original.binding_resolver().ok_or_else(missing)?);
+        let resolver = original.binding_resolver().ok_or_else(missing)?.clone();
         let original_declaration = original.binding_declaration().ok_or_else(missing)?;
         // Only effects are authored here. Identity/pattern/state law and format
         // stay with the same original parametric binding declaration.
@@ -181,6 +181,14 @@ impl FunctionBindingResolver for ThetaPureOwner {
     }
 }
 impl AggregateSignatureResolver for ThetaPureOwner {
+    fn borrow_update_signature<'a>(
+        &'a self,
+        selected_overload: &str,
+        arguments: &'a [FunctionValueType],
+    ) -> Result<Option<AggregateUpdateSignatureRecipe<'a>>, FunctionResolutionError> {
+        self.family
+            .borrow_update_signature(selected_overload, arguments)
+    }
     fn validate_value_arguments(
         &self,
         arguments: &[FunctionValueType],
@@ -214,6 +222,11 @@ impl AggregateSignatureResolver for ThetaPureOwner {
     }
 }
 impl PureFunctionMetadataOwner for ThetaPureOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> FunctionBindingResolverOwner {
+        // Keep the exact registration's original parametric author. The pure
+        // effects wrapper neither rebuilds it nor chooses a new family.
+        self.resolver.clone()
+    }
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -238,6 +251,55 @@ impl FunctionEffectOwner for ThetaPureOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
+        self.refine_core(input, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>> {
+        self.refine_core(input, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(CheckedOwnerFailure::Original)
+    }
+}
+impl PureAggregateImplementation for ThetaPureOwner {
+    type Kernel = PreparedThetaKernel;
+    fn prepare_aggregate(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<PreparedThetaKernel>, KernelFailure> {
+        self.prepare_core(input, contract, control, false, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn prepare_aggregate_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &CheckedCallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<PreparedThetaKernel>, CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_core(input, contract, control, true, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(CheckedOwnerFailure::Original)
+    }
+}
+
+impl ThetaPureOwner {
+    fn refine_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(FunctionEffectOwnerError::Control)?;
         let result = (|| {
@@ -258,13 +320,10 @@ impl FunctionEffectOwner for ThetaPureOwner {
                 .into());
             }
             work.flush().map_err(FunctionEffectOwnerError::Control)?;
-            self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(cause) => {
-                        FunctionEffectOwnerError::Control(cause)
-                    }
-                    error => FunctionEffectOwnerError::Owner(error),
-                })?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(cause) => FunctionEffectOwnerError::Control(cause),
+                error => FunctionEffectOwnerError::Owner(error),
+            })?;
             work.step().map_err(FunctionEffectOwnerError::Control)?;
             Ok(self.call_effects(input.proof_scope))
         })();
@@ -274,14 +333,13 @@ impl FunctionEffectOwner for ThetaPureOwner {
         work.finish().map_err(FunctionEffectOwnerError::Control)?;
         result
     }
-}
-impl PureAggregateImplementation for ThetaPureOwner {
-    type Kernel = PreparedThetaKernel;
-    fn prepare_aggregate(
+    fn prepare_core(
         &self,
         input: CallEffectInput<'_>,
         contract: Arc<AggregateCallContract>,
         control: &dyn PureCompileControl,
+        borrow_signature: bool,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
     ) -> Result<Arc<PreparedThetaKernel>, KernelFailure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(compile_failure)?;
@@ -312,11 +370,10 @@ impl PureAggregateImplementation for ThetaPureOwner {
                 ));
             }
             work.flush().map_err(compile_failure)?;
-            self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(cause) => compile_failure(cause),
-                    _ => invalid("Iceberg Theta preparation has a stale selected binding"),
-                })?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(cause) => compile_failure(cause),
+                _ => invalid("Iceberg Theta preparation has a stale selected binding"),
+            })?;
             let (
                 FunctionArgument::Value {
                     value_type: actual, ..
@@ -340,9 +397,9 @@ impl PureAggregateImplementation for ThetaPureOwner {
                 ));
             }
             let physical_binary = |ty: &FunctionValueType| {
-                ty.logical_type == ValueLogicalType::Physical
-                    && ty.data_type == DataType::Binary
-                    && !ty.nullable
+                ty.logical_type() == ValueLogicalType::Physical
+                    && ty.data_type() == &DataType::Binary
+                    && !ty.nullable()
             };
             let valid = physical_binary(contract.final_type())
                 && physical_binary(contract.intermediate_type())
@@ -355,28 +412,45 @@ impl PureAggregateImplementation for ThetaPureOwner {
             }
             // The original family is still the sole fixed signature/options author.
             work.flush().map_err(compile_failure)?;
-            let mut carriers = Vec::new();
-            carriers
-                .try_reserve_exact(1)
-                .map_err(|_| KernelFailure::ResourceExhausted)?;
-            work.step().map_err(compile_failure)?;
-            carriers.push(actual.data_type.clone());
-            work.step().map_err(compile_failure)?;
-            work.flush().map_err(compile_failure)?;
-            let signature = ResolvedAggregateSignature {
-                overload: AggregateOverloadIdentity::try_new(input.selected.overload.as_str())
-                    .map_err(|_| invalid("Iceberg Theta selected overload identity is invalid"))?,
-                argument_types: carriers,
-                intermediate_type: contract.intermediate_type().data_type.clone(),
-                output_type: contract.final_type().data_type.clone(),
-                state_format: contract.state_format().clone(),
+            let signature = if borrow_signature {
+                // The checked path borrows the already-validated source and
+                // exact contract. It never builds an owned signature first.
+                None
+            } else {
+                let mut carriers = Vec::new();
+                carriers
+                    .try_reserve_exact(1)
+                    .map_err(|_| KernelFailure::ResourceExhausted)?;
+                work.step().map_err(compile_failure)?;
+                carriers.push(actual.data_type().clone());
+                work.step().map_err(compile_failure)?;
+                work.flush().map_err(compile_failure)?;
+                let signature = ResolvedAggregateSignature {
+                    overload: AggregateOverloadIdentity::try_new(input.selected.overload.as_str())
+                        .map_err(|_| {
+                            invalid("Iceberg Theta selected overload identity is invalid")
+                        })?,
+                    argument_types: carriers,
+                    intermediate_type: contract.intermediate_type().data_type().clone(),
+                    output_type: contract.final_type().data_type().clone(),
+                    state_format: contract.state_format().clone(),
+                };
+                Some(signature)
             };
             let options = AggregateBindOptions::try_new(false, &[], &[], None)
                 .map_err(|_| invalid("Iceberg Theta canonical options are invalid"))?;
-            let original = self
-                .family
-                .prepare(&signature, &options)
-                .map_err(author_failure);
+            let original = match &signature {
+                Some(signature) => self.family.prepare(signature, &options),
+                None => self.family.prepare_borrowed(
+                    input.selected.overload.as_str(),
+                    std::slice::from_ref(actual.data_type()),
+                    contract.intermediate_type().data_type(),
+                    contract.final_type().data_type(),
+                    contract.state_format(),
+                    &options,
+                ),
+            }
+            .map_err(author_failure);
             work.step().map_err(compile_failure)?;
             let original = original?;
             work.flush().map_err(compile_failure)?;

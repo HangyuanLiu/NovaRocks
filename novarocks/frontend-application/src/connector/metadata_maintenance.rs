@@ -21,6 +21,7 @@
 //! generic cache finalization. Provider-specific maintenance planning, durable
 //! artifacts, markers and external mutation all remain behind the SPI.
 
+use crate::connector::schema_creation::FrontendSchemaLoad;
 use std::fmt;
 
 use novarocks_spi::connector::{
@@ -269,11 +270,13 @@ pub fn read_max_compactable_data_files(
         ));
     }
     let lease = resolver.acquire_current_metadata_maintenance(instance_id)?;
-    let metadata = lease.metadata().load_table(ConnectorTableRequest {
-        table: table.clone(),
-        resolution: ConnectorTableResolution::StrictBaseTable,
-        context: context.clone(),
-    })?;
+    let metadata = lease
+        .metadata()
+        .load_frontend_table(ConnectorTableRequest {
+            table: table.clone(),
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context.clone(),
+        })?;
     if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
         return Err(ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
@@ -347,7 +350,7 @@ impl MetadataMaintenanceSession {
             })?;
         let metadata = lease
             .metadata()
-            .load_table(ConnectorTableRequest {
+            .load_frontend_table(ConnectorTableRequest {
                 table: table.clone(),
                 resolution: ConnectorTableResolution::StrictBaseTable,
                 context: context.clone(),
@@ -502,6 +505,35 @@ mod tests {
 
     use super::*;
 
+    fn empty_table_metadata(
+        header: novarocks_spi::connector::ConnectorTableMetadataHeader,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        // This fixture explicitly declares a zero-column table.
+        let schema = creation.arc(Schema::empty())?;
+        let storage = creation.storage();
+        let execution = {
+            let (request, work) = creation.observers();
+            novarocks_connector_contract::ConnectorReadExecutionSchema::try_new_observed(
+                schema.clone(),
+                Vec::new().into_boxed_slice(),
+                storage,
+                |layout| {
+                    request(layout)
+                        .map_err(novarocks_connector_contract::PureProviderCompileError::Control)
+                },
+                |units| {
+                    work(units)
+                        .map_err(novarocks_connector_contract::PureProviderCompileError::Control)
+                },
+            )?
+        };
+        ConnectorTableMetadata::try_new_typed(header, schema, execution, creation)
+    }
+
     #[derive(Clone, Copy)]
     enum Mode {
         Committed,
@@ -589,20 +621,27 @@ mod tests {
         fn load_table(
             &self,
             request: ConnectorTableRequest,
-        ) -> Result<novarocks_spi::connector::ConnectorTableMetadata, ConnectorError> {
+            creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
             self.metadata_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(ConnectorTableMetadata {
-                identity: request.table,
-                schema: Arc::new(Schema::empty()),
-                planning_facts: ConnectorTablePlanningFacts::empty(),
-                definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
-                version: None,
-                statistics_data_version: None,
-                table: ConnectorTableHandle::try_new(
-                    self.descriptor.instance_id.clone(),
-                    Bytes::from_static(b"table"),
-                )?,
-            })
+            empty_table_metadata(
+                novarocks_spi::connector::ConnectorTableMetadataHeader {
+                    identity: request.table,
+                    planning_facts: ConnectorTablePlanningFacts::empty(),
+                    definition_facts:
+                        novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
+                    version: None,
+                    statistics_data_version: None,
+                    table: ConnectorTableHandle::try_new(
+                        self.descriptor.instance_id.clone(),
+                        Bytes::from_static(b"table"),
+                    )?,
+                },
+                creation,
+            )
         }
     }
 
@@ -819,12 +858,16 @@ mod tests {
         fn load_table(
             &self,
             request: ConnectorTableRequest,
-        ) -> Result<ConnectorTableMetadata, ConnectorError> {
+            creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
             assert_eq!(
                 request.resolution,
                 ConnectorTableResolution::StrictBaseTable
             );
-            self.inner.load_table(request)
+            self.inner.load_table(request, creation)
         }
     }
 

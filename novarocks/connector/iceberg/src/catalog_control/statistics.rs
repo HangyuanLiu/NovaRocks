@@ -413,12 +413,18 @@ impl StatisticsCollection for IcebergMetadata {
                             "resolve the schema of the measured Iceberg snapshot: {error}"
                         ))
                     })?;
-                let sql_schema = crate::scalar_integer_domain::metadata_sql_schema(
-                    physical.table.metadata(),
-                    &schema,
-                )?;
+                let execution =
+                    crate::metadata::with_pure_schema_creation(&request.context, |creation| {
+                        crate::schema_mapping::catalog_value::table(
+                            physical.table.metadata(),
+                            &schema,
+                            &[],
+                            creation,
+                        )
+                        .map_err(crate::metadata::metadata_creation_error)
+                    })?;
                 let requirements =
-                    collection_requirements(&schema, sql_schema.as_ref(), &request.selection)?;
+                    collection_requirements(&schema, &execution, &request.selection)?;
                 (
                     Some(snapshot_id),
                     Some(snapshot.sequence_number()),
@@ -512,7 +518,7 @@ impl StatisticsCollectionSession for IcebergStatisticsCollectionSession {
 
 fn collection_requirements(
     schema: &crate::iceberg::spec::Schema,
-    arrow_schema: &arrow::datatypes::Schema,
+    execution: &novarocks_connector_contract::ConnectorReadExecutionSchema,
     selection: &StatisticsColumnSelection,
 ) -> Result<Vec<StatisticsRequiredAggregation>, ConnectorError> {
     let explicit = match selection {
@@ -548,7 +554,7 @@ fn collection_requirements(
             }
             continue;
         };
-        let arrow_field = arrow_schema.fields().get(ordinal).ok_or_else(|| {
+        let arrow_field = execution.schema().fields().get(ordinal).ok_or_else(|| {
             corrupt("Iceberg and Arrow statistics schemas have different field counts")
         })?;
         if !supports_theta_input_type(arrow_field.data_type()) {
@@ -560,12 +566,13 @@ fn collection_requirements(
             }
             continue;
         }
-        let value_type = crate::statistics_value_type::statistics_input_value_type(
-            iceberg_field,
-            arrow_field,
-            arrow_field,
-        )
-        .map_err(corrupt)?;
+        let value_type = execution
+            .bindings()
+            .get(ordinal)
+            .ok_or_else(|| {
+                corrupt("Iceberg statistics field has no complete execution declaration")
+            })?
+            .clone();
         let input = StatisticsScanColumn::try_new(
             ordinal,
             Arc::<str>::from(iceberg_field.name.as_str()),
@@ -980,6 +987,34 @@ mod tests {
         .expect("context")
     }
 
+    fn execution_fixture(
+        schema: &crate::iceberg::spec::Schema,
+        properties: std::collections::HashMap<String, String>,
+    ) -> novarocks_connector_contract::ConnectorReadExecutionSchema {
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+            schema.clone(),
+            crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "memory://statistics_fixture".to_string(),
+            crate::iceberg::spec::FormatVersion::V3,
+            properties,
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        crate::metadata::with_pure_schema_creation(&context(), |creation| {
+            crate::schema_mapping::catalog_value::table(
+                &metadata,
+                metadata.current_schema(),
+                &[],
+                creation,
+            )
+            .map_err(crate::metadata::metadata_creation_error)
+        })
+        .expect("provider complete type author")
+    }
+
     fn provider() -> (tokio::runtime::Runtime, tempfile::TempDir, IcebergMetadata) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
@@ -1071,12 +1106,22 @@ mod tests {
             namespace: Arc::from("empty_stats"),
             table: Arc::from("t"),
         };
+        let mut request = |_| Ok(());
+        let mut work = |_| Ok(());
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
         let metadata = provider
-            .load_table(ConnectorTableRequest {
-                table: identity,
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                context: context(),
-            })
+            .load_table(
+                ConnectorTableRequest {
+                    table: identity,
+                    resolution: ConnectorTableResolution::StrictBaseTable,
+                    context: context(),
+                },
+                &mut creation,
+            )
             .expect("load empty table");
         let data_version = metadata
             .statistics_data_version
@@ -1127,9 +1172,7 @@ mod tests {
             .expect("schema");
         let requirements = collection_requirements(
             &schema,
-            crate::schema_mapping::sql_read_schema_from_iceberg(&schema)
-                .unwrap()
-                .as_ref(),
+            &execution_fixture(&schema, Default::default()),
             &StatisticsColumnSelection::Explicit(vec![Arc::from("u")]),
         )
         .expect("UUID requirement");
@@ -1139,10 +1182,10 @@ mod tests {
             &DataType::FixedSizeBinary(16)
         );
         assert_eq!(
-            requirements[0].input().value_type().logical_type,
+            requirements[0].input().value_type().logical_type(),
             novarocks_type_contract::ValueLogicalType::Uuid
         );
-        assert!(requirements[0].input().value_type().nullable);
+        assert!(requirements[0].input().value_type().nullable());
     }
 
     #[test]
@@ -1158,20 +1201,18 @@ mod tests {
             .expect("schema");
         let requirements = collection_requirements(
             &schema,
-            crate::schema_mapping::sql_read_schema_from_iceberg(&schema)
-                .unwrap()
-                .as_ref(),
+            &execution_fixture(&schema, Default::default()),
             &StatisticsColumnSelection::Explicit(vec![Arc::from("fixed")]),
         )
         .expect("fixed requirement");
         assert_eq!(requirements.len(), 1);
         let input = requirements[0].input().value_type();
-        assert_eq!(input.data_type, DataType::FixedSizeBinary(16));
+        assert_eq!(input.data_type(), &DataType::FixedSizeBinary(16));
         assert_eq!(
-            input.logical_type,
+            input.logical_type(),
             novarocks_type_contract::ValueLogicalType::Physical
         );
-        assert!(!input.nullable);
+        assert!(!input.nullable());
     }
 
     #[test]
@@ -1188,9 +1229,7 @@ mod tests {
         assert!(
             collection_requirements(
                 &schema,
-                crate::schema_mapping::sql_read_schema_from_iceberg(&schema)
-                    .unwrap()
-                    .as_ref(),
+                &execution_fixture(&schema, Default::default()),
                 &StatisticsColumnSelection::Explicit(vec![Arc::from("v")]),
             )
             .is_err()
@@ -1198,9 +1237,7 @@ mod tests {
         assert!(
             collection_requirements(
                 &schema,
-                crate::schema_mapping::sql_read_schema_from_iceberg(&schema)
-                    .unwrap()
-                    .as_ref(),
+                &execution_fixture(&schema, Default::default()),
                 &StatisticsColumnSelection::Default
             )
             .expect("default selection")
@@ -1246,18 +1283,15 @@ mod tests {
             ("novarocks.logical_type.n".into(), "largeint".into()),
         ]
         .into();
-        let sql_schema = crate::scalar_integer_domain::sql_schema(&schema, &properties).unwrap();
-        let requirements = collection_requirements(
-            &schema,
-            sql_schema.as_ref(),
-            &StatisticsColumnSelection::Default,
-        )
-        .unwrap();
+        let execution = execution_fixture(&schema, properties);
+        let requirements =
+            collection_requirements(&schema, &execution, &StatisticsColumnSelection::Default)
+                .unwrap();
         use novarocks_type_contract::ValueLogicalType;
         assert_eq!(
             requirements
                 .iter()
-                .map(|requirement| requirement.input().value_type().logical_type)
+                .map(|requirement| requirement.input().value_type().logical_type())
                 .collect::<Vec<_>>(),
             vec![
                 ValueLogicalType::Hll,

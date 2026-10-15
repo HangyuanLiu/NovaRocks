@@ -147,7 +147,10 @@ async fn original_intermediary_eof(pool_refusal: bool) {
         QueryExecutionId::new(QueryId::new(771, 1), AttemptId::new(1).unwrap()).unwrap();
     let (producer, execution, _resources, _schema) = ResultStreamTestProducer::open(
         execution_id,
-        vec![ResultField::new("payload", DataType::Utf8, false, None)],
+        vec![ResultField::new(
+            "payload",
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+        )],
         1,
         ResourceConfig {
             total_bytes: 1024 * 1024,

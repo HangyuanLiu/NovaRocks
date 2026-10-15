@@ -88,14 +88,14 @@ impl<'a> NumericValue<'a> {
         argument: EvaluatedArgument<'a>,
         value_type: &FunctionValueType,
     ) -> Result<Self, KernelFailure> {
-        if value_type.logical_type != ValueLogicalType::Physical {
+        if value_type.logical_type() != ValueLogicalType::Physical {
             return Err(invalid("dround input is not an exact installed profile"));
         }
-        let view = checked_numeric_view(argument.array(), &value_type.data_type)?;
+        let view = checked_numeric_view(argument.array(), value_type.data_type())?;
         Ok(Self {
             argument,
             view,
-            nullable: value_type.nullable,
+            nullable: value_type.nullable(),
         })
     }
     fn value(&self, ordinal: usize, batch_row: usize) -> Result<Option<f64>, KernelFailure> {
@@ -127,7 +127,8 @@ impl<'a> DigitsInput<'a> {
         argument: EvaluatedArgument<'a>,
         source: &FunctionValueType,
     ) -> Result<Self, KernelFailure> {
-        if source.logical_type != ValueLogicalType::Physical || source.data_type != DataType::Int32
+        if source.logical_type() != ValueLogicalType::Physical
+            || source.data_type() != &DataType::Int32
         {
             return Err(invalid(
                 "dround digits require the exact Physical Int32 profile",
@@ -141,7 +142,7 @@ impl<'a> DigitsInput<'a> {
         Ok(Self {
             argument,
             array,
-            nullable: source.nullable,
+            nullable: source.nullable(),
         })
     }
     fn value(&self, ordinal: usize, batch_row: usize) -> Result<Option<i64>, KernelFailure> {
@@ -167,9 +168,9 @@ pub(super) fn evaluate_dround<'a>(
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     control.checkpoint(0)?;
     let target = input.contract().result_type();
-    if target.logical_type != ValueLogicalType::Physical
-        || target.data_type != DataType::Float64
-        || !target.nullable
+    if target.logical_type() != ValueLogicalType::Physical
+        || target.data_type() != &DataType::Float64
+        || !target.nullable()
     {
         return Err(invalid(
             "dround requires its exact nullable Physical Float64 result",
@@ -197,8 +198,8 @@ pub(super) fn evaluate_dround<'a>(
                 FunctionArgumentType::Value(digits),
             ],
             [left, right],
-        ) if source.logical_type == ValueLogicalType::Physical
-            && source.data_type == DataType::Float64 =>
+        ) if source.logical_type() == ValueLogicalType::Physical
+            && source.data_type() == &DataType::Float64 =>
         {
             (
                 NumericValue::checked(*left, source)?,
@@ -220,7 +221,7 @@ pub(super) fn evaluate_dround<'a>(
     let values = compute_dround(
         computation,
         selection,
-        Some(&target.data_type),
+        Some(target.data_type()),
         Some(control),
         |ordinal, batch_row| {
             let x = value.value(ordinal, batch_row)?;
@@ -238,7 +239,7 @@ pub(super) fn evaluate_dround<'a>(
             KernelFailure::Operational(crate::KernelDiagnostic::new(&error))
         }
     })?;
-    SelectedValues::try_new(selection, &target.data_type, values, Box::default())
+    SelectedValues::try_new(selection, target.data_type(), values, Box::default())
         .map_err(|_| internal("dround compact output violates its selected contract"))
 }
 /// Check Rust allocation representability; this never authorizes memory.
@@ -310,7 +311,9 @@ mod tests {
     fn dense(arrays: Vec<ArrayRef>, rows: usize) -> ArrayRef {
         let types: Vec<_> = arrays
             .iter()
-            .map(|array| FunctionValueType::new(array.data_type().clone(), true))
+            .map(|array| {
+                FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true)
+            })
             .collect();
         let mut instance = instance(&types);
         let arguments: Vec<_> = arrays.iter().map(EvaluatedArgument::Column).collect();

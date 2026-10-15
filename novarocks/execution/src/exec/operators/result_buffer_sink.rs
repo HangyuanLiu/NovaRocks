@@ -23,10 +23,13 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::DataType;
 
 use crate::exec::chunk::Chunk;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::operators::compiled_expression::RuntimeKernelControl;
+use crate::exec::pipeline::operator::{
+    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::io::{
-    FragmentResultSession, ResultWriteAdmission, ResultWriteCredit,
+    FragmentResultSession, ResultWriteAdmission, ResultWriteCredit, ResultWriteFailure,
 };
 use crate::runtime::observable::Observable;
 use crate::runtime::runtime_state::RuntimeState;
@@ -86,6 +89,8 @@ impl OperatorFactory for ResultBufferSinkFactory {
             shared: Arc::clone(&self.shared),
             credit: Mutex::new(ResultSinkCreditState::Ready),
             finished: false,
+            construction_factory: None,
+            prepared: false,
         })
     }
 
@@ -100,6 +105,19 @@ struct ResultBufferSinkOperator {
     shared: Arc<ResultBufferSinkShared>,
     credit: Mutex<ResultSinkCreditState>,
     finished: bool,
+    construction_factory: Option<Arc<dyn InputConstructionFactory>>,
+    prepared: bool,
+}
+
+impl ResultBufferSinkOperator {
+    fn prepared_factory(&self) -> Result<&dyn InputConstructionFactory, ConstructionFailure> {
+        if !self.prepared {
+            return Err(ConstructionFailure::MissingOwner);
+        }
+        self.construction_factory
+            .as_deref()
+            .ok_or(ConstructionFailure::MissingOwner)
+    }
 }
 
 enum ResultSinkCreditState {
@@ -115,6 +133,22 @@ enum ResultSinkCreditState {
 impl Operator for ResultBufferSinkOperator {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.construction_factory = Some(factory);
+    }
+
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        self.construction_factory
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        self.prepared = true;
+        Ok(())
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -152,6 +186,7 @@ impl ProcessorOperator for ResultBufferSinkOperator {
     }
 
     fn can_accept_input(&self, chunk: &Chunk) -> ExecutionResult<bool> {
+        self.prepared_factory()?;
         if self.finished || chunk.is_empty() {
             return Ok(!self.finished);
         }
@@ -239,7 +274,8 @@ impl ProcessorOperator for ResultBufferSinkOperator {
         false
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+    fn push_chunk(&mut self, runtime: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+        let factory = self.prepared_factory()?;
         if self.finished || chunk.is_empty() {
             return Ok(());
         }
@@ -282,10 +318,10 @@ impl ProcessorOperator for ResultBufferSinkOperator {
                 }
             }
         };
-        Ok(self
-            .session
-            .write_with_credit(chunk, credit)
-            .map_err(|error| error.to_string())?)
+        let control = RuntimeKernelControl::new(runtime.error_state());
+        self.session
+            .write_with_credit(chunk, credit, factory, &control)
+            .map_err(ResultWriteFailure::into_execution)
     }
 
     fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
@@ -331,7 +367,7 @@ mod tests {
     use std::time::Duration;
 
     use arrow::array::Int32Array;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field};
 
     use super::*;
     use crate::exec::chunk::ChunkSchema;
@@ -458,7 +494,9 @@ mod tests {
             &self,
             chunk: Chunk,
             credit: ResultWriteCredit,
-        ) -> Result<(), FragmentIoError> {
+            _factory: &dyn InputConstructionFactory,
+            _control: &dyn novarocks_functions::KernelEvaluationControl,
+        ) -> Result<(), ResultWriteFailure> {
             assert_eq!(chunk.logical_bytes(), credit.bytes());
             self.inner
                 .state
@@ -487,20 +525,33 @@ mod tests {
     }
 
     fn values_chunk(values: Vec<i32>) -> Chunk {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int32,
-            false,
-        )]));
-        let batch = arrow::record_batch::RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int32Array::from(values))],
+        use crate::exec::chunk::ChunkSlotSchema;
+        use novarocks_type_contract::{
+            TypedValueBinding, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+        };
+        let rows = values.len();
+        let pure = ValueTypeStorageLifetime::pure();
+        let binding = TypedValueBinding::try_new(
+            ValueTypeRef::try_new(ValueKind::Scalar(DataType::Int32), false, pure.clone()).unwrap(),
+            ValueLayout::try_new(&DataType::Int32, pure.clone()).unwrap(),
         )
-        .expect("one row batch");
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
-                .expect("one row chunk schema");
-        Chunk::new_with_chunk_schema(batch, chunk_schema)
+        .unwrap();
+        let slot = ChunkSlotSchema::try_new_typed(
+            SlotId::new(1),
+            Arc::new(Field::new("value", DataType::Int32, false)),
+            binding,
+            None,
+            pure.clone(),
+        )
+        .unwrap();
+        let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap());
+        Chunk::try_new_typed_with_columns_observed::<String, _>(
+            schema,
+            vec![Arc::new(Int32Array::from(values))],
+            rows,
+            |_| Ok(()),
+        )
+        .unwrap()
     }
 
     fn runtime_state() -> RuntimeState {
@@ -515,6 +566,16 @@ mod tests {
         )
     }
 
+    fn prepare_test_sink(operator: &mut dyn Operator) {
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("result sink fixture"),
+            runtime_state().error_state(),
+        ).unwrap();
+        operator.set_construction_factory(factory);
+        operator.prepare().unwrap();
+    }
+
     #[test]
     fn byte_credit_blocks_and_consumer_release_wakes_without_overshoot() {
         let first = one_row_chunk();
@@ -524,6 +585,7 @@ mod tests {
         let session = CreditSession::new(bytes);
         let factory = ResultBufferSinkFactory::new(session.clone(), None);
         let mut operator = factory.create(1, 0);
+        prepare_test_sink(operator.as_mut());
         let processor = operator.as_processor_mut().expect("result processor");
         let runtime = runtime_state();
 
@@ -580,6 +642,7 @@ mod tests {
         let session = CreditSession::new(2 * bytes);
         let factory = ResultBufferSinkFactory::new(session.clone(), None);
         let mut operator = factory.create(1, 0);
+        prepare_test_sink(operator.as_mut());
         let processor = operator.as_processor_mut().expect("result processor");
         assert!(processor.can_accept_input(&first).expect("first admission"));
         processor
@@ -684,8 +747,11 @@ mod tests {
             &self,
             chunk: Chunk,
             credit: ResultWriteCredit,
-        ) -> Result<(), FragmentIoError> {
-            self.inner.write_with_credit(chunk, credit)
+            factory: &dyn InputConstructionFactory,
+            control: &dyn novarocks_functions::KernelEvaluationControl,
+        ) -> Result<(), ResultWriteFailure> {
+            self.inner
+                .write_with_credit(chunk, credit, factory, control)
         }
         fn finish(&self) -> Result<(), FragmentIoError> {
             self.finished.store(true, Ordering::SeqCst);
@@ -698,9 +764,11 @@ mod tests {
 
     fn credit_driver(session: Arc<RacingCreditSession>, chunk: Chunk) -> PipelineDriver {
         let factory = ResultBufferSinkFactory::new(session, None);
+        let mut sink = factory.create(1, 0);
+        prepare_test_sink(sink.as_mut());
         PipelineDriver::new(
             0,
-            vec![Box::new(OneChunkSource(Some(chunk))), factory.create(1, 0)],
+            vec![Box::new(OneChunkSource(Some(chunk))), sink],
             None,
             Vec::new(),
             Arc::new(runtime_state()),
@@ -745,5 +813,49 @@ mod tests {
         assert_eq!(observable.generation(), generation);
         assert_eq!(session.inner.retained(), 0);
         assert!(!session.finished.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn result_sink_missing_creator_refuses_before_credit_or_input_consumption() {
+        let input = one_row_chunk();
+        let session = CreditSession::new(input.logical_bytes());
+        let factory = ResultBufferSinkFactory::new(session.clone(), None);
+        let mut operator = factory.create(1, 0);
+        assert!(operator.creates_typed_storage());
+        let error = operator.prepare().unwrap_err();
+        assert!(matches!(
+            error.cause(),
+            crate::runtime::fragment::ExecutionFailureCause::Construction(
+                ConstructionFailure::MissingOwner
+            )
+        ));
+        let processor = operator.as_processor_mut().unwrap();
+        let error = processor.can_accept_input(&input).unwrap_err();
+        assert!(matches!(
+            error.cause(),
+            crate::runtime::fragment::ExecutionFailureCause::Construction(
+                ConstructionFailure::MissingOwner
+            )
+        ));
+        let error = processor
+            .push_chunk(&runtime_state(), input.clone())
+            .unwrap_err();
+        assert!(matches!(
+            error.cause(),
+            crate::runtime::fragment::ExecutionFailureCause::Construction(
+                ConstructionFailure::MissingOwner
+            )
+        ));
+        assert_eq!(session.retained(), 0);
+        assert_eq!(session.high_water(), 0);
+        assert!(session.inner.state.lock().unwrap().queue.is_empty());
+        assert_eq!(input.len(), 1);
+        assert_eq!(
+            input.columns()[0]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            7
+        );
     }
 }

@@ -127,12 +127,19 @@ impl Resolver {
                 FunctionArgument::Value { value_type, .. } => {
                     let mut target = value_type.clone();
                     if !matches!(self.0, Behavior::Echo) {
-                        target.data_type = match value_type.data_type {
-                            DataType::Int32 => DataType::Int64,
-                            DataType::Int64 if matches!(self.0, Behavior::Drift) => DataType::Int16,
-                            DataType::Int64 => DataType::Int64,
-                            _ => return Err(FunctionBindingError::NoMatchingOverload),
-                        };
+                        target = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                            match value_type.data_type() {
+                                DataType::Int32 => DataType::Int64,
+                                DataType::Int64 if matches!(self.0, Behavior::Drift) => {
+                                    DataType::Int16
+                                }
+                                DataType::Int64 => DataType::Int64,
+                                _ => return Err(FunctionBindingError::NoMatchingOverload),
+                            },
+                            target.nullable(),
+                            target.logical_type(),
+                        )
+                        .unwrap();
                     }
                     FunctionArgumentType::Value(target)
                 }
@@ -149,7 +156,7 @@ impl Resolver {
             // it without changing the stable identity or overload.
             let result = match &request.arguments[0] {
                 FunctionArgument::Value { value_type, .. }
-                    if value_type.data_type == DataType::Int32 =>
+                    if *value_type.data_type() == DataType::Int32 =>
                 {
                     FunctionValueType::new(DataType::Int32, true)
                 }
@@ -157,7 +164,9 @@ impl Resolver {
             };
             Ok(FunctionBindingSelection {
                 overload: FunctionOverloadId::try_new("test.scalar/rebind/0/v1").unwrap(),
-                argument_types: vec![argument].into_boxed_slice(),
+                argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    vec![argument].into_boxed_slice(),
+                ),
                 result_type: FunctionResultType::Scalar(result),
                 aggregate: None,
             })
@@ -395,7 +404,7 @@ enum Fault {
     Nullable,
     Logical,
     Zone,
-    Metadata,
+    NestedName,
     LambdaParameter,
     LambdaResult,
     Control(CompileControlError),
@@ -445,36 +454,38 @@ impl SqlFunctionCatalog for FaultCatalog {
         if at != self.at {
             return Ok(bound);
         }
+        let mut arguments = bound.selected.argument_types.to_vec();
         match self.fault {
-            Fault::Short => bound.selected.argument_types = Box::new([]),
-            Fault::Long => {
-                bound.selected.argument_types =
-                    vec![bound.selected.argument_types[0].clone(); 2].into_boxed_slice()
-            }
+            Fault::Short => arguments.clear(),
+            Fault::Long => arguments = vec![arguments[0].clone(); 2],
             Fault::Kind => bound.kind = FunctionKind::Window,
             Fault::Relation => {
                 bound.selected.result_type = FunctionResultType::Relation(
-                    vec![FunctionValueType::new(DataType::Int64, false)].into_boxed_slice(),
+                    novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        vec![FunctionValueType::new(DataType::Int64, false)].into_boxed_slice(),
+                    ),
                 )
             }
             Fault::Shape => {
-                bound.selected.argument_types[0] = FunctionArgumentType::Lambda {
-                    parameter_types: Box::new([]),
+                arguments[0] = FunctionArgumentType::Lambda {
+                    parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        Box::new([]),
+                    ),
                     result_type: FunctionValueType::new(DataType::Int64, false),
                 }
             }
             Fault::Type => {
-                bound.selected.argument_types[0] =
+                arguments[0] =
                     FunctionArgumentType::Value(FunctionValueType::new(DataType::Int16, false))
             }
             Fault::Nullable => {
-                let FunctionArgumentType::Value(ty) = &mut bound.selected.argument_types[0] else {
+                let FunctionArgumentType::Value(ty) = &mut arguments[0] else {
                     panic!("value");
                 };
-                ty.nullable = !ty.nullable;
+                *ty = ty.with_nullable(!ty.nullable()).unwrap();
             }
             Fault::Logical => {
-                bound.selected.argument_types[0] = FunctionArgumentType::Value(
+                arguments[0] = FunctionArgumentType::Value(
                     FunctionValueType::try_with_logical_type(
                         DataType::Utf8,
                         true,
@@ -484,39 +495,54 @@ impl SqlFunctionCatalog for FaultCatalog {
                 )
             }
             Fault::Zone => {
-                bound.selected.argument_types[0] =
-                    FunctionArgumentType::Value(FunctionValueType::new(
-                        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                        true,
-                    ))
+                arguments[0] = FunctionArgumentType::Value(FunctionValueType::new(
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    true,
+                ))
             }
-            Fault::Metadata => {
-                let FunctionArgumentType::Value(ty) = &mut bound.selected.argument_types[0] else {
+            Fault::NestedName => {
+                let FunctionArgumentType::Value(ty) = &mut arguments[0] else {
                     panic!("value");
                 };
-                let DataType::Struct(fields) = &ty.data_type else {
+                let DataType::Struct(fields) = &ty.data_type() else {
                     panic!("struct");
                 };
                 let mut field = fields[0].as_ref().clone();
-                field.set_metadata([(String::from("provider"), String::from("different"))].into());
-                ty.data_type = DataType::Struct(vec![Arc::new(field)].into());
+                field = Field::new(
+                    "different_actual",
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                )
+                .with_metadata(field.metadata().clone());
+                *ty = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                    DataType::Struct(vec![Arc::new(field)].into()),
+                    ty.nullable(),
+                    ty.logical_type(),
+                )
+                .unwrap();
             }
             Fault::LambdaParameter | Fault::LambdaResult => {
                 let FunctionArgumentType::Lambda {
                     parameter_types,
                     result_type,
-                } = &mut bound.selected.argument_types[0]
+                } = &mut arguments[0]
                 else {
                     panic!("lambda");
                 };
                 if matches!(self.fault, Fault::LambdaParameter) {
-                    parameter_types[0] = FunctionValueType::new(DataType::Int32, false);
+                    let mut parameters = parameter_types.to_vec();
+                    parameters[0] = FunctionValueType::new(DataType::Int32, false);
+                    *parameter_types = novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        parameters.into_boxed_slice(),
+                    );
                 } else {
                     *result_type = FunctionValueType::new(DataType::Int64, true);
                 }
             }
             Fault::Control(_) => unreachable!(),
         }
+        bound.selected.argument_types =
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(arguments.into_boxed_slice());
         Ok(bound)
     }
     fn contains_aggregate(&self, name: &str) -> bool {
@@ -594,7 +620,7 @@ fn scalar_rebind_full_value_and_callable_targets_match_actual_coerced_ast() {
             Fault::Zone,
             FunctionValueType::new(DataType::Timestamp(TimeUnit::Microsecond, None), true),
         ),
-        (Fault::Metadata, FunctionValueType::new(decorated, true)),
+        (Fault::NestedName, FunctionValueType::new(decorated, true)),
     ];
     for path in [Path::Ordinary, Path::Resolved] {
         for (fault, ty) in &cases {
@@ -622,8 +648,9 @@ fn scalar_rebind_full_value_and_callable_targets_match_actual_coerced_ast() {
         assert_eq!(
             binding.selected.argument_types[0],
             FunctionArgumentType::Lambda {
-                parameter_types: vec![FunctionValueType::new(DataType::Int64, false)]
-                    .into_boxed_slice(),
+                parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    vec![FunctionValueType::new(DataType::Int64, false)].into_boxed_slice()
+                ),
                 result_type: FunctionValueType::new(DataType::Int64, false),
             }
         );

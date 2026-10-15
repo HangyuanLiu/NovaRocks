@@ -45,8 +45,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::local::{runtime_filter_consumer_contract, runtime_filter_producer};
 use super::*;
-use crate::exec::chunk::{Chunk, ChunkSchema};
-use crate::exec::node::exchange_source::ExchangeSourceNode;
+#[cfg(test)]
+use crate::exec::chunk::Chunk;
 use crate::exec::operators::compiled_aggregate::CompiledAggregateProcessorFactory;
 use crate::exec::operators::compiled_change_events::CompiledChangeEventProcessorFactory;
 use crate::exec::operators::compiled_expression::{
@@ -60,10 +60,6 @@ use crate::exec::operators::compiled_table_function::CompiledTableFunctionProces
 use crate::exec::operators::compiled_unpivot::CompiledUnpivotProcessorFactory;
 use crate::exec::operators::compiled_window::CompiledWindowProcessorFactory;
 use crate::exec::operators::runtime_filter::CompiledRuntimeFilterConsumers;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
-use crate::runtime::preparation_metadata::{
-    CompiledMetadataMode, CompiledSchemaMetadataScope, DirectCompiledSchemaMetadataScope,
-};
 use crate::runtime::runtime_state::RuntimeErrorState;
 use novarocks_local_program::{
     AssertRowsMode, BindingRequirement, FilterConsumerActivation, FilterConsumerAtExpr,
@@ -332,6 +328,37 @@ fn compiled_runtime_filter_consumers(
     .map(|consumers| Some(Arc::new(consumers)))
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The test port preserves the production graph builder inputs"
+)]
+pub fn build_compiled_pipeline_graph_for_test(
+    program: &Arc<LocalProgram>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
+    dep_manager: DependencyManager,
+    pipeline_dop: i32,
+    root_sink_dop: Option<i32>,
+    function_set: Arc<SealedExecutionFunctionSet>,
+    error: Arc<RuntimeErrorState>,
+) -> Result<PipelineGraph, String> {
+    build_compiled_pipeline_graph(
+        program,
+        exchange_bindings,
+        scan_bindings,
+        writer_bindings,
+        runtime_filter_session,
+        dep_manager,
+        pipeline_dop,
+        root_sink_dop,
+        function_set,
+        error,
+    )
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "The compiled program and its Task capabilities are independent inputs"
@@ -348,112 +375,13 @@ pub(crate) fn build_compiled_pipeline_graph(
     function_set: Arc<SealedExecutionFunctionSet>,
     error: Arc<RuntimeErrorState>,
 ) -> Result<PipelineGraph, String> {
-    build_compiled_pipeline_graph_in(
-        program,
-        exchange_bindings,
-        scan_bindings,
-        writer_bindings,
-        runtime_filter_session,
-        dep_manager,
-        pipeline_dop,
-        root_sink_dop,
-        function_set,
-        error,
-        &mut CompiledMetadataMode::<DirectCompiledSchemaMetadataScope>::Direct,
-    )
-    .map_err(ExecutionFailure::into_pipeline_message)
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The compiled program and its Task capabilities are independent inputs"
-)]
-pub(crate) fn build_compiled_pipeline_graph_with_metadata_host<H: CompiledSchemaMetadataScope>(
-    program: &Arc<LocalProgram>,
-    exchange_bindings: ExchangeBindings,
-    scan_bindings: ScanBindings,
-    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
-    runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
-    dep_manager: DependencyManager,
-    pipeline_dop: i32,
-    root_sink_dop: Option<i32>,
-    function_set: Arc<SealedExecutionFunctionSet>,
-    error: Arc<RuntimeErrorState>,
-    host: &mut H,
-) -> ExecutionResult<PipelineGraph> {
-    build_compiled_pipeline_graph_in(
-        program,
-        exchange_bindings,
-        scan_bindings,
-        writer_bindings,
-        runtime_filter_session,
-        dep_manager,
-        pipeline_dop,
-        root_sink_dop,
-        function_set,
-        error,
-        &mut CompiledMetadataMode::Hosted(host),
-    )
-}
-
-/// Forward every original builder input without manufacturing source authority.
-#[cfg(feature = "test-support")]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The original builder inputs remain independent in the test bridge"
-)]
-pub fn build_compiled_pipeline_graph_with_metadata_host_for_test<H: CompiledSchemaMetadataScope>(
-    program: &Arc<LocalProgram>,
-    exchange_bindings: ExchangeBindings,
-    scan_bindings: ScanBindings,
-    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
-    runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
-    dep_manager: DependencyManager,
-    pipeline_dop: i32,
-    root_sink_dop: Option<i32>,
-    function_set: Arc<SealedExecutionFunctionSet>,
-    error: Arc<RuntimeErrorState>,
-    host: &mut H,
-) -> ExecutionResult<PipelineGraph> {
-    build_compiled_pipeline_graph_with_metadata_host(
-        program,
-        exchange_bindings,
-        scan_bindings,
-        writer_bindings,
-        runtime_filter_session,
-        dep_manager,
-        pipeline_dop,
-        root_sink_dop,
-        function_set,
-        error,
-        host,
-    )
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The compiled program and its Task capabilities are independent inputs"
-)]
-pub(crate) fn build_compiled_pipeline_graph_in<H: CompiledSchemaMetadataScope>(
-    program: &Arc<LocalProgram>,
-    exchange_bindings: ExchangeBindings,
-    scan_bindings: ScanBindings,
-    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
-    runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
-    dep_manager: DependencyManager,
-    pipeline_dop: i32,
-    root_sink_dop: Option<i32>,
-    function_set: Arc<SealedExecutionFunctionSet>,
-    error: Arc<RuntimeErrorState>,
-    metadata: &mut CompiledMetadataMode<'_, H>,
-) -> ExecutionResult<PipelineGraph> {
     let graph = program.graph();
     if graph
         .nodes()
         .iter()
         .any(|node| node.legacy_native_node_id().is_some())
     {
-        return Err("legacy-lowered nodes cannot enter the compiled pipeline".into());
+        return Err("legacy-lowered nodes cannot enter the compiled pipeline".to_string());
     }
     validate_compiled_exchange_bindings(program, &exchange_bindings)?;
     validate_compiled_scan_bindings(program, &scan_bindings)?;
@@ -476,7 +404,7 @@ pub(crate) fn build_compiled_pipeline_graph_in<H: CompiledSchemaMetadataScope>(
         local_exchange_max_buffered_rows: 0,
         precomputed_keyed_assert_keys: std::collections::HashMap::new(),
     };
-    let mut build = build_node(program, graph.root(), &mut ctx, &error, metadata)?;
+    let mut build = build_node(program, graph.root(), &mut ctx, &error)?;
     // Statistics owns its specific original bounded materializer. Other root
     // purposes validate the actual computing root output at one final boundary.
     if let Some(novarocks_local_program::StaticSinkProgram::RootResult(contract)) = graph.sink()
@@ -485,21 +413,10 @@ pub(crate) fn build_compiled_pipeline_graph_in<H: CompiledSchemaMetadataScope>(
                 novarocks_result_contract::InternalResultDomain::StatisticsArtifactV1,
             )
     {
-        let factory = match metadata {
-            CompiledMetadataMode::Direct => {
-                CompiledProjectProcessorFactory::try_new_final_result_boundary(
-                    Arc::clone(program),
-                    Arc::clone(&error),
-                )?
-            }
-            CompiledMetadataMode::Hosted(host) => {
-                CompiledProjectProcessorFactory::try_new_final_result_boundary_with_metadata_host(
-                    Arc::clone(program),
-                    Arc::clone(&error),
-                    *host,
-                )?
-            }
-        };
+        let factory = CompiledProjectProcessorFactory::try_new_final_result_boundary(
+            Arc::clone(program),
+            Arc::clone(&error),
+        )?;
         build.pipeline.factories.push(Box::new(factory));
     }
     match root_sink_dop {
@@ -507,7 +424,9 @@ pub(crate) fn build_compiled_pipeline_graph_in<H: CompiledSchemaMetadataScope>(
         // The frozen profile places the root sink on one driver.
         Some(1) => build = gather_to_one(build, &mut ctx, ROOT_SINK_LOCAL_EXCHANGE_NODE_ID),
         Some(other) => {
-            return Err(format!("compiled root sink width {other} is not executable yet").into());
+            return Err(format!(
+                "compiled root sink width {other} is not executable yet"
+            ));
         }
     }
     build.pipeline.needs_sink = true;
@@ -517,13 +436,12 @@ pub(crate) fn build_compiled_pipeline_graph_in<H: CompiledSchemaMetadataScope>(
     Ok(PipelineGraph { pipelines, root_id })
 }
 
-fn build_node<H: CompiledSchemaMetadataScope>(
+fn build_node(
     program: &Arc<LocalProgram>,
     id: ProgramNodeId,
     ctx: &mut PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
-    metadata: &mut CompiledMetadataMode<'_, H>,
-) -> ExecutionResult<PipelineBuildResult> {
+) -> Result<PipelineBuildResult, String> {
     let node = program
         .graph()
         .nodes()
@@ -531,21 +449,13 @@ fn build_node<H: CompiledSchemaMetadataScope>(
         .ok_or_else(|| format!("missing compiled program node {}", id.index()))?;
     let node_id = display_id(id)?;
     match node.kind() {
-        ProgramNodeKind::Values { values } => {
-            let source: Box<dyn OperatorFactory> = match values.batch() {
-                Some(batch) => {
-                    let chunk_schema = ChunkSchema::from_compiled_layout(values.layout())?;
-                    let chunk = Chunk::new_with_chunk_schema(batch.clone(), chunk_schema);
-                    Box::new(ValuesSourceFactory::new(chunk, node_id))
-                }
-                // Dynamic cells are evaluated once, at the source's opening
-                // turn, by the one compiled evaluator.
-                None => Box::new(values_source::CompiledValuesSourceFactory::try_new(
+        ProgramNodeKind::Values { .. } => {
+            let source: Box<dyn OperatorFactory> =
+                Box::new(values_source::CompiledValuesSourceFactory::try_new(
                     Arc::clone(program),
                     id,
                     Arc::clone(error),
-                )?),
-            };
+                )?);
             let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
             Ok(PipelineBuildResult {
                 pipeline,
@@ -554,7 +464,7 @@ fn build_node<H: CompiledSchemaMetadataScope>(
             })
         }
         ProgramNodeKind::GenerateSeries { input, .. } => {
-            let mut build = build_node(program, *input, ctx, error, metadata)?;
+            let mut build = build_node(program, *input, ctx, error)?;
             build.pipeline.factories.push(Box::new(
                 CompiledGenerateSeriesProcessorFactory::try_new(
                     Arc::clone(program),
@@ -565,16 +475,19 @@ fn build_node<H: CompiledSchemaMetadataScope>(
             Ok(build)
         }
         ProgramNodeKind::Project { input, .. } => {
-            let mut build = build_node(program, *input, ctx, error, metadata)?;
-            let factory = match metadata {
-                CompiledMetadataMode::Direct => CompiledProjectProcessorFactory::try_new(Arc::clone(program), id, Arc::clone(error))?,
-                CompiledMetadataMode::Hosted(host) => CompiledProjectProcessorFactory::try_new_with_metadata_host(Arc::clone(program), id, Arc::clone(error), *host)?,
-            };
-            build.pipeline.factories.push(Box::new(factory));
+            let mut build = build_node(program, *input, ctx, error)?;
+            build
+                .pipeline
+                .factories
+                .push(Box::new(CompiledProjectProcessorFactory::try_new(
+                    Arc::clone(program),
+                    id,
+                    Arc::clone(error),
+                )?));
             Ok(build)
         }
         ProgramNodeKind::Filter { input, .. } => {
-            let mut build = build_node(program, *input, ctx, error, metadata)?;
+            let mut build = build_node(program, *input, ctx, error)?;
             build
                 .pipeline
                 .factories
@@ -598,7 +511,7 @@ fn build_node<H: CompiledSchemaMetadataScope>(
                 return Err(format!(
                     "scan at local node {} carries no compiled provider read",
                     id.index()
-                ).into());
+                ));
             }
             // Consumers are built first, so a refused binding builds no driver.
             let runtime_filters = compiled_runtime_filter_consumers(
@@ -614,7 +527,7 @@ fn build_node<H: CompiledSchemaMetadataScope>(
                 return Err(format!(
                     "compiled scan at local node {} with a scan limit is not executable yet",
                     id.index()
-                ).into());
+                ));
             }
             let scan_node = scan_node_id(program, id)?;
             let op = ctx.scan_bindings.get(scan_node).ok_or_else(|| {
@@ -669,25 +582,21 @@ fn build_node<H: CompiledSchemaMetadataScope>(
                 return Err(format!(
                     "compiled exchange source at local node {} with runtime-filter consumers is not executable yet",
                     id.index()
-                ).into());
+                ));
             }
             if !hash_partition_exprs.is_empty() {
                 return Err(format!(
                     "compiled exchange source at local node {} with hash-key expressions is not executable yet",
                     id.index()
-                ).into());
+                ));
             }
             let receiver = receiver_node_id(program, id)?;
             let binding = ctx.exchange_bindings.get(receiver).ok_or_else(|| {
                 format!("missing exchange binding for compiled receiver node {receiver}")
             })?;
-            let exchange = ExchangeSourceNode::new(
-                node_id,
-                *timeout,
-                ChunkSchema::from_compiled_layout(node.output_layout())?,
-            );
-            let source: Box<dyn OperatorFactory> =
-                Box::new(ExchangeSourceFactory::new_compiled(exchange, binding)?);
+            let source: Box<dyn OperatorFactory> = Box::new(ExchangeSourceFactory::new_compiled(
+                node_id, *timeout, binding,
+            ));
             // Every driver pulls from the one instance-wide receiver.
             let pipeline = new_source_pipeline(ctx, source);
             Ok(PipelineBuildResult {
@@ -701,7 +610,7 @@ fn build_node<H: CompiledSchemaMetadataScope>(
             limit,
             offset,
         } => {
-            let build = build_node(program, *input, ctx, error, metadata)?;
+            let build = build_node(program, *input, ctx, error)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build
                 .pipeline
@@ -727,20 +636,22 @@ fn build_node<H: CompiledSchemaMetadataScope>(
             // re-pruning them locally would evaluate a key twice.
             let factory =
                 CompiledSortProcessorFactory::try_new(Arc::clone(program), id, Arc::clone(error))?;
-            let build = build_node(program, *input, ctx, error, metadata)?;
+            let build = build_node(program, *input, ctx, error)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::single();
             Ok(build)
         }
         ProgramNodeKind::UnionAll { inputs } => {
-            build_union_all(program, id, node_id, inputs, ctx, error, metadata)
+            build_union_all(program, id, node_id, inputs, ctx, error)
         }
         ProgramNodeKind::GroupedTopN { input, .. } => {
             let factory = CompiledGroupedTopNProcessorFactory::try_new(
-                Arc::clone(program), id, Arc::clone(error),
+                Arc::clone(program),
+                id,
+                Arc::clone(error),
             )?;
-            let build = build_node(program, *input, ctx, error, metadata)?;
+            let build = build_node(program, *input, ctx, error)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::single();
@@ -756,7 +667,7 @@ fn build_node<H: CompiledSchemaMetadataScope>(
                 Arc::clone(error),
             )?;
             let complete = factory.completes_groups();
-            let mut build = build_node(program, *input, ctx, error, metadata)?;
+            let mut build = build_node(program, *input, ctx, error)?;
             if factory.requires_local_update_stages() && build.pipeline.dop > 1 {
                 let partition_slots = factory.local_group_partition_slots();
                 let (partial, final_stage) = factory.into_local_update_stages()?;
@@ -787,15 +698,12 @@ fn build_node<H: CompiledSchemaMetadataScope>(
         ProgramNodeKind::Analytic { input, .. } => {
             // M1 evaluates every partition on one driver: the instance input
             // is gathered, in the order its sorted source emits it.
-            let factory = match metadata {
-                CompiledMetadataMode::Direct => CompiledWindowProcessorFactory::try_new(
-                    Arc::clone(program), id, Arc::clone(error),
-                )?,
-                CompiledMetadataMode::Hosted(host) => CompiledWindowProcessorFactory::try_new_with_metadata_host(
-                    Arc::clone(program), id, Arc::clone(error), *host,
-                )?,
-            };
-            let build = build_node(program, *input, ctx, error, metadata)?;
+            let factory = CompiledWindowProcessorFactory::try_new(
+                Arc::clone(program),
+                id,
+                Arc::clone(error),
+            )?;
+            let build = build_node(program, *input, ctx, error)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::single();
@@ -807,7 +715,7 @@ fn build_node<H: CompiledSchemaMetadataScope>(
             // at most one row per key, so the assertion runs on one driver.
             // The keyed mode keeps the existing owner's key identity: a NULL
             // key equals a NULL key, and values compare by type and display.
-            let build = build_node(program, *input, ctx, error, metadata)?;
+            let build = build_node(program, *input, ctx, error)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::single();
@@ -815,7 +723,7 @@ fn build_node<H: CompiledSchemaMetadataScope>(
         }
         ProgramNodeKind::Repeat { input, .. } => {
             let factory = CompiledRepeatProcessorFactory::try_new(program, id)?;
-            let mut build = build_node(program, *input, ctx, error, metadata)?;
+            let mut build = build_node(program, *input, ctx, error)?;
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
@@ -829,7 +737,7 @@ fn build_node<H: CompiledSchemaMetadataScope>(
             max_output_rows,
             max_output_bytes,
         } => {
-            let mut build = build_node(program, *input, ctx, error, metadata)?;
+            let mut build = build_node(program, *input, ctx, error)?;
             let statistics_root = id == program.graph().root()
                 && matches!(program.graph().sink(),
                 Some(novarocks_local_program::StaticSinkProgram::RootResult(contract))
@@ -879,9 +787,7 @@ fn build_node<H: CompiledSchemaMetadataScope>(
                         program.graph().nodes()[input.index()]
                             .output_layout()
                             .slots(),
-                        crate::exec::chunk::ChunkSchema::from_compiled_layout(
-                            node.output_layout(),
-                        )?,
+                        node.output_layout().clone(),
                         passthrough_columns.len(),
                         *max_output_rows,
                         *max_output_bytes,
@@ -906,7 +812,7 @@ fn build_node<H: CompiledSchemaMetadataScope>(
                 id,
                 Arc::clone(error),
             )?;
-            let mut build = build_node(program, *input, ctx, error, metadata)?;
+            let mut build = build_node(program, *input, ctx, error)?;
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
@@ -920,31 +826,31 @@ fn build_node<H: CompiledSchemaMetadataScope>(
                 id,
                 Arc::clone(error),
             )?;
-            let mut build = build_node(program, *input, ctx, error, metadata)?;
+            let mut build = build_node(program, *input, ctx, error)?;
             build.pipeline.factories.push(Box::new(factory));
             Ok(build)
         }
         ProgramNodeKind::TableWriter { input, .. } => {
-            writer_pipelines::build_table_writer(program, id, node_id, *input, ctx, error, metadata)
+            writer_pipelines::build_table_writer(program, id, node_id, *input, ctx, error)
         }
         ProgramNodeKind::TableFinish { inputs, .. } => {
-            writer_pipelines::build_table_finish(program, id, node_id, inputs, ctx, error, metadata)
+            writer_pipelines::build_table_finish(program, id, node_id, inputs, ctx, error)
         }
         // The probe is the left input and the build the right input.
         ProgramNodeKind::Join { left, right, .. } => {
-            join_pipelines::build_hash_join(program, id, node_id, *left, *right, ctx, error, metadata)
+            join_pipelines::build_hash_join(program, id, node_id, *left, *right, ctx, error)
         }
         ProgramNodeKind::NestedLoopJoin { left, right, .. } => {
-            join_pipelines::build_nested_loop_join(program, id, node_id, *left, *right, ctx, error, metadata)
+            join_pipelines::build_nested_loop_join(program, id, node_id, *left, *right, ctx, error)
         }
         ProgramNodeKind::RuntimeFilterConsumer { .. } => Err(format!(
             "compiled join probe-key runtime-filter consumer at local node {} is not executable yet",
             id.index()
-        ).into()),
+        )),
         _ => Err(format!(
             "compiled node family at local node {} has no compiled processor yet",
             id.index()
-        ).into()),
+        )),
     }
 }
 
@@ -953,20 +859,19 @@ fn build_node<H: CompiledSchemaMetadataScope>(
 /// output layout, so each branch owns the union's channels in their frozen
 /// order and its chunks pass through unchanged. The branches fan in through
 /// the shared UnionAll queue, which carries no expression and no ordering.
-fn build_union_all<H: CompiledSchemaMetadataScope>(
+fn build_union_all(
     program: &Arc<LocalProgram>,
     id: ProgramNodeId,
     node_id: i32,
     inputs: &[ProgramNodeId],
     ctx: &mut PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
-    metadata: &mut CompiledMetadataMode<'_, H>,
-) -> ExecutionResult<PipelineBuildResult> {
+) -> Result<PipelineBuildResult, String> {
     validate_union_branches(program, id, inputs)?;
     let mut builds = Vec::with_capacity(inputs.len());
     let mut producers = 0usize;
     for input in inputs {
-        let child = build_node(program, *input, ctx, error, metadata)?;
+        let child = build_node(program, *input, ctx, error)?;
         producers =
             producers.saturating_add(usize::try_from(child.pipeline.dop.max(1)).unwrap_or(1));
         builds.push(child);
@@ -1074,6 +979,10 @@ mod writer_pipelines;
 #[cfg(test)]
 #[path = "compiled_writer_tests.rs"]
 mod writer_tests;
+#[cfg(test)]
+pub(crate) use writer_tests::{
+    compiled_statistics_finish_fixture, compiled_statistics_writer_fixture,
+};
 
 #[path = "compiled_join.rs"]
 mod join_pipelines;
@@ -1092,7 +1001,7 @@ mod scan_tests;
 
 #[cfg(test)]
 #[path = "compiled_family_fixture.rs"]
-mod family_fixture;
+pub(super) mod family_fixture;
 
 #[cfg(test)]
 #[path = "compiled_sort_tests.rs"]
@@ -1108,7 +1017,7 @@ mod assert_tests;
 
 #[cfg(test)]
 #[path = "compiled_expand_tests.rs"]
-mod expand_tests;
+pub(super) mod expand_tests;
 
 #[cfg(test)]
 #[path = "compiled_topn_split_tests.rs"]

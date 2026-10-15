@@ -58,6 +58,14 @@ EXTRA_EXTERNAL_NAMES = frozenset(['aho-corasick', 'allocator-api2', 'arrow-arith
 EXTRA_BUILD_TARGETS = frozenset(['chrono-tz', 'generic-array', 'getrandom', 'icu_normalizer_data', 'icu_properties_data', 'openssl', 'openssl-sys', 'serde', 'serde_core', 'serde_json', 'zmij'])
 EXTRA_PROC_MACROS = frozenset(['displaydoc', 'openssl-macros', 'serde_derive', 'yoke-derive', 'zerofrom-derive', 'zerovec-derive'])
 
+# Carrier-neutral Arrow row/IPC construction geometry is shared by function
+# owners. It installs no Native transport or task runtime. FlatBuffers' audited
+# registry build script only selects its compiler-channel cfg via rustc_version.
+EXTRA_EXTERNAL_NAMES |= frozenset({
+    "arrow-row", "arrow-ipc", "flatbuffers", "rustc_version", "semver",
+})
+EXTRA_BUILD_TARGETS |= frozenset({"flatbuffers"})
+
 
 # These categories name capabilities, not every package currently in the tree.
 FORBIDDEN_EXACT = frozenset({
@@ -125,6 +133,7 @@ def verify_package(package, workspace_ids):
         build_edges["openssl"] = frozenset({"cc"})
         build_edges["openssl-sys"] = frozenset({"cc", "pkg-config", "vcpkg", "bindgen", "openssl-src"})
         build_edges["chrono-tz"] = frozenset({"chrono-tz-build"})
+        build_edges["flatbuffers"] = frozenset({"rustc_version"})
         violations.extend(support.verify_external_authority(
             package, support.EXTERNAL_PACKAGE_NAMES | EXTRA_EXTERNAL_NAMES,
             support.EXTERNAL_BUILD_TARGETS | EXTRA_BUILD_TARGETS,

@@ -42,7 +42,7 @@ fn read<'a>(
     value: &'a ConstantValue,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Option<&'a str>, ConstantError> {
-    let physical = value.value_type().logical_type == ValueLogicalType::Physical;
+    let physical = value.value_type().logical_type() == ValueLogicalType::Physical;
     work.step()?;
     if !physical {
         return Err(ConstantError::Invalid(
@@ -50,7 +50,7 @@ fn read<'a>(
         ));
     }
     let utf8 = matches!(
-        value.value_type().data_type,
+        value.value_type().data_type(),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
     );
     work.step()?;

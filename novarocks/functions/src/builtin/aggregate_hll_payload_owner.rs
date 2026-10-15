@@ -188,6 +188,10 @@ impl AggregateSignatureResolver for PayloadOwner {
     }
 }
 impl PureFunctionMetadataOwner for PayloadOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::borrowed_aggregate(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -212,6 +216,56 @@ impl FunctionEffectOwner for PayloadOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
+        self.refine_core(input, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_core(input, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
+    }
+}
+impl PureAggregateImplementation for PayloadOwner {
+    type Kernel = PayloadKernel;
+    fn prepare_aggregate(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<PayloadKernel>, KernelFailure> {
+        self.prepare_core(input, contract, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn prepare_aggregate_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<Self::Kernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_core(input, contract, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
+    }
+}
+
+impl PayloadOwner {
+    fn refine_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(FunctionEffectOwnerError::Control)?;
         let result = (|| {
@@ -232,13 +286,10 @@ impl FunctionEffectOwner for PayloadOwner {
                 .into());
             }
             work.flush().map_err(FunctionEffectOwnerError::Control)?;
-            self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => {
-                        FunctionEffectOwnerError::Control(error)
-                    }
-                    other => FunctionEffectOwnerError::Owner(other),
-                })?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+                other => FunctionEffectOwnerError::Owner(other),
+            })?;
             Ok(self.call_effects(input.proof_scope))
         })();
         if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
@@ -247,14 +298,12 @@ impl FunctionEffectOwner for PayloadOwner {
         work.finish().map_err(FunctionEffectOwnerError::Control)?;
         result
     }
-}
-impl PureAggregateImplementation for PayloadOwner {
-    type Kernel = PayloadKernel;
-    fn prepare_aggregate(
+    fn prepare_core(
         &self,
         input: CallEffectInput<'_>,
         contract: Arc<AggregateCallContract>,
         control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
     ) -> Result<Arc<PayloadKernel>, KernelFailure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(compile_failure)?;
@@ -284,11 +333,10 @@ impl PureAggregateImplementation for PayloadOwner {
                 ));
             }
             work.flush().map_err(compile_failure)?;
-            self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => compile_failure(error),
-                    _ => invalid("HLL payload aggregate preparation has a stale selected binding"),
-                })?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => compile_failure(error),
+                _ => invalid("HLL payload aggregate preparation has a stale selected binding"),
+            })?;
             for (actual, selected) in input
                 .request
                 .arguments

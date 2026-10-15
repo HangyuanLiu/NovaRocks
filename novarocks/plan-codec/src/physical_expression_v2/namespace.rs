@@ -1055,7 +1055,7 @@ fn prepare_core<'loan, 'source, 'control>(
                 admission.charge(&mut facts, verified.work_upper_bound(), work)?;
                 work.flush()?;
                 let matched =
-                    arrow_data_types_exact_borrowed_observed(&node.ty.data_type, target, || {
+                    arrow_data_types_exact_borrowed_observed(&node.ty.data_type(), target, || {
                         work.step()
                             .map_err(crate::physical_type_v2::TypeCodecError::from)
                     });
@@ -1379,6 +1379,12 @@ fn initial_source_floor(
         source_floor,
         bytes::<novarocks_proto_models::physical_type_v2::FieldDefinition>(
             table.fields.capacity(),
+        )?,
+    )?;
+    source_floor = add(
+        source_floor,
+        bytes::<novarocks_proto_models::value_type::LogicalTypeDefinition>(
+            table.logical_types.capacity(),
         )?,
     )?;
     Ok(source_floor)

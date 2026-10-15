@@ -27,7 +27,7 @@ fn unary(
     let (calls, types) = assembled(
         vec![
             node,
-            StaticExprNode::new(kind, output.data_type.clone(), None),
+            StaticExprNode::new(kind, output.data_type().clone(), None),
         ],
         vec![ty, FunctionArgumentType::Value(output.clone())],
         ProgramExprId::new(1),
@@ -162,7 +162,10 @@ fn public_null_predicate_rejects_callable_operand_without_erasing_its_value_resu
             vec![
                 body_type,
                 FunctionArgumentType::Lambda {
-                    parameter_types: Box::default(),
+                    parameter_types:
+                        novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                            Box::default(),
+                        ),
                     result_type: output.clone(),
                 },
                 FunctionArgumentType::Value(output.clone()),

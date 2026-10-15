@@ -22,6 +22,7 @@
 //! statistics application crate owns current-process job state and worker
 //! composition.
 
+use crate::connector::schema_creation::FrontendSchemaLoad;
 use std::fmt;
 use std::sync::Arc;
 
@@ -180,7 +181,7 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
             namespace: target.namespace.clone(),
             table: target.table.clone(),
             object_id: captured.object_id.as_bytes().to_vec(),
-            sql_columns: sql_visible_column_names(&captured.metadata.schema),
+            sql_columns: sql_visible_column_names(&captured.metadata.schema()),
         })
     }
 }
@@ -219,10 +220,11 @@ pub(crate) fn rebind_table_object(
             "connector metadata did not provide a statistics data-version for rebound table",
         )
     })?;
+    let sql_columns = sql_visible_columns(metadata.schema());
     Ok(StatisticsAttemptBinding {
         table: metadata.table,
         data_version,
-        sql_columns: sql_visible_columns(&metadata.schema),
+        sql_columns,
     })
 }
 
@@ -231,7 +233,7 @@ pub(crate) fn rebind_table_object(
 /// A caller that only validates names takes them off the field. A caller that
 /// builds a statistics metric request needs the type: which metrics a column
 /// can answer depends on it.
-fn sql_visible_columns(schema: &arrow::datatypes::SchemaRef) -> Vec<arrow::datatypes::FieldRef> {
+fn sql_visible_columns(schema: &arrow::datatypes::Schema) -> Vec<arrow::datatypes::FieldRef> {
     schema
         .fields()
         .iter()
@@ -245,7 +247,7 @@ fn sql_visible_columns(schema: &arrow::datatypes::SchemaRef) -> Vec<arrow::datat
         .collect()
 }
 
-fn sql_visible_column_names(schema: &arrow::datatypes::SchemaRef) -> Vec<String> {
+fn sql_visible_column_names(schema: &arrow::datatypes::Schema) -> Vec<String> {
     sql_visible_columns(schema)
         .iter()
         .map(|field| field.name().clone())
@@ -282,7 +284,7 @@ impl StatisticsTableReader for ConnectorStatisticsTableReader {
                 "connector metadata did not provide a statistics data-version pin",
             )
         })?;
-        let sql_columns = sql_visible_columns(&metadata.schema);
+        let sql_columns = sql_visible_columns(&metadata.schema());
         let requested_column_metric_count = sql_columns.len().saturating_mul(5);
         if requested_column_metric_count > MAX_CONNECTOR_STATISTICS_METRICS {
             return Err(StatisticsApplicationError::new(format!(
@@ -353,7 +355,7 @@ fn load_statistics_table_metadata(
     binding
         .binding()
         .metadata()
-        .load_table(ConnectorTableRequest {
+        .load_frontend_table(ConnectorTableRequest {
             table: ConnectorTableIdentity {
                 instance_id,
                 namespace: Arc::from(namespace),

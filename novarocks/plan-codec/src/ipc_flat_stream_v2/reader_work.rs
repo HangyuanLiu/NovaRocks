@@ -60,10 +60,10 @@ fn source_work(
 
 /// Allocation-free lower component of the full source work bound, checked
 /// before the original constant owner starts either metadata iteration.
-pub(super) fn source_metadata_work(
+pub(super) fn source_metadata_work<W: ResourceWork>(
     source_retained_bytes: usize,
-    work: &mut impl ResourceWork,
-) -> Result<usize, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<usize, W::Error> {
     let result = source_work(source_retained_bytes, 0, 0);
     if work.parent() {
         let upper = work.numeric(result)?;
@@ -72,18 +72,18 @@ pub(super) fn source_metadata_work(
         Ok(upper)
     } else {
         work.step()?;
-        result
+        Ok(result?)
     }
 }
 
-pub(super) fn preflight(
+pub(super) fn preflight<W: ResourceWork>(
     stream: &FlatConstantStream<'_, '_>,
     source_retained_bytes: usize,
     pool: &FlatPoolResourceProjection,
     structures: &ReaderAllocationRequests,
     diagnostics: &ReaderDiagnosticRequests,
-    work: &mut impl ResourceWork,
-) -> Result<usize, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<usize, W::Error> {
     let mut known = 0;
     let geometry = stream.geometry();
     let n = geometry.rows;

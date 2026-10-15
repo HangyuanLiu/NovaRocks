@@ -495,36 +495,55 @@ impl ConnectorReadChangeWindow {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ConnectorReadFrozenRewriteGroup {
-    artifact_location: Arc<str>,
+    operation_id: crate::connector::ConnectorWriteOperationId,
     artifact_digest_hex: Arc<str>,
     group_digest_hex: Arc<str>,
+    content: crate::connector::ConnectorProcessLocalPayload,
 }
-
+impl PartialEq for ConnectorReadFrozenRewriteGroup {
+    fn eq(&self, other: &Self) -> bool {
+        self.operation_id == other.operation_id
+            && self.artifact_digest_hex == other.artifact_digest_hex
+            && self.group_digest_hex == other.group_digest_hex
+    }
+}
+impl Eq for ConnectorReadFrozenRewriteGroup {}
 impl ConnectorReadFrozenRewriteGroup {
-    pub fn new(
-        artifact_location: impl AsRef<str>,
-        artifact_digest_hex: impl AsRef<str>,
-        group_digest_hex: impl AsRef<str>,
+    pub fn from_cohort(
+        group: &crate::connector::ConnectorFrozenRewriteGroup,
+        group_digest: [u8; 32],
     ) -> Self {
         Self {
-            artifact_location: Arc::from(artifact_location.as_ref()),
-            artifact_digest_hex: Arc::from(artifact_digest_hex.as_ref()),
-            group_digest_hex: Arc::from(group_digest_hex.as_ref()),
+            operation_id: group.operation_id(),
+            artifact_digest_hex: Arc::from(
+                group
+                    .artifact_digest()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            ),
+            group_digest_hex: Arc::from(
+                group_digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            ),
+            content: group.content().clone(),
         }
     }
-
-    pub fn artifact_location(&self) -> &str {
-        &self.artifact_location
+    pub const fn operation_id(&self) -> crate::connector::ConnectorWriteOperationId {
+        self.operation_id
     }
-
     pub fn artifact_digest_hex(&self) -> &str {
         &self.artifact_digest_hex
     }
-
     pub fn group_digest_hex(&self) -> &str {
         &self.group_digest_hex
+    }
+    pub fn content(&self) -> &crate::connector::ConnectorProcessLocalPayload {
+        &self.content
     }
 }
 
@@ -630,11 +649,16 @@ pub trait ConnectorReadMetadata: Send + Sync {
         _session: &ConnectorSession,
         _table: &ConnectorReadTableHandle,
         _columns: &[ConnectorReadColumnHandle],
-    ) -> Result<super::ConnectorReadPublicSchema, ConnectorError> {
+        _creation: &mut super::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        super::ConnectorReadPublicSchema,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         Err(ConnectorError::new(
             crate::connector::ConnectorErrorKind::Unsupported,
             "connector read generation does not publish a public read schema",
-        ))
+        )
+        .into())
     }
 
     /// Offer a provider an ordered list of pushdowns and learn what it takes on.

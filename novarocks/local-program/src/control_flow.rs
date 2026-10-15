@@ -53,6 +53,45 @@ impl ProgramControlFlow {
         )
         .map(Self)
     }
+    /// Same shared control author with independent actual validation scratch
+    /// and immutable graph backing lifetimes.
+    pub fn try_new_with_creator_in<H>(
+        domains: Vec<ProgramEvaluationDomain>,
+        uses: Vec<ProgramExpressionUse>,
+        definition_count: usize,
+        temporary: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        retained: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, crate::ProgramCreationFailure<ProgramControlFlowError, H>> {
+        use crate::ProgramCreationFailure as Failure;
+        use novarocks_type_contract::{
+            CompileCheckpoints, ExpressionControlCreationFailure as Shared,
+        };
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        let result = novarocks_type_contract::ExpressionControlFlow::try_new_with_creator_in(
+            domains,
+            uses,
+            &DenseDefinitions(definition_count),
+            temporary,
+            retained,
+            &mut work,
+        )
+        .map(Self)
+        .map_err(|e| match e {
+            Shared::Control(e) => Failure::Control(e),
+            Shared::Creator(e) => Failure::Creator(e),
+            Shared::Resource(e) => Failure::Resource(e),
+            Shared::Owner(e) => Failure::Owner(e),
+        });
+        if matches!(
+            &result,
+            Err(Failure::Control(_) | Failure::Creator(_) | Failure::Resource(_))
+        ) {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
     /// Borrow the original checked neutral author for scoped effect composition.
     /// No second flow or evaluation-use identities are reconstructed here.
     pub const fn shared_flow(
@@ -354,5 +393,117 @@ mod tests {
             uses.push(owner);
             ProgramControlFlow::try_new(domains, uses, 1, &Control(false)).unwrap();
         }
+    }
+    #[test]
+    fn actual_control_flow_creator_refusal_keeps_original_cause_without_tail() {
+        use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
+        use std::{
+            alloc::Layout,
+            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        struct FirstControl {
+            refused: AtomicBool,
+            tail: AtomicUsize,
+        }
+        impl PureCompileControl for FirstControl {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                if self.refused.load(Ordering::SeqCst) {
+                    self.tail.fetch_add(1, Ordering::SeqCst);
+                    Err(CompileControlError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let control = FirstControl {
+            refused: AtomicBool::new(false),
+            tail: AtomicUsize::new(0),
+        };
+        let mut temporary_layout = |_: Layout| Ok::<(), u32>(());
+        let mut temporary_opaque = |_: usize| Ok::<(), u32>(());
+        let mut temporary = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut temporary_layout,
+            &mut temporary_opaque,
+        );
+        let mut retained_layout = |_: Layout| {
+            control.refused.store(true, Ordering::SeqCst);
+            Err(73u32)
+        };
+        let mut retained_opaque = |_: usize| {
+            control.refused.store(true, Ordering::SeqCst);
+            Err(73u32)
+        };
+        let mut retained = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut retained_layout,
+            &mut retained_opaque,
+        );
+        assert!(matches!(
+            ProgramControlFlow::try_new_with_creator_in(
+                vec![root()],
+                vec![value(0, root().id)],
+                1,
+                &mut temporary,
+                &mut retained,
+                &control
+            ),
+            Err(crate::ProgramCreationFailure::Creator(73))
+        ));
+        assert_eq!(control.tail.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn control_flow_clone_retains_entity_without_validation_temporary_scope() {
+        use novarocks_type_contract::{
+            ValueSchemaCreation, ValueTypeStorageHold, ValueTypeStorageLifetime,
+        };
+        use std::{
+            alloc::Layout,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+        };
+        struct Hold(Arc<AtomicUsize>);
+        impl ValueTypeStorageHold for Hold {}
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let temporary_drops = Arc::new(AtomicUsize::new(0));
+        let entity_drops = Arc::new(AtomicUsize::new(0));
+        let mut t_layout = |_: Layout| Ok::<(), std::convert::Infallible>(());
+        let mut t_opaque = |_: usize| Ok::<(), std::convert::Infallible>(());
+        let mut r_layout = |_: Layout| Ok::<(), std::convert::Infallible>(());
+        let mut r_opaque = |_: usize| Ok::<(), std::convert::Infallible>(());
+        let mut temporary = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::held(Arc::new(Hold(temporary_drops.clone()))),
+            &mut t_layout,
+            &mut t_opaque,
+        );
+        let mut retained = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::held(Arc::new(Hold(entity_drops.clone()))),
+            &mut r_layout,
+            &mut r_opaque,
+        );
+        let flow = ProgramControlFlow::try_new_with_creator_in(
+            vec![root()],
+            vec![value(0, root().id)],
+            1,
+            &mut temporary,
+            &mut retained,
+            &Control(false),
+        )
+        .unwrap();
+        let last = flow.clone();
+        drop(flow);
+        drop(temporary);
+        drop(retained);
+        assert_eq!(temporary_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(entity_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(last.uses().len(), 1);
+        drop(last);
+        assert_eq!(entity_drops.load(Ordering::SeqCst), 1);
     }
 }

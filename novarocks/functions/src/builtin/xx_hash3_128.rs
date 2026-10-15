@@ -125,9 +125,9 @@ pub(super) fn validate_profile(
     let arguments = &contract.selected().argument_types;
     let target = contract.result_type();
     if arguments.is_empty()
-        || target.data_type != DataType::FixedSizeBinary(16)
-        || target.logical_type != ValueLogicalType::LargeInt
-        || !target.nullable
+        || target.data_type() != &DataType::FixedSizeBinary(16)
+        || target.logical_type() != ValueLogicalType::LargeInt
+        || !target.nullable()
     {
         return Err(invalid(
             "xx_hash3_128 requires nonempty arguments and its exact nullable LARGEINT result",
@@ -139,7 +139,7 @@ pub(super) fn validate_profile(
             return Err(invalid("xx_hash3_128 requires byte value arguments"));
         };
         if !matches!(
-            source.data_type,
+            source.data_type(),
             DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary
         ) {
             return Err(invalid(
@@ -207,7 +207,7 @@ pub(super) fn evaluate<'a>(
         )?;
         SelectedValues::try_new_observed(
             selection,
-            &input.contract().result_type().data_type,
+            input.contract().result_type().data_type(),
             out,
             Box::default(),
             || work.step(),

@@ -95,12 +95,19 @@ pub(crate) fn author_physical_argument_observed(
             .try_reserve_exact(parameter_types.len())
             .map_err(|_| CompileControlError::ResourceExhausted)?;
         for parameter in parameter_types {
-            parameters.push(parameter.clone());
-            work.step()?;
+            parameters.push(parameter.clone_observed(|| work.step())?);
         }
+        work.flush()?;
+        let parameters = parameters.into_boxed_slice();
+        work.step()?;
+        work.flush()?;
+        let parameter_types =
+            novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(parameters);
+        work.step()?;
+        work.flush()?;
         let argument = FunctionArgument::Lambda {
-            parameter_types: parameters.into_boxed_slice(),
-            result_type: source.ty.clone(),
+            parameter_types,
+            result_type: source.ty.clone_observed(|| work.step())?,
         };
         work.flush()?;
         return Ok(argument);

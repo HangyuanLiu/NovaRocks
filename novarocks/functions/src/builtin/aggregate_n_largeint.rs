@@ -656,11 +656,11 @@ pub(super) fn validate_contract(
         || contract
             .state_interpretation()
             .is_some_and(|state| state.distinct || !state.order_keys.is_empty())
-        || value.logical_type != ValueLogicalType::LargeInt
-        || value.data_type != DataType::FixedSizeBinary(16)
-        || limit.logical_type != ValueLogicalType::Physical
+        || value.logical_type() != ValueLogicalType::LargeInt
+        || value.data_type() != &DataType::FixedSizeBinary(16)
+        || limit.logical_type() != ValueLogicalType::Physical
         || !matches!(
-            limit.data_type,
+            limit.data_type(),
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
         )
     {
@@ -684,16 +684,28 @@ pub(super) fn validate_contract(
         ));
     }
     work.step().map_err(compile_failure)?;
-    let expected = FunctionValueType::new(
-        DataType::List(Arc::new(super::signature::value_field("item", value, true))),
-        true,
-    );
-    if !expected.exactly_equals_observed::<KernelFailure>(contract.final_type(), || {
-        work.step().map_err(compile_failure)
-    })? || !FunctionValueType::new(DataType::Binary, true)
-        .exactly_equals_observed::<KernelFailure>(contract.intermediate_type(), || {
-            work.step().map_err(compile_failure)
-        })?
+    let output = contract.final_type();
+    let DataType::List(item) = output.data_type() else {
+        return Err(invalid(
+            "min_n/max_n LARGEINT result or state differs from its exact declaration",
+        ));
+    };
+    let child = output.value_type().child_type_at(0).ok_or_else(|| {
+        invalid("min_n/max_n LARGEINT result or state differs from its exact declaration")
+    })?;
+    if !output.nullable()
+        || !child.nullable()
+        || !FunctionValueType::borrowed_value_domains_equal_observed::<KernelFailure>(
+            value.value_type(),
+            child,
+            || work.step().map_err(compile_failure),
+        )?
+        || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+            value.data_type(),
+            item.data_type(),
+            || work.step().map_err(compile_failure),
+        )?
+        || !super::aggregate_any_value::matches_nullable_binary(contract.intermediate_type(), work)?
         || contract.state_format().as_str() != format!("novarocks/{name}/state-v1")
     {
         return Err(invalid(

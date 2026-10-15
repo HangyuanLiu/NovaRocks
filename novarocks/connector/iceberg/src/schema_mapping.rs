@@ -22,6 +22,9 @@ use std::sync::Arc;
 
 type ListFieldWrapper = Box<dyn FnOnce(Arc<Field>) -> DataType>;
 
+pub(crate) mod nominal_declaration;
+pub(crate) mod typed_value;
+
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 pub use novarocks_types::value::variant::is_variant_struct_data_type;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -183,19 +186,13 @@ fn sql_read_data_type(
                     "Iceberg map {path} does not have key/value entries"
                 ));
             }
-            // Iceberg requires a map key to be present, and iceberg-rust's
-            // generic mapping reproduces that as a non-nullable Arrow field.
-            // NovaRocks stores and returns NULL map keys, so the SQL read
-            // carrier has to say so: the plan codec decodes a map key as
-            // nullable, `retag_iceberg_array` refuses to narrow a key the
-            // data proves nullable, and the runtime retag widens any child
-            // that carries nulls. Leaving the carrier non-nullable made the
-            // declared result type disagree with its own rows the moment a
-            // NULL key appeared in them.
+            // The formal Iceberg source requires a present key. Preserve this
+            // exact NULL contract in the Arrow format projection; downstream
+            // value layout normalization cannot authorize nullable map keys.
             let fields = vec![
                 Arc::new(
                     sql_read_field(arrow_fields[0].as_ref(), &iceberg_map.key_field)?
-                        .with_nullable(true),
+                        .with_nullable(!iceberg_map.key_field.required),
                 ),
                 Arc::new(sql_read_field(
                     arrow_fields[1].as_ref(),
@@ -858,8 +855,9 @@ mod tests {
         assert!(!record[0].is_nullable());
         assert!(record[1].is_nullable());
         assert!(items.is_nullable());
-        // Preserve the existing read owner's explicit map-key widening.
-        assert!(map[0].is_nullable());
+        // The frozen Iceberg Map declares a required key independently of its
+        // generic Arrow projection; execution must retain that declaration.
+        assert!(!map[0].is_nullable());
         assert!(!map[1].is_nullable());
         let frozen = crate::schema_facts::iceberg_schema_def(&iceberg);
         let annotated = annotate_read_schema_from_scan_model(&schema, &frozen).unwrap();
@@ -1041,3 +1039,5 @@ mod tests {
         assert_eq!(entries[1].data_type(), &DataType::LargeBinary);
     }
 }
+
+pub(crate) mod catalog_value;

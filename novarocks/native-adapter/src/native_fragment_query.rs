@@ -198,24 +198,38 @@ impl NativeFragmentQueryRuntime {
         exec_mem_limit: Option<i64>,
         runtime_filter: Option<RuntimeFilterSessionRef>,
     ) -> Result<NativeFragmentAdmissionResources, NativeFragmentAdmissionError> {
-        let memory = self.prepare_query_memory_typed(
+        let (query_mem_tracker, query_memory) = self.establish_query_resources(
             execution_id,
             delivery_expire,
             query_expire,
             exec_mem_limit,
         )?;
-        Ok(self.prepare_admission_with_memory(fragment_instance_id, memory, runtime_filter))
+        let fragment_label = format!(
+            "fragment_{:x}_{:x}",
+            fragment_instance_id.high(),
+            fragment_instance_id.low()
+        );
+        let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
+        let resources = NativeFragmentAdmissionResources {
+            query_memory,
+            query_mem_tracker,
+            fragment_mem_tracker,
+            runtime_filter,
+        };
+        Ok(resources)
     }
 
-    /// The SAME original query owner, obtained before compiled type births.
-    /// The caller must hold this fragment's original registration lease.
-    pub(crate) fn prepare_query_memory_typed(
+    /// Establish resources for an admitted native query context. Its original
+    /// options own this policy, before RF facts or a first task decode types.
+    /// The task protocol remains the lifecycle authority; this is no lookup
+    /// fallback and adds no preparation quota.
+    pub(crate) fn establish_query_resources(
         &self,
         execution_id: QueryExecutionId,
         delivery_expire: Duration,
         query_expire: Duration,
         exec_mem_limit: Option<i64>,
-    ) -> Result<NativeQueryPreparationMemory, NativeFragmentAdmissionError> {
+    ) -> Result<(Arc<MemTracker>, Option<QueryMemoryBinding>), NativeFragmentAdmissionError> {
         let execution = execution_key(execution_id);
         self.manager
             .ensure_native_context_execution(execution, false, delivery_expire, query_expire)
@@ -232,10 +246,11 @@ impl NativeFragmentQueryRuntime {
             query_mem_tracker
                 .install_limit_once(limit)
                 .map_err(NativeFragmentAdmissionError::Existing)?;
-            // Preserve both original policies during this partial migration.
-            // Tagged type births use the account; other execution allocations
-            // still use the tracker. Full combined hard-limit coverage belongs
-            // to the remaining query funding migration.
+            // The same number, stated on both mechanisms. Charges still live
+            // on the tracker, so the account's own `L` is near zero and this
+            // policy refuses nothing yet; that is deliberate. As later slices
+            // move charges onto accounts, the tracker side shrinks and the
+            // account side grows, and their sum stays this one limit.
             let account = self
                 .manager
                 .ensure_query_memory_account(execution, &self.memory_authority)
@@ -256,16 +271,57 @@ impl NativeFragmentQueryRuntime {
                 .ensure_query_memory_account(execution, &self.memory_authority)
                 .map_err(NativeFragmentAdmissionError::MemoryAccount)?
         };
-        let query_memory = bind_query_memory(
-            execution_id,
-            Arc::clone(&self.memory_authority),
-            query_memory_account,
-        )
-        .map_err(NativeFragmentAdmissionError::Binding)?;
-        Ok(NativeQueryPreparationMemory {
-            query_memory,
-            query_mem_tracker,
-        })
+        let query_memory = Some(
+            bind_query_memory(
+                execution_id,
+                Arc::clone(&self.memory_authority),
+                query_memory_account,
+            )
+            .map_err(NativeFragmentAdmissionError::Binding)?,
+        );
+        Ok((query_mem_tracker, query_memory))
+    }
+
+    /// Type decoding precedes runtime installation, but belongs to the already
+    /// established BE query. Observe that same tracker and its frozen policy;
+    /// never invent a default context or a second preparation byte quota.
+    pub(crate) fn type_construction_tracker(
+        &self,
+        execution_id: QueryExecutionId,
+        exec_mem_limit: Option<i64>,
+    ) -> Result<Arc<MemTracker>, NativeFragmentAdmissionError> {
+        let tracker = self
+            .manager
+            .query_mem_tracker_execution(execution_key(execution_id))
+            .ok_or_else(|| {
+                NativeFragmentAdmissionError::Existing(
+                    "native type construction requires an established query tracker".to_string(),
+                )
+            })?;
+        if let Some(limit) = exec_mem_limit {
+            tracker
+                .install_limit_once(limit)
+                .map_err(NativeFragmentAdmissionError::Existing)?;
+        }
+        Ok(tracker)
+    }
+
+    /// The SAME original query owner, obtained before compiled type births.
+    /// The caller must hold this fragment's original registration lease.
+    pub(crate) fn prepare_query_memory_typed(
+        &self,
+        execution_id: QueryExecutionId,
+        delivery_expire: Duration,
+        query_expire: Duration,
+        exec_mem_limit: Option<i64>,
+    ) -> Result<NativeQueryPreparationMemory, NativeFragmentAdmissionError> {
+        let (query_mem_tracker, query_memory) = self.establish_query_resources(
+            execution_id, delivery_expire, query_expire, exec_mem_limit,
+        )?;
+        let query_memory = query_memory.ok_or_else(|| NativeFragmentAdmissionError::Existing(
+            "native preparation requires the established query memory binding".into(),
+        ))?;
+        Ok(NativeQueryPreparationMemory { query_memory, query_mem_tracker })
     }
 
     /// Consume the early binding rather than minting a second query account.

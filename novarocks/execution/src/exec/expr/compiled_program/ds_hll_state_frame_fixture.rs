@@ -96,7 +96,7 @@ pub(super) fn program(count: usize) -> Arc<LocalProgram> {
         ControlShape::Eager,
     );
     let result_ty = owner.result();
-    assert_eq!(result_ty.data_type, DataType::Binary);
+    assert_eq!(result_ty.data_type().clone(), DataType::Binary);
     let call = b
         .add_expression(
             output,

@@ -156,18 +156,22 @@ fn public_n_owner_installs_every_exact_largeint_declaration_and_phase() {
                                 .unwrap()
                             )
                         );
-                        let DataType::List(field) = &handle.contract().final_type().data_type
+                        let DataType::List(field) = handle.contract().final_type().data_type()
                         else {
                             panic!("List result")
                         };
                         assert_eq!(field.data_type(), &DataType::FixedSizeBinary(16));
                         assert!(field.is_nullable());
+                        assert_eq!(field.metadata().capacity(), 0);
                         assert_eq!(
-                            field.metadata(),
-                            &std::collections::HashMap::from([(
-                                "nr_logical_type".to_owned(),
-                                "largeint".to_owned()
-                            )])
+                            handle
+                                .contract()
+                                .final_type()
+                                .value_type()
+                                .child_type_at(0)
+                                .unwrap()
+                                .domain(),
+                            Some(ValueLogicalType::LargeInt),
                         );
                         assert_eq!(
                             handle.contract().intermediate_type(),
@@ -206,7 +210,7 @@ fn public_n_owner_preserves_physical_profile_and_explicit_uuid_refusal() {
             let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
                 panic!("aggregate ABI")
             };
-            let DataType::List(field) = &handle.contract().final_type().data_type else {
+            let DataType::List(field) = handle.contract().final_type().data_type() else {
                 panic!("List result")
             };
             assert!(field.metadata().is_empty());
@@ -334,9 +338,16 @@ fn public_n_state_column_runs_selected_single_and_partial_final_with_last_alias_
                 let DataType::List(field) = output.data_type() else {
                     panic!("List result")
                 };
+                assert_eq!(field.metadata().capacity(), 0);
                 assert_eq!(
-                    field.metadata().get("nr_logical_type").map(String::as_str),
-                    Some("largeint")
+                    handle
+                        .contract()
+                        .final_type()
+                        .value_type()
+                        .child_type_at(0)
+                        .unwrap()
+                        .domain(),
+                    Some(ValueLogicalType::LargeInt),
                 );
                 Arc::clone(list.values())
             };

@@ -52,13 +52,15 @@ fn write_namespace_binds_same_type_emission_and_counts_each_alias_output() {
     let pools = alias_pools(&original);
     let roots = [(0, original.value_type().clone())];
     let fields = [(u32::MAX, Arc::clone(original.field_ref()))];
-    let table = encode_type_table_sources(
-        &roots,
-        &fields,
-        type_limits(),
-        &Control::good(CompilePhase::Encode),
-    )
-    .unwrap();
+    let value_refs = roots
+        .iter()
+        .map(|(id, value)| (*id, value))
+        .collect::<Vec<_>>();
+    let field_refs = fields
+        .iter()
+        .map(|(id, field)| (*id, field))
+        .collect::<Vec<_>>();
+    let table = encoded_fixture_types(&value_refs, &field_refs);
     let bindings = [binding(0, 0, u32::MAX), binding(u32::MAX, 0, u32::MAX)];
     let control = Control::good(CompilePhase::Encode);
     let prepared = prepare_constant_namespace_write(
@@ -86,13 +88,7 @@ fn write_namespace_binds_same_type_emission_and_counts_each_alias_output() {
     );
     assert_eq!(records[0].arrow_ipc, records[1].arrow_ipc);
     assert_ne!(records[0].arrow_ipc.as_ptr(), records[1].arrow_ipc.as_ptr());
-    let wire_types = table.into_wire();
-    let decoded_types = decode_type_table(
-        &wire_types,
-        type_limits(),
-        &Control::good(CompilePhase::Decode),
-    )
-    .unwrap();
+    let decoded_types = decode_fixture_types(&table, &fields);
     let decoded = decode_constant_namespace(
         &records,
         &decoded_types,
@@ -146,13 +142,15 @@ fn write_namespace_mixed_full_fields_and_equal_distinct_arcs_roundtrip() {
         (0, Arc::new(nested.field().clone())),
         (u32::MAX, Arc::clone(flat.field_ref())),
     ];
-    let table = encode_type_table_sources(
-        &roots,
-        &fields,
-        type_limits(),
-        &Control::good(CompilePhase::Encode),
-    )
-    .unwrap();
+    let value_refs = roots
+        .iter()
+        .map(|(id, value)| (*id, value))
+        .collect::<Vec<_>>();
+    let field_refs = fields
+        .iter()
+        .map(|(id, field)| (*id, field))
+        .collect::<Vec<_>>();
+    let table = encoded_fixture_types(&value_refs, &field_refs);
     let bindings = [binding(0, u32::MAX, 0), binding(u32::MAX, 0, u32::MAX)];
     let records = encode_constant_namespace(
         &pools,
@@ -164,12 +162,7 @@ fn write_namespace_mixed_full_fields_and_equal_distinct_arcs_roundtrip() {
         &Control::good(CompilePhase::Encode),
     )
     .unwrap();
-    let decoded_types = decode_type_table(
-        table.as_wire(),
-        type_limits(),
-        &Control::good(CompilePhase::Decode),
-    )
-    .unwrap();
+    let decoded_types = decode_fixture_types(&table, &fields);
     for (record, original) in records.iter().zip([&nested, &flat]) {
         let (_, result) = decode(record, &decoded_types);
         for ordinal in 0..original.array().len() as u32 {
@@ -209,13 +202,15 @@ fn write_namespace_rejects_wrong_full_types_fields_ids_count_and_order() {
             ),
         ),
     ];
-    let table = encode_type_table_sources(
-        &roots,
-        &fields,
-        type_limits(),
-        &Control::good(CompilePhase::Encode),
-    )
-    .unwrap();
+    let value_refs = roots
+        .iter()
+        .map(|(id, value)| (*id, value))
+        .collect::<Vec<_>>();
+    let field_refs = fields
+        .iter()
+        .map(|(id, field)| (*id, field))
+        .collect::<Vec<_>>();
+    let table = encoded_fixture_types(&value_refs, &field_refs);
     for bindings in [
         vec![],
         vec![binding(0, 0, 0)],
@@ -254,13 +249,15 @@ fn write_namespace_original_invoice_cannot_be_padded_with_prepared_storage() {
         .unwrap();
     let roots = [(0, original.value_type().clone())];
     let fields = [(0, Arc::clone(original.field_ref()))];
-    let table = encode_type_table_sources(
-        &roots,
-        &fields,
-        type_limits(),
-        &Control::good(CompilePhase::Encode),
-    )
-    .unwrap();
+    let value_refs = roots
+        .iter()
+        .map(|(id, value)| (*id, value))
+        .collect::<Vec<_>>();
+    let field_refs = fields
+        .iter()
+        .map(|(id, field)| (*id, field))
+        .collect::<Vec<_>>();
+    let table = encoded_fixture_types(&value_refs, &field_refs);
     let bindings = [binding(0, 0, 0)];
     let insufficient = original.resource_facts().retained_buffer_capacity_bytes as usize - 1;
     let result = encode_constant_namespace(
@@ -314,13 +311,15 @@ fn write_namespace_near_over_requests_work_and_all_control_prefixes() {
     let pools = alias_pools(&original);
     let roots = [(0, original.value_type().clone())];
     let fields = [(0, Arc::clone(original.field_ref()))];
-    let table = encode_type_table_sources(
-        &roots,
-        &fields,
-        type_limits(),
-        &Control::good(CompilePhase::Encode),
-    )
-    .unwrap();
+    let value_refs = roots
+        .iter()
+        .map(|(id, value)| (*id, value))
+        .collect::<Vec<_>>();
+    let field_refs = fields
+        .iter()
+        .map(|(id, field)| (*id, field))
+        .collect::<Vec<_>>();
+    let table = encoded_fixture_types(&value_refs, &field_refs);
     let bindings = [binding(0, 0, 0), binding(u32::MAX, 0, 0)];
     let control = Control::good(CompilePhase::Encode);
     let facts = *prepare_constant_namespace_write(

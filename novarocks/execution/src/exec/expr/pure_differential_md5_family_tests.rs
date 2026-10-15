@@ -166,58 +166,7 @@ fn pure_differential_md5_dedup_keeps_sole_unary_utf8_overload() {
         }
     }
 }
-#[test]
-fn pure_differential_md5sum_fixed_variadic_any_flat_cast_profiles() {
-    for (i, a) in profiles().into_iter().enumerate() {
-        assert_scalar_matches_v1(
-            ScalarDiffSpec::new("md5sum")
-                .column(a.clone())
-                .column(Arc::new(StringArray::from(vec![
-                    Some("suffix"),
-                    None,
-                    Some(""),
-                    Some("\0"),
-                ])))
-                .sparse_selections(12, 2300 + i as u64),
-        );
-        assert_scalar_matches_v1(
-            ScalarDiffSpec::new("md5sum")
-                .column(a.slice(1, 3))
-                .sparse_selections(12, 2350 + i as u64),
-        );
-        assert_scalar_matches_v1(
-            ScalarDiffSpec::new("md5sum")
-                .column(a.slice(0, 0))
-                .sparse_selections(12, 2380 + i as u64),
-        );
-    }
-}
-#[test]
-fn pure_differential_md5sum_numeric_dynamic_flat_cast_profiles_keep_be128() {
-    for (i, a) in profiles().into_iter().enumerate() {
-        assert_scalar_matches_v1(
-            ScalarDiffSpec::new("md5sum_numeric")
-                .column(a.clone())
-                .column(Arc::new(BinaryArray::from(vec![
-                    Some(b"suffix".as_slice()),
-                    None,
-                    Some(b"".as_slice()),
-                    Some(b"\0".as_slice()),
-                ])))
-                .sparse_selections(12, 2400 + i as u64),
-        );
-        assert_scalar_matches_v1(
-            ScalarDiffSpec::new("md5sum_numeric")
-                .column(a.slice(1, 3))
-                .sparse_selections(12, 2450 + i as u64),
-        );
-        assert_scalar_matches_v1(
-            ScalarDiffSpec::new("md5sum_numeric")
-                .column(a.slice(0, 0))
-                .sparse_selections(12, 2480 + i as u64),
-        );
-    }
-}
+
 #[test]
 fn pure_differential_md5sum_both_overloads_keep_existing_nominal_byte_identity() {
     use novarocks_type_contract::ValueLogicalType;
@@ -269,23 +218,138 @@ fn pure_differential_md5sum_both_overloads_keep_existing_nominal_byte_identity()
         }
     }
 }
+
+fn profile_declarations() -> Vec<FunctionValueType> {
+    [
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Binary,
+        DataType::LargeBinary,
+        DataType::Utf8View,
+        DataType::BinaryView,
+        DataType::Null,
+        DataType::Boolean,
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::UInt8,
+        DataType::UInt16,
+        DataType::UInt32,
+        DataType::UInt64,
+        DataType::Float16,
+        DataType::Float32,
+        DataType::Float64,
+        DataType::Decimal32(9, 2),
+        DataType::Decimal64(18, 3),
+        DataType::Decimal128(30, 4),
+        DataType::Decimal256(50, 5),
+    ]
+    .into_iter()
+    .map(|ty| FunctionValueType::new(ty, true))
+    .collect()
+}
+// Raw owner/profile and prepared-source replacement passed before retirement
+// of the superseded engine-ingress mismatch witnesses.
 #[test]
-fn pure_differential_md5sum_nullable_literal_pool_constants_and_opaque_binary_views() {
+fn pure_differential_md5sum_fixed_variadic_any_flat_cast_profiles_prepared_plain_views() {
+    let arrays = profiles();
+    let declarations = profile_declarations();
+    assert_eq!(arrays.len(), declarations.len());
+    for (i, (ty, a)) in declarations.into_iter().zip(arrays).enumerate() {
+        super::assert_scalar_matches_v1_with_plain_views(
+            ScalarDiffSpec::new("md5sum")
+                .typed_column(ty.clone(), a.clone())
+                .typed_column(
+                    FunctionValueType::new(DataType::Utf8, true),
+                    Arc::new(StringArray::from(vec![
+                        Some("suffix"),
+                        None,
+                        Some(""),
+                        Some("\0"),
+                    ])),
+                )
+                .sparse_selections(12, 2300 + i as u64),
+        );
+        super::assert_scalar_matches_v1_with_plain_views(
+            ScalarDiffSpec::new("md5sum")
+                .typed_column(ty.clone(), a.slice(1, 3))
+                .sparse_selections(12, 2350 + i as u64),
+        );
+        super::assert_scalar_matches_v1_with_plain_views(
+            ScalarDiffSpec::new("md5sum")
+                .typed_column(ty.clone(), a.slice(0, 0))
+                .sparse_selections(12, 2380 + i as u64),
+        );
+    }
+}
+
+#[test]
+fn pure_differential_md5sum_numeric_dynamic_flat_cast_profiles_keep_be128_prepared_plain_views() {
+    let arrays = profiles();
+    let declarations = profile_declarations();
+    assert_eq!(arrays.len(), declarations.len());
+    for (i, (ty, a)) in declarations.into_iter().zip(arrays).enumerate() {
+        super::assert_scalar_matches_v1_with_plain_views(
+            ScalarDiffSpec::new("md5sum_numeric")
+                .typed_column(ty.clone(), a.clone())
+                .typed_column(
+                    FunctionValueType::new(DataType::Binary, true),
+                    Arc::new(BinaryArray::from(vec![
+                        Some(b"suffix".as_slice()),
+                        None,
+                        Some(b"".as_slice()),
+                        Some(b"\0".as_slice()),
+                    ])),
+                )
+                .sparse_selections(12, 2400 + i as u64),
+        );
+        super::assert_scalar_matches_v1_with_plain_views(
+            ScalarDiffSpec::new("md5sum_numeric")
+                .typed_column(ty.clone(), a.slice(1, 3))
+                .sparse_selections(12, 2450 + i as u64),
+        );
+        super::assert_scalar_matches_v1_with_plain_views(
+            ScalarDiffSpec::new("md5sum_numeric")
+                .typed_column(ty.clone(), a.slice(0, 0))
+                .sparse_selections(12, 2480 + i as u64),
+        );
+    }
+}
+
+#[test]
+fn pure_differential_md5sum_nullable_literal_pool_constants_and_opaque_binary_views_prepared_plain_views()
+ {
     for name in ["md5sum", "md5sum_numeric"] {
         for literal in [true, false] {
             for rows in [0, 7] {
-                for a in [
-                    Arc::new(NullArray::new(1)) as ArrayRef,
-                    Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
-                    Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef,
-                    Arc::new(Float64Array::from(vec![Some(-0.0)])) as ArrayRef,
+                for (ty, a) in [
+                    (
+                        FunctionValueType::new(DataType::Null, true),
+                        Arc::new(NullArray::new(1)) as ArrayRef,
+                    ),
+                    (
+                        FunctionValueType::new(DataType::Utf8, true),
+                        Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+                    ),
+                    (
+                        FunctionValueType::new(DataType::Int64, true),
+                        Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef,
+                    ),
+                    (
+                        FunctionValueType::new(DataType::Float64, false),
+                        Arc::new(Float64Array::from(vec![Some(-0.0)])) as ArrayRef,
+                    ),
                 ] {
                     let spec = ScalarDiffSpec::new(name)
-                        .constant_array(a)
-                        .constant_array(Arc::new(StringArray::from(vec![Some("x")])))
+                        .constant(constant(ty, a))
+                        .constant(constant(
+                            FunctionValueType::new(DataType::Utf8, false),
+                            Arc::new(StringArray::from(vec![Some("x")])),
+                        ))
                         .constant_rows(rows)
                         .sparse_selections(12, 2600);
-                    assert_scalar_matches_v1(if literal {
+                    super::assert_scalar_matches_v1_with_plain_views(if literal {
                         spec
                     } else {
                         spec.legacy_constants(LegacyConstantForm::Pool)
@@ -293,13 +357,16 @@ fn pure_differential_md5sum_nullable_literal_pool_constants_and_opaque_binary_vi
                 }
             }
         }
-        assert_scalar_matches_v1(
+        super::assert_scalar_matches_v1_with_plain_views(
             ScalarDiffSpec::new(name)
-                .column(Arc::new(BinaryViewArray::from(vec![
-                    Some(b"\xff".as_slice()),
-                    None,
-                    Some(b"hello".as_slice()),
-                ])))
+                .typed_column(
+                    FunctionValueType::new(DataType::BinaryView, true),
+                    Arc::new(BinaryViewArray::from(vec![
+                        Some(b"\xff".as_slice()),
+                        None,
+                        Some(b"hello".as_slice()),
+                    ])),
+                )
                 .sparse_selections(12, 2610),
         );
     }

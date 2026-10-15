@@ -254,29 +254,27 @@ impl RequestSummary {
     }
 }
 
-fn datatype_clone(
+fn datatype_clone<W: crate::array_backing_geometry::MetadataWork>(
     data_type: &DataType,
-    work: &mut crate::EvaluationCheckpoints<'_>,
-) -> Result<SourceCustodyAllocationFacts, KernelFailure> {
+    work: &mut W,
+) -> Result<SourceCustodyAllocationFacts, W::Error> {
     work.step()?;
-    match data_type {
+    Ok(match data_type {
         DataType::Dictionary(key, value) => {
             SourceCustodyAllocationFacts::layout(Layout::new::<DataType>())
                 .times(2)?
                 .plus(datatype_clone(key, work)?)?
-                .plus(datatype_clone(value, work)?)
+                .plus(datatype_clone(value, work)?)?
         }
-        _ => Ok(SourceCustodyAllocationFacts::empty()),
-    }
+        _ => SourceCustodyAllocationFacts::empty(),
+    })
 }
-fn union_slots(
+fn union_slots<W: crate::array_backing_geometry::MetadataWork>(
     data_type: &DataType,
-    work: &mut crate::EvaluationCheckpoints<'_>,
-) -> Result<usize, KernelFailure> {
+    work: &mut W,
+) -> Result<usize, W::Error> {
     let DataType::Union(fields, _) = data_type else {
-        return Err(invalid(
-            "source custody indexed table requires an Arrow Union",
-        ));
+        return Err(invalid("source custody indexed table requires an Arrow Union").into());
     };
     // This is Arrow's empty indexed-table construction, not a budget default.
     let mut maximum = 0;
@@ -286,7 +284,7 @@ fn union_slots(
             .map_err(|_| invalid("source Union has a negative Arrow field id"))?;
         maximum = maximum.max(id);
     }
-    add(maximum, 1)
+    Ok(add(maximum, 1)?)
 }
 fn validation_table(data_type: &DataType) -> Result<SourceCustodyAllocationFacts, KernelFailure> {
     let count = match data_type {
@@ -307,12 +305,12 @@ fn validation_table(data_type: &DataType) -> Result<SourceCustodyAllocationFacts
     table::<BufferSpec>(count)
 }
 
-pub(crate) fn summarize_source_node(
+pub(crate) fn summarize_source_node<W: crate::array_backing_geometry::MetadataWork>(
     node: RequestSourceNode<'_>,
     children: RequestSummary,
     pricing: &SourceRequestPricing,
-    work: &mut crate::EvaluationCheckpoints<'_>,
-) -> Result<RequestSummary, KernelFailure> {
+    work: &mut W,
+) -> Result<RequestSummary, W::Error> {
     let buffers = table::<Buffer>(node.data_buffers)?;
     let child_table = table::<ArrayData>(node.child_count)?;
     let kind_clone = datatype_clone(node.data_type, work)?;

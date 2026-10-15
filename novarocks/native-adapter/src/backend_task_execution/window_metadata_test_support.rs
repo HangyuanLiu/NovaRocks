@@ -36,7 +36,8 @@ use novarocks_execution::{
     runtime::{
         fragment::{CompiledWriterBindings, ExecutionResult},
         preparation_metadata::{
-            CompiledSchemaMetadataScope, CompiledSchemaSite, PreparationMetadataFailure,
+            CompiledSchemaPreparationScope, CompiledSchemaSite, PreparationMetadataFailure,
+            prepare_operator_schema_for_test,
         },
         query_memory::QueryMemoryBinding,
         runtime_state::RuntimeErrorState,
@@ -68,18 +69,16 @@ struct Capture<'a, 'loan> {
     preparation: &'a PreparationControlLoan<'loan>,
     control: &'a dyn PureCompileControl,
     occurrences: Vec<WindowSchemaOccurrenceForTest>,
+    pending: Option<(CompiledSchemaSite, ProjectMetadataJournal)>,
 }
-impl CompiledSchemaMetadataScope for Capture<'_, '_> {
-    fn materialize<B>(
+impl CompiledSchemaPreparationScope for Capture<'_, '_> {
+    fn prepare(
         &mut self,
         program: &Arc<LocalProgram>,
         site: CompiledSchemaSite,
         layout: &StaticLayout,
-        body: B,
-    ) -> ExecutionResult<ChunkSchemaRef>
-    where
-        B: FnOnce() -> Result<ChunkSchemaRef, String>,
-    {
+        body: &mut dyn FnMut() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
         let source =
             self.prepared
                 .native_metadata_loan()
@@ -89,27 +88,51 @@ impl CompiledSchemaMetadataScope for Capture<'_, '_> {
                     ),
                 ))?;
         let mut journal = ProjectMetadataJournal::default();
-        let schema = CompiledProjectMetadataHost::new(
+        CompiledProjectMetadataHost::new(
             source,
             self.binding,
             self.preparation,
             self.control,
             &mut journal,
         )
-        .materialize(program, site, layout, body)?;
-        // Capture scaffolding is after the original funded synchronous body.
+        .prepare(program, site, layout, body)?;
+        // The schema is captured from the actual prepared operator by the caller.
+        self.pending = Some((site, journal));
+        Ok(())
+    }
+}
+impl Capture<'_, '_> {
+    fn capture(&mut self, operator: &dyn novarocks_execution::exec::pipeline::operator::Operator) {
+        let (site, journal) = self.pending.take().expect("actual preparation recorded");
         self.occurrences.push(WindowSchemaOccurrenceForTest {
             site,
-            schema: Arc::clone(&schema),
             journal,
+            schema: operator
+                .prepared_schema_for_test()
+                .expect("actual typed schema prepared"),
         });
-        Ok(schema)
     }
+}
+fn prepare_actual_operator(
+    operator: &mut dyn novarocks_execution::exec::pipeline::operator::Operator,
+    tracker: Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
+    error: Arc<RuntimeErrorState>,
+    host: &mut Capture<'_, '_>,
+) -> ExecutionResult<()> {
+    let construction = novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+        novarocks_execution::exec::pipeline::pipeline::representation_construction_profile()
+            .map_err(novarocks_execution::exec::pipeline::operator::ConstructionFailure::from)?, tracker, error,
+    )?;
+    operator.set_construction_factory(construction);
+    prepare_operator_schema_for_test(operator, host)?;
+    host.capture(operator);
+    Ok(())
 }
 pub fn prepare_window_metadata_for_test(
     compiled: CompiledTaskProgram,
     node: ProgramNodeId,
     binding: &QueryMemoryBinding,
+    tracker: Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
     preparation: &PreparationControlLoan<'_>,
     control: &dyn PureCompileControl,
 ) -> ExecutionResult<PreparedWindowMetadataForTest> {
@@ -120,13 +143,18 @@ pub fn prepare_window_metadata_for_test(
         preparation,
         control,
         occurrences: Vec::new(),
+        pending: None,
     };
+    let error = Arc::new(RuntimeErrorState::default());
     let factory = novarocks_execution::exec::operators::prepare_window_factory_for_test(
         Arc::clone(prepared.program()),
         node,
-        Arc::new(RuntimeErrorState::default()),
-        &mut host,
+        Arc::clone(&error),
     )?;
+    use novarocks_execution::exec::pipeline::operator_factory::OperatorFactory;
+    let mut operator = factory.create(1, 0);
+    prepare_actual_operator(operator.as_mut(), tracker, error, &mut host)?;
+    drop(operator);
     let occurrence = host
         .occurrences
         .pop()
@@ -151,6 +179,7 @@ pub fn prepare_window_metadata_graph_for_test(
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
     binding: &QueryMemoryBinding,
+    tracker: Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
     preparation: &PreparationControlLoan<'_>,
     control: &dyn PureCompileControl,
 ) -> ExecutionResult<PreparedWindowMetadataGraphForTest> {
@@ -161,12 +190,39 @@ pub fn prepare_window_metadata_graph_for_test(
         preparation,
         control,
         occurrences: Vec::new(),
+        pending: None,
     };
-    let graph = novarocks_execution::exec::pipeline::builder::build_compiled_pipeline_graph_with_metadata_host_for_test(
-        prepared.program(), ExchangeBindings::default(), ScanBindings::default(), CompiledWriterBindings::default(),
-        None, DependencyManager::new(), pipeline_dop, root_sink_dop, functions,
-        Arc::new(RuntimeErrorState::default()), &mut host,
-    )?;
+    let graph =
+        novarocks_execution::exec::pipeline::builder::build_compiled_pipeline_graph_for_test(
+            prepared.program(),
+            ExchangeBindings::default(),
+            ScanBindings::default(),
+            CompiledWriterBindings::default(),
+            None,
+            DependencyManager::new(),
+            pipeline_dop,
+            root_sink_dop,
+            functions,
+            Arc::new(RuntimeErrorState::default()),
+        )?;
+    // Reuse the real graph's per-driver occurrences. Only schema sites enter
+    // this component fixture; the original runtime owns all other preparation.
+    let error = Arc::new(RuntimeErrorState::default());
+    for pipeline in &graph.pipelines {
+        for driver in 0..pipeline.dop {
+            for factory in &pipeline.factories {
+                let mut operator = factory.create(pipeline.dop, driver);
+                if operator.compiled_schema_preparation_site().is_some() {
+                    prepare_actual_operator(
+                        operator.as_mut(),
+                        Arc::clone(&tracker),
+                        Arc::clone(&error),
+                        &mut host,
+                    )?;
+                }
+            }
+        }
+    }
     Ok(PreparedWindowMetadataGraphForTest {
         program: Arc::clone(prepared.program()),
         graph,

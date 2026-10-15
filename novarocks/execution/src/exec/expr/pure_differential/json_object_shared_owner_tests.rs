@@ -299,13 +299,13 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                         accesses += 1;
                         assert_eq!(args.len(), 2);
                         assert_eq!(
-                            expression.ty.data_type,
-                            DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
+                            expression.ty.data_type(),
+                            &DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
                         );
-                        assert!(expression.ty.nullable);
+                        assert!(expression.ty.nullable());
                         let index = fragment.expressions().get(args[1]).unwrap();
-                        assert_eq!(index.ty.data_type, DataType::Int32);
-                        assert!(index.ty.nullable);
+                        assert_eq!(index.ty.data_type(), &DataType::Int32);
+                        assert!(index.ty.nullable());
                         let ExprKind::Cast {
                             expr: if_id,
                             target,
@@ -316,8 +316,8 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                         };
                         assert_eq!(target, &DataType::Int32);
                         let conditional = fragment.expressions().get(*if_id).unwrap();
-                        assert_eq!(conditional.ty.data_type, DataType::Int64);
-                        assert!(conditional.ty.nullable);
+                        assert_eq!(conditional.ty.data_type(), &DataType::Int64);
+                        assert!(conditional.ty.nullable());
                         let ExprKind::FunctionCall { function, args } = &conditional.kind else {
                             panic!("primitive SQL IF");
                         };
@@ -325,7 +325,7 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                         assert_eq!(args.len(), 3);
                         for (arg, value) in args[1..].iter().zip([None, Some(1)]) {
                             let branch = fragment.expressions().get(*arg).unwrap();
-                            assert_eq!(branch.ty.data_type, DataType::Int64);
+                            assert_eq!(branch.ty.data_type(), &DataType::Int64);
                             let actual = match &branch.kind {
                                 ExprKind::Literal(
                                     novarocks_physical_plan::LiteralValue::Int64(v),
@@ -340,7 +340,7 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                                         .downcast_ref::<arrow::array::Int64Array>()
                                         .unwrap();
                                     let row = usize::try_from(reference.ordinal).unwrap();
-                                    assert_eq!(branch.ty.nullable, value.is_none());
+                                    assert_eq!(branch.ty.nullable(), value.is_none());
                                     (!values.is_null(row)).then(|| values.value(row))
                                 }
                                 other => panic!("actual SQL integer source {other:?}"),

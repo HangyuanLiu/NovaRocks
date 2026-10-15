@@ -261,7 +261,7 @@ fn branch_union_aggregate_change_stream_output_columns(
             | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgCount => {
                 novarocks_type_contract::FunctionValueType::new(
                     DataType::Binary,
-                    column.value_type.nullable,
+                    column.value_type.nullable(),
                 )
             }
             crate::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount => {
@@ -867,7 +867,10 @@ mod tests {
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                     output_column_id: ColumnId::new_for_test(3),
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![col_expr(2, "amount")],

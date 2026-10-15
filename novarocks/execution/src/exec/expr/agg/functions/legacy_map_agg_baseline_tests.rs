@@ -372,10 +372,12 @@ fn legacy_map_agg_baseline_raw_nominal_largeint_target_preserves_exact_bytes() {
     .unwrap();
     let input = packed(input_values.clone(), input_values, None);
     let field = |name: &str| {
-        novarocks_functions::FunctionValueType {
-            logical_type: novarocks_type_contract::ValueLogicalType::LargeInt,
-            ..novarocks_functions::FunctionValueType::new(DataType::FixedSizeBinary(16), true)
-        }
+        novarocks_functions::FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            true,
+            novarocks_type_contract::ValueLogicalType::LargeInt,
+        )
+        .unwrap()
         .try_to_field(name)
         .unwrap()
     };

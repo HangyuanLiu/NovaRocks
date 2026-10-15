@@ -92,7 +92,7 @@ impl DistributedRewriteSealing for QueryExecutionService {
 /// Admit the synthetic source used by one pinned rewrite cohort read.
 pub(crate) fn admit_pinned_rewrite_scan_binding(
     bindings: &QueryTableBindingStore,
-    input_schema: &arrow::datatypes::SchemaRef,
+    input_schema: &novarocks_connector_contract::ConnectorReadExecutionSchema,
     read: QueryPinnedFileSetRead,
 ) -> Result<SqlTableBindingId, String> {
     crate::query_execution::pinned_connector_read::admit_pinned_file_set_scan_binding(
@@ -107,9 +107,9 @@ pub(crate) fn admit_pinned_rewrite_scan_binding(
 /// Preparation freezes the relation restricted to exactly the files the
 /// provider pinned for this cohort; no normal table lookup may run.
 pub(crate) fn pinned_rewrite_scan_physical_plan(
-    input_schema: &arrow::datatypes::SchemaRef,
+    input_schema: &novarocks_connector_contract::ConnectorReadExecutionSchema,
     binding: SqlTableBindingId,
-) -> FrozenConnectorScanPlan {
+) -> Result<FrozenConnectorScanPlan, String> {
     crate::query_execution::pinned_connector_read::pinned_file_set_scan_physical_plan(
         &frozen_rewrite_identity(),
         input_schema,
@@ -120,7 +120,7 @@ pub(crate) fn pinned_rewrite_scan_physical_plan(
 /// Admit the synthetic source used by one procedure cohort's group read.
 pub(crate) fn admit_rewrite_group_scan_binding(
     bindings: &QueryTableBindingStore,
-    input_schema: &arrow::datatypes::SchemaRef,
+    input_schema: &novarocks_connector_contract::ConnectorReadExecutionSchema,
     read: QueryRewriteGroupRead,
 ) -> Result<SqlTableBindingId, String> {
     crate::query_execution::rewrite_group_read::admit_table_execute_scan_binding(
@@ -135,9 +135,9 @@ pub(crate) fn admit_rewrite_group_scan_binding(
 /// Preparation freezes the relation the group names; no normal table lookup
 /// may run.
 pub(crate) fn rewrite_group_scan_physical_plan(
-    input_schema: &arrow::datatypes::SchemaRef,
+    input_schema: &novarocks_connector_contract::ConnectorReadExecutionSchema,
     binding: SqlTableBindingId,
-) -> FrozenConnectorScanPlan {
+) -> Result<FrozenConnectorScanPlan, String> {
     crate::query_execution::rewrite_group_read::table_execute_scan_physical_plan(
         &frozen_rewrite_identity(),
         input_schema,
@@ -152,7 +152,7 @@ pub(crate) fn rewrite_group_scan_physical_plan(
 /// is admitted beside the binding, and only the freeze puts the two together.
 pub(crate) fn rewrite_cohort_provider_read_need(
     binding: SqlTableBindingId,
-    input_schema: &arrow::datatypes::SchemaRef,
+    input_schema: &novarocks_connector_contract::ConnectorReadExecutionSchema,
     cohort: &crate::catalog_application::query_bindings::QueryFrozenCohortRead,
 ) -> Result<novarocks_sql::compiler::ProviderReadNeed, String> {
     use crate::catalog_application::query_bindings::QueryFrozenCohortRead;
@@ -175,16 +175,20 @@ pub(crate) fn rewrite_cohort_provider_read_need(
         REWRITE_COHORT_SCAN_OCCURRENCE,
         binding,
         relation,
-        input_schema.fields().iter().map(|field| {
-            (
-                Box::<str>::from(field.name().as_str()),
-                novarocks_physical_plan::ValueType {
-                    logical_type: novarocks_type_contract::ValueLogicalType::Physical,
-                    data_type: field.data_type().clone(),
-                    nullable: field.is_nullable(),
-                },
-            )
-        }),
+        input_schema
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, field)| {
+                (
+                    Box::<str>::from(field.name().as_str()),
+                    input_schema
+                        .binding(ordinal)
+                        .expect("validated connector execution schema covers every field")
+                        .clone(),
+                )
+            }),
     )
     .map_err(|error| error.to_string())
 }
@@ -274,13 +278,13 @@ impl ConnectorDistributedRewriteSession {
                 rewrite_begin_request(&plan, table, context).map_err(invalid)?,
             )
             .map_err(invalid)?;
-            let sealed = session.expected_targets().len();
-            if sealed != plan.cohorts().len() {
-                return Err(invalid(format!(
-                    "distributed rewrite sealed {sealed} write targets for {} frozen groups",
-                    plan.cohorts().len()
-                )));
-            }
+            validate_rewrite_target_groups(
+                &plan,
+                session
+                    .targets()
+                    .iter()
+                    .map(|target| (target.ordinal(), target.rewrite_group_digest())),
+            )?;
             Some(session)
         };
 
@@ -407,6 +411,39 @@ impl ConnectorDistributedRewriteSession {
 /// rewrite selected, so the plan's frozen shape travels in the flavor: it is
 /// what decides whether the session seals data branches or delete branches, and
 /// the provider refuses an input that disagrees with it.
+/// Validate correspondence before any cohort is dispatched to a writer.
+fn validate_rewrite_target_groups(
+    plan: &ConnectorDistributedRewritePlan,
+    mut targets: impl Iterator<
+        Item = (
+            novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+            Option<[u8; 32]>,
+        ),
+    >,
+) -> Result<(), ConnectorError> {
+    for (index, cohort) in plan.cohorts().iter().enumerate() {
+        let Some((ordinal, digest)) = targets.next() else {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "distributed rewrite sealed fewer writers than frozen cohorts",
+            ));
+        };
+        if ordinal.get() as usize != index || digest != Some(cohort.group_digest()) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "distributed rewrite writer group differs from its frozen cohort",
+            ));
+        }
+    }
+    if targets.next().is_some() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Internal,
+            "distributed rewrite sealed more writers than frozen cohorts",
+        ));
+    }
+    Ok(())
+}
+
 fn rewrite_begin_request(
     plan: &ConnectorDistributedRewritePlan,
     table: &novarocks_spi::connector::ConnectorTableMetadata,
@@ -437,12 +474,10 @@ fn rewrite_begin_request(
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
             input: crate::connector::write_target::write_input_request_for_shape(
                 preparation.input(),
-            ),
+            )?,
             base: None,
             flavor:
-                novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::DistributedRewrite(
-                    plan.shape(),
-                ),
+                novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::DistributedRewrite { shape: plan.shape(), frozen: plan.frozen().clone() },
             context,
         },
     )
@@ -522,12 +557,18 @@ mod tests {
         owner: ConnectorProviderBindingKey,
         table: ConnectorTableHandle,
         schema: &arrow::datatypes::SchemaRef,
+        execution_schema: &novarocks_connector_contract::ConnectorReadExecutionSchema,
     ) -> ConnectorWritePreparation {
         let binding = |index: usize, field: &Field| {
-            ConnectorWriteFieldBinding::new(
+            ConnectorWriteFieldBinding::try_new_typed(
                 ConnectorWriteFieldToken::from_bytes([index as u8 + 1; 32]),
                 field.clone(),
+                execution_schema
+                    .binding(index)
+                    .expect("complete frozen rewrite column declaration")
+                    .clone(),
             )
+            .expect("writer field matches its independently declared rewrite column")
         };
         let lineage = |name: &str| matches!(name, "_row_id" | "_last_updated_sequence_number");
         let data_fields = schema
@@ -566,25 +607,35 @@ mod tests {
     /// writer input.
     fn table_metadata() -> novarocks_spi::connector::ConnectorTableMetadata {
         let instance = ConnectorInstanceId::parse("rewrite-session-instance").unwrap();
-        novarocks_spi::connector::ConnectorTableMetadata {
-            identity: novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: instance.clone(),
-                namespace: Arc::from("db"),
-                table: Arc::from("orders"),
+        crate::connector::schema_creation::declared_test_metadata(
+            novarocks_spi::connector::ConnectorTableMetadataHeader {
+                identity: novarocks_spi::connector::ConnectorTableIdentity {
+                    instance_id: instance.clone(),
+                    namespace: Arc::from("db"),
+                    table: Arc::from("orders"),
+                },
+                planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
+                definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
+                version: None,
+                statistics_data_version: None,
+                table: ConnectorTableHandle::try_new(instance, Bytes::from_static(b"table"))
+                    .unwrap(),
             },
-            schema: Arc::new(Schema::new(vec![
+            Arc::new(Schema::new(vec![
                 Field::new("value", DataType::Int64, true),
                 Field::new("_file", DataType::Utf8, true),
                 Field::new("_pos", DataType::Int64, true),
                 Field::new("_row_id", DataType::Int64, true),
                 Field::new("_last_updated_sequence_number", DataType::Int64, true),
             ])),
-            planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
-            definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
-            version: None,
-            statistics_data_version: None,
-            table: ConnectorTableHandle::try_new(instance, Bytes::from_static(b"table")).unwrap(),
-        }
+            vec![
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+                novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            ],
+        )
     }
 
     struct TestMetadata {
@@ -643,7 +694,11 @@ mod tests {
         fn load_table(
             &self,
             _request: novarocks_spi::connector::ConnectorTableRequest,
-        ) -> Result<novarocks_spi::connector::ConnectorTableMetadata, ConnectorError> {
+            creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
             unreachable!("rewrite session does not load metadata")
         }
     }
@@ -663,7 +718,11 @@ mod tests {
         fn plan_rewrite(
             &self,
             _request: ConnectorDistributedRewritePlanningRequest,
-        ) -> Result<ConnectorDistributedRewritePlan, ConnectorError> {
+            _creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorDistributedRewritePlan,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
             unreachable!()
         }
         fn finalize_rewrite(
@@ -762,22 +821,58 @@ mod tests {
             .enumerate()
             .map(|(index, schema)| {
                 let digest = [u8::try_from(index).unwrap_or_default(); 32];
-                ConnectorDistributedRewriteCohortPlan::try_new(
-                    ConnectorWriteCohortId::derive(operation_id, b"test", digest).unwrap(),
-                    novarocks_spi::connector::ConnectorRewriteCohortRead::DeleteArtifactGroup(
-                        novarocks_spi::connector::ConnectorFrozenRewriteGroup::try_new(
-                            "db",
-                            "orders",
-                            "s3://warehouse/db/orders/_rewrite/0199",
-                            digest,
+                // Every column in these relation fixtures is declared BigInt.
+                // The declaration remains explicit even for widened groups.
+                let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+                let bindings = schema
+                    .fields()
+                    .iter()
+                    .map(|field| {
+                        novarocks_type_contract::FunctionValueType::try_from_typed_binding(
+                            novarocks_types::execution_value_type_from_declaration(
+                                &novarocks_types::schema::SqlType::BigInt,
+                                field.data_type(),
+                                field.is_nullable(),
+                                storage.clone(),
+                            )
+                            .expect("declared rewrite relation column"),
                         )
-                        .unwrap(),
-                    ),
-                    schema.clone(),
-                    [3; 32],
-                    preparation(key.clone(), table.clone(), schema),
-                    digest,
-                )
+                        .expect("complete rewrite relation binding")
+                    })
+                    .collect::<Vec<_>>();
+                let execution_schema =
+                    novarocks_connector_contract::ConnectorReadExecutionSchema::try_new(
+                        schema.clone(),
+                        bindings.into_boxed_slice(),
+                        storage,
+                    )
+                    .expect("complete rewrite relation schema");
+                let preparation =
+                    preparation(key.clone(), table.clone(), schema, &execution_schema);
+                crate::connector::schema_creation::with_schema_creation(&context(), |creation| {
+                    ConnectorDistributedRewriteCohortPlan::try_new_typed(
+                        ConnectorWriteCohortId::derive(operation_id, b"test", digest).unwrap(),
+                        novarocks_spi::connector::ConnectorRewriteCohortRead::DeleteArtifactGroup(
+                            novarocks_spi::connector::ConnectorFrozenRewriteGroup::try_new(
+                                "db",
+                                "orders",
+                                operation_id,
+                                digest,
+                                novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+                                    key.clone(),
+                                    Arc::new(()),
+                                ),
+                            )
+                            .unwrap(),
+                        ),
+                        schema.clone(),
+                        execution_schema,
+                        [3; 32],
+                        preparation,
+                        digest,
+                        creation,
+                    )
+                })
                 .unwrap()
             })
             .collect();
@@ -791,6 +886,7 @@ mod tests {
             },
             Bytes::from_static(b"plan"),
             cohort_plans,
+            novarocks_spi::connector::ConnectorProcessLocalPayload::new(key.clone(), Arc::new(())),
         )
         .unwrap();
         let rewrite = Arc::new(TestRewrite {
@@ -930,7 +1026,7 @@ mod tests {
             plan.cohorts()[0].scan_schema().fields().len(),
             "the writer input stands one-to-one with the frozen scan, not with the \
              {} column table schema",
-            table.schema.fields().len()
+            table.schema().fields().len()
         );
         assert_eq!(request.intent, ConnectorWriteIntent::Overwrite);
         assert_eq!(request.target_ref.as_str(), "main");
@@ -953,4 +1049,90 @@ mod tests {
         };
         assert!(error.contains("different writer inputs"), "{error}");
     }
+    #[test]
+    fn writer_groups_must_match_each_cohort_before_dispatch() {
+        let (plan, _) = fixture(3);
+        let expected = plan
+            .cohorts()
+            .iter()
+            .enumerate()
+            .map(|(i, cohort)| {
+                (
+                    novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(i as u32)
+                        .unwrap(),
+                    Some(cohort.group_digest()),
+                )
+            })
+            .collect::<Vec<_>>();
+        validate_rewrite_target_groups(&plan, expected.clone().into_iter()).unwrap();
+        let mut wrong = expected.clone();
+        wrong[0].1 = Some([255; 32]);
+        assert_eq!(
+            validate_rewrite_target_groups(&plan, wrong.into_iter())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Internal
+        );
+        let mut wrong = expected.clone();
+        wrong[0].0 = wrong[1].0;
+        assert_eq!(
+            validate_rewrite_target_groups(&plan, wrong.into_iter())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Internal
+        );
+        let mut wrong = expected.clone();
+        wrong.pop();
+        assert_eq!(
+            validate_rewrite_target_groups(&plan, wrong.into_iter())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Internal
+        );
+        let mut wrong = expected.clone();
+        wrong.push(expected[0]);
+        assert_eq!(
+            validate_rewrite_target_groups(&plan, wrong.into_iter())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Internal
+        );
+        let mut wrong = expected;
+        wrong[1].1 = None;
+        assert_eq!(
+            validate_rewrite_target_groups(&plan, wrong.into_iter())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Internal
+        );
+    }
+}
+
+/// SQL declarations are projected from complete signed execution bindings.
+/// Source annotations and physical binary/string resemblance confer no domain.
+pub(crate) fn connector_execution_columns(
+    schema: &novarocks_connector_contract::ConnectorReadExecutionSchema,
+) -> Result<Vec<novarocks_types::schema::ColumnDef>, String> {
+    schema
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, field)| {
+            let binding = schema
+                .binding(ordinal)
+                .ok_or_else(|| "connector execution field has no complete binding".to_string())?;
+            novarocks_types::schema::ColumnDef::from_value_type(
+                field.name().clone(),
+                binding.clone(),
+                None,
+            )
+            .map_err(|error| {
+                format!(
+                    "invalid connector execution column `{}`: {error}",
+                    field.name()
+                )
+            })
+        })
+        .collect()
 }

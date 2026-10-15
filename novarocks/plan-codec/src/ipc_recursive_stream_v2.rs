@@ -19,7 +19,10 @@
 //! The numerical request/work projection precedes the public safe reader;
 //! preparation hosts retain grant, allocation-origin and free ownership.
 
-use crate::ipc_flat_stream_v2::progress::{Admission, IpcReaderProgressFacts};
+use crate::ipc_flat_stream_v2::ReaderFailure;
+use crate::ipc_flat_stream_v2::progress::{
+    Admission, IpcReaderProgressFacts, ReaderGeometryFailure,
+};
 use crate::{
     ipc_flat_stream_v2::{FlatPoolResourceError, require},
     ipc_recursive_batch_v2::{CheckedRecursiveBatch, preflight_verified_recursive_record_batch},
@@ -110,14 +113,140 @@ impl PreparedRecursiveReader<'_, '_, '_, '_> {
             ))
             .into());
         }
-        let mut admission = Admission::new(self.parts.facts.source_retained_bytes, admit);
+        let mut adapter =
+            |facts: &IpcReaderProgressFacts| admit(facts).map_err(RecursiveReaderError::from);
+        let mut admission = Admission::new(self.parts.facts.source_retained_bytes, &mut adapter);
         admission.seed(self.parts.progress.ok_or_else(|| {
             FlatPoolResourceError::from(TypeCodecError::InvalidShape(
                 "recursive reader is missing caller-owned facts",
             ))
         })?)?;
         self.stream
-            .materialize_parts_core(self.parts, Some(&mut admission), work)
+            .materialize_parts_core(self.parts, Some(&mut admission), None, None, work)
+    }
+
+    pub(crate) fn materialize_pure_observed<E: ReaderFailure>(
+        self,
+        admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_, E>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantPool, E> {
+        let Some(original) = self.original_control else {
+            return Err(RecursiveReaderError::from(reader_resources::invalid(
+                "recursive reader requires caller-owned preparation",
+            ))
+            .into());
+        };
+        if !std::ptr::addr_eq(original, work.control()) {
+            return Err(RecursiveReaderError::from(reader_resources::invalid(
+                "recursive reader belongs to another original control",
+            ))
+            .into());
+        }
+        let mut admission = Admission::new(self.parts.facts.source_retained_bytes, admit);
+        admission.seed(self.parts.progress.ok_or_else(|| {
+            reader_resources::invalid("recursive reader is missing caller-owned facts")
+        })?)?;
+        self.stream
+            .materialize_parts_core(self.parts, Some(&mut admission), None, None, work)
+    }
+
+    pub(crate) fn materialize_with_creator_observed<H>(
+        self,
+        source: novarocks_constant_contract::ConstantSourceOwner,
+        creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+        admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<
+            '_,
+            crate::host_projection_v2::ProjectionFailure<RecursiveReaderError, H>,
+        >,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantPool, crate::host_projection_v2::ProjectionFailure<RecursiveReaderError, H>>
+    {
+        creation.with_error_mapping(
+            crate::host_projection_v2::ProjectionFailure::Host,
+            |mapped| self.materialize_with_scope_observed(source, mapped, admit, work),
+        )
+    }
+    pub(crate) fn materialize_with_scope_observed<E: ReaderFailure>(
+        self,
+        source: novarocks_constant_contract::ConstantSourceOwner,
+        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<E>,
+        admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_, E>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantPool, E> {
+        let Some(original) = self.original_control else {
+            return Err(RecursiveReaderError::from(reader_resources::invalid(
+                "recursive reader requires caller-owned preparation",
+            ))
+            .into());
+        };
+        if !std::ptr::addr_eq(original, work.control()) {
+            return Err(RecursiveReaderError::from(reader_resources::invalid(
+                "recursive reader belongs to another original control",
+            ))
+            .into());
+        }
+        let mut admission = Admission::new(self.parts.facts.source_retained_bytes, admit);
+        admission.seed(self.parts.progress.ok_or_else(|| {
+            reader_resources::invalid("recursive reader is missing caller-owned facts")
+        })?)?;
+        self.stream.materialize_parts_core(
+            self.parts,
+            Some(&mut admission),
+            Some(source),
+            Some(crate::ipc_flat_stream_v2::reader_creation::ReaderCreation::Single(creation)),
+            work,
+        )
+    }
+    pub(crate) fn materialize_with_paired_creator_observed<H>(
+        self,
+        source: novarocks_constant_contract::ConstantSourceOwner,
+        temporary: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        retained: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        pool: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<
+            '_,
+            crate::host_projection_v2::ProjectionFailure<
+                crate::ipc_flat_stream_v2::FlatReaderError,
+                H,
+            >,
+        >,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<
+        ConstantPool,
+        crate::host_projection_v2::ProjectionFailure<crate::ipc_flat_stream_v2::FlatReaderError, H>,
+    > {
+        let Some(original) = self.original_control else {
+            return Err(RecursiveReaderError::from(reader_resources::invalid(
+                "recursive reader requires caller-owned preparation",
+            ))
+            .into());
+        };
+        if !std::ptr::addr_eq(original, work.control()) {
+            return Err(RecursiveReaderError::from(reader_resources::invalid(
+                "recursive reader belongs to another original control",
+            ))
+            .into());
+        }
+        let mut temporary = crate::ipc_flat_stream_v2::reader_creation::MappedScope(temporary);
+        let mut retained = crate::ipc_flat_stream_v2::reader_creation::MappedScope(retained);
+        let mut pool = crate::ipc_flat_stream_v2::reader_creation::MappedScope(pool);
+        let mut admission = Admission::new(self.parts.facts.source_retained_bytes, admit);
+        admission.seed(self.parts.progress.ok_or_else(|| {
+            reader_resources::invalid("recursive reader is missing caller-owned facts")
+        })?)?;
+        self.stream.materialize_parts_core(
+            self.parts,
+            Some(&mut admission),
+            Some(source),
+            Some(
+                crate::ipc_flat_stream_v2::reader_creation::ReaderCreation::Paired {
+                    temporary: &mut temporary,
+                    retained: &mut retained,
+                    pool: &mut pool,
+                },
+            ),
+            work,
+        )
     }
 
     pub(crate) fn materialize(
@@ -170,12 +299,41 @@ pub(crate) fn preflight_recursive_constant_stream_in<'a, 'f>(
     admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<RecursiveConstantStream<'a, 'f>, TypeCodecError> {
+    preflight_recursive_constant_stream_observed(
+        input,
+        expected,
+        limits,
+        verifier,
+        source_retained_bytes,
+        &mut |facts| admit(facts).map_err(TypeCodecError::from),
+        None,
+        work,
+    )
+}
+
+pub(crate) fn preflight_recursive_constant_stream_observed<
+    'a,
+    'f,
+    'port,
+    E: ReaderGeometryFailure,
+>(
+    input: &'a [u8],
+    expected: &'f Field,
+    limits: RecursiveStreamProjectionLimits,
+    verifier: &VerifierOptions,
+    source_retained_bytes: usize,
+    admit: &'port mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'port, E>,
+    construction: Option<&'port mut (dyn FnMut(std::alloc::Layout) -> Result<(), E> + 'port)>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<RecursiveConstantStream<'a, 'f>, E> {
     if input.len() > source_retained_bytes {
-        return Err(TypeCodecError::InvalidShape(
+        return Err((TypeCodecError::InvalidShape(
             "recursive stream source retention is below visible input",
-        ));
+        ))
+        .into());
     }
-    let mut admission = Admission::new(source_retained_bytes, admit);
+    let mut admission =
+        Admission::new(source_retained_bytes, admit).with_construction(construction);
     admission.check()?;
     preflight_core(
         input,
@@ -196,30 +354,70 @@ fn preflight<'a, 'f>(
 ) -> Result<RecursiveConstantStream<'a, 'f>, TypeCodecError> {
     preflight_core(input, expected, limits, verifier, None, work)
 }
-fn preflight_core<'a, 'f>(
+fn preflight_core<'a, 'f, E: ReaderGeometryFailure>(
     input: &'a [u8],
     expected: &'f Field,
     limits: RecursiveStreamProjectionLimits,
     verifier: &VerifierOptions,
-    mut admission: Option<&mut Admission<'_, '_>>,
+    admission: Option<&mut Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<RecursiveConstantStream<'a, 'f>, TypeCodecError> {
+) -> Result<RecursiveConstantStream<'a, 'f>, E> {
+    preflight_profile_core(
+        input,
+        expected,
+        Some(limits),
+        Some(verifier),
+        admission,
+        work,
+    )
+}
+pub(crate) fn preflight_recursive_constant_stream_input_derived_observed<
+    'a,
+    'f,
+    'port,
+    E: ReaderGeometryFailure,
+>(
+    input: &'a [u8],
+    expected: &'f Field,
+    source: usize,
+    admit: &'port mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'port, E>,
+    construction: Option<&'port mut (dyn FnMut(std::alloc::Layout) -> Result<(), E> + 'port)>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<RecursiveConstantStream<'a, 'f>, E> {
+    if input.len() > source {
+        return Err(TypeCodecError::InvalidShape(
+            "recursive stream source retention is below visible input",
+        )
+        .into());
+    }
+    let mut admission = Admission::new(source, admit).with_construction(construction);
+    admission.check()?;
+    preflight_profile_core(input, expected, None, None, Some(&mut admission), work)
+}
+fn preflight_profile_core<'a, 'f, E: ReaderGeometryFailure>(
+    input: &'a [u8],
+    expected: &'f Field,
+    limits: Option<RecursiveStreamProjectionLimits>,
+    verifier: Option<&VerifierOptions>,
+    mut admission: Option<&mut Admission<'_, '_, E>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<RecursiveConstantStream<'a, 'f>, E> {
     if admission.is_some() {
-        if input.len() > limits.max_input_bytes {
+        if limits.is_some_and(|limits| input.len() > limits.max_input_bytes) {
             return Err(novarocks_type_contract::CompileControlError::ResourceExhausted.into());
         }
     } else {
         require(
-            input.len() <= limits.max_input_bytes,
+            limits.is_none_or(|limits| input.len() <= limits.max_input_bytes),
             "recursive IPC input envelope exceeded",
             work,
         )?;
     }
-    let (schema, schema_end) = crate::ipc_flat_stream_v2::metadata_in(
+    let (schema, schema_end) = crate::ipc_flat_stream_v2::metadata_core(
         input,
         0,
-        limits.schema.max_flatbuffer_bytes,
-        Some(verifier.max_apparent_size),
+        limits.map(|limits| limits.schema.max_flatbuffer_bytes),
+        verifier.map(|verifier| verifier.max_apparent_size),
         admission.as_deref_mut(),
         work,
     )?;
@@ -232,28 +430,63 @@ fn preflight_core<'a, 'f>(
             a.requests(4, f.request_bytes, f.request_count)?;
             a.schema_work(f.work_upper_bound)
         };
-        crate::ipc_schema_v2::verify_single_field_schema_in(
+        let mut host = |facts: &crate::ipc_schema_v2::SchemaWriterRequestFacts| {
+            capture(facts).map_err(crate::host_projection_v2::ProjectionFailure::Host)
+        };
+        let verified = if let (Some(limits), Some(verifier)) = (limits, verifier) {
+            crate::ipc_schema_v2::verify_single_field_schema_with_host_in(
+                schema,
+                expected,
+                limits.schema,
+                verifier,
+                source,
+                usize::MAX,
+                &mut host,
+                work,
+            )
+        } else {
+            crate::ipc_schema_v2::verify_single_field_schema_input_derived_with_host_in(
+                schema, expected, source, &mut host, work,
+            )
+            .map(|_| ())
+        };
+        verified.map_err(|error| match error {
+            crate::host_projection_v2::ProjectionFailure::Host(error) => error,
+            crate::host_projection_v2::ProjectionFailure::Codec(error) => E::from(error),
+        })?;
+    } else {
+        verify_single_field_schema_with_work(
             schema,
             expected,
-            limits.schema,
-            verifier,
-            source,
-            usize::MAX,
-            &mut capture,
+            limits.expect("fixed plain schema profile").schema,
+            verifier.expect("fixed plain verifier"),
             work,
         )?;
-    } else {
-        verify_single_field_schema_with_work(schema, expected, limits.schema, verifier, work)?;
     }
-    let (batch_metadata, body_start) = crate::ipc_flat_stream_v2::metadata_in(
+    let (batch_metadata, body_start) = crate::ipc_flat_stream_v2::metadata_core(
         input,
         schema_end,
-        limits.batch.flat.max_metadata_bytes,
-        Some(verifier.max_apparent_size),
+        limits.map(|limits| limits.batch.flat.max_metadata_bytes),
+        verifier.map(|verifier| verifier.max_apparent_size),
         admission.as_deref_mut(),
         work,
     )?;
-    let message = verified_message_observed(batch_metadata, verifier, work)?;
+    let derived;
+    let batch_verifier = if let Some(verifier) = verifier {
+        verifier
+    } else {
+        derived = crate::ipc_flat_stream_v2::input_derived_batch_verifier(batch_metadata.len())?;
+        if let Some(a) = admission.as_deref_mut() {
+            a.batch_work_add(
+                derived
+                    .max_apparent_size
+                    .checked_add(batch_metadata.len())
+                    .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?,
+            )?;
+        }
+        &derived
+    };
+    let message = verified_message_observed(batch_metadata, batch_verifier, work)?;
     crate::ipc_flat_stream_v2::framing_require(
         message.header_type() == arrow::ipc::MessageHeader::RecordBatch,
         "recursive IPC schema must precede exactly one RecordBatch",
@@ -263,11 +496,14 @@ fn preflight_core<'a, 'f>(
     let body_length = nonnegative_length(message.bodyLength()).map_err(|_| {
         TypeCodecError::InvalidShape("recursive IPC body length is negative or unrepresentable")
     })?;
-    if admission.is_some() && body_length > limits.batch.flat.max_body_bytes {
+    if admission.is_some()
+        && limits.is_some_and(|limits| body_length > limits.batch.flat.max_body_bytes)
+    {
         return Err(novarocks_type_contract::CompileControlError::ResourceExhausted.into());
     }
     crate::ipc_flat_stream_v2::framing_require(
-        body_length <= limits.batch.flat.max_body_bytes && body_length % 8 == 0,
+        limits.is_none_or(|limits| body_length <= limits.batch.flat.max_body_bytes)
+            && body_length % 8 == 0,
         "recursive IPC body framing exceeds its aligned envelope",
         admission.as_deref_mut(),
         work,
@@ -278,16 +514,22 @@ fn preflight_core<'a, 'f>(
     let body_end = range.end;
     let body = &input[range];
     let checked = if let Some(a) = admission.as_deref_mut() {
-        crate::ipc_recursive_batch_v2::preflight_verified_recursive_record_batch_in(
+        crate::ipc_recursive_batch_v2::preflight_verified_recursive_record_batch_profile(
             message,
             body,
             expected,
-            limits.batch,
-            a,
+            limits.map(|limits| limits.batch),
+            Some(a),
             work,
         )?
     } else {
-        preflight_verified_recursive_record_batch(message, body, expected, limits.batch, work)?
+        preflight_verified_recursive_record_batch(
+            message,
+            body,
+            expected,
+            limits.expect("fixed plain geometry profile").batch,
+            work,
+        )?
     };
     let end = continuation_prefix(input, body_end);
     crate::ipc_flat_stream_v2::framing_step(&mut admission, work)?;
@@ -476,6 +718,27 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
         admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_>,
         work: &mut CompileCheckpoints<'c>,
     ) -> Result<PreparedRecursiveReader<'a, 'f, 'v, 'c>, RecursiveReaderError> {
+        self.prepare_pool_borrowed_observed(
+            field,
+            value_type,
+            source_retained_bytes,
+            policy,
+            limits,
+            &mut |facts| admit(facts).map_err(RecursiveReaderError::from),
+            work,
+        )
+    }
+
+    pub(crate) fn prepare_pool_borrowed_observed<'v, 'c, E: ReaderFailure>(
+        self,
+        field: Arc<Field>,
+        value_type: &'v FunctionValueType,
+        source_retained_bytes: usize,
+        policy: ConstantPolicy,
+        limits: RecursiveReaderProjectionLimits,
+        admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_, E>,
+        work: &mut CompileCheckpoints<'c>,
+    ) -> Result<PreparedRecursiveReader<'a, 'f, 'v, 'c>, E> {
         let mut admission = Admission::new(source_retained_bytes, admit);
         admission.limits(
             limits.max_new_allocation_request_bytes,
@@ -520,16 +783,63 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
             work,
         )
     }
-    fn prepare_parts_core<'v>(
+    fn prepare_parts_core<'v, E: ReaderFailure>(
         &self,
         field: Arc<Field>,
         value_type: Cow<'v, FunctionValueType>,
         source_retained_bytes: usize,
         policy: ConstantPolicy,
         limits: RecursiveReaderProjectionLimits,
-        mut admission: Option<&mut Admission<'_, '_>>,
+        admission: Option<&mut Admission<'_, '_, E>>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<PreparedRecursiveParts<'v>, RecursiveReaderError> {
+    ) -> Result<PreparedRecursiveParts<'v>, E> {
+        self.prepare_parts_profile_core(
+            field,
+            value_type,
+            source_retained_bytes,
+            Some(policy),
+            Some(limits),
+            admission,
+            work,
+        )
+    }
+    pub(crate) fn prepare_pool_borrowed_input_derived_observed<'v, 'c, E: ReaderFailure>(
+        self,
+        field: Arc<Field>,
+        value_type: &'v FunctionValueType,
+        source: usize,
+        admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_, E>,
+        work: &mut CompileCheckpoints<'c>,
+    ) -> Result<PreparedRecursiveReader<'a, 'f, 'v, 'c>, E> {
+        let mut admission = Admission::new(source, admit);
+        if let Some(prefix) = self.progress {
+            admission.seed_prefix(prefix)?;
+        }
+        let parts = self.prepare_parts_profile_core(
+            field,
+            Cow::Borrowed(value_type),
+            source,
+            None,
+            None,
+            Some(&mut admission),
+            work,
+        )?;
+        Ok(PreparedRecursiveReader {
+            original_control: Some(work.control()),
+            stream: self,
+            parts,
+        })
+    }
+    fn prepare_parts_profile_core<'v, E: ReaderFailure>(
+        &self,
+        field: Arc<Field>,
+        value_type: Cow<'v, FunctionValueType>,
+        source_retained_bytes: usize,
+        policy: Option<ConstantPolicy>,
+        limits: Option<RecursiveReaderProjectionLimits>,
+        mut admission: Option<&mut Admission<'_, '_, E>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<PreparedRecursiveParts<'v>, E> {
         if admission.is_some() {
             if !std::ptr::eq(self.field, field.as_ref()) {
                 return Err(FlatPoolResourceError::from(TypeCodecError::InvalidShape(
@@ -556,9 +866,7 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
                 a.clone_work(
                     crate::physical_type_v2::value_type_clone_preflight_work_upper_bound(),
                 )?;
-                crate::physical_type_v2::preflight_value_type_clone_admitted::<
-                    FlatPoolResourceError,
-                >(
+                crate::physical_type_v2::preflight_value_type_clone_admitted::<E>(
                     value_type.as_ref(),
                     &mut |f, _| {
                         a.requests(
@@ -581,30 +889,43 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
             )
             .map_err(FlatPoolResourceError::from)?;
         }
-        let mut facts = if let Some(a) = admission.as_deref_mut() {
+        let (mut facts, sealed) = if let Some(a) = admission.as_deref_mut() {
             if self.input.len() > source_retained_bytes {
                 return Err(FlatPoolResourceError::from(TypeCodecError::InvalidShape(
                     "recursive reader source retention below visible input",
                 ))
                 .into());
             }
-            reader_resources::preflight_in(
+            reader_resources::preflight_profile_core(
                 &self.reader_input(),
                 value_type.as_ref(),
                 source_retained_bytes,
                 policy,
                 limits,
-                a,
+                Some(a),
                 work,
             )?
         } else {
-            self.reader_resources(
-                value_type.as_ref(),
-                source_retained_bytes,
+            let policy = policy.ok_or_else(|| {
+                FlatPoolResourceError::from(TypeCodecError::InvalidShape(
+                    "input-derived recursive reader requires original observation",
+                ))
+            })?;
+            let limits = limits.ok_or_else(|| {
+                FlatPoolResourceError::from(TypeCodecError::InvalidShape(
+                    "plain recursive reader requires explicit profile",
+                ))
+            })?;
+            (
+                self.reader_resources(
+                    value_type.as_ref(),
+                    source_retained_bytes,
+                    policy,
+                    limits,
+                    work,
+                )?,
                 policy,
-                limits,
-                work,
-            )?
+            )
         };
         let progress = admission.as_deref().map(Admission::facts);
         if let Some(p) = progress {
@@ -624,7 +945,7 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
         Ok(PreparedRecursiveParts {
             field,
             value_type,
-            policy,
+            policy: sealed,
             facts,
             progress,
         })
@@ -635,21 +956,39 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
         parts: PreparedRecursiveParts<'_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<ConstantPool, RecursiveReaderError> {
-        self.materialize_parts_core(parts, None, work)
+        self.materialize_parts_core(parts, None, None, None, work)
     }
-    fn materialize_parts_core(
+    fn materialize_parts_core<E: ReaderFailure>(
         &self,
         parts: PreparedRecursiveParts<'_>,
-        admission: Option<&mut Admission<'_, '_>>,
+        admission: Option<&mut Admission<'_, '_, E>>,
+        source: Option<novarocks_constant_contract::ConstantSourceOwner>,
+        mut creation: Option<crate::ipc_flat_stream_v2::reader_creation::ReaderCreation<'_, E>>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<ConstantPool, RecursiveReaderError> {
+    ) -> Result<ConstantPool, E> {
         let PreparedRecursiveParts {
             field,
             value_type,
             policy,
-            facts: _,
-            progress: _,
+            facts,
+            progress,
         } = parts;
+        if let Some(creation) = creation.as_mut() {
+            let operation = facts
+                .new_allocation_request_bytes_upper_bound
+                .checked_sub(facts.constant_owner_request_bytes_upper_bound)
+                .and_then(|bytes| {
+                    bytes.checked_sub(progress.map_or(0, |p| p.geometry_scratch_request_bytes))
+                })
+                .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+            creation.operation(
+                operation,
+                facts.retained_payload_request_bytes_upper_bound,
+                facts.retained_reader_request_bytes_upper_bound,
+                facts.retained_pool_data_request_bytes_upper_bound,
+                work,
+            )?;
+        }
         work.flush()?;
         let schema = Arc::new(Schema::new([Arc::clone(&field)]));
         if admission.is_some() {
@@ -695,8 +1034,38 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
                     f.cumulative_work_upper_bound,
                 )
             };
-            ConstantPool::try_new_in(field, value_type, data, policy, &mut capture, work)
-                .map_err(FlatPoolResourceError::from)?
+            if let Some(creation) = creation {
+                let source = source.ok_or_else(|| {
+                    reader_resources::invalid(
+                        "recursive creator reader is missing original source custody",
+                    )
+                })?;
+                creation
+                    .pool(
+                        field,
+                        value_type,
+                        data,
+                        policy,
+                        source,
+                        &mut |facts| {
+                            capture(facts).map_err(
+                                novarocks_constant_contract::ConstantCreationFailure::Creator,
+                            )
+                        },
+                        work,
+                    )
+                    .map_err(crate::ipc_flat_stream_v2::pool_resources::flatten_constant_failure)?
+            } else {
+                ConstantPool::try_new_pure_observed_in(
+                    field,
+                    value_type,
+                    data,
+                    policy,
+                    &mut capture,
+                    work,
+                )
+                .map_err(crate::ipc_flat_stream_v2::pool_resources::flatten_constant_failure)?
+            }
         } else {
             ConstantPool::try_new(
                 field,

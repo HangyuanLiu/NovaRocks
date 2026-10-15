@@ -1208,8 +1208,12 @@ mod purpose_tests {
             ResultField, ResultPort, ResultValueDomain, ValueId, ValueType,
         };
         use novarocks_type_contract::ValueLogicalType;
-        let mut ty = ValueType::new(arrow::datatypes::DataType::FixedSizeBinary(16), true);
-        ty.logical_type = ValueLogicalType::Uuid;
+        let ty = ValueType::try_with_logical_type(
+            arrow::datatypes::DataType::FixedSizeBinary(16),
+            true,
+            ValueLogicalType::Uuid,
+        )
+        .unwrap();
         let port = ResultPort {
             fragment: novarocks_physical_plan::FragmentId::new(1),
             output: novarocks_physical_plan::OutputPort {

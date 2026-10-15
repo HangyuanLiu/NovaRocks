@@ -101,7 +101,7 @@ fn output(result: &SelectedValues<'_>) -> Vec<Option<String>> {
         .collect()
 }
 fn pool(array: ArrayRef) -> ConstantPool {
-    let ty = FunctionValueType::new(array.data_type().clone(), true);
+    let ty = FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true);
     ConstantPool::try_new(
         Arc::new(
             ty.try_to_field("original")
@@ -132,7 +132,7 @@ const NAMES: [&str; 1] = ["substring_index"];
 fn sources(arity: usize) -> Vec<FunctionValueType> {
     (0..arity)
         .map(|i| {
-            FunctionValueType::new(
+            FunctionValueType::from_legacy_declared_projection(
                 if i < 2 {
                     DataType::Utf8
                 } else {
@@ -192,7 +192,9 @@ fn string_substring_index_exact_profile_preserves_direction_empty_delimiter_and_
         let types: Vec<_> = sources(3)
             .into_iter()
             .map(|mut ty| {
-                ty.nullable = nullable;
+                ty = ty
+                    .with_nullable(nullable)
+                    .expect("valid function nullability declaration");
                 ty
             })
             .collect();
@@ -468,7 +470,9 @@ fn string_substring_index_required_child_errors_and_wrong_canonical_shapes_fail_
         Err(KernelFailure::InvalidProgram(_))
     ));
     let mut types = sources(3);
-    types[0].nullable = false;
+    types[0] = types[0]
+        .with_nullable(false)
+        .expect("valid function nullability declaration");
     let prepared =
         prepared_for_test_with_policy("substring_index", &types, DecimalOverflowPolicy::OutputNull)
             .unwrap();
@@ -799,7 +803,7 @@ fn string_substring_index_owner_preserves_exact_fresh_frozen_arc_effects_and_rej
         for source in [
             FunctionValueType::new(DataType::LargeUtf8, true),
             FunctionValueType::new(DataType::Binary, true),
-            FunctionValueType::new(
+            FunctionValueType::from_legacy_declared_projection(
                 DataType::List(Arc::new(arrow_schema::Field::new(
                     "item",
                     DataType::Int64,
@@ -830,7 +834,7 @@ fn string_substring_index_owner_preserves_exact_fresh_frozen_arc_effects_and_rej
 fn string_substring_index_compile_success_and_ordinary_tail_preserve_all_callback_causes() {
     for ty in [source(true), FunctionValueType::new(DataType::Binary, true)] {
         let good = CompileControl::default();
-        let success = ty.data_type == DataType::Utf8;
+        let success = ty.data_type() == &DataType::Utf8;
         assert_eq!(
             prepared_for_test_with_control(
                 "substring_index",

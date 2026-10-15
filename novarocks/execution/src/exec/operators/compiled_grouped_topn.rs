@@ -48,7 +48,7 @@ use super::compiled_expression::{
 use super::compiled_grouped_topn_resources::{
     ArrowWorkBudget, ArrowWorkShape, retain_new_key_array,
 };
-use super::sort::normalize_sort_key_array;
+use super::sort::creation::SortCreation;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, OutputColumnMetadata};
 use crate::exec::expr::agg::{AggregateAllocator, AggregateVec};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
@@ -95,11 +95,11 @@ struct Plan {
     sites: Vec<ProgramExpressionRootSite>,
     groups: usize,
     permutation: Vec<usize>,
-    rank_types: Vec<DataType>,
+    rank_types: Vec<novarocks_type_contract::FunctionValueType>,
     fields: Vec<SortField>,
     limit: usize,
     calls: Vec<CallPlan>,
-    output: ChunkSchemaRef,
+    output_layout: novarocks_local_program::StaticLayout,
 }
 
 pub(crate) struct CompiledGroupedTopNProcessorFactory {
@@ -114,6 +114,8 @@ impl CompiledGroupedTopNProcessorFactory {
             plan: self.plan.clone(),
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             tracker: None,
+            construction: None,
+            output: None,
             instances: None,
             candidates: None,
             pending: None,
@@ -144,7 +146,10 @@ impl CompiledGroupedTopNProcessorFactory {
         else {
             return Err("compiled node is not a GroupedTopN".into());
         };
-        let output = ChunkSchema::from_compiled_layout(graph_node.output_layout())?;
+        if !graph_node.output_layout().is_typed() {
+            return Err("compiled GroupedTopN requires its complete output layout".into());
+        }
+        let output_layout = graph_node.output_layout().clone();
         let mut sites = Vec::new();
         for group in 0..group_by.len() {
             sites.push(ProgramExpressionRootSite::Node {
@@ -169,11 +174,12 @@ impl CompiledGroupedTopNProcessorFactory {
             if !comparator.supports_value_type(&ty) {
                 return Err("GroupedTopN key is outside its exact comparison domain".into());
             }
-            let normalized = if novarocks_types::largeint::is_largeint_data_type(&ty.data_type) {
-                DataType::Decimal128(38, 0)
-            } else {
-                ty.data_type.clone()
-            };
+            let normalized =
+                if ty.logical_type() == novarocks_type_contract::ValueLogicalType::LargeInt {
+                    DataType::Decimal128(38, 0)
+                } else {
+                    ty.data_type().clone()
+                };
             fields.push(SortField::new_with_options(
                 normalized,
                 SortOptions {
@@ -181,7 +187,7 @@ impl CompiledGroupedTopNProcessorFactory {
                     nulls_first: key.nulls_first,
                 },
             ));
-            rank_types.push(ty.data_type);
+            rank_types.push(ty);
             sites.push(site);
         }
         let mut calls = Vec::new();
@@ -215,7 +221,7 @@ impl CompiledGroupedTopNProcessorFactory {
             fields,
             limit: *limit,
             calls,
-            output,
+            output_layout,
             sites,
             program,
         };
@@ -303,6 +309,8 @@ struct CompiledGroupedTopNProcessor {
     plan: Plan,
     control: RuntimeKernelControl,
     tracker: Option<Arc<MemTracker>>,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    output: Option<ChunkSchemaRef>,
     instances: Option<Vec<CompiledExpressionInstance>>,
     candidates: Option<Candidates>,
     pending: Option<AggregateVec<Chunk>>,
@@ -418,11 +426,27 @@ impl CompiledGroupedTopNProcessor {
                 buffers: multiply(self.plan.groups, 3)?,
             },
         )?;
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        let input_schema = input.chunk_schema_ref();
+        let creation = SortCreation::new(factory.as_ref(), &input_schema);
+        let owner = creation.begin(input)?;
+        let types = creation.begin(input)?;
         let mut normalized = AggregateVec::new_in(set.allocator.clone());
         reserve(&mut normalized, self.plan.groups)?;
-        for array in &values[self.plan.groups..self.plan.groups * 2] {
+        for (rank, array) in values[self.plan.groups..self.plan.groups * 2]
+            .iter()
+            .enumerate()
+        {
             self.control.checkpoint(0)?;
-            normalized.push(normalize_sort_key_array(array).map_err(arrow_failure)?);
+            normalized.push(creation.normalize_key(
+                array,
+                self.plan.rank_types[rank].value_type(),
+                owner.as_ref(),
+                types.as_ref(),
+            )?);
             self.control.checkpoint(0)?;
         }
         let mut row_stock = OpaqueRetainedCharge::try_new(Arc::clone(&set.host))?;
@@ -493,6 +517,14 @@ impl CompiledGroupedTopNProcessor {
         let Some(set) = self.candidates.as_ref() else {
             return Ok(());
         };
+        let output = self
+            .output
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        let creation = self
+            .construction
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
         let mut pending = AggregateVec::new_in(set.allocator.clone());
         reserve(&mut pending, set.entries.len())?;
         for candidate in &set.entries {
@@ -518,9 +550,9 @@ impl CompiledGroupedTopNProcessor {
             reserve(&mut keys, self.plan.groups)?;
             keys.resize_with(self.plan.groups, || None);
             for (rank, array) in decoded.into_iter().enumerate() {
-                let array = if novarocks_types::largeint::is_largeint_data_type(
-                    &self.plan.rank_types[rank],
-                ) {
+                let array = if self.plan.rank_types[rank].logical_type()
+                    == novarocks_type_contract::ValueLogicalType::LargeInt
+                {
                     let decimal = array
                         .as_any()
                         .downcast_ref::<Decimal128Array>()
@@ -557,13 +589,14 @@ impl CompiledGroupedTopNProcessor {
             for state in &candidate.states {
                 columns.push(state.emit_evaluation(1, &self.control)?);
             }
-            let batch = RecordBatch::try_new(self.plan.output.arrow_schema_ref(), columns)
-                .map_err(arrow_failure)?;
+            let batch =
+                RecordBatch::try_new(output.arrow_schema_ref(), columns).map_err(arrow_failure)?;
             self.control.checkpoint(0)?;
             pending.push(Chunk::try_new_with_output_column_metadata(
                 batch,
-                Arc::clone(&self.plan.output),
+                Arc::clone(output),
                 column_metadata,
+                creation.begin_typed_construction(output)?.as_ref(),
             )?);
             // Output's actual source/call custody survives this temporary loan.
             drop(library);
@@ -580,6 +613,24 @@ impl Drop for CompiledGroupedTopNProcessor {
     }
 }
 impl Operator for CompiledGroupedTopNProcessor {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.control.bind_construction_factory(factory.clone());
+        self.construction = Some(factory);
+    }
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        self.output = Some(factory.create_compiled_chunk_schema(&self.plan.output_layout)?);
+        Ok(())
+    }
     fn name(&self) -> &str {
         &self.name
     }

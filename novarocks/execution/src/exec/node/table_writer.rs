@@ -35,7 +35,9 @@ use novarocks_spi::connector::write_stack::{
     WriteTargetOrdinal,
 };
 
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+#[cfg(test)]
+use crate::exec::chunk::ChunkSchema;
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::exec::node::ExecNode;
@@ -45,6 +47,7 @@ use crate::exec::node::table_write_relation::ConnectorCommitFragmentEncoder;
 use crate::exec::node::table_write_relation::{
     AllowTableWriteAggregates, TableWriteAggregateGuard,
 };
+#[cfg(test)]
 use novarocks_types::SlotId;
 
 /// The attempt-local facts every driver of one `TableWriter` shares.
@@ -102,45 +105,50 @@ pub struct TableWriterInputProjection {
     arena: ExprArena,
     exprs: Vec<ExprId>,
     schema: SchemaRef,
-    chunk_schema: ChunkSchemaRef,
+    chunk_schema: Option<ChunkSchemaRef>,
+    provider_chunk_schema: Option<ChunkSchemaRef>,
+    _provider_layout: Option<novarocks_local_program::StaticLayout>,
+    static_layout: Option<novarocks_local_program::StaticLayout>,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
 }
 
 impl TableWriterInputProjection {
     pub(crate) fn from_static(
         projection: &novarocks_local_program::StaticWriterProjection,
+        provider_layout: &novarocks_local_program::StaticLayout,
         runtime_error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
     ) -> Result<Self, String> {
         let mut arena = ExprArena::from_immutable(&projection.arena)?;
         arena.bind_runtime_error(runtime_error);
-        let exprs = projection
+        let exprs: Vec<ExprId> = projection
             .expressions
             .iter()
             .map(|id| ExprId(id.index()))
             .collect();
-        Self::try_new(arena, exprs, Arc::clone(projection.layout.schema()))
-            .map_err(|error| error.to_string())
+        if !projection.layout.is_typed() || !provider_layout.is_typed() {
+            return Err("writer projection lacks its complete static bindings".into());
+        }
+        Self::validate_expressions(&arena, &exprs, provider_layout.schema())
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            arena,
+            exprs,
+            schema: Arc::clone(provider_layout.schema()),
+            chunk_schema: None,
+            provider_chunk_schema: None,
+            _provider_layout: Some(provider_layout.clone()),
+            static_layout: Some(projection.layout.clone()),
+            construction: None,
+        })
     }
 
+    #[cfg(test)]
     pub fn try_new(
         arena: ExprArena,
         exprs: Vec<ExprId>,
         schema: SchemaRef,
     ) -> Result<Self, ExecPlanBuildError> {
-        if exprs.is_empty() || exprs.len() != schema.fields().len() {
-            return Err(ExecPlanBuildError::new(
-                ExecPlanInvariant::Node,
-                "table writer expression projection does not match its output schema",
-            ));
-        }
-        if let Some(expr_id) = exprs.iter().find(|expr_id| arena.node(**expr_id).is_none()) {
-            return Err(ExecPlanBuildError::new(
-                ExecPlanInvariant::Expression,
-                format!(
-                    "table writer input expression id {} is missing from its arena",
-                    expr_id.0
-                ),
-            ));
-        }
+        Self::validate_expressions(&arena, &exprs, &schema)?;
         let slot_ids = (0..schema.fields().len())
             .map(|ordinal| {
                 ordinal
@@ -162,8 +170,120 @@ impl TableWriterInputProjection {
             arena,
             exprs,
             schema,
-            chunk_schema,
+            provider_chunk_schema: Some(chunk_schema.clone()),
+            chunk_schema: Some(chunk_schema),
+            _provider_layout: None,
+            static_layout: None,
+            construction: None,
         })
+    }
+
+    fn validate_expressions(
+        arena: &ExprArena,
+        exprs: &[ExprId],
+        schema: &SchemaRef,
+    ) -> Result<(), ExecPlanBuildError> {
+        if exprs.is_empty() || exprs.len() != schema.fields().len() {
+            return Err(ExecPlanBuildError::new(
+                ExecPlanInvariant::Node,
+                "table writer expression projection does not match its output schema",
+            ));
+        }
+        if let Some(expr_id) = exprs.iter().find(|expr_id| arena.node(**expr_id).is_none()) {
+            return Err(ExecPlanBuildError::new(
+                ExecPlanInvariant::Expression,
+                format!(
+                    "table writer input expression id {} is missing from its arena",
+                    expr_id.0
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The decoder supplies its already-created complete execution schema.
+    /// No type or logical domain is reconstructed from presentation fields.
+    pub fn try_new_typed(
+        arena: ExprArena,
+        exprs: Vec<ExprId>,
+        provider_chunk_schema: ChunkSchemaRef,
+        chunk_schema: ChunkSchemaRef,
+    ) -> Result<Self, ExecPlanBuildError> {
+        if !chunk_schema.is_typed()
+            || !provider_chunk_schema.is_typed()
+            || chunk_schema.slot_ids() != provider_chunk_schema.slot_ids()
+        {
+            return Err(ExecPlanBuildError::new(
+                ExecPlanInvariant::Schema,
+                "writer projection requires its complete execution bindings",
+            ));
+        }
+        let schema = provider_chunk_schema.arrow_schema_ref();
+        Self::validate_expressions(&arena, &exprs, &schema)?;
+        Ok(Self {
+            arena,
+            exprs,
+            schema,
+            chunk_schema: Some(chunk_schema),
+            provider_chunk_schema: Some(provider_chunk_schema),
+            _provider_layout: None,
+            static_layout: None,
+            construction: None,
+        })
+    }
+
+    pub(crate) fn prepare_created(
+        &mut self,
+        factory: Option<&Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        if let Some(layout) = self.static_layout.as_ref() {
+            let factory = factory.ok_or(ConstructionFailure::MissingOwner)?;
+            self.chunk_schema = Some(factory.create_compiled_chunk_schema(layout)?);
+            self.static_layout = None;
+        }
+        if self.chunk_schema().is_typed() {
+            self.construction = Some(factory.ok_or(ConstructionFailure::MissingOwner)?.clone());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn project_created(
+        &self,
+        chunk: &Chunk,
+    ) -> crate::runtime::fragment::ExecutionResult<Chunk> {
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        let schema = self.chunk_schema();
+        if !schema.is_typed() {
+            #[cfg(test)]
+            return Ok(self.project(chunk)?);
+            #[cfg(not(test))]
+            return Err(ConstructionFailure::InvalidSource(
+                "writer projection lacks its complete execution bindings".into(),
+            )
+            .into());
+        }
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let owner = factory.begin_typed_construction(schema)?;
+        let layout = std::alloc::Layout::array::<arrow::array::ArrayRef>(self.exprs.len())
+            .map_err(|_| ConstructionFailure::from(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?;
+        owner.request(layout)?;
+        let columns = self.project_columns(chunk)?;
+        validate_writer_projection_requiredness(&self.schema, &columns)?;
+        let rows = columns.first().map_or(chunk.len(), |array| array.len());
+        Ok(Chunk::try_new_typed_with_columns_owned_observed::<
+            ConstructionFailure,
+            _,
+        >(
+            schema.clone(),
+            columns,
+            rows,
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
+        )?)
     }
 
     pub const fn schema(&self) -> &SchemaRef {
@@ -174,20 +294,24 @@ impl TableWriterInputProjection {
         &mut self.arena
     }
 
-    pub const fn chunk_schema(&self) -> &ChunkSchemaRef {
-        &self.chunk_schema
+    pub fn chunk_schema(&self) -> &ChunkSchemaRef {
+        self.chunk_schema
+            .as_ref()
+            .expect("writer projection schema is prepared")
+    }
+
+    pub(crate) fn provider_chunk_schema(&self) -> &ChunkSchemaRef {
+        self.provider_chunk_schema
+            .as_ref()
+            .expect("decoded provider schema is present")
     }
 
     /// Consume decoder-owned expression backing when freezing the local
     /// program. No writer or request capability crosses this boundary.
     pub(crate) fn into_static(
         self,
+        layout: novarocks_local_program::StaticLayout,
     ) -> Result<novarocks_local_program::StaticWriterProjection, String> {
-        let layout = novarocks_local_program::StaticLayout::try_new(
-            self.chunk_schema.arrow_schema_ref(),
-            Arc::from(self.chunk_schema.slot_ids()),
-        )
-        .map_err(|error| error.to_string())?;
         Ok(novarocks_local_program::StaticWriterProjection {
             arena: Arc::new(
                 self.arena
@@ -205,43 +329,58 @@ impl TableWriterInputProjection {
 
     /// Evaluate the projection once and expose the exact same target-typed
     /// Arrow buffers to both the connector writer and embedded aggregates.
+    #[cfg(test)]
     pub fn project(&self, chunk: &Chunk) -> Result<Chunk, String> {
-        let arrays = self
-            .exprs
-            .iter()
-            .map(|expr| self.arena.eval(*expr, chunk))
-            .collect::<Result<Vec<_>, _>>()?;
-        let arrays = arrays
-            .into_iter()
-            .zip(self.schema.fields())
-            .enumerate()
-            .map(|(index, (array, field))| {
-                if array.data_type() == field.data_type() {
-                    return Ok(array);
-                }
-                let casted = if matches!(
-                    field.data_type(),
-                    DataType::FixedSizeBinary(width)
-                        if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH
-                ) {
-                    cast_with_special_rules(&array, field.data_type())
-                } else {
-                    cast(array.as_ref(), field.data_type()).map_err(|error| error.to_string())
-                };
-                casted.map_err(|error| {
-                    format!(
-                        "table writer projection cast failed at column {index} from {:?} to {:?}: {error}",
-                        array.data_type(),
-                        field.data_type()
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        if self.chunk_schema().is_typed() {
+            return Err("typed writer projection requires its actual construction owner".into());
+        }
+        let arrays = self.project_columns(chunk)?;
         let batch = arrow::record_batch::RecordBatch::try_new(Arc::clone(&self.schema), arrays)
             .map_err(|error| format!("build table writer projected batch: {error}"))?;
-        Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.chunk_schema))
+        Chunk::try_new_with_chunk_schema(batch, Arc::clone(self.chunk_schema()))
             .map_err(|error| format!("build table writer projected chunk: {error}"))
     }
+    fn project_columns(&self, chunk: &Chunk) -> Result<Vec<arrow::array::ArrayRef>, String> {
+        // Preserve the original ordering: evaluate every expression, then cast
+        // each result in ordinal order. Reuse this actual output Vec rather
+        // than creating a second container whose lifetime could be ambiguous.
+        let mut arrays = Vec::with_capacity(self.exprs.len());
+        for expr in &self.exprs {
+            arrays.push(self.arena.eval(*expr, chunk)?);
+        }
+        for (index, (array, field)) in arrays.iter_mut().zip(self.schema.fields()).enumerate() {
+            if array.data_type() == field.data_type() {
+                continue;
+            }
+            let casted = if matches!(field.data_type(), DataType::FixedSizeBinary(width)
+                if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
+            {
+                cast_with_special_rules(array, field.data_type())
+            } else {
+                cast(array.as_ref(), field.data_type()).map_err(|error| error.to_string())
+            };
+            *array = casted.map_err(|error| format!(
+                "table writer projection cast failed at column {index} from {:?} to {:?}: {error}",
+                array.data_type(), field.data_type(),
+            ))?;
+        }
+        Ok(arrays)
+    }
+}
+
+pub(crate) fn validate_writer_projection_requiredness(
+    schema: &arrow::datatypes::Schema,
+    columns: &[arrow::array::ArrayRef],
+) -> Result<(), String> {
+    for (field, column) in schema.fields().iter().zip(columns) {
+        if !field.is_nullable() && column.null_count() > 0 {
+            return Err(format!(
+                "build table writer projected batch: Invalid argument error: Column '{}' is declared as non-nullable but contains null values",
+                field.name(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for TableWriterInputProjection {
@@ -528,6 +667,150 @@ mod runtime_projection_tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
+    fn created_projection_layout(schema: SchemaRef) -> novarocks_local_program::StaticLayout {
+        use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
+        use crate::runtime::mem_tracker::MemTracker;
+        use novarocks_type_contract::owned_resources::layout::arc_layout;
+        use novarocks_type_contract::{FunctionValueType, TypedValueBinding};
+        use std::alloc::Layout;
+
+        let ty = FunctionValueType::new(DataType::Boolean, false);
+        let declared = crate::exec::chunk::typed_fixture::layout(
+            Arc::clone(&schema),
+            &[SlotId::new(1)],
+            &[ty.clone()],
+        );
+        let factory = try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            MemTracker::new_root("writer projection fixture layout"),
+            Arc::new(RuntimeErrorState::default()),
+        )
+        .unwrap();
+        let owner = factory
+            .begin_compiled_layout_construction(&declared)
+            .unwrap();
+        owner
+            .request(arc_layout(Layout::array::<SlotId>(1).unwrap()).unwrap())
+            .unwrap();
+        let slots = Arc::from([SlotId::new(1)]);
+        owner
+            .request(Layout::array::<(TypedValueBinding, Option<i32>)>(1).unwrap())
+            .unwrap();
+        let bindings = vec![(ty.typed_binding().clone(), None)];
+        novarocks_local_program::StaticLayout::try_new_typed_with_creator(
+            schema,
+            slots,
+            bindings,
+            owner.storage_lifetime(),
+            |request| {
+                owner
+                    .request(request)
+                    .map_err(novarocks_local_program::LayoutCreationFailure::Creator)
+            },
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn typed_writer_projection_keeps_nominal_input_through_freeze_and_last_output_exit() {
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
+        use crate::runtime::mem_tracker::MemTracker;
+        use arrow::array::{ArrayRef, StringArray};
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        let tracker = MemTracker::new_root("typed writer projection output");
+        let errors = Arc::new(RuntimeErrorState::default());
+        let factory = try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker.clone(),
+            errors.clone(),
+        )
+        .unwrap();
+        let ty =
+            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+                .unwrap();
+        let layout = crate::exec::chunk::typed_fixture::layout(
+            Arc::new(Schema::new(vec![Field::new(
+                "document",
+                DataType::Utf8,
+                false,
+            )])),
+            &[SlotId::new(1)],
+            &[ty.clone()],
+        );
+        let source_schema = factory.create_compiled_chunk_schema(&layout).unwrap();
+        let mut arena = ExprArena::default();
+        let expr = arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), ty.clone());
+        let decoded = TableWriterInputProjection::try_new_typed(
+            arena,
+            vec![expr],
+            source_schema.clone(),
+            source_schema.clone(),
+        )
+        .unwrap();
+        assert!(decoded.chunk_schema().is_typed());
+        assert_eq!(
+            decoded.chunk_schema().slots()[0].typed_binding(),
+            ty.typed_binding()
+        );
+        let frozen = decoded.into_static(layout.clone()).unwrap();
+        let mut runtime =
+            TableWriterInputProjection::from_static(&frozen, &frozen.layout, errors.clone())
+                .unwrap();
+        runtime.prepare_created(Some(&factory)).unwrap();
+        let owner = factory.begin_typed_construction(&source_schema).unwrap();
+        owner
+            .request(std::alloc::Layout::array::<ArrayRef>(1).unwrap())
+            .unwrap();
+        let input = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            source_schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["{}", "[]"])) as ArrayRef],
+            2,
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
+        )
+        .unwrap();
+        drop(owner);
+        let output = runtime.project_created(&input).unwrap();
+        assert_eq!(
+            output.chunk_schema().slots()[0].typed_binding(),
+            ty.typed_binding()
+        );
+        assert_eq!(
+            output.chunk_schema().slots()[0]
+                .field()
+                .metadata()
+                .capacity(),
+            0
+        );
+        assert_eq!(
+            output.columns()[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(1),
+            "[]"
+        );
+        let weak = Arc::downgrade(&factory);
+        let output = output.into_batch_projection();
+        drop((
+            runtime,
+            frozen,
+            layout,
+            source_schema,
+            input,
+            factory,
+            errors,
+            ty,
+        ));
+        assert!(weak.upgrade().is_none());
+        assert!(tracker.current() > 0);
+        assert_eq!(output.record_batch().num_rows(), 2);
+        drop(output);
+        assert_eq!(tracker.current(), 0);
+    }
+
     #[test]
     fn static_writer_projection_binds_its_exact_fragment_stop_owner() {
         let mut arena = ExprArena::default();
@@ -544,15 +827,25 @@ mod runtime_projection_tests {
             DataType::Boolean,
             false,
         )]));
+        let layout = created_projection_layout(Arc::clone(&schema));
         let frozen = TableWriterInputProjection::try_new(arena, vec![sleep], schema)
             .unwrap()
-            .into_static()
+            .into_static(layout)
             .unwrap();
         let first = Arc::new(RuntimeErrorState::default());
         let sibling = Arc::new(RuntimeErrorState::default());
-        let projection =
-            TableWriterInputProjection::from_static(&frozen, Arc::clone(&first)).unwrap();
-        let sibling_projection = TableWriterInputProjection::from_static(&frozen, sibling).unwrap();
+        let mut projection =
+            TableWriterInputProjection::from_static(&frozen, &frozen.layout, Arc::clone(&first))
+                .unwrap();
+        let mut sibling_projection =
+            TableWriterInputProjection::from_static(&frozen, &frozen.layout, sibling).unwrap();
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("writer projection runtime fixture"),
+            Arc::new(RuntimeErrorState::default()),
+        ).unwrap();
+        projection.prepare_created(Some(&factory)).unwrap();
+        sibling_projection.prepare_created(Some(&factory)).unwrap();
         let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&input_schema),
@@ -563,16 +856,18 @@ mod runtime_projection_tests {
             ChunkSchema::try_ref_from_schema_and_slot_ids(&input_schema, &[SlotId::new(1)])
                 .unwrap();
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
-        assert!(projection.project(&chunk).is_ok());
+        assert!(projection.project_created(&chunk).is_ok());
         first.set_error("writer fragment cancelled".to_string());
         assert_eq!(
-            projection.project(&chunk).unwrap_err(),
-            "writer fragment cancelled"
+            projection.project_created(&chunk).unwrap_err(),
+            crate::runtime::fragment::ExecutionFailure::from(
+                "writer fragment cancelled".to_string()
+            )
         );
-        assert!(sibling_projection.project(&chunk).is_ok());
+        assert!(sibling_projection.project_created(&chunk).is_ok());
         assert!(
             projection
-                .into_static()
+                .into_static(frozen.layout.clone())
                 .unwrap_err()
                 .contains("RuntimeBoundArena")
         );

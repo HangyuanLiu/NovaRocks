@@ -263,12 +263,18 @@ fn setop_exact_remap_rejects_full_nested_dictionary_and_field_drift() {
     // Arrow PartialEq cannot certify these two frozen Field attributes.
     assert_eq!(source, changed_id);
     assert_eq!(source, changed_order);
-    for target in [
+    for same_value in [
         changed_id,
         changed_order,
+        dictionary(7, false, true, "nested", "changed"),
+    ] {
+        let ty = physical(source.clone(), true);
+        let mut fixture = Fixture::new(ty.clone(), ty, physical(same_value, true));
+        assert!(fixture.run(&Control::default()).unwrap().is_some());
+    }
+    for target in [
         dictionary(7, false, false, "nested", "original"),
         dictionary(7, false, true, "different_name", "original"),
-        dictionary(7, false, true, "nested", "changed"),
     ] {
         assert_refused(physical(source.clone(), true), physical(target, true));
     }

@@ -123,9 +123,8 @@ impl PreparedWindowKernel for PreparedValue {
             self.partition_retained_upper_bound(rows)?;
             let source = input.full_input().logical_arguments()[0];
             let mut addresses = reserve::<Option<u64>>(rows, &mut work)?;
-            // Only the needed direction is retained temporarily. IGNORE NULLS
-            // intentionally uses the original physical Array::is_null rule,
-            // not the logical encoded-NULL traversal of scalar kernels.
+            // Retain only the needed direction. NULL follows the selected
+            // logical value through borrowed encoding access.
             let nearest = if self.contract.options().ignore_nulls() {
                 let count = rows
                     .checked_add(1)
@@ -140,7 +139,12 @@ impl PreparedWindowKernel for PreparedValue {
                     ValueOperation::First => {
                         for row in (0..rows).rev() {
                             let address = source.value_row(row, row);
-                            if !source.array().is_null(address) {
+                            if !crate::kernel_input::logical_is_null(
+                                source.array().as_ref(),
+                                address,
+                                1,
+                                &mut work,
+                            )? {
                                 found = Some(row);
                             }
                             nearest[row] = found;
@@ -150,7 +154,12 @@ impl PreparedWindowKernel for PreparedValue {
                     ValueOperation::Last => {
                         for (row, slot) in nearest.iter_mut().take(rows).enumerate() {
                             let address = source.value_row(row, row);
-                            if !source.array().is_null(address) {
+                            if !crate::kernel_input::logical_is_null(
+                                source.array().as_ref(),
+                                address,
+                                1,
+                                &mut work,
+                            )? {
                                 found = Some(row);
                             }
                             *slot = found;
@@ -251,7 +260,7 @@ impl WindowKernelPartition for ValuePartition<'_> {
                     copied.map_err(|_| internal("window value Arrow take failed"))?;
                 SelectedValues::try_new_observed::<KernelFailure>(
                     selection,
-                    &self.prepared.contract.result_type().data_type,
+                    self.prepared.contract.result_type().data_type(),
                     copied,
                     Box::default(),
                     || work.step(),

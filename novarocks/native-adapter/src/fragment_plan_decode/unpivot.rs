@@ -18,18 +18,19 @@
 //! Native Unpivot decoder integration coverage.
 
 mod tests {
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field};
 
+    use super::super::NativePlanDecodeContext;
     use super::super::tests::{
-        column_ref, one_col_values_node, output_column_with_nullable, physical_node, string_literal,
+        FixturePlan, column_ref, decode_node, one_col_values_node, output_column_with_nullable,
+        physical_node, string_literal,
     };
-    use super::super::{NativePlanDecodeContext, decode_node};
+    use crate::fragment_expression::fixture_sources::{Declaration, relation_fields};
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
-    use novarocks_proto_codec::{FieldPath, arrow_physical};
     use novarocks_proto_models::plan;
 
-    fn valid_unpivot(literal: novarocks_proto_models::expr::Expr) -> plan::DistributedNode {
+    fn valid_unpivot(literal: novarocks_proto_models::expr::Expr) -> FixturePlan {
         let mut node = physical_node(
             20,
             plan::plan_node::Kind::Unpivot(plan::UnpivotNode {
@@ -63,11 +64,7 @@ mod tests {
         node
     }
 
-    fn install_exact_output_schema(
-        node: &mut plan::DistributedNode,
-        fields: Vec<Field>,
-        slot_ids: &[u32],
-    ) {
+    fn install_exact_output_schema(node: &mut FixturePlan, fields: Vec<Field>, slot_ids: &[u32]) {
         let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
         else {
             panic!("physical node");
@@ -76,17 +73,27 @@ mod tests {
         let Some(plan::plan_node::Kind::Unpivot(unpivot)) = physical.kind.as_mut() else {
             panic!("Unpivot node");
         };
-        let schema = Schema::new(fields);
-        let (columns, schema_metadata) = arrow_physical::encode_schema(
-            &schema,
-            slot_ids,
-            false,
-            FieldPath::root("unpivot.output_schema"),
-        )
-        .expect("exact output schema");
+        // Independently declared fixture types author the exact output relation.
+        let declarations = fields
+            .iter()
+            .zip(slot_ids)
+            .map(|(field, slot)| {
+                (
+                    *slot,
+                    field.name().as_str(),
+                    field
+                        .data_type()
+                        .declared()
+                        .with_nullable(field.is_nullable())
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (columns, logical_types) = relation_fields(&declarations);
         unpivot.output_schema = Some(plan::ArrowPhysicalSchema {
             columns,
-            schema_metadata,
+
+            logical_types,
         });
     }
 
@@ -129,22 +136,36 @@ mod tests {
         let Some(plan::plan_node::Kind::Unpivot(unpivot)) = physical.kind.as_mut() else {
             panic!("Unpivot node");
         };
-        unpivot
-            .output_schema
-            .as_mut()
-            .expect("output schema")
-            .columns[1]
-            .field
-            .as_mut()
-            .expect("field")
-            .nullable = false;
+        let (columns, logical_types) = relation_fields(&[
+            (
+                10,
+                "label",
+                DataType::Utf8.declared().with_nullable(false).unwrap(),
+            ),
+            (
+                11,
+                "value",
+                DataType::Int64.declared().with_nullable(false).unwrap(),
+            ),
+        ]);
+        let output = unpivot.output_schema.as_mut().expect("output schema");
+        output.columns = columns;
+        output.logical_types = logical_types;
         let mut arena = ExprArena::default();
         let error =
             decode_node(&node, &mut arena, &NativePlanDecodeContext::default()).unwrap_err();
-        assert!(
-            error.contains("value output nullability mismatch"),
-            "{error}"
+        let protocol = error
+            .protocol()
+            .expect("complete NULL mismatch is a protocol refusal");
+        assert_eq!(
+            protocol.kind(),
+            novarocks_proto_codec::ProtocolErrorKind::InconsistentFields
         );
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.root.payload.physical.unpivot.value_mappings[0].input_value_column_id"
+        );
+        assert!(error.contains("UnpivotNode value type mismatch"), "{error}");
     }
 
     #[test]

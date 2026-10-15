@@ -33,18 +33,11 @@ pub(crate) struct Requests {
     pub count: usize,
 }
 
-// FlatBuffers 25.9.23 builder.rs FieldLoc has these two fields. Under the
-// caller's locked Rust source contract its allocation layout is size 8,
-// alignment 4. This is an allocation implementation detail, not a type grammar.
-#[allow(dead_code)]
-struct FieldLocation {
-    offset: u32,
-    slot: u16,
-}
-
-/// Layout of the sole locked FlatBuffers private FieldLoc source mirror.
+// The original locked private-layout author is shared with standard Arrow
+// stream construction; the codec retains its original source-model checks.
+type FieldLocation = novarocks_functions::arrow_ipc_construction::LockedFieldLocation;
 pub(crate) fn field_location_layout() -> Layout {
-    Layout::new::<FieldLocation>()
+    novarocks_functions::arrow_ipc_construction::locked_field_location_layout()
 }
 
 type TypeWalkerEntry<'a> = (&'a DataType, usize);

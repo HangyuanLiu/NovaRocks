@@ -109,9 +109,13 @@ fn run(
         facts: resources.facts(),
     })
 }
-fn raw(root: &DataType, source: usize) -> Outcome {
-    let control = Control::default();
-    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+fn run_raw(
+    root: &DataType,
+    source: usize,
+    caps: Caps,
+    control: &Control,
+) -> Result<Outcome, ControlResourceError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
     let mut resources = ControlResourceCounter::default();
     let mut usage = ResourceUsage::limited(MAX_FRAGMENT_DYNAMIC_ITEMS, MAX_FRAGMENT_DYNAMIC_BYTES);
     let mut errors = ValidationContext::new();
@@ -123,18 +127,20 @@ fn raw(root: &DataType, source: usize) -> Outcome {
         &mut CallerTypeValidation {
             source,
             resources: &mut resources,
-            admit: &mut |_| Ok(()),
+            admit: &mut |facts| gate(facts, caps),
             work: &mut work,
         },
-    )
-    .unwrap();
-    work.finish().unwrap();
-    Outcome {
+    )?;
+    work.finish()?;
+    Ok(Outcome {
         items: usage.items,
         bytes: usage.bytes,
         errors: errors.into_vec(),
         facts: resources.facts(),
-    }
+    })
+}
+fn raw(root: &DataType, source: usize) -> Outcome {
+    run_raw(root, source, OPEN, &Control::default()).unwrap()
 }
 fn plain(ty: &ValueType) -> (usize, usize, Vec<ValidationError>) {
     let mut cut = CutResourcePreflight::new();
@@ -148,7 +154,7 @@ fn assert_plain(ty: &ValueType, actual: &Outcome) {
     assert_eq!(actual.bytes, bytes);
     assert_eq!(actual.errors, errors);
 }
-fn wide(count: usize) -> (ValueType, usize) {
+fn wide_raw(count: usize) -> (DataType, usize) {
     // These fresh source Fields have empty String/HashMap backings. Their
     // actual Arc<Field> and Arc<[FieldRef]> layouts give a truthful union
     // source invoice without guessing existing HashMap deleted capacity.
@@ -165,11 +171,43 @@ fn wide(count: usize) -> (ValueType, usize) {
     .unwrap()
     .size();
     (
-        ValueType::new(DataType::Struct(fields.into()), false),
+        DataType::Struct(fields.into()),
         std::mem::size_of::<ValueType>() + slice + count * field_bytes,
     )
 }
-fn metadata_field(reserved: usize, retained: usize) -> (ValueType, usize) {
+fn wide(count: usize) -> (ValueType, usize) {
+    let (data_type, source) = wide_raw(count);
+    let ty = ValueType::new(data_type, false);
+    // The checked author retains independent semantic holders alongside the
+    // normalized Arrow tree. Query their actual private layouts, not mirrors.
+    let mut source = source
+        + novarocks_type_contract::ValueLayout::storage_allocation_layout()
+            .unwrap()
+            .size();
+    novarocks_type_contract::visit_value_type_observed(ty.value_type(), |visit| {
+        match visit {
+            novarocks_type_contract::ValueSemanticVisit::Node(value) => {
+                source += novarocks_type_contract::ValueTypeRef::storage_allocation_layout()
+                    .unwrap()
+                    .size();
+                if let novarocks_type_contract::ValueKind::Struct(fields) = value.kind() {
+                    source += Layout::array::<novarocks_type_contract::ValueField>(fields.len())
+                        .unwrap()
+                        .size();
+                }
+            }
+            novarocks_type_contract::ValueSemanticVisit::NamedField(_) => {
+                source += novarocks_type_contract::ValueField::storage_allocation_layout()
+                    .unwrap()
+                    .size();
+            }
+        }
+        Ok::<_, std::convert::Infallible>(())
+    })
+    .unwrap();
+    (ty, source)
+}
+fn metadata_field(reserved: usize, retained: usize) -> (DataType, usize) {
     let mut metadata = HashMap::new();
     metadata.try_reserve(reserved).unwrap();
     for i in 0..reserved {
@@ -192,7 +230,7 @@ fn metadata_field(reserved: usize, retained: usize) -> (ValueType, usize) {
             .size()
         + table.request_bytes_upper_bound
         + string_backings;
-    (ValueType::new(DataType::List(field), false), source)
+    (DataType::List(field), source)
 }
 
 #[test]
@@ -204,7 +242,7 @@ fn real_pending_vec_initial_and_branch_exact_layouts_have_independent_goldens() 
         Layout::array::<(&DataType, usize)>(1).unwrap().size()
     );
     let (ty, source) = wide(MAX_DATA_TYPE_NODES - 1);
-    let out = raw(&ty.data_type, source);
+    let out = raw(&ty.data_type(), source);
     assert!(out.errors.is_empty());
     assert_eq!(out.items, 2 * MAX_DATA_TYPE_NODES - 1);
     // The caller policy performs the actual branch reserve_exact(4095),
@@ -217,8 +255,11 @@ fn real_pending_vec_initial_and_branch_exact_layouts_have_independent_goldens() 
                 .unwrap()
                 .size()
     );
-    let (over, source) = wide(MAX_DATA_TYPE_NODES);
-    let over = raw(&over.data_type, source);
+    let (over, source) = wide_raw(MAX_DATA_TYPE_NODES);
+    assert!(
+        ValueType::try_with_logical_type(over.clone(), false, ValueLogicalType::Physical).is_err()
+    );
+    let over = raw(&over, source);
     assert_eq!(over.items, 1);
     assert_eq!(over.errors.len(), 1);
     assert_eq!(
@@ -236,18 +277,17 @@ fn real_pending_vec_initial_and_branch_exact_layouts_have_independent_goldens() 
 
 #[test]
 fn original_lifo_decimal_dictionary_and_negative_fixed_size_diagnostics_stay_exact() {
-    let ty = ValueType::new(
-        DataType::Struct(
-            vec![
-                Arc::new(Field::new("", DataType::Decimal128(0, 0), false)),
-                Arc::new(Field::new("", DataType::FixedSizeBinary(-1), false)),
-            ]
-            .into(),
-        ),
-        false,
+    let ty = DataType::Struct(
+        vec![
+            Arc::new(Field::new("", DataType::Decimal128(0, 0), false)),
+            Arc::new(Field::new("", DataType::FixedSizeBinary(-1), false)),
+        ]
+        .into(),
     );
-    let out = run(&ty, 4096, OPEN, &Control::default()).unwrap();
-    assert_plain(&ty, &out);
+    assert!(
+        ValueType::try_with_logical_type(ty.clone(), false, ValueLogicalType::Physical).is_err()
+    );
+    let out = raw(&ty, 4096);
     assert_eq!(
         out.errors.iter().map(|e| e.message()).collect::<Vec<_>>(),
         [
@@ -259,15 +299,15 @@ fn original_lifo_decimal_dictionary_and_negative_fixed_size_diagnostics_stay_exa
         out.errors[0].category(),
         ValidationErrorCategory::StructuralInvariant
     );
-    let dictionary = ValueType::new(
-        DataType::Dictionary(
-            Box::new(DataType::Utf8),
-            Box::new(DataType::FixedSizeBinary(-1)),
-        ),
-        false,
+    let dictionary = DataType::Dictionary(
+        Box::new(DataType::Utf8),
+        Box::new(DataType::FixedSizeBinary(-1)),
     );
-    let out = run(&dictionary, 4096, OPEN, &Control::default()).unwrap();
-    assert_plain(&dictionary, &out);
+    assert!(
+        ValueType::try_with_logical_type(dictionary.clone(), false, ValueLogicalType::Physical)
+            .is_err()
+    );
+    let out = raw(&dictionary, 4096);
     assert_eq!(
         out.errors[0].message(),
         "Arrow dictionary key must be an integer type"
@@ -283,14 +323,13 @@ fn real_deleted_metadata_backing_is_charged_without_len_or_capacity_inference() 
     let (fresh, fresh_source) = metadata_field(1, 1);
     let (deleted, deleted_source) = metadata_field(2048, 1);
     assert!(deleted_source > fresh_source);
-    let original_metadata = match &deleted.data_type {
+    let original_metadata = match &deleted {
         DataType::List(field) => field.metadata(),
         _ => unreachable!(),
     };
     assert_eq!(original_metadata.len(), 1);
-    let fresh = run(&fresh, fresh_source, OPEN, &Control::default()).unwrap();
-    let out = run(&deleted, deleted_source, OPEN, &Control::default()).unwrap();
-    assert_plain(&deleted, &out);
+    let fresh = raw(&fresh, fresh_source);
+    let out = raw(&deleted, deleted_source);
     assert!(out.errors.is_empty());
     assert_eq!(out.items, fresh.items);
     assert_eq!(out.bytes, fresh.bytes);
@@ -303,21 +342,14 @@ fn real_deleted_metadata_backing_is_charged_without_len_or_capacity_inference() 
 }
 
 #[test]
-fn separate_logical_law_uses_real_scratch_and_original_nominal_errors() {
-    let mut ty = ValueType::new(DataType::Utf8, true);
-    ty.logical_type = ValueLogicalType::Variant;
-    let out = run(
-        &ty,
-        std::mem::size_of::<ValueType>(),
-        OPEN,
-        &Control::default(),
-    )
-    .unwrap();
-    assert_plain(&ty, &out);
-    assert_eq!(out.errors.len(), 1);
-    assert_eq!(out.errors[0].message(), "invalid Arrow carrier for Variant");
+fn typed_semantic_author_refuses_invalid_domains_and_does_not_read_metadata() {
+    assert_eq!(
+        ValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Variant)
+            .unwrap_err(),
+        novarocks_type_contract::ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::Variant)
+    );
     let field = Arc::new(
-        Field::new("", DataType::Int64, false).with_metadata(
+        Field::new("ignored-role", DataType::Int64, false).with_metadata(
             [(
                 novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_owned(),
                 "unknown".to_owned(),
@@ -326,12 +358,13 @@ fn separate_logical_law_uses_real_scratch_and_original_nominal_errors() {
         ),
     );
     let nested = ValueType::new(DataType::List(field), false);
-    let nested_out = run(&nested, 4096, OPEN, &Control::default()).unwrap();
-    assert_plain(&nested, &nested_out);
-    assert_eq!(
-        nested_out.errors[0].message(),
-        "unknown logical type metadata"
-    );
+    let out = run(&nested, 4096, OPEN, &Control::default()).unwrap();
+    assert_plain(&nested, &out);
+    assert!(out.errors.is_empty());
+    let DataType::List(field) = nested.data_type() else {
+        unreachable!()
+    };
+    assert!(field.metadata().is_empty());
     let primitive = ValueType::new(DataType::Int64, false);
     let out = run(
         &primitive,
@@ -340,14 +373,14 @@ fn separate_logical_law_uses_real_scratch_and_original_nominal_errors() {
         &Control::default(),
     )
     .unwrap();
-    let carrier = raw(&primitive.data_type, std::mem::size_of::<ValueType>());
+    let carrier = raw(primitive.data_type(), std::mem::size_of::<ValueType>());
     assert_eq!(
         out.facts.allocation_requests_upper_bound,
         carrier.facts.allocation_requests_upper_bound
     );
     assert_eq!(
         out.facts.cumulative_work_upper_bound - carrier.facts.cumulative_work_upper_bound,
-        type_validation::scratch_work_upper_bound() + 1
+        1
     );
 }
 
@@ -355,13 +388,7 @@ fn separate_logical_law_uses_real_scratch_and_original_nominal_errors() {
 fn every_actual_small_success_and_ordinary_type_callback_preserves_three_causes() {
     for ty in [
         ValueType::new(DataType::Int64, false),
-        ValueType::new(
-            DataType::Dictionary(
-                Box::new(DataType::Utf8),
-                Box::new(DataType::Decimal32(0, 0)),
-            ),
-            false,
-        ),
+        ValueType::new(DataType::Decimal32(9, 0), false),
     ] {
         let good = Control::default();
         let result = run(&ty, 4096, OPEN, &good).unwrap();
@@ -478,8 +505,7 @@ fn known_initial_and_branch_requests_refuse_before_real_late_controls() {
 fn actual_metadata_take_257_has_real_quantum_and_keeps_original_overlimit_law() {
     let (ty, source) = metadata_field(320, 320);
     let good = Control::default();
-    let out = run(&ty, source, OPEN, &good).unwrap();
-    assert_plain(&ty, &out);
+    let out = run_raw(&ty, source, OPEN, &good).unwrap();
     assert_eq!(out.errors.len(), 1);
     assert_eq!(
         out.errors[0].message(),
@@ -493,7 +519,7 @@ fn actual_metadata_take_257_has_real_quantum_and_keeps_original_overlimit_law() 
                 refusal: Some((at, cause)),
                 ..Control::default()
             };
-            assert!(matches!(run(&ty,source,OPEN,&control),
+            assert!(matches!(run_raw(&ty,source,OPEN,&control),
             Err(ControlResourceError::Control(actual)) if actual==cause));
             assert_eq!(control.trace(), trace[..=at]);
         }
@@ -556,13 +582,12 @@ fn all_owned_axes_exact_replay_and_saturated_original_usage_remain_distinct() {
     assert_eq!(control.trace(), [0, 0]);
 }
 
-/// The logical getter probes the closed key over at most the retained source
-/// buckets, and each candidate comparison reads at most that key. Its charge
-/// is affine in the source invoice, so a truthful multi-GiB receiver invoice
-/// with several nested fields stays representable.
+/// Actual semantic visits no longer probe Arrow metadata. The independent
+/// retained Arrow layout's iterator source bound remains affine, so a large
+/// original source invoice cannot make semantic name work quadratic.
 #[test]
 #[cfg(target_pointer_width = "64")]
-fn nested_field_logical_lookup_charge_is_linear_in_the_retained_source() {
+fn semantic_walk_is_source_independent_and_layout_header_work_remains_linear() {
     let ty = ValueType::new(
         DataType::Struct(
             vec![
@@ -580,13 +605,12 @@ fn nested_field_logical_lookup_charge_is_linear_in_the_retained_source() {
         out.facts.cumulative_work_upper_bound
     };
     let key = novarocks_type_contract::NR_LOGICAL_TYPE_KEY.len();
-    let lookup = |source| hashmap::string_operations_work_upper_bound(source, 1, key, key).unwrap();
     let header = |source| hashmap::source_iterator_work_upper_bound(source, 0).unwrap();
     let step = 1usize << 30;
     let (one, two, three) = (work(step), work(2 * step), work(3 * step));
-    // Exactly one field header and one logical lookup per nested field depend
-    // on the source; nothing else does, and neither grows faster than it.
-    let per_step = 2 * (lookup(2 * step) - lookup(step) + header(2 * step) - header(step));
+    // Only the physical field header's original opaque iterator source bound
+    // depends on source B; semantic name bytes are the actual retained names.
+    let per_step = 2 * (header(2 * step) - header(step));
     assert_eq!(two - one, per_step);
     assert_eq!(three - two, per_step);
     // A source-sized key length charged about 2 * source^2 per field: two

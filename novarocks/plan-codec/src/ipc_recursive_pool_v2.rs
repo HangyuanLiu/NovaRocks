@@ -58,7 +58,8 @@ pub struct RecursivePoolWriteFacts {
 
 struct Prepared<'pool> {
     geometry: geometry::Geometry,
-    facts: RecursivePoolWriteFacts,
+    facts: Option<RecursivePoolWriteFacts>,
+    construction: ipc_flat_pool_v2::WriterConstruction,
     schema: Option<ipc_schema_v2::PreparedSchemaWriter<'pool>>,
 }
 
@@ -72,7 +73,10 @@ pub(crate) struct PreparedRecursivePoolWriter<'pool, 'control> {
 }
 impl PreparedRecursivePoolWriter<'_, '_> {
     pub(crate) const fn facts(&self) -> &RecursivePoolWriteFacts {
-        &self.prepared.facts
+        self.prepared
+            .facts
+            .as_ref()
+            .expect("receiving recursive writer owns source facts")
     }
 
     pub(crate) fn emit_in(
@@ -98,8 +102,19 @@ impl PreparedRecursivePoolWriter<'_, '_> {
         {
             return Err((shape("recursive writer belongs to another control")).into());
         }
-        admit(&self.prepared.facts)?;
-        emit_prepared_core(self.pool, &self.prepared, self.limits, Some(admit), work)
+        admit(
+            self.prepared
+                .facts
+                .as_ref()
+                .expect("receiving recursive writer owns source facts"),
+        )?;
+        emit_prepared_core(
+            self.pool,
+            &self.prepared,
+            Some(self.limits.flat.schema),
+            Some(admit),
+            work,
+        )
     }
     pub(crate) fn emit(self, control: &dyn PureCompileControl) -> Result<Vec<u8>, TypeCodecError> {
         if self
@@ -109,9 +124,81 @@ impl PreparedRecursivePoolWriter<'_, '_> {
             return Err(shape("recursive writer belongs to another control"));
         }
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-        let result = emit_prepared(self.pool, &self.prepared, self.limits, &mut work);
+        let result = emit_prepared(
+            self.pool,
+            &self.prepared,
+            Some(self.limits.flat.schema),
+            &mut work,
+        );
         finish(work, result)
     }
+}
+
+/// Explicit pure owner: the immutable source and original control remain
+/// borrowed, while receiving resource/admission facts are absent.
+pub(crate) struct PreparedPureRecursivePoolWriter<'pool, 'control> {
+    pool: &'pool ConstantPool,
+    prepared: Prepared<'pool>,
+    control: &'control dyn PureCompileControl,
+}
+impl PreparedPureRecursivePoolWriter<'_, '_> {
+    pub(crate) fn emit_in(
+        self,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Vec<u8>, TypeCodecError> {
+        if !std::ptr::addr_eq(self.control, work.control()) {
+            return Err(shape("pure recursive writer belongs to another control"));
+        }
+        emit_prepared(self.pool, &self.prepared, None, work)
+    }
+}
+pub(crate) fn prepare_recursive_pool_write_pure_in<'pool, 'control>(
+    pool: &'pool ConstantPool,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedPureRecursivePoolWriter<'pool, 'control>, TypeCodecError> {
+    work.flush()?;
+    if pool.source_owner().is_none() {
+        novarocks_constant_contract::validate_pure_borrowed_source_in(pool.field(), work).map_err(
+            |error| match error {
+                novarocks_constant_contract::ConstantError::Control(cause) => {
+                    TypeCodecError::Control(cause)
+                }
+                _ => TypeCodecError::ResourceSource(
+                    "pure borrowed pool has no original metadata custody",
+                ),
+            },
+        )?;
+    }
+    if !(LOCKED_FAMILY
+        && LOCKED_TOOLCHAIN
+        && arrow::ARROW_VERSION == crate::resource_source_model::LOCKED_ARROW_VERSION
+        && cfg!(target_endian = "little"))
+    {
+        return Err(shape(
+            "recursive writer source model does not match this target",
+        ));
+    }
+    let geometry = geometry::inspect_pure(pool.data(), work)?;
+    let schema = ipc_schema_v2::preflight_writer_pure_in(pool.field(), work)?;
+    let construction = ipc_flat_pool_v2::construction_from_counts(
+        &schema,
+        geometry.nodes,
+        geometry.buffers,
+        geometry.view_fields,
+        geometry.body_bytes,
+    )?;
+    std::alloc::Layout::array::<u8>(construction.stream_backing)
+        .map_err(|_| shape("recursive writer stream request is not representable"))?;
+    Ok(PreparedPureRecursivePoolWriter {
+        pool,
+        prepared: Prepared {
+            geometry,
+            facts: None,
+            construction,
+            schema: None,
+        },
+        control: work.control(),
+    })
 }
 
 fn finish<T>(
@@ -387,17 +474,15 @@ fn prepare_core<'pool, H>(
         )
     };
     let schema_resources = schema_facts;
-    let batch_backing = policy.numeric(ipc_flat_pool_v2::header::backing_counts(
+    let construction = policy.numeric(ipc_flat_pool_v2::construction_from_counts(
+        &schema,
         geometry.nodes,
         geometry.buffers,
         geometry.view_fields,
+        geometry.body_bytes,
     ))?;
-    let schema_capacity = policy.numeric(ipc_flat_pool_v2::metadata_capacity(schema.backing))?;
-    let batch_capacity = policy.numeric(ipc_flat_pool_v2::metadata_capacity(batch_backing))?;
-    let stream_capacity = add(
-        add(add(schema_capacity, batch_capacity)?, geometry.body_bytes)?,
-        24,
-    )?;
+    let batch_backing = construction.batch_backing;
+    let stream_capacity = construction.stream_backing;
     if stream_capacity > limits.flat.max_encoded_stream_bytes {
         return Err((if policy.0 {
             CompileControlError::ResourceExhausted.into()
@@ -494,7 +579,8 @@ fn prepare_core<'pool, H>(
     }
     Ok(Prepared {
         geometry,
-        facts,
+        facts: Some(facts),
+        construction,
         schema: schema_token,
     })
 }
@@ -587,8 +673,11 @@ pub fn preflight_recursive_pool_write(
     control: &dyn PureCompileControl,
 ) -> Result<RecursivePoolWriteFacts, TypeCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result =
-        prepare(pool, source_retained_bytes, limits, &mut work).map(|prepared| prepared.facts);
+    let result = prepare(pool, source_retained_bytes, limits, &mut work).map(|prepared| {
+        prepared
+            .facts
+            .expect("receiving recursive writer owns source facts")
+    });
     finish(work, result)
 }
 
@@ -620,24 +709,24 @@ pub fn encode_recursive_pool(
 ) -> Result<Vec<u8>, TypeCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
     let result = prepare(pool, source_retained_bytes, limits, &mut work)
-        .and_then(|prepared| emit_prepared(pool, &prepared, limits, &mut work));
+        .and_then(|prepared| emit_prepared(pool, &prepared, Some(limits.flat.schema), &mut work));
     finish(work, result)
 }
 
 fn emit_prepared(
     pool: &ConstantPool,
     prepared: &Prepared<'_>,
-    limits: RecursivePoolWriteLimits,
+    schema_limits: Option<ipc_schema_v2::IpcSchemaProjectionLimits>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<u8>, TypeCodecError> {
-    emit_prepared_core::<std::convert::Infallible>(pool, prepared, limits, None, work)
+    emit_prepared_core::<std::convert::Infallible>(pool, prepared, schema_limits, None, work)
         .map_err(ProjectionFailure::without_host)
 }
 
 fn emit_prepared_core<H>(
     pool: &ConstantPool,
     prepared: &Prepared<'_>,
-    limits: RecursivePoolWriteLimits,
+    schema_limits: Option<ipc_schema_v2::IpcSchemaProjectionLimits>,
     mut parent: Option<&mut HostPoolAdmit<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<u8>, HostError<H>> {
@@ -646,33 +735,36 @@ fn emit_prepared_core<H>(
         schema.emit_with_host_in(
             &mut |_| {
                 if let Some(parent) = parent.as_deref_mut() {
-                    parent(&prepared.facts)?;
+                    parent(
+                        prepared
+                            .facts
+                            .as_ref()
+                            .expect("receiving recursive writer owns source facts"),
+                    )?;
                 }
                 Ok(())
             },
             work,
         )?
     } else {
-        ipc_schema_v2::encode_single_field_schema(pool.field(), limits.flat.schema, work.control())?
+        match schema_limits {
+            Some(limits) => {
+                ipc_schema_v2::encode_single_field_schema(pool.field(), limits, work.control())?
+            }
+            None => ipc_schema_v2::encode_single_field_schema_pure_in(pool.field(), work)?,
+        }
     };
     work.flush()?;
-    let mut batch =
-        ipc_flat_pool_v2::reserve(prepared.facts.flat.batch_backing_bytes_upper_bound, work)?;
-    ipc_flat_pool_v2::initialize_to(
-        &mut batch,
-        prepared.facts.flat.batch_backing_bytes_upper_bound,
-        work,
-    )?;
+    let mut batch = ipc_flat_pool_v2::reserve(prepared.construction.batch_backing, work)?;
+    ipc_flat_pool_v2::initialize_to(&mut batch, prepared.construction.batch_backing, work)?;
     work.flush()?;
     let mut builder = FlatBufferBuilder::from_vec(batch);
     work.flush()?;
     header::emit(pool.data(), &prepared.geometry, &mut builder, work)?;
-    if builder.mut_finished_buffer().0.len() != prepared.facts.flat.batch_backing_bytes_upper_bound
-    {
+    if builder.mut_finished_buffer().0.len() != prepared.construction.batch_backing {
         return Err((shape("recursive batch builder grew beyond admitted backing")).into());
     }
-    let mut output =
-        ipc_flat_pool_v2::reserve(prepared.facts.flat.encoded_stream_bytes_upper_bound, work)?;
+    let mut output = ipc_flat_pool_v2::reserve(prepared.construction.stream_backing, work)?;
     ipc_flat_pool_v2::frame(&mut output, &schema, work)?;
     ipc_flat_pool_v2::frame(&mut output, builder.finished_data(), work)?;
     let body_start = output.len();
@@ -685,7 +777,7 @@ fn emit_prepared_core<H>(
         work,
     )?;
     ipc_flat_pool_v2::append(&mut output, &[255, 255, 255, 255, 0, 0, 0, 0], work)?;
-    if output.len() > prepared.facts.flat.encoded_stream_bytes_upper_bound {
+    if output.len() > prepared.construction.stream_backing {
         return Err((shape("recursive writer result exceeds admitted stream capacity")).into());
     }
     Ok(output)

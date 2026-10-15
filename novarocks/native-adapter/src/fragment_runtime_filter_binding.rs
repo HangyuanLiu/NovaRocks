@@ -19,14 +19,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
-use std::sync::Arc;
 
 use crate::fragment_error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use novarocks_execution::runtime_filter as execution;
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{expr, plan};
-
-use crate::runtime_filter_membership::{MembershipContractDecodeError, decode_membership_contract};
 
 /// Backend-local producer attachment target decoded from the native fragment
 /// binding table. It is translated into the corresponding neutral execution
@@ -42,12 +39,12 @@ pub enum ProducerBindingTarget {
     dead_code,
     reason = "Retained for target-specific native integration and regression coverage."
 )]
-pub struct DecodedRuntimeFilterBinding {
+pub struct DecodedRuntimeFilterBinding<'wire> {
     pub binding_id: u32,
     pub channel_id: u32,
     pub node_id: i32,
     pub apply_point: DecodedApplyPoint,
-    pub expression: expr::Expr,
+    pub expression: &'wire expr::Expr,
     pub expression_path: FieldPath,
     pub role: DecodedBindingRole,
 }
@@ -106,9 +103,9 @@ enum WireArtifactCapability {
     EmptyDomain,
 }
 
-pub struct NativeRuntimeFilterDecodeLedger {
+pub struct NativeRuntimeFilterDecodeLedger<'wire> {
     fragment_id: u32,
-    records: BTreeMap<u32, DecodedRuntimeFilterBinding>,
+    records: BTreeMap<u32, DecodedRuntimeFilterBinding<'wire>>,
     consumed: BTreeMap<u32, ()>,
 }
 
@@ -116,10 +113,21 @@ pub struct NativeRuntimeFilterDecodeLedger {
     dead_code,
     reason = "Retained for target-specific native integration and regression coverage."
 )]
-impl NativeRuntimeFilterDecodeLedger {
+impl<'wire> NativeRuntimeFilterDecodeLedger<'wire> {
+    #[cfg(test)]
     pub fn decode(
         enclosing_fragment_id: u32,
-        table: Option<&plan::RuntimeFilterBindingTable>,
+        table: Option<&'wire plan::RuntimeFilterBindingTable>,
+    ) -> Result<Self, NativeFragmentDecodeError> {
+        crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+            Self::decode_with_types(enclosing_fragment_id, table, decoder)
+        })
+    }
+
+    pub(crate) fn decode_with_types(
+        enclosing_fragment_id: u32,
+        table: Option<&'wire plan::RuntimeFilterBindingTable>,
+        type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
     ) -> Result<Self, NativeFragmentDecodeError> {
         let path = FieldPath::root("plan_fragment").field("runtime_filter_bindings");
         let table = table.ok_or_else(|| {
@@ -152,7 +160,7 @@ impl NativeRuntimeFilterDecodeLedger {
                     ),
                 ));
             }
-            let record = decode_binding(wire, binding_path.clone())?;
+            let record = decode_binding(wire, binding_path.clone(), type_decoder)?;
             if records.insert(record.binding_id, record).is_some() {
                 return Err(NativeFragmentDecodeError::inconsistent(
                     binding_path.field("binding_id"),
@@ -173,7 +181,7 @@ impl NativeRuntimeFilterDecodeLedger {
         binding_id: u32,
         node_id: i32,
         node_fragment_id: u32,
-    ) -> Result<&DecodedRuntimeFilterBinding, NativeFragmentLeafDecodeError> {
+    ) -> Result<&DecodedRuntimeFilterBinding<'wire>, NativeFragmentLeafDecodeError> {
         if node_fragment_id != self.fragment_id {
             return Err(NativeFragmentLeafDecodeError::at_field(
                 ProtocolErrorKind::InconsistentFields,
@@ -218,7 +226,7 @@ impl NativeRuntimeFilterDecodeLedger {
         binding_ids: &[u32],
         node_id: i32,
         node_fragment_id: u32,
-    ) -> Result<Vec<DecodedRuntimeFilterBinding>, NativeFragmentLeafDecodeError> {
+    ) -> Result<Vec<DecodedRuntimeFilterBinding<'wire>>, NativeFragmentLeafDecodeError> {
         let mut seen = BTreeSet::new();
         binding_ids.iter().copied().map(|binding_id| {
             if !seen.insert(binding_id) {
@@ -294,10 +302,11 @@ impl NativeRuntimeFilterDecodeLedger {
     }
 }
 
-fn decode_binding(
-    wire: &plan::RuntimeFilterBinding,
+fn decode_binding<'wire>(
+    wire: &'wire plan::RuntimeFilterBinding,
     path: FieldPath,
-) -> Result<DecodedRuntimeFilterBinding, NativeFragmentDecodeError> {
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
+) -> Result<DecodedRuntimeFilterBinding<'wire>, NativeFragmentDecodeError> {
     let apply_point = plan::RuntimeFilterApplyPoint::try_from(wire.apply_point).map_err(|_| {
         NativeFragmentDecodeError::invalid_enum(
             path.clone().field("apply_point"),
@@ -316,26 +325,45 @@ fn decode_binding(
         plan::RuntimeFilterApplyPoint::Unspecified => unreachable!("rejected above"),
     };
     let expression_path = path.clone().field("expression");
-    let expression = wire.expression.clone().ok_or_else(|| {
+    let expression = wire.expression.as_ref().ok_or_else(|| {
         NativeFragmentDecodeError::missing(
             expression_path.clone(),
             "runtime-filter binding requires expression",
         )
     })?;
-    crate::fragment_expression::validate_proto_expr_shape_at(&expression, expression_path.clone())
-        .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))?;
-    let expression_type = novarocks_plan_codec::native_type::decode_type(
-        expression.r#type.as_ref().expect("checked"),
+    crate::fragment_expression::validate_proto_expr_shape_at_with_types(
+        expression,
+        expression_path.clone(),
+        type_decoder,
     )
-    .map_err(|error| {
-        NativeFragmentDecodeError::invalid_value(expression_path.clone().field("type"), error)
-    })?;
-    let contract = decode_contract(
-        wire.binding_id,
-        &expression_type,
-        wire.contract.as_ref(),
-        path.clone().field("contract"),
-    )?;
+    .map_err(|error| error.into_native())?;
+    let desc = expression.r#type.as_ref().expect("checked");
+    let endpoint_type = type_decoder.value_type(desc, expression_path.clone().field("type"))?;
+    let contract = match type_decoder {
+        crate::fragment_type_decode::NativeTypeDecoder::Strong { resources, .. } => {
+            let wire_contract = wire.contract.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    path.clone().field("contract"),
+                    "runtime filter contract is required",
+                )
+            })?;
+            crate::runtime_filter_install::decode_typed_contract_domain(
+                wire.binding_id,
+                wire_contract,
+                None,
+                path.clone(),
+                resources,
+            )?
+        }
+    };
+    if let (Some(endpoint), Some(domain)) = (endpoint_type.as_ref(), contract.value_type()) {
+        if !type_decoder.bindings_match(endpoint.typed_binding(), domain.typed_binding(), true)? {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                expression_path.clone().field("type"),
+                "runtime filter endpoint differs from complete independently owned domain",
+            ));
+        }
+    }
     let reduction = decode_reduction(
         wire.binding_id,
         &contract,
@@ -521,166 +549,6 @@ fn decode_runtime_filter_activation(
                 }
             };
             Ok(execution::ConsumerActivation::NonBlockingLive { late_apply })
-        }
-    }
-}
-
-fn decode_contract(
-    binding_id: u32,
-    expression_type: &arrow::datatypes::DataType,
-    wire: Option<&plan::RuntimeFilterContract>,
-    path: FieldPath,
-) -> Result<execution::RuntimeFilterExecutionContract, NativeFragmentDecodeError> {
-    let wire = wire.ok_or_else(|| {
-        NativeFragmentDecodeError::missing(
-            path.clone(),
-            format!("native runtime-filter binding_id={binding_id} missing contract"),
-        )
-    })?;
-    let kind = wire.kind.as_ref().ok_or_else(|| {
-        NativeFragmentDecodeError::missing(
-            path.clone().field("kind"),
-            format!("native runtime-filter binding_id={binding_id} missing contract kind"),
-        )
-    })?;
-    match kind {
-        plan::runtime_filter_contract::Kind::Membership(membership) => {
-            let path = path.field("membership").field("null_semantics");
-            let schema = decode_membership_contract(expression_type, membership).map_err(
-                |decode_error| match decode_error {
-                    MembershipContractDecodeError::UnspecifiedNullSemantics
-                    | MembershipContractDecodeError::UnknownNullSemantics { .. } => {
-                        NativeFragmentDecodeError::invalid_enum(
-                            path,
-                            format!(
-                                "native runtime-filter binding_id={binding_id} invalid membership null semantics: {decode_error}"
-                            ),
-                        )
-                    }
-                    MembershipContractDecodeError::InvalidExecutionSchema { .. } => {
-                        NativeFragmentDecodeError::invalid_value(
-                            path,
-                            format!(
-                                "native runtime-filter binding_id={binding_id} invalid membership schema: {decode_error}"
-                            ),
-                        )
-                    }
-                },
-            )?;
-            Ok(execution::RuntimeFilterExecutionContract::Membership(
-                schema,
-            ))
-        }
-        plan::runtime_filter_contract::Kind::Ordered(ordered) => {
-            let path = path.field("ordered");
-            if ordered.keys.len() != 1 {
-                return Err(NativeFragmentDecodeError::invalid_value(
-                    path.clone().field("keys"),
-                    format!(
-                        "native runtime-filter binding_id={binding_id} ordered contract must contain exactly one key, got {}",
-                        ordered.keys.len()
-                    ),
-                ));
-            }
-            let mut keys = Vec::with_capacity(ordered.keys.len());
-            for (index, key) in ordered.keys.iter().enumerate() {
-                let key_path = path.clone().field("keys").index(index);
-                let wire_type = key.r#type.as_ref().ok_or_else(|| {
-                    NativeFragmentDecodeError::missing(
-                        key_path.clone().field("type"),
-                        format!(
-                            "native runtime-filter binding_id={binding_id} ordered key type missing"
-                        ),
-                    )
-                })?;
-                let data_type =
-                    novarocks_plan_codec::native_type::decode_type(wire_type).map_err(|error| {
-                        NativeFragmentDecodeError::invalid_value(
-                            key_path.clone().field("type"),
-                            error,
-                        )
-                    })?;
-                let direction = match plan::RuntimeFilterSortDirection::try_from(key.direction) {
-                    Ok(plan::RuntimeFilterSortDirection::Ascending) => {
-                        execution::contribution::RuntimeOrderSortDirection::Ascending
-                    }
-                    Ok(plan::RuntimeFilterSortDirection::Descending) => {
-                        execution::contribution::RuntimeOrderSortDirection::Descending
-                    }
-                    Ok(plan::RuntimeFilterSortDirection::Unspecified) | Err(_) => {
-                        return Err(NativeFragmentDecodeError::invalid_enum(
-                            key_path.clone().field("direction"),
-                            format!(
-                                "native runtime-filter binding_id={binding_id} invalid sort direction={}",
-                                key.direction
-                            ),
-                        ));
-                    }
-                };
-                let null_order = match plan::RuntimeFilterNullOrder::try_from(key.null_order) {
-                    Ok(plan::RuntimeFilterNullOrder::First) => {
-                        execution::contribution::RuntimeOrderNullOrder::First
-                    }
-                    Ok(plan::RuntimeFilterNullOrder::Last) => {
-                        execution::contribution::RuntimeOrderNullOrder::Last
-                    }
-                    Ok(plan::RuntimeFilterNullOrder::Unspecified) | Err(_) => {
-                        return Err(NativeFragmentDecodeError::invalid_enum(
-                            key_path.field("null_order"),
-                            format!(
-                                "native runtime-filter binding_id={binding_id} invalid null order={}",
-                                key.null_order
-                            ),
-                        ));
-                    }
-                };
-                keys.push(execution::contribution::RuntimeOrderKey::with_order(
-                    data_type, direction, null_order,
-                ));
-            }
-            if keys[0].data_type() != expression_type {
-                return Err(NativeFragmentDecodeError::inconsistent(
-                    path.clone().field("keys").index(0).field("type"),
-                    format!(
-                        "native runtime-filter binding_id={binding_id} ordered key type {:?} does not match expression type {:?}",
-                        keys[0].data_type(),
-                        expression_type
-                    ),
-                ));
-            }
-            let comparator = digest32(binding_id, "comparator_digest", &ordered.comparator_digest)
-                .map_err(|error| {
-                    NativeFragmentDecodeError::invalid_value(
-                        path.clone().field("comparator_digest"),
-                        error,
-                    )
-                })?;
-            let order_digest = digest32(
-                binding_id,
-                "order_contract_digest",
-                &ordered.order_contract_digest,
-            )
-            .map_err(|error| {
-                NativeFragmentDecodeError::invalid_value(
-                    path.clone().field("order_contract_digest"),
-                    error,
-                )
-            })?;
-            let canonical = execution::contribution::RuntimeOrderContract::from_fragment_contract(
-                keys,
-                comparator,
-                order_digest,
-            ).map_err(|error| {
-                NativeFragmentDecodeError::invalid_value(
-                    path.clone(),
-                    format!(
-                        "native runtime-filter binding_id={binding_id} ordered contract is noncanonical: {error:?}"
-                    ),
-                )
-            })?;
-            Ok(execution::RuntimeFilterExecutionContract::Ordered(
-                Arc::new(canonical),
-            ))
         }
     }
 }
@@ -1144,19 +1012,99 @@ mod tests {
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::expr;
 
+    struct FixtureControl;
+    impl novarocks_type_contract::PureCompileControl for FixtureControl {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
     fn int64_type() -> novarocks_proto_models::common::TypeDesc {
         novarocks_proto_models::common::TypeDesc {
-            kind: Some(novarocks_proto_models::common::type_desc::Kind::Scalar(
-                novarocks_proto_models::common::ScalarType {
-                    r#type: novarocks_proto_models::common::PrimitiveType::Bigint as i32,
-                    ..Default::default()
-                },
-            )),
+            value_binding_id: Some(0),
         }
+    }
+    fn fixture_source_table(
+        value: &novarocks_type_contract::FunctionValueType,
+    ) -> plan::ExecutionTypeTable {
+        use novarocks_plan_codec::execution_type_table::{
+            ExecutionTypeRoot, ExecutionTypeTableBuilder, ExecutionTypeTableLimits,
+        };
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+        let creation = crate::native_type_construction::NativeTypeConstruction::try_with_control(
+            novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+                "RF fixture source types",
+            ),
+            &FixtureControl,
+        )
+        .unwrap();
+        let roots = [ExecutionTypeRoot { id: 0, value }];
+        let mut work = CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Encode).unwrap();
+        let table = ExecutionTypeTableBuilder::new(&roots)
+            .encode_observed(
+                ExecutionTypeTableLimits::for_validated_root_count(roots.len()).unwrap(),
+                &mut |layout| creation.request(layout),
+                &mut work,
+            )
+            .unwrap()
+            .into_wire();
+        work.finish().unwrap();
+        table
+    }
+    fn fixture_domain(
+        value: &novarocks_type_contract::FunctionValueType,
+    ) -> plan::RuntimeFilterTypeDomain {
+        plan::RuntimeFilterTypeDomain {
+            value_type: Some(int64_type()),
+            execution_types: Some(fixture_source_table(value)),
+        }
+    }
+    fn decode_fixture_bindings<'wire>(
+        fragment: u32,
+        wire: Option<&'wire plan::RuntimeFilterBindingTable>,
+    ) -> Result<NativeRuntimeFilterDecodeLedger<'wire>, NativeFragmentDecodeError> {
+        use crate::fragment_type_decode::{
+            NativeDecodeResources, NativeTypeDecoder, table_failure,
+        };
+        use crate::native_type_construction::{NativeTypeConstruction, NativeTypeFactory};
+        use novarocks_plan_codec::execution_type_table::{
+            ExecutionTypeTableLimits, decode_execution_type_table_with_factory_in,
+        };
+        let declared = novarocks_type_contract::FunctionValueType::new(DataType::Int64, false);
+        let source = fixture_source_table(&declared);
+        let creation = NativeTypeConstruction::try_with_control(
+            novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+                "RF fixture endpoint types",
+            ),
+            &FixtureControl,
+        )?;
+        let mut resources = NativeDecodeResources::try_new(&creation)?;
+        let factory = NativeTypeFactory::new(&creation);
+        let types = decode_execution_type_table_with_factory_in(
+            &source,
+            ExecutionTypeTableLimits::for_validated_root_count(1).unwrap(),
+            &factory,
+            &mut resources.work,
+        )
+        .map_err(|error| table_failure(error, FieldPath::root("execution_types")))?;
+        let mut decoder = NativeTypeDecoder::Strong {
+            types: &types,
+            original_requests: None,
+            resources: &mut resources,
+        };
+        let result =
+            NativeRuntimeFilterDecodeLedger::decode_with_types(fragment, wire, &mut decoder)?;
+        drop(decoder);
+        resources.finish()?;
+        Ok(result)
     }
 
     fn expression(column_id: u32) -> expr::Expr {
         expr::Expr {
+            original_definition_id: None,
             r#type: Some(int64_type()),
             nullable: false,
             kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
@@ -1169,9 +1117,11 @@ mod tests {
 
     fn cast_expression(operand: expr::Expr) -> expr::Expr {
         expr::Expr {
+            original_definition_id: None,
             r#type: Some(int64_type()),
             nullable: false,
             kind: Some(expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                allow_throw_exception: None,
                 decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 operand: Some(Box::new(operand)),
                 target: Some(int64_type()),
@@ -1181,9 +1131,11 @@ mod tests {
 
     fn binary_expression(op: i32) -> expr::Expr {
         expr::Expr {
+            original_definition_id: None,
             r#type: Some(int64_type()),
             nullable: false,
             kind: Some(expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                allow_throw_exception: None,
                 decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 op,
                 left: Some(Box::new(expression(1))),
@@ -1200,6 +1152,9 @@ mod tests {
             apply_point: i32::from(plan::RuntimeFilterApplyPoint::NodeInput),
             expression: Some(expression(1)),
             contract: Some(plan::RuntimeFilterContract {
+                logical_domain: Some(fixture_domain(
+                    &novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                )),
                 kind: Some(plan::runtime_filter_contract::Kind::Membership(
                     plan::RuntimeFilterMembershipContract {
                         null_semantics: plan::RuntimeFilterMembershipNullSemantics::NeverMatches
@@ -1237,10 +1192,7 @@ mod tests {
             panic!("consumer")
         };
         role.target = None;
-        assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![missing_target])),)
-                .is_err()
-        );
+        assert!(decode_fixture_bindings(7, Some(&table(7, vec![missing_target])),).is_err());
     }
 
     fn producer_role_with_target(
@@ -1373,14 +1325,14 @@ mod tests {
             apply_point: i32::from(plan::RuntimeFilterApplyPoint::NodeInput),
             expression: Some(expression(1)),
             contract: Some(plan::RuntimeFilterContract {
+                    logical_domain: Some(fixture_domain(&novarocks_type_contract::FunctionValueType::new(keys.first().map(|key| key.data_type().clone()).unwrap_or(DataType::Int64), false))),
                 kind: Some(plan::runtime_filter_contract::Kind::Ordered(
                     plan::RuntimeFilterOrderedContract {
                         keys: keys
                             .iter()
                             .map(|key| plan::RuntimeFilterOrderKey {
                                 r#type: Some(
-                                    novarocks_plan_codec::encode_native_type(key.data_type())
-                                        .expect("test key type"),
+                                    int64_type(),
                                 ),
                                 direction: i32::from(match key.direction() {
                                     execution::contribution::RuntimeOrderSortDirection::Ascending => {
@@ -1463,10 +1415,10 @@ mod tests {
     #[test]
     fn binding_table_decode_rejects_missing_duplicate_unknown_enum_and_wrong_fragment() {
         let valid = table(7, vec![membership_binding(1, 11)]);
-        NativeRuntimeFilterDecodeLedger::decode(7, Some(&valid)).expect("valid table");
-        assert!(NativeRuntimeFilterDecodeLedger::decode(7, None).is_err());
+        decode_fixture_bindings(7, Some(&valid)).expect("valid table");
+        assert!(decode_fixture_bindings(7, None).is_err());
         assert!(
-            NativeRuntimeFilterDecodeLedger::decode(
+            decode_fixture_bindings(
                 7,
                 Some(&table(
                     7,
@@ -1477,10 +1429,8 @@ mod tests {
         );
         let mut unknown = membership_binding(1, 11);
         unknown.apply_point = 99_999;
-        assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![unknown]))).is_err()
-        );
-        assert!(NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(8, Vec::new()))).is_err());
+        assert!(decode_fixture_bindings(7, Some(&table(7, vec![unknown]))).is_err());
+        assert!(decode_fixture_bindings(7, Some(&table(8, Vec::new()))).is_err());
     }
 
     #[test]
@@ -1490,8 +1440,7 @@ mod tests {
         child.r#type = None;
         missing_type.expression = Some(cast_expression(child));
         assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![missing_type])))
-                .is_err(),
+            decode_fixture_bindings(7, Some(&table(7, vec![missing_type]))).is_err(),
             "nested expression without type must be rejected during binding decode"
         );
 
@@ -1500,8 +1449,7 @@ mod tests {
         child.kind = None;
         missing_kind.expression = Some(cast_expression(child));
         assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![missing_kind])))
-                .is_err(),
+            decode_fixture_bindings(7, Some(&table(7, vec![missing_kind]))).is_err(),
             "nested expression without kind must be rejected during binding decode"
         );
     }
@@ -1511,7 +1459,7 @@ mod tests {
         let mut binding = membership_binding(1, 11);
         binding.expression = Some(cast_expression(binary_expression(99_999)));
         assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding]))).is_err(),
+            decode_fixture_bindings(7, Some(&table(7, vec![binding]))).is_err(),
             "nested illegal expression enum must be rejected during binding decode"
         );
     }
@@ -1520,6 +1468,7 @@ mod tests {
     fn binding_table_decode_rejects_window_frame_without_end() {
         let mut binding = membership_binding(1, 11);
         binding.expression = Some(expr::Expr {
+            original_definition_id: None,
             r#type: Some(int64_type()),
             nullable: false,
             kind: Some(expr::expr::Kind::WindowCall(expr::WindowCall {
@@ -1539,7 +1488,7 @@ mod tests {
             })),
         });
         assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding]))).is_err(),
+            decode_fixture_bindings(7, Some(&table(7, vec![binding]))).is_err(),
             "window frame without end must be rejected during binding decode"
         );
     }
@@ -1563,7 +1512,7 @@ mod tests {
             ],
         );
         assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding]))).is_err(),
+            decode_fixture_bindings(7, Some(&table(7, vec![binding]))).is_err(),
             "ordered binding contract must contain exactly one key"
         );
     }
@@ -1580,7 +1529,7 @@ mod tests {
             )],
         );
         assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding]))).is_err(),
+            decode_fixture_bindings(7, Some(&table(7, vec![binding]))).is_err(),
             "ordered key type must match binding expression type"
         );
     }
@@ -1598,8 +1547,7 @@ mod tests {
         };
         ordered.keys[0].direction = plan::RuntimeFilterSortDirection::Unspecified as i32;
 
-        let error = match NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding])))
-        {
+        let error = match decode_fixture_bindings(7, Some(&table(7, vec![binding]))) {
             Ok(_) => panic!("unspecified direction must fail"),
             Err(error) => error,
         };
@@ -1628,11 +1576,10 @@ mod tests {
             };
             membership.null_semantics = raw;
 
-            let error =
-                match NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding]))) {
-                    Ok(_) => panic!("invalid membership null semantics must fail"),
-                    Err(error) => error,
-                };
+            let error = match decode_fixture_bindings(7, Some(&table(7, vec![binding]))) {
+                Ok(_) => panic!("invalid membership null semantics must fail"),
+                Err(error) => error,
+            };
             let protocol = error.protocol().expect("protocol error");
             assert_eq!(
                 protocol.path().to_string(),
@@ -1655,8 +1602,7 @@ mod tests {
         };
         topk.k = 0;
 
-        let error = match NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding])))
-        {
+        let error = match decode_fixture_bindings(7, Some(&table(7, vec![binding]))) {
             Ok(_) => panic!("zero TopK K must fail"),
             Err(error) => error,
         };
@@ -1673,8 +1619,7 @@ mod tests {
         let mut binding = membership_binding(1, 11);
         binding.reduction = None;
 
-        let error = match NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding])))
-        {
+        let error = match decode_fixture_bindings(7, Some(&table(7, vec![binding]))) {
             Ok(_) => panic!("missing reduction message must fail"),
             Err(error) => error,
         };
@@ -1696,8 +1641,7 @@ mod tests {
         };
         consumer.activation = None;
 
-        let error = match NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding])))
-        {
+        let error = match decode_fixture_bindings(7, Some(&table(7, vec![binding]))) {
             Ok(_) => panic!("missing activation message must fail"),
             Err(error) => error,
         };
@@ -1719,8 +1663,7 @@ mod tests {
         };
         consumer.activation = Some(plan::RuntimeFilterConsumerActivation::default());
 
-        let error = match NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding])))
-        {
+        let error = match decode_fixture_bindings(7, Some(&table(7, vec![binding]))) {
             Ok(_) => panic!("missing activation kind must fail"),
             Err(error) => error,
         };
@@ -1746,8 +1689,7 @@ mod tests {
             },
         ));
 
-        let error = match NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding])))
-        {
+        let error = match decode_fixture_bindings(7, Some(&table(7, vec![binding]))) {
             Ok(_) => panic!("unspecified contribution kind must fail"),
             Err(error) => error,
         };
@@ -1762,7 +1704,7 @@ mod tests {
     #[test]
     fn binding_table_decode_recomputes_membership_order_and_topk_digests() {
         let mut membership = membership_binding(1, 11);
-        NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![membership.clone()])))
+        decode_fixture_bindings(7, Some(&table(7, vec![membership.clone()])))
             .expect("valid membership");
         let plan::runtime_filter_contract::Kind::Membership(contract) = membership
             .contract
@@ -1773,14 +1715,12 @@ mod tests {
             panic!("membership")
         };
         contract.null_semantics = 99;
-        assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![membership]))).is_err()
-        );
+        assert!(decode_fixture_bindings(7, Some(&table(7, vec![membership]))).is_err());
 
         let ordered = ordered_topk_binding(2, 11);
+        let source_table = table(7, vec![ordered.clone()]);
         let ledger =
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![ordered.clone()])))
-                .expect("single-key ordered TopK");
+            decode_fixture_bindings(7, Some(&source_table)).expect("single-key ordered TopK");
         let record = ledger.lookup_for_node(2, 11, 7).expect("binding");
         let DecodedBindingRole::Consumer { contract, .. } = &record.role else {
             panic!("consumer")
@@ -1800,10 +1740,7 @@ mod tests {
             panic!("ordered")
         };
         contract.comparator_digest[0] ^= 1;
-        assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![wrong_comparator])))
-                .is_err()
-        );
+        assert!(decode_fixture_bindings(7, Some(&table(7, vec![wrong_comparator]))).is_err());
 
         let mut wrong_order = ordered.clone();
         let plan::runtime_filter_contract::Kind::Ordered(contract) = wrong_order
@@ -1815,9 +1752,7 @@ mod tests {
             panic!("ordered")
         };
         contract.order_contract_digest[0] ^= 1;
-        assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![wrong_order]))).is_err()
-        );
+        assert!(decode_fixture_bindings(7, Some(&table(7, vec![wrong_order]))).is_err());
 
         let mut wrong_topk = ordered;
         let plan::runtime_filter_reduction_contract::Kind::MergeTopkSummary(topk) = wrong_topk
@@ -1829,9 +1764,7 @@ mod tests {
             panic!("topk")
         };
         topk.contract_digest[0] ^= 1;
-        assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![wrong_topk]))).is_err()
-        );
+        assert!(decode_fixture_bindings(7, Some(&table(7, vec![wrong_topk]))).is_err());
     }
 
     #[test]
@@ -1854,9 +1787,9 @@ mod tests {
             },
         ));
 
+        let source_table = table(7, vec![consumer, producer]);
         let ledger =
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![consumer, producer])))
-                .expect("canonical execution contracts");
+            decode_fixture_bindings(7, Some(&source_table)).expect("canonical execution contracts");
         let consumer = ledger.lookup_for_node(1, 11, 7).expect("consumer binding");
         let DecodedBindingRole::Consumer { contract, .. } = &consumer.role else {
             panic!("consumer role")
@@ -1887,7 +1820,7 @@ mod tests {
     #[test]
     fn node_lookup_rejects_unknown_duplicate_wrong_node_role_and_apply_point() {
         let valid = table(7, vec![membership_binding(1, 11)]);
-        let mut ledger = NativeRuntimeFilterDecodeLedger::decode(7, Some(&valid)).expect("decode");
+        let mut ledger = decode_fixture_bindings(7, Some(&valid)).expect("decode");
         assert!(ledger.lookup_for_node(999, 11, 7).is_err());
         assert!(ledger.lookup_for_node(1, 12, 7).is_err());
         ledger.lookup_for_node(1, 11, 7).expect("lookup");
@@ -1896,10 +1829,7 @@ mod tests {
 
         let mut consumer_at_output = membership_binding(2, 11);
         consumer_at_output.apply_point = i32::from(plan::RuntimeFilterApplyPoint::NodeOutput);
-        assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![consumer_at_output])),)
-                .is_err()
-        );
+        assert!(decode_fixture_bindings(7, Some(&table(7, vec![consumer_at_output])),).is_err());
 
         let mut producer_at_input = membership_binding(3, 11);
         producer_at_input.role = Some(plan::runtime_filter_binding::Role::Producer(
@@ -1916,16 +1846,13 @@ mod tests {
                 )),
             },
         ));
-        assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![producer_at_input])),)
-                .is_err()
-        );
+        assert!(decode_fixture_bindings(7, Some(&table(7, vec![producer_at_input])),).is_err());
     }
 
     #[test]
     fn node_lookup_rejects_matching_node_id_from_different_wire_fragment() {
         let valid = table(7, vec![membership_binding(1, 11)]);
-        let ledger = NativeRuntimeFilterDecodeLedger::decode(7, Some(&valid)).expect("decode");
+        let ledger = decode_fixture_bindings(7, Some(&valid)).expect("decode");
         assert!(ledger.lookup_for_node(1, 11, 8).is_err());
         assert!(ledger.peek_attached(&[1], 11, 8).is_err());
     }
@@ -1940,11 +1867,8 @@ mod tests {
         };
         role.capabilities.pop();
         assert!(
-            NativeRuntimeFilterDecodeLedger::decode(
-                7,
-                Some(&table(7, vec![missing_consumer_capability])),
-            )
-            .is_err()
+            decode_fixture_bindings(7, Some(&table(7, vec![missing_consumer_capability])),)
+                .is_err()
         );
 
         let mut extra_consumer_capability = membership_binding(1, 11);
@@ -1957,11 +1881,7 @@ mod tests {
             plan::RuntimeFilterArtifactCapability::OrderedRange,
         ));
         assert!(
-            NativeRuntimeFilterDecodeLedger::decode(
-                7,
-                Some(&table(7, vec![extra_consumer_capability])),
-            )
-            .is_err()
+            decode_fixture_bindings(7, Some(&table(7, vec![extra_consumer_capability])),).is_err()
         );
 
         let producer_role = |kinds, completion| {
@@ -1983,10 +1903,7 @@ mod tests {
             ],
             plan::RuntimeFilterCompletionRequirement::ProducerClosed,
         ));
-        assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![extra_producer_kind])),)
-                .is_err()
-        );
+        assert!(decode_fixture_bindings(7, Some(&table(7, vec![extra_producer_kind])),).is_err());
 
         let mut wrong_completion = membership_binding(1, 11);
         wrong_completion.apply_point = i32::from(plan::RuntimeFilterApplyPoint::NodeOutput);
@@ -1997,10 +1914,7 @@ mod tests {
             ],
             plan::RuntimeFilterCompletionRequirement::FencedCommittedDomainFrozen,
         ));
-        assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![wrong_completion])),)
-                .is_err()
-        );
+        assert!(decode_fixture_bindings(7, Some(&table(7, vec![wrong_completion])),).is_err());
 
         let mut final_domain = membership_binding(1, 11);
         final_domain.apply_point = i32::from(plan::RuntimeFilterApplyPoint::NodeOutput);
@@ -2011,7 +1925,7 @@ mod tests {
             ],
             plan::RuntimeFilterCompletionRequirement::FencedCommittedDomainFrozen,
         ));
-        NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![final_domain])))
+        decode_fixture_bindings(7, Some(&table(7, vec![final_domain])))
             .expect("canonical final-domain producer");
 
         let mut blocking_ordered = ordered_topk_binding(1, 11);
@@ -2023,18 +1937,15 @@ mod tests {
         role.activation = Some(plan::RuntimeFilterConsumerActivation {
             kind: Some(plan::runtime_filter_consumer_activation::Kind::BlockingSnapshot(true)),
         });
-        assert!(
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![blocking_ordered])),)
-                .is_err()
-        );
+        assert!(decode_fixture_bindings(7, Some(&table(7, vec![blocking_ordered])),).is_err());
     }
 
     #[test]
     fn fragment_finish_rejects_unconsumed_binding() {
         let valid = table(7, vec![membership_binding(1, 11)]);
-        let ledger = NativeRuntimeFilterDecodeLedger::decode(7, Some(&valid)).expect("decode");
+        let ledger = decode_fixture_bindings(7, Some(&valid)).expect("decode");
         assert!(ledger.finish().is_err());
-        NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, Vec::new())))
+        decode_fixture_bindings(7, Some(&table(7, Vec::new())))
             .expect("empty")
             .finish()
             .expect("all consumed");
@@ -2059,9 +1970,8 @@ mod tests {
                 )),
             },
         ));
-        let mut ledger =
-            NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![consumer, producer])))
-                .expect("decode");
+        let source_table = table(7, vec![consumer, producer]);
+        let mut ledger = decode_fixture_bindings(7, Some(&source_table)).expect("decode");
 
         ledger.lookup_for_node(2, 12, 7).expect("producer lookup");
         ledger.commit_consumed(2).expect("producer consumed");

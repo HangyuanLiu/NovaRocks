@@ -385,7 +385,7 @@ mod refusal_tests {
             require_view_refusal(server_error(
                 1105,
                 "HY000",
-                "Unsupported: FeatureUnsupported => list_views is not supported by this catalog"
+                "Unsupported: list_views is not supported by this catalog"
             ))
             .is_ok()
         );

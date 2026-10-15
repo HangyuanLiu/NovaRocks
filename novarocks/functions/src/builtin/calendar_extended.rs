@@ -86,14 +86,14 @@ impl<'a> DateInput<'a> {
         source: &FunctionValueType,
         array: &'a dyn Array,
     ) -> Result<Self, KernelFailure> {
-        if source.logical_type != ValueLogicalType::Physical
-            || array.data_type() != &source.data_type
+        if source.logical_type() != ValueLogicalType::Physical
+            || array.data_type() != source.data_type()
         {
             return Err(invalid(
                 "extended calendar requires its exact Physical selected source",
             ));
         }
-        match &source.data_type {
+        match source.data_type() {
             DataType::Date32 => array.as_any().downcast_ref().map(Self::Date),
             DataType::Timestamp(TimeUnit::Microsecond, None) => {
                 array.as_any().downcast_ref().map(Self::Timestamp)
@@ -404,7 +404,7 @@ pub(super) fn evaluate_calendar_input<'a>(
         let arguments = input.arguments();
         let types = input.types;
         let target = input.target;
-        if target.logical_type != ValueLogicalType::Physical || !target.nullable {
+        if target.logical_type() != ValueLogicalType::Physical || !target.nullable() {
             return Err(invalid(
                 "extended calendar requires its nullable Physical result",
             ));
@@ -430,8 +430,8 @@ pub(super) fn evaluate_calendar_input<'a>(
             let FunctionArgumentType::Value(ty) = ty else {
                 return Err(invalid("extended calendar requires exact value arguments"));
             };
-            if ty.logical_type != ValueLogicalType::Physical
-                || &ty.data_type != arg.array().data_type()
+            if ty.logical_type() != ValueLogicalType::Physical
+                || ty.data_type() != arg.array().data_type()
             {
                 return Err(invalid(
                     "extended calendar selected argument carrier mismatch",
@@ -453,8 +453,8 @@ pub(super) fn evaluate_calendar_input<'a>(
                 | CalendarExtendedOp::MinutesDiff
                 | CalendarExtendedOp::SecondsDiff
         ) {
-            if (!input.legacy && sources[0].data_type != sources[1].data_type)
-                || target.data_type != DataType::Int64
+            if (!input.legacy && sources[0].data_type() != sources[1].data_type())
+                || target.data_type() != &DataType::Int64
             {
                 return Err(invalid(
                     "calendar difference requires homogeneous sources and Int64 result",
@@ -474,12 +474,12 @@ pub(super) fn evaluate_calendar_input<'a>(
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| invalid("date_trunc expects string unit"))?;
-            let expected = if sources[1].data_type == DataType::Date32 {
+            let expected = if sources[1].data_type() == &DataType::Date32 {
                 DataType::Date32
             } else {
                 DataType::Timestamp(TimeUnit::Microsecond, None)
             };
-            if !input.legacy && target.data_type != expected {
+            if !input.legacy && *target.data_type() != expected {
                 return Err(invalid(
                     "date_trunc result differs from its exact source profile",
                 ));
@@ -490,11 +490,11 @@ pub(super) fn evaluate_calendar_input<'a>(
         };
         if op == CalendarExtendedOp::Timestamp
             && !input.legacy
-            && target.data_type != DataType::Timestamp(TimeUnit::Microsecond, None)
+            && target.data_type() != &DataType::Timestamp(TimeUnit::Microsecond, None)
         {
             return Err(invalid("timestamp requires microsecond output"));
         }
-        if op == CalendarExtendedOp::UnixTimestamp && target.data_type != DataType::Int64 {
+        if op == CalendarExtendedOp::UnixTimestamp && target.data_type() != &DataType::Int64 {
             return Err(invalid(
                 "unix_timestamp argument form requires its exact Int64 result",
             ));
@@ -522,7 +522,7 @@ pub(super) fn evaluate_calendar_input<'a>(
                     return Err(internal("extended calendar selected row is out of bounds"));
                 }
                 nulls[index] = argument.array().is_null(rows[index]);
-                if nulls[index] && !sources[index].nullable {
+                if nulls[index] && !sources[index].nullable() {
                     return Err(internal(
                         "extended calendar non-null source contains SQL NULL",
                     ));
@@ -542,14 +542,15 @@ pub(super) fn evaluate_calendar_input<'a>(
                     work.flush()?;
                     let truncated = date.map(|date| truncate(date, unit));
                     work.flush()?;
-                    if target.data_type == DataType::Date32 {
+                    if target.data_type() == &DataType::Date32 {
                         truncated.map(|d| {
                             (d.date().num_days_from_ce() - datetime_value::UNIX_EPOCH_DAY_OFFSET)
                                 as i64
                         })
                     } else {
-                        truncated
-                            .and_then(|date| timestamp_value_for_type(date, &target.data_type).ok())
+                        truncated.and_then(|date| {
+                            timestamp_value_for_type(date, target.data_type()).ok()
+                        })
                     }
                 } else {
                     work.flush()?;
@@ -586,7 +587,9 @@ pub(super) fn evaluate_calendar_input<'a>(
                     if op == CalendarExtendedOp::UnixTimestamp {
                         left.map(super::calendar_extended_shared::calendar_unix_seconds)
                     } else {
-                        left.and_then(|date| timestamp_value_for_type(date, &target.data_type).ok())
+                        left.and_then(|date| {
+                            timestamp_value_for_type(date, target.data_type()).ok()
+                        })
                     }
                 }
             };

@@ -330,7 +330,7 @@ fn recursive_projection_checks_exact_source_shape_and_never_skips_unsupported_em
         .is_err()
     );
     let mut wrong_nullable = ty(&source);
-    wrong_nullable.nullable = false;
+    wrong_nullable = wrong_nullable.with_nullable(false).unwrap();
     assert!(
         preflight_recursive_pool_resources(
             &source,

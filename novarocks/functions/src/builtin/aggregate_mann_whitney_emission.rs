@@ -105,12 +105,12 @@ where
     }
     let kind = match context.phase() {
         AggregateInvocationPhase::Intermediate
-            if expected_contract.intermediate_type().data_type == DataType::Binary =>
+            if expected_contract.intermediate_type().data_type() == &DataType::Binary =>
         {
             FlatByteKind::Binary
         }
         AggregateInvocationPhase::Final
-            if expected_contract.final_type().data_type == DataType::Utf8 =>
+            if expected_contract.final_type().data_type() == &DataType::Utf8 =>
         {
             FlatByteKind::Utf8
         }

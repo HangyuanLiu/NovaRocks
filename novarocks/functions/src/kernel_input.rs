@@ -22,10 +22,7 @@ use crate::{
     EvaluatedArgument, KernelEvaluationControl, KernelFailure, MAX_UNOBSERVED_KERNEL_WORK,
     Selection,
 };
-use arrow_array::types::{
-    Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
-};
-use arrow_array::{Array, DictionaryArray, RunArray, UnionArray};
+use arrow_array::Array;
 use arrow_schema::DataType;
 use novarocks_type_contract::{CompileCheckpoints, FunctionValueType};
 
@@ -115,7 +112,10 @@ pub fn validate_argument_observed(
         argument.validate_shape_observed::<KernelFailure>(selection, || work.step())?;
         if let EvaluatedArgument::Constant(value) = argument {
             work.step()?;
-            if !constant_type_matches(value.value_type(), value_type) {
+            if !value
+                .value_type()
+                .fits_value_type_observed(value_type, || work.step())?
+            {
                 return Err(invalid(
                     "constant argument differs from its exact logical type or nullability",
                 ));
@@ -123,7 +123,7 @@ pub fn validate_argument_observed(
         }
         if !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
             argument.array().data_type(),
-            &value_type.data_type,
+            value_type.data_type(),
             || work.step(),
         )? {
             return Err(invalid(
@@ -131,7 +131,7 @@ pub fn validate_argument_observed(
             ));
         }
         work.step()?;
-        if !value_type.nullable {
+        if !value_type.nullable() {
             for (ordinal, row) in selection.iter().enumerate() {
                 if logical_is_null(
                     argument.array().as_ref(),
@@ -150,15 +150,6 @@ pub fn validate_argument_observed(
     }
     work.finish()?;
     result
-}
-
-/// One original Constant rule, shared with numerical request preparation.
-/// Physical comparison and selected NULL addressing retain their own authors.
-pub(crate) fn constant_type_matches(
-    actual: &FunctionValueType,
-    expected: &FunctionValueType,
-) -> bool {
-    actual.logical_type == expected.logical_type && (!actual.nullable || expected.nullable)
 }
 
 /// Inspect selected SQL NULLs through the original carrier-addressing owner.
@@ -215,90 +206,19 @@ pub fn visit_selected_nulls(
     result
 }
 
-/// Logical NULL checks never materialize Arrow's dictionary/union/run-end
-/// logical-null bitmap. Every visited row/type node has bounded work control.
+/// Observe borrowed logical NULL access without materializing a bitmap.
 pub(crate) fn logical_is_null(
     array: &dyn Array,
     row: usize,
     depth: usize,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<bool, KernelFailure> {
-    work.step()?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH || row >= array.len() {
-        return Err(internal("kernel value has invalid nested row addressing"));
-    }
-    if array.is_null(row) {
-        return Ok(true);
-    }
-    match array.data_type() {
-        DataType::Null => Ok(true),
-        DataType::Dictionary(key, _) => {
-            macro_rules! dictionary {
-                ($key:ty) => {{
-                    let array = array
-                        .as_any()
-                        .downcast_ref::<DictionaryArray<$key>>()
-                        .ok_or_else(|| {
-                            internal("kernel dictionary carrier differs from its type")
-                        })?;
-                    match array.key(row) {
-                        Some(key) => logical_is_null(array.values().as_ref(), key, depth + 1, work),
-                        None => Ok(true),
-                    }
-                }};
-            }
-            match key.as_ref() {
-                DataType::Int8 => dictionary!(Int8Type),
-                DataType::Int16 => dictionary!(Int16Type),
-                DataType::Int32 => dictionary!(Int32Type),
-                DataType::Int64 => dictionary!(Int64Type),
-                DataType::UInt8 => dictionary!(UInt8Type),
-                DataType::UInt16 => dictionary!(UInt16Type),
-                DataType::UInt32 => dictionary!(UInt32Type),
-                DataType::UInt64 => dictionary!(UInt64Type),
-                _ => Err(internal("kernel dictionary key type is invalid")),
-            }
-        }
-        DataType::RunEndEncoded(run_ends, _) => {
-            macro_rules! run {
-                ($key:ty) => {{
-                    let array = array
-                        .as_any()
-                        .downcast_ref::<RunArray<$key>>()
-                        .ok_or_else(|| internal("kernel run-end carrier differs from its type"))?;
-                    logical_is_null(
-                        array.values().as_ref(),
-                        array.get_physical_index(row),
-                        depth + 1,
-                        work,
-                    )
-                }};
-            }
-            match run_ends.data_type() {
-                DataType::Int16 => run!(Int16Type),
-                DataType::Int32 => run!(Int32Type),
-                DataType::Int64 => run!(Int64Type),
-                _ => Err(internal("kernel run-end index type is invalid")),
-            }
-        }
-        DataType::Union(fields, _) => {
-            let array = array
-                .as_any()
-                .downcast_ref::<UnionArray>()
-                .ok_or_else(|| internal("kernel union carrier differs from its type"))?;
-            let type_id = array.type_id(row);
-            if !fields.iter().any(|(id, _)| id == type_id) {
-                return Err(internal("kernel union type id is invalid"));
-            }
-            logical_is_null(
-                array.child(type_id).as_ref(),
-                array.value_offset(row),
-                depth + 1,
-                work,
-            )
-        }
-        _ => Ok(false),
-    }
+    crate::logical_null::logical_is_null_observed(array, row, depth, &mut || work.step()).map_err(
+        |error| match error {
+            crate::logical_null::NullVisitError::Control(cause) => cause,
+            crate::logical_null::NullVisitError::Invalid(message) => internal(message),
+        },
+    )
 }
 
 /// Validate a complete pure function value type in the caller's existing work
@@ -309,11 +229,11 @@ pub fn validate_type_observed(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), KernelFailure> {
     value
-        .logical_type
-        .validate_carrier(&value.data_type)
+        .logical_type()
+        .validate_carrier(value.data_type())
         .map_err(type_failure)?;
     use novarocks_type_contract::*;
-    validate_value_type_structure_observed(&value.data_type, |visit| {
+    validate_value_type_structure_observed(value.data_type(), |visit| {
         work.step().map_err(compile_failure)?;
         match visit {
             ValueTypeVisit::TypeNode(ty) => {

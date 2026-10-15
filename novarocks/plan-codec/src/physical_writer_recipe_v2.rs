@@ -23,6 +23,7 @@ use crate::{
     allocation_exit_v2::reserve_exit,
     binding_index_v2::{BindingIndex, lookup_work_upper_bound, prepare_work_upper_bound},
     btree_resources_v2,
+    host_projection_v2::ProjectionFailure,
     physical_binding_v2::BindingCodecError,
     physical_connector_payload_v2::{
         ConnectorPayloadCodecError, DecodedConnectorPayloads, EncodedConnectorPayloads,
@@ -35,17 +36,21 @@ use crate::{
 use novarocks_connector_contract::{
     ConnectorError, ConnectorWriteFieldBinding, ConnectorWriteFieldRef, ConnectorWriteFieldToken,
     ConnectorWriteInputRef, ConnectorWriteInputShape, ConnectorWriteRecipeDraft,
-    PureProviderCompileError, WriterOwnedResourceFacts,
+    PureProviderCompileError, WriterOwnedCreationFailure, WriterOwnedResourceFacts,
 };
 use novarocks_physical_plan::NodeId;
 use novarocks_proto_models::physical_package_v2 as wire;
-use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, ValueSchemaCreationFactory, ValueSchemaCreationScope,
+    ValueSchemaScopeBeginFailure, ValueTypeStorageLifetime,
+};
 use std::{alloc::Layout, fmt, mem::size_of};
 
 type E = WriterRecipeCodecError;
 #[derive(Debug)]
 pub enum WriterRecipeCodecError {
     Control(CompileControlError),
+    ConstructionResource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
     Provider(ConnectorError),
     Binding(ProviderBindingCodecError),
     Payload(ConnectorPayloadCodecError),
@@ -58,6 +63,7 @@ impl fmt::Display for E {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(e) => e.fmt(f),
+            Self::ConstructionResource(e) => write!(f, "writer construction layout: {e:?}"),
             Self::Provider(e) => e.fmt(f),
             Self::Binding(e) => e.fmt(f),
             Self::Payload(e) => e.fmt(f),
@@ -113,6 +119,49 @@ impl From<PureProviderCompileError<ConnectorError>> for E {
         }
     }
 }
+
+type Failure<H> = ProjectionFailure<E, H>;
+macro_rules! decode_failure {
+    ($($error:ty),*) => {$(impl<H> From<$error> for Failure<H> {
+        fn from(error:$error)->Self {Self::Codec(E::from(error))}
+    })*};
+}
+decode_failure!(
+    CompileControlError,
+    ProviderBindingCodecError,
+    ConnectorPayloadCodecError,
+    TypeCodecError,
+    BindingCodecError,
+    PureProviderCompileError<ConnectorError>
+);
+fn created_failure<H>(error: WriterOwnedCreationFailure<H>) -> Failure<H> {
+    match error {
+        WriterOwnedCreationFailure::Creator(e) => ProjectionFailure::Host(e),
+        WriterOwnedCreationFailure::Contract(e) => ProjectionFailure::Codec(e.into()),
+        WriterOwnedCreationFailure::Resource(e) => {
+            ProjectionFailure::Codec(E::ConstructionResource(e))
+        }
+    }
+}
+/// Temporary namespace decode backing only. Individual recipes/Field clones
+/// retain their own factory scopes; they never retain this decode scratch.
+pub(crate) struct CreatedWriterRecipes {
+    entries: Vec<(NodeId, ConnectorWriteRecipeDraft)>,
+    facts: WriterRecipeProjectionFacts,
+    temporary_storage: ValueTypeStorageLifetime,
+}
+impl CreatedWriterRecipes {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<(NodeId, ConnectorWriteRecipeDraft)>,
+        WriterRecipeProjectionFacts,
+        ValueTypeStorageLifetime,
+    ) {
+        (self.entries, self.facts, self.temporary_storage)
+    }
+}
+
 fn add(a: usize, b: usize) -> Result<usize, CompileControlError> {
     a.checked_add(b)
         .ok_or(CompileControlError::ResourceExhausted)
@@ -418,13 +467,33 @@ fn encode_group(
 ) -> Result<Vec<wire::ConnectorWriteFieldBinding>, E> {
     let mut output = reserve(fields.len(), work)?;
     for (field, id) in fields.iter().zip(ids) {
-        let actual = types.field_source_observed(*id, work)?;
+        let actual = types.source_field_source_observed(*id, work)?;
         observed(
             if actual.is_some_and(|actual| std::ptr::eq(actual, field.field())) {
                 Ok(())
             } else {
                 Err(E::InvalidShape(
                     "writer Field ID belongs to another source owner",
+                ))
+            },
+            work,
+        )?;
+        let value_id = types
+            .source_field_value_type_id_observed(*id, work)?
+            .ok_or(E::InvalidShape(
+                "writer source lacks its explicit complete value binding",
+            ))?;
+        let value = types.value_type_observed(value_id, work)?;
+        observed(
+            if value.is_some_and(|v| {
+                field
+                    .execution_type()
+                    .is_some_and(|expected| std::ptr::eq(v, expected))
+            }) {
+                Ok(())
+            } else {
+                Err(E::InvalidShape(
+                    "writer value ID belongs to another original execution author",
                 ))
             },
             work,
@@ -436,7 +505,8 @@ fn encode_group(
         }
         output.push(wire::ConnectorWriteFieldBinding {
             field_token: token,
-            field_id: Some(*id),
+            source_field_id: Some(*id),
+            value_type_id: Some(value_id),
         });
         work.step()?;
     }
@@ -451,7 +521,7 @@ fn decode_group<'a>(
     for field in fields {
         let id = observed(
             field
-                .field_id
+                .source_field_id
                 .ok_or(E::InvalidShape("writer Field ID is absent")),
             work,
         )?;
@@ -465,7 +535,7 @@ fn decode_group<'a>(
             },
             work,
         )?;
-        let actual = types.field_observed(id, work)?;
+        let actual = types.source_field_observed(id, work)?;
         let actual = observed(
             actual.ok_or(E::InvalidShape(
                 "writer Field ID is absent from type namespace",
@@ -477,9 +547,22 @@ fn decode_group<'a>(
             *dst = *src;
             work.step()?;
         }
-        output.push(ConnectorWriteFieldRef::new(
+        let value_id = observed(
+            field
+                .value_type_id
+                .ok_or(E::InvalidShape("writer value binding ID is absent")),
+            work,
+        )?;
+        let value = types
+            .value_type_observed(value_id, work)?
+            .ok_or(E::InvalidShape(
+                "writer value binding ID is absent from execution namespace",
+            ))?;
+        work.step()?;
+        output.push(ConnectorWriteFieldRef::new_typed(
             ConnectorWriteFieldToken::from_bytes(token),
             actual.as_ref(),
+            value,
         ));
         work.step()?;
     }
@@ -536,7 +619,10 @@ pub fn encode_writer_recipes_observed(
         }
         model.request(array::<u8>(32)?, count)?;
         model.work(add(
-            mul(count, mul(field_roots, 2)?)?,
+            mul(
+                count,
+                add(mul(field_roots, 3)?, context.types.source_counts().0)?,
+            )?,
             mul(
                 add(
                     context.bindings.source_count(),
@@ -595,7 +681,7 @@ pub fn encode_writer_recipes_observed(
             .payloads
             .source_id_observed(recipe.recipe.payload(), work)?;
         for (binding, id) in recipe.recipe.input().fields_iter().zip(recipe.field_ids) {
-            let actual = context.types.field_source_observed(*id, work)?;
+            let actual = context.types.source_field_source_observed(*id, work)?;
             observed(
                 if actual.is_some_and(|actual| std::ptr::eq(actual, binding.field())) {
                     Ok(())
@@ -651,6 +737,59 @@ pub fn decode_writer_recipes_observed(
     ),
     E,
 > {
+    let decoded = decode_writer_recipes_core::<
+        std::convert::Infallible,
+        crate::value_type_table::resources::NoFactory,
+    >(definitions, context, source, limits, None, admit, work)
+    .map_err(ProjectionFailure::without_host)?;
+    let (entries, facts, _) = decoded.into_parts();
+    Ok((entries, facts))
+}
+/// Same original whole-namespace grammar/model and owned-copy constructor;
+/// each independently escaping recipe/Field has its actual finite creator.
+pub(crate) fn decode_writer_recipes_with_factory_in<H, F: ValueSchemaCreationFactory<H>>(
+    definitions: &[wire::FrozenWriterRecipe],
+    context: WriterRecipeDecodeContext<'_, '_, '_>,
+    source: usize,
+    limits: WriterRecipeProjectionLimits,
+    factory: &F,
+    admit: &mut impl FnMut(&WriterRecipeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<CreatedWriterRecipes, Failure<H>> {
+    decode_writer_recipes_core(
+        definitions,
+        context,
+        source,
+        limits,
+        Some(factory),
+        admit,
+        work,
+    )
+}
+fn request_temporary<H, S: ValueSchemaCreationScope<H>>(
+    scope: &mut Option<S>,
+    layout: Layout,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), Failure<H>> {
+    if layout.size() != 0
+        && let Some(scope) = scope
+    {
+        work.flush()?;
+        scope
+            .request_layout(layout)
+            .map_err(ProjectionFailure::Host)?;
+    }
+    Ok(())
+}
+fn decode_writer_recipes_core<H, F: ValueSchemaCreationFactory<H>>(
+    definitions: &[wire::FrozenWriterRecipe],
+    context: WriterRecipeDecodeContext<'_, '_, '_>,
+    source: usize,
+    limits: WriterRecipeProjectionLimits,
+    factory: Option<&F>,
+    admit: &mut impl FnMut(&WriterRecipeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<CreatedWriterRecipes, Failure<H>> {
     let mut model = Model::new::<(NodeId, ConnectorWriteRecipeDraft)>(definitions.len(), source)?;
     model.gate(limits, admit)?;
     observed(
@@ -680,18 +819,23 @@ pub fn decode_writer_recipes_observed(
         model.floor(
             provider_floor
                 .max(payload_floor)
-                .max(context.types.necessary_fields_retained_floor()?),
+                .max(context.types.necessary_source_fields_retained_floor()?),
         ),
         work,
     )?;
-    let type_lookup = btree_resources_v2::lookup_work_typed(context.types.field_count()).map_err(
-        |e| match e {
+    let mut type_lookup = 0usize;
+    for cardinality in [
+        context.types.source_field_count(),
+        context.types.value_type_count(),
+    ] {
+        let bound = btree_resources_v2::lookup_work_typed(cardinality).map_err(|e| match e {
             btree_resources_v2::BTreeResourceError::Arithmetic(_) => {
                 E::Control(CompileControlError::ResourceExhausted)
             }
             btree_resources_v2::BTreeResourceError::SourceModel(s) => E::SourceModel(s),
-        },
-    )?;
+        })?;
+        type_lookup = add(type_lookup, bound)?;
+    }
     for definition in definitions {
         observed(
             definition
@@ -723,7 +867,7 @@ pub fn decode_writer_recipes_observed(
         let roles = raw_roles(input);
         let (_, groups, capacity) = match roles {
             Ok(roles) => roles,
-            Err(error) => return observed(Err(error), work),
+            Err(error) => return observed(Err(error), work).map_err(ProjectionFailure::Codec),
         };
         let count = add(groups[0].len(), groups[1].len())?;
         model.fields(count)?;
@@ -775,7 +919,7 @@ pub fn decode_writer_recipes_observed(
             for field in group {
                 observed(
                     field
-                        .field_id
+                        .source_field_id
                         .ok_or(E::InvalidShape("writer Field ID is absent")),
                     work,
                 )?;
@@ -789,11 +933,27 @@ pub fn decode_writer_recipes_observed(
                     },
                     work,
                 )?;
+                let value_id = observed(
+                    field
+                        .value_type_id
+                        .ok_or(E::InvalidShape("writer value binding ID is absent")),
+                    work,
+                )?;
+                observed(
+                    context
+                        .types
+                        .value_type_observed(value_id, work)?
+                        .ok_or(E::InvalidShape(
+                            "writer value binding ID is absent from execution namespace",
+                        )),
+                    work,
+                )?;
                 raw_floor = add(raw_floor, field.field_token.capacity())?;
                 observed(model.floor(raw_floor), work)?;
-                let actual = context
-                    .types
-                    .field_observed(field.field_id.expect("preflight required Field ID"), work)?;
+                let actual = context.types.source_field_observed(
+                    field.source_field_id.expect("preflight required Field ID"),
+                    work,
+                )?;
                 observed(
                     actual.ok_or(E::InvalidShape(
                         "writer Field ID is absent from type namespace",
@@ -803,9 +963,32 @@ pub fn decode_writer_recipes_observed(
             }
         }
     }
+    // Original complete header/reference checks precede even scope headers.
+    let mut temporary = if let Some(factory) = factory.filter(|_| !definitions.is_empty()) {
+        work.flush()?;
+        Some(
+            factory
+                .begin_scope_observed(&mut |layout| {
+                    model.request(layout, 1)?;
+                    model.gate(limits, admit)
+                })
+                .map_err(|error| match error {
+                    ValueSchemaScopeBeginFailure::Observer(e) => ProjectionFailure::Codec(e),
+                    ValueSchemaScopeBeginFailure::Creator(e) => ProjectionFailure::Host(e),
+                })?,
+        )
+    } else {
+        None
+    };
+    request_temporary(&mut temporary, array::<usize>(definitions.len())?, work)?;
     let _index = BindingIndex::prepare(
         definitions.len(),
         |i| definitions[i].node_id.expect("preflight required node ID"),
+        work,
+    )?;
+    request_temporary(
+        &mut temporary,
+        array::<(NodeId, ConnectorWriteRecipeDraft)>(definitions.len())?,
         work,
     )?;
     let mut output = reserve(definitions.len(), work)?;
@@ -836,7 +1019,17 @@ pub fn decode_writer_recipes_observed(
         )?;
         let (shape, groups, _) =
             raw_roles(definition.input.as_ref().expect("preflight required input"))?;
+        request_temporary(
+            &mut temporary,
+            array::<ConnectorWriteFieldRef<'_>>(groups[0].len())?,
+            work,
+        )?;
         let first = decode_group(groups[0], context.types, work)?;
+        request_temporary(
+            &mut temporary,
+            array::<ConnectorWriteFieldRef<'_>>(groups[1].len())?,
+            work,
+        )?;
         let second = decode_group(groups[1], context.types, work)?;
         let input = borrowed_shape(shape, &first, &second);
         let view_bytes = add(
@@ -845,17 +1038,31 @@ pub fn decode_writer_recipes_observed(
         )?;
         let constructor_source = add(source, view_bytes)?;
         let mut current = WriterOwnedResourceFacts::default();
-        let recipe = ConnectorWriteRecipeDraft::try_new_from_borrowed_input_observed(
-            provider,
-            payload,
-            &input,
-            constructor_source,
-            &mut |facts| {
-                current = *facts;
-                admit(&model.combined(facts, limits)?)
-            },
-            work,
-        )?;
+        let mut constructor_admit = |facts: &WriterOwnedResourceFacts| {
+            current = *facts;
+            admit(&model.combined(facts, limits)?)
+        };
+        let recipe = if let Some(factory) = factory {
+            ConnectorWriteRecipeDraft::try_new_from_borrowed_input_with_factory_in(
+                provider,
+                payload,
+                &input,
+                constructor_source,
+                factory,
+                &mut constructor_admit,
+                work,
+            )
+            .map_err(created_failure)?
+        } else {
+            ConnectorWriteRecipeDraft::try_new_from_borrowed_input_observed(
+                provider,
+                payload,
+                &input,
+                constructor_source,
+                &mut constructor_admit,
+                work,
+            )?
+        };
         model.complete(current)?;
         model.gate(limits, admit)?;
         output.push((
@@ -866,7 +1073,16 @@ pub fn decode_writer_recipes_observed(
     }
     let facts = model.combined(&Default::default(), limits)?;
     admit(&facts)?;
-    Ok((output, facts))
+    let temporary_storage = temporary
+        .as_ref()
+        .map_or_else(ValueTypeStorageLifetime::pure, |scope| {
+            scope.storage_lifetime()
+        });
+    Ok(CreatedWriterRecipes {
+        entries: output,
+        facts,
+        temporary_storage,
+    })
 }
 
 #[cfg(test)]

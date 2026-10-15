@@ -758,7 +758,7 @@ fn c06_p2_truncate_actual_compiler_slot_inputs_preserve_v1_values_and_exact_type
                 let actual = instance
                     .evaluate(&batch, selection, &HarnessControl)
                     .unwrap();
-                assert_eq!(actual.values().data_type(), &result_type.data_type);
+                assert_eq!(actual.values().data_type(), result_type.data_type());
                 let label = format!(
                     "compiled source={:?}/binary={binary}/rows={rows:?}",
                     value.data_type()

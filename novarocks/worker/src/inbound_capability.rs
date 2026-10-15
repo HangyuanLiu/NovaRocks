@@ -163,6 +163,12 @@ pub enum InboundFrameClaim {
     Refused(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InboundFrameDelivery<E> {
+    Claim(InboundFrameClaim),
+    Receiver(E),
+}
+
 impl TaskInboundCapabilities {
     pub fn new() -> Arc<Self> {
         Self::with_capacity_limits(TaskInboundCapabilityLimits::default())
@@ -308,6 +314,28 @@ impl TaskInboundCapabilities {
         sender_count: u32,
         deliver: impl FnOnce() -> Result<(), String>,
     ) -> InboundFrameClaim {
+        match self.deliver_frame_with_receiver_error(
+            destination_kernel_key,
+            destination_node_id,
+            source_kernel_key,
+            sender_ordinal,
+            sender_count,
+            deliver,
+        ) {
+            InboundFrameDelivery::Claim(claim) => claim,
+            InboundFrameDelivery::Receiver(error) => InboundFrameClaim::Refused(error),
+        }
+    }
+
+    pub fn deliver_frame_with_receiver_error<E>(
+        &self,
+        destination_kernel_key: UniqueId,
+        destination_node_id: FragmentNodeId,
+        source_kernel_key: UniqueId,
+        sender_ordinal: u32,
+        sender_count: u32,
+        deliver: impl FnOnce() -> Result<(), E>,
+    ) -> InboundFrameDelivery<E> {
         let gate = self
             .state
             .lock()
@@ -316,13 +344,13 @@ impl TaskInboundCapabilities {
             .get(&destination_kernel_key)
             .cloned();
         let Some(gate) = gate else {
-            return self.claim_frame(
+            return InboundFrameDelivery::Claim(self.claim_frame(
                 destination_kernel_key,
                 destination_node_id,
                 source_kernel_key,
                 sender_ordinal,
                 sender_count,
-            );
+            ));
         };
         let _delivery = gate.read().expect("task inbound delivery gate");
         let claim = Self::claim_locked(
@@ -334,11 +362,11 @@ impl TaskInboundCapabilities {
             sender_count,
         );
         if claim != InboundFrameClaim::Authorized {
-            return claim;
+            return InboundFrameDelivery::Claim(claim);
         }
         match deliver() {
-            Ok(()) => InboundFrameClaim::Authorized,
-            Err(detail) => InboundFrameClaim::Refused(detail),
+            Ok(()) => InboundFrameDelivery::Claim(InboundFrameClaim::Authorized),
+            Err(error) => InboundFrameDelivery::Receiver(error),
         }
     }
 

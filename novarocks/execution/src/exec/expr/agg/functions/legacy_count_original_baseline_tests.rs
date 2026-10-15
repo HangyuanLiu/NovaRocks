@@ -90,10 +90,10 @@ fn legacy_count_original_star_empty_expr_null_and_ignored_payload_types() {
     assert!(!null.is_null(0));
     let mut state = Legacy::new(Some(&DataType::Null));
     state.update(&null);
-    assert_eq!(state.output(false), 3);
+    assert_eq!(state.output(false), 0);
 }
 #[test]
-fn legacy_count_original_dictionary_value_null_is_not_key_null() {
+fn legacy_count_dictionary_value_null_matches_plain_value_null() {
     let input: ArrayRef = Arc::new(
         DictionaryArray::<Int8Type>::try_new(
             Int8Array::from(vec![Some(0), Some(1), None, Some(1), Some(0)]),
@@ -104,11 +104,21 @@ fn legacy_count_original_dictionary_value_null_is_not_key_null() {
     assert_eq!(input.null_count(), 1);
     let mut state = Legacy::new(Some(input.data_type()));
     state.update(&input);
-    assert_eq!(state.output(false), 4);
+    assert_eq!(state.output(false), 2);
+    let plain: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("ok"),
+        None,
+        None,
+        None,
+        Some("ok"),
+    ]));
+    let mut plain_state = Legacy::new(Some(plain.data_type()));
+    plain_state.update(&plain);
+    assert_eq!(plain_state.output(false), state.output(false));
     let sliced = input.slice(1, 3);
     let mut state = Legacy::new(Some(sliced.data_type()));
     state.update(&sliced);
-    assert_eq!(state.output(false), 2);
+    assert_eq!(state.output(false), 0);
 }
 #[test]
 fn legacy_count_original_merge_all_signed_carriers_and_nulls() {

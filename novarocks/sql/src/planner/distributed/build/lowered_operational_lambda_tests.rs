@@ -169,7 +169,7 @@ fn operational_lambda_real_sql_loans_original_parameters_and_actual_body_scope()
         unreachable!()
     };
     assert_eq!(parameter_types.len(), 1);
-    assert_eq!(parameter_types[0].data_type, DataType::Utf8);
+    assert_eq!(parameter_types[0].data_type().clone(), DataType::Utf8);
     assert_eq!(result_type, &ValueType::new(DataType::Utf8, true));
     let lambda = fragment.expressions().get(receipt.arguments()[0]).unwrap();
     let ContractExprKind::Lambda { body, .. } = &lambda.kind else {
@@ -192,6 +192,7 @@ fn nested_identity_lambda_owner() -> (SqlAuthoredPhysicalPlan, ValueType) {
         Field::new("provider_leaf", DataType::Utf8, false)
             .with_metadata([("provider.attribute".to_string(), "original-é".to_string())].into()),
     );
+    assert_eq!(field.metadata()["provider.attribute"], "original-é");
     let parameter_type = ValueType::new(DataType::Struct(vec![field].into()), false);
     let lambda = TypedExpr {
         kind: ExprKind::LambdaFunction {
@@ -264,16 +265,14 @@ fn operational_lambda_actual_catalog_typed_emitter_preserves_nested_parameter_me
     };
     assert_eq!(parameter_types.as_ref(), std::slice::from_ref(&expected));
     assert_eq!(result_type, &expected);
-    let DataType::Struct(fields) = &parameter_types[0].data_type else {
+    let DataType::Struct(fields) = &parameter_types[0].data_type() else {
         unreachable!()
     };
     assert_eq!(fields[0].name(), "provider_leaf");
+    assert!(fields[0].metadata().is_empty());
     assert_eq!(
-        fields[0]
-            .metadata()
-            .get("provider.attribute")
-            .map(String::as_str),
-        Some("original-é")
+        parameter_types[0].child_at(0).unwrap().logical_type(),
+        novarocks_type_contract::ValueLogicalType::Physical
     );
     assert!(!fields[0].is_nullable());
     assert_eq!(

@@ -22,7 +22,7 @@ use crate::{
 };
 use arrow::datatypes::DataType;
 use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
-use std::sync::Mutex;
+use std::{collections::HashMap, sync::Mutex};
 const SOURCE: usize = 1 << 20;
 const CAUSES: [CompileControlError; 3] = [
     CompileControlError::Cancelled,
@@ -85,6 +85,9 @@ fn type_limits() -> TypeProjectionLimits {
     }
 }
 fn field() -> Arc<Field> {
+    Arc::new(Field::new("original", DataType::Int64, true))
+}
+fn original_source_field() -> Arc<Field> {
     Arc::new(
         Field::new("original", DataType::Int64, true)
             .with_metadata([("field.tag".into(), "unmodified".into())].into()),
@@ -149,20 +152,18 @@ fn schemas_preserve_zero_max_ordered_repeated_fields_and_empty_root() {
             wire::SchemaDefinition {
                 id: u32::MAX,
                 field_ids: vec![u32::MAX, 0, u32::MAX],
-                metadata: vec![]
             },
             wire::SchemaDefinition {
                 id: 0,
                 field_ids: vec![],
-                metadata: vec![]
             }
         ]
     );
     let decoded = run_decode(encoded.as_wire(), &read, &control).unwrap();
     assert_eq!(decoded.definitions()[0].0, u32::MAX);
     assert_eq!(decoded.definitions()[1].0, 0);
-    assert!(decoded.definitions()[1].1.fields().is_empty());
-    let output = decoded.definitions()[0].1.fields();
+    assert!(decoded.definitions()[1].1.schema().fields().is_empty());
+    let output = decoded.definitions()[0].1.schema().fields();
     assert!(Arc::ptr_eq(&output[0], read.field(u32::MAX).unwrap()));
     assert!(Arc::ptr_eq(&output[1], read.field(0).unwrap()));
     assert!(Arc::ptr_eq(&output[2], read.field(u32::MAX).unwrap()));
@@ -170,7 +171,7 @@ fn schemas_preserve_zero_max_ordered_repeated_fields_and_empty_root() {
     assert!(decoded.schema_observed(7, &mut work).unwrap().is_none());
     assert!(std::ptr::eq(
         decoded.schema_observed(0, &mut work).unwrap().unwrap(),
-        &decoded.definitions()[1].1
+        decoded.definitions()[1].1.schema()
     ));
     work.finish().unwrap();
     let foreign = Control::default();
@@ -180,15 +181,23 @@ fn schemas_preserve_zero_max_ordered_repeated_fields_and_empty_root() {
 #[test]
 #[allow(deprecated)]
 fn schema_metadata_hand_oracle_is_independent_of_complete_field_metadata() {
+    use crate::physical_public_source_schema_v2::{
+        SourceSchemaFactsSource, decode_public_source_schemas_pure_in,
+        encode_public_source_schemas_pure_in,
+    };
+    use crate::physical_type_v2::{
+        decode_source_field_table_input_derived_with_creator, encode_source_field_table_pure_in,
+    };
+    use novarocks_connector_contract::{ConnectorSourceSchemaFacts, ConnectorSourceSchemaShape};
+    use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
     let control = Control::default();
-    let nested = FunctionValueType::try_with_logical_type(
+    let declared = FunctionValueType::try_with_logical_type(
         DataType::FixedSizeBinary(16),
         false,
         ValueLogicalType::LargeInt,
     )
-    .unwrap()
-    .try_to_field("large")
     .unwrap();
+    let nested = Arc::new(declared.try_to_field("large").unwrap());
     let dictionary = Arc::new(
         Field::new_dict(
             "dict",
@@ -201,57 +210,158 @@ fn schema_metadata_hand_oracle_is_independent_of_complete_field_metadata() {
     );
     let structure = Arc::new(Field::new(
         "nested",
-        DataType::Struct(vec![Arc::new(nested)].into()),
+        DataType::Struct(vec![nested].into()),
         false,
     ));
-    let roots = [(0, dictionary.clone()), (u32::MAX, structure.clone())];
-    let schema = Schema::new_with_metadata(vec![dictionary, structure], metadata());
-    let sources = [SchemaSource {
-        id: 7,
-        source: &schema,
-        field_ids: &[0, u32::MAX],
-    }];
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    let original = original_source_field();
+    let source_fields = encode_source_field_table_pure_in(
+        &[(0, &dictionary), (1, &original), (u32::MAX, &structure)],
+        type_limits(),
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
+    let mut request = |_: Layout| Ok::<(), ()>(());
+    let mut opaque = |_: usize| Ok::<(), ()>(());
+    let mut creation =
+        ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let decoded_fields = decode_source_field_table_input_derived_with_creator(
+        &source_fields,
+        SOURCE,
+        &mut creation,
+        &mut work,
+    )
+    .unwrap();
+    let actual = decoded_fields
+        .field_observed(0, &mut work)
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual.dict_id(), Some(77));
+    assert_eq!(actual.dict_is_ordered(), Some(true));
+    assert_eq!(actual.metadata()["unknown.field"], "雪");
+    assert_eq!(
+        decoded_fields
+            .field_observed(1, &mut work)
+            .unwrap()
+            .unwrap()
+            .metadata()["field.tag"],
+        "unmodified"
+    );
+    let nested_actual = decoded_fields
+        .field_observed(u32::MAX, &mut work)
+        .unwrap()
+        .unwrap();
+    assert!(!nested_actual.is_nullable());
+    let DataType::Struct(children) = nested_actual.data_type() else {
+        panic!()
+    };
+    assert_eq!(children[0].data_type(), &DataType::FixedSizeBinary(16));
+    // Execution identity is the explicit author beside source attributes.
+    assert_eq!(declared.logical_type(), ValueLogicalType::LargeInt);
+    work.finish().unwrap();
+    let roots = [];
     let types = encode_type_table_sources(&[], &roots, type_limits(), &control).unwrap();
     let read = decode_type_table(types.as_wire(), type_limits(), &control).unwrap();
+    let shape = Schema::empty();
+    let sources = [SchemaSource {
+        id: 7,
+        source: &shape,
+        field_ids: &[],
+    }];
     let encoded = run_encode(&sources, &types, &control).unwrap();
+    let schemas = run_decode(encoded.as_wire(), &read, &control).unwrap();
+    let facts = ConnectorSourceSchemaFacts::try_new(
+        ConnectorSourceSchemaShape::try_new(
+            Arc::new(Schema::empty()),
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+        metadata(),
+        Box::new([]),
+        ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    let wire = encode_public_source_schemas_pure_in(
+        &[SourceSchemaFactsSource {
+            id: 0,
+            source_shape_schema_id: 7,
+            facts: &facts,
+        }],
+        &mut work,
+    )
+    .unwrap();
     assert_eq!(
-        encoded.as_wire()[0].metadata,
+        wire[0].schema_attributes,
         vec![
-            ArrowFieldMetadataEntry {
+            novarocks_proto_models::arrow_type::ArrowFieldMetadataEntry {
                 key: "".into(),
                 value: "".into()
             },
-            ArrowFieldMetadataEntry {
+            novarocks_proto_models::arrow_type::ArrowFieldMetadataEntry {
                 key: "a\0".into(),
                 value: "雪\0".into()
             },
-            ArrowFieldMetadataEntry {
+            novarocks_proto_models::arrow_type::ArrowFieldMetadataEntry {
                 key: "雪".into(),
                 value: "value".into()
-            }
+            },
         ]
     );
-    let decoded = run_decode(encoded.as_wire(), &read, &control).unwrap();
-    let actual = &decoded.definitions()[0].1;
-    assert_eq!(actual.metadata(), &metadata());
-    assert_eq!(actual.fields()[0].dict_id(), Some(77));
-    assert_eq!(actual.fields()[0].dict_is_ordered(), Some(true));
+    work.finish().unwrap();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let decoded =
+        decode_public_source_schemas_pure_in(&wire, &schemas, SOURCE, limits(), &mut work).unwrap();
     assert_eq!(
-        actual.fields()[0].metadata().get("unknown.field").unwrap(),
-        "雪"
+        decoded
+            .lookup_observed(0, &mut work)
+            .unwrap()
+            .unwrap()
+            .schema_attributes(),
+        &metadata()
     );
-    assert!(!actual.fields()[1].is_nullable());
-    let DataType::Struct(fields) = actual.fields()[1].data_type() else {
-        panic!()
-    };
+    assert_eq!(schemas.definitions()[0].1.schema().metadata().capacity(), 0);
+    work.finish().unwrap();
+    // The original large Unicode annotation remains a source fact. It is
+    // carried through the actual independent codec, never an execution shape.
+    let text = "雪".repeat(320);
+    let wide = ConnectorSourceSchemaFacts::try_new(
+        ConnectorSourceSchemaShape::try_new(
+            Arc::new(Schema::empty()),
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+        HashMap::from([("key".into(), text.clone())]),
+        Box::new([]),
+        ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    let wire = encode_public_source_schemas_pure_in(
+        &[SourceSchemaFactsSource {
+            id: u32::MAX,
+            source_shape_schema_id: 7,
+            facts: &wide,
+        }],
+        &mut work,
+    )
+    .unwrap();
+    assert_eq!(wire[0].schema_attributes[0].value, text);
+    work.finish().unwrap();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let decoded =
+        decode_public_source_schemas_pure_in(&wire, &schemas, SOURCE, limits(), &mut work).unwrap();
     assert_eq!(
-        novarocks_type_contract::field_logical_type(&fields[0]).unwrap(),
-        ValueLogicalType::LargeInt
+        decoded
+            .lookup_observed(u32::MAX, &mut work)
+            .unwrap()
+            .unwrap()
+            .schema_attributes()["key"],
+        text
     );
-    assert!(Arc::ptr_eq(
-        &actual.fields()[1],
-        read.field(u32::MAX).unwrap()
-    ));
+    work.finish().unwrap();
 }
 #[test]
 fn schema_field_namespace_requires_original_arc_and_real_connector_schema() {
@@ -305,38 +415,48 @@ fn schema_field_namespace_requires_original_arc_and_real_connector_schema() {
     let bad = [wire::SchemaDefinition {
         id: 0,
         field_ids: vec![7],
-        metadata: vec![],
     }];
     ordinary(run_decode(&bad, &read, &control).map(|_| ()));
 }
 #[test]
 fn schema_metadata_duplicate_unsorted_and_duplicate_ids_never_normalize() {
+    use crate::physical_public_source_schema_v2::decode_public_source_schemas_pure_in;
     let control = Control::default();
     let types = empty_types(&control);
+    let defs = [wire::SchemaDefinition {
+        id: 0,
+        field_ids: vec![],
+    }];
+    let schemas = run_decode(&defs, &types, &control).unwrap();
     for keys in [["a", "a"], ["b", "a"]] {
-        let input = [wire::SchemaDefinition {
-            id: 0,
-            field_ids: vec![],
-            metadata: keys
+        let source = [wire::PublicSourceSchemaFactsDefinition {
+            id: Some(0),
+            source_shape_schema_id: Some(0),
+            schema_attributes: keys
                 .into_iter()
-                .map(|key| ArrowFieldMetadataEntry {
-                    key: key.into(),
-                    value: "".into(),
-                })
+                .map(
+                    |key| novarocks_proto_models::arrow_type::ArrowFieldMetadataEntry {
+                        key: key.into(),
+                        value: "".into(),
+                    },
+                )
                 .collect(),
+            field_facts: vec![],
         }];
-        ordinary(run_decode(&input, &types, &control).map(|_| ()));
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        assert!(
+            decode_public_source_schemas_pure_in(&source, &schemas, SOURCE, limits(), &mut work)
+                .is_err()
+        );
     }
     let duplicates = [
         wire::SchemaDefinition {
             id: u32::MAX,
             field_ids: vec![],
-            metadata: vec![],
         },
         wire::SchemaDefinition {
             id: u32::MAX,
             field_ids: vec![],
-            metadata: vec![],
         },
     ];
     assert!(matches!(
@@ -344,8 +464,7 @@ fn schema_metadata_duplicate_unsorted_and_duplicate_ids_never_normalize() {
         Err(Error::Binding(BindingCodecError::InvalidShape(_)))
     ));
     let empty = Schema::empty();
-    let roots = [];
-    let types = encode_type_table_sources(&[], &roots, type_limits(), &control).unwrap();
+    let types = encode_type_table_sources(&[], &[], type_limits(), &control).unwrap();
     let sources = [
         SchemaSource {
             id: 0,
@@ -377,7 +496,7 @@ fn schema_request_layout_golden_includes_empty_fields_arc_and_persistent_index()
     let roots = [(0, original.clone())];
     let types = encode_type_table_sources(&[], &roots, type_limits(), &control).unwrap();
     let read = decode_type_table(types.as_wire(), type_limits(), &control).unwrap();
-    let schema = Schema::new_with_metadata(vec![original.clone(), original], metadata());
+    let schema = Schema::new(vec![original.clone(), original]);
     let sources = [SchemaSource {
         id: 0,
         source: &schema,
@@ -385,30 +504,12 @@ fn schema_request_layout_golden_includes_empty_fields_arc_and_persistent_index()
     }];
     let encoded = run_encode(&sources, &types, &control).unwrap();
     let decoded = run_decode(encoded.as_wire(), &read, &control).unwrap();
-    let string_bytes = "a\0".len() + "雪\0".len() + "雪".len() + "value".len();
     let sent = encoded.facts();
     let send_bytes = Layout::array::<usize>(1).unwrap().size()
         + Layout::array::<wire::SchemaDefinition>(1).unwrap().size()
-        + Layout::array::<u32>(2).unwrap().size()
-        + Layout::array::<(&str, &str)>(3).unwrap().size()
-        + Layout::array::<ArrowFieldMetadataEntry>(3).unwrap().size()
-        + string_bytes;
-    assert_eq!(sent.allocation_requests_upper_bound, 9);
+        + Layout::array::<u32>(2).unwrap().size();
+    assert_eq!(sent.allocation_requests_upper_bound, 3);
     assert_eq!(sent.allocation_request_bytes_upper_bound, send_bytes);
-    // Locked aarch64 Group8 or x86 SSE2 Group16; String pairs use 4 buckets
-    // for three entries. This oracle uses public actual pair/header Layout.
-    let group = if cfg!(all(
-        target_arch = "x86_64",
-        target_feature = "sse2",
-        not(miri)
-    )) {
-        16
-    } else {
-        8
-    };
-    let pair = Layout::new::<(String, String)>();
-    let align = pair.align().max(group);
-    let table = (pair.size() * 4).div_ceil(align) * align + 4 + group;
     let arc = Layout::new::<[usize; 2]>()
         .extend(Layout::array::<Arc<Field>>(2).unwrap())
         .unwrap()
@@ -416,12 +517,12 @@ fn schema_request_layout_golden_includes_empty_fields_arc_and_persistent_index()
         .pad_to_align()
         .size();
     let receive_bytes = Layout::array::<usize>(1).unwrap().size()
-        + 2 * Layout::array::<(u32, Schema)>(1).unwrap().size()
+        + 2 * Layout::array::<(u32, MaterializedSchema)>(1)
+            .unwrap()
+            .size()
         + Layout::array::<Arc<Field>>(2).unwrap().size()
-        + arc
-        + table
-        + string_bytes;
-    assert_eq!(decoded.facts().allocation_requests_upper_bound, 10);
+        + arc;
+    assert_eq!(decoded.facts().allocation_requests_upper_bound, 5);
     assert_eq!(
         decoded.facts().allocation_request_bytes_upper_bound,
         receive_bytes
@@ -429,14 +530,15 @@ fn schema_request_layout_golden_includes_empty_fields_arc_and_persistent_index()
     let empty = [wire::SchemaDefinition {
         id: 0,
         field_ids: vec![],
-        metadata: vec![],
     }];
     let empty_decoded = run_decode(&empty, &read, &control).unwrap();
     assert_eq!(empty_decoded.facts().allocation_requests_upper_bound, 4);
     assert_eq!(
         empty_decoded.facts().allocation_request_bytes_upper_bound,
         Layout::array::<usize>(1).unwrap().size()
-            + 2 * Layout::array::<(u32, Schema)>(1).unwrap().size()
+            + 2 * Layout::array::<(u32, MaterializedSchema)>(1)
+                .unwrap()
+                .size()
             + Layout::new::<[usize; 2]>().size()
     );
     for receive in [false, true] {
@@ -504,29 +606,17 @@ fn shared_schema_source_union_floor_and_deleted_hash_backing_remain_truthful() {
             field_ids: &ids,
         },
     ];
-    let encoded = run_encode(&sources, &types, &control).unwrap();
-    assert!(encoded.as_wire().iter().all(|s| s.metadata.is_empty()));
-    assert!(
-        encoded.facts().cumulative_work_upper_bound
-            >= 4 * maps::source_iterator_work_upper_bound(SOURCE, 0).unwrap()
-    );
+    ordinary(run_encode(&sources, &types, &control).map(|_| ()));
+    assert!(schema.metadata().is_empty() && schema.metadata().capacity() > 0);
     let mut input = vec![wire::SchemaDefinition {
         id: 0,
         field_ids: vec![0],
-        metadata: vec![ArrowFieldMetadataEntry {
-            key: "key".into(),
-            value: "value".into(),
-        }],
     }];
     input[0].field_ids.reserve(64);
-    input[0].metadata[0].value.reserve(4096);
     let read = decode_type_table(types.as_wire(), type_limits(), &control).unwrap();
     let known = bytes::<wire::SchemaDefinition>(1).unwrap()
         + read.necessary_fields_retained_floor().unwrap()
-        + bytes::<u32>(input[0].field_ids.capacity()).unwrap()
-        + bytes::<ArrowFieldMetadataEntry>(input[0].metadata.capacity()).unwrap()
-        + input[0].metadata[0].key.capacity()
-        + input[0].metadata[0].value.capacity();
+        + bytes::<u32>(input[0].field_ids.capacity()).unwrap();
     ordinary(prepare_schemas_decode(&input, &read, known - 1, limits(), &control).map(|_| ()));
     // Eight exact aliases share one 320-field Fields allocation and one IDs
     // slice. The caller invoice covers their actual union, including the
@@ -581,7 +671,7 @@ fn every_small_schema_callback_preserves_three_primary_causes_and_ordinary_tail(
     let roots = [(0, original.clone())];
     let types = encode_type_table_sources(&[], &roots, type_limits(), &control).unwrap();
     let read = decode_type_table(types.as_wire(), type_limits(), &control).unwrap();
-    let schema = Schema::new_with_metadata(vec![original], metadata());
+    let schema = Schema::new(vec![original]);
     let sources = [SchemaSource {
         id: 0,
         source: &schema,
@@ -601,7 +691,6 @@ fn every_small_schema_callback_preserves_three_primary_causes_and_ordinary_tail(
     let bad = [wire::SchemaDefinition {
         id: 0,
         field_ids: vec![7],
-        metadata: vec![],
     }];
     control.arm(None);
     ordinary(run_decode(&bad, &read, &control).map(|_| ()));
@@ -621,113 +710,48 @@ fn every_small_schema_callback_preserves_three_primary_causes_and_ordinary_tail(
     assert_eq!(control.trace(), [(CompilePhase::Decode, 0)]);
 }
 #[test]
-fn known_metadata_prefix_resource_refusal_precedes_late_control() {
+fn known_shape_field_prefix_resource_refusal_precedes_late_control() {
     let control = Control::default();
-    let roots = [];
+    let original = field();
+    let roots = [(0, original.clone())];
     let types = encode_type_table_sources(&[], &roots, type_limits(), &control).unwrap();
     let read = decode_type_table(types.as_wire(), type_limits(), &control).unwrap();
-    let schema =
-        Schema::new_with_metadata(Vec::<Arc<Field>>::new(), [("x".into(), "".into())].into());
+    let shape = Schema::new(vec![original]);
     let sources = [SchemaSource {
         id: 0,
-        source: &schema,
-        field_ids: &[],
+        source: &shape,
+        field_ids: &[0],
     }];
-    // The original container requests fit exactly; the first actual key adds
-    // one known byte. No subsequent iterator/footer observation may win.
-    let mut send = limits();
-    send.max_allocation_request_bytes = Layout::array::<usize>(1).unwrap().size()
-        + Layout::array::<wire::SchemaDefinition>(1).unwrap().size()
-        + Layout::array::<(&str, &str)>(1).unwrap().size()
-        + Layout::array::<ArrowFieldMetadataEntry>(1).unwrap().size();
-    let empty_key_schema =
-        Schema::new_with_metadata(Vec::<Arc<Field>>::new(), [("".into(), "".into())].into());
-    let empty_key_sources = [SchemaSource {
-        id: 0,
-        source: &empty_key_schema,
-        field_ids: &[],
-    }];
-    let mut send_work = limits();
-    send_work.max_work = run_encode(&empty_key_sources, &types, &control)
-        .unwrap()
-        .facts()
-        .cumulative_work_upper_bound;
-    control.arm(Some((4, CompileControlError::Cancelled)));
-    let late = prepare_schemas_encode(&sources, &types, SOURCE, send, &control);
-    assert!(
-        matches!(
-            late,
+    let encoded = run_encode(&sources, &types, &control).unwrap();
+    let decoded = run_decode(encoded.as_wire(), &read, &control).unwrap();
+    for receive in [false, true] {
+        let facts = if receive {
+            *decoded.facts()
+        } else {
+            *encoded.facts()
+        };
+        let mut bound = limits();
+        bound.max_allocation_request_bytes = facts.allocation_request_bytes_upper_bound - 1;
+        control.arm(None);
+        let run = |control: &Control| {
+            if receive {
+                prepare_schemas_decode(encoded.as_wire(), &read, SOURCE, bound, control).map(|_| ())
+            } else {
+                prepare_schemas_encode(&sources, &types, SOURCE, bound, control).map(|_| ())
+            }
+        };
+        assert!(matches!(
+            run(&control),
             Err(Error::Control(CompileControlError::ResourceExhausted))
-        ),
-        "late control replaced known resource: {:?}",
-        late.err()
-    );
-    control.arm(None);
-    assert!(matches!(
-        prepare_schemas_encode(&sources, &types, SOURCE, send, &control),
-        Err(Error::Control(CompileControlError::ResourceExhausted))
-    ));
-    let prefix = control.trace();
-    assert_eq!(
-        prefix.len(),
-        4,
-        "no callback after the first key's known refusal"
-    );
-    for bound in [send, send_work] {
+        ));
+        let prefix = control.trace();
         for cause in CAUSES {
             control.arm(Some((prefix.len(), cause)));
             assert!(matches!(
-                prepare_schemas_encode(&sources, &types, SOURCE, bound, &control),
+                run(&control),
                 Err(Error::Control(CompileControlError::ResourceExhausted))
             ));
             assert_eq!(control.trace(), prefix);
-        }
-    }
-    let input = [wire::SchemaDefinition {
-        id: 0,
-        field_ids: vec![],
-        metadata: vec![ArrowFieldMetadataEntry {
-            key: "x".into(),
-            value: "".into(),
-        }],
-    }];
-    let mut receive = limits();
-    receive.max_allocation_request_bytes = Layout::array::<usize>(1).unwrap().size()
-        + 2 * Layout::array::<(u32, Schema)>(1).unwrap().size()
-        + Layout::new::<[usize; 2]>().size()
-        + maps::fresh_table_layout::<String, String>(1)
-            .unwrap()
-            .layout
-            .unwrap()
-            .size();
-    control.arm(None);
-    let empty_key_input = [wire::SchemaDefinition {
-        id: 0,
-        field_ids: vec![],
-        metadata: vec![ArrowFieldMetadataEntry {
-            key: "".into(),
-            value: "".into(),
-        }],
-    }];
-    let mut receive_work = limits();
-    receive_work.max_work = run_decode(&empty_key_input, &read, &control)
-        .unwrap()
-        .facts()
-        .cumulative_work_upper_bound;
-    // Exercise the sole count author in an already active caller scope, with
-    // a real pending quantum: its three preceding header gates leave 255.
-    for bound in [receive, receive_work] {
-        for cause in CAUSES {
-            control.arm(Some((1, cause)));
-            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
-            for _ in 0..240 {
-                work.step().unwrap();
-            }
-            assert!(matches!(
-                decode_preflight(&input, &read, SOURCE, bound, &mut |_| Ok(()), &mut work),
-                Err(Error::Control(CompileControlError::ResourceExhausted))
-            ));
-            assert_eq!(control.trace(), [(CompilePhase::Decode, 0)]);
         }
     }
     control.arm(None);
@@ -739,9 +763,7 @@ fn wide_schema_copy_has_actual_quantum_without_claiming_hashmap_internal_samplin
     let roots = [(u32::MAX, original.clone())];
     let types = encode_type_table_sources(&[], &roots, type_limits(), &control).unwrap();
     let read = decode_type_table(types.as_wire(), type_limits(), &control).unwrap();
-    let text = "雪".repeat(320);
-    let schema =
-        Schema::new_with_metadata(vec![original; 320], [("key".into(), text.clone())].into());
+    let schema = Schema::new(vec![original; 320]);
     let ids = vec![u32::MAX; 320];
     let sources = [SchemaSource {
         id: u32::MAX,
@@ -753,16 +775,29 @@ fn wide_schema_copy_has_actual_quantum_without_claiming_hashmap_internal_samplin
     let sent = control.trace();
     assert!(sent.iter().any(|(_, units)| *units == 256));
     assert_eq!(encoded.as_wire()[0].field_ids, ids);
-    assert_eq!(encoded.as_wire()[0].metadata[0].value, text);
+
     control.arm(None);
     let decoded = run_decode(encoded.as_wire(), &read, &control).unwrap();
     let received = control.trace();
-    assert!(received.iter().any(|(_, units)| *units == 256));
-    assert_eq!(decoded.definitions()[0].1.fields().len(), 320);
+    // Decode borrows each immutable Field through an opaque lookup and clones
+    // its Arc at an observed boundary. The retired metadata byte-copy was the
+    // receive operation that accumulated a 256-unit quantum; do not simulate it.
+    assert!(
+        received
+            .iter()
+            .map(|(_, units)| u64::from(*units))
+            .sum::<u64>()
+            >= 320
+    );
+    assert_eq!(decoded.definitions()[0].1.schema().fields().len(), 320);
     for receive in [false, true] {
         let trace = if receive { &received } else { &sent };
-        let quantum = trace.iter().position(|(_, units)| *units == 256).unwrap();
-        for at in [0, quantum, trace.len() - 1] {
+        let middle = if receive {
+            trace.len() / 2
+        } else {
+            trace.iter().position(|(_, units)| *units == 256).unwrap()
+        };
+        for at in [0, middle, trace.len() - 1] {
             for cause in CAUSES {
                 control.arm(Some((at, cause)));
                 let result = if receive {
@@ -819,7 +854,7 @@ fn observed_schema_composition_keeps_original_loans_and_one_caller_scope() {
     let roots = [(0, original.clone()), (u32::MAX, original.clone())];
     let types = encode_type_table_sources(&[], &roots, type_limits(), &control).unwrap();
     let read = decode_type_table(types.as_wire(), type_limits(), &control).unwrap();
-    let schema = Schema::new_with_metadata(vec![original.clone(), original], metadata());
+    let schema = Schema::new(vec![original.clone(), original]);
     let sources = [SchemaSource {
         id: u32::MAX,
         source: &schema,
@@ -858,13 +893,13 @@ fn observed_schema_composition_keeps_original_loans_and_one_caller_scope() {
     let decoded = observed_decode(encoded.as_wire(), &read, &control, &mut |_| Ok(())).unwrap();
     assert_eq!(decoded.facts(), original_decoded.facts());
     assert_eq!(decoded.definitions()[0].0, u32::MAX);
-    assert_eq!(decoded.definitions()[0].1.metadata(), &metadata());
+    assert_eq!(decoded.definitions()[0].1.schema().metadata().capacity(), 0);
     assert!(Arc::ptr_eq(
-        &decoded.definitions()[0].1.fields()[0],
+        &decoded.definitions()[0].1.schema().fields()[0],
         read.field(u32::MAX).unwrap()
     ));
     assert!(Arc::ptr_eq(
-        &decoded.definitions()[0].1.fields()[1],
+        &decoded.definitions()[0].1.schema().fields()[1],
         read.field(0).unwrap()
     ));
     assert!(std::ptr::eq(decoded.types(), &read));
@@ -903,12 +938,13 @@ fn observed_schema_parent_numeric_refusal_precedes_pending_quantum_and_output_re
     let definitions = [wire::SchemaDefinition {
         id: u32::MAX,
         field_ids: vec![],
-        metadata: vec![],
     }];
     let send_bytes = Layout::array::<usize>(1).unwrap().size()
         + Layout::array::<wire::SchemaDefinition>(1).unwrap().size();
     let receive_bytes = Layout::array::<usize>(1).unwrap().size()
-        + 2 * Layout::array::<(u32, Schema)>(1).unwrap().size();
+        + 2 * Layout::array::<(u32, MaterializedSchema)>(1)
+            .unwrap()
+            .size();
     for receive in [false, true] {
         for cause in CAUSES {
             control.arm(Some((1, cause)));
@@ -963,50 +999,6 @@ fn observed_schema_parent_numeric_refusal_precedes_pending_quantum_and_output_re
             assert_eq!(control.trace(), [(phase, 0)]);
         }
     }
-    // The actual receiver discovers the first key after its three original
-    // header gates. Their 15 completed operations leave exactly 255 pending;
-    // the parent's byte refusal must precede the key's next gate callback.
-    let with_key = [wire::SchemaDefinition {
-        id: 0,
-        field_ids: vec![],
-        metadata: vec![ArrowFieldMetadataEntry {
-            key: "x".into(),
-            value: "".into(),
-        }],
-    }];
-    let header_bytes = receive_bytes
-        + Layout::new::<[usize; 2]>().size()
-        + maps::fresh_table_layout::<String, String>(1)
-            .unwrap()
-            .layout
-            .unwrap()
-            .size();
-    for cause in CAUSES {
-        control.arm(Some((1, cause)));
-        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
-        for _ in 0..240 {
-            work.step().unwrap();
-        }
-        let mut admit = |facts: &NodeProjectionFacts| {
-            if facts.allocation_request_bytes_upper_bound > header_bytes {
-                Err(CompileControlError::ResourceExhausted)
-            } else {
-                Ok(())
-            }
-        };
-        assert!(matches!(
-            prepare_schemas_decode_observed_in(
-                &with_key,
-                &read,
-                SOURCE,
-                limits(),
-                &mut admit,
-                &mut work
-            ),
-            Err(Error::Control(CompileControlError::ResourceExhausted))
-        ));
-        assert_eq!(control.trace(), [(CompilePhase::Decode, 0)]);
-    }
     // The full prepared contribution is admitted again before its first owned
     // output request. Preparation and its persistent index are already real.
     control.arm(None);
@@ -1045,7 +1037,7 @@ fn observed_schema_every_actual_callback_keeps_primary_cause_and_caller_ordinary
     let roots = [(0, original.clone())];
     let types = encode_type_table_sources(&[], &roots, type_limits(), &control).unwrap();
     let read = decode_type_table(types.as_wire(), type_limits(), &control).unwrap();
-    let schema = Schema::new_with_metadata(vec![original], metadata());
+    let schema = Schema::new(vec![original]);
     let sources = [SchemaSource {
         id: 0,
         source: &schema,
@@ -1065,7 +1057,6 @@ fn observed_schema_every_actual_callback_keeps_primary_cause_and_caller_ordinary
     let bad = [wire::SchemaDefinition {
         id: 0,
         field_ids: vec![u32::MAX],
-        metadata: vec![],
     }];
     control.arm(None);
     ordinary(observed_decode(&bad, &read, &control, &mut |_| Ok(())).map(|_| ()));

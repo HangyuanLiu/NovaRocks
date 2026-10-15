@@ -75,17 +75,17 @@ pub(crate) fn coerce_literal_for_comparison(left: &TypedExpr, right: TypedExpr) 
     if !is_column_ref(left) {
         return right;
     }
-    if !is_coercible_target(&left.value_type.data_type) {
+    if !is_coercible_target(&left.value_type.data_type()) {
         return right;
     }
     if !matches!(
-        right.value_type.data_type,
+        right.value_type.data_type(),
         DataType::Utf8 | DataType::LargeUtf8
     ) {
         return right;
     }
     // Reuse the existing coercion that already handles STRING → DATE / TIMESTAMP.
-    super::resolve_expr::coerce_to_target_type(right, &left.value_type.data_type)
+    super::resolve_expr::coerce_to_target_type(right, &left.value_type.data_type())
 }
 
 #[cfg(test)]
@@ -118,7 +118,7 @@ mod coercion_tests {
         let right = string_lit("2020-01-01 00:00:00.012");
         let coerced = coerce_literal_for_comparison(&left, right);
         assert!(matches!(
-            coerced.value_type.data_type,
+            coerced.value_type.data_type(),
             DataType::Timestamp(TimeUnit::Microsecond, _)
         ));
         assert!(matches!(coerced.kind, ExprKind::Cast { .. }));
@@ -129,7 +129,7 @@ mod coercion_tests {
         let left = column(DataType::Date32);
         let right = string_lit("2020-01-01");
         let coerced = coerce_literal_for_comparison(&left, right);
-        assert_eq!(coerced.value_type.data_type, DataType::Date32);
+        assert_eq!(coerced.value_type.data_type().clone(), DataType::Date32);
     }
 
     #[test]
@@ -141,7 +141,7 @@ mod coercion_tests {
         };
         let right = string_lit("foo");
         let coerced = coerce_literal_for_comparison(&left, right);
-        assert_eq!(coerced.value_type.data_type, DataType::Utf8);
+        assert_eq!(coerced.value_type.data_type().clone(), DataType::Utf8);
     }
 
     #[test]
@@ -172,6 +172,6 @@ mod coercion_tests {
         let left = column(DataType::Boolean);
         let right = string_lit("true");
         let coerced = coerce_literal_for_comparison(&left, right);
-        assert_eq!(coerced.value_type.data_type, DataType::Utf8);
+        assert_eq!(coerced.value_type.data_type().clone(), DataType::Utf8);
     }
 }

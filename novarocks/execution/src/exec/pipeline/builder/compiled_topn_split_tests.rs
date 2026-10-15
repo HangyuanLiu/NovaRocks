@@ -641,7 +641,7 @@ impl ExchangeFrameTransmitter for RecordingTransmitter {
                 ExchangeTransmitRejection::Failed(FragmentIoError::new(
                     FragmentIoOperation::ExchangeTransmit,
                     FragmentIoErrorKind::RemoteRejected,
-                    error,
+                    error.to_string(),
                 ))
             })
     }
@@ -651,7 +651,7 @@ impl ExchangeFrameTransmitter for RecordingTransmitter {
 fn rows_of(chunk: &Chunk) -> Vec<Row> {
     let column = |index: usize| {
         chunk
-            .batch
+            .record_batch()
             .column(index)
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -671,7 +671,9 @@ fn runtime_state() -> Arc<RuntimeState> {
         None,
         None,
         None,
-        None,
+        Some(crate::runtime::mem_tracker::MemTracker::new_root(
+            "compiled topn split tests",
+        )),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ))
 }
@@ -724,6 +726,7 @@ fn register(
             ExchangeInputAssignment::new(NonZeroUsize::new(senders).unwrap()),
         )])),
         Arc::clone(port),
+        Some(&crate::runtime::fragment::exchange::test_receiver_creation_factory()),
     )
     .expect("compiled receivers");
     for registration in registrations {

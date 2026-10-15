@@ -23,10 +23,10 @@ use crate::{ArithmeticOperator, FunctionValueType, ValueLogicalType};
 
 /// Classify an admitted integer value. This is not a complete schema validator.
 pub fn is_integer_value_type(value: &FunctionValueType) -> bool {
-    match value.logical_type {
-        ValueLogicalType::LargeInt => crate::is_largeint_data_type(&value.data_type),
+    match value.logical_type() {
+        ValueLogicalType::LargeInt => crate::is_largeint_data_type(value.data_type()),
         ValueLogicalType::Physical => matches!(
-            value.data_type,
+            value.data_type(),
             DataType::Int8
                 | DataType::Int16
                 | DataType::Int32
@@ -44,9 +44,9 @@ pub fn is_integer_value_type(value: &FunctionValueType) -> bool {
 /// A classified carrier can still be outside a particular frozen operator rule.
 pub fn is_numeric_value_type(value: &FunctionValueType) -> bool {
     is_integer_value_type(value)
-        || (value.logical_type == ValueLogicalType::Physical
+        || (value.logical_type() == ValueLogicalType::Physical
             && matches!(
-                value.data_type,
+                value.data_type(),
                 DataType::Float16
                     | DataType::Float32
                     | DataType::Float64
@@ -66,10 +66,27 @@ pub fn arithmetic_result_value_type_with_op(
     right: &FunctionValueType,
     op: ArithmeticOperator,
 ) -> Option<FunctionValueType> {
+    let (data_type, logical_type) = arithmetic_result_value_shape_with_op(left, right, op)?;
+    FunctionValueType::try_with_logical_type(
+        data_type,
+        left.nullable() || right.nullable(),
+        logical_type,
+    )
+    .ok()
+}
+
+/// Borrowed validation uses this same arithmetic decision without constructing
+/// an otherwise discarded semantic/layout owner. The decision never infers a
+/// nominal domain from a non-numeric carrier.
+pub fn arithmetic_result_value_shape_with_op(
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    op: ArithmeticOperator,
+) -> Option<(DataType, ValueLogicalType)> {
     if !is_numeric_value_type(left) || !is_numeric_value_type(right) {
         return None;
     }
-    let data_type = crate::arithmetic_result_type_with_op(&left.data_type, &right.data_type, op)?;
+    let data_type = crate::arithmetic_result_type_with_op(left.data_type(), right.data_type(), op)?;
     let logical_type = if crate::is_largeint_data_type(&data_type) {
         // Physical fixed binary was rejected above. This result is authored
         // solely by the frozen algorithm acting on exact LARGEINT input.
@@ -77,11 +94,7 @@ pub fn arithmetic_result_value_type_with_op(
     } else {
         ValueLogicalType::Physical
     };
-    Some(FunctionValueType {
-        data_type,
-        nullable: left.nullable || right.nullable,
-        logical_type,
-    })
+    Some((data_type, logical_type))
 }
 
 #[cfg(test)]
@@ -109,7 +122,7 @@ mod tests {
             DataType::UInt32,
             DataType::UInt64,
         ] {
-            let value = FunctionValueType::new(data_type, false);
+            let value = FunctionValueType::from_legacy_declared_projection(data_type, false);
             assert!(is_integer_value_type(&value));
             assert!(is_numeric_value_type(&value));
         }
@@ -122,7 +135,7 @@ mod tests {
             DataType::Decimal128(38, 2),
             DataType::Decimal256(76, 2),
         ] {
-            let value = FunctionValueType::new(data_type, true);
+            let value = FunctionValueType::from_legacy_declared_projection(data_type, true);
             assert!(!is_integer_value_type(&value));
             assert!(is_numeric_value_type(&value));
         }
@@ -140,16 +153,6 @@ mod tests {
                 ValueLogicalType::Uuid,
             )
             .unwrap(),
-            FunctionValueType {
-                data_type: DataType::Int64,
-                nullable: false,
-                logical_type: ValueLogicalType::LargeInt,
-            },
-            FunctionValueType {
-                data_type: DataType::Int64,
-                nullable: false,
-                logical_type: ValueLogicalType::Json,
-            },
         ] {
             assert!(!is_integer_value_type(&value));
             assert!(!is_numeric_value_type(&value));
@@ -169,6 +172,12 @@ mod tests {
                     None
                 );
             }
+        }
+        for logical in [ValueLogicalType::LargeInt, ValueLogicalType::Json] {
+            assert_eq!(
+                FunctionValueType::try_with_logical_type(DataType::Int64, false, logical),
+                Err(crate::ValueTypeError::InvalidLogicalCarrier(logical))
+            );
         }
     }
 
@@ -195,17 +204,17 @@ mod tests {
                     ArithmeticOperator::Modulo,
                 ] {
                     let carrier = crate::arithmetic_result_type_with_op(
-                        &left.data_type,
-                        &right.data_type,
+                        left.data_type(),
+                        right.data_type(),
                         op,
                     );
                     let result = arithmetic_result_value_type_with_op(left, right, op);
-                    assert_eq!(result.as_ref().map(|ty| ty.data_type.clone()), carrier);
+                    assert_eq!(result.as_ref().map(|ty| ty.data_type().clone()), carrier);
                     if let Some(result) = result {
-                        assert_eq!(result.nullable, left.nullable || right.nullable);
+                        assert_eq!(result.nullable(), left.nullable() || right.nullable());
                         assert_eq!(
-                            result.logical_type,
-                            if crate::is_largeint_data_type(&result.data_type) {
+                            result.logical_type(),
+                            if crate::is_largeint_data_type(result.data_type()) {
                                 ValueLogicalType::LargeInt
                             } else {
                                 ValueLogicalType::Physical
@@ -255,6 +264,36 @@ mod tests {
                 ArithmeticOperator::Add
             ),
             Some(largeint(false))
+        );
+    }
+    #[test]
+    fn borrowed_arithmetic_decision_matches_the_original_complete_author() {
+        let plain = FunctionValueType::new(DataType::Int64, false);
+        let integer = largeint(true);
+        for left in [&plain, &integer] {
+            for right in [&plain, &integer] {
+                for op in [
+                    ArithmeticOperator::Add,
+                    ArithmeticOperator::Subtract,
+                    ArithmeticOperator::Multiply,
+                    ArithmeticOperator::Divide,
+                ] {
+                    let raw = arithmetic_result_value_shape_with_op(left, right, op);
+                    let owned = arithmetic_result_value_type_with_op(left, right, op);
+                    assert_eq!(
+                        raw.as_ref().map(|(carrier, domain)| (carrier, *domain)),
+                        owned.as_ref().map(|ty| (ty.data_type(), ty.logical_type()))
+                    );
+                    if let Some(owned) = owned {
+                        assert_eq!(owned.nullable(), left.nullable() || right.nullable());
+                    }
+                }
+            }
+        }
+        let bytes = FunctionValueType::new(DataType::FixedSizeBinary(16), false);
+        assert!(
+            arithmetic_result_value_shape_with_op(&bytes, &integer, ArithmeticOperator::Add)
+                .is_none()
         );
     }
 }

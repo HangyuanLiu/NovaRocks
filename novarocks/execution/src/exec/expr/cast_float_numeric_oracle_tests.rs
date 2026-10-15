@@ -48,7 +48,10 @@ fn legacy(
     let chunk = Chunk::new_with_chunk_schema(batch, layout);
     let mut arena = ExprArena::default();
     arena.set_allow_throw_exception(allow);
-    let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), source_type.data_type);
+    let child = arena.push_typed(
+        ExprNode::SlotId(SlotId::new(1)),
+        source_type.data_type().clone(),
+    );
     let cast = arena.push_typed(ExprNode::Cast(child, policy), target);
     let frozen = arena.into_immutable().unwrap();
     // The real frozen legacy arena owns the original ALLOW and per-node policy.

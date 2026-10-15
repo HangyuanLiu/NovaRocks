@@ -731,7 +731,7 @@ fn string_repeat_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
 fn string_repeat_compile_success_and_ordinary_tail_preserve_all_callback_causes() {
     for ty in [source(true), FunctionValueType::new(DataType::Binary, true)] {
         let good = CompileControl::default();
-        let success = ty.data_type == DataType::Utf8;
+        let success = ty.data_type() == &DataType::Utf8;
         assert_eq!(
             prepared_for_test_with_control(
                 "repeat",

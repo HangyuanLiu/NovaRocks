@@ -328,8 +328,8 @@ fn assert_case_recipes(program: &LocalProgram, ty: DataType) {
         let recipe = program
             .comparison_recipe(ProgramComparisonSite::CaseWhen { occurrence, arm })
             .unwrap();
-        assert_eq!(recipe.left_type().data_type, ty);
-        assert_eq!(recipe.right_type().data_type, ty);
+        assert_eq!(recipe.left_type().data_type().clone(), ty);
+        assert_eq!(recipe.right_type().data_type().clone(), ty);
     }
     assert!(
         program

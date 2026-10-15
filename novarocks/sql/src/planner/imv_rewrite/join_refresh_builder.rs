@@ -475,7 +475,7 @@ fn build_payload_coalesce_aggregate(
             aggregates: vec![AggregateCall {
                 name: "sum".to_string(),
                 distinct: false,
-                result_type: DataType::Int64,
+                result_type: crate::functions::aggregate_result_type(&resolved).clone(),
                 output_column_id: net_column.column_id,
                 source: crate::binding::AggregateArgumentSource::logical_update(
                     aggregate_args,
@@ -637,7 +637,7 @@ fn build_key_shape_assert_join(
                 AggregateCall {
                     name: "sum".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: crate::functions::aggregate_result_type(&resolved).clone(),
                     output_column_id: pending_insert_count.column_id,
                     source: crate::binding::AggregateArgumentSource::logical_update(
                         insert_args,
@@ -648,7 +648,7 @@ fn build_key_shape_assert_join(
                 AggregateCall {
                     name: "sum".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: crate::functions::aggregate_result_type(&resolved).clone(),
                     output_column_id: pending_delete_count.column_id,
                     source: crate::binding::AggregateArgumentSource::logical_update(
                         delete_args,
@@ -1391,11 +1391,11 @@ fn validate_input_column(
             expected.column_id,
             expected.name,
             actual.name,
-            actual.value_type.data_type,
-            actual.value_type.nullable,
+            actual.value_type.data_type(),
+            actual.value_type.nullable(),
             actual.is_internal,
-            expected.value_type.data_type,
-            expected.value_type.nullable,
+            expected.value_type.data_type(),
+            expected.value_type.nullable(),
             expected.is_internal
         ));
     }
@@ -1744,7 +1744,7 @@ mod tests {
     }
 
     #[test]
-    fn locator_schema_rejects_unrepresentable_object_root_instead_of_plain_binary() {
+    fn locator_schema_preserves_explicit_object_root_instead_of_plain_binary() {
         use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 
         let key = OutputColumn {
@@ -1758,7 +1758,7 @@ mod tests {
             .unwrap(),
             is_internal: false,
         };
-        let error = super::build_target_locator_scan(
+        let plan = super::build_target_locator_scan(
             &test_coalesce_descriptor(),
             &test_locator_binding(),
             &key,
@@ -1768,12 +1768,15 @@ mod tests {
             ColumnId(5),
             ColumnId(6),
         )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("invalid IMV locator apply-key declaration")
+        .unwrap();
+        let LogicalPlanKind::Scan(scan) = plan.kind else {
+            panic!("locator scan")
+        };
+        assert_eq!(
+            scan.table.columns[0].declared_value_type().unwrap(),
+            key.value_type
         );
+        assert_eq!(scan.columns[0].value_type, key.value_type);
     }
 
     #[test]
@@ -1840,7 +1843,7 @@ mod tests {
             let metadata = factory.get(column.column_id);
             assert_eq!(metadata.name, column.name);
             assert_eq!(metadata.value_type, column.value_type);
-            assert_eq!(metadata.value_type.nullable, column.value_type.nullable);
+            assert_eq!(metadata.value_type.nullable(), column.value_type.nullable());
         }
     }
 

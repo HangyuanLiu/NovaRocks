@@ -42,6 +42,7 @@ mod mv_storage_observation;
 mod original_result_scope;
 mod payload_retention;
 mod predicate;
+mod process_local;
 pub mod provider;
 mod provider_binding;
 mod publication;
@@ -186,13 +187,13 @@ pub use metadata::{
     ConnectorTableDefinitionStructField, ConnectorTableDefinitionType,
     ConnectorTableForeignKeyConstraint, ConnectorTableIdentity, ConnectorTableJobAdmission,
     ConnectorTableJobAdmissionRequest, ConnectorTableJobKind, ConnectorTableMetadata,
-    ConnectorTableObjectBinding, ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
-    ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTablePlanningFacts,
-    ConnectorTableRequest, ConnectorTableResolution, ConnectorTableUniqueConstraint,
-    MAX_CONNECTOR_COLUMN_DEFAULT_DEPTH, MAX_CONNECTOR_COLUMN_DEFAULT_NODES,
-    MAX_CONNECTOR_TABLE_DEFINITION_COLUMNS, MAX_CONNECTOR_TABLE_DEFINITION_TYPE_DEPTH,
-    MAX_CONNECTOR_TABLE_DEFINITION_TYPE_NODES, MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES,
-    MAX_CONNECTOR_TABLE_PLANNING_FACT_COLUMNS,
+    ConnectorTableMetadataHeader, ConnectorTableObjectBinding, ConnectorTableObjectCaptureRequest,
+    ConnectorTableObjectId, ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector,
+    ConnectorTablePlanningFacts, ConnectorTableRequest, ConnectorTableResolution,
+    ConnectorTableUniqueConstraint, MAX_CONNECTOR_COLUMN_DEFAULT_DEPTH,
+    MAX_CONNECTOR_COLUMN_DEFAULT_NODES, MAX_CONNECTOR_TABLE_DEFINITION_COLUMNS,
+    MAX_CONNECTOR_TABLE_DEFINITION_TYPE_DEPTH, MAX_CONNECTOR_TABLE_DEFINITION_TYPE_NODES,
+    MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES, MAX_CONNECTOR_TABLE_PLANNING_FACT_COLUMNS,
     MAX_CONNECTOR_TABLE_PLANNING_FACT_CONSTRAINT_COLUMNS,
     MAX_CONNECTOR_TABLE_PLANNING_FACT_FOREIGN_KEY_CONSTRAINTS,
     MAX_CONNECTOR_TABLE_PLANNING_FACT_UNIQUE_CONSTRAINTS,
@@ -205,7 +206,7 @@ pub use metadata_maintenance::{
     ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
     ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReceiptSummary,
     ConnectorMetadataMaintenanceResolver, EXPIRE_TABLE_VERSIONS_KIND,
-    MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES, MAX_CONNECTOR_METADATA_MAINTENANCE_PATH_BYTES,
+    MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES,
     MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES, REWRITE_METADATA_LAYOUT_KIND,
 };
 pub use mutation::{
@@ -365,3 +366,5 @@ pub use write::{
     MAX_CONNECTOR_WRITE_RECEIPT_BYTES, WriteCommitEvidenceLedger, WriteCommitEvidenceLimits,
     WriteCommitEvidenceUsage,
 };
+
+pub use process_local::ConnectorProcessLocalPayload;

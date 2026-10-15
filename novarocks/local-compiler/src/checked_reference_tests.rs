@@ -83,12 +83,9 @@ fn policy() -> ConstantPolicy {
 fn pool(array: ArrayRef) -> ConstantPool {
     let ty = FunctionValueType::new(array.data_type().clone(), false);
     let field = Arc::new(
-        ty.try_to_field("authored-source")
-            .unwrap()
-            .with_metadata(HashMap::from([(
-                "provider.unknown".into(),
-                "keep-root-facts".into(),
-            )])),
+        Field::new("authored-source", array.data_type().clone(), false).with_metadata(
+            HashMap::from([("provider.unknown".into(), "keep-root-facts".into())]),
+        ),
     );
     ConstantPool::try_new(
         field,
@@ -283,7 +280,7 @@ fn replace_constant(lowered: &mut LoweredExpressions, id: ProgramExprId, value: 
     let mut nodes = lowered.arena.nodes().to_vec();
     nodes[id.index()] = StaticExprNode::new(
         StaticExprKind::Constant(value.clone()),
-        value.value_type().data_type.clone(),
+        value.value_type().data_type().clone(),
         None,
     );
     lowered.arena = Arc::new(
@@ -377,7 +374,13 @@ fn checked_reference_preparation_rejects_payload_or_projection_full_type_mismatc
             ConstantReferenceError::InvalidConsumer(_)
         ))
     ));
-    lowered.types[id.index()] = FunctionArgumentType::Value(ty);
+    // This pure negative fixture authors another immutable collection. The
+    // published checked slice remains read-only for every real consumer.
+    let mut declarations = lowered.types.to_vec();
+    declarations[id.index()] = FunctionArgumentType::Value(ty);
+    lowered.types = novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+        declarations.into_boxed_slice(),
+    );
     assert!(matches!(
         prepare_calls(&package, &lowered, &functions, &Control::good()),
         Err(ExpressionLoweringError::Invalid(

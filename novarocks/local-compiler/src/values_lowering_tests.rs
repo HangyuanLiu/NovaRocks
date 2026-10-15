@@ -39,7 +39,11 @@ pub(crate) fn checked_pool(
     let ty = FunctionValueType::try_with_logical_type(array.data_type().clone(), nullable, logical)
         .unwrap();
     ConstantPool::try_new(
-        Arc::new(ty.try_to_field("source-original").unwrap()),
+        Arc::new(Field::new(
+            "source-original",
+            array.data_type().clone(),
+            nullable,
+        )),
         ty,
         array.to_data(),
         policy(),
@@ -383,9 +387,16 @@ fn values_materialize_real_rows_columns_selected_ordinals_float_bits_and_json() 
     );
     assert_eq!(batch.schema().field(0).name(), "alias-0");
     assert_eq!(
-        FunctionValueType::try_from_field(batch.schema().field(2))
+        match program.graph().nodes()[0]
+            .output_layout()
+            .value_binding_at(2)
             .unwrap()
-            .logical_type,
+            .value_type()
+            .kind()
+        {
+            novarocks_type_contract::ValueKind::Nominal(logical) => *logical,
+            _ => panic!("JSON binding is explicit"),
+        },
         ValueLogicalType::Json
     );
     assert!(
@@ -512,7 +523,19 @@ fn values_nested_fields_nulls_and_empty_rows_preserve_exact_admitted_types() {
     let DataType::Struct(fields) = batch(&program).schema().field(0).data_type().clone() else {
         panic!("struct")
     };
-    assert!(Arc::ptr_eq(&fields[0], &child));
+    assert_eq!(fields[0].name(), child.name());
+    assert_eq!(fields[0].is_nullable(), child.is_nullable());
+    assert!(fields[0].metadata().is_empty());
+    let DataType::Struct(source_fields) = original.field_ref().data_type() else {
+        panic!("source Struct");
+    };
+    assert_eq!(
+        source_fields[0]
+            .metadata()
+            .get("nested.unknown")
+            .map(String::as_str),
+        Some("keep")
+    );
     let empty = compile(
         build(std::slice::from_ref(&original), &[], &[0], false),
         &Control::good(),
@@ -524,7 +547,7 @@ fn values_nested_fields_nulls_and_empty_rows_preserve_exact_admitted_types() {
     );
     assert_eq!(
         batch(&empty).column(0).data_type(),
-        original.array().data_type()
+        original.value_type().data_type()
     );
     for rows in [0, 1, 3] {
         let program = compile(
@@ -746,24 +769,93 @@ fn values_empty_union_and_nested_empty_union_refuse_before_arrow_constructor() {
 
 #[test]
 fn values_empty_malformed_map_refuses_before_arrow_constructor() {
-    let ty = FunctionValueType::new(
-        DataType::Map(
-            Arc::new(arrow_schema::Field::new("entries", DataType::Int64, false)),
-            false,
-        ),
-        true,
+    assert!(
+        FunctionValueType::try_from_legacy_declared_projection(
+            DataType::Map(
+                Arc::new(arrow_schema::Field::new("entries", DataType::Int64, false)),
+                false
+            ),
+            true,
+            ValueLogicalType::Physical,
+        )
+        .is_err()
     );
-    let package = build_typed(&[], &[], &[ty], false);
-    assert!(package.constants().entries().is_empty());
-    assert!(matches!(
-        compile(package, &Control::good()),
-        Err(FragmentCompileError::Unsupported {
-            feature: "Values empty carrier has invalid Arrow constructor parameters",
-            ..
-        })
-    ));
 }
 
 #[cfg(test)]
 #[path = "values_cell_lowering_tests.rs"]
 mod values_cell_lowering_tests;
+
+#[test]
+fn actual_empty_values_keep_nested_nominal_binding_after_source_and_program_drop() {
+    use novarocks_type_contract::{
+        ValueField, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageHold,
+        ValueTypeStorageLifetime,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Held(Arc<AtomicUsize>);
+    impl ValueTypeStorageHold for Held {}
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let released = Arc::new(AtomicUsize::new(0));
+    let storage = ValueTypeStorageLifetime::held(Arc::new(Held(released.clone())));
+    let json = ValueTypeRef::try_new(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        true,
+        storage.clone(),
+    )
+    .unwrap();
+    let list = ValueTypeRef::try_new(ValueKind::List(json), false, storage.clone()).unwrap();
+    let semantic = ValueTypeRef::try_new(
+        ValueKind::Struct(Box::from([ValueField::new(
+            "payload",
+            list,
+            storage.clone(),
+        )])),
+        false,
+        storage.clone(),
+    )
+    .unwrap();
+    let data_type = DataType::Struct(
+        vec![Field::new(
+            "payload",
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, true))),
+            false,
+        )]
+        .into(),
+    );
+    let ty = FunctionValueType::try_from_value(
+        semantic,
+        ValueLayout::try_new(&data_type, storage.clone()).unwrap(),
+    )
+    .unwrap();
+    drop(storage);
+    let source = build_typed(&[], &[], std::slice::from_ref(&ty), false);
+    let program = compile(source, &Control::good()).unwrap();
+    let layout = program.graph().nodes()[0].output_layout();
+    assert!(layout.is_typed());
+    assert_eq!(layout.schema().field(0).name(), "alias-0");
+    assert!(layout.schema().metadata().is_empty());
+    assert!(layout.schema().field(0).metadata().is_empty());
+    let binding = layout.value_binding_at(0).unwrap().clone();
+    assert_eq!(&binding, ty.typed_binding());
+    assert_eq!(binding.layout().data_type(), &data_type);
+    drop(ty);
+    drop(program);
+    assert_eq!(released.load(Ordering::SeqCst), 0);
+    let ValueKind::Struct(fields) = binding.value_type().kind() else {
+        panic!("Struct binding")
+    };
+    let ValueKind::List(item) = fields[0].value_type().kind() else {
+        panic!("List binding")
+    };
+    assert!(matches!(
+        item.kind(),
+        ValueKind::Nominal(ValueLogicalType::Json)
+    ));
+    drop(binding);
+    assert_eq!(released.load(Ordering::SeqCst), 1);
+}

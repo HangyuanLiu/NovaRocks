@@ -118,6 +118,10 @@ fn sparse_definition_constructor_preserves_zero_max_full_source_and_ordered_occu
     let mut root = definition(u32::MAX);
     root.lambda_scope = Some(ExprId::new(41));
     root.ty = ValueType::new(DataType::List(Arc::clone(&child)), true);
+    let DataType::List(child) = root.ty.data_type() else {
+        unreachable!()
+    };
+    let child = Arc::clone(child);
     root.kind = ExprKind::Conjunction {
         args: vec![ExprId::new(0), ExprId::new(41), ExprId::new(0)].into_boxed_slice(),
     };
@@ -135,7 +139,7 @@ fn sparse_definition_constructor_preserves_zero_max_full_source_and_ordered_occu
     let stored = arena.get(ExprId::new(u32::MAX)).unwrap();
     assert_eq!(stored.owner, NodeId::new(999));
     assert_eq!(stored.lambda_scope, Some(ExprId::new(41)));
-    let DataType::List(stored_child) = &stored.ty.data_type else {
+    let DataType::List(stored_child) = &stored.ty.data_type() else {
         panic!("complete source carrier changed")
     };
     assert!(Arc::ptr_eq(stored_child, &child));

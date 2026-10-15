@@ -40,7 +40,7 @@ use novarocks_plan_codec::{
 use novarocks_type_contract::CompleteMetadataRequestFacts;
 use novarocks_worker::{PreparationControlLoan, PreparationStop};
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypeMaterializationRefusal {
     Stopped(PreparationStop),
     MissingQueryMemory,
@@ -61,16 +61,52 @@ impl std::fmt::Display for TypeMaterializationRefusal {
 }
 impl std::error::Error for TypeMaterializationRefusal {}
 
-/// Fixed local evidence, including the latest real qualification while Pending.
-/// Observation faults remain observations; they do not become SQL refusals.
+/// Fixed receipt of one completed namespace; moved, never cloned after failure.
 #[derive(Debug, Default)]
-pub struct TypeMaterializationJournal {
+pub struct TypeMaterializationNamespaceReceipt {
     pub facts: Option<PackageTypeProjectionFacts>,
     pub workset_bytes: Option<usize>,
     pub pending: Option<CoverageReceipt>,
     pub shortage: Option<ShortageReceipt>,
     pub capacity: Option<CapacityError>,
     pub body: KernelMemoryJournal,
+}
+
+/// Fixed local evidence, including the latest real qualification while Pending.
+/// Observation faults remain observations; they do not become SQL refusals.
+#[derive(Debug, Default)]
+pub struct TypeMaterializationJournal {
+    pub current_namespace:
+        Option<novarocks_plan_codec::physical_type_v2::TypeMaterializationNamespace>,
+    pub completed_execution: Option<TypeMaterializationNamespaceReceipt>,
+    pub facts: Option<PackageTypeProjectionFacts>,
+    pub workset_bytes: Option<usize>,
+    pub pending: Option<CoverageReceipt>,
+    pub shortage: Option<ShortageReceipt>,
+    pub capacity: Option<CapacityError>,
+    pub body: KernelMemoryJournal,
+}
+
+impl TypeMaterializationJournal {
+    fn begin_namespace(
+        &mut self,
+        namespace: novarocks_plan_codec::physical_type_v2::TypeMaterializationNamespace,
+    ) {
+        use novarocks_plan_codec::physical_type_v2::TypeMaterializationNamespace;
+        if self.current_namespace == Some(TypeMaterializationNamespace::ExecutionPhysical)
+            && namespace == TypeMaterializationNamespace::Source
+        {
+            self.completed_execution = Some(TypeMaterializationNamespaceReceipt {
+                facts: self.facts.take(),
+                workset_bytes: self.workset_bytes.take(),
+                pending: self.pending.take(),
+                shortage: self.shortage.take(),
+                capacity: self.capacity.take(),
+                body: std::mem::take(&mut self.body),
+            });
+        }
+        self.current_namespace = Some(namespace);
+    }
 }
 
 /// A synchronous borrowed capability, never retained in a package or wire DTO.
@@ -102,14 +138,15 @@ impl<'a> TypeMaterializationHost<'a> {
     }
 
     #[cfg(test)]
-    fn materialize_with_request<B, R>(
+    fn materialize_with_request<C, B, R>(
         &mut self,
         facts: &PackageTypeProjectionFacts,
         body: B,
         request: R,
-    ) -> Result<DecodedTypeTable, ProjectionFailure<TypeCodecError, TypeMaterializationRefusal>>
+    ) -> Result<DecodedTypeTable, ProjectionFailure<C, TypeMaterializationRefusal>>
     where
-        B: FnOnce() -> Result<DecodedTypeTable, TypeCodecError>,
+        C: From<TypeCodecError>,
+        B: FnOnce() -> Result<DecodedTypeTable, C>,
         R: FnMut(&QueryMemoryBinding, usize) -> KernelMemoryAdmission,
     {
         self.journal.facts = Some(*facts);
@@ -129,13 +166,14 @@ impl<'a> TypeMaterializationHost<'a> {
 }
 impl PackageTypeMaterializationScope for TypeMaterializationHost<'_> {
     type HostError = TypeMaterializationRefusal;
-    fn materialize<B>(
+    fn materialize<C, B>(
         &mut self,
         facts: &PackageTypeProjectionFacts,
         body: B,
-    ) -> Result<DecodedTypeTable, ProjectionFailure<TypeCodecError, Self::HostError>>
+    ) -> Result<DecodedTypeTable, ProjectionFailure<C, Self::HostError>>
     where
-        B: FnOnce() -> Result<DecodedTypeTable, TypeCodecError>,
+        C: From<TypeCodecError>,
+        B: FnOnce() -> Result<DecodedTypeTable, C>,
     {
         self.journal.facts = Some(*facts);
         let control = WorkerPreparationMemoryControl {
@@ -150,6 +188,19 @@ impl PackageTypeMaterializationScope for TypeMaterializationHost<'_> {
             )
             .map_err(original_failure)
     }
+    fn materialize_namespace<C, B>(
+        &mut self,
+        namespace: novarocks_plan_codec::physical_type_v2::TypeMaterializationNamespace,
+        facts: &PackageTypeProjectionFacts,
+        body: B,
+    ) -> Result<DecodedTypeTable, ProjectionFailure<C, Self::HostError>>
+    where
+        C: From<TypeCodecError>,
+        B: FnOnce() -> Result<DecodedTypeTable, C>,
+    {
+        self.journal.begin_namespace(namespace);
+        PackageTypeMaterializationScope::materialize(self, facts, body)
+    }
 }
 
 fn request_facts(facts: &PackageTypeProjectionFacts) -> CompleteMetadataRequestFacts {
@@ -158,9 +209,9 @@ fn request_facts(facts: &PackageTypeProjectionFacts) -> CompleteMetadataRequestF
         allocation_request_bytes_upper_bound: facts.allocation_request_bytes_upper_bound,
     }
 }
-fn original_failure(
-    failure: SynchronousPreparationFailure<TypeCodecError>,
-) -> ProjectionFailure<TypeCodecError, TypeMaterializationRefusal> {
+fn original_failure<C>(
+    failure: SynchronousPreparationFailure<C>,
+) -> ProjectionFailure<C, TypeMaterializationRefusal> {
     match failure {
         SynchronousPreparationFailure::Body(error) => ProjectionFailure::Codec(error),
         SynchronousPreparationFailure::Host(error) => ProjectionFailure::Host(match error {

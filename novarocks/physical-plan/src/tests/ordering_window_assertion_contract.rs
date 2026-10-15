@@ -449,7 +449,7 @@ fn window_function() -> BoundFunction {
         function_id: FunctionId::try_new("builtin/row_number/v1").unwrap(),
         overload: FunctionOverloadId::try_new("row-number-empty").unwrap(),
         kind: FunctionKind::Window,
-        argument_types: Box::default(),
+        argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::default()),
         result_type: ty(DataType::Int64, false),
     }
 }
@@ -1013,8 +1013,12 @@ fn finish_table_function_with_sink(
                     }),
                     function_id: FunctionId::try_new("builtin/generate_one/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("empty-to-i64").unwrap(),
-                    argument_types: Box::default(),
-                    result_types: Box::from([ty(DataType::Int64, false)]),
+                    argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        Box::default(),
+                    ),
+                    result_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        Box::from([ty(DataType::Int64, false)]),
+                    ),
                 },
                 arguments: Box::default(),
                 outputs,

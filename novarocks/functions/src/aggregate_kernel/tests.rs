@@ -150,10 +150,12 @@ impl Owner {
             selected: Arc::new(FunctionBindingSelection {
                 overload: FunctionOverloadId::try_new("fixture/aggregate-lifecycle/signature")
                     .unwrap(),
-                argument_types: arguments
-                    .iter()
-                    .map(FunctionArgument::argument_type)
-                    .collect(),
+                argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                    arguments
+                        .iter()
+                        .map(FunctionArgument::argument_type)
+                        .collect::<Box<[_]>>(),
+                ),
                 result_type: FunctionResultType::Scalar(FunctionValueType::new(
                     DataType::Int32,
                     false,

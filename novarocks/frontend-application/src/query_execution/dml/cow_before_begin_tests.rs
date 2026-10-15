@@ -52,11 +52,15 @@ fn owned_boolean_selection(
     ))];
     for n in 0..width {
         let field = arrow::datatypes::Field::new(format!("after_{n}"), DataType::Boolean, false);
-        after.push(spi::ConnectorMutationTargetField::new(
-            spi::ConnectorWriteFieldToken::from_bytes([(n + 2) as u8; 32]),
-            field.clone(),
-            (n + 1) as u32,
-        ));
+        after.push(
+            spi::ConnectorMutationTargetField::try_new_typed(
+                spi::ConnectorWriteFieldToken::from_bytes([(n + 2) as u8; 32]),
+                field.clone(),
+                (n + 1) as u32,
+                novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+            )
+            .expect("explicit mutation fixture declaration"),
+        );
         fields.push(field);
         columns.push(Arc::new(BooleanArray::from(vec![true; rows])));
     }
@@ -69,7 +73,15 @@ fn owned_boolean_selection(
         owner.clone(),
         table.clone(),
         base.clone(),
-        vec![spi::ConnectorMutationSourceField::new(id, id_field, 0)],
+        vec![
+            spi::ConnectorMutationSourceField::try_new_typed(
+                id,
+                id_field,
+                0,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            )
+            .expect("explicit mutation fixture declaration"),
+        ],
         Vec::new(),
         after,
         vec![id],
@@ -187,6 +199,7 @@ fn small_signed_rewrite_and_append_reach_original_builders_without_false_refusal
         vec![2],
         Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
         DataType::Boolean,
+        novarocks_types::schema::SqlType::Boolean,
     );
     let validation = crate::query_execution::row_mutation::RowMutationMatchValidator::try_new(
         fixture.preparation.match_contract().clone(),
@@ -234,7 +247,16 @@ fn small_signed_rewrite_and_append_reach_original_builders_without_false_refusal
         .match_contract()
         .after_fields()
         .iter()
-        .map(|f| spi::ConnectorWriteFieldBinding::new(f.token(), f.field().clone()))
+        .map(|f| {
+            spi::ConnectorWriteFieldBinding::try_new_typed(
+                f.token(),
+                f.field().clone(),
+                f.execution_type()
+                    .expect("signed append after-image declaration")
+                    .clone(),
+            )
+            .expect("complete append writer field")
+        })
         .collect::<Vec<_>>();
     let input = spi::ConnectorWriteInputShape::Data {
         fields: writer_fields.clone(),
@@ -359,6 +381,7 @@ fn original_cancelled_and_expired_controls_win_before_request_and_keep_the_same_
         vec![2],
         Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
         DataType::Boolean,
+        novarocks_types::schema::SqlType::Boolean,
     );
     let (control, root, binding, capacity) =
         crate::query_execution::internal_result_cpu::admitted_internal_fixture();

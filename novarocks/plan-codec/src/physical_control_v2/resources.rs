@@ -47,7 +47,7 @@ pub(super) struct Model {
     pub future: ControlOwnedResourceFacts,
     pub planned_child: ControlOwnedResourceFacts,
     source: usize,
-    limits: ControlProjectionLimits,
+    limits: Option<ControlProjectionLimits>,
 }
 impl Model {
     pub fn new(d: usize, u: usize, r: usize, b: usize, l: ControlProjectionLimits) -> Self {
@@ -57,7 +57,17 @@ impl Model {
             future: ControlOwnedResourceFacts::default(),
             planned_child: ControlOwnedResourceFacts::default(),
             source: b,
-            limits: l,
+            limits: Some(l),
+        }
+    }
+    pub fn input_derived(d: usize, u: usize, r: usize, b: usize) -> Self {
+        Self {
+            counts: [d, u, r],
+            resources: ControlResourceCounter::default(),
+            future: ControlOwnedResourceFacts::default(),
+            planned_child: ControlOwnedResourceFacts::default(),
+            source: b,
+            limits: None,
         }
     }
     pub fn facts_with(
@@ -94,13 +104,14 @@ impl Model {
             cumulative_work_upper_bound: f.cumulative_work_upper_bound,
         })
     }
-    pub fn gate_with(
+    pub fn check_with(
         &self,
         child: ControlOwnedResourceFacts,
-        admit: &mut impl FnMut(&ControlProjectionFacts) -> Result<(), CompileControlError>,
     ) -> Result<ControlProjectionFacts, ControlCodecError> {
         let f = self.facts_with(child)?;
-        let l = self.limits;
+        let Some(l) = self.limits else {
+            return Ok(f);
+        };
         if f.domain_count > l.max_domains
             || f.use_reference_count > l.max_use_references
             || f.root_binding_count > l.max_root_bindings
@@ -112,8 +123,16 @@ impl Model {
         {
             return Err(CompileControlError::ResourceExhausted.into());
         }
-        admit(&f)?;
         Ok(f)
+    }
+    pub fn gate_with(
+        &self,
+        child: ControlOwnedResourceFacts,
+        admit: &mut impl FnMut(&ControlProjectionFacts) -> Result<(), CompileControlError>,
+    ) -> Result<ControlProjectionFacts, ControlCodecError> {
+        let facts = self.check_with(child)?;
+        admit(&facts)?;
+        Ok(facts)
     }
     pub fn gate(
         &self,

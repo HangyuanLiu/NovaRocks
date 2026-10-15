@@ -514,7 +514,7 @@ fn c12_p3_substring_index_actual_compiled_slots_constants_strict_null_and_explic
                     .evaluate(&batch, selection, &HarnessControl)
                     .unwrap();
                 assert_eq!(actual.selection(), selection);
-                assert_eq!(actual.values().data_type(), &ty.data_type);
+                assert_eq!(actual.values().data_type(), ty.data_type());
                 assert!(actual.errors().is_empty());
                 assert_eq!(actual.values().len(), expected.len());
                 for i in 0..expected.len() {

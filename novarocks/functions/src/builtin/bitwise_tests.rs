@@ -66,7 +66,7 @@ impl KernelEvaluationControl for Control {
     }
 }
 fn ty(dtype: DataType, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(dtype, nullable)
+    FunctionValueType::from_legacy_declared_projection(dtype, nullable)
 }
 fn pair_types(dtype: DataType, nullable: bool) -> [FunctionValueType; 2] {
     [ty(dtype.clone(), nullable), ty(dtype, nullable)]
@@ -127,12 +127,15 @@ fn signed_values(array: &ArrayRef) -> Vec<Option<i128>> {
 fn dense(name: &str, source: FunctionValueType, arrays: &[ArrayRef]) -> ArrayRef {
     let sources = vec![source.clone(); arrays.len()];
     let mut kernel = instance(name, &sources);
-    assert!(kernel.contract().result_type().nullable);
+    assert!(kernel.contract().result_type().nullable());
     assert_eq!(
-        kernel.contract().result_type().logical_type,
-        source.logical_type
+        kernel.contract().result_type().logical_type(),
+        source.logical_type()
     );
-    assert_eq!(kernel.contract().result_type().data_type, source.data_type);
+    assert_eq!(
+        kernel.contract().result_type().data_type(),
+        source.data_type()
+    );
     let args: Vec<_> = arrays.iter().map(EvaluatedArgument::Column).collect();
     let result = kernel
         .evaluate(Selection::all(arrays[0].len()), &args, &Control::default())
@@ -181,7 +184,7 @@ fn all_twenty_actual_records_have_independent_signed_oracles_and_exact_output() 
     for (name, expected) in [("bitand", 2), ("bitor", -5), ("bitxor", -7), ("bitnot", 5)] {
         for (source, left, right) in &profiles {
             let output = pair(name, source.clone(), left.clone(), right.clone());
-            assert_eq!(output.data_type(), &source.data_type);
+            assert_eq!(output.data_type(), source.data_type());
             assert_eq!(signed_values(&output), [Some(expected)]);
             assert_eq!(output.null_count(), 0);
             records += 1;
@@ -773,7 +776,7 @@ fn allocation_representability_overflow_precedes_any_selected_row_read() {
         ty(DataType::Int64, true),
         large_type(true),
     ] {
-        let value: ArrayRef = match source.data_type {
+        let value: ArrayRef = match source.data_type() {
             DataType::Int8 => Arc::new(Int8Array::from(vec![None])),
             DataType::Int64 => Arc::new(Int64Array::from(vec![None])),
             _ => large_array(&[None]),

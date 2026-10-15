@@ -528,3 +528,54 @@ fn bitmap_selected_compile_three_causes_are_not_row_data() {
         assert_eq!(crate::kernel_control::compile_failure(cause), expected);
     }
 }
+
+#[test]
+fn bitmap_nominal_selection_preserves_domain_and_refuses_plain_overload_replay() {
+    use novarocks_type_contract::ValueLogicalType;
+    let owner = owner();
+    let control = crate::binding_test_control();
+    let plain = arguments(1);
+    let bitmap = [FunctionArgument::Value {
+        value_type: FunctionValueType::try_with_logical_type(
+            DataType::Binary,
+            true,
+            ValueLogicalType::Bitmap,
+        )
+        .unwrap(),
+        constant: None,
+    }];
+    let plain_selected = owner.resolve(request(&plain), control).unwrap();
+    let selected = owner.resolve(request(&bitmap), control).unwrap();
+    assert_ne!(plain_selected.overload, selected.overload);
+    let [crate::FunctionArgumentType::Value(input)] = selected.argument_types.as_ref() else {
+        panic!("one bitmap input")
+    };
+    assert_eq!(input.logical_type(), ValueLogicalType::Bitmap);
+    assert_eq!(input.data_type(), &DataType::Binary);
+    owner
+        .validate_selected(&selected, request(&bitmap), control)
+        .unwrap();
+    owner
+        .admit_selected_profile_observed(&selected, 1, control)
+        .unwrap();
+    assert!(
+        owner
+            .select_at_overload_observed(&plain_selected.overload, request(&bitmap), control)
+            .is_err()
+    );
+    assert!(
+        owner
+            .select_at_overload_observed(&selected.overload, request(&plain), control)
+            .is_err()
+    );
+    let hll = [FunctionArgument::Value {
+        value_type: FunctionValueType::try_with_logical_type(
+            DataType::Binary,
+            true,
+            ValueLogicalType::Hll,
+        )
+        .unwrap(),
+        constant: None,
+    }];
+    assert!(owner.resolve(request(&hll), control).is_err());
+}

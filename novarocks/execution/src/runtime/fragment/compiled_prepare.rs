@@ -37,10 +37,7 @@ use crate::exec::fragment::program::FragmentSinkKind;
 use crate::exec::node::table_finish::TableFinishRuntimeBinding;
 use crate::exec::node::table_writer::TableWriterRuntimeBinding;
 use crate::exec::operators::ResultBufferSinkFactory;
-use crate::exec::pipeline::executor::{
-    prepare_compiled_program_pipeline_execution_with_profiler,
-    prepare_compiled_program_pipeline_execution_with_profiler_and_metadata_host,
-};
+use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::exchange::materialize_compiled_exchange_receivers;
 use crate::runtime::fragment::instance::FragmentInstanceSpec;
@@ -48,9 +45,6 @@ use crate::runtime::fragment::scan::{
     CompiledScanSources, materialize_compiled_scan_bindings, validate_compiled_scan_sources,
 };
 use crate::runtime::fragment::sink::materialize_compiled_sink;
-use crate::runtime::preparation_metadata::{
-    CompiledMetadataMode, CompiledSchemaMetadataScope, DirectCompiledSchemaMetadataScope,
-};
 
 /// One Task's write capabilities for its compiled program: one bound write
 /// capability per compiled TableWriter and one validation authority per
@@ -282,25 +276,23 @@ pub fn prepare_compiled_fragment(
     submission: CompiledFragmentSubmission,
     context: FragmentPrepareContext,
 ) -> Result<DormantFragmentHandle, FragmentLaunchError> {
-    prepare_compiled_fragment_in(
-        submission,
-        context,
-        &mut CompiledMetadataMode::<DirectCompiledSchemaMetadataScope>::Direct,
-    )
+    prepare_compiled_fragment_in(submission, context, None)
 }
 
-pub fn prepare_compiled_fragment_with_metadata_host<H: CompiledSchemaMetadataScope>(
+pub fn prepare_compiled_fragment_with_metadata_host(
     submission: CompiledFragmentSubmission,
     context: FragmentPrepareContext,
-    host: &mut H,
+    host: &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
 ) -> Result<DormantFragmentHandle, FragmentLaunchError> {
-    prepare_compiled_fragment_in(submission, context, &mut CompiledMetadataMode::Hosted(host))
+    prepare_compiled_fragment_in(submission, context, Some(host))
 }
 
-fn prepare_compiled_fragment_in<H: CompiledSchemaMetadataScope>(
+fn prepare_compiled_fragment_in(
     mut submission: CompiledFragmentSubmission,
     context: FragmentPrepareContext,
-    metadata: &mut CompiledMetadataMode<'_, H>,
+    schema_preparation: Option<
+        &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
+    >,
 ) -> Result<DormantFragmentHandle, FragmentLaunchError> {
     // The write capabilities move into the one pipeline graph that owns them.
     let writers = std::mem::take(&mut submission.writers);
@@ -365,22 +357,6 @@ fn prepare_compiled_fragment_in<H: CompiledSchemaMetadataScope>(
             result_spec,
         )?;
         context.fail_if_injected(PrepareFailurePoint::AfterResult)?;
-        let receivers = materialize_compiled_exchange_receivers(
-            program,
-            finst_id,
-            instance.exchange_inputs(),
-            Arc::clone(&context.exchange_receiver_port),
-        )
-        .map_err(|detail| {
-            FragmentLaunchError::new(
-                FragmentLaunchStage::Register,
-                FragmentLaunchErrorKind::Binding,
-                detail,
-            )
-        })?;
-        resources.acquire_compiled_exchange(receivers.registrations)?;
-        context.fail_if_injected(PrepareFailurePoint::AfterExchange)?;
-
         let runtime_state = build_runtime_state(RuntimeStateInputs {
             query_options: apply_query_option_overrides(
                 Some(instance.runtime_options().query_options().clone()),
@@ -404,6 +380,50 @@ fn prepare_compiled_fragment_in<H: CompiledSchemaMetadataScope>(
                 error,
             )
         })?;
+        // Receiver schemas are created by the same BE tracker/control policy
+        // as operator schemas. The registry retains each independent schema,
+        // while this temporary factory exits with preparation.
+        let construction_error = |cause: crate::exec::pipeline::operator::ConstructionFailure| {
+            FragmentLaunchError::from_failure(
+                FragmentLaunchStage::Register,
+                FragmentLaunchErrorKind::ResourceUnavailable,
+                cause.into(),
+            )
+        };
+        let receiver_creation = if program.exchange_inputs().is_empty() {
+            None
+        } else {
+            let tracker = runtime_state.mem_tracker().ok_or_else(|| {
+                construction_error(
+                    crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                )
+            })?;
+            let profile = crate::exec::pipeline::pipeline::representation_construction_profile()
+                .map_err(crate::exec::pipeline::operator::ConstructionFailure::from)
+                .map_err(construction_error)?;
+            Some(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                profile, tracker, runtime_state.error_state(),
+            ).map_err(construction_error)?)
+        };
+        let receivers = materialize_compiled_exchange_receivers(
+            program,
+            finst_id,
+            instance.exchange_inputs(),
+            Arc::clone(&context.exchange_receiver_port),
+            receiver_creation.as_ref(),
+        )
+        .map_err(|cause| {
+            let kind = match &cause {
+                crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(_) => {
+                    FragmentLaunchErrorKind::Binding
+                }
+                _ => FragmentLaunchErrorKind::ResourceUnavailable,
+            };
+            FragmentLaunchError::from_failure(FragmentLaunchStage::Register, kind, cause.into())
+        })?;
+        resources.acquire_compiled_exchange(receivers.registrations)?;
+        context.fail_if_injected(PrepareFailurePoint::AfterExchange)?;
+
         let result_sink = match program.graph().sink() {
             Some(StaticSinkProgram::RootResult(_)) => {
                 let session = resources.root_result_session().ok_or_else(|| {
@@ -455,39 +475,20 @@ fn prepare_compiled_fragment_in<H: CompiledSchemaMetadataScope>(
         )?;
         let scan_bindings =
             materialize_compiled_scan_bindings(program, &submission.scans, instance)?;
-        match metadata {
-            CompiledMetadataMode::Direct => {
-                prepare_compiled_program_pipeline_execution_with_profiler(
-                    Arc::clone(program),
-                    Duration::from_millis(50),
-                    sink,
-                    receivers.bindings,
-                    scan_bindings,
-                    writers,
-                    Some((finst_id.high(), finst_id.low())),
-                    context.profiler.clone(),
-                    pipeline_dop,
-                    runtime_state,
-                    Arc::clone(&context.event_sink),
-                )
-            }
-            CompiledMetadataMode::Hosted(host) => {
-                prepare_compiled_program_pipeline_execution_with_profiler_and_metadata_host(
-                    Arc::clone(program),
-                    Duration::from_millis(50),
-                    sink,
-                    receivers.bindings,
-                    scan_bindings,
-                    writers,
-                    Some((finst_id.high(), finst_id.low())),
-                    context.profiler.clone(),
-                    pipeline_dop,
-                    runtime_state,
-                    Arc::clone(&context.event_sink),
-                    *host,
-                )
-            }
-        }
+        prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation(
+            Arc::clone(program),
+            Duration::from_millis(50),
+            sink,
+            receivers.bindings,
+            scan_bindings,
+            writers,
+            Some((finst_id.high(), finst_id.low())),
+            context.profiler.clone(),
+            pipeline_dop,
+            runtime_state,
+            Arc::clone(&context.event_sink),
+            schema_preparation,
+        )
         .map_err(|error| {
             FragmentLaunchError::from_failure(
                 FragmentLaunchStage::BuildPipelines,

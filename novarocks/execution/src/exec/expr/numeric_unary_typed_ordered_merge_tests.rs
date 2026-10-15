@@ -18,7 +18,8 @@
 //! Typed physical ordered merge support; explicitly not optimizer SQL plans.
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
-    NodeKind, PhysicalCallDefinition, PhysicalCallSite, StaticFunctionArgument,
+    FunctionArgumentType, NodeKind, PhysicalCallDefinition, PhysicalCallSite,
+    StaticFunctionArgument,
 };
 use novarocks_sql::compiler::{
     SqlCompileControl, SqlPhysicalEmissionMode, ordered_array_state_source_for_test,
@@ -46,7 +47,7 @@ fn check(intermediate: bool, mode: SqlPhysicalEmissionMode) {
             let NodeKind::Aggregate { calls, .. } = &node.kind else {
                 continue;
             };
-            for (ordinal, _) in calls.iter().enumerate() {
+            for (ordinal, call) in calls.iter().enumerate() {
                 let request = fragment
                     .call_requests()
                     .get(PhysicalCallDefinition::Relational(
@@ -65,11 +66,29 @@ fn check(intermediate: bool, mode: SqlPhysicalEmissionMode) {
                 else {
                     panic!("actual own nonconstant ORDER")
                 };
-                assert_eq!(value_type.data_type, DataType::Int8);
-                assert_eq!(
-                    value_type.nullable,
-                    mode == SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration
+                assert_eq!(value_type.data_type().clone(), DataType::Int8);
+                assert!(
+                    value_type.nullable(),
+                    "both modes retain the successful Int8 NEGATE NULL guarantee in OWN ORDER"
                 );
+                let FunctionArgumentType::Value(bound) =
+                    &call.binding.function.argument_types[request.logical_argument_count]
+                else {
+                    panic!("actual ORDER selected Value")
+                };
+                assert_eq!(bound, value_type, "selected ORDER uses its own request");
+                if call.binding.phase.consumes_logical_arguments() {
+                    assert_eq!(call.order_by.len(), 1);
+                    assert_eq!(
+                        &fragment
+                            .expressions()
+                            .get(call.order_by[0].expr)
+                            .unwrap()
+                            .ty,
+                        value_type,
+                        "the request retains the completed ORDER expression's full FVT"
+                    );
+                }
             }
         }
     }

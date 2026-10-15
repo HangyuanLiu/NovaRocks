@@ -312,7 +312,7 @@ fn variant_source_nominal_json_nonmatch_and_full_type_mismatch_keep_original_bou
     );
     assert!(!changed);
     assert!(scan_from_plan(&plan).variant_columns.is_empty());
-    assert_eq!(json_path.value_type().logical_type, ValueLogicalType::Json);
+    assert_eq!(json_path.value_type().logical_type(), ValueLogicalType::Json);
 
     // The original interner rejects an inconsistent CV before the rewrite can
     // inspect it. Do not manufacture an admitted malformed arena to bypass it.

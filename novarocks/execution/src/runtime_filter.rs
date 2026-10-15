@@ -23,8 +23,9 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 use novarocks_local_program::{
     FilterMembershipSchema, FilterMembershipSchemaError, FilterNullSemantics,
-    encode_filter_key_type,
 };
+
+pub use novarocks_functions::FunctionValueType;
 
 pub mod contribution;
 pub mod evaluator;
@@ -125,6 +126,18 @@ pub enum RuntimeFilterExecutionContract {
     Ordered(Arc<contribution::RuntimeOrderContract>),
 }
 
+impl RuntimeFilterExecutionContract {
+    pub fn value_type(&self) -> Option<&novarocks_functions::FunctionValueType> {
+        match self {
+            Self::Membership(schema) => schema.value_type(),
+            Self::Ordered(order) => order
+                .keys()
+                .first()
+                .and_then(contribution::RuntimeOrderKey::value_type),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeFilterNullSemantics {
     NeverMatches,
@@ -138,16 +151,98 @@ pub enum RuntimeFilterNullSemantics {
 #[derive(Clone, Eq, PartialEq)]
 pub struct RuntimeFilterMembershipSchema {
     canonical: FilterMembershipSchema,
+    complete_type: Option<novarocks_functions::FunctionValueType>,
 }
 
 impl RuntimeFilterMembershipSchema {
+    pub fn from_canonical_value_type(
+        canonical: FilterMembershipSchema,
+        value_type: novarocks_functions::FunctionValueType,
+    ) -> Result<Self, RuntimeFilterContractViolation> {
+        if canonical.data_type() != value_type.data_type() {
+            return Err(RuntimeFilterContractViolation::new(
+                RuntimeFilterContractViolationKind::ContractMismatch,
+                "membership canonical carrier differs from complete execution declaration",
+            ));
+        }
+        Ok(Self {
+            canonical,
+            complete_type: Some(value_type),
+        })
+    }
+
     pub fn new(
         data_type: &DataType,
         null_semantics: RuntimeFilterNullSemantics,
     ) -> Result<Self, RuntimeFilterContractViolation> {
         let canonical = FilterMembershipSchema::try_new(data_type, null_semantics.canonical())
             .map_err(membership_schema_error)?;
-        Ok(Self { canonical })
+        Ok(Self {
+            canonical,
+            complete_type: None,
+        })
+    }
+
+    /// The canonical bytes remain physical artifact facts; the complete value
+    /// binding is the independent channel author and retains its creator hold.
+    pub fn new_value_typed_observed<E>(
+        value_type: novarocks_functions::FunctionValueType,
+        null_semantics: RuntimeFilterNullSemantics,
+        request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
+        work: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<Self, E>
+    where
+        E: From<FilterMembershipSchemaError>
+            + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+    {
+        Self::new_value_typed_with_storage_observed(
+            value_type,
+            null_semantics,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            request,
+            work,
+        )
+    }
+
+    pub fn new_value_typed_with_storage_observed<E>(
+        value_type: novarocks_functions::FunctionValueType,
+        null_semantics: RuntimeFilterNullSemantics,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+        mut request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
+        work: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<Self, E>
+    where
+        E: From<FilterMembershipSchemaError>
+            + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+    {
+        let storage = storage.retaining_observed(
+            &value_type
+                .typed_binding()
+                .layout()
+                .arrow_backing_storage_lifetime(),
+            &mut request,
+        )?;
+        let canonical = FilterMembershipSchema::try_new_with_storage_observed(
+            value_type.data_type(),
+            null_semantics.canonical(),
+            storage,
+            request,
+            work,
+        )?;
+        Ok(Self {
+            canonical,
+            complete_type: Some(value_type),
+        })
+    }
+
+    /// Borrow the physical artifact owner, whose clone retains its own
+    /// canonical backing independently of the complete value declaration.
+    pub fn canonical_schema(&self) -> &FilterMembershipSchema {
+        &self.canonical
+    }
+
+    pub fn value_type(&self) -> Option<&novarocks_functions::FunctionValueType> {
+        self.complete_type.as_ref()
     }
 
     pub fn from_canonical(
@@ -156,7 +251,10 @@ impl RuntimeFilterMembershipSchema {
     ) -> Result<Self, RuntimeFilterContractViolation> {
         let canonical = FilterMembershipSchema::from_canonical(canonical_bytes, expected_digest)
             .map_err(membership_schema_error)?;
-        Ok(Self { canonical })
+        Ok(Self {
+            canonical,
+            complete_type: None,
+        })
     }
 
     pub const fn data_type(&self) -> &DataType {
@@ -210,15 +308,6 @@ fn membership_schema_error(error: FilterMembershipSchemaError) -> RuntimeFilterC
         RuntimeFilterContractViolationKind::ContractMismatch,
         error.detail(),
     )
-}
-
-/// Append the canonical encoding of one runtime-filter key type, as owned by
-/// the canonical schema in `novarocks-local-program`.
-fn encode_membership_schema_type(
-    data_type: &DataType,
-    output: &mut Vec<u8>,
-) -> Result<(), RuntimeFilterContractViolation> {
-    encode_filter_key_type(data_type, output).map_err(membership_schema_error)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1443,5 +1532,46 @@ mod tests {
         );
         RuntimeFilterFinalDomain::from_value_domain(&domain, [7; 32], 1024)
             .expect("small final domain is canonical")
+    }
+}
+
+#[cfg(test)]
+mod typed_channel_identity_tests {
+    use super::*;
+    use novarocks_functions::FunctionValueType;
+    #[test]
+    fn membership_channel_keeps_complete_semantics_separate_from_physical_artifact_digest() {
+        let text = FunctionValueType::new(DataType::Utf8, true);
+        let json = FunctionValueType::try_with_logical_type(
+            DataType::Utf8,
+            true,
+            novarocks_type_contract::ValueLogicalType::Json,
+        )
+        .unwrap();
+        let construct = |value| {
+            RuntimeFilterMembershipSchema::new_value_typed_observed::<FilterMembershipSchemaError>(
+                value,
+                RuntimeFilterNullSemantics::NeverMatches,
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .unwrap()
+        };
+        let text = construct(text);
+        let json = construct(json);
+        assert_eq!(text.canonical_bytes(), json.canonical_bytes());
+        assert_eq!(text.digest(), json.digest());
+        assert_ne!(
+            RuntimeFilterExecutionContract::Membership(text.clone()),
+            RuntimeFilterExecutionContract::Membership(json.clone())
+        );
+        assert_eq!(
+            json.value_type().unwrap().logical_type(),
+            novarocks_type_contract::ValueLogicalType::Json
+        );
+        assert_eq!(
+            construct(FunctionValueType::new(DataType::Utf8, true)),
+            text
+        );
     }
 }

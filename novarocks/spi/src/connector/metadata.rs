@@ -1165,24 +1165,115 @@ fn corrupt_definition(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(super::ConnectorErrorKind::CorruptData, message)
 }
 
+/// Non-type facts published with one exact catalog load. Source IDs, defaults,
+/// visibility and definition/display facts never supply missing execution types.
+#[derive(Clone)]
+pub struct ConnectorTableMetadataHeader {
+    pub identity: ConnectorTableIdentity,
+    pub planning_facts: ConnectorTablePlanningFacts,
+    pub definition_facts: ConnectorTableDefinitionFacts,
+    pub version: Option<Bytes>,
+    pub statistics_data_version: Option<StatisticsDataVersion>,
+    pub table: ConnectorTableHandle,
+}
+
 #[derive(Clone)]
 pub struct ConnectorTableMetadata {
     pub identity: ConnectorTableIdentity,
-    pub schema: SchemaRef,
-    /// Bounded provider-neutral facts aligned to `schema`. Empty facts retain
-    /// the historical provider-neutral defaults.
+    format_schema: SchemaRef,
+    execution_schema: novarocks_connector_contract::ConnectorReadExecutionSchema,
     pub planning_facts: ConnectorTablePlanningFacts,
-    /// Bounded SQL definition facts loaded from this exact provider
-    /// generation. Empty facts mean SHOW CREATE is unsupported.
     pub definition_facts: ConnectorTableDefinitionFacts,
-    /// Provider-owned schema identity. This remains deliberately distinct
-    /// from the data-version pin used by statistics and scan planning.
     pub version: Option<Bytes>,
-    /// Opaque data-version resolved together with this table metadata. Core
-    /// must pass this exact pin to both scan and statistics consumers rather
-    /// than resolving `latest` a second time.
     pub statistics_data_version: Option<StatisticsDataVersion>,
     pub table: ConnectorTableHandle,
+    _source_storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl ConnectorTableMetadata {
+    pub fn schema(&self) -> &arrow::datatypes::Schema {
+        &self.format_schema
+    }
+    pub fn format_schema(&self) -> &arrow::datatypes::Schema {
+        &self.format_schema
+    }
+    pub fn execution_schema(&self) -> &novarocks_connector_contract::ConnectorReadExecutionSchema {
+        &self.execution_schema
+    }
+    pub fn try_new_typed(
+        header: ConnectorTableMetadataHeader,
+        format_schema: SchemaRef,
+        execution_schema: novarocks_connector_contract::ConnectorReadExecutionSchema,
+        creation: &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<Self, novarocks_connector_contract::PureProviderCompileError<ConnectorError>> {
+        creation.work(1)?;
+        if format_schema.fields().len() != execution_schema.bindings().len() {
+            return Err(ConnectorError::new(
+                super::ConnectorErrorKind::InvalidRequest,
+                "catalog source/execution schema field counts differ",
+            )
+            .into());
+        }
+        for (ordinal, source) in format_schema.fields().iter().enumerate() {
+            let target = &execution_schema.schema().fields()[ordinal];
+            let binding = &execution_schema.bindings()[ordinal];
+            creation.work(source.name().len() + target.name().len() + 1)?;
+            if source.name() != target.name() || source.is_nullable() != binding.nullable() {
+                return Err(ConnectorError::new(
+                    super::ConnectorErrorKind::InvalidRequest,
+                    "catalog source/execution field name or NULL contract differs",
+                )
+                .into());
+            }
+            let same = novarocks_type_contract::value_layout_matches_carrier_observed(
+                binding.typed_binding().layout(),
+                source.data_type(),
+                |units| creation.work(units).map_err(CatalogLayoutError::Caller),
+            )
+            .map_err(CatalogLayoutError::into_failure)?;
+            if !same {
+                return Err(ConnectorError::new(
+                    super::ConnectorErrorKind::InvalidRequest,
+                    "catalog source/execution normalized layouts differ",
+                )
+                .into());
+            }
+        }
+        Ok(Self {
+            identity: header.identity,
+            format_schema,
+            execution_schema,
+            planning_facts: header.planning_facts,
+            definition_facts: header.definition_facts,
+            version: header.version,
+            statistics_data_version: header.statistics_data_version,
+            table: header.table,
+            _source_storage: creation.storage(),
+        })
+    }
+}
+#[derive(Debug)]
+enum CatalogLayoutError {
+    Caller(novarocks_connector_contract::PureProviderCompileError<ConnectorError>),
+    Source(novarocks_type_contract::ValueTypeError),
+}
+impl From<novarocks_type_contract::ValueTypeError> for CatalogLayoutError {
+    fn from(cause: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Source(cause)
+    }
+}
+impl CatalogLayoutError {
+    fn into_failure(
+        self,
+    ) -> novarocks_connector_contract::PureProviderCompileError<ConnectorError> {
+        match self {
+            Self::Caller(cause) => cause,
+            Self::Source(cause) => ConnectorError::new(
+                super::ConnectorErrorKind::InvalidRequest,
+                format!("invalid catalog source carrier: {cause}"),
+            )
+            .into(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1530,7 +1621,11 @@ pub trait ConnectorMetadata: Send + Sync {
     fn load_table(
         &self,
         request: ConnectorTableRequest,
-    ) -> Result<ConnectorTableMetadata, ConnectorError>;
+        creation: &mut super::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    >;
 }
 
 #[cfg(test)]
@@ -1541,6 +1636,161 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+
+    fn typed_catalog_header() -> ConnectorTableMetadataHeader {
+        let instance_id = ConnectorInstanceId::parse("typed-catalog").unwrap();
+        ConnectorTableMetadataHeader {
+            identity: ConnectorTableIdentity {
+                instance_id: instance_id.clone(),
+                namespace: "db".into(),
+                table: "t".into(),
+            },
+            planning_facts: ConnectorTablePlanningFacts::empty(),
+            definition_facts: ConnectorTableDefinitionFacts::empty(),
+            version: None,
+            statistics_data_version: None,
+            table: ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"typed-table"))
+                .unwrap(),
+        }
+    }
+    fn typed_catalog_execution(
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+    ) -> novarocks_connector_contract::ConnectorReadExecutionSchema {
+        use novarocks_type_contract::{
+            FunctionValueType, ValueLayout, ValueLogicalType, ValueTypeRef,
+        };
+        let layout = ValueLayout::try_new(&DataType::Binary, storage.clone()).unwrap();
+        let semantic = ValueTypeRef::try_from_declared_arrow(
+            &DataType::Binary,
+            true,
+            ValueLogicalType::Physical,
+            storage.clone(),
+        )
+        .unwrap();
+        let binding = FunctionValueType::try_from_value(semantic, layout).unwrap();
+        novarocks_connector_contract::ConnectorReadExecutionSchema::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::Binary,
+                true,
+            )])),
+            vec![binding].into_boxed_slice(),
+            storage,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn catalog_metadata_keeps_full_binding_and_creator_without_attribute_hydration() {
+        use novarocks_type_contract::{
+            ValueLogicalType, ValueTypeStorageHold, ValueTypeStorageLifetime,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Hold(Arc<AtomicUsize>);
+        impl ValueTypeStorageHold for Hold {}
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let exits = Arc::new(AtomicUsize::new(0));
+        let storage = ValueTypeStorageLifetime::held(Arc::new(Hold(exits.clone())));
+        let execution = typed_catalog_execution(storage.clone());
+        let source = Arc::new(Schema::new(vec![
+            Field::new("payload", DataType::Binary, true).with_metadata(
+                std::collections::HashMap::from([(
+                    novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
+                    "hll".into(),
+                )]),
+            ),
+        ]));
+        let mut request = |_| Ok(());
+        let mut work = |_| Ok(());
+        let mut creation = crate::connector::read_stack::ConnectorReadSchemaCreation::new(
+            storage.clone(),
+            &mut request,
+            &mut work,
+        );
+        let metadata = ConnectorTableMetadata::try_new_typed(
+            typed_catalog_header(),
+            source,
+            execution,
+            &mut creation,
+        )
+        .unwrap();
+        assert_eq!(
+            metadata
+                .execution_schema()
+                .binding(0)
+                .unwrap()
+                .logical_type(),
+            ValueLogicalType::Physical
+        );
+        assert_eq!(
+            metadata.schema().field(0).metadata()[novarocks_type_contract::NR_LOGICAL_TYPE_KEY],
+            "hll"
+        );
+        let independent = metadata.execution_schema().binding(0).unwrap().clone();
+        drop((metadata, creation, storage));
+        assert_eq!(exits.load(Ordering::SeqCst), 0);
+        drop(independent);
+        assert_eq!(exits.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn catalog_metadata_rejects_actual_name_null_and_layout_drift() {
+        use novarocks_type_contract::ValueTypeStorageLifetime;
+        for source in [
+            Field::new("other", DataType::Binary, true),
+            Field::new("payload", DataType::Binary, false),
+            Field::new("payload", DataType::Utf8, true),
+        ] {
+            let mut request = |_| Ok(());
+            let mut work = |_| Ok(());
+            let mut creation = crate::connector::read_stack::ConnectorReadSchemaCreation::new(
+                ValueTypeStorageLifetime::pure(),
+                &mut request,
+                &mut work,
+            );
+            let result = ConnectorTableMetadata::try_new_typed(
+                typed_catalog_header(),
+                Arc::new(Schema::new(vec![source])),
+                typed_catalog_execution(ValueTypeStorageLifetime::pure()),
+                &mut creation,
+            );
+            assert!(
+                matches!(result, Err(novarocks_connector_contract::PureProviderCompileError::Provider(ref cause)) if cause.kind()==super::super::ConnectorErrorKind::InvalidRequest)
+            );
+        }
+    }
+    #[test]
+    fn catalog_metadata_preserves_each_original_control_cause_before_source_work() {
+        use novarocks_type_contract::{CompileControlError, ValueTypeStorageLifetime};
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let mut request = |_| panic!("validation creates no new holder");
+            let mut work = |_| Err(cause);
+            let mut creation = crate::connector::read_stack::ConnectorReadSchemaCreation::new(
+                ValueTypeStorageLifetime::pure(),
+                &mut request,
+                &mut work,
+            );
+            let result = ConnectorTableMetadata::try_new_typed(
+                typed_catalog_header(),
+                Arc::new(Schema::new(vec![Field::new(
+                    "payload",
+                    DataType::Binary,
+                    true,
+                )])),
+                typed_catalog_execution(ValueTypeStorageLifetime::pure()),
+                &mut creation,
+            );
+            assert!(
+                matches!(result, Err(novarocks_connector_contract::PureProviderCompileError::Control(actual)) if actual==cause)
+            );
+        }
+    }
 
     #[test]
     fn materialized_view_target_property_keys_are_durable_spellings() {
@@ -1588,11 +1838,16 @@ mod tests {
         fn load_table(
             &self,
             _request: ConnectorTableRequest,
-        ) -> Result<ConnectorTableMetadata, ConnectorError> {
+            _creation: &mut crate::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
             Err(ConnectorError::new(
                 super::super::ConnectorErrorKind::Unsupported,
                 "test metadata does not load tables",
-            ))
+            )
+            .into())
         }
     }
 

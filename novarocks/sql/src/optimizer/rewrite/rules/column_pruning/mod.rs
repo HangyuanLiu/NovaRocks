@@ -398,7 +398,10 @@ mod tests {
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                     output_column_id: out_sum,
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![col_ref(id_c, "c")],

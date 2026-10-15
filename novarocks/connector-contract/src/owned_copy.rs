@@ -23,6 +23,10 @@ use novarocks_type_contract::owned_resources::{copy, hashmap, layout};
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
 use std::{alloc::Layout, collections::TryReserveError};
 
+mod created;
+pub(crate) use created::CreatedWriteCopy;
+pub use created::WriterOwnedCreationFailure;
+
 /// Contributions accumulated by the original writer constructors. The caller
 /// must provide the truthful whole retained source invoice, including private
 /// backing and shared allocations once. `source_floor` is only a necessary
@@ -40,6 +44,45 @@ pub struct WriterOwnedResourceFacts {
 
 pub(crate) trait OwnedCopy {
     type Error: From<ConnectorError>;
+    // Optional actual construction ownership. Pure/count actors have no scope
+    // capability; their original work/request observation sequence is unchanged.
+    fn created_fields(&self) -> bool {
+        false
+    }
+    fn begin_field(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn finish_field(
+        &mut self,
+    ) -> Result<novarocks_type_contract::ValueTypeStorageLifetime, Self::Error> {
+        Ok(novarocks_type_contract::ValueTypeStorageLifetime::pure())
+    }
+    fn retain_shared_field(
+        &mut self,
+        _: novarocks_type_contract::ValueTypeStorageLifetime,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn created_wrapper(&mut self, _layout: Layout) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    // Pure/counting actors have no construction capability. These operation
+    // hooks are overridden only by the actual scoped writer copy.
+    fn temporary_request(&mut self, _: Layout) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn prefunded_request(&mut self, _: Layout, _: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn receipt_request(&mut self, _: Layout, _: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn storage_lifetime(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+        novarocks_type_contract::ValueTypeStorageLifetime::pure()
+    }
+    fn receipt_storage_lifetime(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+        novarocks_type_contract::ValueTypeStorageLifetime::pure()
+    }
     fn prepare_field_materialization(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -60,6 +103,20 @@ pub(crate) trait OwnedCopy {
     }
     fn source_invoice(&self) -> Option<usize> {
         None
+    }
+    fn temporary_model_request(
+        &mut self,
+        layout: Layout,
+        copies: usize,
+    ) -> Result<(), Self::Error> {
+        self.request(layout, copies)
+    }
+    fn temporary_array<T>(&mut self, count: usize, copies: usize) -> Result<(), Self::Error> {
+        let layout = Layout::array::<T>(count).map_err(|_| self.arithmetic())?;
+        if layout.size() != 0 {
+            self.temporary_model_request(layout, copies)?;
+        }
+        Ok(())
     }
     fn request(&mut self, _: Layout, _: usize) -> Result<(), Self::Error> {
         Ok(())
@@ -165,6 +222,14 @@ pub(crate) trait OwnedCopy {
         }
         self.flush()
     }
+    fn metadata_iteration_with_bound(
+        &mut self,
+        entries: usize,
+        traversals: usize,
+        _source_work_bound: Option<usize>,
+    ) -> Result<(), Self::Error> {
+        self.metadata_iteration(entries, traversals)
+    }
     fn string(&mut self, value: &str) -> Result<Option<String>, Self::Error> {
         self.array::<u8>(value.len(), 1)?;
         // The same body is visited once for counting and once for copying.
@@ -181,6 +246,7 @@ pub(crate) trait OwnedCopy {
         self.array::<u8>(value.len(), 1)?;
         self.work(self.add(value.len(), 16)?)?;
         self.flush()?;
+        self.temporary_request(Layout::array::<u8>(value.len()).map_err(|_| self.arithmetic())?)?;
         self.spelling(value)
     }
 }
@@ -238,6 +304,12 @@ where
         context.array::<u8>(1024, 16)?;
         context.work(16 * 1024)?;
         Ok(context)
+    }
+    pub(super) fn extra_request(
+        &mut self,
+        layout: Layout,
+    ) -> Result<(), PureProviderCompileError<ConnectorError>> {
+        extra_request(&mut self.facts, self.admit, layout)
     }
     fn gate(&mut self) -> Result<(), PureProviderCompileError<ConnectorError>> {
         (self.admit)(&self.facts).map_err(PureProviderCompileError::Control)
@@ -307,4 +379,24 @@ where
         self.gate()?;
         copy::copy_string::<Self::Error>(value, self.checkpoints)
     }
+}
+
+// Extra geometry comes only from the actual scope/flat-holder/Vec constructor.
+// This extends the original cumulative model; it never resets source/work/caps.
+fn extra_request<A: FnMut(&WriterOwnedResourceFacts) -> Result<(), CompileControlError>>(
+    facts: &mut WriterOwnedResourceFacts,
+    admit: &mut A,
+    layout: Layout,
+) -> Result<(), PureProviderCompileError<ConnectorError>> {
+    let add = |a: usize, b: usize| {
+        a.checked_add(b)
+            .ok_or(CompileControlError::ResourceExhausted)
+    };
+    facts.allocation_requests = add(facts.allocation_requests, 1)?;
+    facts.requested_bytes = add(facts.requested_bytes, layout.size())?;
+    facts.coexistence_bytes = add(facts.source_retained_bytes, facts.requested_bytes)?;
+    // New scope headers and actual pointer/flat holder copies have real byte
+    // initialization/move work, separate from unchanged original copy work.
+    facts.work_units = add(facts.work_units, add(layout.size(), 128)?)?;
+    admit(facts).map_err(PureProviderCompileError::Control)
 }

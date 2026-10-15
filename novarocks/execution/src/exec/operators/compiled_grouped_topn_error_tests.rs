@@ -32,6 +32,7 @@ fn populated(f: &Fixture, tracker: Arc<MemTracker>) -> CompiledGroupedTopNProces
     .unwrap();
     let mut processor = factory.processor();
     processor.set_mem_tracker(tracker);
+    prepare_typed_fixture_operator(&mut processor);
     let state = RuntimeState::default();
     // Independent Partial processors preserve each original contribution.
     for offset in 0..f.input.len() {
@@ -77,7 +78,7 @@ fn compiled_grouped_topn_actual_key_array_clone_keeps_stock_after_all_parents_dr
     let tracker = MemTracker::new_root("grouped-key-array-alias");
     let mut processor = populated(&f, tracker.clone());
     let output = drain(&mut processor);
-    let alias = output[1].batch.column(0).clone();
+    let alias = output[1].record_batch().column(0).clone();
     drop(output);
     drop(processor);
     drop(f);
@@ -93,7 +94,7 @@ fn compiled_grouped_topn_actual_key_buffer_keeps_stock_after_parent_array_drop()
     let tracker = MemTracker::new_root("grouped-key-buffer-alias");
     let mut processor = populated(&f, tracker.clone());
     let output = drain(&mut processor);
-    let array = output[1].batch.column(0).clone();
+    let array = output[1].record_batch().column(0).clone();
     let alias = array.to_data().buffers()[1].clone();
     drop(array);
     drop(output);
@@ -178,7 +179,7 @@ fn compiled_grouped_topn_later_finish_refusal_destroys_the_unpublished_success_p
     let headroom = control_tracker.peak();
     assert_eq!(output.len(), 2);
     assert_eq!(
-        array_key(output[0].batch.column(0), 0),
+        array_key(output[0].record_batch().column(0), 0),
         Some(KeyCell::Text("a".into()))
     );
     drop(output);
@@ -193,7 +194,7 @@ fn compiled_grouped_topn_later_finish_refusal_destroys_the_unpublished_success_p
     let prefix_output = drain(&mut prefix_control);
     assert_eq!(prefix_output.len(), 2);
     assert_eq!(
-        array_key(prefix_output[0].batch.column(0), 0),
+        array_key(prefix_output[0].record_batch().column(0), 0),
         Some(KeyCell::Text("a".into()))
     );
     drop(prefix_output);
@@ -263,6 +264,7 @@ fn compiled_grouped_topn_second_call_merge_data_survives_state_drop_and_keeps_fi
     let second_contract = factory.plan.calls[1].contract.clone();
     let mut processor = factory.processor();
     processor.set_mem_tracker(tracker.clone());
+    prepare_typed_fixture_operator(&mut processor);
     let state = RuntimeState::default();
     for chunk in partial_chunks(&f, 0, 1) {
         processor.push_chunk(&state, chunk).unwrap();

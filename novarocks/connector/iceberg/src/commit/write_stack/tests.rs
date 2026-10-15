@@ -22,6 +22,7 @@
 //! outcomes rather than mocked verdicts.
 
 use crate::commit::model::EntryIdentity;
+use novarocks_spi::connector::write_stack::{ConnectorWriteBeginRequest, ConnectorWriteControl};
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
@@ -1118,7 +1119,23 @@ fn cow_rewrite_source(
         arrow::datatypes::Field::new("_row_id", DataType::Int64, true),
         arrow::datatypes::Field::new("_last_updated_sequence_number", DataType::Int64, true),
     ]));
-    novarocks_spi::connector::write_stack::session::ConnectorWriteRewriteSource::new(
+    let bindings = (0..3)
+        .map(|_| novarocks_type_contract::FunctionValueType::new(DataType::Int64, true))
+        .collect::<Vec<_>>();
+    let execution = novarocks_connector_contract::ConnectorReadExecutionSchema::try_new(
+        schema.clone(),
+        bindings.into_boxed_slice(),
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+    )
+    .expect("declared COW execution schema");
+    let mut request = |_| Ok(());
+    let mut work = |_| Ok(());
+    let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        &mut request,
+        &mut work,
+    );
+    novarocks_spi::connector::write_stack::session::ConnectorWriteRewriteSource::try_new_typed(
         novarocks_spi::connector::ConnectorTableHandle::try_new(
             ConnectorInstanceId::parse("copy_on_write").expect("instance id"),
             bytes::Bytes::from_static(b"frozen-source"),
@@ -1128,6 +1145,7 @@ fn cow_rewrite_source(
             .expect("pinned source"),
         [5; 32],
         schema,
+        execution,
         vec![
             novarocks_spi::connector::ConnectorRowMutationScanBinding::new(
                 novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([1; 32]),
@@ -1144,7 +1162,9 @@ fn cow_rewrite_source(
         ],
         vec![novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([5; 32])],
         Some(novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([6; 32])),
+        &mut creation,
     )
+    .expect("typed frozen COW source")
 }
 
 /// A sealed copy-on-write session holding exactly these frozen branches.
@@ -1991,7 +2011,34 @@ fn a_distributed_rewrite_commits_the_exact_file_set_it_froze() {
 #[test]
 fn a_position_delete_rewrite_seals_one_delete_branch_per_frozen_group() {
     let adapter = adapter("rewrite-position-deletes", 6);
-    let groups = position_delete_rewrite_groups(&["a", "b"]);
+    let original = position_delete_rewrite_groups(&["a", "b"]);
+    let mut groups = original.clone();
+    let operation = (1u8..=255)
+        .map(|n| novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([n; 16]))
+        .find(|id| {
+            let cohort = |g: &IcebergFrozenRewriteBranch| {
+                novarocks_spi::connector::ConnectorWriteCohortId::derive(
+                    *id,
+                    b"iceberg-distributed-rewrite-group",
+                    crate::distributed_rewrite::decode_digest(&g.group.group_digest_hex).unwrap(),
+                )
+                .unwrap()
+            };
+            cohort(&original[0]) > cohort(&original[1])
+        })
+        .expect("cohort order must differ from group-digest order for this fixture");
+    groups.sort_by_key(|g| {
+        novarocks_spi::connector::ConnectorWriteCohortId::derive(
+            operation,
+            b"iceberg-distributed-rewrite-group",
+            crate::distributed_rewrite::decode_digest(&g.group.group_digest_hex).unwrap(),
+        )
+        .unwrap()
+    });
+    assert_ne!(
+        groups[0].group.group_digest_hex,
+        original[0].group.group_digest_hex
+    );
     assert_eq!(groups.len(), 2);
     let plan = plan_distributed_rewrite_branches(
         &session_material(delete_input_shape(IcebergWriteBranch::DeletionVector)),
@@ -2013,8 +2060,7 @@ fn a_position_delete_rewrite_seals_one_delete_branch_per_frozen_group() {
     );
     // Each branch owns exactly its own group's data file, which is what makes
     // the unique-owner proof pass with two delete branches in one session.
-    // Ordinals follow the frozen group order, which is the planner's digest
-    // order rather than the partition order it was cut from.
+    // Ordinals follow the supplied frozen order even when it differs from digest order.
     assert_eq!(handle.delete_owner().len(), 2);
     for (index, branch) in groups.iter().enumerate() {
         for file in &branch.group.data_files {
@@ -2798,20 +2844,14 @@ fn an_empty_prepared_set_commits_or_aborts_by_the_publication_disposition() {
         other => panic!("unexpected outcome: {other:?}"),
     }
 
-    // A rewrite with nothing to rewrite is the same no-op, and it is decided by
-    // the flavor rather than by a publication disposition.
-    let (rewrite, _) = flavor_session(
-        plan_distributed_rewrite_branches(
-            &session_material(data_input_shape()),
-            DATA_FILE_REWRITE,
-            &[],
-        )
-        .expect("plan an empty distributed rewrite"),
-    );
-    assert_eq!(
-        rewrite.empty_write_decision(),
-        IcebergEmptyWriteDecision::SkipExternalCommit
-    );
+    // Empty plans terminate in FE without opening a write session.
+    let error = plan_distributed_rewrite_branches(
+        &session_material(data_input_shape()),
+        DATA_FILE_REWRITE,
+        &[],
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ConnectorErrorKind::Internal);
 }
 
 fn _assert_error_is_send_sync(error: ConnectorError) -> impl Send + Sync {
@@ -2921,9 +2961,13 @@ fn staged_begin_request(
         intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
         purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
         input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
-            fields: vec![novarocks_spi::connector::ConnectorWriteFieldRequest::new(
-                Field::new("id", DataType::Int64, false),
-            )],
+            fields: vec![
+                novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                    Field::new("id", DataType::Int64, false),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                )
+                .expect("staged caller declares required Int64 id"),
+            ],
         },
         base: None,
         flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::StagedCreate(
@@ -3228,19 +3272,30 @@ fn scalar_integer_staged_target_handle(
 }
 
 fn scalar_integer_fields() -> Vec<novarocks_spi::connector::ConnectorWriteFieldRequest> {
+    use novarocks_type_contract::FunctionValueType;
     vec![
-        Field::new("id", DataType::Int8, false),
-        Field::new("small", DataType::Int16, true),
-        Field::new("plain", DataType::Int32, false),
+        (
+            Field::new("id", DataType::Int8, false),
+            FunctionValueType::new(DataType::Int8, false),
+        ),
+        (
+            Field::new("small", DataType::Int16, true),
+            FunctionValueType::new(DataType::Int16, true),
+        ),
+        (
+            Field::new("plain", DataType::Int32, false),
+            FunctionValueType::new(DataType::Int32, false),
+        ),
     ]
     .into_iter()
     .enumerate()
-    .map(|(ordinal, field)| {
-        // The actual table schema authors field IDs 1/2/3; preparation and
-        // begin must retain these same provider annotations with the carrier.
-        novarocks_spi::connector::ConnectorWriteFieldRequest::new(
+    .map(|(ordinal, (field, value))| {
+        // Independent SQL execution declarations accompany the provider's IDs.
+        novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
             field.with_metadata([("PARQUET:field_id".into(), (ordinal + 1).to_string())].into()),
+            value,
         )
+        .expect("complete scalar integer caller declaration")
     })
     .collect()
 }
@@ -3331,12 +3386,17 @@ fn real_begin_rejects_storage_i32_forgery_even_when_statistics_are_disabled() {
             let target =
                 scalar_integer_staged_target_handle(&runtime, incarnation, collect_statistics);
             let mut fields = scalar_integer_fields();
-            fields[forged_ordinal] = ConnectorWriteFieldRequest::new(
+            fields[forged_ordinal] = ConnectorWriteFieldRequest::try_new_typed(
                 fields[forged_ordinal]
                     .field()
                     .clone()
                     .with_data_type(DataType::Int32),
-            );
+                novarocks_type_contract::FunctionValueType::new(
+                    DataType::Int32,
+                    forged_ordinal == 1,
+                ),
+            )
+            .expect("explicit forged scalar declaration");
             let mut request = staged_begin_request(target.clone());
             request.input = ConnectorWriteInputRequest::Data { fields };
             let outcome = crate::commit::write_preparation::prepare_write(
@@ -3586,9 +3646,13 @@ fn all_write_admission_requests(
     .collect::<Vec<_>>();
     let mut equality_delete = ordinary(ConnectorWriteIntent::RowDelta);
     equality_delete.input = novarocks_spi::connector::ConnectorWriteInputRequest::EqualityDelete {
-        equality_fields: vec![novarocks_spi::connector::ConnectorWriteFieldRequest::new(
-            Field::new("id", DataType::Int64, false),
-        )],
+        equality_fields: vec![
+            novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                Field::new("id", DataType::Int64, false),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            )
+            .expect("equality caller declares required Int64 id"),
+        ],
     };
     requests.push(("equality delete".to_string(), equality_delete));
     for (name, flavor) in [
@@ -3613,11 +3677,17 @@ fn all_write_admission_requests(
         ),
         (
             "data rewrite",
-            ConnectorWriteSessionFlavor::DistributedRewrite(DATA_FILE_REWRITE),
+            ConnectorWriteSessionFlavor::DistributedRewrite {
+                shape: DATA_FILE_REWRITE,
+                frozen: test_rewrite_payload(),
+            },
         ),
         (
             "position delete rewrite",
-            ConnectorWriteSessionFlavor::DistributedRewrite(POSITION_DELETE_REWRITE),
+            ConnectorWriteSessionFlavor::DistributedRewrite {
+                shape: POSITION_DELETE_REWRITE,
+                frozen: test_rewrite_payload(),
+            },
         ),
     ] {
         let mut request = ordinary(ConnectorWriteIntent::Append);
@@ -3703,4 +3773,810 @@ fn assert_write_admission_refused_without_io(
         catalog.assert_no_io();
         file_io.assert_no_dispatch();
     }
+}
+
+fn test_rewrite_payload() -> novarocks_spi::connector::ConnectorProcessLocalPayload {
+    novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+        novarocks_spi::connector::ConnectorProviderBindingKey {
+            instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("test").unwrap(),
+            incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
+        },
+        std::sync::Arc::new(()),
+    )
+}
+
+// Real local FileIO protects the attempt-input contract without an object-store
+// test double. This owner runs with the ordinary Iceberg unit-test chain; SQL
+// owns native FE/BE execution. TempDir and Runtime own isolation and real exit.
+struct FrozenRewriteLake {
+    executor: tokio::runtime::Runtime,
+    _warehouse: tempfile::TempDir,
+    runtime: Arc<crate::metadata_context::IcebergMetadataContext>,
+    rewrite: crate::distributed_rewrite::IcebergDistributedRewriteControl,
+    control: crate::commit::write_stack::control::IcebergWriteSessionControl,
+    adapter: IcebergWriteAdapter,
+}
+impl FrozenRewriteLake {
+    fn new() -> Self {
+        Self::new_version(crate::iceberg::spec::FormatVersion::V2)
+    }
+    fn new_version(version: crate::iceberg::spec::FormatVersion) -> Self {
+        let executor = tokio::runtime::Runtime::new().unwrap();
+        let warehouse = tempfile::tempdir().unwrap();
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "rewrite-local",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .unwrap();
+        let binding = IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
+        );
+        let runtime = Arc::new(
+            crate::metadata_context::IcebergMetadataContext::try_new(
+                crate::catalog_control::IcebergCatalogControlState::new(configuration),
+                crate::resources::IcebergMetadataResources::new(binding, executor.handle().clone()),
+            )
+            .unwrap(),
+        );
+        let descriptor = descriptor("rewrite-local");
+        let incarnation = ProviderBindingEpoch::from_bytes([6; 16]);
+        let provider = Arc::new(crate::metadata::IcebergMetadata::new(
+            descriptor.clone(),
+            incarnation,
+            runtime.clone(),
+        ));
+        let rewrite = crate::distributed_rewrite::IcebergDistributedRewriteControl::new(
+            descriptor.clone(),
+            incarnation,
+            runtime.clone(),
+            provider,
+        )
+        .unwrap();
+        let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+            descriptor.clone(),
+            incarnation,
+            CatalogHandle::new(descriptor.instance_id, CatalogVersion::from_bytes([6; 32])),
+            runtime.clone(),
+        );
+        let catalog = runtime.novarocks_catalog().vendored_client();
+        executor.block_on(async {
+            let namespace = crate::iceberg::NamespaceIdent::new("db".to_string());
+            catalog
+                .create_namespace(&namespace, std::collections::HashMap::new())
+                .await
+                .unwrap();
+            let schema = crate::iceberg::spec::Schema::builder()
+                .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
+                    1,
+                    "id",
+                    crate::iceberg::spec::Type::Primitive(
+                        crate::iceberg::spec::PrimitiveType::Long,
+                    ),
+                ))])
+                .build()
+                .unwrap();
+            catalog
+                .create_table(
+                    &namespace,
+                    crate::iceberg::TableCreation::builder()
+                        .name("t".to_string())
+                        .schema(schema)
+                        .format_version(version)
+                        .properties(std::collections::HashMap::from([
+                            (
+                                "write.metadata.metrics.default".to_string(),
+                                "none".to_string(),
+                            ),
+                            (
+                                crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY.to_string(),
+                                "false".to_string(),
+                            ),
+                        ]))
+                        .build(),
+                )
+                .await
+                .unwrap();
+        });
+        Self {
+            executor,
+            _warehouse: warehouse,
+            runtime,
+            rewrite,
+            control,
+            adapter: adapter("rewrite-local", 6),
+        }
+    }
+    fn table(&self) -> crate::iceberg::table::Table {
+        self.executor
+            .block_on(
+                self.runtime
+                    .novarocks_catalog()
+                    .vendored_client()
+                    .load_table(&crate::iceberg::TableIdent::new(
+                        crate::iceberg::NamespaceIdent::new("db".to_string()),
+                        "t".to_string(),
+                    )),
+            )
+            .unwrap()
+    }
+    fn plan(&self, position: bool) -> novarocks_spi::connector::ConnectorDistributedRewritePlan {
+        use novarocks_spi::connector::{
+            ConnectorDistributedRewrite, ConnectorDistributedRewriteOperation,
+            ConnectorDistributedRewritePlanningRequest, ConnectorTableHandle,
+            ConnectorWriteOperationId,
+        };
+        let table = ConnectorTableHandle::try_new(self.control.binding_key().instance_id.clone(), bytes::Bytes::from_static(br#"{"namespace":"db","table":"t","metadata_location":null,"table_info":null,"metadata_columns":[],"metadata_table_type":null,"prepared_files":[],"explicit_files":null}"#)).unwrap();
+        let mut layout = |_| Ok(());
+        let mut work = |_| Ok(());
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut layout,
+            &mut work,
+        );
+        self.rewrite
+            .plan_rewrite(
+                ConnectorDistributedRewritePlanningRequest::try_new(
+                    ConnectorWriteOperationId::new(),
+                    self.control.binding_key().clone(),
+                    if position {
+                        ConnectorDistributedRewriteOperation::RewritePositionDeletes {
+                            table,
+                            rewrite_all: true,
+                            min_input_files: None,
+                        }
+                    } else {
+                        ConnectorDistributedRewriteOperation::RewriteDataFiles {
+                            table,
+                            rewrite_all: true,
+                        }
+                    },
+                    request_context(),
+                )
+                .unwrap(),
+                &mut creation,
+            )
+            .unwrap()
+    }
+    fn request(
+        &self,
+        plan: &novarocks_spi::connector::ConnectorDistributedRewritePlan,
+    ) -> ConnectorWriteBeginRequest {
+        let prep = plan.cohorts()[0].preparation();
+        ConnectorWriteBeginRequest {
+            table: Arc::from("db.t"),
+            target_ref: prep.target_ref().clone(),
+            intent: prep.intent(),
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
+                fields: prep
+                    .input()
+                    .fields()
+                    .iter()
+                    .map(|b| {
+                        novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                            b.field().clone(),
+                            b.execution_type()
+                                .expect("rewrite field declaration")
+                                .clone(),
+                        )
+                        .expect("frozen writer declaration")
+                    })
+                    .collect(),
+            },
+            base: None,
+            flavor: ConnectorWriteSessionFlavor::DistributedRewrite {
+                shape: plan.shape(),
+                frozen: plan.frozen().clone(),
+            },
+            context: request_context(),
+        }
+    }
+    fn write_rows(
+        &self,
+        intent: novarocks_spi::connector::ConnectorWriteIntent,
+        rows: &[i64],
+        name: &str,
+    ) {
+        use novarocks_spi::connector::write_stack::{
+            ConnectorWriteControl, ConnectorWriteFinishPublication, ConnectorWriteFinishRequest,
+        };
+        let request = ConnectorWriteBeginRequest {
+            table: Arc::from("db.t"),
+            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+            intent,
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
+                fields: vec![
+                    novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                        Field::new("id", DataType::Int64, false),
+                        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                    )
+                    .expect("fixture declares required Int64 id"),
+                ],
+            },
+            base: None,
+            flavor: ConnectorWriteSessionFlavor::Ordinary,
+            context: request_context(),
+        };
+        let session = self.control.begin_write(request).unwrap();
+        let prepared = self.output(&session, rows, name);
+        let result = self
+            .control
+            .finish_write(ConnectorWriteFinishRequest {
+                commit: session.commit_handle(),
+                prepared,
+                statistics: Vec::new(),
+                publication: ConnectorWriteFinishPublication::None,
+                context: request_context(),
+            })
+            .unwrap();
+        assert!(
+            matches!(result, ExternalMutationOutcome::KnownCommitted { .. }),
+            "{result:?}"
+        );
+    }
+    fn output(
+        &self,
+        session: &novarocks_spi::connector::write_stack::ConnectorWriteSessionPlan,
+        rows: &[i64],
+        name: &str,
+    ) -> ConnectorPreparedWriteSet {
+        let root = self
+            .table()
+            .metadata()
+            .location()
+            .trim_start_matches("file://")
+            .to_string();
+        let path = std::path::PathBuf::from(root)
+            .join("data")
+            .join(format!("{name}.parquet"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(rows.to_vec()))],
+        )
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let fragment = IcebergCommitFragment::data_file(
+            IcebergDataFileArtifact::try_new(
+                location(&path),
+                IcebergFileFormat::Parquet,
+                sample_partition(),
+                sample_metrics(rows.len() as u64, std::fs::metadata(&path).unwrap().len()),
+                None,
+            )
+            .unwrap(),
+        );
+        prepared(
+            &self.adapter,
+            vec![(session.targets()[0].ordinal(), fragment)],
+            &session.expected_targets(),
+        )
+    }
+    fn rows(&self) -> Vec<i64> {
+        let table = self.table();
+        let files = self
+            .executor
+            .block_on(crate::manifest::extract_data_files_with_stats(&table))
+            .unwrap();
+        let mut rows = Vec::new();
+        for file in files {
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                std::fs::File::open(file.path.trim_start_matches("file://")).unwrap(),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                rows.extend(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied(),
+                );
+            }
+        }
+        rows.sort();
+        rows
+    }
+    fn inventory(&self) -> Vec<std::path::PathBuf> {
+        fn walk(root: &std::path::Path, paths: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(root).unwrap() {
+                let entry = entry.unwrap();
+                assert_ne!(entry.file_name(), "_novarocks");
+                paths.push(entry.path());
+                if entry.file_type().unwrap().is_dir() {
+                    walk(&entry.path(), paths);
+                }
+            }
+        }
+        let table = self.table();
+        let mut paths = Vec::new();
+        walk(
+            std::path::Path::new(table.metadata().location().trim_start_matches("file://")),
+            &mut paths,
+        );
+        paths.sort();
+        paths
+    }
+}
+
+#[test]
+fn distributed_rewrite_inputs_are_attempt_owned_and_never_written() {
+    let lake = FrozenRewriteLake::new();
+    for position in [false, true] {
+        let before = lake.inventory();
+        let plan = lake.plan(position);
+        assert!(plan.cohorts().is_empty());
+        assert_eq!(lake.inventory(), before);
+    }
+    lake.write_rows(
+        novarocks_spi::connector::ConnectorWriteIntent::Append,
+        &[1],
+        "a",
+    );
+    lake.write_rows(
+        novarocks_spi::connector::ConnectorWriteIntent::Append,
+        &[2],
+        "b",
+    );
+    let before = lake.inventory();
+    let plan = lake.plan(false);
+    assert_eq!(lake.inventory(), before);
+    let content = plan
+        .frozen()
+        .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
+        .unwrap();
+    let weak = Arc::downgrade(content);
+    assert_eq!(content.groups.len(), plan.cohorts().len());
+    for (group, cohort) in content.groups.iter().zip(plan.cohorts()) {
+        assert_eq!(
+            crate::distributed_rewrite::decode_digest(&group.group_digest_hex).unwrap(),
+            cohort.group_digest()
+        );
+    }
+    assert!(
+        content
+            .validate_identity(plan.operation_id(), &"ff".repeat(32))
+            .is_err()
+    );
+    assert!(
+        content
+            .validate_identity(
+                novarocks_spi::connector::ConnectorWriteOperationId::new(),
+                &content
+                    .manifest_digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            )
+            .is_err()
+    );
+    assert_eq!(
+        content.group(&"ff".repeat(32)).unwrap_err().kind(),
+        ConnectorErrorKind::Internal
+    );
+    let cloned = plan.clone();
+    drop(plan);
+    assert!(weak.upgrade().is_some());
+    drop(cloned);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(lake.inventory(), before);
+}
+
+#[test]
+fn distributed_rewrite_refuses_a_head_that_moved_before_begin_without_writing() {
+    use novarocks_spi::connector::write_stack::ConnectorWriteControl;
+    let lake = FrozenRewriteLake::new();
+    lake.write_rows(
+        novarocks_spi::connector::ConnectorWriteIntent::Append,
+        &[1],
+        "old",
+    );
+    let shared_context = request_context();
+    // Production FE clones this exact context across metadata, planning and begin.
+    let observed = lake
+        .runtime
+        .load_table_for_request("db", "t", &shared_context)
+        .unwrap();
+    let plan = lake.plan(false);
+    assert_eq!(
+        observed.table.metadata().current_snapshot_id(),
+        plan.frozen()
+            .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
+            .unwrap()
+            .base_snapshot_id
+    );
+    lake.write_rows(
+        novarocks_spi::connector::ConnectorWriteIntent::Overwrite,
+        &[99],
+        "concurrent",
+    );
+    let before = lake.inventory();
+    let mut request = lake.request(&plan);
+    request.context = shared_context.clone();
+    assert_eq!(
+        lake.runtime
+            .load_table_for_request("db", "t", &shared_context)
+            .unwrap()
+            .table
+            .metadata()
+            .current_snapshot_id(),
+        observed.table.metadata().current_snapshot_id(),
+        "the cached planning observation intentionally remains S0"
+    );
+    let error = lake.control.begin_write(request).unwrap_err();
+    assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    assert!(error.message().contains("moved after planning"));
+    assert_eq!(lake.inventory(), before);
+    assert_eq!(lake.rows(), vec![99]);
+}
+
+#[test]
+fn distributed_rewrite_replaces_only_frozen_inputs_and_rejects_concurrent_commit() {
+    use novarocks_spi::connector::write_stack::{
+        ConnectorWriteControl, ConnectorWriteFinishPublication, ConnectorWriteFinishRequest,
+    };
+    for concurrent in [false, true] {
+        let lake = FrozenRewriteLake::new();
+        lake.write_rows(
+            novarocks_spi::connector::ConnectorWriteIntent::Append,
+            &[1, 2],
+            "old",
+        );
+        let plan = lake.plan(false);
+        let session = lake.control.begin_write(lake.request(&plan)).unwrap();
+        for (target, cohort) in session.targets().iter().zip(plan.cohorts()) {
+            assert_eq!(target.rewrite_group_digest(), Some(cohort.group_digest()));
+        }
+        let handle = lake.adapter.commit_handle(session.commit_handle()).unwrap();
+        let selected = crate::commit::write_stack::control::selected_rewrite_files(handle).unwrap();
+        let content = plan
+            .frozen()
+            .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
+            .unwrap();
+        assert_eq!(
+            selected.data_paths,
+            content
+                .groups
+                .iter()
+                .flat_map(|g| g.data_files.iter().map(|f| EntryIdentity::DataFile {
+                    path: f.path.clone()
+                }))
+                .collect()
+        );
+        let prepared = lake.output(&session, &[1, 2], "rewritten");
+        if concurrent {
+            lake.write_rows(
+                novarocks_spi::connector::ConnectorWriteIntent::Overwrite,
+                &[99],
+                "concurrent",
+            );
+        }
+        let result = lake
+            .control
+            .finish_write(ConnectorWriteFinishRequest {
+                commit: session.commit_handle(),
+                prepared,
+                statistics: Vec::new(),
+                publication: ConnectorWriteFinishPublication::None,
+                context: request_context(),
+            })
+            .unwrap();
+        if concurrent {
+            assert!(
+                matches!(result, ExternalMutationOutcome::KnownUncommitted { .. }),
+                "{result:?}"
+            );
+            assert_eq!(lake.rows(), vec![99]);
+        } else {
+            assert!(
+                matches!(result, ExternalMutationOutcome::KnownCommitted { .. }),
+                "{result:?}"
+            );
+            assert_eq!(lake.rows(), vec![1, 2]);
+        }
+        lake.inventory();
+    }
+}
+
+#[test]
+fn distributed_rewrite_refuses_foreign_missing_and_mismatched_frozen_inputs() {
+    let lake = FrozenRewriteLake::new();
+    lake.write_rows(
+        novarocks_spi::connector::ConnectorWriteIntent::Append,
+        &[1],
+        "old",
+    );
+    let plan = lake.plan(false);
+    let before = lake.inventory();
+    let original = plan
+        .frozen()
+        .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
+        .unwrap();
+    for case in 0..8 {
+        let mut content = original.as_ref().clone();
+        let mut owner = lake.control.binding_key().clone();
+        match case {
+            0 => owner.instance_id = ConnectorInstanceId::parse("foreign").unwrap(),
+            1 => {}
+            2 => content.artifact.namespace = "other".to_string(),
+            3 => content.artifact.operation_kind = "other".to_string(),
+            4 => content.artifact.target_ref = "other".to_string(),
+            5 => content.artifact.groups.clear(),
+            6 => content.artifact.table_uuid = "other".to_string(),
+            7 => content.artifact.base_snapshot_id = None,
+            _ => unreachable!(),
+        }
+        let frozen = if case == 1 {
+            novarocks_spi::connector::ConnectorProcessLocalPayload::new(owner, Arc::new(()))
+        } else {
+            novarocks_spi::connector::ConnectorProcessLocalPayload::new(owner, Arc::new(content))
+        };
+        let mut request = lake.request(&plan);
+        request.flavor = ConnectorWriteSessionFlavor::DistributedRewrite {
+            shape: plan.shape(),
+            frozen,
+        };
+        let error = lake.control.begin_write(request).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            if case >= 6 {
+                ConnectorErrorKind::InvalidRequest
+            } else {
+                ConnectorErrorKind::Internal
+            },
+            "case {case}: {error}"
+        );
+        assert_eq!(lake.inventory(), before);
+    }
+    assert_eq!(lake.rows(), vec![1]);
+}
+
+#[test]
+fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_artifacts() {
+    use novarocks_spi::connector::read_stack::{
+        ConnectorReadConstraint, ConnectorReadDynamicFilterSnapshot,
+        ConnectorReadFrozenRewriteGroup, ConnectorReadRequestControlFactory,
+        ConnectorReadTableExecuteProcedure, ConnectorSession, SchemaTableName,
+    };
+    use novarocks_spi::connector::write_stack::{
+        ConnectorWriteFinishPublication, ConnectorWriteFinishRequest,
+    };
+    use novarocks_spi::connector::{
+        ConnectorFrozenRewriteGroup, ConnectorPlanningContext, ConnectorProcessLocalPayload,
+        ConnectorRewriteCohortRead,
+    };
+    let lake = FrozenRewriteLake::new_version(crate::iceberg::spec::FormatVersion::V3);
+    lake.write_rows(
+        novarocks_spi::connector::ConnectorWriteIntent::Append,
+        &[1, 2],
+        "first",
+    );
+    lake.write_rows(
+        novarocks_spi::connector::ConnectorWriteIntent::Append,
+        &[3, 4],
+        "second",
+    );
+    let table = lake.table();
+    let files = lake
+        .executor
+        .block_on(crate::manifest::extract_data_files_with_stats(&table))
+        .unwrap();
+    for (index, file) in files.iter().enumerate() {
+        let input = novarocks_spi::connector::ConnectorWriteInputRequest::DeletionVector {
+            identity_fields: vec![
+                novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                    Field::new("_file", DataType::Utf8, false),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+                )
+                .expect("fixture declares required file path"),
+                novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                    Field::new("_pos", DataType::Int64, false),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                )
+                .expect("fixture declares required row position"),
+            ],
+            partition_source_fields: Vec::new(),
+        };
+        let session = lake
+            .control
+            .begin_write(ConnectorWriteBeginRequest {
+                table: Arc::from("db.t"),
+                target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+                intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+                purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                input,
+                base: None,
+                flavor: ConnectorWriteSessionFlavor::Ordinary,
+                context: request_context(),
+            })
+            .unwrap();
+        let path = format!("{}/data/vector-{index}.puffin", table.metadata().location());
+        let mut vector = crate::commit::DeletionVector::new();
+        vector.insert(0).unwrap();
+        let written = lake
+            .executor
+            .block_on(crate::commit::write_single_deletion_vector_puffin(
+                table.file_io(),
+                &path,
+                &file.path,
+                &vector,
+            ))
+            .unwrap();
+        let fragment = IcebergCommitFragment::deletion_vector(
+            dv_artifact(
+                &written.path,
+                &file.path,
+                written.cardinality,
+                written.file_size_in_bytes,
+                written.content_offset,
+                written.content_size_in_bytes,
+            )
+            .unwrap(),
+        );
+        let target = session
+            .targets()
+            .iter()
+            .find(|target| {
+                lake.adapter
+                    .writer_handle(target.handle())
+                    .unwrap()
+                    .branch()
+                    == IcebergWriteBranch::DeletionVector
+            })
+            .unwrap();
+        let set = prepared(
+            &lake.adapter,
+            vec![(target.ordinal(), fragment)],
+            &session.expected_targets(),
+        );
+        let result = lake
+            .control
+            .finish_write(ConnectorWriteFinishRequest {
+                commit: session.commit_handle(),
+                prepared: set,
+                statistics: Vec::new(),
+                publication: ConnectorWriteFinishPublication::None,
+                context: request_context(),
+            })
+            .unwrap();
+        assert!(
+            matches!(result, ExternalMutationOutcome::KnownCommitted { .. }),
+            "{result:?}"
+        );
+    }
+    let before = lake.inventory();
+    let plan = lake.plan(true);
+    assert_eq!(plan.cohorts().len(), 2);
+    assert_eq!(lake.inventory(), before);
+    let descriptor = descriptor("rewrite-local");
+    let catalog = CatalogHandle::new(
+        descriptor.instance_id.clone(),
+        CatalogVersion::from_bytes([6; 32]),
+    );
+    let boundary = Arc::new(crate::typed_boundary::IcebergTypedBoundary::new(
+        descriptor,
+        lake.control.binding_key().incarnation,
+        catalog,
+        crate::typed_read::HiveTransactionHandle::new(true, [1; 16]),
+        lake.runtime.clone(),
+    ));
+    let factory = crate::typed_boundary::IcebergTypedRequestControlFactory::new(boundary);
+    let control = factory
+        .for_planning(&ConnectorPlanningContext::try_from_request(request_context()).unwrap())
+        .unwrap();
+    let metadata = control.metadata();
+    let split_manager = control.splits();
+    let session = ConnectorSession::try_new(
+        "rewrite-test",
+        "user",
+        "UTC",
+        "en_US",
+        std::time::SystemTime::now(),
+    )
+    .unwrap();
+    let name = SchemaTableName::try_new("db", "t").unwrap();
+    let content = plan
+        .frozen()
+        .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
+        .unwrap();
+    let weak = Arc::downgrade(content);
+    for cohort in plan.cohorts() {
+        let ConnectorRewriteCohortRead::DeleteArtifactGroup(group) = cohort.read() else {
+            panic!("position rewrite")
+        };
+        let procedure = ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(
+            ConnectorReadFrozenRewriteGroup::from_cohort(group, cohort.group_digest()),
+        );
+        let opened = metadata
+            .get_table_execute_plan(&session, &name, procedure)
+            .unwrap()
+            .unwrap();
+        let mut source = split_manager
+            .get_splits(
+                &session,
+                &opened,
+                &[],
+                &std::collections::BTreeSet::new(),
+                &ConnectorReadConstraint::of_summary(
+                    novarocks_spi::connector::read_stack::TupleDomain::all(),
+                ),
+            )
+            .unwrap();
+        let batch = source
+            .next_batch(1, &ConnectorReadDynamicFilterSnapshot::all_complete())
+            .unwrap();
+        assert_eq!(batch.splits().len(), 1);
+        assert!(source.is_finished());
+        source.close().unwrap();
+        assert_eq!(lake.inventory(), before);
+    }
+    let group = match plan.cohorts()[0].read() {
+        ConnectorRewriteCohortRead::DeleteArtifactGroup(g) => g,
+        _ => unreachable!(),
+    };
+    for case in 0..8 {
+        let mut owner = lake.control.binding_key().clone();
+        let mut private = content.as_ref().clone();
+        let mut op = group.operation_id();
+        let mut digest = group.artifact_digest();
+        let mut group_digest = plan.cohorts()[0].group_digest();
+        match case {
+            0 => owner.instance_id = ConnectorInstanceId::parse("foreign").unwrap(),
+            1 => {}
+            2 => op = novarocks_spi::connector::ConnectorWriteOperationId::new(),
+            3 => digest = [255; 32],
+            4 => group_digest = [255; 32],
+            5 => private.artifact.table_uuid = "different".to_string(),
+            6 => private.artifact.schema_id += 1,
+            7 => private.artifact.base_snapshot_id = None,
+            _ => unreachable!(),
+        }
+        let payload = if case == 1 {
+            ConnectorProcessLocalPayload::new(owner, Arc::new(()))
+        } else {
+            ConnectorProcessLocalPayload::new(owner, Arc::new(private))
+        };
+        let wrong = ConnectorFrozenRewriteGroup::try_new("db", "t", op, digest, payload).unwrap();
+        let error = metadata
+            .get_table_execute_plan(
+                &session,
+                &name,
+                ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(
+                    ConnectorReadFrozenRewriteGroup::from_cohort(&wrong, group_digest),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            if case < 5 {
+                ConnectorErrorKind::Internal
+            } else {
+                ConnectorErrorKind::InvalidRequest
+            },
+            "case {case}: {error}"
+        );
+        assert_eq!(lake.inventory(), before);
+    }
+    drop(plan);
+    assert!(
+        weak.upgrade().is_none(),
+        "read and split scopes must release content after their actual exit"
+    );
 }

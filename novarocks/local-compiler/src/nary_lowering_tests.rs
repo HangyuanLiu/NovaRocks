@@ -496,9 +496,9 @@ fn ordered_nullable_nary_three_and_wide_320_lower_into_one_intrinsic_definition_
                 else {
                     panic!("Boolean result")
                 };
-                assert_eq!(ty.data_type, DataType::Boolean);
-                assert!(ty.nullable);
-                assert_eq!(ty.logical_type, ValueLogicalType::Physical);
+                assert_eq!(ty.data_type(), &DataType::Boolean);
+                assert!(ty.nullable());
+                assert_eq!(ty.logical_type(), ValueLogicalType::Physical);
                 assert_eq!(program.graph().nodes().len(), 3);
                 assert_eq!(program.provenance().operators().len(), 3);
                 assert!(matches!(
@@ -598,6 +598,7 @@ fn a_frozen_function_call_cannot_be_attached_to_a_physical_nary_intrinsic() {
             &fixture.fragment,
             &uses,
             vec![FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,

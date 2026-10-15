@@ -199,7 +199,7 @@ fn fresh_and_frozen_keep_exact_full_types_nullable_policy_and_selected_arc() {
                     ValueLogicalType::Json,
                 )
                 .unwrap(),
-                FunctionValueType::new(nested.clone(), nullable),
+                FunctionValueType::from_legacy_declared_projection(nested.clone(), nullable),
             ] {
                 let arguments = arguments(name, value.clone());
                 let selected = Arc::new(
@@ -413,7 +413,9 @@ fn actual_arity_lambda_and_full_domain_forgery_are_rejected() {
     );
     let mut lambda = arguments.clone();
     lambda[1] = FunctionArgument::Lambda {
-        parameter_types: Box::new([]),
+        parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+            Box::new([]),
+        ),
         result_type: FunctionValueType::new(DataType::Utf8, true),
     };
     assert!(
@@ -422,10 +424,13 @@ fn actual_arity_lambda_and_full_domain_forgery_are_rejected() {
             .is_err()
     );
     let mut wrong = selected.clone();
-    wrong.argument_types[1] = FunctionArgumentType::Value(
+    let mut revised = wrong.argument_types.to_vec();
+    revised[1] = FunctionArgumentType::Value(
         FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
             .unwrap(),
     );
+    wrong.argument_types =
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(revised.into_boxed_slice());
     assert!(
         owner
             .validate_selected(&wrong, request(&arguments), crate::binding_test_control())

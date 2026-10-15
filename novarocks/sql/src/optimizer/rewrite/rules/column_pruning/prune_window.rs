@@ -254,8 +254,8 @@ mod tests {
                 .iter()
                 .map(|column| ColumnDef {
                     name: column.name.clone(),
-                    data_type: column.value_type.data_type.clone(),
-                    nullable: column.value_type.nullable,
+                    data_type: column.value_type.data_type().clone(),
+                    nullable: column.value_type.nullable(),
                     write_default: None,
                     logical_type: None,
                 })

@@ -473,19 +473,12 @@ pub(crate) fn plan_distributed_rewrite_branches(
             IcebergWriteFlavor::DistributedRewritePositionDeletes
         }
     };
-    // A rewrite that found nothing to rewrite still seals one branch: the
-    // session has to exist so it can terminate, and its empty prepared set is
-    // what makes it a no-op rather than a failure. Its frozen input is empty
-    // for the same reason, and the branch count stays one per input.
-    let empty = [IcebergFrozenRewriteBranch {
-        group: IcebergFrozenRewriteGroupV1::default(),
-        delete_targets: Vec::new(),
-    }];
-    let groups = if groups.is_empty() {
-        &empty[..]
-    } else {
-        groups
-    };
+    if groups.is_empty() {
+        return Err(ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Internal,
+            "Iceberg distributed rewrite requires non-empty frozen groups",
+        ));
+    }
     let rewrite_inputs = groups
         .iter()
         .map(|branch| frozen_rewrite_branch_input(shape, &branch.group))

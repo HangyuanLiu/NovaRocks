@@ -46,7 +46,7 @@ impl AnyValueKernel {
         else {
             unreachable!("validated result")
         };
-        &output.data_type
+        output.data_type()
     }
     fn build<'s, I>(
         &self,
@@ -302,6 +302,42 @@ pub(super) fn supported(
         _ => false,
     })
 }
+/// Compare the original nullable result/state law against complete borrowed
+/// bindings. Only the source root NULL is replaced; every child promise,
+/// nominal domain and exact physical layout remains part of the comparison.
+pub(super) fn matches_nullable_source(
+    source: &FunctionValueType,
+    actual: &FunctionValueType,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<bool, KernelFailure> {
+    work.step().map_err(compile_failure)?;
+    if !actual.nullable() {
+        return Ok(false);
+    }
+    source.same_physical_binding_ignoring_root_nullability_observed(actual, || {
+        work.step().map_err(compile_failure)
+    })
+}
+
+/// The fixed Binary state is the same canonical recipe used by the aggregate
+/// type author. This comparison owns neither an expected FVT nor a layout.
+pub(super) fn matches_nullable_binary(
+    actual: &FunctionValueType,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<bool, KernelFailure> {
+    crate::aggregate_types::AggregateTypeRecipe::Scalar(DataType::Binary)
+        .matches_value_observed(
+            actual.typed_binding().borrowed(),
+            true,
+            novarocks_type_contract::ValueLogicalType::Physical,
+            work,
+        )
+        .map_err(|error| match error {
+            FunctionBindingError::Control(cause) => compile_failure(cause),
+            _ => invalid("aggregate canonical Binary comparison failed"),
+        })
+}
+
 pub(super) fn validate_contract(
     contract: &AggregateCallContract,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
@@ -313,23 +349,18 @@ pub(super) fn validate_contract(
     let FunctionResultType::Scalar(output) = &contract.call().selected().result_type else {
         return Err(invalid("any_value requires a scalar result"));
     };
-    if !output.nullable || !supported(&source.data_type, work)? {
+    if !output.nullable() || !supported(source.data_type(), work)? {
         return Err(invalid(&format!(
             "{} has no installed nullable any_value input profile for {:?}",
             contract.call().function_id().as_str(),
             source
         )));
     }
-    let mut expected_value = source.clone();
-    // The existing resolver preserves the carrier/logical facts and explicitly
-    // assigns nullable result/state to represent empty groups.
-    expected_value.nullable = true;
-    if !expected_value
-        .exactly_equals_observed::<KernelFailure>(output, || work.step().map_err(compile_failure))?
-        || !expected_value
-            .exactly_equals_observed::<KernelFailure>(contract.intermediate_type(), || {
-                work.step().map_err(compile_failure)
-            })?
+    // The original result author changes only root NULL for empty groups.
+    // Borrow every semantic child and layout fact instead of publishing a
+    // nullable expected node that preparation immediately discards.
+    if !matches_nullable_source(source, output, work)?
+        || !matches_nullable_source(source, contract.intermediate_type(), work)?
     {
         return Err(invalid(
             "any_value selected source, result and intermediate must be the same exact value type",
@@ -507,6 +538,135 @@ mod failure_tests {
             contract: handle.contract().clone(),
         }
     }
+    #[test]
+    fn borrowed_prepare_preserves_complete_nullable_source_and_fixed_state() {
+        let source = FunctionValueType::new(
+            DataType::Struct(Fields::from(vec![Field::new(
+                "value",
+                DataType::Utf8,
+                false,
+            )])),
+            false,
+        );
+        // The genuine installed owner is still prepared from the original
+        // full source. The borrowed checker sees its actual final/state ports.
+        let prepared = kernel(source.clone());
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            &Compile,
+            CompilePhase::FunctionSpecialization,
+        )
+        .unwrap();
+        validate_contract(&prepared.contract, &mut work).unwrap();
+        assert!(
+            matches_nullable_source(&source, prepared.contract.final_type(), &mut work).unwrap()
+        );
+        assert!(!matches_nullable_source(&source, &source, &mut work).unwrap());
+        let wrong_child_null = FunctionValueType::new(
+            DataType::Struct(Fields::from(vec![Field::new(
+                "value",
+                DataType::Utf8,
+                true,
+            )])),
+            true,
+        );
+        assert!(!matches_nullable_source(&source, &wrong_child_null, &mut work).unwrap());
+        let json = FunctionValueType::try_with_logical_type(
+            DataType::Utf8,
+            false,
+            novarocks_type_contract::ValueLogicalType::Json,
+        )
+        .unwrap();
+        let text = FunctionValueType::new(DataType::Utf8, true);
+        assert!(!matches_nullable_source(&json, &text, &mut work).unwrap());
+        let json_child =
+            super::super::signature::declared_struct(vec![("value".into(), json)], false).unwrap();
+        let text_child =
+            super::super::signature::declared_struct(vec![("value".into(), text)], true).unwrap();
+        assert_eq!(json_child.data_type(), text_child.data_type());
+        assert!(!matches_nullable_source(&json_child, &text_child, &mut work).unwrap());
+        assert!(
+            matches_nullable_binary(&FunctionValueType::new(DataType::Binary, true), &mut work)
+                .unwrap()
+        );
+        assert!(
+            !matches_nullable_binary(&FunctionValueType::new(DataType::Binary, false), &mut work)
+                .unwrap()
+        );
+        let opaque = FunctionValueType::try_with_logical_type(
+            DataType::Binary,
+            true,
+            novarocks_type_contract::ValueLogicalType::Percentile,
+        )
+        .unwrap();
+        assert!(!matches_nullable_binary(&opaque, &mut work).unwrap());
+        work.finish().unwrap();
+    }
+
+    #[test]
+    fn borrowed_prepare_complete_comparison_keeps_three_primary_causes_without_tail() {
+        struct Observe {
+            trace: Mutex<Vec<u32>>,
+            refusal: Option<(usize, CompileControlError)>,
+        }
+        impl PureCompileControl for Observe {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                let mut trace = self.trace.lock().unwrap();
+                let at = trace.len();
+                if let Some((stop, _)) = &self.refusal {
+                    assert!(at <= *stop, "callback after original preparation refusal");
+                }
+                trace.push(units);
+                match &self.refusal {
+                    Some((stop, cause)) if *stop == at => Err(cause.clone()),
+                    _ => Ok(()),
+                }
+            }
+        }
+        let source = FunctionValueType::new(
+            DataType::Struct(Fields::from(
+                (0..320)
+                    .map(|index| Field::new(format!("field{index}"), DataType::Utf8, false))
+                    .collect::<Vec<_>>(),
+            )),
+            false,
+        );
+        let target = source.with_nullable(true).unwrap();
+        let compare = |control: &Observe| {
+            let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+                control,
+                CompilePhase::FunctionSpecialization,
+            )
+            .map_err(compile_failure)?;
+            let same = matches_nullable_source(&source, &target, &mut work)?;
+            work.finish().map_err(compile_failure)?;
+            Ok::<_, KernelFailure>(same)
+        };
+        let success = Observe {
+            trace: Mutex::new(Vec::new()),
+            refusal: None,
+        };
+        assert!(compare(&success).unwrap());
+        let trace = success.trace.lock().unwrap().clone();
+        assert!(trace.iter().any(|units| *units == 256));
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for stop in 0..trace.len() {
+                let control = Observe {
+                    trace: Mutex::new(Vec::new()),
+                    refusal: Some((stop, cause.clone())),
+                };
+                assert_eq!(
+                    compare(&control).unwrap_err(),
+                    compile_failure(cause.clone())
+                );
+                assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
+            }
+        }
+    }
+
     fn nested() -> (FunctionValueType, ArrayRef) {
         let ty = DataType::Struct(Fields::from(vec![
             Field::new("first", DataType::Utf8, false),
@@ -521,7 +681,10 @@ mod failure_tests {
             &mut ScalarWork::new(None),
         )
         .unwrap();
-        (FunctionValueType::new(ty, false), values)
+        (
+            FunctionValueType::from_legacy_declared_projection(ty, false),
+            values,
+        )
     }
     fn update(
         kernel: &AnyValueKernel,

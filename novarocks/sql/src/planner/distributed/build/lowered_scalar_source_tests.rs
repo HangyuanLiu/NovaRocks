@@ -106,8 +106,8 @@ fn emission_plan(expression: TypedExpr) -> PhysicalPlanNode {
     let mut output = column(
         71,
         "source_result",
-        expression.value_type.data_type.clone(),
-        expression.value_type.nullable,
+        expression.value_type.data_type().clone(),
+        expression.value_type.nullable(),
     );
     output.value_type = expression.value_type.clone();
     PhysicalPlanNode {

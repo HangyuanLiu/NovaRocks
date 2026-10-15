@@ -60,8 +60,8 @@ fn native_bitnot_sql_before_actual_project_file_uses_only_signed_bigint_source()
     assert!(
         observed
             .iter()
-            .all(|ty| ty.logical_type == ValueLogicalType::Physical
-                && ty.data_type == DataType::Int64)
+            .all(|ty| ty.logical_type() == ValueLogicalType::Physical
+                && *ty.data_type() == DataType::Int64)
     );
     let input: ArrayRef = Arc::new(Int64Array::from(vec![-1, 0, 1, 1024]));
     assert_eq!(

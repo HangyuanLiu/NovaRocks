@@ -150,7 +150,6 @@ message IcebergColumnHandle {
   bool nullable = 5;
   optional string comment = 6;
   optional string scalar_integer_domain = 7;
-  optional string nominal_read_domain = 8;
 }
 
 message HiveTransactionHandle {
@@ -203,7 +202,7 @@ message IcebergTableHandle {
   optional IcebergReadDomain read_domain = 15;
   map<int32, string> scalar_integer_domains = 16;
   optional IcebergCowSourceProof frozen_cow_source = 17;
-  map<int32, string> nominal_read_domains = 18;
+  map<int32, string> nominal_declarations = 18;
 }
 
 message TableChangesFunctionHandle {
@@ -225,6 +224,7 @@ message IcebergChangeWindowHandle {
   map<int32, string> partition_spec_jsons = 7;
   optional IcebergReadDomain from_read_domain = 8;
   optional IcebergReadDomain to_read_domain = 9;
+  map<int32, string> nominal_declarations = 10;
 }
 
 enum IcebergSystemTableType {
@@ -265,7 +265,7 @@ message IcebergOptimizeHandle {
 }
 
 message IcebergRewriteArtifactContentId {
-  string artifact_location = 1;
+  bytes operation_id = 1;
   string artifact_digest_hex = 2;
 }
 

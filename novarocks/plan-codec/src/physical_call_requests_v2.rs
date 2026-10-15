@@ -30,10 +30,17 @@ use std::fmt;
 
 mod encode;
 mod read;
+#[cfg(test)]
 pub(crate) use encode::encode_call_requests_in;
+pub(crate) use encode::encode_source_policy;
 pub use encode::{PreparedCallRequestsEncode, encode_call_requests, prepare_call_requests_encode};
 pub use encode::{prepare_call_requests_encode_in, prepare_call_requests_encode_with_host_in};
-pub use read::{PreparedCallRequestsDecode, decode_call_requests, prepare_call_requests_decode};
+pub use read::{
+    CallRequestTypeOwner, DecodedCallRequests, PreparedCallRequestsDecode, decode_call_requests,
+    decode_call_requests_with_creator_in, prepare_call_requests_decode,
+    prepare_call_requests_decode_input_derived_with_creator_in,
+    prepare_call_requests_decode_with_creator_in,
+};
 pub(crate) use read::{decode_call_requests_in, prepare_call_requests_decode_in};
 
 /// IDs name exact complete FVT roots in the same emitted type table. They are

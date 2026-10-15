@@ -17,7 +17,10 @@
 
 use super::*;
 use crate::*;
-use arrow_array::{DictionaryArray, Int32Array, StringArray, types::Int8Type};
+use arrow_array::{
+    DictionaryArray, Int32Array, StringArray,
+    types::{Int8Type, Int32Type},
+};
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
     EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, FunctionInstanceState,
@@ -76,7 +79,7 @@ fn context() -> ExpressionEffectContext {
     }
 }
 fn ty(nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(arrow_schema::DataType::Int64, nullable)
+    FunctionValueType::from_legacy_declared_projection(arrow_schema::DataType::Int64, nullable)
 }
 struct Fixture {
     catalog: PureEngineFunctionCatalog,
@@ -243,6 +246,274 @@ fn apply(kernel: &CountKernel, args: &[EvaluatedArgument<'_>], selection: Select
         call.update_next(&mut state, &ctrl).unwrap();
     }
     state
+}
+
+fn apply_typed(
+    kernel: &CountKernel,
+    args: &[EvaluatedArgument<'_>],
+    sources: &[&FunctionValueType],
+    selection: Selection<'_>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<i64, KernelFailure> {
+    let handle = PreparedAggregateHandle::from_typed(
+        Arc::new(CountKernel {
+            contract: Arc::clone(&kernel.contract),
+        }),
+        &CompileControl::default(),
+    )?;
+    let mut storage = Storage([MaybeUninit::uninit(); 8]);
+    let mut states = [handle.initialize_in(&mut storage.0, &RuntimeControl::default())?];
+    let input = SelectedAggregateUpdateInput::try_new_with_typed_source_lookup(
+        handle.contract().as_ref(),
+        selection,
+        args,
+        &[],
+        |ordinal| {
+            sources
+                .get(ordinal)
+                .copied()
+                .ok_or_else(|| crate::kernel_control::invalid("missing typed test source ordinal"))
+        },
+        |ordinal| handle.argument_encoding(ordinal),
+        control,
+    )?;
+    let mapping = vec![0; selection.len()];
+    let mut invocation = handle.prepare_update_batch(&mut states, &mapping, input, control)?;
+    invocation.run(control)?;
+    drop(invocation);
+    Ok(result(&handle.emit(&states, &[0], 1, control)?)[0])
+}
+
+#[test]
+fn installed_aggregate_source_lookup_keeps_missing_ordinal_and_control_first_causes() {
+    let source = FunctionValueType::new(arrow_schema::DataType::Utf8, true);
+    let kernel = Fixture::new(&[source.clone()], DecimalOverflowPolicy::OutputNull)
+        .kernel(AggregateKernelPhase::Single);
+    let array: ArrayRef = Arc::new(StringArray::from(vec!["x"]));
+    let args = [EvaluatedArgument::Column(&array)];
+    let original =
+        KernelFailure::Operational(KernelDiagnostic::new("missing original source ordinal"));
+    let result = SelectedAggregateUpdateInput::try_new_with_typed_source_lookup(
+        kernel.contract.as_ref(),
+        Selection::all(1),
+        &args,
+        &[],
+        |ordinal| {
+            assert_eq!(ordinal, 0);
+            Err(original.clone())
+        },
+        |_| panic!("encoding lookup after source refusal"),
+        &RuntimeControl::default(),
+    );
+    assert_eq!(result.unwrap_err(), original);
+    let result = SelectedAggregateUpdateInput::try_new_with_typed_source_lookup(
+        kernel.contract.as_ref(),
+        Selection::all(1),
+        &args,
+        &[],
+        |_| Ok(&source),
+        |_| Err(original.clone()),
+        &RuntimeControl::default(),
+    );
+    assert_eq!(result.unwrap_err(), original);
+    let control = RuntimeControl {
+        trace: Mutex::new(Vec::new()),
+        refusal: Some((0, KernelFailure::Cancelled)),
+    };
+    let result = SelectedAggregateUpdateInput::try_new_with_typed_source_lookup(
+        kernel.contract.as_ref(),
+        Selection::all(1),
+        &args,
+        &[],
+        |_| panic!("source lookup after original control refusal"),
+        |_| panic!("encoding lookup after original control refusal"),
+        &control,
+    );
+    assert_eq!(result.unwrap_err(), KernelFailure::Cancelled);
+    assert_eq!(*control.trace.lock().unwrap(), [0]);
+}
+
+#[test]
+fn aggregate_installed_owner_is_adapter_identity_even_for_same_contract_and_kernel() {
+    let kernel = Arc::new(
+        Fixture::new(&[ty(true)], DecimalOverflowPolicy::OutputNull)
+            .kernel(AggregateKernelPhase::Single),
+    );
+    let first =
+        PreparedAggregateHandle::from_typed(Arc::clone(&kernel), &CompileControl::default())
+            .unwrap();
+    let cloned = first.clone();
+    assert!(first.same_installed_owner(&cloned));
+    let rewrapped =
+        PreparedAggregateHandle::from_typed(Arc::clone(&kernel), &CompileControl::default())
+            .unwrap();
+    assert!(Arc::ptr_eq(first.contract(), rewrapped.contract()));
+    assert!(!first.same_installed_owner(&rewrapped));
+    assert!(!rewrapped.same_installed_owner(&cloned));
+}
+
+#[test]
+fn installed_count_dictionary_uses_explicit_typed_source_and_selected_logical_nulls() {
+    let source = FunctionValueType::new(arrow_schema::DataType::Utf8, true);
+    let fixture = Fixture::new(&[source.clone()], DecimalOverflowPolicy::OutputNull);
+    let kernel = fixture.kernel(AggregateKernelPhase::Single);
+    let values: ArrayRef = Arc::new(StringArray::from(vec![None, Some("x"), None]));
+    let dictionary: ArrayRef = Arc::new(
+        DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![Some(0), Some(1), None, Some(1)]),
+            values,
+        )
+        .unwrap(),
+    );
+    let plain: ArrayRef = Arc::new(StringArray::from(vec![None, Some("x"), None, Some("x")]));
+    let selection = Selection::all(4);
+    assert_eq!(
+        apply(&kernel, &[EvaluatedArgument::Column(&plain)], selection),
+        2
+    );
+    assert_eq!(
+        apply_typed(
+            &kernel,
+            &[EvaluatedArgument::Column(&dictionary)],
+            &[&source],
+            selection,
+            &RuntimeControl::default()
+        )
+        .unwrap(),
+        2
+    );
+    assert!(
+        SelectedAggregateUpdateInput::try_new(
+            kernel.contract.as_ref(),
+            selection,
+            &[EvaluatedArgument::Column(&dictionary)],
+            &[],
+            &RuntimeControl::default()
+        )
+        .is_err()
+    );
+    let prepared = fixture
+        .prepare(AggregateKernelPhase::Single, &CompileControl::default())
+        .unwrap();
+    let PreparedPureKernel::Aggregate(handle) = prepared.prepared() else {
+        panic!("installed COUNT")
+    };
+    let token = handle.argument_encoding(0).unwrap();
+    assert!(token.accepts_root_int32_string_dictionary());
+    assert!(handle.argument_encoding(1).is_err());
+    assert!(
+        SelectedAggregateUpdateInput::try_new_with_typed_sources(
+            kernel.contract.as_ref(),
+            selection,
+            &[EvaluatedArgument::Column(&dictionary)],
+            &[],
+            &[&source],
+            &[],
+            &[token],
+            &RuntimeControl::default()
+        )
+        .is_err(),
+        "other exact call token must be refused"
+    );
+    let wrong = FunctionValueType::try_with_logical_type(
+        arrow_schema::DataType::Utf8,
+        true,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    assert!(
+        apply_typed(
+            &kernel,
+            &[EvaluatedArgument::Column(&dictionary)],
+            &[&wrong],
+            selection,
+            &RuntimeControl::default()
+        )
+        .is_err(),
+        "carrier cannot erase nominal source semantics"
+    );
+}
+
+#[test]
+fn installed_count_dictionary_refuses_unsupported_encoding_and_original_control_prefix() {
+    let source = FunctionValueType::new(arrow_schema::DataType::Utf8, true);
+    let kernel = Fixture::new(&[source.clone()], DecimalOverflowPolicy::OutputNull)
+        .kernel(AggregateKernelPhase::Single);
+    let values: ArrayRef = Arc::new(StringArray::from(vec![None, Some("x")]));
+    let dictionary: ArrayRef = Arc::new(
+        DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![Some(0), Some(1), None]),
+            Arc::clone(&values),
+        )
+        .unwrap(),
+    );
+    let selection = Selection::all(3);
+    let control = RuntimeControl::default();
+    apply_typed(
+        &kernel,
+        &[EvaluatedArgument::Column(&dictionary)],
+        &[&source],
+        selection,
+        &control,
+    )
+    .unwrap();
+    let trace = control.trace.lock().unwrap().clone();
+    for at in 0..trace.len() {
+        let cause = crate::kernel_control::invalid("original refusal");
+        let control = RuntimeControl {
+            trace: Mutex::new(Vec::new()),
+            refusal: Some((at, cause.clone())),
+        };
+        assert_eq!(
+            apply_typed(
+                &kernel,
+                &[EvaluatedArgument::Column(&dictionary)],
+                &[&source],
+                selection,
+                &control
+            )
+            .unwrap_err(),
+            cause
+        );
+        assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+    }
+    let int8: ArrayRef = Arc::new(
+        DictionaryArray::<Int8Type>::try_new(
+            arrow_array::Int8Array::from(vec![Some(0), Some(1), None]),
+            values,
+        )
+        .unwrap(),
+    );
+    assert!(
+        apply_typed(
+            &kernel,
+            &[EvaluatedArgument::Column(&int8)],
+            &[&source],
+            selection,
+            &RuntimeControl::default()
+        )
+        .is_err()
+    );
+    let numeric_source = FunctionValueType::new(arrow_schema::DataType::Int64, true);
+    let numeric_kernel = Fixture::new(&[numeric_source.clone()], DecimalOverflowPolicy::OutputNull)
+        .kernel(AggregateKernelPhase::Single);
+    let numeric: ArrayRef = Arc::new(
+        DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![Some(0), Some(1), None]),
+            Arc::new(Int64Array::from(vec![1, 2])),
+        )
+        .unwrap(),
+    );
+    assert!(
+        apply_typed(
+            &numeric_kernel,
+            &[EvaluatedArgument::Column(&numeric)],
+            &[&numeric_source],
+            selection,
+            &RuntimeControl::default()
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -420,16 +691,22 @@ fn aggregate_count_independent_count_star_nullable_encoded_and_selected_addresse
     let dictionary: ArrayRef =
         Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap());
     let f = Fixture::new(
-        &[FunctionValueType::new(dictionary.data_type().clone(), true)],
+        &[FunctionValueType::from_legacy_declared_projection(
+            dictionary.data_type().clone(),
+            true,
+        )],
         DecimalOverflowPolicy::OutputNull,
     );
-    assert_eq!(
-        apply(
-            &f.kernel(AggregateKernelPhase::Single),
+    assert!(
+        SelectedAggregateUpdateInput::try_new(
+            &f.kernel(AggregateKernelPhase::Single).contract,
+            Selection::all(5),
             &[EvaluatedArgument::Column(&dictionary)],
-            Selection::all(5)
-        ),
-        4
+            &[],
+            &RuntimeControl::default(),
+        )
+        .is_err(),
+        "strict input does not promise an unsupported Int8 dictionary path"
     );
     let pool = ConstantPool::try_new(
         Arc::new(ty(true).try_to_field("original-count-source").unwrap()),
@@ -663,7 +940,10 @@ fn aggregate_count_exact_binding_distinct_order_state_and_required_children_reje
             phase: AggregateKernelPhase::Final,
             distinct: false,
             order_keys: Arc::from([]),
-            state_input_type: Some(FunctionValueType::new(arrow_schema::DataType::Int32, true)),
+            state_input_type: Some(FunctionValueType::from_legacy_declared_projection(
+                arrow_schema::DataType::Int32,
+                true,
+            )),
         },
     };
     assert!(
@@ -678,7 +958,7 @@ fn aggregate_count_exact_binding_distinct_order_state_and_required_children_reje
             .is_err()
     );
 
-    let metadata_type = FunctionValueType::new(
+    let metadata_type = FunctionValueType::from_legacy_declared_projection(
         arrow_schema::DataType::List(Arc::new(
             arrow_schema::Field::new("item", arrow_schema::DataType::Int64, true)
                 .with_metadata([("source".into(), "original".into())].into()),
@@ -691,7 +971,7 @@ fn aggregate_count_exact_binding_distinct_order_state_and_required_children_reje
             .prepare(AggregateKernelPhase::Single, &CompileControl::default())
             .is_ok()
     );
-    let changed_type = FunctionValueType::new(
+    let changed_type = FunctionValueType::from_legacy_declared_projection(
         arrow_schema::DataType::List(Arc::new(
             arrow_schema::Field::new("item", arrow_schema::DataType::Int64, true)
                 .with_metadata([("source".into(), "different".into())].into()),
@@ -713,7 +993,8 @@ fn aggregate_count_exact_binding_distinct_order_state_and_required_children_reje
                 metadata_fixture.options(AggregateKernelPhase::Single),
                 &CompileControl::default()
             )
-            .is_err()
+            .is_ok(),
+        "source annotations are not complete execution value identity"
     );
     let kernel = fixture.kernel(AggregateKernelPhase::Single);
     let ctrl = RuntimeControl::default();
@@ -1079,4 +1360,173 @@ fn aggregate_count_actual_erased_emission_all_callbacks_keep_seven_original_caus
             }
         }
     }
+}
+
+// This owner deliberately retains the default Plain capability even though its
+// semantic contract and row implementation are the same as COUNT.
+#[derive(Debug)]
+struct PlainCount(CountKernel);
+impl PreparedAggregateKernel for PlainCount {
+    type State = i64;
+    type PreparedUpdateBatch<'batch> = SelectedAggregateUpdateInput<'batch, 'batch>;
+    type PreparedMergeBatch<'batch> = SelectedAggregateMergeInput<'batch, 'batch>;
+    fn contract(&self) -> &Arc<AggregateCallContract> {
+        self.0.contract()
+    }
+    fn memory_policy(&self) -> AggregateStateMemoryPolicy {
+        self.0.memory_policy()
+    }
+    fn retained_bytes(&self, state: &i64) -> usize {
+        self.0.retained_bytes(state)
+    }
+    fn create_state(&self, control: &dyn KernelEvaluationControl) -> Result<i64, KernelFailure> {
+        self.0.create_state(control)
+    }
+    fn prepare_update<'batch>(
+        &'batch self,
+        input: SelectedAggregateUpdateInput<'batch, 'batch>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self::PreparedUpdateBatch<'batch>, KernelFailure> {
+        self.0.prepare_update(input, control)
+    }
+    fn update_row<'batch>(
+        &self,
+        state: &mut i64,
+        input: &Self::PreparedUpdateBatch<'batch>,
+        ordinal: usize,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<(), KernelFailure> {
+        self.0.update_row(state, input, ordinal, control)
+    }
+    fn prepare_merge<'batch>(
+        &'batch self,
+        input: SelectedAggregateMergeInput<'batch, 'batch>,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<Self::PreparedMergeBatch<'batch>, KernelFailure> {
+        self.0.prepare_merge(input, control)
+    }
+    fn merge_row<'batch>(
+        &self,
+        state: &mut i64,
+        input: &Self::PreparedMergeBatch<'batch>,
+        ordinal: usize,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<(), KernelFailure> {
+        self.0.merge_row(state, input, ordinal, control)
+    }
+    fn build_intermediate<'state, I>(
+        &self,
+        states: I,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<ArrayRef, KernelFailure>
+    where
+        Self::State: 'state,
+        I: ExactSizeIterator<Item = &'state Self::State>,
+    {
+        self.0.build_intermediate(states, control)
+    }
+    fn build_final<'state, I>(
+        &self,
+        states: I,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<ArrayRef, KernelFailure>
+    where
+        Self::State: 'state,
+        I: ExactSizeIterator<Item = &'state Self::State>,
+    {
+        self.0.build_final(states, control)
+    }
+}
+#[test]
+fn installed_dictionary_proof_cannot_cross_rewrapped_or_plain_adapter_at_actual_frame() {
+    let source = FunctionValueType::new(arrow_schema::DataType::Utf8, true);
+    let kernel = Arc::new(
+        Fixture::new(&[source.clone()], DecimalOverflowPolicy::OutputNull)
+            .kernel(AggregateKernelPhase::Single),
+    );
+    let first =
+        PreparedAggregateHandle::from_typed(Arc::clone(&kernel), &CompileControl::default())
+            .unwrap();
+    let second =
+        PreparedAggregateHandle::from_typed(Arc::clone(&kernel), &CompileControl::default())
+            .unwrap();
+    let plain = PreparedAggregateHandle::from_typed(
+        Arc::new(PlainCount(CountKernel {
+            contract: Arc::clone(kernel.contract()),
+        })),
+        &CompileControl::default(),
+    )
+    .unwrap();
+    let array: ArrayRef = Arc::new(
+        DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0, 1]),
+            Arc::new(StringArray::from(vec![Some("x"), None])),
+        )
+        .unwrap(),
+    );
+    let args = [EvaluatedArgument::Column(&array)];
+    let control = RuntimeControl::default();
+    let input = SelectedAggregateUpdateInput::try_new_with_typed_source_lookup(
+        first.contract(),
+        Selection::all(2),
+        &args,
+        &[],
+        |_| Ok(&source),
+        |ordinal| first.argument_encoding(ordinal),
+        &control,
+    )
+    .unwrap();
+    assert!(
+        !plain
+            .argument_encoding(0)
+            .unwrap()
+            .accepts_root_int32_string_dictionary()
+    );
+    // Naked typed-kernel invocation is not the installed adapter entrance.
+    assert!(matches!(
+        AggregateUpdateInvocation::try_new(kernel.as_ref(), input, &control),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
+    for foreign in [&second, &plain] {
+        assert!(Arc::ptr_eq(first.contract(), foreign.contract()));
+        let mut storage = Storage([MaybeUninit::uninit(); 8]);
+        let mut states = [foreign.initialize_in(&mut storage.0, &control).unwrap()];
+        let outcome =
+            foreign.prepare_update_batch_evaluation(&mut states, &[0, 0], input, None, &control);
+        assert!(matches!(
+            outcome,
+            Err(EvaluationFailure::Kernel(KernelFailure::InvalidProgram(_)))
+        ));
+        drop(outcome);
+        assert_eq!(
+            result(&foreign.emit(&states, &[0], 1, &control).unwrap()),
+            [0]
+        );
+    }
+    let cloned = first.clone();
+    let mut storage = Storage([MaybeUninit::uninit(); 8]);
+    let mut states = [cloned.initialize_in(&mut storage.0, &control).unwrap()];
+    let mut invocation = cloned
+        .prepare_update_batch_evaluation(&mut states, &[0, 0], input, None, &control)
+        .unwrap();
+    invocation.run(&control).unwrap();
+    drop(invocation);
+    assert_eq!(
+        result(&cloned.emit(&states, &[0], 1, &control).unwrap()),
+        [1]
+    );
+    let raw = kernel.argument_encoding(0);
+    assert!(
+        SelectedAggregateUpdateInput::try_new_with_typed_sources(
+            kernel.contract(),
+            Selection::all(2),
+            &args,
+            &[],
+            &[&source],
+            &[],
+            &[raw],
+            &control
+        )
+        .is_err()
+    );
 }

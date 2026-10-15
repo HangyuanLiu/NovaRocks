@@ -281,12 +281,15 @@ impl ChunkAccounting {
         state.tracker = Arc::clone(tracker);
     }
 
-    pub(super) fn try_transfer_to(&self, tracker: &Arc<MemTracker>) -> Result<(), String> {
+    pub(super) fn try_transfer_to_typed(
+        &self,
+        tracker: &Arc<MemTracker>,
+    ) -> Result<(), crate::runtime::mem_tracker::MemTrackerLimitExceeded> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if Arc::ptr_eq(&state.tracker, tracker) {
             return Ok(());
         }
-        MemTracker::try_transfer_charge(&state.tracker, tracker, state.bytes)?;
+        MemTracker::try_transfer_charge_typed(&state.tracker, tracker, state.bytes)?;
         state.tracker = Arc::clone(tracker);
         Ok(())
     }

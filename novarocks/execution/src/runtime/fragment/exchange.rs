@@ -20,8 +20,8 @@ use crate::runtime::fragment::instance::{ExchangeInputAssignments, FragmentInsta
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::exec::chunk::ChunkSchema;
 use crate::exec::fragment::program::{FragmentNodeId, FragmentProgram};
+use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionFactory};
 use crate::runtime::exchange::{ExchangeColumnBinding, ExchangeKey};
 use crate::runtime::fragment::io::{
     ExchangeReceiverKey, ExchangeReceiverPort, ExchangeReceiverRegistration,
@@ -68,6 +68,19 @@ pub(crate) struct CompiledExchangeReceivers {
     pub(crate) bindings: ExchangeBindings,
 }
 
+#[cfg(test)]
+pub(crate) fn test_receiver_creation_factory() -> Arc<dyn InputConstructionFactory> {
+    let tracker =
+        crate::runtime::mem_tracker::MemTracker::new_root("compiled receiver schema fixture");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+        crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+        tracker,
+        Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+    )
+    .unwrap()
+}
+
 /// Project a compiled program's exchange inputs into receiver registrations
 /// and pipeline bindings for one fragment instance.
 ///
@@ -82,7 +95,8 @@ pub(crate) fn materialize_compiled_exchange_receivers(
     fragment_instance_id: UniqueId,
     assignments: &ExchangeInputAssignments,
     receiver_port: Arc<dyn ExchangeReceiverPort>,
-) -> Result<CompiledExchangeReceivers, String> {
+    creation: Option<&Arc<dyn InputConstructionFactory>>,
+) -> Result<CompiledExchangeReceivers, ConstructionFailure> {
     let nodes = program.graph().nodes();
     let mut receivers = BTreeSet::new();
     let mut registrations = Vec::with_capacity(program.exchange_inputs().len());
@@ -101,7 +115,8 @@ pub(crate) fn materialize_compiled_exchange_receivers(
             return Err(format!(
                 "compiled exchange input at local node {} is not an exchange source",
                 id.index()
-            ));
+            )
+            .into());
         }
         let receiver = i32::try_from(input.receiver_node).map_err(|_| {
             format!(
@@ -112,7 +127,8 @@ pub(crate) fn materialize_compiled_exchange_receivers(
         if !receivers.insert(receiver) {
             return Err(format!(
                 "compiled exchange receiver node {receiver} is addressed by more than one source"
-            ));
+            )
+            .into());
         }
         let assignment = assignments
             .get(&FragmentNodeId::new(receiver))
@@ -127,8 +143,11 @@ pub(crate) fn materialize_compiled_exchange_receivers(
         registrations.push(ExchangeReceiverRegistration {
             key,
             expected_senders,
-            expected_chunk_schema: ChunkSchema::from_compiled_layout(node.output_layout())?,
+            expected_chunk_schema: creation
+                .ok_or(ConstructionFailure::MissingOwner)?
+                .create_compiled_chunk_schema(node.output_layout())?,
             column_binding: ExchangeColumnBinding::Positional,
+            creation_factory: Arc::clone(creation.ok_or(ConstructionFailure::MissingOwner)?),
         });
         bindings.insert(
             receiver,
@@ -150,7 +169,8 @@ pub(crate) fn materialize_compiled_exchange_receivers(
         return Err(format!(
             "exchange assignment for node {} has no compiled exchange source",
             extra.get()
-        ));
+        )
+        .into());
     }
     Ok(CompiledExchangeReceivers {
         registrations,
@@ -164,7 +184,7 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::sync::Arc;
 
-    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::ExprArena;
     use crate::exec::fragment::program::{
         ExchangeInputContract, FragmentContractVersion, FragmentNodeId, FragmentProgram,
@@ -191,22 +211,21 @@ mod tests {
             arena: ExprArena::default(),
             root: ExecNode {
                 kind: ExecNodeKind::Values(ValuesNode {
-                    chunk: Chunk::default(),
+                    chunk: crate::exec::chunk::typed_fixture::columns(&[], &[], &[], Vec::new(), 0),
                     node_id: 1,
                 }),
             },
         };
-        let profile = plan
-            .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
-            .unwrap();
-        let (local, runtime) = plan
-            .into_local_program_and_bindings(
-                profile,
-                BTreeMap::new(),
-                Vec::new(),
-                novarocks_local_program::StaticSinkProgram::Noop,
-            )
-            .unwrap();
+        let profile =
+            crate::exec::chunk::typed_fixture::profile(&plan, NonZeroUsize::new(1).unwrap(), None);
+        let (local, runtime) = crate::exec::chunk::typed_fixture::try_lower_with_scans(
+            plan,
+            profile,
+            BTreeMap::new(),
+            Vec::new(),
+            novarocks_local_program::StaticSinkProgram::Noop,
+        )
+        .unwrap();
         assert_eq!(runtime.scan_count(), 0);
         FragmentProgram::try_new(
             Arc::new(local),

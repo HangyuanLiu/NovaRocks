@@ -131,7 +131,7 @@ fn c16_p1_json_object_legacy_reconstruction_preserves_each_control_prefix() {
 }
 
 #[test]
-fn c16_p1_json_object_v1_wire_retains_accurate_logical_identity_refusal() {
+fn c16_p1_json_object_v1_wire_retains_accurate_logical_identity() {
     let (catalogue, original) = bound();
     let FunctionResultType::Scalar(result) = &original.selected.result_type else {
         panic!("actual scalar result")
@@ -162,13 +162,14 @@ fn c16_p1_json_object_v1_wire_retains_accurate_logical_identity_refusal() {
             None,
             &control
         ),
-        Err(PhysicalEncodeError::Invalid(
-            "bound function result: native wire v1 cannot carry explicit root logical identities"
-                .into()
-        ))
+        Ok(())
     );
-    assert!(control.seen.lock().unwrap().is_empty());
-    // Original wire rejection occurs before catalogue/control reconstruction.
+    assert_eq!(function.result_type, *result);
+    assert_eq!(result.logical_type(), novarocks_type_contract::ValueLogicalType::Json);
+    assert!(!control.seen.lock().unwrap().is_empty());
+    // The new wire preserves complete logical identity; an absent original
+    // declaration still refuses before any catalogue/control reconstruction.
+    let control = Control::default();
     let mut missing = function;
     missing.legacy_metadata = None;
     assert_eq!(

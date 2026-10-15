@@ -126,9 +126,21 @@ fn nullable(name: &str, data_type: DataType) -> Field {
     Field::new(name, data_type, true)
 }
 
-/// A `JSON` column. Arrow has no JSON type, so the crate-wide convention is a
-/// UTF-8 field tagged with the engine's logical-type metadata; that keeps the
-/// value exact and still tells the engine it is JSON rather than free text.
+/// The closed system source declaration: readable_metrics is JSON in the two
+/// actual relation authors that publish it. Other sources explicitly declare
+/// physical values, recursively, independently of generic Arrow annotations.
+pub(crate) fn system_column_domain(kind: IcebergSystemTableType, name: &str) -> ValueLogicalType {
+    if matches!(
+        kind,
+        IcebergSystemTableType::Files | IcebergSystemTableType::Entries
+    ) && name == "readable_metrics"
+    {
+        ValueLogicalType::Json
+    } else {
+        ValueLogicalType::Physical
+    }
+}
+/// Arrow library projection of the same explicit JSON source declaration.
 fn json_column(name: &str) -> Field {
     field_with_logical_type(nullable(name, DataType::Utf8), LogicalType::Json)
 }
@@ -482,18 +494,18 @@ pub(crate) fn system_column_field_for_compile(
                 );
             }
         } else {
-            work.flush()?;
-            let expected_type = FunctionValueType::try_from_field(expected)?;
-            let actual_type = FunctionValueType {
-                data_type: field.data_type().clone(),
-                nullable: field.is_nullable(),
-                logical_type: logical,
-            };
-            work.flush()?;
-            let same = expected_type
-                .same_value_domain_observed::<SystemMirrorError>(&actual_type, || {
-                    work.step().map_err(SystemMirrorError::Control)
-                })?;
+            let expected_domain = system_column_domain(kind, expected.name());
+            if logical != expected_domain {
+                return Err(invalid(
+                    "system column differs from its explicitly declared value domain",
+                )
+                .into());
+            }
+            let same = novarocks_type_contract::arrow_data_types_exact_observed::<SystemMirrorError>(
+                expected.data_type(),
+                field.data_type(),
+                || work.step().map_err(SystemMirrorError::Control),
+            )?;
             if !same {
                 return Err(invalid(
                     "system column differs from its exact Arrow source declaration",
@@ -952,6 +964,9 @@ pub fn partitions_view_schema(
         partitions_metrics_row_type(schema)?.as_ref(),
     ))))
 }
+
+mod schema_author;
+pub(crate) use schema_author::publish_read_schema;
 
 // ---------------------------------------------------------------------------
 // Frozen-metadata I/O
@@ -4650,5 +4665,91 @@ mod tests {
             .block_on(stream.close())
             .expect("closing a drained stream");
         assert_eq!(task_operations.live_operations(), 0);
+    }
+}
+
+/// Check the complete declaration supplied by the frozen system source. Generic
+/// field attributes never establish a scalar or nested value domain.
+pub(crate) fn validate_system_column_value(
+    kind: IcebergSystemTableType,
+    field: &Field,
+    binding: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), PureProviderCompileError<ConnectorError>> {
+    if field.is_nullable() != binding.nullable() {
+        return Err(invalid("system root NULL declaration differs").into());
+    }
+    system_value(
+        field.data_type(),
+        binding.value_type(),
+        system_column_domain(kind, field.name()),
+        work,
+    )
+}
+fn system_value(
+    layout: &DataType,
+    value: &novarocks_type_contract::ValueTypeRef,
+    domain: ValueLogicalType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), PureProviderCompileError<ConnectorError>> {
+    use novarocks_type_contract::ValueKind;
+    work.step()?;
+    if domain != ValueLogicalType::Physical {
+        if matches!(value.kind(), ValueKind::Nominal(actual) if *actual == domain)
+            && *layout == DataType::Utf8
+        {
+            return Ok(());
+        }
+        return Err(invalid("system nominal declaration differs from its source author").into());
+    }
+    let child = |field: &Field,
+                 value: &novarocks_type_contract::ValueTypeRef,
+                 work: &mut CompileCheckpoints<'_>| {
+        if field.is_nullable() != value.nullable() {
+            return Err(invalid("system child NULL declaration differs").into());
+        }
+        system_value(field.data_type(), value, ValueLogicalType::Physical, work)
+    };
+    match (layout, value.kind()) {
+        (DataType::Utf8, ValueKind::String) | (DataType::Binary, ValueKind::Binary) => Ok(()),
+        (layout, ValueKind::Scalar(scalar)) => {
+            let same =
+                novarocks_type_contract::arrow_data_types_exact_observed::<SystemMirrorError>(
+                    layout,
+                    scalar,
+                    || work.step().map_err(SystemMirrorError::Control),
+                )
+                .map_err(|error| match error {
+                    SystemMirrorError::Control(cause) => PureProviderCompileError::Control(cause),
+                    SystemMirrorError::Source(cause) => PureProviderCompileError::Provider(cause),
+                })?;
+            if same {
+                Ok(())
+            } else {
+                Err(invalid("system scalar declaration differs").into())
+            }
+        }
+        (DataType::List(field), ValueKind::List(value)) => child(field, value, work),
+        (DataType::Struct(fields), ValueKind::Struct(values)) if fields.len() == values.len() => {
+            for (field, value) in fields.iter().zip(values) {
+                work.step()?;
+                if field.name() != value.name() {
+                    return Err(invalid("system named child declaration differs").into());
+                }
+                child(field, value.value_type(), work)?;
+            }
+            Ok(())
+        }
+        (DataType::Map(entries, false), ValueKind::Map { key, value }) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(invalid("system map entries is not a row").into());
+            };
+            if fields.len() != 2 || entries.is_nullable() {
+                return Err(invalid("system map entries declaration differs").into());
+            }
+            child(&fields[0], key, work)?;
+            child(&fields[1], value, work)
+        }
+        _ => Err(invalid("system complete value declaration differs from source").into()),
     }
 }

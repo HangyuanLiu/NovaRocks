@@ -61,7 +61,7 @@ pub(super) fn wrap_scalar_applies(
         // Copy output-column fields before spec.output_column is moved into the LogicalApplyNode.
         let col_id = spec.output_column.column_id;
         let col_name = spec.output_column.name.clone();
-        let col_type = spec.output_column.value_type.data_type.clone();
+        let col_type = spec.output_column.value_type.data_type().clone();
         current = LogicalPlanNode::new(
             LogicalPlanKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,

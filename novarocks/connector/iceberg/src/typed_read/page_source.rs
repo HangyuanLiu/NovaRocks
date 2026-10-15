@@ -751,7 +751,6 @@ pub struct IcebergReadRelation {
     name_mapping: Option<Arc<NameMapping>>,
     effective_predicate: TupleDomain<IcebergColumnHandle>,
     scalar_integer_domains: crate::scalar_integer_domain::ScalarIntegerDomains,
-    nominal_read_domains: crate::nominal_read_domain::NominalReadDomains,
     delete_domains: super::delete_manager::DeleteDomainBindings,
 }
 
@@ -767,7 +766,6 @@ impl IcebergReadRelation {
             name_mapping: parse_name_mapping(handle.name_mapping_json())?,
             effective_predicate: handle.effective_predicate()?,
             scalar_integer_domains: handle.scalar_integer_domains().clone(),
-            nominal_read_domains: handle.nominal_read_domains().clone(),
             delete_domains: super::delete_manager::DeleteDomainBindings::Single(Arc::clone(
                 handle.read_domain().ok_or_else(|| {
                     invalid("iceberg data reader requires its pinned read domain")
@@ -790,15 +788,6 @@ impl IcebergReadRelation {
             partition_spec: handle.parse_partition_spec(partition_spec_id)?,
             name_mapping: parse_name_mapping(handle.name_mapping_json())?,
             effective_predicate: TupleDomain::all(),
-            nominal_read_domains: handle
-                .columns()
-                .iter()
-                .filter_map(|column| {
-                    column
-                        .nominal_read_domain()
-                        .map(|domain| (column.base_field_id(), domain))
-                })
-                .collect(),
             scalar_integer_domains: handle
                 .columns()
                 .iter()
@@ -887,17 +876,6 @@ fn admit_split(request: &IcebergPageSourceRequest<'_>) -> Result<AdmittedSplit, 
     }
 
     for column in request.columns {
-        if column.nominal_read_domain()
-            != request
-                .relation
-                .nominal_read_domains
-                .get(&column.base_field_id())
-                .copied()
-        {
-            return Err(invalid(
-                "Iceberg scan column nominal declaration differs from its frozen relation",
-            ));
-        }
         let declaration = request
             .relation
             .scalar_integer_domains
@@ -1959,14 +1937,6 @@ impl IcebergParquetPageSource {
                 partition_spec: self.partition_spec.clone(),
                 name_mapping: self.name_mapping.clone(),
                 effective_predicate: self.effective_predicate.clone(),
-                nominal_read_domains: self.bound_handles[..self.prefix_len]
-                    .iter()
-                    .filter_map(|column| {
-                        column
-                            .nominal_read_domain()
-                            .map(|domain| (column.base_field_id(), domain))
-                    })
-                    .collect(),
                 scalar_integer_domains: self.bound_handles[..self.prefix_len]
                     .iter()
                     .filter_map(|column| {

@@ -19,10 +19,11 @@
 //! These tests grant no Native metadata provenance or allocation capacity.
 use super::window_fixture::{Call, Shape, compile, installed_catalog, package};
 use super::*;
-use crate::runtime::fragment::ExecutionFailureCause;
+use crate::exec::chunk::ChunkSchema;
+use crate::runtime::fragment::{ExecutionFailureCause, ExecutionResult};
 use crate::runtime::preparation_memory::PreparationMemoryRefusal;
 use crate::runtime::preparation_metadata::{
-    CompiledSchemaMetadataScope, CompiledSchemaSite, PreparationMetadataFailure,
+    CompiledSchemaPreparationScope, CompiledSchemaSite, PreparationMetadataFailure,
 };
 use novarocks_local_program::StaticLayout;
 
@@ -33,17 +34,14 @@ struct Scope {
     refuse: bool,
     outputs: Vec<crate::exec::chunk::ChunkSchemaRef>,
 }
-impl CompiledSchemaMetadataScope for Scope {
-    fn materialize<B>(
+impl CompiledSchemaPreparationScope for Scope {
+    fn prepare(
         &mut self,
         program: &Arc<LocalProgram>,
         site: CompiledSchemaSite,
         layout: &StaticLayout,
-        body: B,
-    ) -> ExecutionResult<crate::exec::chunk::ChunkSchemaRef>
-    where
-        B: FnOnce() -> Result<crate::exec::chunk::ChunkSchemaRef, String>,
-    {
+        body: &mut dyn FnMut() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
         assert!(Arc::ptr_eq(program, &self.program));
         let id = match site {
             CompiledSchemaSite::AnalyticOutput(id) => {
@@ -74,9 +72,7 @@ impl CompiledSchemaMetadataScope for Scope {
             .into());
         }
         self.bodies += 1;
-        let output = body()?;
-        self.outputs.push(Arc::clone(&output));
-        Ok(output)
+        body()
     }
 }
 fn program() -> (Arc<LocalProgram>, ProgramNodeId) {
@@ -107,48 +103,63 @@ fn scope(program: &Arc<LocalProgram>, refuse: bool) -> Scope {
         outputs: Vec::new(),
     }
 }
-fn graph(program: &Arc<LocalProgram>, host: &mut Scope) -> ExecutionResult<PipelineGraph> {
-    // This is a real nonempty metadata subset. The compiled calls carry
-    // their own pure kernels; no plan-tree evaluator consumes this set.
-    let actual =
-        novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
-    let mut builder = crate::exec::expr::agg::ExecutionFunctionSetBuilder::new();
-    builder
-        .catalog_builder_mut()
-        .register(
-            actual
-                .definition("row_number", novarocks_functions::FunctionKind::Window)
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-    let functions = Arc::new(builder.seal().unwrap());
-    build_compiled_pipeline_graph_with_metadata_host(
-        program,
-        ExchangeBindings::default(),
-        ScanBindings::default(),
-        crate::runtime::fragment::CompiledWriterBindings::default(),
-        None,
-        DependencyManager::new(),
-        1,
-        Some(1),
-        functions,
+fn hosted_window_factory(
+    program: Arc<LocalProgram>,
+    node: ProgramNodeId,
+    error: Arc<RuntimeErrorState>,
+    host: &mut Scope,
+) -> ExecutionResult<Box<dyn crate::exec::pipeline::operator::Operator>> {
+    let factory = CompiledWindowProcessorFactory::try_new(program, node, error)?;
+    let mut operator = factory.create(1, 0);
+    let tracker =
+        crate::runtime::mem_tracker::MemTracker::new_root("Window schema observer fixture");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker,
         Arc::new(RuntimeErrorState::default()),
+    ));
+    crate::runtime::preparation_metadata::prepare_operator_schema_for_test(
+        operator.as_mut(),
         host,
+    )?;
+    host.outputs.push(
+        operator
+            .prepared_schema_for_test()
+            .expect("the real Window prepared its output"),
+    );
+    Ok(operator)
+}
+fn graph(
+    program: &Arc<LocalProgram>,
+    host: &mut Scope,
+) -> ExecutionResult<crate::exec::pipeline::executor::PreparedPipelineExecution> {
+    let tracker =
+        crate::runtime::mem_tracker::MemTracker::new_root("Window pipeline observer fixture");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    let state = Arc::new(crate::runtime::runtime_state::RuntimeState::new(
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(tracker),
+        Some(crate::runtime::execution_runtime::test_execution_runtime()),
+    ));
+    crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation(
+        Arc::clone(program), std::time::Duration::from_millis(10),
+        Box::new(crate::exec::operators::ResultSinkFactory::new(crate::exec::operators::ResultSinkHandle::new())),
+        ExchangeBindings::default(), ScanBindings::default(),
+        crate::runtime::fragment::CompiledWriterBindings::default(), None, None, 1, state,
+        Arc::new(crate::runtime::fragment::io::NoopFragmentEventSink), Some(host),
     )
 }
+
 #[test]
 fn analytic_schema_original_factory_borrows_exact_site_and_runs_body_once() {
     let (program, node) = program();
     let mut host = scope(&program, false);
     let error = Arc::new(RuntimeErrorState::default());
-    let factory = CompiledWindowProcessorFactory::try_new_with_metadata_host(
-        Arc::clone(&program),
-        node,
-        error,
-        &mut host,
-    )
-    .unwrap();
+    let factory = hosted_window_factory(Arc::clone(&program), node, error, &mut host).unwrap();
     assert_eq!(host.sites, vec![CompiledSchemaSite::AnalyticOutput(node)]);
     assert_eq!(host.bodies, 1);
     let direct =
@@ -172,14 +183,9 @@ fn analytic_schema_original_precheck_preserves_message_before_host() {
             .err()
             .unwrap();
     let mut host = scope(&program, false);
-    let hosted = CompiledWindowProcessorFactory::try_new_with_metadata_host(
-        Arc::clone(&program),
-        missing,
-        error,
-        &mut host,
-    )
-    .err()
-    .unwrap();
+    let hosted = hosted_window_factory(Arc::clone(&program), missing, error, &mut host)
+        .err()
+        .unwrap();
     assert_eq!(hosted.into_pipeline_message(), direct);
     assert!(host.sites.is_empty());
     assert_eq!(host.bodies, 0);

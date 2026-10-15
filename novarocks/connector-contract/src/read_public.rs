@@ -35,12 +35,14 @@ pub struct ConnectorReadPublicFacts {
     schema: Arc<Schema>,
     logical_types: Arc<[ValueLogicalType]>,
     charged_bytes: usize,
+    typed: Option<typed::TypedReadSchemas>,
     metadata_materializations: Option<novarocks_type_contract::owned_resources::metadata_materialization::SchemaMetadataMaterializations>,
 }
 impl PartialEq for ConnectorReadPublicFacts {
     fn eq(&self, other: &Self) -> bool {
         self.source == other.source
             && self.metadata_kind == other.metadata_kind
+            && self.typed == other.typed
             && self.logical_types == other.logical_types
             && novarocks_type_contract::arrow_schemas_exact(&self.schema, &other.schema)
     }
@@ -241,6 +243,7 @@ impl ConnectorReadPublicFacts {
             schema,
             logical_types,
             charged_bytes: budget.bytes,
+            typed: None,
             metadata_materializations: None,
         })
     }
@@ -261,10 +264,19 @@ impl ConnectorReadPublicFacts {
         self.charged_bytes
     }
     pub fn matches_value_type(&self, ordinal: usize, ty: &FunctionValueType) -> bool {
+        if let Some(typed) = &self.typed {
+            return typed
+                .execution
+                .binding(ordinal)
+                .is_some_and(|binding| binding == ty);
+        }
         self.schema.fields().get(ordinal).is_some_and(|field| {
-            self.logical_types[ordinal] == ty.logical_type
-                && field.is_nullable() == ty.nullable
-                && novarocks_type_contract::arrow_data_types_exact(field.data_type(), &ty.data_type)
+            self.logical_types[ordinal] == ty.logical_type()
+                && field.is_nullable() == ty.nullable()
+                && novarocks_type_contract::arrow_data_types_exact(
+                    field.data_type(),
+                    &ty.data_type(),
+                )
         })
     }
 }
@@ -468,6 +480,16 @@ impl SchemaBudget {
         preflight_metadata_validation(metadata, context)?;
         completed_law(self.metadata(metadata), context)
     }
+    fn metadata_with_bound_observed<O: OwnedCopy>(
+        &mut self,
+        metadata: &std::collections::HashMap<String, String>,
+        source_work_bound: Option<usize>,
+        context: &mut O,
+    ) -> Result<(), O::Error> {
+        context.metadata_iteration_with_bound(metadata.len(), 1, source_work_bound)?;
+        context.work(context.add(context.mul(metadata.len(), 128)?, 128)?)?;
+        completed_law(self.metadata(metadata), context)
+    }
     fn field_observed<O: OwnedCopy>(
         &mut self,
         field: &Field,
@@ -554,9 +576,9 @@ fn value_type_error(error: novarocks_type_contract::ValueTypeError) -> Connector
         ValueTypeError::TooDeep | ValueTypeError::TooManyNodes => {
             ConnectorErrorKind::ResourceExhausted
         }
-        ValueTypeError::UnknownLogicalMetadata | ValueTypeError::InvalidLogicalCarrier(_) => {
-            ConnectorErrorKind::InvalidRequest
-        }
+        ValueTypeError::UnknownLogicalMetadata
+        | ValueTypeError::InvalidLogicalCarrier(_)
+        | ValueTypeError::InvalidType(_) => ConnectorErrorKind::InvalidRequest,
     };
     ConnectorError::new(kind, error.to_string())
 }
@@ -881,3 +903,6 @@ impl std::fmt::Debug for ConnectorReadPublicFacts {
             .finish()
     }
 }
+
+mod typed;
+pub use typed::TypedReadCreationFailure;

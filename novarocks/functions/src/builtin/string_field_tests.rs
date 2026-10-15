@@ -90,7 +90,7 @@ fn field_kernel_original_float_scalar_equality_is_not_arrow_total_order() {
         p.contract().effects().null_behavior,
         FunctionNullBehavior::CalledOnNull
     );
-    assert!(!p.contract().result_type().nullable);
+    assert!(!p.contract().result_type().nullable());
     let out = ScalarEvaluationInstance::instantiate(p)
         .unwrap()
         .evaluate(Selection::all(4), &args, &Control::default())
@@ -306,7 +306,7 @@ fn field_kernel_actual_preparation_success_and_rejection_preserve_every_compile_
             DecimalOverflowPolicy::ReportError,
             &good,
         );
-        assert_eq!(result.is_ok(), ty.data_type == DataType::Utf8);
+        assert_eq!(result.is_ok(), ty.data_type() == &DataType::Utf8);
         let trace = good.trace.lock().unwrap().clone();
         assert!(!trace.is_empty());
         for at in 0..trace.len() {

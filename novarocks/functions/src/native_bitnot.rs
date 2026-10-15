@@ -34,7 +34,7 @@ use novarocks_type_contract::{
 /// Unsupported UInt/PhysicalNull are explicit compile shape refusals in Exact
 /// mode; this predicate never changes original SQL/native v1 admission.
 pub fn native_bitnot_source_supported(source: &FunctionValueType) -> bool {
-    match (&source.logical_type, &source.data_type) {
+    match (&source.logical_type(), source.data_type()) {
         (
             ValueLogicalType::Physical,
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
@@ -66,9 +66,9 @@ impl PreparedNativeBitNotRecipe {
                     "native BitwiseNot unsupported source shape: {source:?}"
                 ))));
             }
-            if source.logical_type != result.logical_type
-                || source.data_type != result.data_type
-                || (source.nullable && !result.nullable)
+            if source.logical_type() != result.logical_type()
+                || source.data_type() != result.data_type()
+                || (source.nullable() && !result.nullable())
             {
                 return Err(ArithmeticPrepareError::TypeMismatch);
             }
@@ -151,7 +151,7 @@ impl PreparedNativeBitNotRecipe {
                         .next()
                         .ok_or_else(|| invalid("native BitwiseNot inherited error is missing"))?;
                     errors.push(error.clone());
-                    rows.push(arrow_array::new_null_array(&self.result.data_type, 1));
+                    rows.push(arrow_array::new_null_array(self.result.data_type(), 1));
                     work.step()?;
                 } else {
                     work.flush()?;
@@ -161,7 +161,7 @@ impl PreparedNativeBitNotRecipe {
             }
             work.flush()?;
             let output = if rows.is_empty() {
-                arrow_array::new_empty_array(&self.result.data_type)
+                arrow_array::new_empty_array(self.result.data_type())
             } else {
                 let mut arrays = Vec::with_capacity(rows.len());
                 for array in &rows {
@@ -178,7 +178,7 @@ impl PreparedNativeBitNotRecipe {
             work.flush()?;
             crate::SelectedValues::try_new_observed(
                 selection,
-                &self.result.data_type,
+                self.result.data_type(),
                 output,
                 errors.into_boxed_slice(),
                 || work.step(),
@@ -203,7 +203,7 @@ impl PreparedNativeBitNotRecipe {
                 logical_row,
                 &self.source,
                 |array| {
-                    let valid = match &self.source.data_type {
+                    let valid = match self.source.data_type() {
                         DataType::Int8 => array.as_any().is::<arrow_array::Int8Array>(),
                         DataType::Int16 => array.as_any().is::<arrow_array::Int16Array>(),
                         DataType::Int32 => array.as_any().is::<arrow_array::Int32Array>(),
@@ -229,7 +229,7 @@ impl PreparedNativeBitNotRecipe {
                 BitArrayObservation::Step => work.step(),
                 BitArrayObservation::OpaqueBoundary => work.flush(),
             };
-            let answer = if self.source.logical_type == ValueLogicalType::LargeInt {
+            let answer = if self.source.logical_type() == ValueLogicalType::LargeInt {
                 // The original reader is bounded to one already-demanded 16B
                 // row; this does not assert or grant allocator capacity.
                 observer(BitArrayObservation::OpaqueBoundary)?;
@@ -244,7 +244,7 @@ impl PreparedNativeBitNotRecipe {
                 )?;
                 bit_array::cast_largeint_output_observed(
                     &values,
-                    Some(&self.result.data_type),
+                    Some(self.result.data_type()),
                     &mut observer,
                 )?
             } else {
@@ -258,7 +258,11 @@ impl PreparedNativeBitNotRecipe {
                     |v| BitwiseOp::Not.apply_i64(v, 0),
                     &mut observer,
                 )?;
-                bit_array::finish_i64_observed(values, Some(&self.result.data_type), &mut observer)?
+                bit_array::finish_i64_observed(
+                    values,
+                    Some(self.result.data_type()),
+                    &mut observer,
+                )?
             };
             // Valid admitted concrete signed/LARGEINT rows and matching output
             // metadata cannot hit original conversion/output data guards. A

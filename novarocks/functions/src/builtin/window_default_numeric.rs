@@ -41,14 +41,14 @@ impl NumericDefaultRecipe {
         target: &FunctionValueType,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<Self>, KernelFailure> {
-        let numeric = width(&source.data_type).is_some() && width(&target.data_type).is_some();
+        let numeric = width(source.data_type()).is_some() && width(target.data_type()).is_some();
         work.step().map_err(compile_failure)?;
         if !numeric {
             return Ok(None);
         }
-        let valid = source.logical_type == ValueLogicalType::Physical
-            && target.logical_type == ValueLogicalType::Physical
-            && target.nullable;
+        let valid = source.logical_type() == ValueLogicalType::Physical
+            && target.logical_type() == ValueLogicalType::Physical
+            && target.nullable();
         work.step().map_err(compile_failure)?;
         if !valid {
             return Err(invalid(
@@ -56,8 +56,8 @@ impl NumericDefaultRecipe {
             ));
         }
         let recipe = Self {
-            source: source.data_type.clone(),
-            target: target.data_type.clone(),
+            source: source.data_type().clone(),
+            target: target.data_type().clone(),
         };
         work.step().map_err(compile_failure)?;
         Ok(Some(recipe))

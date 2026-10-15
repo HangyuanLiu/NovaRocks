@@ -172,7 +172,7 @@ fn receiving_structure_preserves_zero_max_namespaces_and_original_ordered_fields
             crate::FunctionId::try_new("fixture/receiving/static-request").unwrap(),
             crate::FunctionOverloadId::try_new("fixture/receiving/zero-to-i64").unwrap(),
             crate::FunctionKind::Scalar,
-            Box::default(),
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::default()),
             definition.ty.clone(),
         ),
         args: Box::default(),

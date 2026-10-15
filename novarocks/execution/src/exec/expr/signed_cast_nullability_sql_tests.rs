@@ -157,8 +157,8 @@ fn check_array_source(
                 let index = fragment.expressions().get(args[1]).unwrap();
                 let expected = FunctionValueType::new(
                     DataType::Int32,
-                    expected_index_source.nullable
-                        || expected_index_source.data_type == DataType::Int64,
+                    expected_index_source.nullable()
+                        || expected_index_source.data_type() == &DataType::Int64,
                 );
                 assert_eq!(index.ty, expected);
                 assert_eq!(
@@ -173,7 +173,7 @@ fn check_array_source(
                     panic!("real index source");
                 };
                 assert_eq!(value_type, &expected);
-                if expected_index_source.data_type == DataType::Int32 {
+                if expected_index_source.data_type() == &DataType::Int32 {
                     assert_eq!(index.ty, expected_index_source);
                 } else {
                     let ExprKind::Cast { expr, target, .. } = &index.kind else {

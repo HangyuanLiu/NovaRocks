@@ -27,6 +27,166 @@ use novarocks_type_contract::{
 use sha2::{Digest, Sha256};
 
 pub use novarocks_function_contract::FunctionBindingError;
+/// Exact scoped validation failures. No resolver error is erased or recovered
+/// by text/downcast; an unconverted owner never falls back to pure admission.
+#[derive(Debug)]
+pub enum FunctionBindingConstructionResource {
+    Layout(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+    Vec(novarocks_type_contract::ControlResourceError),
+    HashMap(novarocks_type_contract::owned_resources::hashmap::HashMapResourceError),
+}
+#[derive(Debug)]
+pub enum FunctionBindingCreationFailure<H> {
+    Binding(FunctionBindingError),
+    Creator(H),
+    Resource(FunctionBindingConstructionResource),
+    /// Stage A is not globally enabled until all admitted resolver owners join.
+    UnconvertedResolverOwner,
+}
+impl<H> From<FunctionBindingError> for FunctionBindingCreationFailure<H> {
+    fn from(error: FunctionBindingError) -> Self {
+        Self::Binding(error)
+    }
+}
+impl<H> From<CompileControlError> for FunctionBindingCreationFailure<H> {
+    fn from(error: CompileControlError) -> Self {
+        Self::Binding(error.into())
+    }
+}
+impl<H> From<novarocks_type_contract::FunctionIdentityError> for FunctionBindingCreationFailure<H> {
+    fn from(error: novarocks_type_contract::FunctionIdentityError) -> Self {
+        Self::Binding(FunctionBindingError::InvalidBinding(
+            error.to_string().into(),
+        ))
+    }
+}
+impl<H> From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for FunctionBindingCreationFailure<H>
+{
+    fn from(error: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::Resource(FunctionBindingConstructionResource::Layout(error))
+    }
+}
+impl<H> From<novarocks_type_contract::ValueTypeError> for FunctionBindingCreationFailure<H> {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Binding(error.into())
+    }
+}
+impl FunctionBindingCreationFailure<std::convert::Infallible> {
+    pub(crate) fn into_pure(self) -> FunctionBindingError {
+        match self {
+            Self::Binding(error) => error,
+            Self::Creator(never) => match never {},
+            Self::Resource(_) | Self::UnconvertedResolverOwner => {
+                unreachable!("pure validation delegates its actual owner")
+            }
+        }
+    }
+}
+
+/// A staged object-safe sibling refuses explicitly until its actual owner is
+/// converted. Original owner/control/kernel failures retain their exact cause.
+#[derive(Debug)]
+pub enum CheckedOwnerFailure<E> {
+    Original(E),
+    UnconvertedOwner,
+}
+impl<E: std::fmt::Display> std::fmt::Display for CheckedOwnerFailure<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Original(error) => error.fmt(f),
+            Self::UnconvertedOwner => {
+                f.write_str("checked selected preparation owner is not converted")
+            }
+        }
+    }
+}
+impl<E: std::error::Error> std::error::Error for CheckedOwnerFailure<E> {}
+
+/// A local, non-owning loan minted only after the actual binding author and
+/// its original footer succeed. It proves neither effects nor preparation.
+/// No constructor, memory authority, scope or query is retained here.
+pub struct CheckedCallEffectInput<'a> {
+    catalog: &'a EngineFunctionCatalog,
+    binding: &'a FunctionBindingDefinition,
+    input: crate::CallEffectInput<'a>,
+    constant_policy: &'a crate::ConstantPolicy,
+}
+impl std::fmt::Debug for CheckedCallEffectInput<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckedCallEffectInput")
+            .finish_non_exhaustive()
+    }
+}
+impl<'a> CheckedCallEffectInput<'a> {
+    pub(crate) fn require_input(
+        &self,
+        input: crate::CallEffectInput<'_>,
+        policy: &crate::ConstantPolicy,
+    ) -> Result<(), FunctionBindingError> {
+        if !self.input.same_borrow(input) || self.constant_policy != policy {
+            return Err(invalid_binding(
+                "checked selection differs from its original call input or constant policy",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn require_catalog(
+        &self,
+        catalog: &EngineFunctionCatalog,
+    ) -> Result<(), FunctionBindingError> {
+        if !std::ptr::eq(self.catalog, catalog) {
+            return Err(invalid_binding(
+                "checked selection borrows a different immutable catalogue",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn require_registered(
+        &self,
+        declaration: &FunctionBindingDeclaration,
+        input: crate::CallEffectInput<'_>,
+    ) -> Result<(), FunctionBindingError> {
+        self.require_input(input, self.constant_policy)?;
+        if !std::ptr::eq(self.binding.declaration.as_ref(), declaration) {
+            return Err(invalid_binding(
+                "checked selection borrows a different registered owner",
+            ));
+        }
+        Ok(())
+    }
+    /// Require the exact original resolver loan, independently of its trait
+    /// vtable. This does not re-resolve, allocate or retain the author.
+    pub fn require_binding_author(
+        &self,
+        resolver: &dyn FunctionBindingResolver,
+        input: crate::CallEffectInput<'_>,
+    ) -> Result<(), FunctionBindingError> {
+        self.require_input(input, self.constant_policy)?;
+        if !std::ptr::addr_eq(self.binding.resolver.pure_author(), resolver) {
+            return Err(invalid_binding(
+                "checked selection borrows a different original binding author",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn require_fixed_author(
+        &self,
+        resolver: &crate::builtin::catalogue::BuiltinScalarResolver,
+        input: crate::CallEffectInput<'_>,
+    ) -> Result<(), FunctionBindingError> {
+        self.require_input(input, self.constant_policy)?;
+        if !matches!(&self.binding.resolver.0, BindingResolverOwnerKind::FixedScalar(owner)
+            if std::ptr::eq(owner.as_ref(), resolver))
+        {
+            return Err(invalid_binding(
+                "checked selection borrows a different original binding author",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The installed catalog consumes admitted constants, never pool addresses.
 pub type FunctionArgument = novarocks_function_contract::FunctionArgument<crate::ConstantValue>;
 pub type FunctionBindingRequest<'a> =
@@ -164,16 +324,16 @@ impl FunctionBindingDeclaration {
     ) -> Result<Self, FunctionBindingError> {
         let mut overloads = overloads.into_iter().collect::<Vec<_>>();
         if overloads.is_empty() {
-            return Err(invalid("function has no declared overloads"));
+            return Err(invalid_binding("function has no declared overloads"));
         }
         overloads.sort_unstable_by(|left, right| left.identity.cmp(&right.identity));
         for overload in &mut overloads {
             if let Some(effects) = &mut overload.effects {
                 effects
                     .validate(kind)
-                    .map_err(|_| invalid("invalid complete function effect declaration"))?;
+                    .map_err(|_| invalid_binding("invalid complete function effect declaration"))?;
                 if overload.semantics != FunctionSemantics::from_effects(effects) {
-                    return Err(invalid(
+                    return Err(invalid_binding(
                         "legacy semantics differ from full declaration projection",
                     ));
                 }
@@ -189,7 +349,7 @@ impl FunctionBindingDeclaration {
                 .intrinsic_row_error
                 .is_valid_for_kind(kind)
             {
-                return Err(invalid(
+                return Err(invalid_binding(
                     "intrinsic row-error fact differs from the function kind",
                 ));
             }
@@ -201,12 +361,12 @@ impl FunctionBindingDeclaration {
             validate_pattern(&overload.argument_pattern)?;
             validate_pattern(&overload.result_pattern)?;
             if !patterns.insert(overload.argument_pattern.as_ref()) {
-                return Err(invalid(
+                return Err(invalid_binding(
                     "multiple overloads declare the same argument pattern",
                 ));
             }
             if (kind == FunctionKind::Aggregate) != overload.aggregate.is_some() {
-                return Err(invalid(
+                return Err(invalid_binding(
                     "aggregate state declaration differs from the function kind",
                 ));
             }
@@ -238,7 +398,7 @@ impl FunctionBindingDeclaration {
             if self.kind != FunctionKind::Scalar
                 || overload.semantics.failure_behavior != FunctionFailureBehavior::Propagate
             {
-                return Err(invalid(
+                return Err(invalid_binding(
                     "scalar invocation Data requires a propagating scalar overload",
                 ));
             }
@@ -287,7 +447,7 @@ impl FunctionBindingDeclaration {
 
 fn validate_pattern(pattern: &str) -> Result<(), FunctionBindingError> {
     if pattern.trim().is_empty() || pattern.len() > u16::MAX as usize {
-        return Err(invalid(
+        return Err(invalid_binding(
             "function signature pattern is empty or exceeds 65535 bytes",
         ));
     }
@@ -298,7 +458,7 @@ fn validate_pattern(pattern: &str) -> Result<(), FunctionBindingError> {
 pub enum FunctionResultType {
     Scalar(FunctionValueType),
     /// Only the function's produced columns, excluding outer pass-throughs.
-    Relation(Box<[FunctionValueType]>),
+    Relation(novarocks_type_contract::FunctionParameterTypes),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -316,7 +476,7 @@ pub struct AggregateBindingSelection {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct FunctionBindingSelection {
     pub overload: FunctionOverloadId,
-    pub argument_types: Box<[FunctionArgumentType]>,
+    pub argument_types: novarocks_type_contract::FunctionArgumentTypes,
     pub result_type: FunctionResultType,
     pub aggregate: Option<AggregateBindingSelection>,
 }
@@ -368,10 +528,145 @@ pub struct ResolvedFunctionBinding {
     pub selected: FunctionBindingSelection,
 }
 
+/// The actual immutable binding author retained by one installed definition.
+/// Pure and scoped operations use this same carrier; the original-dynamic arm
+/// is an explicit staging boundary and grants no scoped-validation capability.
+#[derive(Clone)]
+pub struct FunctionBindingResolverOwner(BindingResolverOwnerKind);
+#[derive(Clone)]
+enum BindingResolverOwnerKind {
+    FixedScalar(Arc<crate::builtin::catalogue::BuiltinScalarResolver>),
+    StringField(Arc<crate::builtin::StringFieldOwner>),
+    DynamicScalar(Arc<crate::builtin::catalogue::BuiltinDynamicScalarResolver>),
+    Unnest(Arc<crate::builtin::UnnestOwner>),
+    BorrowedAggregate(Arc<crate::builtin::catalogue::BuiltinAggregateResolver>),
+    BorrowedConversion(Arc<crate::builtin::value_conversion::ValueConversionResolver>),
+    ParametricAggregate(Arc<ParametricAggregateBindingResolver>),
+    Original(Arc<dyn FunctionBindingResolver>),
+}
+impl FunctionBindingResolverOwner {
+    /// Retain an existing original author without claiming scoped capability.
+    pub fn original(resolver: Arc<dyn FunctionBindingResolver>) -> Self {
+        Self(BindingResolverOwnerKind::Original(resolver))
+    }
+    pub(crate) fn fixed_scalar(
+        resolver: Arc<crate::builtin::catalogue::BuiltinScalarResolver>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::FixedScalar(resolver))
+    }
+    pub(crate) fn string_field(resolver: Arc<crate::builtin::StringFieldOwner>) -> Self {
+        Self(BindingResolverOwnerKind::StringField(resolver))
+    }
+    pub(crate) fn dynamic_scalar(
+        resolver: Arc<crate::builtin::catalogue::BuiltinDynamicScalarResolver>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::DynamicScalar(resolver))
+    }
+    pub(crate) fn unnest(owner: Arc<crate::builtin::UnnestOwner>) -> Self {
+        Self(BindingResolverOwnerKind::Unnest(owner))
+    }
+    pub(crate) fn borrowed_aggregate(
+        owner: Arc<crate::builtin::catalogue::BuiltinAggregateResolver>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::BorrowedAggregate(owner))
+    }
+    pub(crate) fn borrowed_conversion(
+        owner: Arc<crate::builtin::value_conversion::ValueConversionResolver>,
+    ) -> Self {
+        Self(BindingResolverOwnerKind::BorrowedConversion(owner))
+    }
+    pub(crate) fn parametric_aggregate(owner: Arc<ParametricAggregateBindingResolver>) -> Self {
+        Self(BindingResolverOwnerKind::ParametricAggregate(owner))
+    }
+    fn validate_selected_with_creation<H>(
+        &self,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingCreationFailure<H>> {
+        match creation {
+            None => self
+                .pure_author()
+                .validate_selected(selected, request, control)
+                .map_err(Into::into),
+            Some(creation) => {
+                match &self.0 {
+                    BindingResolverOwnerKind::FixedScalar(owner) => owner
+                        .validate_selected_with_creator_in(selected, request, creation, control),
+                    BindingResolverOwnerKind::StringField(owner) => owner
+                        .validate_selected_with_creator_in(selected, request, creation, control),
+                    BindingResolverOwnerKind::DynamicScalar(owner) => owner
+                        .validate_selected_with_creator_in(selected, request, creation, control),
+                    BindingResolverOwnerKind::Unnest(owner) => owner
+                        .validate_selected_with_creator_in(selected, request, creation, control),
+                    // These exact original validators match borrowed recipes;
+                    // they create no expected FVT or collection backing.
+                    BindingResolverOwnerKind::BorrowedAggregate(owner) => owner
+                        .validate_selected(selected, request, control)
+                        .map_err(Into::into),
+                    BindingResolverOwnerKind::BorrowedConversion(owner) => owner
+                        .validate_selected(selected, request, control)
+                        .map_err(Into::into),
+                    BindingResolverOwnerKind::ParametricAggregate(owner) => owner
+                        .validate_selected_with_creator_in(selected, request, creation, control),
+                    BindingResolverOwnerKind::Original(_) => {
+                        Err(FunctionBindingCreationFailure::UnconvertedResolverOwner)
+                    }
+                }
+            }
+        }
+    }
+    fn pure_author(&self) -> &(dyn FunctionBindingResolver + 'static) {
+        match &self.0 {
+            BindingResolverOwnerKind::FixedScalar(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::StringField(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::DynamicScalar(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::Unnest(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::BorrowedAggregate(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::BorrowedConversion(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::ParametricAggregate(owner) => owner.as_ref(),
+            BindingResolverOwnerKind::Original(owner) => owner.as_ref(),
+        }
+    }
+}
+impl AsRef<dyn FunctionBindingResolver> for FunctionBindingResolverOwner {
+    fn as_ref(&self) -> &(dyn FunctionBindingResolver + 'static) {
+        self.pure_author()
+    }
+}
+impl FunctionBindingResolver for FunctionBindingResolverOwner {
+    fn resolve(
+        &self,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        self.pure_author().resolve(request, control)
+    }
+    fn select_at_overload_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        self.pure_author()
+            .select_at_overload_observed(overload, request, control)
+    }
+    fn validate_selected(
+        &self,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        self.pure_author()
+            .validate_selected(selected, request, control)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct FunctionBindingDefinition {
     pub(crate) declaration: Arc<FunctionBindingDeclaration>,
-    resolver: Arc<dyn FunctionBindingResolver>,
+    resolver: FunctionBindingResolverOwner,
     pub(crate) pure: Option<crate::pure_catalogue::PureFunctionAttachment>,
 }
 
@@ -390,7 +685,7 @@ impl BoundValidation<'_> {
 
 impl FunctionBindingDefinition {
     pub(crate) fn retain_resolver_from(&mut self, original: &Self) {
-        self.resolver = Arc::clone(&original.resolver);
+        self.resolver = original.resolver.clone();
     }
 
     pub(crate) fn new(
@@ -399,7 +694,7 @@ impl FunctionBindingDefinition {
     ) -> Self {
         Self {
             declaration: Arc::new(declaration),
-            resolver,
+            resolver: FunctionBindingResolverOwner::original(resolver),
             pure: None,
         }
     }
@@ -455,138 +750,23 @@ pub(crate) fn parametric_aggregate_binding(
     let declaration =
         FunctionBindingDeclaration::try_new(function_id, crate::FunctionKind::Aggregate, declared)
             .map_err(|error| invalid_identity(&error))?;
-    Ok(FunctionBindingDefinition::new(
+    let declaration = Arc::new(declaration);
+    let resolver = Arc::new(ParametricAggregateBindingResolver {
+        aggregate_resolver,
+        declaration: Arc::clone(&declaration),
+    });
+    Ok(FunctionBindingDefinition {
         declaration,
-        Arc::new(ParametricAggregateBindingResolver { aggregate_resolver }),
-    ))
+        resolver: FunctionBindingResolverOwner::parametric_aggregate(resolver),
+        pure: None,
+    })
 }
 
 /// Answers binding questions for an aggregate through the same typed contract
 /// its signatures are resolved with, so the two can never disagree.
-struct ParametricAggregateBindingResolver {
-    aggregate_resolver: Arc<dyn crate::AggregateSignatureResolver>,
-}
-
-impl ParametricAggregateBindingResolver {
-    fn argument_types(
-        &self,
-        request: FunctionBindingRequest<'_>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<Vec<arrow_schema::DataType>, FunctionBindingError> {
-        let values = request
-            .arguments
-            .iter()
-            .map(|argument| {
-                work.step()?;
-                match argument {
-                    FunctionArgument::Value { value_type, .. } => Ok(value_type.clone()),
-                    FunctionArgument::Lambda { .. } => {
-                        Err(FunctionBindingError::NoMatchingOverload)
-                    }
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        work.flush()?;
-        let validation = self
-            .aggregate_resolver
-            .validate_value_arguments(&values)
-            .map_err(FunctionBindingError::from);
-        work.step()?;
-        validation?;
-        Ok(values.into_iter().map(|value| value.data_type).collect())
-    }
-
-    // Both exact instantiation and selected-binding validation use the same
-    // original family author. Missing authors refuse; candidate resolution is
-    // reserved for the first FE name-based admission.
-    fn select_exact_observed(
-        &self,
-        overload: &FunctionOverloadId,
-        request: FunctionBindingRequest<'_>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        let argument_types = self.argument_types(request, work)?;
-        let selected_overload = crate::AggregateOverloadIdentity::try_new(overload.as_str())
-            .map_err(|error| invalid(&error.to_string()));
-        work.step()?;
-        let selected_overload = selected_overload?;
-        work.flush()?;
-        let resolved = self
-            .aggregate_resolver
-            .resolve_update_signature(&selected_overload, &argument_types)
-            .map_err(FunctionBindingError::from);
-        work.step()?;
-        let resolved = resolved?;
-        let same_arity = resolved.argument_types.len() == argument_types.len();
-        work.step()?;
-        if !same_arity {
-            return Err(invalid(
-                "aggregate update author returned a different channel count",
-            ));
-        }
-        for (actual, returned) in argument_types.iter().zip(&resolved.argument_types) {
-            let exact =
-                novarocks_type_contract::arrow_data_types_exact_observed(actual, returned, || {
-                    work.step().map_err(FunctionBindingError::from)
-                })?;
-            if !exact {
-                return Err(invalid(
-                    "aggregate update author returned a different channel type",
-                ));
-            }
-        }
-        for _ in request.arguments {
-            work.step()?;
-        }
-        work.flush()?;
-        let selection = self.selection(request, &resolved, work);
-        if matches!(&selection, Err(FunctionBindingError::Control(_))) {
-            return selection;
-        }
-        work.step()?;
-        selection
-    }
-
-    fn selection(
-        &self,
-        request: FunctionBindingRequest<'_>,
-        resolved: &crate::ResolvedAggregateSignature,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        work.flush()?;
-        let state_argument_contract = self
-            .aggregate_resolver
-            .state_argument_contract(&resolved.overload)
-            .map_err(FunctionBindingError::from);
-        if let Err(FunctionBindingError::Control(cause)) = state_argument_contract {
-            return Err(FunctionBindingError::Control(cause));
-        }
-        work.step()?;
-        let state_argument_contract = state_argument_contract?;
-        work.flush()?;
-        let nullable = self.aggregate_resolver.produces_null();
-        Ok(FunctionBindingSelection {
-            overload: FunctionOverloadId::try_new(resolved.overload.as_str())
-                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
-            argument_types: request
-                .arguments
-                .iter()
-                .map(FunctionArgument::argument_type)
-                .collect(),
-            result_type: FunctionResultType::Scalar(FunctionValueType::new(
-                resolved.output_type.clone(),
-                nullable,
-            )),
-            aggregate: Some(crate::AggregateBindingSelection {
-                state_argument_contract,
-                intermediate_type: FunctionValueType::new(
-                    resolved.intermediate_type.clone(),
-                    nullable,
-                ),
-                state_format: resolved.state_format.clone(),
-            }),
-        })
-    }
+pub(crate) struct ParametricAggregateBindingResolver {
+    pub(crate) aggregate_resolver: Arc<dyn crate::AggregateSignatureResolver>,
+    pub(crate) declaration: Arc<FunctionBindingDeclaration>,
 }
 
 impl FunctionBindingResolver for ParametricAggregateBindingResolver {
@@ -643,7 +823,7 @@ impl FunctionBindingResolver for ParametricAggregateBindingResolver {
             if crate::builtin::binding_control::same_selection(&expected, selected, &mut work)? {
                 Ok(())
             } else {
-                Err(invalid(
+                Err(invalid_binding(
                     "selected aggregate overload differs from its typed contract",
                 ))
             }
@@ -712,6 +892,22 @@ impl FunctionDefinition {
         resolver: Arc<dyn FunctionBindingResolver>,
         aggregate_resolver: Option<Arc<dyn crate::AggregateSignatureResolver>>,
     ) -> Result<Self, FunctionCatalogError> {
+        Self::bound_with_owner(
+            canonical_name,
+            visibility,
+            declaration,
+            FunctionBindingResolverOwner::original(resolver),
+            aggregate_resolver,
+        )
+    }
+
+    pub(crate) fn bound_with_owner(
+        canonical_name: impl AsRef<str>,
+        visibility: FunctionVisibility,
+        declaration: FunctionBindingDeclaration,
+        resolver: FunctionBindingResolverOwner,
+        aggregate_resolver: Option<Arc<dyn crate::AggregateSignatureResolver>>,
+    ) -> Result<Self, FunctionCatalogError> {
         let canonical_name = canonical_name.as_ref();
         super::validate_canonical_name(canonical_name)?;
         let aggregate_overloads = declaration
@@ -761,7 +957,7 @@ impl FunctionDefinition {
     /// Borrow the original immutable binding author. A provider can attach its
     /// typed pure CPU to the same declaration without recreating resolution or
     /// electing another family. This loan does not certify effects or kernels.
-    pub fn binding_resolver(&self) -> Option<&Arc<dyn FunctionBindingResolver>> {
+    pub fn binding_resolver(&self) -> Option<&FunctionBindingResolverOwner> {
         self.binding.as_ref().map(|binding| &binding.resolver)
     }
 }
@@ -849,7 +1045,9 @@ impl EngineFunctionCatalog {
             let same_kind = kind == binding.declaration.kind;
             work.step()?;
             if !same_kind {
-                return Err(invalid("exact selection kind differs from the declaration"));
+                return Err(invalid_binding(
+                    "exact selection kind differs from the declaration",
+                ));
             }
             validate_request(kind, request, &mut work)?;
             let mut declared = false;
@@ -862,7 +1060,7 @@ impl EngineFunctionCatalog {
                 }
             }
             if !declared {
-                return Err(invalid(
+                return Err(invalid_binding(
                     "exact selection overload is not declared by this function",
                 ));
             }
@@ -874,7 +1072,7 @@ impl EngineFunctionCatalog {
             let same_overload = &selected.overload == overload;
             work.step()?;
             if !same_overload {
-                return Err(invalid(
+                return Err(invalid_binding(
                     "exact selection owner returned a different overload",
                 ));
             }
@@ -890,7 +1088,7 @@ impl EngineFunctionCatalog {
                     }
                 };
                 if !matches {
-                    return Err(invalid(
+                    return Err(invalid_binding(
                         "exact selection result differs from the requested result type",
                     ));
                 }
@@ -916,19 +1114,168 @@ impl EngineFunctionCatalog {
         request: FunctionBindingRequest<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
+        self.validate_frozen_selection_with_creation::<std::convert::Infallible>(
+            function, kind, selected, request, control, None,
+        )
+        .map_err(FunctionBindingCreationFailure::into_pure)
+    }
+    /// Explicit staged port. Production callers keep the original pure entry
+    /// until every admitted resolver arm supplies its scoped constructor core.
+    pub fn validate_frozen_selection_with_creator_in<H>(
+        &self,
+        function: &FunctionId,
+        kind: FunctionKind,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingCreationFailure<H>> {
+        self.validate_frozen_selection_with_creation(
+            function,
+            kind,
+            selected,
+            request,
+            control,
+            Some(creation),
+        )
+    }
+    fn validate_frozen_selection_with_creation<H>(
+        &self,
+        function: &FunctionId,
+        kind: FunctionKind,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+        creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    ) -> Result<(), FunctionBindingCreationFailure<H>> {
+        self.checked_frozen_selection_with_creation(
+            function, kind, selected, request, control, creation,
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn check_call_effect_input_with_creator_in<'a, H>(
+        &'a self,
+        input: crate::CallEffectInput<'a>,
+        constant_policy: &'a crate::ConstantPolicy,
+        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CheckedCallEffectInput<'a>, FunctionBindingCreationFailure<H>> {
+        let binding = self.checked_frozen_selection_with_creation(
+            input.function_id,
+            input.kind,
+            input.selected,
+            input.request,
+            control,
+            Some(creation),
+        )?;
+        // The original function request has no policy field. The caller loans
+        // its actual already-admitted source policy; it grants no new capacity.
+        Ok(CheckedCallEffectInput {
+            catalog: self,
+            binding,
+            input,
+            constant_policy,
+        })
+    }
+
+    fn checked_frozen_selection_with_creation<H>(
+        &self,
+        function: &FunctionId,
+        kind: FunctionKind,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+        creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    ) -> Result<&FunctionBindingDefinition, FunctionBindingCreationFailure<H>> {
+        self.checked_frozen_selection_with_author(
+            function,
+            kind,
+            selected,
+            request,
+            control,
+            |binding, work| {
+                validate_selected_definition_with_creation(
+                    binding, selected, request, work, creation,
+                )
+            },
+        )
+    }
+
+    fn checked_frozen_selection_with_author<H>(
+        &self,
+        function: &FunctionId,
+        kind: FunctionKind,
+        _selected: &FunctionBindingSelection,
+        _request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+        validate_author: impl FnOnce(
+            &FunctionBindingDefinition,
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<(), FunctionBindingCreationFailure<H>>,
+    ) -> Result<&FunctionBindingDefinition, FunctionBindingCreationFailure<H>> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-        let result = (|| {
-            let definition = self
-                .definition_by_id(function)
-                .ok_or(FunctionBindingError::UnknownFunction)?;
-            let binding = exact_definition(definition)?;
-            if kind != binding.declaration.kind {
-                return Err(invalid("frozen function kind differs from the declaration"));
-            }
-            work.step()?;
-            validate_selected_definition(binding, selected, request, &mut work)
-        })();
-        finish_binding_work(result, work)
+        let result: Result<&FunctionBindingDefinition, FunctionBindingCreationFailure<H>> =
+            (|| {
+                let definition = self
+                    .definition_by_id(function)
+                    .ok_or(FunctionBindingError::UnknownFunction)?;
+                let binding = exact_definition(definition)?;
+                if kind != binding.declaration.kind {
+                    return Err(invalid_binding(
+                        "frozen function kind differs from the declaration",
+                    )
+                    .into());
+                }
+                work.step()?;
+                validate_author(binding, &mut work)?;
+                Ok(binding)
+            })();
+        finish_created_binding_work(result, work)
+    }
+
+    /// Check the original catalogue/request headers before acquiring an actual
+    /// validation-only scope. The same resolver author performs construction;
+    /// pure callers retain their original unscoped entry and control order.
+    pub fn validate_frozen_selection_with_factory_in<H, F>(
+        &self,
+        function: &FunctionId,
+        kind: FunctionKind,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        factory: &F,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingCreationFailure<H>>
+    where
+        F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+    {
+        self.checked_frozen_selection_with_author(
+            function,
+            kind,
+            selected,
+            request,
+            control,
+            |binding, work| {
+                validate_selected_definition_with_author(
+                    binding,
+                    selected,
+                    request,
+                    work,
+                    |author, control| {
+                        let mut scope = factory
+                            .begin_scope()
+                            .map_err(FunctionBindingCreationFailure::Creator)?;
+                        author.validate_selected_with_creation(
+                            selected,
+                            request,
+                            Some(&mut scope),
+                            control,
+                        )
+                    },
+                )
+            },
+        )
+        .map(|_| ())
     }
 
     /// Check one frozen binding and its already-coerced argument expressions.
@@ -970,7 +1317,7 @@ impl EngineFunctionCatalog {
             let binding = exact_definition(definition)?;
             let overload = binding.declaration.overload(&bound.selected.overload)?;
             if bound.kind != binding.declaration.kind || bound.semantics != overload.semantics {
-                return Err(invalid(
+                return Err(invalid_binding(
                     "frozen function kind or semantics differ from the declaration",
                 ));
             }
@@ -981,7 +1328,7 @@ impl EngineFunctionCatalog {
                 BoundValidation::Frozen(bound)
                     if bound.declared_scalar_invocation_data != declared =>
                 {
-                    return Err(invalid(
+                    return Err(invalid_binding(
                         "frozen scalar invocation Data fact differs from the declaration",
                     ));
                 }
@@ -990,7 +1337,7 @@ impl EngineFunctionCatalog {
             }
             let bound = target.binding();
             if bound.logical_argument_count != request.logical_argument_count {
-                return Err(invalid(
+                return Err(invalid_binding(
                     "frozen logical argument count differs from the expression",
                 ));
             }
@@ -1008,19 +1355,45 @@ fn validate_selected_definition(
     request: FunctionBindingRequest<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), FunctionBindingError> {
+    validate_selected_definition_with_creation::<std::convert::Infallible>(
+        binding, selected, request, work, None,
+    )
+    .map_err(FunctionBindingCreationFailure::into_pure)
+}
+fn validate_selected_definition_with_creation<H>(
+    binding: &FunctionBindingDefinition,
+    selected: &FunctionBindingSelection,
+    request: FunctionBindingRequest<'_>,
+    work: &mut CompileCheckpoints<'_>,
+    creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<(), FunctionBindingCreationFailure<H>> {
+    validate_selected_definition_with_author(binding, selected, request, work, |author, control| {
+        author.validate_selected_with_creation(selected, request, creation, control)
+    })
+}
+
+fn validate_selected_definition_with_author<H>(
+    binding: &FunctionBindingDefinition,
+    selected: &FunctionBindingSelection,
+    request: FunctionBindingRequest<'_>,
+    work: &mut CompileCheckpoints<'_>,
+    validate_author: impl FnOnce(
+        &FunctionBindingResolverOwner,
+        &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingCreationFailure<H>>,
+) -> Result<(), FunctionBindingCreationFailure<H>> {
     validate_selection(&binding.declaration, selected, request, work)?;
     for (argument, expected) in request.arguments.iter().zip(&selected.argument_types) {
         work.step()?;
         if !argument.matches_type_observed(expected, work)? {
-            return Err(invalid(
+            return Err(invalid_binding(
                 "frozen argument types differ from the already-coerced expressions",
-            ));
+            )
+            .into());
         }
     }
     work.flush()?;
-    binding
-        .resolver
-        .validate_selected(selected, request, work.control())
+    validate_author(&binding.resolver, work.control())
 }
 
 fn exact_definition(
@@ -1079,7 +1452,7 @@ fn validate_request(
                         work.step().map_err(FunctionBindingError::from)
                     })?
                 {
-                    return Err(invalid(
+                    return Err(invalid_binding(
                         "constant source type differs from its argument type",
                     ));
                 }
@@ -1103,14 +1476,14 @@ fn validate_request(
         || (kind != FunctionKind::Aggregate
             && request.logical_argument_count != request.arguments.len())
     {
-        return Err(invalid(
+        return Err(invalid_binding(
             "logical argument count differs from the function kind or update channels",
         ));
     }
     for argument in &request.arguments[request.logical_argument_count..] {
         work.step()?;
         if matches!(argument, FunctionArgument::Lambda { .. }) {
-            return Err(invalid(
+            return Err(invalid_binding(
                 "aggregate ORDER BY update channels must be values, not lambdas",
             ));
         }
@@ -1149,7 +1522,7 @@ fn validate_selection(
     }
     let overload = declaration.overload(&selected.overload)?;
     if selected.argument_types.len() != request.arguments.len() {
-        return Err(invalid(
+        return Err(invalid_binding(
             "selected signature argument count differs from the request",
         ));
     }
@@ -1167,7 +1540,7 @@ fn validate_selection(
                 },
             ) if parameter_types.len() == selected_parameters.len() => {}
             _ => {
-                return Err(invalid(
+                return Err(invalid_binding(
                     "selected argument shape or lambda arity differs from the request",
                 ));
             }
@@ -1176,7 +1549,7 @@ fn validate_selection(
     if (declaration.kind == FunctionKind::Table)
         != matches!(selected.result_type, FunctionResultType::Relation(_))
     {
-        return Err(invalid(
+        return Err(invalid_binding(
             "selected result shape differs from the function kind",
         ));
     }
@@ -1186,13 +1559,13 @@ fn validate_selection(
             if resolved.state_format != declared.state_format
                 || resolved.state_argument_contract != declared.state_argument_contract
             {
-                return Err(invalid(
+                return Err(invalid_binding(
                     "aggregate state format or argument contract differs from its declaration",
                 ));
             }
         }
         _ => {
-            return Err(invalid(
+            return Err(invalid_binding(
                 "selected aggregate state contract differs from the declaration",
             ));
         }
@@ -1205,7 +1578,7 @@ fn binding_kernel_failure(error: crate::KernelFailure) -> FunctionBindingError {
         crate::KernelFailure::Cancelled => CompileControlError::Cancelled.into(),
         crate::KernelFailure::DeadlineExceeded => CompileControlError::DeadlineExceeded.into(),
         crate::KernelFailure::ResourceExhausted => CompileControlError::ResourceExhausted.into(),
-        other => invalid(&other.to_string()),
+        other => invalid_binding(&other.to_string()),
     }
 }
 
@@ -1238,6 +1611,21 @@ fn validate_argument_type(
     }
 }
 
+fn finish_created_binding_work<T, H>(
+    result: Result<T, FunctionBindingCreationFailure<H>>,
+    work: CompileCheckpoints<'_>,
+) -> Result<T, FunctionBindingCreationFailure<H>> {
+    if matches!(
+        &result,
+        Err(FunctionBindingCreationFailure::Creator(_)
+            | FunctionBindingCreationFailure::Resource(_)
+            | FunctionBindingCreationFailure::Binding(FunctionBindingError::Control(_)))
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
 fn finish_binding_work<T>(
     result: Result<T, FunctionBindingError>,
     work: CompileCheckpoints<'_>,
@@ -1315,7 +1703,7 @@ pub(crate) fn digest_binding_definition(
     crate::pure_catalogue::digest_pure_attachment(hasher, binding.pure.as_ref());
 }
 
-fn invalid(message: &str) -> FunctionBindingError {
+pub(crate) fn invalid_binding(message: &str) -> FunctionBindingError {
     FunctionBindingError::InvalidBinding(message.into())
 }
 
@@ -1329,7 +1717,7 @@ impl From<crate::FunctionResolutionError> for FunctionBindingError {
     fn from(error: crate::FunctionResolutionError) -> Self {
         match error {
             crate::FunctionResolutionError::Control(error) => error.into(),
-            other => invalid(&other.to_string()),
+            other => invalid_binding(&other.to_string()),
         }
     }
 }

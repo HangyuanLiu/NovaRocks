@@ -26,13 +26,13 @@ use novarocks_execution::{
     runtime::{
         fragment::ExecutionResult,
         preparation_metadata::{
-            CompiledSchemaMetadataScope, CompiledSchemaSite, PreparationMetadataFailure,
+            CompiledSchemaSite, PreparationMetadataFailure, prepare_operator_schema_for_test,
         },
         query_memory::QueryMemoryBinding,
         runtime_state::RuntimeErrorState,
     },
 };
-use novarocks_local_program::{LocalProgram, StaticLayout};
+use novarocks_local_program::LocalProgram;
 use novarocks_type_contract::{MetadataRequestError, PureCompileControl};
 use novarocks_worker::PreparationControlLoan;
 use std::sync::Arc;
@@ -42,30 +42,11 @@ pub struct PreparedProjectMetadataForTest {
     pub factory: CompiledProjectProcessorFactory,
     pub schema: ChunkSchemaRef,
 }
-struct Capture<'a, 'host> {
-    host: CompiledProjectMetadataHost<'host>,
-    schema: &'a mut Option<ChunkSchemaRef>,
-}
-impl CompiledSchemaMetadataScope for Capture<'_, '_> {
-    fn materialize<B>(
-        &mut self,
-        program: &Arc<LocalProgram>,
-        site: CompiledSchemaSite,
-        layout: &StaticLayout,
-        body: B,
-    ) -> ExecutionResult<ChunkSchemaRef>
-    where
-        B: FnOnce() -> Result<ChunkSchemaRef, String>,
-    {
-        let schema = self.host.materialize(program, site, layout, body)?;
-        *self.schema = Some(Arc::clone(&schema));
-        Ok(schema)
-    }
-}
 pub fn prepare_project_metadata_for_test<'a>(
     compiled: CompiledTaskProgram,
     site: CompiledSchemaSite,
     binding: &'a QueryMemoryBinding,
+    tracker: Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
     preparation: &'a PreparationControlLoan<'a>,
     control: &'a dyn PureCompileControl,
     journal: &'a mut ProjectMetadataJournal,
@@ -78,22 +59,37 @@ pub fn prepare_project_metadata_for_test<'a>(
                 "GLOBAL fixture requires the actual native interpreter output",
             ),
         ))?;
-    let mut schema = None;
-    let mut host = Capture {
-        host: CompiledProjectMetadataHost::new(source, binding, preparation, control, journal),
-        schema: &mut schema,
-    };
+    let mut host = CompiledProjectMetadataHost::new(source, binding, preparation, control, journal);
     let error = Arc::new(RuntimeErrorState::default());
+    let node = match site {
+        CompiledSchemaSite::Project(node) => Some(node),
+        CompiledSchemaSite::FinalResult => None,
+        CompiledSchemaSite::AnalyticOutput(_) => {
+            return Err("Project fixture requires a Project or FinalResult site".into());
+        }
+    };
     let factory = novarocks_execution::exec::operators::prepare_project_factory_for_test(
         Arc::clone(prepared.program()),
-        site,
-        error,
-        &mut host,
+        node,
+        Arc::clone(&error),
     )?;
+    use novarocks_execution::exec::pipeline::operator_factory::OperatorFactory;
+    let mut operator = factory.create(1, 0);
+    let construction = novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+        novarocks_execution::exec::pipeline::pipeline::representation_construction_profile()
+            .map_err(novarocks_execution::exec::pipeline::operator::ConstructionFailure::from)?,
+        tracker, error,
+    )?;
+    operator.set_construction_factory(construction);
+    prepare_operator_schema_for_test(operator.as_mut(), &mut host)?;
+    let schema = operator
+        .prepared_schema_for_test()
+        .expect("actual Project schema prepared");
+    drop(operator);
     drop(host);
     Ok(PreparedProjectMetadataForTest {
         program: Arc::clone(prepared.program()),
         factory,
-        schema: schema.expect("the original schema callback completed"),
+        schema,
     })
 }

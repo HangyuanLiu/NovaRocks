@@ -52,7 +52,7 @@ use crate::{
     lowering::FragmentCompileError,
     union_flow::UnionRoot,
 };
-use arrow_schema::{FieldRef, Schema};
+
 use novarocks_local_program::{
     DiagnosticSourceNodeId, FilterConsumerAtJoinKey, FilterProducerAtExpr, JoinDistributionMode,
     JoinType, LocalOperatorId, LocalOperatorOrigin, LocalOperatorProvenance, MetricAggregation,
@@ -67,7 +67,7 @@ use novarocks_physical_plan::{
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ExpressionUseId, FunctionValueType,
-    PureCompileControl, arrow_data_types_exact_observed,
+    PureCompileControl,
 };
 use novarocks_types::SlotId;
 use std::{
@@ -386,12 +386,13 @@ impl JoinShape {
 
 /// Map every physical output occurrence to its canonical ordinal. `ports`
 /// gives each child's value-to-ordinal representatives.
-pub(crate) fn shape_join(
+pub(crate) fn shape_join_with_creation<H>(
     fragment: &Fragment,
     node: &PhysicalNode,
     ports: &BTreeMap<NodeId, BTreeMap<ValueId, usize>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<JoinShape, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<JoinShape, crate::FragmentCreationError<H>> {
     let orientation = orient_join(node)?;
     let probe = node.inputs[orientation.probe_input];
     let build = node.inputs[1 - orientation.probe_input];
@@ -404,7 +405,7 @@ pub(crate) fn shape_join(
     let values = fragment.values();
     let child_types = |child: NodeId,
                        nullable: bool,
-                       types: &mut Vec<FunctionValueType>,
+                       types: &mut Vec<(ValueId, bool)>,
                        work: &mut CompileCheckpoints<'_>|
      -> Result<usize, FragmentCompileError> {
         let columns = &fragment
@@ -414,13 +415,11 @@ pub(crate) fn shape_join(
             .output
             .columns;
         for value in columns.iter() {
-            let mut ty = values
+            let ty = &values
                 .get(value)
                 .ok_or(FragmentCompileError::Invalid("missing join input value"))?
-                .ty
-                .clone();
-            ty.nullable |= nullable;
-            types.push(ty);
+                .ty;
+            types.push((*value, ty.nullable() || nullable));
             work.step()?;
         }
         Ok(columns.len())
@@ -444,9 +443,10 @@ pub(crate) fn shape_join(
         let canonical = match definition.origin {
             ValueOrigin::NullExtended { node: owner, of } if owner == node.id => {
                 if !orientation.null_extends_build() {
-                    return Err(FragmentCompileError::Invalid(
+                    return Err((FragmentCompileError::Invalid(
                         "join kind publishes no NULL extension",
-                    ));
+                    ))
+                    .into());
                 }
                 let ordinal = *build_port.get(&of).ok_or(FragmentCompileError::Invalid(
                     "NULL extension source is not on the build side",
@@ -467,9 +467,10 @@ pub(crate) fn shape_join(
                         .ok_or(CompileControlError::ResourceExhausted)?
                 }
                 _ => {
-                    return Err(FragmentCompileError::Invalid(
+                    return Err((FragmentCompileError::Invalid(
                         "join output value is not valid for its local join kind",
-                    ));
+                    ))
+                    .into());
                 }
             },
         };
@@ -479,16 +480,22 @@ pub(crate) fn shape_join(
                 "join output maps outside its canonical output",
             ))?;
         work.flush()?;
-        let same = definition
-            .ty
-            .exactly_equals_observed::<FragmentCompileError>(expected, || {
-                work.step().map_err(Into::into)
-            })?;
+        let expected_type = &values
+            .get(&expected.0)
+            .ok_or(FragmentCompileError::Invalid("missing join input value"))?
+            .ty;
+        let same = definition.ty.nullable() == expected.1
+            && definition
+                .ty
+                .same_physical_binding_ignoring_root_nullability_observed(expected_type, || {
+                    work.step().map_err(FragmentCompileError::from)
+                })?;
         if !same {
-            return Err(unsupported(
+            return Err((unsupported(
                 node,
                 "join output type differs from its canonical source type",
-            ));
+            ))
+            .into());
         }
         sources.push(u32::try_from(canonical).map_err(|_| CompileControlError::ResourceExhausted)?);
         work.step()?;
@@ -498,11 +505,40 @@ pub(crate) fn shape_join(
         identity &= source as usize == ordinal;
         work.step()?;
     }
+    // Canonical output declarations are real retained results. The preceding
+    // source comparisons borrow the immutable input and never author a type.
+    let mut authored_types = Vec::new();
+    reserve_vec(&mut authored_types, canonical_types.len(), work)?;
+    for (source, nullable) in canonical_types {
+        let ty = &values
+            .get(&source)
+            .ok_or(FragmentCompileError::Invalid("missing join input value"))?
+            .ty;
+        work.flush()?;
+        let storage = creation.storage_lifetime();
+        let authored = ty.with_nullable_observed::<crate::FragmentCreationError<H>>(
+            nullable,
+            storage,
+            |layout| {
+                creation
+                    .request_layout(layout)
+                    .map_err(crate::FragmentCreationError::Creator)
+            },
+            |units| {
+                for _ in 0..units {
+                    work.step()?;
+                }
+                Ok(())
+            },
+        )?;
+        authored_types.push(authored);
+        work.step()?;
+    }
     Ok(JoinShape {
         orientation,
         probe,
         build,
-        canonical_types,
+        canonical_types: authored_types,
         sources,
         selection: !identity,
     })
@@ -807,7 +843,7 @@ pub(crate) struct JoinInput<'a> {
     clippy::too_many_arguments,
     reason = "The planned join, its two lowered inputs, the derived selection reads and its runtime-filter producers are independent inputs"
 )]
-pub(crate) fn lower_join(
+pub(crate) fn lower_join_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     planned: &PlannedJoin,
@@ -823,9 +859,10 @@ pub(crate) fn lower_join(
         novarocks_local_program::StaticFilterConsumer,
     )>,
     control: &dyn PureCompileControl,
-) -> Result<LoweredJoin, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<LoweredJoin, crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(
+    let result = lower_core_with_creation(
         package,
         node,
         planned,
@@ -837,12 +874,9 @@ pub(crate) fn lower_join(
         runtime_filters,
         runtime_filter_consumers,
         &mut work,
+        creation,
     );
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    crate::creation::finish_attempt(result, work)
 }
 
 fn layout_role_channels(
@@ -867,7 +901,7 @@ fn layout_role_channels(
     Ok(())
 }
 
-fn named_layout(
+fn named_layout_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     local: ProgramNodeId,
@@ -875,24 +909,15 @@ fn named_layout(
     slots: &[SlotId],
     labels: bool,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<StaticLayout, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<StaticLayout, crate::FragmentCreationError<H>> {
     // Full result labels are authoritative only when the entire ordered
     // physical output is the result port's, whichever node publishes it.
     let result = package
         .result()
         .filter(|result| labels && result.output.columns == node.output.columns);
-    let mut fields = Vec::new();
-    if package.original_metadata_namespace().is_none() {
-        reserve_vec(&mut fields, types.len(), work)?;
-    }
-    let mut original_fields = match package.original_metadata_namespace() {
-        Some(_) => {
-            let mut original_fields = Vec::new();
-            reserve_vec(&mut original_fields, types.len(), work)?;
-            Some(original_fields)
-        }
-        None => None,
-    };
+    let mut typed_layout =
+        crate::typed_layout::TypedLayoutBuilder::new_with_creation(types.len(), work, creation)?;
     for (ordinal, ty) in types.iter().enumerate() {
         let name = match result {
             Some(result) => {
@@ -900,38 +925,26 @@ fn named_layout(
                     .fields
                     .get(ordinal)
                     .ok_or(FragmentCompileError::Invalid("missing join result label"))?;
-                field.alias.as_deref().unwrap_or(&field.name).to_owned()
+                crate::typed_layout::copy_name_with_creation(
+                    field.alias.as_deref().unwrap_or(&field.name),
+                    work,
+                    creation,
+                )?
             }
-            None => format!("local_{}_{}", local.index(), ordinal),
+            None => crate::typed_layout::local_name_with_creation(
+                "local",
+                local.index(),
+                ordinal,
+                work,
+                creation,
+            )?,
         };
         work.flush()?;
-        if let Some(original_fields) = original_fields.as_mut() {
-            let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(ty, name);
-            work.flush()?;
-            original_fields.push(field?);
-        } else {
-            let field = ty.try_to_field(name);
-            work.flush()?;
-            fields.push(field?);
-        }
+        typed_layout.push_with_creation(ty, name, work, creation)?;
         work.step()?;
     }
     work.flush()?;
-    let layout = match (original_fields, package.original_metadata_namespace()) {
-        (Some(fields), Some(namespace)) => {
-            let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema();
-            StaticLayout::try_new_materialized_for_compile(
-                source,
-                Arc::from(slots),
-                work.control(),
-            )?
-        }
-        _ => StaticLayout::try_new_for_compile(
-            Arc::new(Schema::new(fields)),
-            Arc::from(slots),
-            work.control(),
-        )?,
-    };
+    let layout = typed_layout.finish_with_creation(slots, work, creation)?;
     work.flush()?;
     Ok(layout)
 }
@@ -981,7 +994,7 @@ fn lowered(
     clippy::too_many_arguments,
     reason = "Mirrors lower_join with the caller's checkpoint scope"
 )]
-fn lower_core(
+fn lower_core_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     planned: &PlannedJoin,
@@ -997,7 +1010,8 @@ fn lower_core(
         novarocks_local_program::StaticFilterConsumer,
     )>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<LoweredJoin, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<LoweredJoin, crate::FragmentCreationError<H>> {
     let fragment = package.fragment();
     let probe_types = channel_types(package, planned.probe, work)?;
     let build_types = channel_types(package, planned.build, work)?;
@@ -1006,9 +1020,10 @@ fn lower_core(
         || probe_types.len() != probe.layout.slots().len()
         || build_types.len() != build.layout.slots().len()
     {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "join input layouts differ from their planned channels",
-        ));
+        ))
+        .into());
     }
     // The scope is the probe occurrences followed by the build occurrences,
     // with the children's own fields and slot identities.
@@ -1018,60 +1033,37 @@ fn lower_core(
         .len()
         .checked_add(build.layout.slots().len())
         .ok_or(CompileControlError::ResourceExhausted)?;
-    let mut scope_fields: Vec<FieldRef> = Vec::new();
-    reserve_vec(&mut scope_fields, width, work)?;
+    let mut scope_builder =
+        crate::typed_layout::TypedLayoutBuilder::new_with_creation(width, work, creation)?;
     let mut scope_slots = Vec::new();
     reserve_vec(&mut scope_slots, width, work)?;
     for layout in [probe.layout, build.layout] {
-        for (field, slot) in layout.schema().fields().iter().zip(layout.slots()) {
-            scope_fields.push(Arc::clone(field));
+        for (ordinal, (field, slot)) in layout
+            .schema()
+            .fields()
+            .iter()
+            .zip(layout.slots())
+            .enumerate()
+        {
+            let binding = layout
+                .value_binding_at(ordinal)
+                .ok_or(FragmentCompileError::Invalid(
+                    "join child layout has no complete value binding",
+                ))?;
+            scope_builder.push_binding_with_creation(
+                binding,
+                crate::typed_layout::copy_name_with_creation(field.name(), work, creation)?,
+                work,
+                creation,
+            )?;
             scope_slots.push(*slot);
             work.step()?;
         }
     }
-    work.flush()?;
-    let scope = if probe.layout.metadata_materializations().is_some()
-        || build.layout.metadata_materializations().is_some()
-    {
-        let count = [probe.layout, build.layout]
-            .iter()
-            .try_fold(0usize, |count, layout| {
-                count
-                    .checked_add(
-                        layout
-                            .metadata_materializations()
-                            .map_or(0, |source| source.fields().len()),
-                    )
-                    .ok_or(CompileControlError::ResourceExhausted)
-            })?;
-        let mut loans = Vec::new();
-        reserve_vec(&mut loans, count, work)?;
-        for layout in [probe.layout, build.layout] {
-            if let Some(source) = layout.metadata_materializations() {
-                for loan in source.fields() {
-                    loans.push(loan.clone());
-                    work.step()?;
-                }
-            }
-        }
-        work.flush()?;
-        let schema = novarocks_type_contract::owned_resources::metadata_materialization::MaterializedMetadataMap::new_for_original_reserve().into_schema(scope_fields).into_shared();
-        let source = novarocks_type_contract::owned_resources::metadata_materialization::SchemaMetadataMaterializations::from_materialized_owners(schema, loans.into());
-        StaticLayout::try_new_materialized_for_compile(
-            source,
-            Arc::from(scope_slots),
-            work.control(),
-        )?
-    } else {
-        StaticLayout::try_new_for_compile(
-            Arc::new(Schema::new(scope_fields)),
-            Arc::from(scope_slots),
-            work.control(),
-        )?
-    };
+    let scope = scope_builder.finish_with_creation(&scope_slots, work, creation)?;
     work.flush()?;
     let join = planned.join;
-    let canonical = named_layout(
+    let canonical = named_layout_with_creation(
         package,
         node,
         join,
@@ -1079,6 +1071,7 @@ fn lower_core(
         &planned.canonical,
         planned.selection.is_none(),
         work,
+        creation,
     )?;
     let kind = match (&node.kind, planned.orientation.kind) {
         (NodeKind::HashJoin { keys, residual, .. }, LocalJoinKind::Hash(join_type)) => {
@@ -1110,14 +1103,12 @@ fn lower_core(
                 // The hash table compares exact carriers; a key pair whose
                 // carriers differ would need a BE cast, which is refused.
                 work.flush()?;
-                let same = probe_type.logical_type == build_type.logical_type
-                    && arrow_data_types_exact_observed::<FragmentCompileError>(
-                        &probe_type.data_type,
-                        &build_type.data_type,
-                        || work.step().map_err(Into::into),
-                    )?;
+                let same = probe_type
+                    .same_physical_binding_ignoring_root_nullability_observed(build_type, || {
+                        work.step().map_err(FragmentCompileError::from)
+                    })?;
                 if !same {
-                    return Err(unsupported(node, "join key carriers differ"));
+                    return Err((unsupported(node, "join key carriers differ")).into());
                 }
                 probe_keys.push(lowered(expressions, probe_key)?);
                 build_keys.push(lowered(expressions, build_key)?);
@@ -1144,9 +1135,10 @@ fn lower_core(
             reserve_vec(&mut consumers, runtime_filter_consumers.len(), work)?;
             for (key_ordinal, expr_id, consumer) in runtime_filter_consumers {
                 if probe_keys.get(key_ordinal) != Some(&expr_id) {
-                    return Err(FragmentCompileError::Invalid(
+                    return Err((FragmentCompileError::Invalid(
                         "probe consumer differs from its exact key ordinal",
-                    ));
+                    ))
+                    .into());
                 }
                 consumers.push(FilterConsumerAtJoinKey {
                     key_ordinal,
@@ -1174,9 +1166,10 @@ fn lower_core(
         (NodeKind::NestLoopJoin { .. }, LocalJoinKind::NestLoop(_))
             if !runtime_filters.is_empty() || !runtime_filter_consumers.is_empty() =>
         {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "nested-loop join has runtime-filter producers",
-            ));
+            ))
+            .into());
         }
         (NodeKind::NestLoopJoin { predicate, .. }, LocalJoinKind::NestLoop(join_type)) => {
             ProgramNodeKind::NestedLoopJoin {
@@ -1190,9 +1183,10 @@ fn lower_core(
             }
         }
         _ => {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "join family differs from its orientation",
-            ));
+            ))
+            .into());
         }
     };
     let pieces = if planned.selection.is_some() { 2 } else { 1 };
@@ -1271,9 +1265,10 @@ fn lower_core(
             || published.len() != sources.len()
             || node.output.columns.len() != sources.len()
         {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "join selection width differs from its physical output",
-            ));
+            ))
+            .into());
         }
         let local = ProgramNodeId::new(
             join.index()
@@ -1300,7 +1295,9 @@ fn lower_core(
             });
             work.step()?;
         }
-        let layout = named_layout(package, node, local, &types, published, true, work)?;
+        let layout = named_layout_with_creation(
+            package, node, local, &types, published, true, work, creation,
+        )?;
         layout_role_channels(
             local,
             ProgramChannelLayoutRole::NodeOutput,
@@ -1333,9 +1330,10 @@ fn lower_core(
             metrics,
         });
     } else if published != planned.canonical.as_ref() {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "join publishes slots other than its canonical output",
-        ));
+        ))
+        .into());
     }
     Ok(LoweredJoin {
         nodes,

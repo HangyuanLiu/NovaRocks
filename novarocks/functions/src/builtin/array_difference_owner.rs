@@ -77,7 +77,7 @@ pub(super) fn definition(
 
 pub(super) struct ArrayDifferenceOwner {
     op: super::array_difference_core::Operation,
-    resolver: BuiltinDynamicScalarResolver,
+    resolver: Arc<BuiltinDynamicScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
@@ -118,7 +118,7 @@ impl ArrayDifferenceOwner {
             .collect();
         Ok(Self {
             op,
-            resolver,
+            resolver: Arc::new(resolver),
             declaration,
             implementations,
         })
@@ -170,6 +170,10 @@ impl FunctionBindingResolver for ArrayDifferenceOwner {
 }
 
 impl PureFunctionMetadataOwner for ArrayDifferenceOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::dynamic_scalar(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -198,41 +202,21 @@ impl FunctionEffectOwner for ArrayDifferenceOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        let result = (|| {
-            let exact_header = input.function_id == self.declaration.function_id()
-                && input.kind == FunctionKind::Scalar;
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if !exact_header {
-                return Err(FunctionBindingError::UnknownFunction.into());
-            }
-            let exact_scope = input.environment.is_empty()
-                && (matches!(input.proof_scope, CallProofScope::Unconditional)
-                    || input.proof_scope == CallProofScope::Domain(input.context.domain));
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if !exact_scope {
-                return Err(FunctionBindingError::InvalidBinding(
-                    "array_difference has no environment dependencies and requires an exact proof scope"
-                        .into(),
-                )
-                .into());
-            }
-            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        self.refine_selected_core(input, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => {
-                        FunctionEffectOwnerError::Control(error)
-                    }
-                    other => FunctionEffectOwnerError::Owner(other),
-                })?;
-            Ok(self.call_effects(input.proof_scope))
-        })();
-        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
-            return result;
-        }
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        result
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_selected_core(input, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -243,50 +227,21 @@ impl PureScalarImplementation for ArrayDifferenceOwner {
         contract: Arc<ScalarCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        let result: Result<Arc<dyn PreparedScalarKernel>, KernelFailure> = (|| {
-            let exact_call = input.function_id == self.declaration.function_id()
-                && input.kind == FunctionKind::Scalar
-                && contract.function_id() == input.function_id
-                && std::ptr::eq(contract.selected(), input.selected)
-                && contract.context() == input.context
-                && contract.decimal_overflow_policy() == input.decimal_overflow_policy
-                && contract.effects() == &self.call_effects(input.proof_scope)
-                && input.environment.is_empty();
-            work.step().map_err(compile_failure)?;
-            if !exact_call {
-                return Err(invalid(
-                    "array_difference preparation differs from its exact checked call",
-                ));
-            }
-            work.flush().map_err(compile_failure)?;
+        self.prepare_selected_core(input, contract, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => compile_failure(error),
-                    _ => invalid("array_difference preparation has a stale selected binding"),
-                })?;
-            canonical_arguments(input, &mut work)?;
-            work.flush().map_err(compile_failure)?;
-            // The prepared object retains the same canonical contract. Its body is
-            // a static pure implementation and needs no live resolver or authority.
-            let prepared = Arc::new(PreparedArrayDifference {
-                contract,
-                op: self.op,
-            }) as Arc<dyn PreparedScalarKernel>;
-            work.flush().map_err(compile_failure)?;
-            Ok(prepared)
-        })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
-            return result;
-        }
-        work.finish().map_err(compile_failure)?;
-        result
+        })
+    }
+    fn prepare_scalar_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_selected_core(input, contract, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -327,8 +282,8 @@ fn canonical_arguments(
                 "array_difference preparation requires canonical value channels",
             ));
         };
-        let canonical = selected.logical_type == ValueLogicalType::Physical
-            && data_type_is_collection(&selected.data_type);
+        let canonical = selected.logical_type() == ValueLogicalType::Physical
+            && data_type_is_collection(selected.data_type());
         work.step().map_err(compile_failure)?;
         if !canonical {
             return Err(invalid(
@@ -344,8 +299,8 @@ fn canonical_arguments(
         }
     }
     let result = matches!(&input.selected.result_type, FunctionResultType::Scalar(value)
-        if value.logical_type == ValueLogicalType::Physical && value.nullable
-        && matches!(&value.data_type, DataType::List(field) if matches!(field.data_type(),DataType::Int64 | DataType::Float64)));
+        if value.logical_type() == ValueLogicalType::Physical && value.nullable()
+        && matches!(value.data_type(), DataType::List(field) if matches!(field.data_type(),DataType::Int64 | DataType::Float64)));
 
     work.step().map_err(compile_failure)?;
     if !result {
@@ -467,3 +422,96 @@ pub(super) fn prepared_for_test_with_control(
 #[cfg(test)]
 #[path = "array_difference_owner_tests.rs"]
 mod tests;
+
+impl ArrayDifferenceOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        let result = (|| {
+            let exact_header = input.function_id == self.declaration.function_id()
+                && input.kind == FunctionKind::Scalar;
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if !exact_header {
+                return Err(FunctionBindingError::UnknownFunction.into());
+            }
+            let exact_scope = input.environment.is_empty()
+                && (matches!(input.proof_scope, CallProofScope::Unconditional)
+                    || input.proof_scope == CallProofScope::Domain(input.context.domain));
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if !exact_scope {
+                return Err(FunctionBindingError::InvalidBinding(
+                    "array_difference has no environment dependencies and requires an exact proof scope"
+                        .into(),
+                )
+                .into());
+            }
+            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+                other => FunctionEffectOwnerError::Owner(other),
+            })?;
+            Ok(self.call_effects(input.proof_scope))
+        })();
+        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
+            return result;
+        }
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        result
+    }
+    fn prepare_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        let result: Result<Arc<dyn PreparedScalarKernel>, KernelFailure> = (|| {
+            let exact_call = input.function_id == self.declaration.function_id()
+                && input.kind == FunctionKind::Scalar
+                && contract.function_id() == input.function_id
+                && std::ptr::eq(contract.selected(), input.selected)
+                && contract.context() == input.context
+                && contract.decimal_overflow_policy() == input.decimal_overflow_policy
+                && contract.effects() == &self.call_effects(input.proof_scope)
+                && input.environment.is_empty();
+            work.step().map_err(compile_failure)?;
+            if !exact_call {
+                return Err(invalid(
+                    "array_difference preparation differs from its exact checked call",
+                ));
+            }
+            work.flush().map_err(compile_failure)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => compile_failure(error),
+                _ => invalid("array_difference preparation has a stale selected binding"),
+            })?;
+            canonical_arguments(input, &mut work)?;
+            work.flush().map_err(compile_failure)?;
+            // The prepared object retains the same canonical contract. Its body is
+            // a static pure implementation and needs no live resolver or authority.
+            let prepared = Arc::new(PreparedArrayDifference {
+                contract,
+                op: self.op,
+            }) as Arc<dyn PreparedScalarKernel>;
+            work.flush().map_err(compile_failure)?;
+            Ok(prepared)
+        })();
+        if matches!(
+            &result,
+            Err(KernelFailure::Cancelled
+                | KernelFailure::DeadlineExceeded
+                | KernelFailure::ResourceExhausted)
+        ) {
+            return result;
+        }
+        work.finish().map_err(compile_failure)?;
+        result
+    }
+}

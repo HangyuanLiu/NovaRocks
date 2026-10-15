@@ -89,20 +89,76 @@ impl ConnectorRowMutationIntent {
     }
 }
 
+enum MutationFieldValidationFailure {
+    Value(novarocks_type_contract::ValueTypeError),
+    Caller(ConnectorError),
+}
+impl From<novarocks_type_contract::ValueTypeError> for MutationFieldValidationFailure {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Value(error)
+    }
+}
+fn validate_mutation_execution_field(
+    field: &Field,
+    execution_type: &novarocks_type_contract::FunctionValueType,
+    mut observe: impl FnMut(usize) -> Result<(), ConnectorError>,
+) -> Result<(), ConnectorError> {
+    let matches = novarocks_connector_contract::write_field_matches_execution_type_observed::<
+        MutationFieldValidationFailure,
+    >(field, execution_type, |units| {
+        observe(units).map_err(MutationFieldValidationFailure::Caller)
+    })
+    .map_err(|error| match error {
+        MutationFieldValidationFailure::Caller(error) => error,
+        MutationFieldValidationFailure::Value(error) => {
+            ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+        }
+    })?;
+    if !matches {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "mutation source field conflicts with its complete execution declaration",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct ConnectorMutationSourceField {
     token: ConnectorWriteFieldToken,
     field: Field,
     source_ordinal: u32,
+    execution_type: Option<novarocks_type_contract::FunctionValueType>,
 }
 
 impl ConnectorMutationSourceField {
-    pub fn new(token: ConnectorWriteFieldToken, field: Field, source_ordinal: u32) -> Self {
-        Self {
+    /// Preserve the original provider Field and carry its independently
+    /// authored complete value binding. Source attributes decide no domain.
+    pub fn try_new_typed(
+        token: ConnectorWriteFieldToken,
+        field: Field,
+        source_ordinal: u32,
+        execution_type: novarocks_type_contract::FunctionValueType,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_typed_observed(token, field, source_ordinal, execution_type, |_| Ok(()))
+    }
+    pub fn try_new_typed_observed(
+        token: ConnectorWriteFieldToken,
+        field: Field,
+        source_ordinal: u32,
+        execution_type: novarocks_type_contract::FunctionValueType,
+        observe: impl FnMut(usize) -> Result<(), ConnectorError>,
+    ) -> Result<Self, ConnectorError> {
+        validate_mutation_execution_field(&field, &execution_type, observe)?;
+        Ok(Self {
             token,
             field,
             source_ordinal,
-        }
+            execution_type: Some(execution_type),
+        })
+    }
+    pub fn execution_type(&self) -> Option<&novarocks_type_contract::FunctionValueType> {
+        self.execution_type.as_ref()
     }
     pub const fn token(&self) -> ConnectorWriteFieldToken {
         self.token
@@ -120,15 +176,37 @@ pub struct ConnectorMutationTargetField {
     token: ConnectorWriteFieldToken,
     field: Field,
     target_ordinal: u32,
+    execution_type: Option<novarocks_type_contract::FunctionValueType>,
 }
 
 impl ConnectorMutationTargetField {
-    pub fn new(token: ConnectorWriteFieldToken, field: Field, target_ordinal: u32) -> Self {
-        Self {
+    /// Preserve the original provider Field and carry its independently
+    /// authored complete value binding. Source attributes decide no domain.
+    pub fn try_new_typed(
+        token: ConnectorWriteFieldToken,
+        field: Field,
+        target_ordinal: u32,
+        execution_type: novarocks_type_contract::FunctionValueType,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_typed_observed(token, field, target_ordinal, execution_type, |_| Ok(()))
+    }
+    pub fn try_new_typed_observed(
+        token: ConnectorWriteFieldToken,
+        field: Field,
+        target_ordinal: u32,
+        execution_type: novarocks_type_contract::FunctionValueType,
+        observe: impl FnMut(usize) -> Result<(), ConnectorError>,
+    ) -> Result<Self, ConnectorError> {
+        validate_mutation_execution_field(&field, &execution_type, observe)?;
+        Ok(Self {
             token,
             field,
             target_ordinal,
-        }
+            execution_type: Some(execution_type),
+        })
+    }
+    pub fn execution_type(&self) -> Option<&novarocks_type_contract::FunctionValueType> {
+        self.execution_type.as_ref()
     }
     pub const fn token(&self) -> ConnectorWriteFieldToken {
         self.token
@@ -210,6 +288,7 @@ pub struct ConnectorMutationSelectionFieldRef<'a> {
     role: ConnectorMutationSelectionFieldRole,
     ordinal: u32,
     field: &'a Field,
+    execution_type: Option<&'a novarocks_type_contract::FunctionValueType>,
 }
 
 impl<'a> ConnectorMutationSelectionFieldRef<'a> {
@@ -225,6 +304,9 @@ impl<'a> ConnectorMutationSelectionFieldRef<'a> {
         self.ordinal
     }
 
+    pub const fn execution_type(&self) -> Option<&'a novarocks_type_contract::FunctionValueType> {
+        self.execution_type
+    }
     pub const fn field(&self) -> &'a Field {
         self.field
     }
@@ -413,6 +495,7 @@ impl ConnectorMutationMatchContract {
                 role: ConnectorMutationSelectionFieldRole::Identity,
                 ordinal: field.source_ordinal(),
                 field: field.field(),
+                execution_type: field.execution_type(),
             })
             .or_else(|| {
                 self.before_fields
@@ -423,6 +506,7 @@ impl ConnectorMutationMatchContract {
                         role: ConnectorMutationSelectionFieldRole::BeforeImage,
                         ordinal: field.target_ordinal(),
                         field: field.field(),
+                        execution_type: field.execution_type(),
                     })
             })
             .or_else(|| {
@@ -434,6 +518,7 @@ impl ConnectorMutationMatchContract {
                         role: ConnectorMutationSelectionFieldRole::AfterImage,
                         ordinal: field.target_ordinal(),
                         field: field.field(),
+                        execution_type: field.execution_type(),
                     })
             })
             .or_else(|| {
@@ -442,6 +527,7 @@ impl ConnectorMutationMatchContract {
                     role: ConnectorMutationSelectionFieldRole::Effect,
                     ordinal: self.effect_field.target_ordinal(),
                     field: self.effect_field.field(),
+                    execution_type: None,
                 })
             })
     }
@@ -2356,7 +2442,7 @@ fn match_digest(
     effect: &ConnectorMutationEffectField,
 ) -> Result<[u8; 32], ConnectorError> {
     let mut hasher = Sha256::new();
-    hasher.update(b"novarocks.connector-row-mutation-match.v1\0");
+    hasher.update(b"novarocks.connector-row-mutation-match.v2\0");
     digest_owner(&mut hasher, owner);
     digest_bytes(&mut hasher, table.payload());
     hasher.update(base.digest());
@@ -2364,11 +2450,13 @@ fn match_digest(
         hasher.update(field.token.to_bytes());
         hasher.update(field.source_ordinal.to_be_bytes());
         match_bounds::digest_debug_field(&mut hasher, &field.field)?;
+        digest_match_execution_type(&mut hasher, field.execution_type())?;
     }
     for field in before.iter().chain(after) {
         hasher.update(field.token.to_bytes());
         hasher.update(field.target_ordinal.to_be_bytes());
         match_bounds::digest_debug_field(&mut hasher, &field.field)?;
+        digest_match_execution_type(&mut hasher, field.execution_type())?;
     }
     for token in unique {
         hasher.update(token.to_bytes());
@@ -2378,6 +2466,22 @@ fn match_digest(
     match_bounds::digest_debug_field(&mut hasher, &effect.field)?;
     Ok(hasher.finalize().into())
 }
+fn digest_match_execution_type(
+    hasher: &mut Sha256,
+    execution_type: Option<&novarocks_type_contract::FunctionValueType>,
+) -> Result<(), ConnectorError> {
+    match execution_type {
+        Some(value) => {
+            hasher.update(b"complete-execution-binding\0");
+            match_bounds::digest_execution_type(hasher, value)
+        }
+        None => Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "row-mutation match field lacks its complete execution declaration",
+        )),
+    }
+}
+
 fn route_digest(
     route: ConnectorWriteRouteId,
     cohort: ConnectorWriteCohortId,
@@ -3055,17 +3159,33 @@ mod tests {
             owner.clone(),
             table.clone(),
             base.clone(),
-            vec![ConnectorMutationSourceField::new(
-                identity,
-                Field::new("id", DataType::Int64, true),
-                0,
-            )],
+            vec![
+                ConnectorMutationSourceField::try_new_typed(
+                    identity,
+                    Field::new("id", DataType::Int64, true),
+                    0,
+                    super::typed_execution_fields_tests::value(
+                        novarocks_type_contract::ValueKind::Scalar(DataType::Int64),
+                        DataType::Int64,
+                        true,
+                    ),
+                )
+                .expect("explicit BIGINT mutation fixture"),
+            ],
             vec![],
-            vec![ConnectorMutationTargetField::new(
-                after,
-                Field::new("value", DataType::Int64, false),
-                1,
-            )],
+            vec![
+                ConnectorMutationTargetField::try_new_typed(
+                    after,
+                    Field::new("value", DataType::Int64, false),
+                    1,
+                    super::typed_execution_fields_tests::value(
+                        novarocks_type_contract::ValueKind::Scalar(DataType::Int64),
+                        DataType::Int64,
+                        false,
+                    ),
+                )
+                .expect("explicit BIGINT mutation fixture"),
+            ],
             vec![identity],
             ConnectorMutationEffectField::try_new(
                 effect,
@@ -3629,11 +3749,19 @@ mod tests {
             owner.clone(),
             table.clone(),
             base_version.clone(),
-            vec![ConnectorMutationSourceField::new(
-                identity_token,
-                Field::new("id", DataType::Int64, false),
-                0,
-            )],
+            vec![
+                ConnectorMutationSourceField::try_new_typed(
+                    identity_token,
+                    Field::new("id", DataType::Int64, false),
+                    0,
+                    super::typed_execution_fields_tests::value(
+                        novarocks_type_contract::ValueKind::Scalar(DataType::Int64),
+                        DataType::Int64,
+                        false,
+                    ),
+                )
+                .expect("explicit BIGINT mutation fixture"),
+            ],
             Vec::new(),
             Vec::new(),
             vec![identity_token],
@@ -3830,3 +3958,338 @@ mod tests {
 #[cfg(test)]
 #[path = "row_mutation/source_receipt_tests.rs"]
 mod source_receipt_tests;
+
+#[cfg(test)]
+mod typed_execution_fields_tests {
+    use super::*;
+    use novarocks_type_contract::{
+        FunctionValueType, TypedValueBinding, ValueKind, ValueLayout, ValueLogicalType,
+        ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    use std::sync::Arc;
+    pub(super) fn value(kind: ValueKind, carrier: DataType, nullable: bool) -> FunctionValueType {
+        let storage = ValueTypeStorageLifetime::pure();
+        FunctionValueType::try_from_typed_binding(
+            TypedValueBinding::try_new(
+                ValueTypeRef::try_new(kind, nullable, storage.clone()).unwrap(),
+                ValueLayout::try_new(&carrier, storage).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn mutation_field_keeps_explicit_nested_json_and_opaque_source_attributes() {
+        let item = value(
+            ValueKind::Nominal(ValueLogicalType::Json),
+            DataType::Utf8,
+            false,
+        );
+        let carrier = DataType::List(Arc::new(Field::new("item", DataType::Utf8, false)));
+        let declared = value(
+            ValueKind::List(item.value_type().clone()),
+            carrier.clone(),
+            true,
+        );
+        let source = Field::new("document", carrier, true).with_metadata(HashMap::from([(
+            "nr.logical.type".into(),
+            "uninterpreted provider attribute".into(),
+        )]));
+        let token = ConnectorWriteFieldToken::from_bytes([2; 32]);
+        let field =
+            ConnectorMutationTargetField::try_new_typed(token, source.clone(), 7, declared.clone())
+                .unwrap();
+        assert_eq!(field.token(), token);
+        assert_eq!(field.target_ordinal(), 7);
+        assert_eq!(field.field(), &source);
+        assert_eq!(field.execution_type(), Some(&declared));
+        let ordinary = value(ValueKind::String, DataType::Utf8, false);
+        let marker = Field::new("identity", DataType::Utf8, false)
+            .with_metadata(HashMap::from([("nr.logical.type".into(), "JSON".into())]));
+        let field =
+            ConnectorMutationSourceField::try_new_typed(token, marker.clone(), 0, ordinary.clone())
+                .unwrap();
+        assert_eq!(field.field(), &marker);
+        assert_eq!(
+            field.execution_type(),
+            Some(&ordinary),
+            "source attributes author no domain"
+        );
+    }
+    #[test]
+    fn mutation_field_rejects_exact_layout_and_child_nullability_drift() {
+        let token = ConnectorWriteFieldToken::from_bytes([3; 32]);
+        let child = value(
+            ValueKind::Nominal(ValueLogicalType::Json),
+            DataType::Utf8,
+            false,
+        );
+        let declared = value(
+            ValueKind::List(child.value_type().clone()),
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+            true,
+        );
+        let widened = Field::new(
+            "document",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        );
+        assert_eq!(
+            ConnectorMutationTargetField::try_new_typed(token, widened, 0, declared)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        let declared = value(ValueKind::Scalar(DataType::Int64), DataType::Int64, false);
+        assert_eq!(
+            ConnectorMutationSourceField::try_new_typed(
+                token,
+                Field::new("id", DataType::Int32, false),
+                0,
+                declared.clone()
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            ConnectorMutationSourceField::try_new_typed(
+                token,
+                Field::new("id", DataType::Int64, true),
+                0,
+                declared
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
+    #[test]
+    fn mutation_field_first_original_control_refusal_has_no_tail() {
+        let token = ConnectorWriteFieldToken::from_bytes([4; 32]);
+        let declared = value(ValueKind::Scalar(DataType::Int64), DataType::Int64, false);
+        let mut calls = 0;
+        let failure = ConnectorMutationSourceField::try_new_typed_observed(
+            token,
+            Field::new("id", DataType::Int64, false),
+            0,
+            declared,
+            |_| {
+                calls += 1;
+                assert_eq!(calls, 1, "callback after first refusal");
+                Err(ConnectorError::new(
+                    ConnectorErrorKind::Cancelled,
+                    "original mutation declaration control",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(failure.kind(), ConnectorErrorKind::Cancelled);
+        assert_eq!(failure.message(), "original mutation declaration control");
+    }
+}
+
+#[cfg(test)]
+mod typed_match_digest_tests {
+    use super::typed_execution_fields_tests::value;
+    use super::*;
+    use novarocks_type_contract::{FunctionValueType, ValueKind, ValueLogicalType};
+    use std::sync::Arc;
+
+    fn contract(
+        identity_type: FunctionValueType,
+        before_type: FunctionValueType,
+        after_type: FunctionValueType,
+        after_attributes: HashMap<String, String>,
+    ) -> ConnectorMutationMatchContract {
+        let instance = super::super::ConnectorInstanceId::parse("iceberg").unwrap();
+        let owner = ConnectorProviderBindingKey {
+            instance_id: instance.clone(),
+            incarnation: super::super::ProviderBindingEpoch::from_bytes([8; 16]),
+        };
+        let identity = ConnectorWriteFieldToken::from_bytes([1; 32]);
+        ConnectorMutationMatchContract::try_new(
+            owner,
+            ConnectorTableHandle::try_new(instance, Bytes::from_static(b"table")).unwrap(),
+            ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).unwrap(),
+            vec![
+                ConnectorMutationSourceField::try_new_typed(
+                    identity,
+                    Field::new(
+                        "id",
+                        identity_type.data_type().clone(),
+                        identity_type.nullable(),
+                    ),
+                    0,
+                    identity_type,
+                )
+                .unwrap(),
+            ],
+            vec![
+                ConnectorMutationTargetField::try_new_typed(
+                    ConnectorWriteFieldToken::from_bytes([2; 32]),
+                    Field::new(
+                        "before",
+                        before_type.data_type().clone(),
+                        before_type.nullable(),
+                    ),
+                    1,
+                    before_type,
+                )
+                .unwrap(),
+            ],
+            vec![
+                ConnectorMutationTargetField::try_new_typed(
+                    ConnectorWriteFieldToken::from_bytes([3; 32]),
+                    Field::new(
+                        "after",
+                        after_type.data_type().clone(),
+                        after_type.nullable(),
+                    )
+                    .with_metadata(after_attributes),
+                    2,
+                    after_type,
+                )
+                .unwrap(),
+            ],
+            vec![identity],
+            ConnectorMutationEffectField::try_new(
+                ConnectorWriteFieldToken::from_bytes([4; 32]),
+                Field::new("effect", DataType::Int8, false),
+                3,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+    fn text() -> FunctionValueType {
+        value(ValueKind::String, DataType::Utf8, false)
+    }
+    fn json() -> FunctionValueType {
+        value(
+            ValueKind::Nominal(ValueLogicalType::Json),
+            DataType::Utf8,
+            false,
+        )
+    }
+    #[test]
+    fn match_identity_covers_same_carrier_domain_in_each_declared_role() {
+        let baseline = contract(text(), text(), text(), HashMap::new());
+        for changed in [
+            contract(json(), text(), text(), HashMap::new()),
+            contract(text(), json(), text(), HashMap::new()),
+            contract(text(), text(), json(), HashMap::new()),
+        ] {
+            // Arrow names, NULL promises, attrs and carriers are identical.
+            assert_eq!(
+                baseline.identity_fields()[0].field(),
+                changed.identity_fields()[0].field()
+            );
+            assert_eq!(
+                baseline.before_fields()[0].field(),
+                changed.before_fields()[0].field()
+            );
+            assert_eq!(
+                baseline.after_fields()[0].field(),
+                changed.after_fields()[0].field()
+            );
+            assert_ne!(baseline.digest(), changed.digest());
+            changed.validate().unwrap();
+        }
+    }
+    #[test]
+    fn match_identity_distinguishes_uuid_from_largeint_without_source_markers() {
+        let uuid = value(
+            ValueKind::Nominal(ValueLogicalType::Uuid),
+            DataType::FixedSizeBinary(16),
+            false,
+        );
+        let largeint = value(
+            ValueKind::Nominal(ValueLogicalType::LargeInt),
+            DataType::FixedSizeBinary(16),
+            false,
+        );
+        let first = contract(text(), text(), uuid, HashMap::new());
+        let second = contract(text(), text(), largeint, HashMap::new());
+        assert_eq!(
+            first.after_fields()[0].field(),
+            second.after_fields()[0].field()
+        );
+        assert_eq!(first.after_fields()[0].field().metadata().capacity(), 0);
+        assert_ne!(first.digest(), second.digest());
+    }
+    #[test]
+    fn match_identity_reads_complete_nested_binding_and_is_owner_independent() {
+        let nested = |child: FunctionValueType| {
+            value(
+                ValueKind::List(child.value_type().clone()),
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    child.data_type().clone(),
+                    child.nullable(),
+                ))),
+                true,
+            )
+        };
+        let first_type = nested(json());
+        let second_type = nested(json());
+        let (DataType::List(first_item), DataType::List(second_item)) =
+            (first_type.data_type(), second_type.data_type())
+        else {
+            panic!("declared List carrier");
+        };
+        assert!(!Arc::ptr_eq(first_item, second_item));
+        let first = contract(text(), text(), first_type, HashMap::new());
+        let independently_equal = contract(text(), text(), second_type, HashMap::new());
+        let text_child = contract(text(), text(), nested(text()), HashMap::new());
+        assert_eq!(
+            first.after_fields()[0].field(),
+            text_child.after_fields()[0].field()
+        );
+        assert_eq!(first.digest(), independently_equal.digest());
+        assert_ne!(first.digest(), text_child.digest());
+    }
+    #[test]
+    fn match_source_attributes_and_selection_schema_identity_stay_separate() {
+        let first = contract(
+            text(),
+            text(),
+            json(),
+            HashMap::from([("opaque".into(), "first".into())]),
+        );
+        let second = contract(
+            text(),
+            text(),
+            json(),
+            HashMap::from([("opaque".into(), "second".into())]),
+        );
+        assert_eq!(
+            first.after_fields()[0].execution_type(),
+            second.after_fields()[0].execution_type()
+        );
+        assert_ne!(first.digest(), second.digest());
+        let schema = Schema::new(vec![Field::new("after", DataType::Utf8, false)]);
+        assert_eq!(
+            canonical_schema_digest(&schema).unwrap(),
+            canonical_schema_digest(&Schema::new(vec![
+                first.after_fields()[0]
+                    .field()
+                    .clone()
+                    .with_metadata(HashMap::new())
+            ]))
+            .unwrap()
+        );
+    }
+    #[test]
+    fn match_identity_refuses_missing_declaration_in_tests_and_production() {
+        let mut typed = contract(text(), text(), json(), HashMap::new());
+        typed.identity_fields[0].execution_type = None;
+        let failure = typed.validate().unwrap_err();
+        assert_eq!(failure.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            failure.message(),
+            "row-mutation match field lacks its complete execution declaration"
+        );
+    }
+}

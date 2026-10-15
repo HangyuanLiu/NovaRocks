@@ -517,9 +517,9 @@ fn sql_repeat_fresh_composer_consumes_late_nullable_operational_requests() {
         else {
             panic!("late nonconstant source");
         };
-        assert!(!original.nullable);
-        assert!(late.nullable);
-        assert!(scope.source.ty.nullable);
+        assert!(!original.nullable());
+        assert!(late.nullable());
+        assert!(scope.source.ty.nullable());
         assert!(canonical.expected_result_type.is_none());
     }
     work.finish().unwrap();

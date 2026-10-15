@@ -221,8 +221,13 @@ fn actual_cv_rollup_keeps_selected_values_complete_type_and_last_exact_output() 
         ),
     );
     assert!(
+        fixture.plan(&Control::good()).unwrap().is_some(),
+        "source field metadata does not author value identity"
+    );
+    fixture.query_key = insert(&mut fixture.query, integer(vec![41], 0, HashMap::new()));
+    assert!(
         fixture.plan(&Control::good()).unwrap().is_none(),
-        "source field metadata is part of exact CV identity"
+        "different selected values cannot reuse the grouping dimension"
     );
 }
 

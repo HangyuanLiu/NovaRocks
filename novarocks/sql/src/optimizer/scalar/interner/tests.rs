@@ -216,7 +216,21 @@ fn full_types_metadata_and_nullability_are_exact_even_in_the_same_bucket() {
         ))
     };
     let first_ty = FunctionValueType::new(DataType::List(field("first")), false);
-    let second_ty = FunctionValueType::new(DataType::List(field("second")), false);
+    let second_ty = FunctionValueType::new(
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        false,
+    );
+    assert_eq!(
+        forced(
+            &mut arena,
+            column(),
+            FunctionValueType::new(DataType::List(field("second")), false),
+            &control
+        )
+        .unwrap(),
+        forced(&mut arena, column(), first_ty.clone(), &control).unwrap(),
+        "source attributes do not author value identity"
+    );
     let first = forced(&mut arena, column(), first_ty.clone(), &control).unwrap();
     assert_eq!(
         forced(&mut arena, column(), first_ty.clone(), &control).unwrap(),
@@ -227,7 +241,7 @@ fn full_types_metadata_and_nullability_are_exact_even_in_the_same_bucket() {
         first
     );
     let mut nullable = first_ty;
-    nullable.nullable = true;
+    nullable = nullable.with_nullable(true).unwrap();
     assert_ne!(
         forced(&mut arena, column(), nullable, &control).unwrap(),
         first
@@ -240,7 +254,12 @@ fn full_types_metadata_and_nullability_are_exact_even_in_the_same_bucket() {
     )
     .unwrap();
     let mut json = FunctionValueType::new(DataType::Utf8, false);
-    json.logical_type = novarocks_type_contract::ValueLogicalType::Json;
+    json = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+        json.data_type().clone(),
+        json.nullable(),
+        novarocks_type_contract::ValueLogicalType::Json,
+    )
+    .unwrap();
     assert_ne!(
         forced(&mut arena, column(), json, &control).unwrap(),
         physical

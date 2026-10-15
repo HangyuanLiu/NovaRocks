@@ -956,6 +956,7 @@ fn dual_demand_program() -> Arc<LocalProgram> {
         &fixture.fragment,
         &expression_uses,
         vec![FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,

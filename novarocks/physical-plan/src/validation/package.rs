@@ -346,7 +346,7 @@ fn validate_package_scans(input: &FragmentPackageInput, errors: &mut ValidationC
                 .all(|(assignment, field)| {
                     novarocks_connector_contract::connector_type_accepts_arrow(
                         assignment.value_type(),
-                        &field.ty.data_type,
+                        &field.ty.data_type(),
                     )
                 })
         {
@@ -454,17 +454,22 @@ fn validate_package_writes(input: &FragmentPackageInput, errors: &mut Validation
                         "token"
                     } else if field.field().name() != target.provider_name.as_ref() {
                         "name"
-                    } else if novarocks_type_contract::field_logical_type(field.field())
-                        != Ok(target.ty.logical_type)
+                    } else if let Some(actual) = field.execution_type() {
+                        if actual.nullable() != target.ty.nullable() {
+                            "nullable"
+                        } else if !actual.same_semantics(&target.ty) {
+                            "value_type"
+                        } else if actual.typed_binding().layout()
+                            != target.ty.typed_binding().layout()
+                        {
+                            "value_layout"
+                        } else {
+                            return None;
+                        }
+                    } else if let Some(part) =
+                        legacy_writer_field_difference(field.field(), &target.ty)
                     {
-                        "logical_type"
-                    } else if !novarocks_connector_contract::arrow_data_types_exact(
-                        field.field().data_type(),
-                        &target.ty.data_type,
-                    ) {
-                        "data_type"
-                    } else if field.field().is_nullable() != target.ty.nullable {
-                        "nullable"
+                        part
                     } else {
                         return None;
                     };
@@ -553,5 +558,26 @@ fn validate_public_read_properties(
             path,
             "frozen read source properties differ from their exact physical column projection",
         ));
+    }
+}
+
+/// Expansion-only adapter for existing provider drafts. P05 supplies complete
+/// execution projections; P07 removes this None branch and its metadata law.
+/// This is the prior field comparison, never the author of a new typed binding.
+fn legacy_writer_field_difference(
+    field: &arrow_schema::Field,
+    target: &crate::ValueType,
+) -> Option<&'static str> {
+    if novarocks_type_contract::field_logical_type(field) != Ok(target.logical_type()) {
+        Some("logical_type")
+    } else if !novarocks_connector_contract::arrow_data_types_exact(
+        field.data_type(),
+        target.data_type(),
+    ) {
+        Some("data_type")
+    } else if field.is_nullable() != target.nullable() {
+        Some("nullable")
+    } else {
+        None
     }
 }

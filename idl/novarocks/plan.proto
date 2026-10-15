@@ -30,6 +30,12 @@ import "connector_read.proto";
 import "connector_write.proto";
 import "expr.proto";
 import "result.proto";
+import "value_type.proto";
+import "arrow_type.proto";
+import "call_request.proto";
+import "physical_type_v2.proto";
+import "physical_semantics_v2.proto";
+import "physical_control_v2.proto";
 
 // Whole-query distributed plan.
 // Owner: produced by the future FE/native plan encoder and consumed by the
@@ -54,6 +60,34 @@ message PlanFragment {
   optional uint32 cte_id = 8;                            // CTE id when this fragment is CTE-owned.
   repeated CteExchangeBinding cte_exchange_nodes = 9;    // CTE exchange bindings inside this fragment.
   RuntimeFilterBindingTable runtime_filter_bindings = 10; // fragment-local static runtime-filter bindings.
+  // Owns ordinary expression/output/scan/aggregate/static-filter TypeDesc refs.
+  ExecutionTypeTable execution_types = 11;
+  // Original binding requests and source constants have fragment-local owners.
+  novarocks.call_request.FragmentCallRequests original_call_requests = 12;
+  repeated novarocks.call_request.IpcConstantPool constants = 13;
+  // Source-only carrier/field namespace: semantic and binding refs are invalid.
+  novarocks.physical_type_v2.SourceFieldTable constant_source_fields = 14;
+  // Original semantic values required by this fragment's frozen writer calls.
+  novarocks.physical_semantics_v2.SemanticParameters writer_semantic_parameters = 15;
+  // Original frozen control and call facts; absence is never a default scope.
+  novarocks.physical_control_v2.ExpressionControl expression_control = 16;
+  novarocks.physical_semantics_v2.FrozenCalls frozen_calls = 17;
+  novarocks.physical_semantics_v2.SemanticParameters semantic_parameters = 18;
+}
+
+// One explicit owner's complete value bindings. Logical and binding IDs form
+// independent sparse namespaces. References never use an implicit latest table.
+message ExecutionTypeTable {
+  repeated novarocks.value_type.LogicalTypeDefinition logical_types = 1;
+  repeated ExecutionValueBinding value_bindings = 2;
+}
+
+message ExecutionValueBinding {
+  optional uint32 id = 1;
+  optional uint32 logical_type_id = 2;
+  // Accurate value layout; per-batch encoding and BE capabilities are separate.
+  // Nested novarocks.arrow_type.ArrowPhysicalField logical refs use this same table's logical IDs.
+  novarocks.arrow_type.ArrowPhysicalType value_layout = 3;
 }
 
 // Binding between one CTE and its exchange receiver nodes.
@@ -114,24 +148,21 @@ message TableWriterNode {
 // contains the fixed prefix followed by the complete typed auxiliary tail.
 message WriterMultiplexSchema {
   uint32 contract_version = 1;
-  repeated ArrowPhysicalColumn columns = 2;
-  repeated ArrowFieldMetadataEntry schema_metadata = 3;
+  repeated novarocks.arrow_type.ArrowPhysicalColumn columns = 2;
+  reserved 3;
+  reserved "schema_metadata";
+  // Owns logical references in this schema's recursive physical fields.
+  repeated novarocks.value_type.LogicalTypeDefinition logical_types = 4;
 }
 
 // Versioned, exact schema of the fixed Root write-result relation.
 message RootWriteResultSchema {
   uint32 contract_version = 1;
-  repeated ArrowPhysicalColumn columns = 2;
-  repeated ArrowFieldMetadataEntry schema_metadata = 3;
-}
-
-// Lossless Arrow schema for an internal execution relation. The enclosing
-// operator owns the semantic contract; this carrier preserves its exact
-// physical fields and slot identities without routing them through SQL
-// TypeDesc normalization.
-message ArrowPhysicalSchema {
-  repeated ArrowPhysicalColumn columns = 1;
-  repeated ArrowFieldMetadataEntry schema_metadata = 2;
+  repeated novarocks.arrow_type.ArrowPhysicalColumn columns = 2;
+  reserved 3;
+  reserved "schema_metadata";
+  // Owns logical references in this schema's recursive physical fields.
+  repeated novarocks.value_type.LogicalTypeDefinition logical_types = 4;
 }
 
 message WriterPartialAggregatePlan {
@@ -176,151 +207,6 @@ message WriterGroupedUnpivotMapping {
   repeated UnpivotConstant constants = 3;
 }
 
-// A slot-bound Arrow field used by internal execution relations. Unlike the
-// SQL TypeDesc carrier, this descriptor preserves the exact Arrow physical
-// representation and every field-level contract bit.
-message ArrowPhysicalColumn {
-  uint32 slot_id = 1;
-  ArrowPhysicalField field = 2;
-  bool is_internal = 3;
-}
-
-message ArrowPhysicalField {
-  string name = 1;
-  bool nullable = 2;
-  ArrowPhysicalType type = 3;
-  repeated ArrowFieldMetadataEntry metadata = 4;
-  optional int64 dictionary_id = 5;
-  optional bool dictionary_is_ordered = 6;
-}
-
-// Metadata is encoded as a sorted repeated entry rather than a protobuf map so
-// duplicate keys and non-canonical ordering can be rejected at ingress.
-message ArrowFieldMetadataEntry {
-  string key = 1;
-  string value = 2;
-}
-
-message ArrowPhysicalType {
-  oneof kind {
-    ArrowPrimitiveType primitive = 1;
-    ArrowTimestampType timestamp = 2;
-    ArrowTimeType time32 = 3;
-    ArrowTimeType time64 = 4;
-    ArrowTimeType duration = 5;
-    ArrowIntervalUnit interval = 6;
-    int32 fixed_size_binary = 7;
-    ArrowDecimalType decimal32 = 8;
-    ArrowDecimalType decimal64 = 9;
-    ArrowDecimalType decimal128 = 10;
-    ArrowDecimalType decimal256 = 11;
-    ArrowPhysicalField list = 12;
-    ArrowPhysicalField list_view = 13;
-    ArrowFixedSizeListType fixed_size_list = 14;
-    ArrowPhysicalField large_list = 15;
-    ArrowPhysicalField large_list_view = 16;
-    ArrowStructType struct_type = 17;
-    ArrowUnionType union_type = 18;
-    ArrowDictionaryType dictionary = 19;
-    ArrowMapType map = 20;
-    ArrowRunEndEncodedType run_end_encoded = 21;
-  }
-}
-
-enum ArrowPrimitiveType {
-  ARROW_PRIMITIVE_TYPE_UNSPECIFIED = 0;
-  ARROW_PRIMITIVE_TYPE_NULL = 1;
-  ARROW_PRIMITIVE_TYPE_BOOLEAN = 2;
-  ARROW_PRIMITIVE_TYPE_INT8 = 3;
-  ARROW_PRIMITIVE_TYPE_INT16 = 4;
-  ARROW_PRIMITIVE_TYPE_INT32 = 5;
-  ARROW_PRIMITIVE_TYPE_INT64 = 6;
-  ARROW_PRIMITIVE_TYPE_UINT8 = 7;
-  ARROW_PRIMITIVE_TYPE_UINT16 = 8;
-  ARROW_PRIMITIVE_TYPE_UINT32 = 9;
-  ARROW_PRIMITIVE_TYPE_UINT64 = 10;
-  ARROW_PRIMITIVE_TYPE_FLOAT16 = 11;
-  ARROW_PRIMITIVE_TYPE_FLOAT32 = 12;
-  ARROW_PRIMITIVE_TYPE_FLOAT64 = 13;
-  ARROW_PRIMITIVE_TYPE_DATE32 = 14;
-  ARROW_PRIMITIVE_TYPE_DATE64 = 15;
-  ARROW_PRIMITIVE_TYPE_BINARY = 16;
-  ARROW_PRIMITIVE_TYPE_BINARY_VIEW = 17;
-  ARROW_PRIMITIVE_TYPE_LARGE_BINARY = 18;
-  ARROW_PRIMITIVE_TYPE_UTF8 = 19;
-  ARROW_PRIMITIVE_TYPE_UTF8_VIEW = 20;
-  ARROW_PRIMITIVE_TYPE_LARGE_UTF8 = 21;
-}
-
-enum ArrowTimeUnit {
-  ARROW_TIME_UNIT_UNSPECIFIED = 0;
-  ARROW_TIME_UNIT_SECOND = 1;
-  ARROW_TIME_UNIT_MILLISECOND = 2;
-  ARROW_TIME_UNIT_MICROSECOND = 3;
-  ARROW_TIME_UNIT_NANOSECOND = 4;
-}
-
-enum ArrowIntervalUnit {
-  ARROW_INTERVAL_UNIT_UNSPECIFIED = 0;
-  ARROW_INTERVAL_UNIT_YEAR_MONTH = 1;
-  ARROW_INTERVAL_UNIT_DAY_TIME = 2;
-  ARROW_INTERVAL_UNIT_MONTH_DAY_NANO = 3;
-}
-
-enum ArrowUnionMode {
-  ARROW_UNION_MODE_UNSPECIFIED = 0;
-  ARROW_UNION_MODE_SPARSE = 1;
-  ARROW_UNION_MODE_DENSE = 2;
-}
-
-message ArrowTimestampType {
-  ArrowTimeUnit unit = 1;
-  optional string timezone = 2;
-}
-
-message ArrowTimeType {
-  ArrowTimeUnit unit = 1;
-}
-
-message ArrowDecimalType {
-  uint32 precision = 1;
-  int32 scale = 2;
-}
-
-message ArrowFixedSizeListType {
-  ArrowPhysicalField item = 1;
-  int32 length = 2;
-}
-
-message ArrowStructType {
-  repeated ArrowPhysicalField fields = 1;
-}
-
-message ArrowUnionField {
-  int32 type_id = 1;
-  ArrowPhysicalField field = 2;
-}
-
-message ArrowUnionType {
-  ArrowUnionMode mode = 1;
-  repeated ArrowUnionField fields = 2;
-}
-
-message ArrowDictionaryType {
-  ArrowPhysicalType key = 1;
-  ArrowPhysicalType value = 2;
-}
-
-message ArrowMapType {
-  ArrowPhysicalField entries = 1;
-  bool ordered = 2;
-}
-
-message ArrowRunEndEncodedType {
-  ArrowPhysicalField run_ends = 1;
-  ArrowPhysicalField values = 2;
-}
-
 // The single per-query write finish node.
 //
 // It runs on one Root backend at DOP 1, gathers every writer's relation, and
@@ -347,6 +233,7 @@ message ExchangeReceiver {
   repeated novarocks.common.OutputColumn output_columns = 4; // exchange output schema.
   optional string output_qualifier = 5;                 // optional output qualifier for display.
   ExchangeFlavor flavor = 6;                             // exchange semantic flavor.
+  optional uint32 original_edge_id = 7; // Exact FE EdgeId; zero is valid.
 }
 
 // Physical operator payload. Each arm mirrors one PhysicalPlanKind variant.
@@ -456,7 +343,15 @@ enum RuntimeFilterApplyPoint {
   RUNTIME_FILTER_APPLY_POINT_NODE_OUTPUT = 2;
 }
 
+// One independently decoded runtime-filter type domain. No fragment reference
+// or endpoint expression supplies the semantic owner of this container.
+message RuntimeFilterTypeDomain {
+  novarocks.common.TypeDesc value_type = 1;
+  ExecutionTypeTable execution_types = 2;
+}
+
 message RuntimeFilterContract {
+  RuntimeFilterTypeDomain logical_domain = 3;
   oneof kind {
     RuntimeFilterMembershipContract membership = 1;
     RuntimeFilterOrderedContract ordered = 2;
@@ -886,7 +781,7 @@ message UnpivotNode {
   repeated UnpivotValueMapping value_mappings = 4;
   uint64 max_output_rows = 5;
   uint64 max_output_bytes = 6;
-  ArrowPhysicalSchema output_schema = 7;
+  novarocks.arrow_type.ArrowPhysicalSchema output_schema = 7;
 }
 
 // One input column copied to one output column for every expanded row.
@@ -1072,6 +967,9 @@ message WindowExpr {
   bool ignore_nulls = 10;                           // true when IGNORE NULLS is requested.
   repeated novarocks.expr.SortItem function_order_by = 11; // ORDER BY owned by the aggregate call, not OVER.
   ResolvedAggregateSignature aggregate_binding = 12; // exact ordinary aggregate overload; absent for window-only functions.
+  // Required for aggregate_binding: exact original ExprId in this fragment's
+  // original request definition namespace. Presence preserves legal zero.
+  optional uint32 original_expression_definition_id = 13;
 }
 
 // Generate-series physical node.
@@ -1165,6 +1063,14 @@ message ResolvedAggregateSignature {
   novarocks.common.TypeDesc intermediate_type = 3;
   novarocks.common.TypeDesc output_type = 4;
   string state_format_identity = 5;
+  string function_id = 6;                      // exact installed owner identity.
+  optional uint32 logical_argument_count = 7; // original update channels, even for merge.
+  novarocks.common.AggregateStateArgumentContract state_argument_contract = 8;
+  // The selected identity is verified against these actual frozen inputs.
+  // This reference belongs to the enclosing fragment original-request owner.
+  optional uint32 original_request_id = 9;
+  // Present only for writer Partial/Final at this exact original request site.
+  novarocks.physical_semantics_v2.FrozenCall writer_preparation_call = 10;
 }
 
 // Aggregate output layout.
@@ -1335,7 +1241,8 @@ message ColumnDef {
   // defaults reach execution through the connector-owned provider schema.
   // The field is retained (not reserved) so the wire layout does not shift.
   optional string write_default_json = 4;
-  novarocks.common.TypeDesc logical_type = 5;   // optional logical SQL type when distinct from storage type.
+  reserved 5;
+  reserved "logical_type";
 }
 
 // Native scan source for NovaRocks-generated plans.

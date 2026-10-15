@@ -18,168 +18,6 @@
 //! Exact Arrow-to-native-v1 type translation for final physical plans.
 
 use arrow::datatypes::{DataType, TimeUnit};
-use novarocks_proto_models::common;
-
-/// Encode an Arrow type only when native wire v1 preserves its exact identity.
-///
-/// The v1 `TypeDesc` is a SQL type carrier. It cannot preserve Arrow offset
-/// width, nested field nullability, field metadata, dictionary identity, or
-/// several physical primitives. Those types are rejected instead of being
-/// normalized into a nearby SQL type.
-pub(crate) fn encode_physical_type(data_type: &DataType) -> Result<common::TypeDesc, String> {
-    validate_physical_type(data_type)?;
-    if matches!(
-        data_type,
-        DataType::List(_) | DataType::Map(_, _) | DataType::Struct(_)
-    ) {
-        // Validation has already proven every nested field canonical, so what
-        // the reader rebuilds from this descriptor is the type that went in.
-        return encode_arrow_authoritative_compatibility_type_inner(data_type);
-    }
-    use common::PrimitiveType;
-
-    let (primitive, precision, scale, time_unit, time_zone) = match data_type {
-        DataType::Null => (PrimitiveType::NullType, None, None, None, None),
-        DataType::Boolean => (PrimitiveType::Boolean, None, None, None, None),
-        DataType::Int8 => (PrimitiveType::Tinyint, None, None, None, None),
-        DataType::Int16 => (PrimitiveType::Smallint, None, None, None, None),
-        DataType::Int32 => (PrimitiveType::Int, None, None, None, None),
-        DataType::Int64 => (PrimitiveType::Bigint, None, None, None, None),
-        DataType::Float32 => (PrimitiveType::Float, None, None, None, None),
-        DataType::Float64 => (PrimitiveType::Double, None, None, None, None),
-        DataType::Decimal128(precision, scale) => (
-            PrimitiveType::Decimal128,
-            Some(i32::from(*precision)),
-            Some(i32::from(*scale)),
-            None,
-            None,
-        ),
-        DataType::Decimal256(precision, scale) => (
-            PrimitiveType::Decimal256,
-            Some(i32::from(*precision)),
-            Some(i32::from(*scale)),
-            None,
-            None,
-        ),
-        DataType::Date32 => (PrimitiveType::Date, None, None, None, None),
-        DataType::Timestamp(unit, zone) => {
-            let time_unit = match unit {
-                TimeUnit::Microsecond => None,
-                TimeUnit::Nanosecond => Some(3),
-                _ => unreachable!("validated timestamp unit became unsupported"),
-            };
-            (
-                PrimitiveType::Datetime,
-                None,
-                None,
-                time_unit,
-                zone.as_ref().map(ToString::to_string),
-            )
-        }
-        DataType::Time64(TimeUnit::Microsecond) => (PrimitiveType::Time, None, None, None, None),
-        DataType::Utf8 => (PrimitiveType::Varchar, None, None, None, None),
-        DataType::Binary => (PrimitiveType::Varbinary, None, None, None, None),
-        // The wire names this type after what NovaRocks stores in it. A
-        // variant's encoded value is the only thing given a large offset
-        // width, and the reader rebuilds exactly this type from that name.
-        DataType::LargeBinary => (PrimitiveType::Variant, None, None, None, None),
-        DataType::FixedSizeBinary(16) => (PrimitiveType::Largeint, None, None, None, None),
-        other => unreachable!("validated physical type became unsupported: {other:?}"),
-    };
-
-    Ok(common::TypeDesc {
-        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-            r#type: primitive as i32,
-            len: None,
-            precision,
-            scale,
-            time_unit,
-            time_zone,
-        })),
-    })
-}
-
-/// Encode the SQL compatibility descriptor for a value whose complete Arrow
-/// type is carried by a colocated, mandatory `ArrowPhysicalSchema`.
-///
-/// Native v1 cannot preserve nested Arrow field nullability and metadata in
-/// `TypeDesc`. Writer relation nodes also carry one exact Arrow schema, which
-/// is the execution authority; their legacy output-column descriptor is only
-/// an indexable SQL shape. Keep this encoder private to that paired carrier.
-pub(crate) fn encode_arrow_authoritative_compatibility_type(
-    data_type: &DataType,
-) -> Result<common::TypeDesc, String> {
-    validate_arrow_authoritative_compatibility_type(data_type)?;
-    encode_arrow_authoritative_compatibility_type_inner(data_type)
-}
-
-fn encode_arrow_authoritative_compatibility_type_inner(
-    data_type: &DataType,
-) -> Result<common::TypeDesc, String> {
-    use common::type_desc::Kind;
-
-    let kind = match data_type {
-        DataType::List(field) => Kind::List(Box::new(common::ListType {
-            element: Some(Box::new(encode_nested_field(field)?)),
-        })),
-        DataType::Map(entries, _) => {
-            let DataType::Struct(fields) = entries.data_type() else {
-                return Err("native wire v1 writer map entries must be a struct".into());
-            };
-            if fields.len() != 2 {
-                return Err("native wire v1 writer map entries must contain key and value".into());
-            }
-            Kind::Map(Box::new(common::MapType {
-                key: Some(Box::new(encode_nested_field(&fields[0])?)),
-                value: Some(Box::new(encode_nested_field(&fields[1])?)),
-            }))
-        }
-        DataType::Struct(fields) => Kind::Strct(common::StructType {
-            fields: fields
-                .iter()
-                .map(|field| {
-                    Ok(common::StructField {
-                        name: field.name().clone(),
-                        r#type: Some(encode_nested_field(field)?),
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()?,
-        }),
-        _ => return encode_physical_type(data_type),
-    };
-    Ok(common::TypeDesc { kind: Some(kind) })
-}
-
-/// The descriptor one nested field is carried by.
-///
-/// A field's logical type says what it is -- a JSON string is not a string --
-/// and the wire says that with a primitive of its own, which is how the reader
-/// gives the marker back. Reading only the field's data type would hand a JSON
-/// value over as text, and a JSON `null` inside a map would arrive as no value
-/// at all.
-fn encode_nested_field(field: &arrow::datatypes::Field) -> Result<common::TypeDesc, String> {
-    let Some(logical) = novarocks_types::logical::logical_type_of_field(field) else {
-        return encode_arrow_authoritative_compatibility_type_inner(field.data_type());
-    };
-    use novarocks_types::logical::LogicalType;
-    let primitive = match logical {
-        LogicalType::Json => common::PrimitiveType::Json,
-        LogicalType::Hll => common::PrimitiveType::Hll,
-        LogicalType::Bitmap => common::PrimitiveType::Bitmap,
-        LogicalType::Object => common::PrimitiveType::Object,
-        LogicalType::Percentile => common::PrimitiveType::Percentile,
-    };
-    Ok(common::TypeDesc {
-        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-            r#type: primitive as i32,
-            len: None,
-            precision: None,
-            scale: None,
-            time_unit: None,
-            time_zone: None,
-        })),
-    })
-}
 
 /// Validate the legacy SQL shape paired with an exact writer Arrow schema
 /// without allocating its protobuf representation.
@@ -390,4 +228,66 @@ fn validate_decimal(precision: u8, scale: i8, max_precision: u8) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+/// Exact protobuf message depth of a normalized value layout, borrowing its
+/// original tree. This is independent of logical depth and local kernel support.
+pub(crate) fn value_layout_wire_depth_observed<
+    E: From<novarocks_type_contract::CompileControlError>,
+>(
+    value: &arrow::datatypes::DataType,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<usize, E> {
+    use arrow::datatypes::DataType as D;
+    observe()?;
+    let mut maximum = 1usize;
+    let mut child = |value: &D, prefix: usize| -> Result<(), E> {
+        let depth = value_layout_wire_depth_observed(value, observe)?;
+        maximum = maximum.max(
+            prefix
+                .checked_add(depth)
+                .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?,
+        );
+        Ok(())
+    };
+    match value {
+        D::List(field) | D::LargeList(field) | D::ListView(field) | D::LargeListView(field) => {
+            child(field.data_type(), 2)?;
+        }
+        D::FixedSizeList(field, _) => child(field.data_type(), 3)?,
+        D::Struct(fields) => {
+            maximum = 2; // ArrowPhysicalType -> ArrowStructType, even when empty.
+            for field in fields {
+                let depth = value_layout_wire_depth_observed(field.data_type(), observe)?;
+                maximum = maximum.max(
+                    3usize
+                        .checked_add(depth)
+                        .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?,
+                );
+            }
+        }
+        D::Union(fields, _) => {
+            maximum = 2;
+            for (_, field) in fields.iter() {
+                let depth = value_layout_wire_depth_observed(field.data_type(), observe)?;
+                maximum = maximum.max(
+                    4usize
+                        .checked_add(depth)
+                        .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?,
+                );
+            }
+        }
+        D::Map(entries, _) => child(entries.data_type(), 3)?,
+        D::Timestamp(..)
+        | D::Time32(..)
+        | D::Time64(..)
+        | D::Decimal32(..)
+        | D::Decimal64(..)
+        | D::Decimal128(..)
+        | D::Decimal256(..) => maximum = 2,
+        // Constructors have already rejected runtime encoding wrappers; those
+        // types never arrive at this normalized layout boundary.
+        _ => {}
+    }
+    Ok(maximum)
 }

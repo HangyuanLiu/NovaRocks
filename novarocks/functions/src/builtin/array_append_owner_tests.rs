@@ -121,7 +121,7 @@ pub(crate) fn prepared_with_control(
 #[test]
 fn array_append_sole_real_signature_keeps_item_identity_and_nullable_result() {
     for nullable in [false, true] {
-        let list = FunctionValueType::new(
+        let list = FunctionValueType::from_legacy_declared_projection(
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
             nullable,
         );
@@ -133,7 +133,7 @@ fn array_append_sole_real_signature_keeps_item_identity_and_nullable_result() {
             ],
         )
         .unwrap();
-        assert!(p.contract().result_type().nullable);
+        assert!(p.contract().result_type().nullable());
         assert_eq!(
             p.contract().effects().null_behavior,
             FunctionNullBehavior::CalledOnNull

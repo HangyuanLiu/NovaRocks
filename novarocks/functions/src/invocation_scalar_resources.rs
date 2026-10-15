@@ -262,7 +262,7 @@ fn argument_body_reachable(
     expected: &novarocks_type_contract::FunctionValueType,
     control: &dyn KernelEvaluationControl,
 ) -> Result<bool, KernelFailure> {
-    use crate::kernel_input::{EvaluationCheckpoints, constant_type_matches, logical_is_null};
+    use crate::kernel_input::{EvaluationCheckpoints, logical_is_null};
     let mut work = EvaluationCheckpoints::new(control);
     let result = (|| {
         argument.validate_shape_observed::<ReachabilityFailure>(selection, || {
@@ -270,13 +270,15 @@ fn argument_body_reachable(
         })?;
         if let EvaluatedArgument::Constant(value) = argument {
             work.step().map_err(ReachabilityFailure::Control)?;
-            if !constant_type_matches(value.value_type(), expected) {
+            if !value.value_type().fits_value_type_observed(expected, || {
+                work.step().map_err(ReachabilityFailure::Control)
+            })? {
                 return Ok(false);
             }
         }
         novarocks_type_contract::arrow_data_types_exact_borrowed_observed::<ReachabilityFailure>(
             argument.array().data_type(),
-            &expected.data_type,
+            expected.data_type(),
             || work.step().map_err(ReachabilityFailure::Control),
         )
     })();
@@ -289,7 +291,7 @@ fn argument_body_reachable(
         Ok(true) => {}
     }
     work.step()?;
-    if !expected.nullable {
+    if !expected.nullable() {
         for (ordinal, row) in selection.iter().enumerate() {
             match logical_is_null(
                 argument.array().as_ref(),
@@ -342,7 +344,7 @@ pub(crate) fn invocation_input_resources<'types>(
     for (argument, ty) in arguments.iter().zip(expected) {
         resources.metadata = source_sum(
             resources.metadata,
-            argument_metadata_geometry(&ty.data_type, control)?,
+            argument_metadata_geometry(ty.data_type(), control)?,
         )?;
         if !argument_body_reachable(*argument, selection, ty, control)? {
             resources.path = InvocationRequestPath::ArgumentFailure;
@@ -885,10 +887,20 @@ mod tests {
         let key: ArrayRef = Arc::new(StringArray::from(vec!["key"]));
         let value: ArrayRef = Arc::new(StringArray::from(vec!["{\"z\":[2,1],\"a\":\"µ\"}"; 9]));
         let empty: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
+        // Anonymous List roles are canonical. Keep the original long Data
+        // diagnostic in a named Struct field, whose authored name is exact.
+        let unsupported_item = DataType::Struct(
+            vec![Arc::new(Field::new(
+                "field\0µ".repeat(100),
+                DataType::Utf8,
+                true,
+            ))]
+            .into(),
+        );
         let unsupported: ArrayRef = Arc::new(LargeListArray::new(
-            Arc::new(Field::new("field\0µ".repeat(100), DataType::Utf8, true)),
+            Arc::new(Field::new("item", unsupported_item.clone(), true)),
             OffsetBuffer::new(ScalarBuffer::from(vec![0i64, 0])),
-            Arc::new(StringArray::from(Vec::<&str>::new())),
+            new_empty_array(&unsupported_item),
             None,
         ));
         for (arguments, selection, activation, data) in [
@@ -1279,7 +1291,7 @@ mod tests {
         let value = pool.value(1).unwrap();
         let selection = Selection::try_sparse(1000, &[3, 67, 999]).unwrap();
         let mut nonnullable = actual.clone();
-        nonnullable.nullable = false;
+        nonnullable = nonnullable.with_nullable(false).unwrap();
         for expected in [ty(DataType::Utf8, true), nonnullable] {
             let resources = invocation_input_resources(
                 false,

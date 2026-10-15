@@ -34,8 +34,16 @@ pub(crate) fn lower_is_null(
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
     data_type: DataType,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, super::NativeExpressionDecodeError> {
-    let child = lower_required_child(&is_null.operand, path.field("operand"), arena, input_layout)?;
+    let child = lower_required_child(
+        &is_null.operand,
+        path.field("operand"),
+        arena,
+        input_layout,
+        type_decoder,
+    )?;
     let node = if is_null.negated {
         ExprNode::IsNotNull(child)
     } else {
@@ -50,29 +58,63 @@ pub(crate) fn lower_in_list(
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
     data_type: DataType,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, super::NativeExpressionDecodeError> {
     let mut child = lower_required_child(
         &in_list.operand,
         path.clone().field("operand"),
         arena,
         input_layout,
+        type_decoder,
     )?;
     let mut values = lower_expr_list(
         &in_list.list,
         path.clone().field("list"),
         arena,
         input_layout,
+        type_decoder,
     )?;
-    if let Some(compare_type) = in_list_comparison_type(arena, child, &values)
-        .map_err(|error| super::NativeExpressionDecodeError::inconsistent(path.clone(), error))?
-    {
-        child = cast_to_type_if_needed(arena, child, &compare_type).map_err(|error| {
-            super::NativeExpressionDecodeError::inconsistent(path.clone().field("operand"), error)
-        })?;
+    let compare_type = in_list_comparison_type(arena, child, &values)
+        .map_err(|error| super::NativeExpressionDecodeError::inconsistent(path.clone(), error))?;
+    let target_type = match &compare_type {
+        Some(ty) => ty.clone(),
+        None => arena
+            .data_type(child)
+            .cloned()
+            .expect("decoded IN operand type"),
+    };
+    let target = frozen_in_target(
+        arena,
+        child,
+        &values,
+        &target_type,
+        path.clone(),
+        type_decoder,
+    )?;
+    if let Some(compare_type) = compare_type {
+        child = cast_to_type_if_needed(
+            arena,
+            child,
+            &compare_type,
+            target.as_ref(),
+            path.clone().field("operand"),
+            type_decoder,
+        )?;
         for value in &mut values {
-            *value = cast_to_type_if_needed(arena, *value, &compare_type).map_err(|error| {
-                super::NativeExpressionDecodeError::inconsistent(path.clone().field("list"), error)
-            })?;
+            *value = cast_to_type_if_needed(
+                arena,
+                *value,
+                &compare_type,
+                target.as_ref(),
+                path.clone().field("list"),
+                type_decoder,
+            )?;
+        }
+    } else if let Some(target) = target.as_ref() {
+        for input in std::iter::once(child).chain(values.iter().copied()) {
+            let actual = arena.value_type(input).expect("frozen IN input");
+            type_decoder.require_complete_binding(actual, target, true, path.clone())?;
         }
     }
     Ok(arena.push_typed(
@@ -135,24 +177,85 @@ fn is_numeric_type(data_type: &DataType) -> bool {
     )
 }
 
+fn frozen_in_target(
+    arena: &ExprArena,
+    child: ExprId,
+    values: &[ExprId],
+    carrier: &DataType,
+    path: FieldPath,
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
+) -> Result<Option<novarocks_type_contract::FunctionValueType>, super::NativeExpressionDecodeError>
+{
+    let mut selected = None;
+    for input in std::iter::once(child).chain(values.iter().copied()) {
+        let source = arena.value_type(input).ok_or_else(|| {
+            super::NativeExpressionDecodeError::missing(
+                path.clone(),
+                "IN input requires its complete frozen declaration",
+            )
+        })?;
+        if source.data_type() != carrier {
+            continue;
+        }
+        if let Some(previous) = selected {
+            type_decoder.require_complete_binding(source, previous, true, path.clone())?;
+        } else {
+            selected = Some(source);
+        }
+    }
+    let source = selected.ok_or_else(|| {
+        super::NativeExpressionDecodeError::missing(
+            path,
+            "IN comparison target requires a complete frozen operand declaration",
+        )
+    })?;
+    type_decoder
+        .synthetic_nullable_binding(source, source.nullable())
+        .map_err(Into::into)
+}
+
 fn cast_to_type_if_needed(
     arena: &mut ExprArena,
-    expr: ExprId,
+    expression: ExprId,
     target_type: &DataType,
-) -> Result<ExprId, String> {
-    let source_type = arena
-        .data_type(expr)
-        .ok_or_else(|| "expression missing data type for implicit cast".to_string())?;
+    target_binding: Option<&novarocks_type_contract::FunctionValueType>,
+    path: FieldPath,
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
+) -> Result<ExprId, super::NativeExpressionDecodeError> {
+    let source_type = arena.data_type(expression).ok_or_else(|| {
+        super::NativeExpressionDecodeError::missing(
+            path.clone(),
+            "expression missing data type for implicit cast",
+        )
+    })?;
     if source_type == target_type {
-        return Ok(expr);
+        if let Some(target) = target_binding {
+            let source = arena
+                .value_type(expression)
+                .expect("frozen implicit-cast input");
+            type_decoder.require_complete_binding(source, target, true, path)?;
+        }
+        return Ok(expression);
     }
-    Ok(arena.push_typed(
+    let target = match target_binding {
+        Some(target) => {
+            let source = arena
+                .value_type(expression)
+                .expect("frozen implicit-cast input");
+            type_decoder
+                .synthetic_nullable_binding(target, source.nullable() || target.nullable())?
+        }
+        None => None,
+    };
+    let id = arena.push_typed(
         ExprNode::Cast(
-            expr,
+            expression,
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         ),
         target_type.clone(),
-    ))
+    );
+    type_decoder.save_synthetic_binding(id, target.as_ref(), arena)?;
+    Ok(id)
 }
 
 pub(crate) fn lower_between(
@@ -161,6 +264,9 @@ pub(crate) fn lower_between(
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
     data_type: DataType,
+    declared: Option<&novarocks_type_contract::FunctionValueType>,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, super::NativeExpressionDecodeError> {
     if !matches!(data_type, DataType::Boolean) {
         return Err(super::NativeExpressionDecodeError::inconsistent(
@@ -173,9 +279,22 @@ pub(crate) fn lower_between(
         path.clone().field("operand"),
         arena,
         input_layout,
+        type_decoder,
     )?;
-    let low = lower_required_child(&between.low, path.clone().field("low"), arena, input_layout)?;
-    let high = lower_required_child(&between.high, path.field("high"), arena, input_layout)?;
+    let low = lower_required_child(
+        &between.low,
+        path.clone().field("low"),
+        arena,
+        input_layout,
+        type_decoder,
+    )?;
+    let high = lower_required_child(
+        &between.high,
+        path.field("high"),
+        arena,
+        input_layout,
+        type_decoder,
+    )?;
     let expansion = novarocks_type_contract::NativeBetweenPlan::new(between.negated);
     let comparison = |operator, right| match operator {
         novarocks_type_contract::ComparisonOperator::Lt => ExprNode::Lt(operand, right),
@@ -185,7 +304,9 @@ pub(crate) fn lower_between(
         _ => unreachable!("original BETWEEN expansion uses ordered comparisons"),
     };
     let lower = arena.push_typed(comparison(expansion.lower(), low), DataType::Boolean);
+    type_decoder.save_synthetic_binding(lower, declared, arena)?;
     let upper = arena.push_typed(comparison(expansion.upper(), high), DataType::Boolean);
+    type_decoder.save_synthetic_binding(upper, declared, arena)?;
     let connective = match expansion.connective() {
         novarocks_type_contract::ControlShape::Conjunction => ExprNode::And(lower, upper),
         novarocks_type_contract::ControlShape::Disjunction => ExprNode::Or(lower, upper),
@@ -200,14 +321,24 @@ pub(crate) fn lower_like(
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
     data_type: DataType,
+    declared: Option<&novarocks_type_contract::FunctionValueType>,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, super::NativeExpressionDecodeError> {
     let operand = lower_required_child(
         &like.operand,
         path.clone().field("operand"),
         arena,
         input_layout,
+        type_decoder,
     )?;
-    let pattern = lower_required_child(&like.pattern, path.field("pattern"), arena, input_layout)?;
+    let pattern = lower_required_child(
+        &like.pattern,
+        path.field("pattern"),
+        arena,
+        input_layout,
+        type_decoder,
+    )?;
     let like_id = arena.push_typed(
         ExprNode::FunctionCall {
             kind: FunctionKind::Like,
@@ -215,6 +346,7 @@ pub(crate) fn lower_like(
         },
         DataType::Boolean,
     );
+    type_decoder.save_synthetic_binding(like_id, declared, arena)?;
     if like.negated {
         Ok(arena.push_typed(ExprNode::Not(like_id), data_type))
     } else {
@@ -228,6 +360,9 @@ pub(crate) fn lower_is_truth(
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
     data_type: DataType,
+    _declared: Option<&novarocks_type_contract::FunctionValueType>,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, super::NativeExpressionDecodeError> {
     if !matches!(data_type, DataType::Boolean) {
         return Err(super::NativeExpressionDecodeError::inconsistent(
@@ -240,6 +375,7 @@ pub(crate) fn lower_is_truth(
         path.field("operand"),
         arena,
         input_layout,
+        type_decoder,
     )?;
     if is_truth.value && !is_truth.negated {
         Ok(child)
@@ -282,8 +418,9 @@ mod tests {
         };
         assert!(matches!(
             arena.node(*inner),
-            Some(ExprNode::Literal(LiteralValue::Int64(1)))
+            Some(ExprNode::Constant(value)) if value.try_i64().unwrap() == Some(1)
         ));
+        super::super::tests::assert_complete_frozen(arena);
     }
 
     #[test]
@@ -304,6 +441,7 @@ mod tests {
         };
         assert!(matches!(arena.node(*left), Some(ExprNode::Lt(_, _))));
         assert!(matches!(arena.node(*right), Some(ExprNode::Gt(_, _))));
+        super::super::tests::assert_complete_frozen(arena);
     }
 
     #[test]
@@ -349,5 +487,6 @@ mod tests {
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(out.value(0));
         assert!(!out.value(1));
+        super::super::tests::assert_complete_frozen(arena);
     }
 }

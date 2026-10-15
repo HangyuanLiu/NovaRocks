@@ -15,25 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Source requests of ONE normal positive-layout ChunkSchema constructor.
-//! These numerical bounds grant nothing. Native callers separately establish
-//! immutable bounded type provenance; arbitrary public layouts keep Direct.
-use super::{ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
-use arrow::datatypes::{DataType, Field, FieldRef, Schema};
+//! Request evidence for the actual typed ChunkSchema preparation constructor.
+//! The caller separately proves the sealed program/source qualification and
+//! runs the real constructor under its original complete-operation funding.
+use super::{ChunkSchema, ChunkSlotSchema};
+use arrow::datatypes::{FieldRef, Schema};
 use novarocks_local_program::StaticLayout;
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, CompleteMetadataRequestFacts, MetadataRequestError,
-    PureCompileControl, ValueTypeVisit,
-    owned_resources::{
-        formatting, hashmap, layout,
-        metadata_materialization::{MetadataAllocationLoan, MetadataFieldLoan},
-        metadata_request::MetadataRequestSum,
-        type_validation, vec,
-    },
-    validate_value_type_structure_with_scratch_observed,
+    PureCompileControl, ValueTypeStorageLifetime,
+    owned_resources::{hashmap, layout, metadata_request::MetadataRequestSum},
 };
-use novarocks_types::{SlotId, arrow_metadata_owner::MetadataOwnedField};
-use std::{alloc::Layout, mem::MaybeUninit};
+use novarocks_types::SlotId;
+use std::alloc::Layout;
 
 pub fn original_compiled_schema_metadata_request(
     source_layout: &StaticLayout,
@@ -46,564 +40,299 @@ pub fn original_compiled_schema_metadata_request(
 }
 
 fn original_request(
-    source_layout: &StaticLayout,
+    source: &StaticLayout,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<CompleteMetadataRequestFacts, MetadataRequestError> {
-    if source_layout.field_metadata_origins().is_some() {
+    if !source.is_typed()
+        || source.schema().fields().len() != source.slots().len()
+        || source.schema().metadata().capacity() != 0
+    {
         return Err(MetadataRequestError::SourceModel(
-            "compiled schema request requires its normal original metadata route",
+            "compiled schema request requires its exact typed execution layout",
         ));
     }
-    let source =
-        source_layout
-            .metadata_materializations()
-            .ok_or(MetadataRequestError::SourceModel(
-                "compiled schema request has no original metadata source",
-            ))?;
-    if !source.schema_owner().lends(source_layout.schema()) {
-        return Err(MetadataRequestError::SourceModel(
-            "compiled schema request does not borrow its original Schema",
-        ));
+    enum InspectionFailure {
+        Original(MetadataRequestError),
+        InvalidSource,
+    }
+    impl From<String> for InspectionFailure {
+        fn from(_: String) -> Self {
+            Self::InvalidSource
+        }
+    }
+    for (index, field) in source.schema().fields().iter().enumerate() {
+        work.step()?;
+        if source.value_binding_at(index).is_none()
+            || source.slot_metadata_at(index).is_none()
+            || !super::typed_array_normalization::execution_field_is_normalized_observed(
+                field,
+                &mut |units| {
+                    for _ in 0..units {
+                        work.step()
+                            .map_err(|cause| InspectionFailure::Original(cause.into()))?;
+                    }
+                    Ok::<_, InspectionFailure>(())
+                },
+            )
+            .map_err(|failure| match failure {
+                InspectionFailure::Original(cause) => cause,
+                InspectionFailure::InvalidSource => MetadataRequestError::SourceModel(
+                    "compiled schema request has an invalid type structure",
+                ),
+            })?
+        {
+            return Err(MetadataRequestError::SourceModel(
+                "compiled schema request has no canonical complete typed occurrence",
+            ));
+        }
     }
     let mut sum = MetadataRequestSum::default();
-    let mut storage = MaybeUninit::<type_validation::TypeValidationScratch<'_>>::uninit();
-    let scratch = type_validation::initialize_scratch_observed(&mut storage, work)?;
-    let count = source_layout.schema().fields().len();
-    for field in source_layout.schema().fields() {
-        // The first owned Field clone keeps the same metadata bucket origin;
-        // the second owned clone therefore has the same request geometry.
-        let mut twice =
-            |layout, occurrences: usize| sum.allocation(layout, checked_mul(occurrences, 2)?);
-        let mut allocations: Option<MetadataAllocationLoan<'_, MetadataRequestError>> =
-            Some(&mut twice);
-        source
-            .original_borrowed_field_clone_allocation_requests_observed(
-                field,
-                scratch,
-                &mut || work.step().map_err(Into::into),
-                &mut allocations,
-            )?
-            .ok_or(MetadataRequestError::SourceModel(
-                "compiled schema request has an unpaired original root Field",
-            ))?;
-        logical_type_lookup_request(field, &mut sum)?;
-        work.step()?;
-        sum.allocation(layout::arc_layout(Layout::new::<Field>())?, 2)?;
-        let mut debug = DebugRequestBound::default();
-        validate_value_type_structure_with_scratch_observed::<MetadataRequestError>(
-            field.data_type(),
-            scratch,
-            |visit| {
-                work.step()?;
-                debug.observe(visit, work)?;
-                // The original semantic constructor follows a subset of the
-                // same full grammar. Map entries Struct and ignored-carrier
-                // descendants are declared conservative request overcounts.
-                match visit {
-                    ValueTypeVisit::Field(field) => {
-                        logical_type_lookup_request(field, &mut sum)?;
-                    }
-                    ValueTypeVisit::TypeNode(DataType::Struct(fields)) => {
-                        fresh_push::<ChunkFieldSchema>(fields.len(), work, &mut sum)?
-                    }
-                    ValueTypeVisit::TypeNode(DataType::List(_) | DataType::LargeList(_)) => {
-                        array::<ChunkFieldSchema>(1, &mut sum)?
-                    }
-                    ValueTypeVisit::TypeNode(DataType::Map(..)) => {
-                        array::<ChunkFieldSchema>(2, &mut sum)?
-                    }
-                    _ => {}
-                }
-                Ok(())
-            },
-        )?;
-        // Count both original error destinations without running a formatter.
-        // The full root bound dominates every offending entries subtree.
-        for (initial, upper) in [
-            (54, checked_add(27, debug.bytes()?)?),
-            (84, checked_add(42, usize::MAX.ilog10() as usize + 1)?),
-        ] {
-            let bound = formatting::original_format_string_request_bound(initial, upper)?;
-            sum.add(
-                bound.request_bytes_upper_bound,
-                bound.allocation_requests_upper_bound,
-            )?;
-        }
+    let mut exact = |request: Layout| sum.allocation(request, 1);
+    for request in crate::exec::pipeline::operator::input_construction::ObservedInputConstructionFactory::schema_scope_allocation_layouts()? {
+        exact(request)?;
     }
-    fresh_push::<ChunkSlotSchema>(count, work, &mut sum)?;
-    let metadata = source
-        .schema_owner()
-        .original_metadata_clone_request(&mut || work.step().map_err(MetadataRequestError::from))?;
-    if let Some(table) = metadata.table_backing {
-        sum.allocation(table, 1)?;
+    // A held runtime creator may combine with the layout's independent
+    // finite backing. Price the real retention author, conservatively once.
+    exact(ValueTypeStorageLifetime::retaining_allocation_layout()?)?;
+    let count = source.slots().len();
+    exact(array::<ChunkSlotSchema>(count)?)?;
+    let table = hashmap::fresh_table_layout::<SlotId, usize>(count)?;
+    if let Some(request) = table.layout {
+        exact(request)?;
     }
-    sum.add(metadata.text_bytes, metadata.text_requests)?;
-    let index = hashmap::fresh_table_layout::<SlotId, usize>(count)?;
-    sum.add(
-        index.request_bytes_upper_bound,
-        index.allocation_requests_upper_bound,
-    )?;
-    array::<SlotId>(count, &mut sum)?;
-    array::<FieldRef>(count, &mut sum)?;
-    let loans = checked_add(source.fields().len(), count)?;
-    array::<MetadataFieldLoan>(loans, &mut sum)?;
-    for payload in [
-        Layout::array::<FieldRef>(count).map_err(|_| MetadataRequestError::Arithmetic)?,
-        Layout::array::<MetadataFieldLoan>(loans).map_err(|_| MetadataRequestError::Arithmetic)?,
-        Layout::new::<Schema>(),
-        Layout::new::<ChunkSchema>(),
-    ] {
-        sum.allocation(layout::arc_layout(payload)?, 1)?;
-    }
-    if count == 0 {
-        // The original all(origins.is_some()) is vacuously true. Its empty
-        // MetadataOwnedField Arc slice still requests the original header.
-        sum.allocation(
-            layout::arc_layout(
-                Layout::array::<MetadataOwnedField>(0)
-                    .map_err(|_| MetadataRequestError::Arithmetic)?,
-            )?,
-            1,
-        )?;
-    }
+    exact(array::<SlotId>(count)?)?;
+    exact(array::<FieldRef>(count)?)?;
+    exact(layout::arc_layout(array::<FieldRef>(count)?)?)?;
+    exact(layout::arc_layout(Layout::new::<Schema>())?)?;
+    exact(layout::arc_layout(Layout::new::<ChunkSchema>())?)?;
     Ok(sum.facts())
 }
-
-fn logical_type_lookup_request(
-    field: &Field,
-    sum: &mut MetadataRequestSum,
-) -> Result<(), MetadataRequestError> {
-    if let Some(value) = field
-        .metadata()
-        .get(novarocks_type_contract::NR_LOGICAL_TYPE_KEY)
-    {
-        // The original legacy lookup trims the tag, copies it to a String,
-        // and changes ASCII case in place. The borrowed raw length bounds its
-        // one request without replaying the trim or constructing that String.
-        // Full-grammar fields outside the semantic subset are overcounts.
-        array::<u8>(value.len(), sum)?;
-    }
-    Ok(())
-}
-
-fn checked_add(left: usize, right: usize) -> Result<usize, MetadataRequestError> {
-    left.checked_add(right)
-        .ok_or(MetadataRequestError::Arithmetic)
-}
-fn checked_mul(left: usize, right: usize) -> Result<usize, MetadataRequestError> {
-    left.checked_mul(right)
-        .ok_or(MetadataRequestError::Arithmetic)
-}
-fn array<T>(count: usize, sum: &mut MetadataRequestSum) -> Result<(), MetadataRequestError> {
-    sum.allocation(
-        Layout::array::<T>(count).map_err(|_| MetadataRequestError::Arithmetic)?,
-        1,
-    )
-}
-fn fresh_push<T>(
-    count: usize,
-    work: &mut CompileCheckpoints<'_>,
-    sum: &mut MetadataRequestSum,
-) -> Result<(), MetadataRequestError> {
-    let mut allocation = |layout, occurrences| sum.allocation(layout, occurrences);
-    vec::original_fresh_push_allocation_requests_observed::<T, MetadataRequestError>(
-        count,
-        &mut || work.step().map_err(Into::into),
-        &mut Some(&mut allocation),
-    )?;
-    Ok(())
-}
-
-#[derive(Default)]
-struct DebugRequestBound {
-    types: usize,
-    fields: usize,
-    metadata: usize,
-    strings: usize,
-    text_bytes: usize,
-    containers: usize,
-    entries: usize,
-}
-impl DebugRequestBound {
-    fn text(&mut self, value: &str) -> Result<(), MetadataRequestError> {
-        self.strings = checked_add(self.strings, 1)?;
-        self.text_bytes = checked_add(self.text_bytes, value.len())?;
-        Ok(())
-    }
-    fn observe(
-        &mut self,
-        visit: ValueTypeVisit<'_>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), MetadataRequestError> {
-        match visit {
-            ValueTypeVisit::TypeNode(data_type) => {
-                self.types = checked_add(self.types, 1)?;
-                let container = match data_type {
-                    DataType::Struct(fields) => Some(fields.len()),
-                    DataType::Union(fields, _) => Some(fields.len()),
-                    _ => None,
-                };
-                if let Some(entries) = container {
-                    self.containers = checked_add(self.containers, 1)?;
-                    self.entries = checked_add(self.entries, entries)?;
-                }
-                if let DataType::Timestamp(_, Some(zone)) = data_type {
-                    self.text(zone)?;
-                }
-            }
-            ValueTypeVisit::Field(field) => {
-                self.fields = checked_add(self.fields, 1)?;
-                self.metadata = checked_add(self.metadata, field.metadata().len())?;
-                self.text(field.name())?;
-                work.flush()?;
-                for (key, value) in field.metadata() {
-                    self.text(key)?;
-                    self.text(value)?;
-                    work.step()?;
-                }
-                work.flush()?;
-            }
-            ValueTypeVisit::ChildEdge(_) => {}
-        }
-        Ok(())
-    }
-    fn bytes(&self) -> Result<usize, MetadataRequestError> {
-        let mut result = 0;
-        for (count, factor) in [
-            (self.types, 43),
-            (self.fields, 121),
-            (self.metadata, 4),
-            (self.strings, 2),
-            (self.text_bytes, 10),
-            (self.containers, 2),
-            (self.entries, 10),
-        ] {
-            result = checked_add(result, checked_mul(count, factor)?)?;
-        }
-        Ok(result)
-    }
+fn array<T>(count: usize) -> Result<Layout, MetadataRequestError> {
+    Layout::array::<T>(count).map_err(|_| MetadataRequestError::Arithmetic)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_type_contract::{
-        CompileControlError, FunctionValueType, ValueLogicalType,
-        owned_resources::metadata_materialization::{
-            MaterializedFieldNamespace, OriginalFieldMaterialization, TypedSchemaMaterializations,
-            materialize_value_field,
-        },
+    use crate::exec::pipeline::operator::input_construction::{
+        InputConstructionFactory, InputConstructionRequestHost, LockedArrowInputConstructionModel,
+        ObservedInputConstructionFactory,
+        runtime::{RuntimeInputConstructionControl, TrackedInputConstructionHost},
     };
-    use std::sync::{Arc, Mutex};
-    struct Control {
-        trace: Mutex<Vec<(CompilePhase, u32)>>,
-        refusal: Option<(usize, CompileControlError)>,
-    }
-    impl Control {
-        fn good() -> Self {
-            Self {
-                trace: Mutex::default(),
-                refusal: None,
-            }
-        }
-    }
+    use novarocks_type_contract::{
+        CompileControlError, FunctionValueType, TypedValueBinding, ValueLogicalType,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Control;
     impl PureCompileControl for Control {
-        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
-            let mut trace = self.trace.lock().unwrap();
-            trace.push((phase, units));
-            if let Some((at, error)) = self.refusal
-                && trace.len() == at
-            {
-                return Err(error);
-            }
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
             Ok(())
         }
     }
-    fn positive(types: &[FunctionValueType]) -> StaticLayout {
+    fn source(types: &[FunctionValueType]) -> StaticLayout {
+        use arrow::datatypes::Field;
         let fields = types
             .iter()
             .enumerate()
-            .map(|(index, ty)| materialize_value_field(ty, format!("field_{index}")).unwrap())
-            .collect();
-        let source = TypedSchemaMaterializations::new(
-            fields,
-            MaterializedFieldNamespace::from_original_loans(Arc::from([])),
-        )
-        .into_original_schema();
-        StaticLayout::try_new_materialized_for_compile(
-            source,
+            .map(|(index, value)| {
+                Field::new(
+                    format!("field_{index}"),
+                    value.data_type().clone(),
+                    value.nullable(),
+                )
+            })
+            .collect::<Vec<_>>();
+        StaticLayout::try_new_typed_for_compile(
+            Arc::new(Schema::new(fields)),
             (0..types.len())
-                .map(|index| SlotId::new(u32::try_from(index).unwrap() + 1))
+                .map(|index| SlotId::new(index as u32 + 1))
                 .collect::<Vec<_>>()
                 .into(),
-            &Control::good(),
+            types
+                .iter()
+                .map(|value| (value.typed_binding().clone(), None))
+                .collect(),
+            ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+            &Control,
         )
         .unwrap()
     }
-    #[test]
-    fn compiled_layout_metadata_request_empty_includes_vacuous_origins_and_all_arc_headers() {
-        let source = positive(&[]);
-        let facts = original_compiled_schema_metadata_request(&source, &Control::good()).unwrap();
-        let payloads = [
-            Layout::array::<FieldRef>(0).unwrap(),
-            Layout::array::<MetadataFieldLoan>(0).unwrap(),
-            Layout::new::<Schema>(),
-            Layout::new::<ChunkSchema>(),
-            Layout::array::<MetadataOwnedField>(0).unwrap(),
-        ];
-        assert_eq!(facts.allocation_requests_upper_bound, 5);
-        assert_eq!(
-            facts.allocation_request_bytes_upper_bound,
-            payloads
-                .into_iter()
-                .map(|payload| layout::arc_layout(payload).unwrap().size())
-                .sum::<usize>()
-        );
-        let original = ChunkSchema::from_compiled_layout(&source).unwrap();
-        assert!(original.field_metadata_origins().is_some());
-        assert!(original.slots().is_empty());
+    struct ActualHost {
+        original: TrackedInputConstructionHost,
+        requests: AtomicUsize,
+        bytes: AtomicUsize,
     }
-    #[test]
-    fn compiled_layout_metadata_request_both_root_clones_preserve_nominal_map_multiplicity() {
-        let plain = FunctionValueType::new(DataType::Utf8, true);
-        let json =
-            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
-                .unwrap();
-        for count in [1, 3] {
-            let physical = positive(&vec![plain.clone(); count]);
-            let nominal = positive(&vec![json.clone(); count]);
-            let left =
-                original_compiled_schema_metadata_request(&physical, &Control::good()).unwrap();
-            let right =
-                original_compiled_schema_metadata_request(&nominal, &Control::good()).unwrap();
-            let root_table = hashmap::fresh_table_layout::<String, String>(1).unwrap();
-            assert_eq!(
-                right.allocation_request_bytes_upper_bound
-                    - left.allocation_request_bytes_upper_bound,
-                2 * count
-                    * (root_table.request_bytes_upper_bound
-                        + novarocks_type_contract::NR_LOGICAL_TYPE_KEY.len()
-                        + "json".len())
-                    + count * "json".len()
-            );
-            assert_eq!(
-                right.allocation_requests_upper_bound - left.allocation_requests_upper_bound,
-                2 * count * (root_table.allocation_requests_upper_bound + 2) + count
-            );
-            let original = ChunkSchema::from_compiled_layout(&nominal).unwrap();
-            assert_eq!(original.slots().len(), count);
-            assert!(
-                original
-                    .slots()
-                    .iter()
-                    .all(|slot| slot.field_schema().json_semantic())
-            );
-        }
-    }
-    #[test]
-    fn compiled_layout_metadata_request_counts_each_shared_nested_logical_lookup_occurrence() {
-        let count = 128;
-        let plain = Arc::new(Field::new("child", DataType::Utf8, true));
-        let json = Arc::new(
-            plain.as_ref().clone().with_metadata(
-                [(
-                    novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_owned(),
-                    "json".to_owned(),
-                )]
-                .into(),
-            ),
-        );
-        let source = |field: &FieldRef| {
-            positive(&[FunctionValueType::new(
-                DataType::Struct(vec![Arc::clone(field); count].into()),
-                true,
-            )])
-        };
-        let physical = source(&plain);
-        let nominal = source(&json);
-        let left = original_compiled_schema_metadata_request(&physical, &Control::good()).unwrap();
-        let right = original_compiled_schema_metadata_request(&nominal, &Control::good()).unwrap();
-        // Shared FieldRefs avoid new child payload clones, but the original
-        // semantic constructor still reads the tag once per occurrence.
-        assert!(
-            right.allocation_requests_upper_bound - left.allocation_requests_upper_bound >= count
-        );
-        assert!(
-            right.allocation_request_bytes_upper_bound - left.allocation_request_bytes_upper_bound
-                >= count * "json".len()
-        );
-        let original = ChunkSchema::from_compiled_layout(&nominal).unwrap();
-        let semantics = original.slots()[0].field_schema();
-        assert_eq!(semantics.children().len(), count);
-        assert!(
-            semantics
-                .children()
-                .iter()
-                .all(ChunkFieldSchema::json_semantic)
-        );
-        let DataType::Struct(fields) = nominal.schema().fields()[0].data_type() else {
-            panic!("the original source remains a Struct");
-        };
-        assert!(fields.iter().all(|field| Arc::ptr_eq(field, &json)));
-    }
-    #[test]
-    fn compiled_layout_metadata_request_keeps_full_grammar_logical_lookup_overcounts() {
-        let field = Arc::new(
-            Field::new("item", DataType::Utf8, true).with_metadata(
-                [(
-                    novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_owned(),
-                    "json".to_owned(),
-                )]
-                .into(),
-            ),
-        );
-        for ty in [
-            DataType::List(Arc::clone(&field)),
-            DataType::FixedSizeList(Arc::clone(&field), 1),
-        ] {
-            let source = positive(&[FunctionValueType::new(ty, true)]);
-            let facts =
-                original_compiled_schema_metadata_request(&source, &Control::good()).unwrap();
-            assert!(facts.allocation_requests_upper_bound > 0);
-            let original = ChunkSchema::from_compiled_layout(&source).unwrap();
-            let children = original.slots()[0].field_schema().children();
-            match source.schema().fields()[0].data_type() {
-                DataType::List(_) => {
-                    assert_eq!(children.len(), 1);
-                    assert!(children[0].json_semantic());
-                }
-                DataType::FixedSizeList(_, _) => assert!(children.is_empty()),
-                _ => panic!("the source keeps the original carrier"),
+    impl InputConstructionRequestHost for ActualHost {
+        fn request(
+            &self,
+            layout: Layout,
+        ) -> Result<(), crate::exec::pipeline::operator::ConstructionFailure> {
+            self.original.request(layout)?;
+            if layout.size() > 0 {
+                self.requests.fetch_add(1, Ordering::SeqCst);
+                self.bytes.fetch_add(layout.size(), Ordering::SeqCst);
             }
+            Ok(())
         }
-        let mut sum = MetadataRequestSum::default();
-        logical_type_lookup_request(&Field::new("plain", DataType::Utf8, true), &mut sum).unwrap();
-        assert_eq!(sum.facts().allocation_requests_upper_bound, 0);
-        logical_type_lookup_request(&field, &mut sum).unwrap();
-        assert_eq!(sum.facts().allocation_requests_upper_bound, 1);
-        assert_eq!(
-            sum.facts().allocation_request_bytes_upper_bound,
-            "json".len()
-        );
-    }
-    #[test]
-    fn compiled_layout_metadata_request_map_failure_keeps_original_string_and_source_graph() {
-        let malformed = FunctionValueType::new(
-            DataType::Map(
-                Arc::new(Field::new("entries", DataType::Int64, false)),
-                false,
-            ),
-            true,
-        );
-        let source = positive(&[malformed]);
-        let before = Arc::clone(source.schema());
-        let facts = original_compiled_schema_metadata_request(&source, &Control::good()).unwrap();
-        assert!(facts.allocation_request_bytes_upper_bound > 0);
-        assert_eq!(
-            ChunkSchema::from_compiled_layout(&source).unwrap_err(),
-            "map entries is not struct: Int64"
-        );
-        assert!(Arc::ptr_eq(&before, source.schema()));
-        let malformed = FunctionValueType::new(
-            DataType::Map(
-                Arc::new(Field::new(
-                    "entries",
-                    DataType::Struct(
-                        vec![Arc::new(Field::new("key", DataType::Int64, false))].into(),
-                    ),
-                    false,
-                )),
-                false,
-            ),
-            true,
-        );
-        let source = positive(&[malformed]);
-        original_compiled_schema_metadata_request(&source, &Control::good()).unwrap();
-        assert_eq!(
-            ChunkSchema::from_compiled_layout(&source).unwrap_err(),
-            "map entries expected 2 struct fields, got 1"
-        );
-    }
-    #[test]
-    fn compiled_layout_metadata_request_foreign_and_mixed_sources_do_not_mint_facts() {
-        let field = Field::new("foreign", DataType::Int64, true);
-        let foreign = StaticLayout::try_new_for_compile(
-            Arc::new(Schema::new(vec![field.clone()])),
-            Arc::from([SlotId::new(1)]),
-            &Control::good(),
-        )
-        .unwrap();
-        assert!(matches!(
-            original_compiled_schema_metadata_request(&foreign, &Control::good()),
-            Err(MetadataRequestError::SourceModel(_))
-        ));
-        ChunkSchema::from_compiled_layout(&foreign).unwrap();
-        let source = TypedSchemaMaterializations::from_original_fields(
-            vec![OriginalFieldMaterialization::Plain(field)],
-            MaterializedFieldNamespace::from_original_loans(Arc::from([])),
-        )
-        .into_original_schema();
-        let mixed = StaticLayout::try_new_materialized_for_compile(
-            source,
-            Arc::from([SlotId::new(1)]),
-            &Control::good(),
-        )
-        .unwrap();
-        assert!(matches!(
-            original_compiled_schema_metadata_request(&mixed, &Control::good()),
-            Err(MetadataRequestError::SourceModel(_))
-        ));
-        ChunkSchema::from_compiled_layout(&mixed).unwrap();
-    }
-    #[test]
-    fn compiled_layout_metadata_request_nested_wide_source_keeps_every_control_prefix() {
-        let mut metadata = std::collections::HashMap::new();
-        for index in 0..320 {
-            metadata.insert(format!("key_{index}"), "quote\"\\\n".repeat(3));
+        fn observe_opaque_bound(
+            &self,
+            bytes: usize,
+        ) -> Result<(), crate::exec::pipeline::operator::ConstructionFailure> {
+            self.original.observe_opaque_bound(bytes)
         }
-        let nested = FunctionValueType::new(
-            DataType::List(Arc::new(Field::new(
-                "item",
-                DataType::Struct(
-                    vec![Arc::new(
-                        Field::new(
-                            "child",
-                            DataType::Timestamp(
-                                arrow::datatypes::TimeUnit::Nanosecond,
-                                Some("UTC".into()),
-                            ),
-                            true,
-                        )
-                        .with_metadata(metadata),
-                    )]
-                    .into(),
-                ),
-                true,
+        fn release_requested_bytes(&self, bytes: usize) {
+            self.original.release_requested_bytes(bytes);
+        }
+    }
+    fn assert_real_constructor_covered(source: &StaticLayout) {
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        let facts = original_compiled_schema_metadata_request(source, &Control).unwrap();
+        let tracker =
+            crate::runtime::mem_tracker::MemTracker::new_root("typed schema recipe observation");
+        tracker.install_limit_once(16 * 1024 * 1024).unwrap();
+        let host = Arc::new(ActualHost {
+            original: TrackedInputConstructionHost::new(tracker.clone()),
+            requests: AtomicUsize::new(0),
+            bytes: AtomicUsize::new(0),
+        });
+        let factory = ObservedInputConstructionFactory::try_new(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            host.clone(),
+            Arc::new(RuntimeInputConstructionControl::new(Arc::new(
+                crate::runtime::runtime_state::RuntimeErrorState::default(),
             ))),
+            Arc::new(LockedArrowInputConstructionModel),
+        )
+        .unwrap();
+        let factory_bytes = tracker.current();
+        host.requests.store(0, Ordering::SeqCst);
+        host.bytes.store(0, Ordering::SeqCst);
+        let owner = factory.begin_compiled_layout_construction(source).unwrap();
+        let output = ChunkSchema::from_compiled_layout_owned_observed::<ConstructionFailure>(
+            source,
+            owner.storage_lifetime(),
+            |layout| owner.request(layout),
+            |units| {
+                owner.observe(
+                    0,
+                    &[],
+                    super::super::ArrayNormalizationStep::InspectConstructionWork { units },
+                )
+            },
+        )
+        .unwrap();
+        assert!(facts.allocation_requests_upper_bound >= host.requests.load(Ordering::SeqCst));
+        assert!(facts.allocation_request_bytes_upper_bound >= host.bytes.load(Ordering::SeqCst));
+        assert_eq!(output.arrow_schema_ref().metadata().capacity(), 0);
+        for (index, slot) in output.slots().iter().enumerate() {
+            assert_eq!(slot.field_ref().metadata().capacity(), 0);
+            assert_eq!(
+                slot.typed_binding(),
+                source.value_binding_at(index).unwrap()
+            );
+        }
+        let last = output.clone();
+        drop(output);
+        drop(owner);
+        assert!(
+            tracker.current() > factory_bytes,
+            "the actual schema retains its finite creator"
+        );
+        drop(last);
+        assert_eq!(tracker.current(), factory_bytes);
+        drop(factory);
+        assert_eq!(tracker.current(), 0);
+    }
+    #[test]
+    fn compiled_layout_metadata_request_empty_keeps_actual_scope_and_schema_headers() {
+        assert_real_constructor_covered(&source(&[]));
+    }
+    #[test]
+    fn compiled_layout_metadata_request_complete_nominal_and_shared_nested_bindings_are_retained() {
+        use arrow::datatypes::{DataType, Field};
+        let nominal =
+            FunctionValueType::try_with_logical_type(DataType::Binary, true, ValueLogicalType::Hll)
+                .unwrap();
+        let nested = FunctionValueType::try_from_value(
+            novarocks_type_contract::ValueTypeRef::try_new(
+                novarocks_type_contract::ValueKind::List(nominal.value_type().clone()),
+                false,
+                ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+            novarocks_type_contract::ValueLayout::try_new(
+                &DataType::List(Arc::new(Field::new("item", DataType::Binary, true))),
+                ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let wide = FunctionValueType::new(
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("one", DataType::Int64, true)),
+                    Arc::new(Field::new("two", DataType::LargeUtf8, false)),
+                ]
+                .into(),
+            ),
             true,
         );
-        let source = positive(&[nested]);
-        let baseline = Control::good();
-        original_compiled_schema_metadata_request(&source, &baseline).unwrap();
-        ChunkSchema::from_compiled_layout(&source).unwrap();
-        let trace = baseline.trace.into_inner().unwrap();
-        assert!(trace.iter().any(|(_, units)| *units == 256));
-        for error in [
-            CompileControlError::Cancelled,
-            CompileControlError::DeadlineExceeded,
-            CompileControlError::ResourceExhausted,
-        ] {
-            for at in 1..=trace.len() {
-                let control = Control {
-                    trace: Mutex::default(),
-                    refusal: Some((at, error)),
-                };
-                assert_eq!(
-                    original_compiled_schema_metadata_request(&source, &control),
-                    Err(MetadataRequestError::Control(error))
-                );
-                assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
+        assert_real_constructor_covered(&source(&[nominal, nested.clone(), nested, wide]));
+    }
+    #[test]
+    fn compiled_layout_metadata_request_wide_occurrences_cover_actual_growth_and_last_schema_reference()
+     {
+        let value = FunctionValueType::new(arrow::datatypes::DataType::Utf8, true);
+        assert_real_constructor_covered(&source(&vec![value; 128]));
+    }
+    #[test]
+    fn compiled_layout_metadata_request_untyped_source_never_claims_typed_constructor_facts() {
+        let untyped =
+            StaticLayout::try_new_for_compile(Arc::new(Schema::empty()), Arc::from([]), &Control)
+                .unwrap();
+        assert!(matches!(
+            original_compiled_schema_metadata_request(&untyped, &Control),
+            Err(MetadataRequestError::SourceModel(_))
+        ));
+    }
+    struct PrefixControl {
+        calls: AtomicUsize,
+        refuse_at: Option<usize>,
+    }
+    impl PureCompileControl for PrefixControl {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            let at = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.refuse_at == Some(at) {
+                Err(CompileControlError::Cancelled)
+            } else {
+                Ok(())
             }
+        }
+    }
+    #[test]
+    fn compiled_layout_metadata_request_keeps_every_original_control_prefix() {
+        let value = FunctionValueType::new(arrow::datatypes::DataType::Int64, true);
+        let source = source(&vec![value; 128]);
+        let good = PrefixControl {
+            calls: AtomicUsize::new(0),
+            refuse_at: None,
+        };
+        original_compiled_schema_metadata_request(&source, &good).unwrap();
+        for refuse_at in 0..good.calls.load(Ordering::SeqCst) {
+            let control = PrefixControl {
+                calls: AtomicUsize::new(0),
+                refuse_at: Some(refuse_at),
+            };
+            assert_eq!(
+                original_compiled_schema_metadata_request(&source, &control),
+                Err(MetadataRequestError::Control(
+                    CompileControlError::Cancelled
+                ))
+            );
         }
     }
 }

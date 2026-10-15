@@ -19,7 +19,7 @@
 use super::aggregate_by_core::{ByDirection, ByEncodeBuffer, ByState};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_scalar::{self as scalar, ScalarStateError, ScalarWork};
-use crate::kernel_control::{KernelControlObservation, compile_failure, internal, invalid};
+use crate::kernel_control::{KernelControlObservation, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::*;
 use allocator_api2::vec::Vec as HostVec;
@@ -134,7 +134,7 @@ impl ByKernel {
         else {
             unreachable!("validated scalar")
         };
-        &output.data_type
+        output.data_type()
     }
 }
 impl PreparedAggregateKernel for ByKernel {
@@ -352,6 +352,35 @@ pub(super) enum ByPreparationDomain {
     InstalledAggregate,
     OriginalWindow,
 }
+
+/// Preserve the original public type diagnostic without exposing the private
+/// typed binding/storage Debug representation or constructing a type tree.
+struct OriginalByInputProfile<'a>([&'a FunctionValueType; 2]);
+impl std::fmt::Debug for OriginalByInputProfile<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct Value<'a>(&'a FunctionValueType);
+        impl std::fmt::Debug for Value<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("FunctionValueType")
+                    .field("data_type", self.0.data_type())
+                    .field("nullable", &self.0.nullable())
+                    .field("logical_type", &self.0.logical_type())
+                    .finish()
+            }
+        }
+        struct Argument<'a>(&'a FunctionValueType);
+        impl std::fmt::Debug for Argument<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_tuple("Value").field(&Value(self.0)).finish()
+            }
+        }
+        f.debug_list()
+            .entry(&Argument(self.0[0]))
+            .entry(&Argument(self.0[1]))
+            .finish()
+    }
+}
+
 pub(super) fn validate_contract(
     contract: &AggregateCallContract,
     domain: ByPreparationDomain,
@@ -377,23 +406,17 @@ pub(super) fn validate_contract(
         ByPreparationDomain::OriginalWindow => false,
     };
     if installed_reader_required
-        && (!super::aggregate_any_value::supported(&value.data_type, work)?
-            || !super::aggregate_any_value::supported(&key.data_type, work)?)
+        && (!super::aggregate_any_value::supported(value.data_type(), work)?
+            || !super::aggregate_any_value::supported(key.data_type(), work)?)
     {
         return Err(invalid(&format!(
             "{} has no installed max_by/min_by input profile for {:?}",
             contract.call().function_id().as_str(),
-            contract.call().selected().argument_types
+            OriginalByInputProfile([value, key])
         )));
     }
-    let mut expected = value.clone();
-    expected.nullable = true;
-    if !expected
-        .exactly_equals_observed::<KernelFailure>(output, || work.step().map_err(compile_failure))?
-        || !FunctionValueType::new(DataType::Binary, true)
-            .exactly_equals_observed::<KernelFailure>(contract.intermediate_type(), || {
-                work.step().map_err(compile_failure)
-            })?
+    if !super::aggregate_any_value::matches_nullable_source(value, output, work)?
+        || !super::aggregate_any_value::matches_nullable_binary(contract.intermediate_type(), work)?
     {
         return Err(invalid(
             "max_by/min_by selected result or intermediate differs from its exact value and Binary state",

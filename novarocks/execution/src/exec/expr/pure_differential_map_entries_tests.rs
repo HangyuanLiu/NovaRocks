@@ -130,7 +130,7 @@ fn pure_differential_map_entries_pool_constant_null_empty_and_nonzero_ordinal() 
             );
         }
     }
-    check(new_empty_array(&ty.data_type), true);
+    check(new_empty_array(&ty.data_type()), true);
 }
 #[test]
 fn pure_differential_map_entries_registered_nested_nominal_domains_preserve_tags() {
@@ -192,8 +192,20 @@ fn pure_differential_map_entries_registered_nested_nominal_domains_preserve_tags
     }
 }
 
+// Raw owner/profile and prepared-source replacement passed before retirement
+// of the superseded engine-ingress mismatch witnesses.
+fn check_plain_views(a: ArrayRef, declared: FunctionValueType) {
+    super::assert_scalar_matches_v1_with_plain_views(
+        ScalarDiffSpec::new("map_entries")
+            .typed_column(declared, a)
+            .float_comparison(super::FloatComparison::Exact)
+            .sparse_selections(7, 7712),
+    );
+}
+
 #[test]
-fn pure_differential_map_entries_full_nested_carrier_closure_without_key_restriction() {
+fn pure_differential_map_entries_full_nested_carrier_closure_without_key_restriction_prepared_plain_views()
+ {
     use arrow::array::{new_empty_array, new_null_array};
     use arrow::datatypes::{IntervalUnit, UnionFields, UnionMode};
     let field = |ty| {
@@ -268,6 +280,25 @@ fn pure_differential_map_entries_full_nested_carrier_closure_without_key_restric
         types.push(DataType::Duration(unit));
         types.push(DataType::Timestamp(unit, Some("UTC".into())));
     }
+    let declaration = |key: &DataType, value: &DataType, nullable, sorted| {
+        FunctionValueType::new(
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Arc::new(Field::new("key", key.clone(), false)),
+                            Arc::new(Field::new("value", value.clone(), true)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                sorted,
+            ),
+            nullable,
+        )
+    };
     for ty in types {
         for sorted in [false, true] {
             let a = map(
@@ -277,13 +308,22 @@ fn pure_differential_map_entries_full_nested_carrier_closure_without_key_restric
                 Some(vec![true, false, true, true]),
                 sorted,
             );
-            check(a.clone(), true);
-            check(a.slice(1, 3), true);
-            check(new_empty_array(a.data_type()), false);
+            check_plain_views(a.clone(), declaration(&DataType::Int32, &ty, true, sorted));
+            check_plain_views(
+                a.slice(1, 3),
+                declaration(&DataType::Int32, &ty, true, sorted),
+            );
+            check_plain_views(
+                new_empty_array(a.data_type()),
+                declaration(&DataType::Int32, &ty, false, sorted),
+            );
             // Any valid key type is admitted: no ordered-compare decoder belongs here.
             let key = new_empty_array(&ty);
             let value = new_empty_array(&DataType::Utf8);
-            check(map(key, value, vec![0], None, sorted), false);
+            check_plain_views(
+                map(key, value, vec![0], None, sorted),
+                declaration(&ty, &DataType::Utf8, false, sorted),
+            );
         }
     }
 }

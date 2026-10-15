@@ -177,8 +177,8 @@ pub(super) fn evaluate_string_from_base64<'a>(
         let FunctionArgumentType::Value(source) = &types[0] else {
             return Err(invalid("from_base64 requires a value argument"));
         };
-        let exact =
-            source.logical_type == ValueLogicalType::Physical && source.data_type == DataType::Utf8;
+        let exact = source.logical_type() == ValueLogicalType::Physical
+            && source.data_type() == &DataType::Utf8;
         work.step()?;
         if !exact {
             return Err(invalid(
@@ -186,9 +186,9 @@ pub(super) fn evaluate_string_from_base64<'a>(
             ));
         }
         let target = input.contract().result_type();
-        if target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
+        if target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Utf8
+            || !target.nullable()
         {
             return Err(invalid(
                 "from_base64 differs from its exact installed result profile",
@@ -211,7 +211,7 @@ pub(super) fn evaluate_string_from_base64<'a>(
                 ));
             }
             if strings.is_null(row) {
-                if !source.nullable {
+                if !source.nullable() {
                     return Err(internal(
                         "from_base64 non-null argument contains selected SQL NULL",
                     ));
@@ -274,7 +274,7 @@ pub(super) fn evaluate_string_from_base64<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

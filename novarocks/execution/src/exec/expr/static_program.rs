@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use novarocks_local_program::{
     ImmutableExpressions, ProgramExprId, StaticExprKind, StaticExprNode, StaticExpressionError,
-    StaticFieldSchema, StaticFunctionKind, StaticLiteral,
+    StaticFunctionKind, StaticLiteral, ValueTypeRef,
 };
 
 use super::function::FunctionKind;
@@ -39,21 +39,33 @@ impl ExprArena {
             nodes,
             types,
             field_schemas,
+            complete_types,
             allow_throw_exception,
             query_global_dicts,
             session_time_zone,
             runtime_error: _,
         } = self;
-        if nodes.len() != types.len() || nodes.len() != field_schemas.len() {
+        if nodes.len() != types.len()
+            || nodes.len() != field_schemas.len()
+            || nodes.len() != complete_types.len()
+        {
             return Err(StaticExpressionError::InvalidMetadataArity);
         }
         let mut frozen = Vec::with_capacity(nodes.len());
-        for ((node, data_type), field_schema) in nodes.into_iter().zip(types).zip(field_schemas) {
-            frozen.push(StaticExprNode::new(
-                freeze_kind(node),
-                data_type,
-                field_schema.map(freeze_field_schema),
-            ));
+        for (((node, data_type), field_schema), complete_type) in nodes
+            .into_iter()
+            .zip(types)
+            .zip(field_schemas)
+            .zip(complete_types)
+        {
+            frozen.push(match complete_type {
+                Some(value_type) => StaticExprNode::new_value_typed(freeze_kind(node), value_type),
+                None => StaticExprNode::new(
+                    freeze_kind(node),
+                    data_type,
+                    field_schema.map(freeze_field_schema),
+                ),
+            });
         }
         ImmutableExpressions::try_new(
             frozen,
@@ -82,6 +94,10 @@ impl ExprArena {
         arena.set_query_global_dicts(expressions.query_global_dicts().clone());
         arena.set_session_time_zone(expressions.session_time_zone().map(str::to_owned));
         for node in expressions.nodes() {
+            if let Some(value_type) = node.value_type() {
+                arena.push_value_typed(thaw_kind(node.kind())?, value_type.clone());
+                continue;
+            }
             let id = arena.push_typed(thaw_kind(node.kind())?, node.data_type().clone());
             if let Some(schema) = node.field_schema() {
                 arena.set_field_schema(id, thaw_field_schema(schema));
@@ -91,23 +107,12 @@ impl ExprArena {
     }
 }
 
-pub(crate) fn freeze_field_schema(schema: ChunkFieldSchema) -> StaticFieldSchema {
-    StaticFieldSchema::new(
-        schema.logical_type(),
-        schema
-            .children()
-            .iter()
-            .cloned()
-            .map(freeze_field_schema)
-            .collect(),
-    )
+pub(crate) fn freeze_field_schema(schema: ChunkFieldSchema) -> ValueTypeRef {
+    schema.value_type().clone()
 }
 
-pub(crate) fn thaw_field_schema(schema: &StaticFieldSchema) -> ChunkFieldSchema {
-    ChunkFieldSchema::new(
-        schema.logical_type(),
-        schema.children().iter().map(thaw_field_schema).collect(),
-    )
+pub(crate) fn thaw_field_schema(schema: &ValueTypeRef) -> ChunkFieldSchema {
+    ChunkFieldSchema::from_value_type(schema.clone())
 }
 
 fn old_id(id: ProgramExprId) -> ExprId {
@@ -278,6 +283,8 @@ fn thaw_function(kind: StaticFunctionKind) -> FunctionKind {
         StaticFunctionKind::IsNull => FunctionKind::IsNull,
         StaticFunctionKind::IsNotNull => FunctionKind::IsNotNull,
         StaticFunctionKind::Abs => FunctionKind::Abs,
+        StaticFunctionKind::PercentileToBinary => FunctionKind::PercentileToBinary,
+        StaticFunctionKind::JsonToText => FunctionKind::JsonToText,
         StaticFunctionKind::Round => FunctionKind::Round,
         StaticFunctionKind::Date(name) => FunctionKind::Date(name),
         StaticFunctionKind::Array(name) => FunctionKind::Array(name),
@@ -434,6 +441,8 @@ fn freeze_function(kind: FunctionKind) -> StaticFunctionKind {
         FunctionKind::IsNull => StaticFunctionKind::IsNull,
         FunctionKind::IsNotNull => StaticFunctionKind::IsNotNull,
         FunctionKind::Abs => StaticFunctionKind::Abs,
+        FunctionKind::PercentileToBinary => StaticFunctionKind::PercentileToBinary,
+        FunctionKind::JsonToText => StaticFunctionKind::JsonToText,
         FunctionKind::Round => StaticFunctionKind::Round,
         FunctionKind::Date(name) => StaticFunctionKind::Date(name),
         FunctionKind::Array(name) => StaticFunctionKind::Array(name),

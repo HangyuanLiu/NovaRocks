@@ -19,13 +19,13 @@
 
 use std::sync::Arc;
 
-use novarocks_execution::exec::expr::{ExprArena, ExprNode};
+use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::project::ProjectNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::common;
 use novarocks_type_contract::ValueLogicalType;
-use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY};
+use novarocks_types::logical::NR_LOGICAL_TYPE_KEY;
 
 /// Legacy writer columns are a compatibility projection only when a real
 /// TableFinish owns the separately validated exact Arrow result relation.
@@ -56,24 +56,22 @@ fn strict_source_domain(
     let Some(value) = field.metadata().get(NR_LOGICAL_TYPE_KEY) else {
         return Ok(None);
     };
-    let logical = ValueLogicalType::from_legacy_compatible_metadata_value(value).map_err(|_| {
-        NativeFragmentDecodeError::inconsistent(
-            FieldPath::root("plan_fragment").field("output_columns"),
-            "decoded root contains an unknown logical domain marker",
-        )
-    })?;
-    if matches!(
-        logical,
-        ValueLogicalType::LargeInt | ValueLogicalType::Variant | ValueLogicalType::Uuid
-    ) {
-        logical.validate_carrier(field.data_type()).map_err(|_| {
-            NativeFragmentDecodeError::inconsistent(
-                FieldPath::root("plan_fragment").field("output_columns"),
-                "final result output carrier differs from the decoded root carrier",
-            )
-        })?;
+    let value = value.trim();
+    for domain in [
+        ValueLogicalType::Json,
+        ValueLogicalType::Hll,
+        ValueLogicalType::Bitmap,
+        ValueLogicalType::Object,
+        ValueLogicalType::Percentile,
+    ] {
+        if value.eq_ignore_ascii_case(domain.metadata_value().expect("nominal domain")) {
+            return Ok(Some(domain));
+        }
     }
-    Ok(Some(logical))
+    Err(NativeFragmentDecodeError::inconsistent(
+        FieldPath::root("plan_fragment").field("output_columns"),
+        "decoded root contains an unknown logical domain marker",
+    ))
 }
 
 fn legacy_projection(domain: Option<ValueLogicalType>) -> Option<&'static str> {
@@ -88,7 +86,7 @@ fn legacy_projection(domain: Option<ValueLogicalType>) -> Option<&'static str> {
 }
 
 use crate::fragment_error::NativeFragmentDecodeError;
-use crate::fragment_layout::decode_output_layout;
+
 use crate::fragment_plan_node::NativeLoweredPlanNode;
 
 /// Publish only the final result's exact slot order and field semantics.
@@ -103,6 +101,8 @@ pub(crate) fn apply_final_root_output_layout(
     declared: &[common::OutputColumn],
     arena: &mut ExprArena,
     root_node_id: i32,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<NativeLoweredPlanNode, NativeFragmentDecodeError> {
     let path = FieldPath::root("plan_fragment").field("output_columns");
     if declared.len() != decoded.layout.order().len()
@@ -136,8 +136,9 @@ pub(crate) fn apply_final_root_output_layout(
             "decoded root schema differs from its actual execution node",
         ));
     }
-    let output =
-        decode_output_layout(declared, path.clone()).map_err(NativeFragmentDecodeError::from)?;
+    let output = type_decoder
+        .output_layout(declared, path.clone())
+        .map_err(NativeFragmentDecodeError::from)?;
     let output_schema = output.chunk_schema();
     for (index, (source, target)) in decoded
         .output_schema
@@ -152,33 +153,38 @@ pub(crate) fn apply_final_root_output_layout(
                 "final result output carrier differs from the decoded root carrier",
             ));
         }
-        let target_domain = strict_source_domain(target.field())?;
-        let target_projection = legacy_projection(target_domain);
-        if target
-            .field_schema()
-            .logical_type()
-            .map(LogicalType::metadata_value)
-            != target_projection
-        {
-            return Err(NativeFragmentDecodeError::inconsistent(
-                path.clone().index(index).field("type"),
-                "final result output contains conflicting logical domain facts",
-            ));
-        }
-        // A carrier-only source may acquire the exact frozen root domain, but
-        // an already known source domain cannot be erased or reinterpreted.
-        let source_domain = strict_source_domain(source.field())?;
-        let source_cache = source
-            .field_schema()
-            .logical_type()
-            .map(LogicalType::metadata_value);
-        if (source_domain.is_some() && source_domain != target_domain)
-            || (source_cache.is_some() && source_cache != target_projection)
-        {
-            return Err(NativeFragmentDecodeError::inconsistent(
-                path.clone().index(index).field("type"),
-                "final result output logical domain differs from the decoded root domain",
-            ));
+        if matches!(
+            type_decoder,
+            crate::fragment_type_decode::NativeTypeDecoder::Strong { .. }
+        ) {
+            if !source.is_typed()
+                || !target.is_typed()
+                || !type_decoder.bindings_match(
+                    source.typed_binding(),
+                    target.typed_binding(),
+                    true,
+                )?
+            {
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    path.clone().index(index).field("type"),
+                    "final result output differs from the complete decoded source binding",
+                ));
+            }
+        } else {
+            let target_domain = target.field_schema().logical_type();
+            // A carrier-only source may acquire the exact frozen root domain, but
+            // an already known source domain cannot be erased or reinterpreted.
+            for source_domain in [
+                source.field_schema().logical_type(),
+                strict_source_domain(source.field())?,
+            ] {
+                if source_domain.is_some() && source_domain != target_domain {
+                    return Err(NativeFragmentDecodeError::inconsistent(
+                        path.clone().index(index).field("type"),
+                        "final result output logical domain differs from the decoded root domain",
+                    ));
+                }
+            }
         }
         if source.nullable() && !target.nullable() {
             return Err(NativeFragmentDecodeError::inconsistent(
@@ -191,9 +197,8 @@ pub(crate) fn apply_final_root_output_layout(
     // the logical fields in its actual chunks. Materialize semantic/container
     // layouts at this final boundary even when the decoded facts already agree.
     let plain_leaf_layout = output_schema.slots().iter().all(|slot| {
-        !slot.field().metadata().contains_key(NR_LOGICAL_TYPE_KEY)
-            && slot.field_schema().logical_type().is_none()
-            && slot.field_schema().children().is_empty()
+        slot.field_schema().logical_type().is_none()
+            && slot.field_schema().value_type().child_count() == 0
     });
     if plain_leaf_layout && decoded.output_schema.as_ref() == output_schema.as_ref() {
         return Ok(decoded);
@@ -205,15 +210,8 @@ pub(crate) fn apply_final_root_output_layout(
         .output_schema
         .slots()
         .iter()
-        .map(|source| {
-            let id = arena.push_typed(
-                ExprNode::SlotId(source.slot_id()),
-                source.data_type().clone(),
-            );
-            arena.set_field_schema(id, source.field_schema().clone());
-            id
-        })
-        .collect();
+        .map(|source| type_decoder.source_slot_expression(source, arena))
+        .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
     let slots = decoded.layout.order().to_vec();
     Ok(NativeLoweredPlanNode {
         node: ExecNode {
@@ -236,7 +234,40 @@ pub(crate) fn apply_final_root_output_layout(
 
 #[cfg(test)]
 mod tests {
+    // Exercise the installed BE receive boundary with the fixture's complete
+    // frozen declaration. Returned chunks retain finite creation responsibility.
+    fn test_receive_root_chunks(
+        payload: &[u8],
+        schema: &novarocks_execution::exec::chunk::ChunkSchemaRef,
+    ) -> Result<Vec<novarocks_execution::exec::chunk::Chunk>, String> {
+        use novarocks_execution::runtime::exchange::{
+            ExchangeColumnBinding, ExchangeKey, ExchangeSenderIdentity, ExecutionExchangeRegistry,
+        };
+        let registry = ExecutionExchangeRegistry::default();
+        let key = ExchangeKey {
+            finst_id_hi: 47,
+            finst_id_lo: 83,
+            node_id: 1,
+        };
+        let factory = novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            novarocks_execution::exec::pipeline::pipeline::representation_construction_profile().map_err(|e|e.to_string())?,
+            novarocks_execution::runtime::mem_tracker::MemTracker::new_root("root consumer fixture"),
+            std::sync::Arc::new(novarocks_execution::runtime::runtime_state::RuntimeErrorState::default()),
+        ).map_err(|e|e.to_string())?;
+        registry.try_register_expected_chunk_schema_with_binding(
+            key,
+            1,
+            schema.clone(),
+            ExchangeColumnBinding::Positional,
+            factory,
+        )?;
+        registry
+            .decode_chunks_for_sender(key, ExchangeSenderIdentity::local(1, 1), payload)
+            .map_err(|e| e.to_string())
+    }
+
     use super::*;
+    use crate::fragment_layout::decode_output_layout;
     use arrow::array::{ArrayRef, BinaryArray, StringArray};
     use arrow::datatypes::DataType;
     use novarocks_execution::exec::chunk::{Chunk, SlotLayout};
@@ -248,152 +279,415 @@ mod tests {
     use novarocks_types::logical::{LogicalType, logical_type_of_field};
 
     fn column(id: u32, primitive: common::PrimitiveType, nullable: bool) -> common::OutputColumn {
+        use crate::fragment_expression::fixture_sources as sources;
+        use novarocks_type_contract::FunctionValueType as V;
+        let declaration = match primitive {
+            common::PrimitiveType::Varbinary => V::new(DataType::Binary, nullable),
+            common::PrimitiveType::Varchar => V::new(DataType::Utf8, nullable),
+            common::PrimitiveType::Json => sources::json_type().with_nullable(nullable).unwrap(),
+            common::PrimitiveType::Bitmap => sources::binary_domain(ValueLogicalType::Bitmap)
+                .with_nullable(nullable)
+                .unwrap(),
+            common::PrimitiveType::Hll => sources::binary_domain(ValueLogicalType::Hll)
+                .with_nullable(nullable)
+                .unwrap(),
+            _ => panic!("fixture has no original declaration for this primitive"),
+        };
         common::OutputColumn {
             column_id: id,
             name: format!("field_{id}"),
-            r#type: Some(common::TypeDesc {
-                kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-                    r#type: primitive as i32,
-                    len: None,
-                    precision: None,
-                    scale: None,
-                    time_unit: None,
-                    time_zone: None,
-                })),
-            }),
+            r#type: Some(sources::type_desc_with_nullable(&declaration, nullable)),
             nullable,
             is_internal: false,
         }
     }
 
     fn values(columns: &[common::OutputColumn]) -> (NativeLoweredPlanNode, Chunk) {
-        let output = decode_output_layout(columns, FieldPath::root("source")).unwrap();
-        let schema = output.chunk_schema();
-        let arrays = schema
+        use crate::fragment_expression::fixture_sources as sources;
+        sources::with_decoder(|decoder| -> Result<_, NativeFragmentDecodeError> {
+            let values = columns
+                .iter()
+                .map(|column| {
+                    let ty = sources::declaration_for_reference(column.r#type.as_ref().unwrap());
+                    let value = if ty.data_type() == &DataType::Utf8 {
+                        common::literal_value::Value::StringValue("{\"v\":1}".into())
+                    } else {
+                        common::literal_value::Value::BinaryValue(b"state".to_vec())
+                    };
+                    let literal = novarocks_proto_models::expr::LiteralExpr {
+                        value: Some(common::LiteralValue { value: Some(value) }),
+                    };
+                    novarocks_proto_models::expr::Expr {
+                        original_definition_id: None,
+                        r#type: Some(sources::type_desc_with_nullable(&ty, false)),
+                        nullable: false,
+                        kind: Some(novarocks_proto_models::expr::expr::Kind::ConstantReference(
+                            sources::constant_reference(&ty, &literal),
+                        )),
+                    }
+                })
+                .collect();
+            let output = crate::fragment_plan_node::lower_values_node(
+                &novarocks_proto_models::plan::DistributedNode {
+                    node_id: 37,
+                    limit: -1,
+                    ..Default::default()
+                },
+                &novarocks_proto_models::plan::PlanNode {
+                    output_columns: columns.to_vec(),
+                    ..Default::default()
+                },
+                &novarocks_proto_models::plan::ValuesNode {
+                    columns: columns.to_vec(),
+                    rows: vec![novarocks_proto_models::plan::ExprList { values }],
+                },
+                FieldPath::root("source").field("values"),
+                FieldPath::root("source").field("columns"),
+                Vec::new(),
+                &mut ExprArena::default(),
+                decoder,
+            )?;
+            let ExecNodeKind::Values(values) = &output.node.kind else {
+                panic!("values source")
+            };
+            let chunk = values.chunk.clone();
+            Ok((output, chunk))
+        })
+        .unwrap()
+    }
+    fn apply_fixture_root_layout(
+        source: NativeLoweredPlanNode,
+        columns: &[common::OutputColumn],
+        arena: &mut ExprArena,
+    ) -> Result<NativeLoweredPlanNode, NativeFragmentDecodeError> {
+        crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+            apply_final_root_output_layout(source, columns, arena, 37, decoder)
+        })
+    }
+
+    struct ProjectControl;
+    impl novarocks_type_contract::PureCompileControl for ProjectControl {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+    fn typed_fixture_values(
+        ty: &novarocks_type_contract::FunctionValueType,
+    ) -> (NativeLoweredPlanNode, Chunk) {
+        use crate::fragment_expression::fixture_sources as sources;
+        sources::with_decoder(|decoder| -> Result<_, NativeFragmentDecodeError> {
+            let column = common::OutputColumn {
+                column_id: 1,
+                name: "field_1".into(),
+                r#type: Some(sources::type_desc_with_nullable(ty, ty.nullable())),
+                nullable: ty.nullable(),
+                is_internal: false,
+            };
+            let value = if ty.data_type() == &DataType::Utf8 {
+                common::literal_value::Value::StringValue("{\"v\":1}".into())
+            } else {
+                common::literal_value::Value::BinaryValue(b"state".to_vec())
+            };
+            let literal = novarocks_proto_models::expr::LiteralExpr {
+                value: Some(common::LiteralValue { value: Some(value) }),
+            };
+            let row = novarocks_proto_models::expr::Expr {
+                original_definition_id: None,
+                r#type: Some(sources::type_desc_with_nullable(ty, false)),
+                nullable: false,
+                kind: Some(novarocks_proto_models::expr::expr::Kind::ConstantReference(
+                    sources::constant_reference(ty, &literal),
+                )),
+            };
+            let output = crate::fragment_plan_node::lower_values_node(
+                &novarocks_proto_models::plan::DistributedNode {
+                    node_id: 37,
+                    limit: -1,
+                    ..Default::default()
+                },
+                &novarocks_proto_models::plan::PlanNode {
+                    output_columns: vec![column.clone()],
+                    ..Default::default()
+                },
+                &novarocks_proto_models::plan::ValuesNode {
+                    columns: vec![column],
+                    rows: vec![novarocks_proto_models::plan::ExprList { values: vec![row] }],
+                },
+                FieldPath::root("source").field("values"),
+                FieldPath::root("source").field("columns"),
+                Vec::new(),
+                &mut ExprArena::default(),
+                decoder,
+            )?;
+            let ExecNodeKind::Values(values) = &output.node.kind else {
+                panic!("values source")
+            };
+            let chunk = values.chunk.clone();
+            Ok((output, chunk))
+        })
+        .unwrap()
+    }
+    fn typed_final_project(
+        source: NativeLoweredPlanNode,
+        ty: &novarocks_type_contract::FunctionValueType,
+        arena: &mut ExprArena,
+    ) -> NativeLoweredPlanNode {
+        crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+            apply_final_root_output_layout(
+                source,
+                &[common::OutputColumn {
+                    column_id: 1,
+                    name: "opaque_alias_without_a_function_name".into(),
+                    r#type: Some(
+                        crate::fragment_expression::fixture_sources::type_desc_with_nullable(
+                            ty,
+                            ty.nullable(),
+                        ),
+                    ),
+                    nullable: ty.nullable(),
+                    is_internal: false,
+                }],
+                arena,
+                37,
+                decoder,
+            )
+        })
+        .unwrap()
+    }
+    fn prepared_typed_project(
+        project: &novarocks_execution::exec::node::project::ProjectNode,
+        arena: ExprArena,
+    ) -> Box<dyn novarocks_execution::exec::pipeline::operator::Operator> {
+        use novarocks_local_program::{
+            LayoutCreationFailure, ProjectExpressionSlot, ProjectExpressionSlots, StaticLayout,
+        };
+        use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
+        let creator = crate::native_type_construction::NativeTypeConstruction::try_with_control(
+            novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+                "Native final Project fixture",
+            ),
+            &ProjectControl,
+        )
+        .unwrap();
+        let scope = creator.begin_scope().unwrap();
+        let source = project
+            .expr_slot_schemas
+            .as_ref()
+            .expect("actual complete expression purposes");
+        assert!(source.iter().all(|slot| slot.is_typed()));
+        let observe = |layout| scope.request_layout(layout).unwrap();
+        observe(std::alloc::Layout::array::<ProjectExpressionSlot>(source.len()).unwrap());
+        let purposes = source
+            .iter()
+            .map(|slot| ProjectExpressionSlot {
+                slot_id: slot.slot_id(),
+                field: slot.field_ref().clone(),
+                binding: slot.typed_binding().clone(),
+                storage: slot.storage_lifetime(),
+                unique_id: slot.unique_id(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let purposes = ProjectExpressionSlots::try_from_boxed_observed::<LayoutResourceError>(
+            purposes,
+            scope.storage_lifetime(),
+            |layout| {
+                observe(layout);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let output = &project.output_chunk_schema;
+        observe(
+            arc_layout(
+                std::alloc::Layout::array::<novarocks_types::SlotId>(output.slot_ids().len())
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        let slots = Arc::from(output.slot_ids());
+        observe(
+            std::alloc::Layout::array::<(novarocks_type_contract::TypedValueBinding, Option<i32>)>(
+                output.slots().len(),
+            )
+            .unwrap(),
+        );
+        let bindings = output
             .slots()
             .iter()
-            .map(|slot| match slot.data_type() {
-                DataType::Binary => Arc::new(BinaryArray::from(vec![&b"state"[..]])) as ArrayRef,
-                DataType::Utf8 => Arc::new(StringArray::from(vec!["{\"k\":1}"])) as ArrayRef,
-                _ => panic!("test source requires a text or binary carrier"),
-            })
+            .map(|slot| (slot.typed_binding().clone(), slot.unique_id()))
             .collect();
-        let chunk = Chunk::try_new_with_columns(Arc::clone(&schema), arrays).unwrap();
-        (
-            NativeLoweredPlanNode {
-                node: ExecNode {
-                    kind: ExecNodeKind::Values(ValuesNode {
-                        chunk: chunk.clone(),
-                        node_id: 37,
-                    }),
-                },
-                layout: SlotLayout::for_slots(output.slot_ids().iter().copied()),
-                output_schema: schema,
+        let storage = scope
+            .storage_lifetime()
+            .retaining_observed(&output.storage_lifetime(), |layout| {
+                scope.request_layout(layout)
+            })
+            .unwrap();
+        let layout = StaticLayout::try_new_typed_with_creator::<
+            crate::native_type_construction::NativeTypeConstructionError,
+        >(
+            output.arrow_schema_ref(),
+            slots,
+            bindings,
+            storage,
+            |layout| {
+                scope
+                    .request_layout(layout)
+                    .map_err(LayoutCreationFailure::Creator)
             },
-            chunk,
+            &creator,
         )
+        .unwrap();
+        let factory = ProjectProcessorFactory::new(
+            project.node_id,
+            project.is_subordinate,
+            Arc::new(arena),
+            project.exprs.clone(),
+            project.expr_slot_ids.clone(),
+            Some(purposes),
+            project.output_indices.clone(),
+            layout,
+        )
+        .with_final_result_input_validation(project.validate_final_result_input);
+        let mut operator = factory.create(1, 0);
+        operator.set_construction_factory(novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(novarocks_execution::exec::pipeline::pipeline::representation_construction_profile().unwrap(), novarocks_execution::runtime::mem_tracker::MemTracker::new_root("Native Project runtime fixture"), Arc::new(novarocks_execution::runtime::runtime_state::RuntimeErrorState::default())).unwrap());
+        operator.prepare().unwrap();
+        operator
+            .bind_runtime_state(&RuntimeState::default())
+            .unwrap();
+        operator
     }
 
     #[test]
     fn nonempty_final_domain_is_owned_in_local_program_and_actual_ipc_output() {
-        use common::PrimitiveType as P;
-        for (primitive, plain, logical) in [
-            (P::Bitmap, P::Varbinary, LogicalType::Bitmap),
-            (P::Hll, P::Varbinary, LogicalType::Hll),
-            (P::Percentile, P::Varbinary, LogicalType::Percentile),
-            (P::Object, P::Varbinary, LogicalType::Object),
-            (P::Json, P::Varchar, LogicalType::Json),
+        use crate::fragment_expression::fixture_sources as sources;
+        for logical in [
+            ValueLogicalType::Bitmap,
+            ValueLogicalType::Hll,
+            ValueLogicalType::Percentile,
+            ValueLogicalType::Object,
+            ValueLogicalType::Json,
         ] {
-            let (source, input) = values(&[column(1, plain, false)]);
-            let original_array = Arc::clone(&input.columns()[0]);
-            let mut declared = column(1, primitive, false);
-            declared.name = "opaque_alias_without_a_function_name".into();
+            let ty = if logical == ValueLogicalType::Json {
+                sources::json_type()
+            } else {
+                sources::binary_domain(logical)
+            }
+            .with_nullable(false)
+            .unwrap();
+            let (source, input) = typed_fixture_values(&ty);
+            let original_array = input.columns()[0].clone();
             let mut arena = ExprArena::default();
-            let adapted =
-                apply_final_root_output_layout(source, &[declared], &mut arena, 37).unwrap();
+            let adapted = typed_final_project(source, &ty, &mut arena);
             let ExecNodeKind::Project(project) = &adapted.node.kind else {
-                panic!("different root field semantics require an output adapter")
+                panic!("final presentation requires Project")
             };
-            assert!(project.is_subordinate);
-            assert!(project.validate_final_result_input);
-            assert_eq!(project.node_id, 37);
+            assert!(project.is_subordinate && project.validate_final_result_input);
             assert_eq!(
-                arena.data_type(project.exprs[0]),
-                Some(original_array.data_type())
-            );
-            assert_eq!(
-                arena.field_schema(project.exprs[0]).unwrap().logical_type(),
-                None
+                arena.value_type(project.exprs[0]).unwrap().value_type(),
+                ty.value_type()
             );
             assert_eq!(
                 project.expr_slot_schemas.as_ref().unwrap()[0]
-                    .field_schema()
-                    .logical_type(),
-                None
+                    .typed_binding()
+                    .value_type(),
+                ty.value_type()
             );
-
-            // Run the real processor on a nonempty input, then use the actual
-            // typed Arrow IPC path consumed by legacy SQL results.
-            let factory = ProjectProcessorFactory::new(
-                project.node_id,
-                project.is_subordinate,
-                Arc::new(arena.clone()),
-                project.exprs.clone(),
-                project.expr_slot_ids.clone(),
-                project.expr_slot_schemas.clone(),
-                project.output_indices.clone(),
-                Arc::clone(&project.output_chunk_schema),
-            )
-            .with_final_result_input_validation(project.validate_final_result_input);
-            let mut operator = factory.create(1, 0);
+            let mut operator = prepared_typed_project(project, arena.clone());
             let processor = operator.as_processor_mut().unwrap();
-            let state = RuntimeState::default();
-            processor.push_chunk(&state, input).unwrap();
-            let output = processor.pull_chunk(&state).unwrap().unwrap();
+            processor
+                .push_chunk(&RuntimeState::default(), input)
+                .unwrap();
+            let output = processor
+                .pull_chunk(&RuntimeState::default())
+                .unwrap()
+                .unwrap();
             assert_eq!(output.len(), 1);
-            // Chunk construction retags ArrayData and creates a fresh wrapper;
-            // the actual payload and offset buffers must remain shared.
-            let original_data = original_array.to_data();
-            let output_data = output.columns()[0].to_data();
-            assert_eq!(original_data, output_data);
-            assert_eq!(original_data.buffers().len(), output_data.buffers().len());
-            for (original, output) in original_data.buffers().iter().zip(output_data.buffers()) {
-                assert!(original.ptr_eq(output));
+            assert_eq!(output.columns()[0].to_data(), original_array.to_data());
+            for (source, target) in original_array
+                .to_data()
+                .buffers()
+                .iter()
+                .zip(output.columns()[0].to_data().buffers())
+            {
+                assert!(source.ptr_eq(target));
             }
-            let slot = &output.chunk_schema().slots()[0];
-            assert_eq!(logical_type_of_field(slot.field()), Some(logical));
-            assert_eq!(slot.field_schema().logical_type(), Some(logical));
-            let origin = slot.metadata_origins().expect("owned declared field");
-            assert!(origin.metadata_bytes_for(slot.field_ref()).is_some());
+            assert_eq!(
+                output.chunk_schema().slots()[0]
+                    .typed_binding()
+                    .value_type(),
+                ty.value_type()
+            );
+            assert_eq!(
+                output.chunk_schema().slots()[0]
+                    .field()
+                    .metadata()
+                    .capacity(),
+                0
+            );
+            let schema = output.chunk_schema_ref();
             let ipc =
                 novarocks_execution::runtime::exchange::encode_chunks(&[output], true).unwrap();
-            let received =
-                novarocks_execution::runtime::exchange::decode_root_result_chunks(&ipc, None)
-                    .unwrap();
+            let received = test_receive_root_chunks(&ipc, &schema).unwrap();
             assert_eq!(received[0].len(), 1);
             assert_eq!(
-                logical_type_of_field(received[0].chunk_schema().slots()[0].field()),
-                Some(logical)
+                received[0].chunk_schema().slots()[0]
+                    .typed_binding()
+                    .value_type(),
+                ty.value_type()
             );
             assert_eq!(
-                novarocks_types::FieldRenderSchema::from_field(
-                    received[0].chunk_schema().slots()[0].field(),
-                )
-                .renders_opaque_binary(),
-                logical != LogicalType::Json,
+                received[0].chunk_schema().slots()[0]
+                    .field()
+                    .metadata()
+                    .capacity(),
+                0
             );
             assert_eq!(received[0].columns()[0].to_data(), original_array.to_data());
-
+            let actual_schema = project.output_chunk_schema.clone();
             let exec = ExecPlanBuilder::new(arena, adapted.node).finish().unwrap();
+            let creation =
+                crate::native_type_construction::NativeTypeConstruction::try_with_control(
+                    novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+                        "complete final result lowering",
+                    ),
+                    &ProjectControl,
+                )
+                .unwrap();
+            let retained = creation.begin_scope().unwrap();
+            let temporary = creation.begin_scope().unwrap();
+            let storage = retained
+                .storage_lifetime()
+                .retaining_observed(&actual_schema.storage_lifetime(), |layout| {
+                    retained.request_layout(layout)
+                })
+                .unwrap();
+            let mut request = |layout| retained.request_layout(layout);
+            let mut temporary_request = |layout| temporary.request_layout(layout);
+            let mut layout_creation = novarocks_execution::exec::node::LocalLayoutCreation::new(
+                storage,
+                &mut request,
+                &mut temporary_request,
+                &creation,
+            );
             let profile = exec
-                .local_compile_profile(std::num::NonZeroUsize::new(1).unwrap(), None)
+                .local_compile_profile_with_creator(
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                    None,
+                    &mut layout_creation,
+                )
                 .unwrap();
             let (local, _) = exec
-                .into_local_program_and_bindings(
+                .into_local_program_and_bindings_with_creator(
                     profile,
                     std::collections::BTreeMap::new(),
                     vec![ExternalSinkRequirement::Result],
                     novarocks_local_program::StaticSinkProgram::Result,
+                    layout_creation,
                 )
                 .unwrap();
             let root = &local.nodes()[local.root().index()];
@@ -404,12 +698,16 @@ mod tests {
                     ..
                 }
             ));
-            let layout = root.output_layout();
             assert_eq!(
-                logical_type_of_field(&layout.schema().fields()[0]),
-                Some(logical)
+                root.output_layout().slot_metadata_at(0).unwrap().0,
+                ty.value_type()
             );
-            assert!(layout.field_metadata_origins().is_some());
+            assert_eq!(
+                root.output_layout().schema().fields()[0]
+                    .metadata()
+                    .capacity(),
+                0
+            );
             assert_eq!(local.nodes().len(), 2);
         }
     }
@@ -433,50 +731,25 @@ mod tests {
 
     #[test]
     fn unknown_source_markers_cannot_be_erased_or_reassigned() {
-        use arrow::datatypes::Field;
-        use common::PrimitiveType as P;
-        use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-        for value in ["unknown", "", "  "] {
-            for target in [P::Varbinary, P::Bitmap] {
-                let (mut source, input) = values(&[column(1, P::Varbinary, false)]);
-                let field = Field::new("state", DataType::Binary, false)
-                    .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), value.into())].into());
-                let schema = Arc::new(
-                    ChunkSchema::try_new(vec![
-                        ChunkSlotSchema::try_new_with_field(
-                            novarocks_types::SlotId::new(1),
-                            field,
-                            None,
-                            None,
-                        )
-                        .unwrap(),
-                    ])
-                    .unwrap(),
-                );
-                let chunk = Chunk::try_new_with_columns(
-                    Arc::clone(&schema),
-                    vec![Arc::clone(&input.columns()[0])],
-                )
-                .unwrap();
-                source.node = ExecNode {
-                    kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 37 }),
-                };
-                source.output_schema = schema;
-                let mut arena = ExprArena::default();
-                let error = apply_final_root_output_layout(
-                    source,
-                    &[column(1, target, false)],
-                    &mut arena,
-                    37,
-                )
-                .unwrap_err();
-                assert!(error.contains("unknown logical domain"));
-                assert!(
-                    arena
-                        .node(novarocks_execution::exec::expr::ExprId(0))
-                        .is_none()
-                );
-            }
+        use crate::fragment_expression::fixture_sources as sources;
+        let plain = novarocks_type_contract::FunctionValueType::new(DataType::Binary, false);
+        for _ in 0..3 {
+            let (mut columns, logical) = sources::relation_fields(&[(1, "state", plain.clone())]);
+            columns[0].field.as_mut().unwrap().logical_type_id = Some(u32::MAX);
+            let arena = ExprArena::default();
+            let error = sources::with_decoder(|decoder| {
+                decoder.execution_relation_schema(&columns, &logical, FieldPath::root("source"))
+            })
+            .unwrap_err();
+            assert!(
+                error.contains("logical") || error.contains("reference"),
+                "{error}"
+            );
+            assert!(
+                arena
+                    .node(novarocks_execution::exec::expr::ExprId(0))
+                    .is_none()
+            );
         }
     }
 
@@ -490,14 +763,14 @@ mod tests {
         ] {
             let (source, _) = values(&[column(1, source_type, false)]);
             let mut arena = ExprArena::default();
-            let error = apply_final_root_output_layout(
-                source,
-                &[column(1, target_type, false)],
-                &mut arena,
-                37,
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains("logical domain differs"));
+            let error =
+                apply_fixture_root_layout(source, &[column(1, target_type, false)], &mut arena)
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("complete decoded source binding")
+            );
             assert!(
                 arena
                     .node(novarocks_execution::exec::expr::ExprId(0))
@@ -508,75 +781,69 @@ mod tests {
 
     #[test]
     fn final_layout_refuses_runtime_domain_conflict_before_retagging() {
-        for primitive in [
-            common::PrimitiveType::Hll,
-            common::PrimitiveType::Percentile,
-        ] {
-            let declared = [column(1, common::PrimitiveType::Bitmap, false)];
-            let (source, _) = values(&declared);
-            let (_, conflicting_input) = values(&[column(1, primitive, false)]);
+        use crate::fragment_expression::fixture_sources as sources;
+        let target = sources::binary_domain(ValueLogicalType::Bitmap)
+            .with_nullable(false)
+            .unwrap();
+        for domain in [ValueLogicalType::Hll, ValueLogicalType::Percentile] {
+            let (source, _) = typed_fixture_values(&target);
+            let (_, conflicting_input) =
+                typed_fixture_values(&sources::binary_domain(domain).with_nullable(false).unwrap());
             let mut arena = ExprArena::default();
-            let adapted =
-                apply_final_root_output_layout(source, &declared, &mut arena, 37).unwrap();
-            let ExecNodeKind::Project(project) = adapted.node.kind else {
+            let adapted = typed_final_project(source, &target, &mut arena);
+            let ExecNodeKind::Project(project) = &adapted.node.kind else {
                 panic!("semantic result requires runtime validation")
             };
-            let factory = ProjectProcessorFactory::new(
-                project.node_id,
-                project.is_subordinate,
-                Arc::new(arena),
-                project.exprs,
-                project.expr_slot_ids,
-                project.expr_slot_schemas,
-                project.output_indices,
-                project.output_chunk_schema,
-            )
-            .with_final_result_input_validation(project.validate_final_result_input);
-            let mut operator = factory.create(1, 0);
+            let mut operator = prepared_typed_project(project, arena);
             let processor = operator.as_processor_mut().unwrap();
-            let state = RuntimeState::default();
-            let error = processor.push_chunk(&state, conflicting_input).unwrap_err();
-            assert!(error.to_string().contains("logical domain"));
-            assert!(processor.pull_chunk(&state).unwrap().is_none());
+            assert!(
+                processor
+                    .push_chunk(&RuntimeState::default(), conflicting_input)
+                    .is_err()
+            );
+            assert!(
+                processor
+                    .pull_chunk(&RuntimeState::default())
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
-
     #[test]
     fn equal_static_semantic_layout_still_materializes_actual_output_fields() {
-        let declared = [column(1, common::PrimitiveType::Bitmap, false)];
-        let (source, _) = values(&declared);
-        let (_, plain_input) = values(&[column(1, common::PrimitiveType::Varbinary, false)]);
-        let original = plain_input.columns()[0].to_data();
+        use crate::fragment_expression::fixture_sources as sources;
+        let target = sources::binary_domain(ValueLogicalType::Bitmap)
+            .with_nullable(false)
+            .unwrap();
+        let (source, _) = typed_fixture_values(&target);
+        let (_, input) = typed_fixture_values(&target);
+        let original = input.columns()[0].to_data();
         let mut arena = ExprArena::default();
-        let adapted = apply_final_root_output_layout(source, &declared, &mut arena, 37).unwrap();
-        let ExecNodeKind::Project(project) = adapted.node.kind else {
-            panic!("static semantic facts alone do not prove runtime field publication")
+        let adapted = typed_final_project(source, &target, &mut arena);
+        let ExecNodeKind::Project(project) = &adapted.node.kind else {
+            panic!("complete static facts do not prove runtime publication")
         };
-        let factory = ProjectProcessorFactory::new(
-            project.node_id,
-            project.is_subordinate,
-            Arc::new(arena),
-            project.exprs,
-            project.expr_slot_ids,
-            project.expr_slot_schemas,
-            project.output_indices,
-            project.output_chunk_schema,
-        )
-        .with_final_result_input_validation(project.validate_final_result_input);
-        let mut operator = factory.create(1, 0);
+        let mut operator = prepared_typed_project(project, arena);
         let processor = operator.as_processor_mut().unwrap();
-        let state = RuntimeState::default();
-        processor.push_chunk(&state, plain_input).unwrap();
-        let output = processor.pull_chunk(&state).unwrap().unwrap();
+        processor
+            .push_chunk(&RuntimeState::default(), input)
+            .unwrap();
+        let output = processor
+            .pull_chunk(&RuntimeState::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            logical_type_of_field(output.batch.schema().field(0)),
-            Some(LogicalType::Bitmap)
+            output.chunk_schema().slots()[0]
+                .typed_binding()
+                .value_type(),
+            target.value_type()
         );
         assert_eq!(
             output.chunk_schema().slots()[0]
-                .field_schema()
-                .logical_type(),
-            Some(LogicalType::Bitmap)
+                .field()
+                .metadata()
+                .capacity(),
+            0
         );
         assert_eq!(output.columns()[0].to_data(), original);
         for (source, target) in original
@@ -586,6 +853,21 @@ mod tests {
         {
             assert!(source.ptr_eq(target));
         }
+        let (_, plain) = typed_fixture_values(&novarocks_type_contract::FunctionValueType::new(
+            DataType::Binary,
+            false,
+        ));
+        assert!(
+            processor
+                .push_chunk(&RuntimeState::default(), plain)
+                .is_err()
+        );
+        assert!(
+            processor
+                .pull_chunk(&RuntimeState::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -594,7 +876,7 @@ mod tests {
         let (source, _) = values(&columns);
         let schema = Arc::clone(&source.output_schema);
         let mut arena = ExprArena::default();
-        let adapted = apply_final_root_output_layout(source, &columns, &mut arena, 37).unwrap();
+        let adapted = apply_fixture_root_layout(source, &columns, &mut arena).unwrap();
         assert!(matches!(adapted.node.kind, ExecNodeKind::Values(_)));
         assert!(Arc::ptr_eq(&schema, &adapted.output_schema));
         assert!(
@@ -609,22 +891,20 @@ mod tests {
         let source_columns = [column(1, common::PrimitiveType::Varbinary, false)];
         let (source, _) = values(&source_columns);
         let mut arena = ExprArena::default();
-        let adapted = apply_final_root_output_layout(
+        let adapted = apply_fixture_root_layout(
             source,
-            &[column(1, common::PrimitiveType::Bitmap, true)],
+            &[column(1, common::PrimitiveType::Varbinary, true)],
             &mut arena,
-            37,
         )
         .unwrap();
         assert!(adapted.output_schema.slots()[0].nullable());
 
         let (source, _) = values(&[column(1, common::PrimitiveType::Varbinary, true)]);
         assert!(
-            apply_final_root_output_layout(
+            apply_fixture_root_layout(
                 source,
-                &[column(1, common::PrimitiveType::Bitmap, false)],
-                &mut ExprArena::default(),
-                37,
+                &[column(1, common::PrimitiveType::Varbinary, false)],
+                &mut ExprArena::default()
             )
             .unwrap_err()
             .contains("cannot narrow")
@@ -646,7 +926,7 @@ mod tests {
         ] {
             let (source, _) = values(&source_columns);
             let mut arena = ExprArena::default();
-            assert!(apply_final_root_output_layout(source, &declared, &mut arena, 37).is_err());
+            assert!(apply_fixture_root_layout(source, &declared, &mut arena).is_err());
             assert!(
                 arena
                     .node(novarocks_execution::exec::expr::ExprId(0))
@@ -663,7 +943,7 @@ mod tests {
         for declared in [column(1, P::Json, false), missing] {
             let (source, _) = values(&[column(1, P::Varbinary, false)]);
             let mut arena = ExprArena::default();
-            assert!(apply_final_root_output_layout(source, &[declared], &mut arena, 37).is_err());
+            assert!(apply_fixture_root_layout(source, &[declared], &mut arena).is_err());
             assert!(
                 arena
                     .node(novarocks_execution::exec::expr::ExprId(0))

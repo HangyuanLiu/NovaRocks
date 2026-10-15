@@ -91,8 +91,8 @@ impl ScalarKernelInstance for RandInstance {
     ) -> Result<SelectedValues<'a>, KernelFailure> {
         control.checkpoint(0)?;
         let result_type = input.contract().result_type();
-        if result_type.logical_type != ValueLogicalType::Physical
-            || result_type.data_type != DataType::Float64
+        if result_type.logical_type() != ValueLogicalType::Physical
+            || result_type.data_type() != &DataType::Float64
         {
             return Err(invalid("RAND requires its exact Physical Float64 result"));
         }
@@ -111,8 +111,8 @@ impl ScalarKernelInstance for RandInstance {
                 else {
                     return Err(invalid("seeded RAND requires one exact value argument"));
                 };
-                if value_type.logical_type != ValueLogicalType::Physical
-                    || value_type.data_type != DataType::Int64
+                if value_type.logical_type() != ValueLogicalType::Physical
+                    || value_type.data_type() != &DataType::Int64
                 {
                     return Err(invalid("seeded RAND requires an exact Physical Int64 seed"));
                 }
@@ -124,7 +124,7 @@ impl ScalarKernelInstance for RandInstance {
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .ok_or_else(|| internal("RAND selected Int64 seed cannot be downcast"))?;
-                Some((*argument, array, value_type.nullable))
+                Some((*argument, array, value_type.nullable()))
             }
         };
         let selection = input.selection();
@@ -162,7 +162,7 @@ impl ScalarKernelInstance for RandInstance {
         }
         let values = Arc::new(builder.finish()) as ArrayRef;
         work.finish()?;
-        SelectedValues::try_new(selection, &result_type.data_type, values, Box::default())
+        SelectedValues::try_new(selection, result_type.data_type(), values, Box::default())
             .map_err(|_| internal("RAND compact output violates its selected contract"))
     }
 }

@@ -614,9 +614,7 @@ pub(crate) mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::exec::chunk::{
-        Chunk, ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema,
-    };
+    use crate::exec::chunk::{ChunkFieldSchema, ChunkSchemaRef, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::exec::fragment::error::{
         FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
@@ -682,7 +680,7 @@ pub(crate) mod tests {
             arena: ExprArena::default(),
             root: ExecNode {
                 kind: ExecNodeKind::Values(ValuesNode {
-                    chunk: Chunk::default(),
+                    chunk: crate::exec::chunk::typed_fixture::columns(&[], &[], &[], Vec::new(), 0),
                     node_id,
                 }),
             },
@@ -702,7 +700,10 @@ pub(crate) mod tests {
         if let Some(node_id) = node_id {
             scan = scan.with_node_id(node_id);
         }
-        scan = scan.with_output_chunk_schema(Arc::new(ChunkSchema::empty()));
+        scan = scan.with_output_chunk_schema(
+            crate::exec::chunk::typed_fixture::columns(&[], &[], &[], Vec::new(), 0)
+                .chunk_schema_ref(),
+        );
         ExecNode {
             kind: ExecNodeKind::Scan(scan),
         }
@@ -716,22 +717,17 @@ pub(crate) mod tests {
     }
 
     fn schema(slot_id: u32, nullable: bool) -> ChunkSchemaRef {
-        let arrow_schema = Schema::new(vec![Field::new("v", DataType::Int32, nullable)]);
-        ChunkSchema::try_ref_from_schema_and_slot_ids(&arrow_schema, &[SlotId::new(slot_id)])
-            .expect("chunk schema")
-    }
-
-    fn schema_with_metadata(
-        slot_id: u32,
-        field: Field,
-        schema_metadata: HashMap<String, String>,
-    ) -> ChunkSchemaRef {
-        let slot = ChunkSlotSchema::from_field(SlotId::new(slot_id), &field, None)
-            .expect("chunk slot schema");
-        Arc::new(
-            ChunkSchema::try_new_with_schema_metadata(vec![slot], schema_metadata)
-                .expect("chunk schema with metadata"),
+        crate::exec::chunk::typed_fixture::columns(
+            &["v"],
+            &[SlotId::new(slot_id)],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                nullable,
+            )],
+            vec![Arc::new(arrow::array::Int32Array::from(Vec::<i32>::new()))],
+            0,
         )
+        .chunk_schema_ref()
     }
 
     fn exchange_node(node_id: i32, expected_schema: ChunkSchemaRef, _finst: UniqueId) -> ExecNode {
@@ -996,7 +992,9 @@ pub(crate) mod tests {
         plan: ExecPlan,
     ) -> Result<
         (LocalProgramGraph, LocalRuntimeBindings),
-        crate::exec::node::LocalProgramLoweringError,
+        crate::exec::node::LocalProgramCreationFailure<
+            crate::exec::pipeline::operator::ConstructionFailure,
+        >,
     > {
         let mut ids = Vec::new();
         scan_ids(&plan.root, &mut ids);
@@ -1004,8 +1002,10 @@ pub(crate) mod tests {
             .into_iter()
             .map(|id| (id, static_scan_for_test()))
             .collect();
-        let profile = plan.local_compile_profile(NonZeroUsize::new(1).unwrap(), None)?;
-        plan.into_local_program_and_bindings(
+        let profile =
+            crate::exec::chunk::typed_fixture::profile(&plan, NonZeroUsize::new(1).unwrap(), None);
+        crate::exec::chunk::typed_fixture::try_lower_with_scans(
+            plan,
             profile,
             static_scans,
             vec![ExternalSinkRequirement::Result],
@@ -1026,9 +1026,8 @@ pub(crate) mod tests {
             .into_iter()
             .map(|id| (id, static_scan_for_test()))
             .collect();
-        let profile = plan
-            .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
-            .expect("test compile profile");
+        let profile =
+            crate::exec::chunk::typed_fixture::profile(&plan, NonZeroUsize::new(1).unwrap(), None);
         let static_sink = sink.into_program().into_static().expect("static test sink");
         let sink_requirements = match &static_sink {
             StaticSinkProgram::Result => vec![ExternalSinkRequirement::Result],
@@ -1037,9 +1036,14 @@ pub(crate) mod tests {
                 .map(|branch| ExternalSinkRequirement::ExchangeOutput { branch })
                 .collect(),
         };
-        let (local_program, _runtime) = plan
-            .into_local_program_and_bindings(profile, static_scans, sink_requirements, static_sink)
-            .expect("lower test local program");
+        let (local_program, _runtime) = crate::exec::chunk::typed_fixture::try_lower_with_scans(
+            plan,
+            profile,
+            static_scans,
+            sink_requirements,
+            static_sink,
+        )
+        .expect("lower test local program");
         let scans = scans
             .into_iter()
             .map(|(id, kind)| (id, ScanSourceContract::new(kind)))
@@ -1304,11 +1308,11 @@ pub(crate) mod tests {
     #[test]
     fn rejects_scan_without_node_id_during_local_lowering() {
         let plan = scan_plan(None);
-        let profile = plan
-            .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
-            .expect("profile");
+        let profile =
+            crate::exec::chunk::typed_fixture::profile(&plan, NonZeroUsize::new(1).unwrap(), None);
         assert!(
-            plan.into_local_program_and_bindings(
+            crate::exec::chunk::typed_fixture::try_lower_with_scans(
+                plan,
                 profile,
                 BTreeMap::new(),
                 vec![ExternalSinkRequirement::Result],
@@ -1512,243 +1516,319 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn rejects_exchange_schema_mismatch_after_layout_match() {
-        let id = FragmentNodeId::new(20);
-        let program = program_with(
-            ExecPlan {
-                arena: ExprArena::default(),
-                root: exchange_node(20, schema(1, true), uid(5, 8)),
-            },
-            result_sink(),
-            BTreeMap::new(),
-            BTreeMap::from([(id, schema(1, false))]),
-            BTreeSet::new(),
+    fn typed_exchange_schema(ty: &novarocks_type_contract::FunctionValueType) -> ChunkSchemaRef {
+        use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
+        let declared = crate::exec::chunk::typed_fixture::layout(
+            Arc::new(Schema::new(vec![Field::new(
+                "v",
+                ty.data_type().clone(),
+                ty.nullable(),
+            )])),
+            &[SlotId::new(1)],
+            &[ty.clone()],
         );
-        let instance = instance_with(
-            FragmentContractVersion::CURRENT,
-            query_id(1, 2),
-            uid(1, 34),
-            BTreeMap::new(),
-            BTreeMap::from([(id, 1)]),
-            FragmentSinkAssignment::None,
-            BTreeMap::new(),
-            BTreeMap::new(),
+        let factory = try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root(
+                "submission typed exchange declaration",
+            ),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        )
+        .unwrap();
+        let schema = factory.create_compiled_chunk_schema(&declared).unwrap();
+        assert!(schema.is_typed());
+        assert_eq!(schema.arrow_schema_ref().metadata().capacity(), 0);
+        assert_eq!(schema.slots()[0].field_ref().metadata().capacity(), 0);
+        schema
+    }
+
+    fn typed_exchange_mismatch(
+        actual: ChunkSchemaRef,
+        expected: ChunkSchemaRef,
+        instance_id: i64,
+    ) -> FragmentBindingError {
+        let id = FragmentNodeId::new(20);
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: exchange_node(20, actual, uid(5, 8)),
+        };
+        let profile =
+            crate::exec::chunk::typed_fixture::profile(&plan, NonZeroUsize::new(1).unwrap(), None);
+        let (local_program, _) = crate::exec::chunk::typed_fixture::lower(
+            plan,
+            profile,
+            vec![ExternalSinkRequirement::Result],
+            StaticSinkProgram::Result,
+        );
+        let program = Arc::new(
+            FragmentProgram::try_new(
+                Arc::new(local_program),
+                FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
+                BTreeMap::new(),
+                BTreeMap::from([(id, ExchangeInputContract::new(expected))]),
+                RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
+            )
+            .unwrap(),
         );
         let error = assert_error(
-            test_submission(program, instance),
+            test_submission(
+                program,
+                instance_with(
+                    FragmentContractVersion::CURRENT,
+                    query_id(1, 2),
+                    uid(1, instance_id),
+                    BTreeMap::new(),
+                    BTreeMap::from([(id, 1)]),
+                    FragmentSinkAssignment::None,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                ),
+            ),
             FragmentBindingTarget::ExchangeNode(20),
             FragmentBindingErrorKind::SchemaMismatch,
         );
-        assert_eq!(
-            error.detail(),
-            "exchange node 20 expected schema [slot=1,name=v,type=Int32,nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [] }], got [slot=1,name=v,type=Int32,nullable=true,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [] }]"
+        // These are stable occurrence/contract facts; private Arc/ValueType
+        // Debug representation and accounting fields are not diagnostic ABI.
+        assert!(
+            error
+                .detail()
+                .starts_with("exchange node 20 expected schema [slot=1,name=v,type=")
         );
+        assert!(error.detail().contains("got [slot=1,name=v,type="));
+        error
+    }
+
+    fn reject_annotated_execution_projection(
+        source: Schema,
+        ty: &novarocks_type_contract::FunctionValueType,
+    ) {
+        struct DeclarationControl;
+        impl novarocks_type_contract::PureCompileControl for DeclarationControl {
+            fn checkpoint(
+                &self,
+                _: novarocks_type_contract::CompilePhase,
+                _: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                Ok(())
+            }
+        }
+        // This is a pure declaration control seam, not a runtime grant. Dirty
+        // source attributes never become execution identity or author a type.
+        let error = novarocks_local_program::StaticLayout::try_new_typed_for_compile(
+            Arc::new(source),
+            Arc::from([SlotId::new(1)]),
+            vec![(ty.typed_binding().clone(), None)],
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+            &DeclarationControl,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            novarocks_local_program::LayoutCompileError::Layout(
+                novarocks_local_program::LayoutError::ValueBindingMismatch
+            )
+        );
+    }
+
+    fn declared_exchange_struct(
+        child: &novarocks_type_contract::FunctionValueType,
+    ) -> novarocks_type_contract::FunctionValueType {
+        use novarocks_type_contract::{
+            FunctionValueType, ValueField, ValueKind, ValueLayout, ValueTypeRef,
+            ValueTypeStorageLifetime,
+        };
+        FunctionValueType::try_from_value(
+            ValueTypeRef::try_new(
+                ValueKind::Struct(
+                    vec![ValueField::new(
+                        "item",
+                        child.value_type().clone(),
+                        ValueTypeStorageLifetime::pure(),
+                    )]
+                    .into(),
+                ),
+                false,
+                ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+            ValueLayout::try_new(
+                &DataType::Struct(
+                    vec![Arc::new(Field::new(
+                        "item",
+                        child.data_type().clone(),
+                        child.nullable(),
+                    ))]
+                    .into(),
+                ),
+                ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rejects_exchange_schema_mismatch_after_layout_match() {
+        use novarocks_type_contract::FunctionValueType;
+        let expected = typed_exchange_schema(&FunctionValueType::new(DataType::Int32, false));
+        let actual = typed_exchange_schema(&FunctionValueType::new(DataType::Int32, true));
+        assert_eq!(expected.slot_ids(), actual.slot_ids());
+        assert_eq!(
+            expected.slots()[0].data_type(),
+            actual.slots()[0].data_type()
+        );
+        assert!(!expected.slots()[0].nullable());
+        assert!(actual.slots()[0].nullable());
+        let error = typed_exchange_mismatch(actual, expected, 34);
+        assert!(error.detail().contains("type=Int32,nullable=false"));
+        assert!(error.detail().contains("type=Int32,nullable=true"));
     }
 
     #[test]
     fn reports_field_metadata_only_exchange_schema_mismatch() {
-        let id = FragmentNodeId::new(20);
-        let expected = schema_with_metadata(
-            1,
-            Field::new("v", DataType::Int32, false).with_metadata(HashMap::from([(
-                "contract".to_string(),
-                "expected".to_string(),
-            )])),
-            HashMap::new(),
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        let integer = FunctionValueType::new(DataType::Int32, false);
+        for annotation in ["expected", "actual"] {
+            reject_annotated_execution_projection(
+                Schema::new(vec![Field::new("v", DataType::Int32, false).with_metadata(
+                    HashMap::from([("contract".into(), annotation.into())]),
+                )]),
+                &integer,
+            );
+        }
+        let expected = typed_exchange_schema(
+            &FunctionValueType::try_with_logical_type(
+                DataType::Utf8,
+                false,
+                ValueLogicalType::Json,
+            )
+            .unwrap(),
         );
-        let actual = schema_with_metadata(
-            1,
-            Field::new("v", DataType::Int32, false).with_metadata(HashMap::from([(
-                "contract".to_string(),
-                "actual".to_string(),
-            )])),
-            HashMap::new(),
-        );
-        let program = program_with(
-            ExecPlan {
-                arena: ExprArena::default(),
-                root: exchange_node(20, actual, uid(5, 8)),
-            },
-            result_sink(),
-            BTreeMap::new(),
-            BTreeMap::from([(id, expected)]),
-            BTreeSet::new(),
-        );
-        let error = assert_error(
-            test_submission(
-                program,
-                instance_with(
-                    FragmentContractVersion::CURRENT,
-                    query_id(1, 2),
-                    uid(1, 341),
-                    BTreeMap::new(),
-                    BTreeMap::from([(id, 1)]),
-                    FragmentSinkAssignment::None,
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                ),
-            ),
-            FragmentBindingTarget::ExchangeNode(20),
-            FragmentBindingErrorKind::SchemaMismatch,
-        );
+        let actual = typed_exchange_schema(&FunctionValueType::new(DataType::Utf8, false));
         assert_eq!(
-            error.detail(),
-            "exchange node 20 expected schema [slot=1,name=v,type=Int32,nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [] },metadata={\"contract\":\"expected\"}], got [slot=1,name=v,type=Int32,nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [] },metadata={\"contract\":\"actual\"}]"
+            expected.arrow_schema_ref().as_ref(),
+            actual.arrow_schema_ref().as_ref()
         );
+        assert_ne!(
+            expected.slots()[0].typed_binding(),
+            actual.slots()[0].typed_binding()
+        );
+        typed_exchange_mismatch(actual, expected, 341);
     }
 
     #[test]
-    fn reports_field_schema_only_exchange_schema_mismatch() {
-        let id = FragmentNodeId::new(20);
+    fn rejects_semantic_only_exchange_carrier_mismatch_before_layout_publication() {
         let field = Field::new("v", DataType::Int32, false);
-        let expected_field_schema = ChunkFieldSchema::empty();
-        let actual_field_schema = ChunkFieldSchema::from_field(&field_with_logical_type(
+        let json = ChunkFieldSchema::from_field(&field_with_logical_type(
             Field::new("logical", DataType::Utf8, true),
             LogicalType::Json,
         ))
-        .expect("logical field schema");
-        let with_field_schema = |field_schema| {
-            Arc::new(
-                ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
-                    SlotId::new(1),
-                    field.clone(),
-                    Some(field_schema),
-                    None,
-                )])
-                .expect("chunk schema with explicit field schema"),
-            )
-        };
-        let expected = with_field_schema(expected_field_schema);
-        let actual = with_field_schema(actual_field_schema);
-        let program = program_with(
-            ExecPlan {
-                arena: ExprArena::default(),
-                root: exchange_node(20, actual, uid(5, 8)),
-            },
-            result_sink(),
-            BTreeMap::new(),
-            BTreeMap::from([(id, expected)]),
-            BTreeSet::new(),
-        );
-        let error = assert_error(
-            test_submission(
-                program,
-                instance_with(
-                    FragmentContractVersion::CURRENT,
-                    query_id(1, 2),
-                    uid(1, 344),
-                    BTreeMap::new(),
-                    BTreeMap::from([(id, 1)]),
-                    FragmentSinkAssignment::None,
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                ),
-            ),
-            FragmentBindingTarget::ExchangeNode(20),
-            FragmentBindingErrorKind::SchemaMismatch,
-        );
-        assert_eq!(
-            error.detail(),
-            "exchange node 20 expected schema [slot=1,name=v,type=Int32,nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [] }], got [slot=1,name=v,type=Int32,nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: Some(Json), children: [] }]"
+        .expect("explicit JSON declaration");
+        assert!(
+            ChunkSlotSchema::try_new_with_field(SlotId::new(1), field, Some(json), None).is_err()
         );
     }
 
     #[test]
     fn reports_nested_type_metadata_in_sorted_exact_detail() {
-        let id = FragmentNodeId::new(20);
-        let nested = |last: &str| {
-            schema_with_metadata(
-                1,
-                Field::new(
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        let integer = FunctionValueType::new(DataType::Int64, true);
+        let integer_struct = declared_exchange_struct(&integer);
+        for annotation in ["expected", "actual"] {
+            reject_annotated_execution_projection(
+                Schema::new(vec![Field::new(
                     "v",
                     DataType::Struct(Fields::from(vec![Arc::new(
                         Field::new("item", DataType::Int64, true).with_metadata(HashMap::from([
-                            ("zeta".to_string(), last.to_string()),
-                            ("alpha".to_string(), "first".to_string()),
+                            ("zeta".into(), annotation.into()),
+                            ("alpha".into(), "first".into()),
                         ])),
                     )])),
                     false,
-                ),
-                HashMap::new(),
-            )
-        };
-        let program = program_with(
-            ExecPlan {
-                arena: ExprArena::default(),
-                root: exchange_node(20, nested("actual"), uid(5, 8)),
-            },
-            result_sink(),
-            BTreeMap::new(),
-            BTreeMap::from([(id, nested("expected"))]),
-            BTreeSet::new(),
-        );
-        let error = assert_error(
-            test_submission(
-                program,
-                instance_with(
-                    FragmentContractVersion::CURRENT,
-                    query_id(1, 2),
-                    uid(1, 342),
-                    BTreeMap::new(),
-                    BTreeMap::from([(id, 1)]),
-                    FragmentSinkAssignment::None,
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                ),
-            ),
-            FragmentBindingTarget::ExchangeNode(20),
-            FragmentBindingErrorKind::SchemaMismatch,
-        );
+                )]),
+                &integer_struct,
+            );
+        }
+        // Same carrier, names and root NULL; the complete nested domain differs.
+        let json =
+            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+                .unwrap();
+        let string = FunctionValueType::new(DataType::Utf8, true);
+        let expected = typed_exchange_schema(&declared_exchange_struct(&json));
+        let actual = typed_exchange_schema(&declared_exchange_struct(&string));
         assert_eq!(
-            error.detail(),
-            "exchange node 20 expected schema [slot=1,name=v,type=Struct([field(name=\"item\",type=Int64,nullable=true,metadata={\"alpha\":\"first\",\"zeta\":\"expected\"})]),nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [ChunkFieldSchema { logical_type: None, children: [] }] }], got [slot=1,name=v,type=Struct([field(name=\"item\",type=Int64,nullable=true,metadata={\"alpha\":\"first\",\"zeta\":\"actual\"})]),nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [ChunkFieldSchema { logical_type: None, children: [] }] }]"
+            expected.arrow_schema_ref().as_ref(),
+            actual.arrow_schema_ref().as_ref()
         );
+        assert_ne!(
+            expected.slots()[0].typed_binding(),
+            actual.slots()[0].typed_binding()
+        );
+        typed_exchange_mismatch(actual, expected, 342);
+        // The independent child NULL promise remains an exact source fact.
+        let expected = typed_exchange_schema(&declared_exchange_struct(&FunctionValueType::new(
+            DataType::Int64,
+            false,
+        )));
+        let actual = typed_exchange_schema(&integer_struct);
+        assert!(
+            !expected.slots()[0]
+                .typed_binding()
+                .value_type()
+                .child_type_at(0)
+                .unwrap()
+                .nullable()
+        );
+        assert!(
+            actual.slots()[0]
+                .typed_binding()
+                .value_type()
+                .child_type_at(0)
+                .unwrap()
+                .nullable()
+        );
+        typed_exchange_mismatch(actual, expected, 342);
     }
 
     #[test]
     fn reports_schema_metadata_only_exchange_schema_mismatch() {
-        let id = FragmentNodeId::new(20);
-        let expected = schema_with_metadata(
-            1,
-            Field::new("v", DataType::Int32, false),
-            HashMap::from([("owner".to_string(), "expected".to_string())]),
-        );
-        let actual = schema_with_metadata(
-            1,
-            Field::new("v", DataType::Int32, false),
-            HashMap::from([("owner".to_string(), "actual".to_string())]),
-        );
-        let program = program_with(
-            ExecPlan {
-                arena: ExprArena::default(),
-                root: exchange_node(20, actual, uid(5, 8)),
-            },
-            result_sink(),
-            BTreeMap::new(),
-            BTreeMap::from([(id, expected)]),
-            BTreeSet::new(),
-        );
-        let error = assert_error(
-            test_submission(
-                program,
-                instance_with(
-                    FragmentContractVersion::CURRENT,
-                    query_id(1, 2),
-                    uid(1, 343),
-                    BTreeMap::new(),
-                    BTreeMap::from([(id, 1)]),
-                    FragmentSinkAssignment::None,
-                    BTreeMap::new(),
-                    BTreeMap::new(),
+        use novarocks_type_contract::FunctionValueType;
+        let integer = FunctionValueType::new(DataType::Int32, false);
+        for annotation in ["expected", "actual"] {
+            reject_annotated_execution_projection(
+                Schema::new_with_metadata(
+                    vec![Field::new("v", DataType::Int32, false)],
+                    HashMap::from([("owner".into(), annotation.into())]),
                 ),
-            ),
-            FragmentBindingTarget::ExchangeNode(20),
-            FragmentBindingErrorKind::SchemaMismatch,
+                &integer,
+            );
+        }
+        let utf8 = FunctionValueType::new(DataType::Utf8, false);
+        let large = FunctionValueType::new(DataType::LargeUtf8, false);
+        // Dictionary remains a runtime/source encoding, never a prepared
+        // execution projection. No dictionary ID or annotation authors meaning.
+        reject_annotated_execution_projection(
+            Schema::new(vec![Field::new(
+                "v",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            )]),
+            &utf8,
         );
-        assert_eq!(
-            error.detail(),
-            "exchange node 20 expected schema [slot=1,name=v,type=Int32,nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [] }],metadata={\"owner\":\"expected\"}, got [slot=1,name=v,type=Int32,nullable=false,unique_id=none,field_schema=ChunkFieldSchema { logical_type: None, children: [] }],metadata={\"owner\":\"actual\"}"
+        reject_annotated_execution_projection(
+            Schema::new_with_metadata(
+                vec![Field::new("v", DataType::Int32, false)],
+                HashMap::with_capacity(1),
+            ),
+            &integer,
+        );
+        assert_eq!(utf8.value_type(), large.value_type());
+        assert_ne!(utf8.data_type(), large.data_type());
+        typed_exchange_mismatch(
+            typed_exchange_schema(&large),
+            typed_exchange_schema(&utf8),
+            343,
         );
     }
 
@@ -2250,7 +2330,8 @@ pub(crate) mod tests {
     #[test]
     fn binary_right_child_is_traversed() {
         let id = FragmentNodeId::new(10);
-        let empty_schema = Arc::new(ChunkSchema::empty());
+        let empty_schema = crate::exec::chunk::typed_fixture::columns(&[], &[], &[], Vec::new(), 0)
+            .chunk_schema_ref();
         let program = program_with(
             ExecPlan {
                 arena: ExprArena::default(),
@@ -2303,7 +2384,14 @@ pub(crate) mod tests {
                         kind: SetOpKind::Intersect,
                         inputs: vec![values_plan(7).root, scan_node(Some(10))],
                         node_id: 30,
-                        output_chunk_schema: Arc::new(ChunkSchema::empty()),
+                        output_chunk_schema: crate::exec::chunk::typed_fixture::columns(
+                            &[],
+                            &[],
+                            &[],
+                            Vec::new(),
+                            0,
+                        )
+                        .chunk_schema_ref(),
                     }),
                 },
             },

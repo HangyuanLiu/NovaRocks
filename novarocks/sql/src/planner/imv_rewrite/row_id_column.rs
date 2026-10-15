@@ -254,8 +254,8 @@ mod tests {
     fn row_id_output_column_shape() {
         let col = ImvRowIdColumn::output_column(ColumnId(7));
         assert_eq!(col.name, "_row_id");
-        assert_eq!(col.value_type.data_type, DataType::Int64);
-        assert!(!col.value_type.nullable);
+        assert_eq!(col.value_type.data_type().clone(), DataType::Int64);
+        assert!(!col.value_type.nullable());
         assert!(col.is_internal);
     }
 
