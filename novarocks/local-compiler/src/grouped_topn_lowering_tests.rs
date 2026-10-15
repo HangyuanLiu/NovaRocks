@@ -293,7 +293,7 @@ fn grouped_topn_installs_intermediate_scope_independent_roots_and_fresh_state_ch
     );
     assert_eq!(
         node.output_layout().schema().field(2).data_type(),
-        &kernel.contract().intermediate_type().data_type
+        kernel.contract().intermediate_type().data_type()
     );
     let snapshot = program
         .checked()

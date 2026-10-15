@@ -64,6 +64,7 @@ fn binding(bytes: u64) -> QueryMemoryBinding {
     .unwrap()
 }
 fn source() -> package::FragmentPackage {
+    use novarocks_proto_models::value_type as logical;
     let metadata = (0..32)
         .map(|n| plan::ArrowFieldMetadataEntry {
             key: format!("{n:02}{}", "k".repeat(1000)),
@@ -71,7 +72,30 @@ fn source() -> package::FragmentPackage {
         })
         .collect();
     package::FragmentPackage {
-        types: Some(wire::TypeTable::default()),
+        types: Some(wire::TypeTable {
+            carriers: vec![wire::CarrierTypeDefinition {
+                id: 0,
+                kind: Some(wire::carrier_type_definition::Kind::Primitive(
+                    plan::ArrowPrimitiveType::Int64 as i32,
+                )),
+            }],
+            value_types: vec![wire::ValueTypeDefinition {
+                id: 0,
+                carrier_type_id: Some(0),
+                logical_type_id: Some(0),
+            }],
+            logical_types: vec![logical::LogicalTypeDefinition {
+                id: Some(0),
+                nullable: false,
+                kind: Some(logical::logical_type_definition::Kind::Scalar(
+                    logical::ScalarValue {
+                        kind: logical::ScalarKind::Int64 as i32,
+                        ..Default::default()
+                    },
+                )),
+            }],
+            ..Default::default()
+        }),
         source_fields: Some(wire::SourceFieldTable {
             shape: Some(wire::TypeTable {
                 carriers: vec![wire::CarrierTypeDefinition {
@@ -102,7 +126,7 @@ fn source() -> package::FragmentPackage {
                         fields: vec![package::ConnectorWriteFieldBinding {
                             source_field_id: Some(2),
                             field_token: vec![],
-                            value_type_id: None,
+                            value_type_id: Some(0),
                         }],
                     },
                 )),

@@ -22,6 +22,7 @@ use crate::physical_package_v2::definition_sources::tests::{
 use crate::physical_package_v2::encode::{PackageEncodeError, encode_fragment_package};
 use crate::physical_package_v2::provider_sources::tests::checked_read;
 use crate::physical_package_v2::test_support::{decode_limits, encode_limits};
+use crate::physical_type_v2::PackageTypeMaterializationScope;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };

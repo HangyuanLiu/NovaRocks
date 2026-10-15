@@ -38,12 +38,12 @@ use novarocks_execution::{
 use novarocks_local_compiler::{
     FragmentCompileError, ProjectMetadataScope, ProjectOutputRequestFacts,
 };
-use novarocks_local_program::{ProgramNodeId, ProgramNodeKind, StaticLayout};
+use novarocks_local_program::{ProgramNodeId, ProgramNodeKind};
 use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority};
 use novarocks_plan_codec::physical_package_v2::decode_fragment_package_with_type_host;
 use novarocks_type_contract::{CompleteMetadataRequestFacts, MetadataRequestError};
 use novarocks_types::{
-    QueryId, SlotId,
+    QueryId,
     identity::{AttemptId, QueryExecutionId},
 };
 use novarocks_worker::{PreparationStop, TestPreparationControl};
@@ -216,59 +216,141 @@ fn project_metadata_explicit_direct_product_cannot_lend_native_provenance() {
     assert!(direct.into_preparation().native_metadata_loan().is_none());
 }
 
+/// Exercise a real prepared operator's creator refusal inside the funded body.
+/// A malformed Map is rejected by main's declaration validator before this
+/// boundary, so it cannot serve as the body-error transport oracle anymore.
+fn assert_actual_schema_body_error_keeps_owned_bytes(
+    compiled: CompiledTaskProgram,
+    site: CompiledSchemaSite,
+    binding: &QueryMemoryBinding,
+    loan: &novarocks_worker::PreparationControlLoan<'_>,
+    journal: &mut ProjectMetadataJournal,
+) {
+    use novarocks_execution::{
+        exec::pipeline::{operator::ConstructionFailure, operator_factory::OperatorFactory},
+        runtime::{
+            preparation_metadata::CompiledSchemaPreparationScope, runtime_state::RuntimeErrorState,
+        },
+    };
+    let prepared = compiled.into_preparation();
+    let program = prepared.program();
+    let node = match site {
+        CompiledSchemaSite::Project(node) | CompiledSchemaSite::AnalyticOutput(node) => node,
+        CompiledSchemaSite::FinalResult => {
+            panic!("this fixture exercises a real Project or Analytic")
+        }
+    };
+    let layout = program.graph().nodes()[node.index()].output_layout();
+    let error_state = Arc::new(RuntimeErrorState::default());
+    let mut operator = match site {
+        CompiledSchemaSite::Project(node) => {
+            novarocks_execution::exec::operators::prepare_project_factory_for_test(
+                Arc::clone(program),
+                Some(node),
+                Arc::clone(&error_state),
+            )
+            .unwrap()
+            .create(1, 0)
+        }
+        CompiledSchemaSite::AnalyticOutput(node) => {
+            novarocks_execution::exec::operators::prepare_window_factory_for_test(
+                Arc::clone(program),
+                node,
+                Arc::clone(&error_state),
+            )
+            .unwrap()
+            .create(1, 0)
+        }
+        CompiledSchemaSite::FinalResult => unreachable!(),
+    };
+    let tracker = MemTracker::new_root("funded schema body creator refusal");
+    let construction = novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+        novarocks_execution::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+        Arc::clone(&tracker), error_state,
+    ).unwrap();
+    let existing = tracker.current();
+    assert!(
+        existing > 0,
+        "the actual constructor adapters were created successfully"
+    );
+    // Freeze the real positive limit after adapter creation. The next actual
+    // schema-scope request must refuse inside Operator.prepare, not in setup.
+    tracker.install_limit_once(existing).unwrap();
+    operator.set_construction_factory(construction);
+    let calls = Cell::new(0);
+    let allocated_before = tracker.allocated();
+    let original_pointer = Cell::new(std::ptr::null::<u8>());
+    let mut host = CompiledProjectMetadataHost::new(
+        prepared.native_metadata_loan().unwrap(),
+        binding,
+        loan,
+        &Control,
+        journal,
+    );
+    let failure = host
+        .prepare(program, site, layout, &mut || {
+            calls.set(calls.get() + 1);
+            let original = operator
+                .prepare()
+                .expect_err("the actual schema creator must cross its installed limit");
+            assert!(matches!(
+                original.cause(),
+                ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
+            ));
+            original_pointer.set(original.detail().as_ptr());
+            Err(original)
+        })
+        .unwrap_err();
+    assert_eq!(calls.get(), 1);
+    let ExecutionFailureCause::Construction(ConstructionFailure::Memory(original)) =
+        failure.cause()
+    else {
+        panic!("the original typed creator cause was replaced: {failure:?}");
+    };
+    assert_eq!(failure.detail().as_ptr(), original_pointer.get());
+    assert_eq!(original.detail().as_ptr(), original_pointer.get());
+    assert_eq!(
+        failure.detail(),
+        format!(
+            "ResourceExhausted: memory limit exceeded for tracker {}: current {} bytes, limit {} bytes",
+            tracker.label(),
+            existing + (tracker.allocated() - allocated_before),
+            existing,
+        )
+    );
+    assert!(tracker.peak() > existing);
+    assert_eq!(
+        tracker.current(),
+        existing,
+        "the unconstructed request was rolled back"
+    );
+    assert!(
+        operator.prepared_schema_for_test().is_none(),
+        "failed preparation published no schema"
+    );
+    drop(host);
+    assert_eq!(journal.phase, Some(ProjectMetadataPhase::Prepare(node)));
+    assert!(journal.facts.is_some());
+    assert_eq!(journal.body.settlement.as_ref().unwrap().next_step, Ok(()));
+    drop(operator);
+    assert_eq!(tracker.current(), 0);
+}
+
 #[test]
 fn project_metadata_original_body_error_keeps_owned_bytes_through_the_real_host() {
     let binding = binding(64 << 20);
     let owner = TestPreparationControl::new(Duration::from_millis(1));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
-    let output = compile(&binding, &loan, &mut journal).into_preparation();
-    let program = output.program();
-    let node = project(program);
-    let layout = program.graph().nodes()[node.index()].output_layout();
-    // Obtain the actual old diagnostic outside this transport-only test body.
-    // This is not proof of an invalid Map passing native FE validation or of
-    // that different Map constructor's resource envelope.
-    let malformed = StaticLayout::try_new(
-        Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new(
-                "map",
-                arrow::datatypes::DataType::Map(
-                    Arc::new(arrow::datatypes::Field::new(
-                        "entries",
-                        arrow::datatypes::DataType::Int64,
-                        false,
-                    )),
-                    false,
-                ),
-                true,
-            ),
-        ])),
-        Arc::from([SlotId::new(1)]),
-    )
-    .unwrap();
-    let original = ChunkSchema::from_compiled_layout(&malformed).unwrap_err();
-    let pointer = original.as_ptr();
-    let mut host = CompiledProjectMetadataHost::new(
-        output.native_metadata_loan().unwrap(),
+    let compiled = compile(&binding, &loan, &mut journal);
+    let node = project(compiled.program());
+    assert_actual_schema_body_error_keeps_owned_bytes(
+        compiled,
+        CompiledSchemaSite::Project(node),
         &binding,
         &loan,
-        &Control,
         &mut journal,
     );
-    let failure = host
-        .materialize(program, CompiledSchemaSite::Project(node), layout, || {
-            Err(original)
-        })
-        .unwrap_err();
-    assert!(matches!(
-        failure.cause(),
-        ExecutionFailureCause::Pipeline(_)
-    ));
-    assert_eq!(failure.detail(), "map entries is not struct: Int64");
-    assert_eq!(failure.detail().as_ptr(), pointer);
-    drop(host);
-    assert!(journal.body.settlement.is_some());
 }
 
 #[test]
@@ -696,56 +778,15 @@ fn analytic_schema_original_body_error_keeps_owned_bytes_through_the_real_host()
     let owner = TestPreparationControl::new(Duration::from_millis(1));
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
-    let output = compile_window(&binding, &loan, &mut journal).into_preparation();
-    let program = output.program();
-    let node = analytic(program);
-    let layout = program.graph().nodes()[node.index()].output_layout();
-    // Obtain the actual old diagnostic outside this transport-only test body.
-    // This is not proof of an invalid Map passing native FE validation or of
-    // that different Map constructor's resource envelope.
-    let malformed = StaticLayout::try_new(
-        Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new(
-                "map",
-                arrow::datatypes::DataType::Map(
-                    Arc::new(arrow::datatypes::Field::new(
-                        "entries",
-                        arrow::datatypes::DataType::Int64,
-                        false,
-                    )),
-                    false,
-                ),
-                true,
-            ),
-        ])),
-        Arc::from([SlotId::new(1)]),
-    )
-    .unwrap();
-    let original = ChunkSchema::from_compiled_layout(&malformed).unwrap_err();
-    let pointer = original.as_ptr();
-    let mut host = CompiledProjectMetadataHost::new(
-        output.native_metadata_loan().unwrap(),
+    let compiled = compile_window(&binding, &loan, &mut journal);
+    let node = analytic(compiled.program());
+    assert_actual_schema_body_error_keeps_owned_bytes(
+        compiled,
+        CompiledSchemaSite::AnalyticOutput(node),
         &binding,
         &loan,
-        &Control,
         &mut journal,
     );
-    let failure = host
-        .materialize(
-            program,
-            CompiledSchemaSite::AnalyticOutput(node),
-            layout,
-            || Err(original),
-        )
-        .unwrap_err();
-    assert!(matches!(
-        failure.cause(),
-        ExecutionFailureCause::Pipeline(_)
-    ));
-    assert_eq!(failure.detail(), "map entries is not struct: Int64");
-    assert_eq!(failure.detail().as_ptr(), pointer);
-    drop(host);
-    assert!(journal.body.settlement.is_some());
 }
 
 #[test]

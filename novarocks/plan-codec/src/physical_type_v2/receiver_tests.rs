@@ -854,7 +854,7 @@ impl PackageTypeMaterializationScope for RecordingScope {
             self.execution_facts = Some(*facts);
             body().map_err(crate::host_projection_v2::ProjectionFailure::Codec)
         } else {
-            self.materialize(facts, body)
+            PackageTypeMaterializationScope::materialize(self, facts, body)
         }
     }
     fn materialize<C, B>(
