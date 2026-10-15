@@ -82,6 +82,59 @@ pub struct MvRefreshPublishOutcome {
     pub published_snapshot_id: i64,
 }
 
+impl MvRefreshPublishPlan {
+    /// Validate the publication identity and lower the exact ref CAS without I/O.
+    pub(crate) fn prepare(
+        &self,
+        loaded: &crate::iceberg::table::Table,
+    ) -> Result<
+        crate::commit::staging::PreparedChange,
+        novarocks_spi::connector::ConnectorMutationFailure,
+    > {
+        use novarocks_spi::connector::{ConnectorMutationFailure, ConnectorMutationFailureKind};
+        let invalid = |message| {
+            ConnectorMutationFailure::new(ConnectorMutationFailureKind::InvalidRequest, message)
+        };
+        if self.staging_branch
+            != format!(
+                "{MV_PUBLICATION_STAGING_REF_PREFIX}{}",
+                self.marker.publication_id
+            )
+        {
+            return Err(invalid(
+                "Staging ref does not match the exact publication identity",
+            ));
+        }
+        if loaded.metadata().uuid() != self.target_table_uuid {
+            return Err(invalid("MV publication target table incarnation changed"));
+        }
+        let snapshot = loaded
+            .metadata()
+            .snapshot_by_id(self.staging_snapshot_id)
+            .ok_or_else(|| {
+                ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::NotFound,
+                    "MV publication snapshot does not exist",
+                )
+            })?;
+        if !snapshot_matches_publication_marker(snapshot, &self.marker) {
+            return Err(invalid("MV publication snapshot marker does not match"));
+        }
+        crate::commit::RefActionPlan {
+            catalog: String::new(),
+            namespace: self.namespace.clone(),
+            table: self.table.clone(),
+            action: crate::commit::RefAction::FastForwardBranch {
+                source_branch: self.staging_branch.clone(),
+                target_branch: "main".to_string(),
+                source_snapshot_id: self.staging_snapshot_id,
+                expected_target_snapshot_id: self.expected_main_snapshot_id,
+            },
+        }
+        .prepare(loaded)
+    }
+}
+
 pub async fn publish_staging_branch_to_main(
     catalog: &dyn Catalog,
     loaded: &crate::iceberg::table::Table,
@@ -178,14 +231,11 @@ fn build_publish_commit(
         ],
         vec![TableUpdate::SetSnapshotRef {
             ref_name: "main".to_string(),
-            reference: SnapshotReference {
-                snapshot_id: plan.staging_snapshot_id,
-                retention: SnapshotRetention::Branch {
-                    min_snapshots_to_keep: None,
-                    max_snapshot_age_ms: None,
-                    max_ref_age_ms: None,
-                },
-            },
+            reference: crate::ref_snapshot::moved_reference(
+                metadata.refs().get("main"),
+                plan.staging_snapshot_id,
+                true,
+            ),
         }],
     )
 }

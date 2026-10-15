@@ -268,7 +268,9 @@ impl RegisteredIcebergDataMutationBackend {
                 let result = operation
                     .runtime()
                     .block_on(async move { attempt::rejected(&rejected_operation, failure).await });
-                return self.project_bridge(&operation, &journal, result);
+                return self
+                    .project_bridge(&operation, &journal, result)
+                    .map(project_external);
             }
         };
         let preflight_journal = journal.clone();
@@ -286,7 +288,9 @@ impl RegisteredIcebergDataMutationBackend {
                             "Snapshot-producing mutation has no published snapshot",
                         ))
                     })?;
-                let receipt = template.receipt(snapshot).map_err(format_error)?;
+                let receipt = template
+                    .publication_receipt(snapshot)
+                    .map_err(format_error)?;
                 preflight_journal.record(evidence, receipt, request)
             },
         );
@@ -380,15 +384,15 @@ impl RegisteredIcebergDataMutationBackend {
                 ));
             }
         }
-        Ok(outcome)
+        Ok(project_external(outcome))
     }
 
     fn project_bridge(
         &self,
         operation: &IcebergCommitOperation,
-        journal: &PublicationJournal<ConnectorDataMutationReceipt>,
+        journal: &PublicationJournal<DataPublication>,
         result: Result<attempt::Report, String>,
-    ) -> Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, ConnectorError> {
+    ) -> Result<ExternalMutationOutcome<DataPublication>, ConnectorError> {
         match result {
             Ok(report) => Ok(journal.project(report)),
             Err(error) => {
@@ -410,23 +414,53 @@ impl RegisteredIcebergDataMutationBackend {
         context: &ConnectorRequestContext,
     ) -> Result<(), ConnectorError> {
         let payload = planned.payload();
+        self.finalize_publication_facts(
+            &DataFinalizationFacts {
+                namespace: payload.namespace.clone(),
+                table: payload.table.clone(),
+                table_uuid: payload.table_uuid.clone(),
+                name_mapping_digest: matches!(
+                    planned,
+                    PlannedIcebergMutation::RegisterExistingFiles { .. }
+                )
+                .then(|| payload.name_mapping_digest_hex.clone()),
+            },
+            context,
+        )
+    }
+
+    pub(super) fn finalize_publication_facts(
+        &self,
+        facts: &DataFinalizationFacts,
+        context: &ConnectorRequestContext,
+    ) -> Result<(), ConnectorError> {
+        context.check_active()?;
         self.runtime
             .control_state()
-            .invalidate_table_cache(&payload.namespace, &payload.table);
-        let reloaded = self
+            .invalidate_table_cache(&facts.namespace, &facts.table);
+        let loaded = self
             .runtime
-            .load_table_for_request(&payload.namespace, &payload.table, context)
+            .load_table_for_request(&facts.namespace, &facts.table, context)
             .map_err(map_provider_error)?;
-        if let PlannedIcebergMutation::RegisterExistingFiles { manifest, .. } = planned {
-            let mapping = reloaded
+        context.check_active()?;
+        if loaded.table.metadata().uuid().to_string() != facts.table_uuid {
+            return Err(corrupt(
+                "Committed data mutation target changed identity before finalization",
+            ));
+        }
+        if let Some(expected) = &facts.name_mapping_digest {
+            let mapping = loaded
                 .table
                 .metadata()
                 .properties()
                 .get(crate::iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING)
-                .map(|mapping| crate::schema_mapping::canonical_name_mapping(mapping))
+                .map(|value| crate::schema_mapping::canonical_name_mapping(value))
                 .transpose()
                 .map_err(map_provider_error)?;
-            if mapping.as_deref() != manifest.canonical_name_mapping.as_deref() {
+            let digest = mapping
+                .as_deref()
+                .map(|value| hex_encode(Sha256::digest(value.as_bytes())));
+            if &digest != expected {
                 return Err(corrupt(
                     "schema.name-mapping.default changed after ADD FILES commit",
                 ));
@@ -436,11 +470,33 @@ impl RegisteredIcebergDataMutationBackend {
     }
 }
 
+pub(super) fn project_external(
+    outcome: ExternalMutationOutcome<DataPublication>,
+) -> ExternalMutationOutcome<ConnectorDataMutationReceipt> {
+    match outcome {
+        ExternalMutationOutcome::KnownCommitted {
+            effect,
+            receipt,
+            finalization,
+        } => ExternalMutationOutcome::KnownCommitted {
+            effect,
+            receipt: receipt.receipt,
+            finalization,
+        },
+        ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
+            ExternalMutationOutcome::KnownUncommitted { failure, cleanup }
+        }
+        ExternalMutationOutcome::CommitUnknown { failure, evidence } => {
+            ExternalMutationOutcome::CommitUnknown { failure, evidence }
+        }
+    }
+}
+
 fn project_recovery_bridge(
     operation: &IcebergCommitOperation,
-    journal: &PublicationJournal<ConnectorDataMutationReceipt>,
-    result: Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, String>,
-) -> ExternalMutationOutcome<ConnectorDataMutationReceipt> {
+    journal: &PublicationJournal<DataPublication>,
+    result: Result<ExternalMutationOutcome<DataPublication>, String>,
+) -> ExternalMutationOutcome<DataPublication> {
     match result {
         Ok(outcome) => outcome,
         Err(error) => journal.bridge_failure(
@@ -473,7 +529,7 @@ mod tests {
     struct ControlledPublisher {
         base: StagingBase,
         template: MutationRecoveryTemplate,
-        journal: PublicationJournal<ConnectorDataMutationReceipt>,
+        journal: PublicationJournal<DataPublication>,
         calls: Arc<AtomicUsize>,
         checked: Arc<Mutex<Option<ExternalMutationEvidence>>>,
         behavior: Behavior,
@@ -521,7 +577,7 @@ mod tests {
                 .map_err(format_error)?;
             let receipt = self
                 .template
-                .receipt(request.ref_snapshot_after(request.target_ref()).unwrap())
+                .publication_receipt(request.ref_snapshot_after(request.target_ref()).unwrap())
                 .map_err(format_error)?;
             *self.checked.lock().unwrap() = Some(evidence.clone());
             self.journal.record(evidence, receipt, request)
@@ -993,7 +1049,7 @@ mod tests {
         .unwrap();
         let intent = freeze_intent(&planned, &operation, &marker).unwrap();
         let dispatches = Arc::new(AtomicUsize::new(0));
-        let journal = PublicationJournal::<ConnectorDataMutationReceipt>::new(operation.token());
+        let journal = PublicationJournal::<DataPublication>::new(operation.token());
         let publisher = journal.observe_prepared(Arc::new(CountedSourcePublisher {
             inner: Arc::new(MutationPublisher {
                 inner: Arc::new(CatalogPublisher {

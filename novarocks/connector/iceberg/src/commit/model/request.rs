@@ -321,9 +321,12 @@ pub(crate) fn validate_ref_retention_update(update: &TableUpdate) -> Result<()> 
         | TableUpdate::RemovePartitionStatistics { .. } => Ok(()),
         TableUpdate::SetProperties { updates }
             if !updates.is_empty()
-                && updates
-                    .keys()
-                    .all(|key| key == "novarocks.connector.maintenance.v1") =>
+                && updates.keys().all(|key| {
+                    matches!(
+                        key.as_str(),
+                        "novarocks.connector.maintenance.v1" | "novarocks.connector.maintenance.v2"
+                    )
+                }) =>
         {
             Ok(())
         }
@@ -530,26 +533,28 @@ mod tests {
     }
     #[test]
     fn ref_retention_freezes_exact_ref_updates_and_only_the_maintenance_marker() {
-        let mut input = parts(RequestShape::RefRetention);
-        input
-            .requirements
-            .push(TableRequirement::RefSnapshotIdMatch {
-                r#ref: "main".into(),
-                snapshot_id: Some(10),
+        for marker in [
+            "novarocks.connector.maintenance.v1",
+            "novarocks.connector.maintenance.v2",
+        ] {
+            let mut input = parts(RequestShape::RefRetention);
+            input
+                .requirements
+                .push(TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "main".into(),
+                    snapshot_id: Some(10),
+                });
+            input.updates.push(set_ref("main", 11));
+            input.updates.push(TableUpdate::SetProperties {
+                updates: HashMap::from([(marker.to_owned(), "operation-1".into())]),
             });
-        input.updates.push(set_ref("main", 11));
-        input.updates.push(TableUpdate::SetProperties {
-            updates: HashMap::from([(
-                "novarocks.connector.maintenance.v1".into(),
-                "operation-1".into(),
-            )]),
-        });
-        let request = FrozenRequest::new(input).unwrap();
-        assert_eq!(request.shape(), RequestShape::RefRetention);
-        assert_eq!(request.ref_snapshot_after("main"), Some(11));
-        let wire = request.to_rest_json().unwrap();
-        assert_eq!(wire["updates"][0]["action"], "set-snapshot-ref");
-        assert_eq!(wire["requirements"][1]["snapshot-id"], 10);
+            let request = FrozenRequest::new(input).unwrap();
+            assert_eq!(request.shape(), RequestShape::RefRetention);
+            assert_eq!(request.ref_snapshot_after("main"), Some(11));
+            let wire = request.to_rest_json().unwrap();
+            assert_eq!(wire["updates"][0]["action"], "set-snapshot-ref");
+            assert_eq!(wire["requirements"][1]["snapshot-id"], 10);
+        }
         let mut arbitrary = parts(RequestShape::RefRetention);
         arbitrary.updates.push(TableUpdate::SetProperties {
             updates: HashMap::from([("owner".into(), "wrong".into())]),

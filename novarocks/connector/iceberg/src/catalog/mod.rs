@@ -66,6 +66,9 @@ pub(crate) mod hive;
 #[cfg(feature = "mem-1-m07-hms-listing-observe")]
 pub(crate) mod hms_listing_observer;
 pub(crate) mod listing_admission;
+pub(crate) mod metadata_read;
+#[cfg(test)]
+mod metadata_read_tests;
 pub(crate) mod publication;
 pub(crate) mod publication_dispatch;
 pub(crate) mod rest;
@@ -79,6 +82,7 @@ use async_trait::async_trait;
 use novarocks_spi::connector::{ConnectorError, ConnectorListingBound, ConnectorMutationFailure};
 
 use self::error::{CatalogOutcome, CatalogUnsupported};
+pub(crate) use self::metadata_read::{CatalogMetadataLoad, CatalogMetadataValidator};
 
 /// A namespace this catalog can be asked about.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -455,6 +459,19 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         Ok(())
     }
 
+    /// A read-only positive attribution proves publication, but cannot claim
+    /// that a lost owner's independent local finalization actually ran.
+    #[cfg(not(test))]
+    fn positive_attribution_finalization(
+        &self,
+    ) -> novarocks_spi::connector::ExternalMutationFinalization;
+    #[cfg(test)]
+    fn positive_attribution_finalization(
+        &self,
+    ) -> novarocks_spi::connector::ExternalMutationFinalization {
+        novarocks_spi::connector::ExternalMutationFinalization::Complete
+    }
+
     #[cfg(not(test))]
     fn evidence_policy(&self) -> publication::CatalogEvidencePolicy;
     #[cfg(test)]
@@ -692,6 +709,38 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         self.load_table(table).await
     }
 
+    /// Read a complete authoritative metadata representation for reclamation.
+    /// The caller retains its original storage authority and full baseline.
+    /// Non-REST owners return a fresh representation without a validator.
+    async fn load_complete_metadata_for_read(
+        &self,
+        table: CatalogTableName,
+        binding: crate::access_binding::IcebergReadBinding,
+        validator: Option<&CatalogMetadataValidator>,
+    ) -> Result<CatalogMetadataLoad, ConnectorError> {
+        use novarocks_spi::connector::{ConnectorErrorKind, ConnectorOperationControl};
+        let context = binding.request_context().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Complete metadata load requires the original admitted request context",
+            )
+        })?;
+        context.check_active()?;
+        if validator.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "This catalog cannot validate a REST metadata representation",
+            ));
+        }
+        let loaded = self.load_table_for_read(table, binding).await?;
+        context.check_active()?;
+        metadata_read::complete_metadata(
+            loaded.metadata().clone(),
+            loaded.metadata_location(),
+            None,
+        )
+    }
+
     /// Reload commit metadata using the operation's authorized object-store
     /// I/O. Catalog HTTP calls remain catalog-owned; filesystem pointer and
     /// metadata reads must use the supplied governor, never a cached FileIO.
@@ -924,6 +973,17 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         &self,
         evidence: ConditionalCreateEvidence,
     ) -> Result<ConditionalCreateVerdict, ConnectorError>;
+
+    async fn adjudicate_conditional_create_for_read(
+        &self,
+        _evidence: ConditionalCreateEvidence,
+        _binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<ConditionalCreateVerdict, ConnectorError> {
+        Err(ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "This catalog has no request-bound conditional-create observation",
+        ))
+    }
 
     /// One local operation rule, shared by admission and the mutation owner.
     fn admit_operation(

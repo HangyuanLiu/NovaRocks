@@ -1097,3 +1097,143 @@ async fn ref_retention_staging_generates_set_ref_assertion_but_requires_explicit
             })
     );
 }
+
+fn artifactless_context(
+    stop: &novarocks_spi::connector::ConnectorStopOwner,
+) -> novarocks_spi::connector::ConnectorRequestContext {
+    novarocks_spi::connector::ConnectorRequestContext::try_new(
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+        stop.view(),
+        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )
+    .unwrap()
+}
+
+#[test]
+fn artifactless_existing_schema_stages_canonical_ids_and_parent_requirements_without_io() {
+    let base = fixture(FormatVersion::V2);
+    let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+    let attempt = AttemptToken::new(token(), 9);
+    let schema = Schema::builder()
+        .with_fields(vec![
+            Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                2,
+                "label",
+                Type::Primitive(PrimitiveType::String),
+            )),
+        ])
+        .build()
+        .unwrap();
+    let request = freeze_existing_change(
+        intent(RequestShape::MetadataOnly).target().ident.clone(),
+        "main",
+        &base,
+        "s3://bucket/table/metadata/base.json",
+        RequestShape::MetadataOnly,
+        attempt,
+        change(vec![
+            TableUpdate::AddSchema { schema },
+            TableUpdate::SetCurrentSchema { schema_id: -1 },
+        ]),
+        &artifactless_context(&stop),
+    )
+    .unwrap();
+    assert_eq!(request.artifacts().attempt(), attempt);
+    assert!(request.artifacts().attempt_owned().is_empty());
+    assert!(request.artifacts().operation_references().is_empty());
+    assert!(request.artifacts().session_references().is_empty());
+    assert_eq!(
+        request.requirements(),
+        &[
+            TableRequirement::UuidMatch { uuid: uuid() },
+            TableRequirement::LastAssignedFieldIdMatch {
+                last_assigned_field_id: 1
+            },
+            TableRequirement::CurrentSchemaIdMatch {
+                current_schema_id: 0
+            },
+        ]
+    );
+    let json = request.to_rest_json().unwrap();
+    assert_eq!(json["updates"][0]["schema"]["schema-id"], 1);
+    assert_eq!(json["updates"][1]["schema-id"], 1);
+    assert_eq!(
+        request.base_facts().unwrap().last_sequence_number,
+        base.last_sequence_number()
+    );
+}
+
+#[test]
+fn artifactless_ref_retention_requires_exact_remove_assertion_and_rejects_artifact_shapes() {
+    let base = fixture(FormatVersion::V2);
+    let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+    let context = artifactless_context(&stop);
+    let freeze = |shape, change| {
+        freeze_existing_change(
+            intent(RequestShape::MetadataOnly).target().ident.clone(),
+            "main",
+            &base,
+            "s3://bucket/table/metadata/base.json",
+            shape,
+            AttemptToken::new(token(), 3),
+            change,
+            &context,
+        )
+    };
+    let update = TableUpdate::RemoveSnapshotRef {
+        ref_name: "old".into(),
+    };
+    assert!(freeze(RequestShape::RefRetention, change(vec![update.clone()])).is_err());
+    let request = freeze(
+        RequestShape::RefRetention,
+        PreparedChange {
+            updates: vec![update],
+            requirements: vec![TableRequirement::RefSnapshotIdMatch {
+                r#ref: "old".into(),
+                snapshot_id: None,
+            }],
+        },
+    )
+    .unwrap();
+    assert!(
+        request
+            .requirements()
+            .contains(&TableRequirement::RefSnapshotIdMatch {
+                r#ref: "old".into(),
+                snapshot_id: None
+            })
+    );
+    for shape in [RequestShape::Create, RequestShape::SnapshotProducing] {
+        assert!(freeze(shape, PreparedChange::default()).is_err());
+    }
+}
+
+#[test]
+fn artifactless_preparation_stop_preserves_original_typed_reason() {
+    use novarocks_spi::connector::{ConnectorMutationFailureKind, ConnectorStopOwner};
+    let base = fixture(FormatVersion::V2);
+    let stop = ConnectorStopOwner::new();
+    let context = artifactless_context(&stop);
+    stop.request_stop();
+    let error = freeze_existing_change(
+        intent(RequestShape::MetadataOnly).target().ident.clone(),
+        "main",
+        &base,
+        "s3://bucket/table/metadata/base.json",
+        RequestShape::MetadataOnly,
+        AttemptToken::new(token(), 0),
+        PreparedChange::default(),
+        &context,
+    )
+    .unwrap_err();
+    assert_eq!(
+        crate::commit::attempt::before_dispatch_failure(&error).kind(),
+        ConnectorMutationFailureKind::Cancelled
+    );
+}

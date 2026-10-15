@@ -275,10 +275,232 @@ pub async fn drop_branch_if_exact(
         Ok(_) => Ok(ExactBranchDropOutcome::Retired),
         // A concurrently moved/deleted ref is a failed compare-and-swap proof,
         // not a reason to retry a destructive action in this GC pass.
-        Err(error) if error.to_string().contains("Requirement") => {
+        Err(error)
+            if matches!(
+                error.kind(),
+                crate::iceberg::ErrorKind::PreconditionFailed
+                    | crate::iceberg::ErrorKind::CatalogCommitConflicts
+            ) =>
+        {
             Ok(ExactBranchDropOutcome::Abandoned)
         }
         Err(error) => Err(format!("iceberg cleanup ref: exact drop failed: {error}")),
+    }
+}
+
+impl RefActionPlan {
+    /// Lower against the exact locked observation. Publication belongs to the journal.
+    pub(crate) fn prepare(
+        &self,
+        loaded: &crate::iceberg::table::Table,
+    ) -> Result<
+        crate::commit::staging::PreparedChange,
+        novarocks_spi::connector::ConnectorMutationFailure,
+    > {
+        use crate::commit::staging::PreparedChange;
+        use novarocks_spi::connector::{
+            ConnectorMutationFailure, ConnectorMutationFailureKind as Kind,
+        };
+        let invalid =
+            |message: String| ConnectorMutationFailure::new(Kind::InvalidRequest, message);
+        let missing = |message: String| ConnectorMutationFailure::new(Kind::NotFound, message);
+        let ident = TableIdent::from_strs([self.namespace.as_str(), self.table.as_str()])
+            .map_err(|error| invalid(format!("Invalid Iceberg ref table identifier: {error}")))?;
+        if loaded.identifier() != &ident {
+            return Err(invalid(
+                "Request-scoped table identity does not match the ref plan".into(),
+            ));
+        }
+        let metadata = loaded.metadata();
+        let (updates, mut requirements) = match &self.action {
+            RefAction::CreateBranch {
+                name,
+                snapshot_id,
+                replace,
+                if_not_exists,
+                expected_table_uuid,
+            }
+            | RefAction::CreateTag {
+                name,
+                snapshot_id,
+                replace,
+                if_not_exists,
+                expected_table_uuid,
+            } => {
+                if expected_table_uuid.is_some_and(|uuid| uuid != metadata.uuid()) {
+                    return Err(invalid("Iceberg ref target table UUID changed".into()));
+                }
+                let branch = matches!(&self.action, RefAction::CreateBranch { .. });
+                let existing = metadata.refs().get(name);
+                if existing.is_some_and(|reference| reference.is_branch() != branch) {
+                    return Err(invalid(format!(
+                        "Iceberg ref '{name}' has a different kind"
+                    )));
+                }
+                if existing.is_some() {
+                    if *if_not_exists {
+                        return Ok(PreparedChange::default());
+                    }
+                    if !*replace {
+                        return Err(ConnectorMutationFailure::new(
+                            Kind::AlreadyExists,
+                            format!("Iceberg ref '{name}' already exists"),
+                        ));
+                    }
+                }
+                if metadata.snapshot_by_id(*snapshot_id).is_none() {
+                    return Err(missing(format!(
+                        "Iceberg ref snapshot {snapshot_id} does not exist"
+                    )));
+                }
+                (
+                    vec![TableUpdate::SetSnapshotRef {
+                        ref_name: name.clone(),
+                        reference: crate::ref_snapshot::moved_reference(
+                            existing,
+                            *snapshot_id,
+                            branch,
+                        ),
+                    }],
+                    vec![TableRequirement::RefSnapshotIdMatch {
+                        r#ref: name.clone(),
+                        snapshot_id: existing.map(|reference| reference.snapshot_id),
+                    }],
+                )
+            }
+            RefAction::DropBranch { name, if_exists } | RefAction::DropTag { name, if_exists } => {
+                let Some(existing) = metadata.refs().get(name) else {
+                    if *if_exists {
+                        return Ok(PreparedChange::default());
+                    }
+                    return Err(missing(format!("Iceberg ref '{name}' does not exist")));
+                };
+                let branch = matches!(&self.action, RefAction::DropBranch { .. });
+                if existing.is_branch() != branch {
+                    return Err(invalid(format!(
+                        "Iceberg ref '{name}' has a different kind"
+                    )));
+                }
+                (
+                    vec![TableUpdate::RemoveSnapshotRef {
+                        ref_name: name.clone(),
+                    }],
+                    vec![TableRequirement::RefSnapshotIdMatch {
+                        r#ref: name.clone(),
+                        snapshot_id: Some(existing.snapshot_id),
+                    }],
+                )
+            }
+            RefAction::FastForwardBranch {
+                source_branch,
+                target_branch,
+                source_snapshot_id,
+                expected_target_snapshot_id,
+            } => {
+                let source = metadata.refs().get(source_branch).ok_or_else(|| {
+                    missing(format!(
+                        "Iceberg source branch '{source_branch}' does not exist"
+                    ))
+                })?;
+                if !source.is_branch() || source.snapshot_id != *source_snapshot_id {
+                    return Err(invalid(format!(
+                        "Iceberg source branch '{source_branch}' changed"
+                    )));
+                }
+                if metadata.snapshot_by_id(*source_snapshot_id).is_none() {
+                    return Err(missing(format!(
+                        "Iceberg source snapshot {source_snapshot_id} does not exist"
+                    )));
+                }
+                let target = metadata.refs().get(target_branch);
+                if target.is_some_and(|reference| !reference.is_branch()) {
+                    return Err(invalid(format!(
+                        "Iceberg target '{target_branch}' is not a branch"
+                    )));
+                }
+                let head = if target_branch == "main" {
+                    metadata.current_snapshot_id()
+                } else {
+                    Some(
+                        target
+                            .ok_or_else(|| {
+                                missing(format!(
+                                    "Iceberg target branch '{target_branch}' does not exist"
+                                ))
+                            })?
+                            .snapshot_id,
+                    )
+                };
+                if head != *expected_target_snapshot_id {
+                    return Err(ConnectorMutationFailure::new(
+                        Kind::Conflict,
+                        "Iceberg target branch changed before publication",
+                    ));
+                }
+                (
+                    vec![TableUpdate::SetSnapshotRef {
+                        ref_name: target_branch.clone(),
+                        reference: crate::ref_snapshot::moved_reference(
+                            target,
+                            *source_snapshot_id,
+                            true,
+                        ),
+                    }],
+                    vec![
+                        TableRequirement::RefSnapshotIdMatch {
+                            r#ref: source_branch.clone(),
+                            snapshot_id: Some(*source_snapshot_id),
+                        },
+                        TableRequirement::RefSnapshotIdMatch {
+                            r#ref: target_branch.clone(),
+                            snapshot_id: *expected_target_snapshot_id,
+                        },
+                    ],
+                )
+            }
+        };
+        requirements.insert(
+            0,
+            TableRequirement::UuidMatch {
+                uuid: metadata.uuid(),
+            },
+        );
+        Ok(PreparedChange {
+            updates,
+            requirements,
+        })
+    }
+
+    /// A stale cleanup candidate grants no destructive request.
+    pub(crate) fn prepare_exact_drop(
+        loaded: &crate::iceberg::table::Table,
+        expected_table_uuid: &str,
+        name: &str,
+        expected_head_snapshot_id: i64,
+    ) -> Option<crate::commit::staging::PreparedChange> {
+        let metadata = loaded.metadata();
+        let reference = metadata.refs().get(name)?;
+        if metadata.uuid().to_string() != expected_table_uuid
+            || !reference.is_branch()
+            || reference.snapshot_id != expected_head_snapshot_id
+            || metadata.snapshot_by_id(expected_head_snapshot_id).is_none()
+        {
+            return None;
+        }
+        Some(crate::commit::staging::PreparedChange {
+            requirements: vec![
+                TableRequirement::UuidMatch {
+                    uuid: metadata.uuid(),
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: name.to_owned(),
+                    snapshot_id: Some(expected_head_snapshot_id),
+                },
+            ],
+            updates: vec![TableUpdate::RemoveSnapshotRef {
+                ref_name: name.to_owned(),
+            }],
+        })
     }
 }
 
@@ -287,194 +509,21 @@ pub async fn execute_ref_action(
     loaded: &crate::iceberg::table::Table,
     plan: &RefActionPlan,
 ) -> Result<RefActionOutcome, String> {
-    let ident = TableIdent::from_strs([plan.namespace.as_str(), plan.table.as_str()])
-        .map_err(|e| format!("iceberg ref: invalid table identifier: {e}"))?;
-    if loaded.identifier() != &ident {
-        return Err(
-            "iceberg ref: request-scoped table identity does not match action plan".to_string(),
-        );
+    let change = plan.prepare(loaded).map_err(|error| error.to_string())?;
+    if change.updates.is_empty() {
+        return Ok(RefActionOutcome::NoOp);
     }
-    let metadata = loaded.metadata();
-
-    let (updates, requirements) = match &plan.action {
-        RefAction::CreateBranch {
-            name,
-            snapshot_id,
-            replace,
-            if_not_exists,
-            expected_table_uuid,
-        } => match metadata.refs().get(name) {
-            Some(_existing) if *if_not_exists => return Ok(RefActionOutcome::NoOp),
-            Some(_existing) if !*replace => {
-                return Err(format!("iceberg ref: branch '{name}' already exists"));
-            }
-            existing => {
-                let parent = existing.map(|r| r.snapshot_id);
-                // The caller's frozen UUID, when present, must name the
-                // loaded incarnation; the commit entry checks and freezes it.
-                let mut requirements = vec![TableRequirement::RefSnapshotIdMatch {
-                    r#ref: name.clone(),
-                    snapshot_id: parent,
-                }];
-                if let Some(uuid) = expected_table_uuid {
-                    requirements.insert(0, TableRequirement::UuidMatch { uuid: *uuid });
-                }
-                (
-                    vec![TableUpdate::SetSnapshotRef {
-                        ref_name: name.clone(),
-                        reference: SnapshotReference {
-                            snapshot_id: *snapshot_id,
-                            retention: SnapshotRetention::Branch {
-                                min_snapshots_to_keep: None,
-                                max_snapshot_age_ms: None,
-                                max_ref_age_ms: None,
-                            },
-                        },
-                    }],
-                    requirements,
-                )
-            }
-        },
-        RefAction::CreateTag {
-            name,
-            snapshot_id,
-            replace,
-            if_not_exists,
-            expected_table_uuid,
-        } => match metadata.refs().get(name) {
-            Some(_existing) if *if_not_exists => return Ok(RefActionOutcome::NoOp),
-            Some(_existing) if !*replace => {
-                return Err(format!("iceberg ref: tag '{name}' already exists"));
-            }
-            existing => {
-                let parent = existing.map(|r| r.snapshot_id);
-                // The caller's frozen UUID, when present, must name the
-                // loaded incarnation; the commit entry checks and freezes it.
-                let mut requirements = vec![TableRequirement::RefSnapshotIdMatch {
-                    r#ref: name.clone(),
-                    snapshot_id: parent,
-                }];
-                if let Some(uuid) = expected_table_uuid {
-                    requirements.insert(0, TableRequirement::UuidMatch { uuid: *uuid });
-                }
-                (
-                    vec![TableUpdate::SetSnapshotRef {
-                        ref_name: name.clone(),
-                        reference: SnapshotReference {
-                            snapshot_id: *snapshot_id,
-                            retention: SnapshotRetention::Tag {
-                                max_ref_age_ms: None,
-                            },
-                        },
-                    }],
-                    requirements,
-                )
-            }
-        },
-        RefAction::DropBranch { name, if_exists } => match metadata.refs().get(name) {
-            None if *if_exists => return Ok(RefActionOutcome::NoOp),
-            None => return Err(format!("iceberg ref: branch '{name}' does not exist")),
-            Some(existing) => (
-                vec![TableUpdate::RemoveSnapshotRef {
-                    ref_name: name.clone(),
-                }],
-                vec![TableRequirement::RefSnapshotIdMatch {
-                    r#ref: name.clone(),
-                    snapshot_id: Some(existing.snapshot_id),
-                }],
-            ),
-        },
-        RefAction::DropTag { name, if_exists } => match metadata.refs().get(name) {
-            None if *if_exists => return Ok(RefActionOutcome::NoOp),
-            None => return Err(format!("iceberg ref: tag '{name}' does not exist")),
-            Some(existing) => (
-                vec![TableUpdate::RemoveSnapshotRef {
-                    ref_name: name.clone(),
-                }],
-                vec![TableRequirement::RefSnapshotIdMatch {
-                    r#ref: name.clone(),
-                    snapshot_id: Some(existing.snapshot_id),
-                }],
-            ),
-        },
-        RefAction::FastForwardBranch {
-            source_branch,
-            target_branch,
-            source_snapshot_id,
-            expected_target_snapshot_id,
-        } => {
-            let source = metadata.refs().get(source_branch).ok_or_else(|| {
-                format!("iceberg ref: source branch '{source_branch}' does not exist")
-            })?;
-            if !source.is_branch() {
-                return Err(format!(
-                    "iceberg ref: source '{source_branch}' is not a branch"
-                ));
-            }
-            if source.snapshot_id != *source_snapshot_id {
-                return Err(format!(
-                    "iceberg ref: source branch '{source_branch}' points to {}, expected {source_snapshot_id}",
-                    source.snapshot_id
-                ));
-            }
-            if metadata.snapshot_by_id(*source_snapshot_id).is_none() {
-                return Err(format!(
-                    "iceberg ref: source snapshot {source_snapshot_id} does not exist"
-                ));
-            }
-            let current_target_snapshot_id = if target_branch == "main" {
-                metadata.current_snapshot_id()
-            } else {
-                let target = metadata.refs().get(target_branch).ok_or_else(|| {
-                    format!("iceberg ref: target branch '{target_branch}' does not exist")
-                })?;
-                if !target.is_branch() {
-                    return Err(format!(
-                        "iceberg ref: target '{target_branch}' is not a branch"
-                    ));
-                }
-                Some(target.snapshot_id)
-            };
-            if current_target_snapshot_id != *expected_target_snapshot_id {
-                return Err(format!(
-                    "iceberg ref: target branch '{target_branch}' points to {:?}, expected {:?}",
-                    current_target_snapshot_id, expected_target_snapshot_id
-                ));
-            }
-            (
-                vec![TableUpdate::SetSnapshotRef {
-                    ref_name: target_branch.clone(),
-                    reference: SnapshotReference {
-                        snapshot_id: *source_snapshot_id,
-                        retention: SnapshotRetention::Branch {
-                            min_snapshots_to_keep: None,
-                            max_snapshot_age_ms: None,
-                            max_ref_age_ms: None,
-                        },
-                    },
-                }],
-                vec![
-                    TableRequirement::RefSnapshotIdMatch {
-                        r#ref: source_branch.clone(),
-                        snapshot_id: Some(*source_snapshot_id),
-                    },
-                    TableRequirement::RefSnapshotIdMatch {
-                        r#ref: target_branch.clone(),
-                        snapshot_id: *expected_target_snapshot_id,
-                    },
-                ],
-            )
-        }
-    };
-
-    let commit = existing_table_commit(ident, metadata, requirements, updates)
-        .map_err(|error| format!("iceberg ref: {error}"))?;
-
+    let commit = existing_table_commit(
+        loaded.identifier().clone(),
+        loaded.metadata(),
+        change.requirements,
+        change.updates,
+    )
+    .map_err(|error| format!("iceberg ref: {error}"))?;
     catalog
         .update_table(commit)
         .await
-        .map_err(|e| format!("iceberg ref: commit failed: {e}"))?;
-
+        .map_err(|error| format!("iceberg ref: commit failed: {error}"))?;
     Ok(RefActionOutcome::Committed)
 }
 
@@ -609,6 +658,114 @@ mod tests {
 
         assert!(error.contains("table UUID"), "{error}");
         assert!(fixture.catalog.commits().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pure_ref_replacement_preserves_policy_and_exact_cas() {
+        let fixture = local_table().await;
+        let first = fixture.append("first").await;
+        let second = fixture.append("second").await;
+        let loaded = fixture.load().await;
+        for branch in [true, false] {
+            let mut value = serde_json::to_value(loaded.metadata()).unwrap();
+            value["refs"]["release"] = if branch {
+                serde_json::json!({"snapshot-id":first,"type":"branch","min-snapshots-to-keep":11,"max-snapshot-age-ms":12,"max-ref-age-ms":13})
+            } else {
+                serde_json::json!({"snapshot-id":first,"type":"tag","max-ref-age-ms":13})
+            };
+            let metadata: TableMetadata = serde_json::from_value(value).unwrap();
+            let expected = metadata.refs()["release"].retention.clone();
+            let table = crate::iceberg::table::Table::builder()
+                .runtime(crate::iceberg::Runtime::try_current().unwrap())
+                .identifier(loaded.identifier().clone())
+                .file_io(loaded.file_io().clone())
+                .metadata(metadata)
+                .build()
+                .unwrap();
+            let duplicate = if branch {
+                RefAction::CreateBranch {
+                    name: "release".into(),
+                    snapshot_id: second,
+                    replace: false,
+                    if_not_exists: false,
+                    expected_table_uuid: Some(table.metadata().uuid()),
+                }
+            } else {
+                RefAction::CreateTag {
+                    name: "release".into(),
+                    snapshot_id: second,
+                    replace: false,
+                    if_not_exists: false,
+                    expected_table_uuid: Some(table.metadata().uuid()),
+                }
+            };
+            let duplicate = plan(duplicate)
+                .prepare(&table)
+                .err()
+                .expect("duplicate ref");
+            assert_eq!(
+                duplicate.kind(),
+                novarocks_spi::connector::ConnectorMutationFailureKind::AlreadyExists
+            );
+            if branch {
+                let stale = plan(RefAction::FastForwardBranch {
+                    source_branch: "main".into(),
+                    target_branch: "release".into(),
+                    source_snapshot_id: second,
+                    expected_target_snapshot_id: Some(second),
+                })
+                .prepare(&table)
+                .err()
+                .expect("stale target head");
+                assert_eq!(
+                    stale.kind(),
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Conflict
+                );
+            }
+            let action = if branch {
+                RefAction::CreateBranch {
+                    name: "release".into(),
+                    snapshot_id: second,
+                    replace: true,
+                    if_not_exists: false,
+                    expected_table_uuid: Some(table.metadata().uuid()),
+                }
+            } else {
+                RefAction::CreateTag {
+                    name: "release".into(),
+                    snapshot_id: second,
+                    replace: true,
+                    if_not_exists: false,
+                    expected_table_uuid: Some(table.metadata().uuid()),
+                }
+            };
+            let prepared = plan(action).prepare(&table).unwrap();
+            let [TableUpdate::SetSnapshotRef { reference, .. }] = prepared.updates.as_slice()
+            else {
+                panic!("one ref update");
+            };
+            assert_eq!(reference.retention, expected);
+            assert_eq!(reference.snapshot_id, second);
+            assert!(
+                prepared
+                    .requirements
+                    .contains(&TableRequirement::UuidMatch {
+                        uuid: table.metadata().uuid()
+                    })
+            );
+            assert!(
+                prepared
+                    .requirements
+                    .contains(&TableRequirement::RefSnapshotIdMatch {
+                        r#ref: "release".into(),
+                        snapshot_id: Some(first)
+                    })
+            );
+        }
+        assert!(
+            fixture.catalog.commits().is_empty(),
+            "pure lowering must not dispatch"
+        );
     }
 
     #[test]

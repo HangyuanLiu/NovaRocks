@@ -234,10 +234,10 @@ fn resolve_outcome(
                 evidence: evidence.clone(),
                 context,
             }) {
-                Ok(outcome) => outcome,
-                Err(_) => {
+                Ok(ExternalMutationOutcome::KnownUncommitted { .. }) | Err(_) => {
                     return ResolvedCatalogMutation::CommitUnknown { failure, evidence };
                 }
+                Ok(outcome) => outcome,
             }
         }
         outcome => outcome,
@@ -282,6 +282,7 @@ mod tests {
     struct UnknownMutation {
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
+        negative_reconciliation: bool,
     }
 
     impl ConnectorCatalogMutation for UnknownMutation {
@@ -316,6 +317,15 @@ mod tests {
             request: ConnectorCatalogMutationReconcileRequest,
         ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError>
         {
+            if self.negative_reconciliation {
+                return Ok(ExternalMutationOutcome::KnownUncommitted {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Conflict,
+                        "ref does not currently match",
+                    ),
+                    cleanup: ExternalMutationFinalization::Complete,
+                });
+            }
             Ok(ExternalMutationOutcome::KnownCommitted {
                 effect: ExternalMutationEffect::Applied,
                 receipt: ConnectorCatalogMutationReceipt::try_new(
@@ -552,6 +562,7 @@ mod tests {
         let mutation = Arc::new(UnknownMutation {
             descriptor: descriptor.clone(),
             incarnation: ProviderBindingEpoch::from_bytes([3; 16]),
+            negative_reconciliation: false,
         });
         let result = execute_catalog_mutation(
             &Resolver(mutation),
@@ -561,6 +572,30 @@ mod tests {
         )
         .expect("reconciled committed result");
         assert_eq!(result.effect, ExternalMutationEffect::Applied);
+    }
+
+    #[test]
+    fn negative_reconciliation_cannot_erase_the_original_unknown() {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("catalog.analytics").unwrap(),
+        };
+        let mutation = Arc::new(UnknownMutation {
+            descriptor: descriptor.clone(),
+            incarnation: ProviderBindingEpoch::from_bytes([3; 16]),
+            negative_reconciliation: true,
+        });
+        let result = resolve_catalog_mutation(
+            &Resolver(mutation),
+            &descriptor.instance_id,
+            create_namespace_operation(descriptor.instance_id.clone()),
+            test_context(),
+        );
+        let ResolvedCatalogMutation::CommitUnknown { failure, evidence } = result else {
+            panic!("a negative read cannot authorize uncommitted cleanup");
+        };
+        assert_eq!(failure.message(), "response lost");
+        assert_eq!(evidence.provider_payload().as_ref(), b"test");
     }
 
     #[test]

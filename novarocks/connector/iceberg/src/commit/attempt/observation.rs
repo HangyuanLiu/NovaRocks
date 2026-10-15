@@ -34,9 +34,10 @@ use crate::commit::staging::StagingBase;
 use crate::iceberg::{Error, ErrorKind, Result};
 use async_trait::async_trait;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorOperationControl, ConnectorRequestContext, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorOperationControl, ConnectorProcessLocalPayload, ConnectorProviderBindingKey,
+    ConnectorRequestContext, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -155,6 +156,14 @@ impl<R> Clone for PublicationJournal<R> {
         }
     }
 }
+// The journal stores only bare evidence. A projected Unknown may retain this
+// original owner; the back-reference must never enter JournalState.
+struct RetainedJournalEvidence<R> {
+    journal: PublicationJournal<R>,
+    entry: JournalEntryRef,
+    evidence: ExternalMutationEvidence,
+}
+
 // A read-only bridge projection, never an independently writable state machine.
 #[derive(Clone)]
 enum Phase<R> {
@@ -166,7 +175,7 @@ enum Phase<R> {
     Rejected(ConnectorMutationFailure, ExternalMutationFinalization),
     Unknown(Checked<R>, ConnectorMutationFailure),
 }
-impl<R: Clone + Send + Sync> PublicationJournal<R> {
+impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
     #[cfg(test)]
     pub(crate) fn new(operation: OperationToken) -> Self {
         Self::new_with_activity(operation, None)
@@ -192,6 +201,72 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             })),
         }
     }
+    /// Recover only the original in-process owner, never a fabricated journal
+    /// from serializable request facts. Wire-only evidence has no such owner.
+    pub(crate) fn from_evidence(
+        evidence: &ExternalMutationEvidence,
+    ) -> std::result::Result<Option<(Self, JournalEntryRef)>, ConnectorError> {
+        let Some(payload) = evidence.process_local_payload() else {
+            return Ok(None);
+        };
+        let retained = payload
+            .value::<RetainedJournalEvidence<R>>(evidence.descriptor().instance_id.as_str())?;
+        if retained.evidence != *evidence {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Publication evidence does not match its original journal owner",
+            ));
+        }
+        let state = retained
+            .journal
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let exact = state.entries.get(&retained.entry.0).is_some_and(|entry| {
+            entry.checked.evidence == *evidence
+                && entry.checked.descriptor.key == retained.entry.0
+                && evidence.operation_id().to_bytes() == retained.journal.operation.to_bytes()
+        });
+        if !exact {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Publication evidence has no exact original journal entry",
+            ));
+        }
+        Ok(Some((retained.journal.clone(), retained.entry)))
+    }
+
+    pub(crate) fn entry_evidence(
+        &self,
+        entry: JournalEntryRef,
+    ) -> Option<ExternalMutationEvidence> {
+        let checked = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .get(&entry.0)?
+            .checked
+            .clone();
+        Some(self.retained_evidence(checked))
+    }
+
+    fn retained_evidence(&self, checked: Checked<R>) -> ExternalMutationEvidence {
+        let evidence = checked.evidence.without_process_local_payload();
+        let owner = ConnectorProviderBindingKey {
+            instance_id: evidence.descriptor().instance_id.clone(),
+            incarnation: evidence.incarnation(),
+        };
+        let retained = Arc::new(RetainedJournalEvidence {
+            journal: self.clone(),
+            entry: JournalEntryRef(checked.descriptor.key),
+            evidence: evidence.clone(),
+        });
+        evidence
+            .with_process_local_payload(ConnectorProcessLocalPayload::new(owner, retained))
+            .expect("Bare journal evidence accepts its exact in-process owner")
+    }
+
     /// A new publication frontier shares the operation's entries but has no
     /// current request yet. A prior stage proof cannot answer a final publish.
     pub(crate) fn next_frontier(&self) -> Result<Self> {
@@ -228,7 +303,9 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             state: Arc::clone(&self.state),
         })
     }
-    fn prepare(&self, checked: Checked<R>) -> Result<()> {
+    fn prepare(&self, mut checked: Checked<R>) -> Result<()> {
+        // No strong cycle: projected owner payloads are never journal facts.
+        checked.evidence = checked.evidence.without_process_local_payload();
         checked.descriptor.validate()?;
         if checked.evidence.operation_id().to_bytes() != self.operation.to_bytes() {
             return Err(Error::new(
@@ -633,6 +710,22 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
         key: Uuid,
         observation: PositiveAttributionObservation,
     ) -> Result<()> {
+        self.append_positive_proof_with_finalization(
+            key,
+            observation,
+            ExternalMutationFinalization::Complete,
+        )
+    }
+
+    /// Publish the verified proof and its pure owner finalization fact under
+    /// one lock. Concurrent reconciliation cannot observe an Applied projection
+    /// with a transient default Complete between these two facts.
+    pub(crate) fn append_positive_proof_with_finalization(
+        &self,
+        key: Uuid,
+        observation: PositiveAttributionObservation,
+        finalization: ExternalMutationFinalization,
+    ) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -683,6 +776,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
                 None => CommitProof::applied(None),
             },
         };
+        entry.finalization = merge_finalization(entry.finalization.clone(), finalization);
         entry.positive_proof = Some(proof);
         Ok(())
     }
@@ -741,13 +835,13 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
                 Phase::Issued(checked) => {
                     return ExternalMutationOutcome::CommitUnknown {
                         failure,
-                        evidence: checked.evidence,
+                        evidence: self.retained_evidence(checked),
                     };
                 }
                 Phase::Unknown(checked, original) => {
                     return ExternalMutationOutcome::CommitUnknown {
                         failure: original,
-                        evidence: checked.evidence,
+                        evidence: self.retained_evidence(checked),
                     };
                 }
                 _ => {}
@@ -778,14 +872,14 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             }
             Phase::Unknown(checked, failure) => ExternalMutationOutcome::CommitUnknown {
                 failure,
-                evidence: checked.evidence,
+                evidence: self.retained_evidence(checked),
             },
             Phase::Issued(checked) => ExternalMutationOutcome::CommitUnknown {
                 failure: ConnectorMutationFailure::new(
                     ConnectorMutationFailureKind::Unavailable,
                     "Publication dispatch has no conclusion",
                 ),
-                evidence: checked.evidence,
+                evidence: self.retained_evidence(checked),
             },
             _ => ExternalMutationOutcome::KnownUncommitted {
                 failure: ConnectorMutationFailure::new(
@@ -832,15 +926,14 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
                 Phase::Issued(checked) | Phase::Unknown(checked, _) => {
                     ExternalMutationOutcome::CommitUnknown {
                         failure,
-                        evidence: checked.evidence,
+                        evidence: self.retained_evidence(checked),
                     }
                 }
                 Phase::Ready | Phase::Waiting => ExternalMutationOutcome::CommitUnknown {
                     failure,
-                    evidence: self
-                        .current_checked()
-                        .expect("active publication entry")
-                        .evidence,
+                    evidence: self.retained_evidence(
+                        self.current_checked().expect("active publication entry"),
+                    ),
                 },
                 _ => panic!("Unknown publication follows its checked dispatch"),
             },
@@ -880,11 +973,11 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
         match self.phase() {
             Phase::Unknown(checked, original) => ExternalMutationOutcome::CommitUnknown {
                 failure: original,
-                evidence: checked.evidence,
+                evidence: self.retained_evidence(checked),
             },
             Phase::Issued(checked) => ExternalMutationOutcome::CommitUnknown {
                 failure,
-                evidence: checked.evidence,
+                evidence: self.retained_evidence(checked),
             },
             Phase::Committed(proof, checked, owner_finalization) => {
                 let cleanup = operation.cleanup_after_commit(&checked.retained).await;
@@ -938,11 +1031,11 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
         match self.phase() {
             Phase::Unknown(checked, original) => ExternalMutationOutcome::CommitUnknown {
                 failure: original,
-                evidence: checked.evidence,
+                evidence: self.retained_evidence(checked),
             },
             Phase::Issued(checked) => ExternalMutationOutcome::CommitUnknown {
                 failure,
-                evidence: checked.evidence,
+                evidence: self.retained_evidence(checked),
             },
             Phase::Committed(proof, checked, finalization) => {
                 ExternalMutationOutcome::KnownCommitted {
@@ -1131,7 +1224,7 @@ struct ObservedPublisher<R> {
 }
 #[async_trait]
 #[cfg(test)]
-impl<R: Clone + Send + Sync> Publisher for ObservedPublisher<R> {
+impl<R: Clone + Send + Sync + 'static> Publisher for ObservedPublisher<R> {
     async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
         self.inner.load_target(attempt).await
     }
@@ -1278,6 +1371,166 @@ mod tests {
                 Behavior::PanicBeforeLoad => unreachable!(),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn retry_policy_deadline_bounds_delayed_owner_preparation_before_evidence() {
+        use crate::catalog::publication::{CatalogEvidencePolicy, EvidenceContext};
+        use crate::catalog::publication_dispatch::{
+            DispatchCompletion, PreparationResult, PreparedCatalogDispatch, PreparedPublication,
+        };
+        use crate::commit::attempt::prepared::PublicationPreparer;
+        use crate::iceberg::spec::TableProperties;
+        use novarocks_spi::connector::{
+            CatalogActivityPhase as P, CatalogActivityReader, CatalogScopeIdentity,
+        };
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        use tokio::sync::Notify;
+
+        struct DelayedOwner {
+            facts: Fake,
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+            actual_exits: Arc<AtomicUsize>,
+            received_deadline: Arc<Mutex<Option<Instant>>>,
+        }
+        struct CountedMutation {
+            calls: Arc<AtomicUsize>,
+            snapshot: Option<i64>,
+        }
+        #[async_trait]
+        impl PreparedCatalogDispatch for CountedMutation {
+            async fn dispatch_once(self: Box<Self>, _: EvidenceContext) -> DispatchCompletion {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                DispatchCompletion::evidence(DispatchEvidence::Applied {
+                    proof: CommitProof::applied(self.snapshot),
+                })
+            }
+        }
+        #[async_trait]
+        impl PublicationPreparer for DelayedOwner {
+            async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
+                self.facts.load_target(attempt).await
+            }
+            fn preflight_recovery(
+                &self,
+                request: &FrozenRequest,
+                operation: &IcebergCommitOperation,
+            ) -> Result<()> {
+                self.facts.preflight_recovery(request, operation)
+            }
+            fn evidence_policy(&self) -> CatalogEvidencePolicy {
+                CatalogEvidencePolicy::default()
+            }
+            async fn prepare_dispatch(
+                self: Arc<Self>,
+                request: FrozenRequest,
+                _: PublicationDescriptor,
+                _: ProviderBindingEpoch,
+                preparation: ConnectorRequestContext,
+            ) -> PreparationResult<PreparedPublication> {
+                *self.received_deadline.lock().unwrap() = Some(preparation.deadline());
+                self.entered.notify_one();
+                self.release.notified().await;
+                self.actual_exits.fetch_add(1, Ordering::SeqCst);
+                // The real owner checks the context it received after its
+                // already-started preparation has actually exited.
+                preparation.check_active()?;
+                Ok(PreparedPublication::Mutation {
+                    binding: None,
+                    dispatch: Box::new(CountedMutation {
+                        calls: self.facts.dispatches.clone(),
+                        snapshot: request.ref_snapshot_after(request.target_ref()),
+                    }),
+                })
+            }
+        }
+
+        let root = crate::activity::CatalogActivity::new(CatalogScopeIdentity::new(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            ConnectorInstanceId::parse("preparation.policy").unwrap(),
+            Uuid::now_v7(),
+        ));
+        let fixture = Fixture::new_observed(root.generation());
+        let operation = fixture.operation.clone();
+        let original = operation.request_context().clone();
+        let metadata = fixture.metadata(FormatVersion::V3);
+        let intent = fixture.intent(&metadata, "main", vec![]);
+        let journal = PublicationJournal::for_runtime(operation.token(), operation.runtime());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let actual_exits = Arc::new(AtomicUsize::new(0));
+        let received_deadline = Arc::new(Mutex::new(None));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let publisher = journal.observe_prepared(Arc::new(DelayedOwner {
+            facts: Fake {
+                operation: operation.clone(),
+                metadata,
+                metadata_location: format!(
+                    "file://{}/base.metadata.json",
+                    fixture.directory.path().display()
+                ),
+                journal: journal.clone(),
+                dispatches: dispatches.clone(),
+                behavior: Behavior::Commit,
+            },
+            entered: entered.clone(),
+            release: release.clone(),
+            actual_exits: actual_exits.clone(),
+            received_deadline: received_deadline.clone(),
+        }));
+        let policy = RetryPolicy::from_properties(&HashMap::from([(
+            TableProperties::PROPERTY_COMMIT_TOTAL_RETRY_TIME_MS.to_owned(),
+            "2000".to_owned(),
+        )]))
+        .unwrap();
+        let running = operation.clone();
+        let task = tokio::spawn(async move {
+            run(
+                &running,
+                &intent,
+                &PreparedChange::default(),
+                &[&FastAppendPreparer],
+                &publisher,
+                policy,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("owner preparation must start inside the retry window");
+        tokio::time::sleep(policy.total_timeout() + Duration::from_millis(20)).await;
+        let waiting = root.snapshot();
+        assert!(
+            !task.is_finished(),
+            "policy expiry must not detach the owner"
+        );
+        assert_eq!(actual_exits.load(Ordering::SeqCst), 0);
+        assert_eq!(waiting.phases[P::PreDispatch as usize].inflight, 1);
+        assert_eq!(waiting.phases[P::Evidence as usize].started, 0);
+        assert!(
+            original.check_active().is_ok(),
+            "the original request is still active"
+        );
+        release.notify_one();
+        let report = task.await.unwrap();
+        let outcome = journal.project(report);
+        assert!(matches!(
+            outcome,
+            ExternalMutationOutcome::KnownUncommitted { failure, .. }
+                if failure.kind() == ConnectorMutationFailureKind::DeadlineExceeded
+        ));
+        assert!(received_deadline.lock().unwrap().unwrap() < original.deadline());
+        assert_eq!(actual_exits.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        let exited = root.snapshot();
+        assert_eq!(exited.phases[P::PreDispatch as usize].inflight, 0);
+        assert_eq!(exited.phases[P::PreDispatch as usize].started, 2);
+        assert_eq!(exited.phases[P::PreDispatch as usize].exited, 2);
+        assert_eq!(exited.events.pre_dispatch_timed_out, 1);
+        assert_eq!(exited.phases[P::Dispatch as usize].started, 0);
+        assert_eq!(exited.phases[P::Evidence as usize].started, 0);
     }
 
     #[test]
@@ -1919,6 +2172,109 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn positive_proof_and_owner_finalization_are_visible_as_one_fact() {
+        let uuid = Uuid::from_u128(42);
+        let (journal, preparation) = catalog_journal_with_attribution(AttributionPlan::Property {
+            table_uuid: uuid,
+            key: "operation".into(),
+            value: "original".into(),
+        });
+        let entry = journal
+            .claim_dispatch()
+            .unwrap()
+            .begin_dispatch(&preparation, &MemoryDispatchBarrier)
+            .await
+            .unwrap();
+        journal.conclude_entry(
+            entry,
+            DispatchEvidence::Unknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "lost reply",
+                ),
+                observation: ProtocolObservation::default(),
+            },
+        );
+        let finalization = ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Unavailable,
+            "owner finalization was not observed",
+        ));
+        let observation = PositiveAttributionObservation::PropertyMarker {
+            table_uuid: uuid,
+            key: "operation".into(),
+            value: "original".into(),
+        };
+        assert!(
+            journal
+                .append_positive_proof_with_finalization(
+                    entry.0,
+                    PositiveAttributionObservation::PropertyMarker {
+                        table_uuid: uuid,
+                        key: "operation".into(),
+                        value: "foreign".into(),
+                    },
+                    finalization.clone()
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            journal.catalog_entry_outcome(entry),
+            ExternalMutationOutcome::CommitUnknown { .. }
+        ));
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let reader_start = start.clone();
+        let reader = journal.clone();
+        let expected = finalization.clone();
+        let task = std::thread::spawn(move || {
+            reader_start.wait();
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match reader.catalog_entry_outcome(entry) {
+                    ExternalMutationOutcome::CommitUnknown { .. } => {}
+                    ExternalMutationOutcome::KnownCommitted { finalization, .. } => {
+                        assert_eq!(
+                            finalization, expected,
+                            "first Applied observation must include the owner fact"
+                        );
+                        break;
+                    }
+                    other => panic!("unexpected publication outcome: {other:?}"),
+                }
+                assert!(
+                    std::time::Instant::now() < until,
+                    "positive observation did not become visible"
+                );
+                std::thread::yield_now();
+            }
+        });
+        start.wait();
+        journal
+            .append_positive_proof_with_finalization(
+                entry.0,
+                observation.clone(),
+                finalization.clone(),
+            )
+            .unwrap();
+        task.join().unwrap();
+        assert!(
+            journal
+                .append_positive_proof_with_finalization(
+                    entry.0,
+                    observation,
+                    ExternalMutationFinalization::Complete
+                )
+                .is_err()
+        );
+        assert!(
+            matches!(journal.catalog_entry_outcome(entry), ExternalMutationOutcome::KnownCommitted { finalization: actual, .. } if actual == finalization)
+        );
+        assert!(matches!(
+            journal.state.lock().unwrap().entries[&entry.0].phase,
+            EntryPhase::Concluded(DispatchEvidence::Unknown { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn unknown_accepts_only_its_frozen_positive_probe_and_preserves_original_observation() {
         let uuid = Uuid::from_u128(42);
         let plan = AttributionPlan::Property {
@@ -2186,5 +2542,132 @@ mod tests {
         assert!(
             matches!(journal.catalog_entry_outcome(second),ExternalMutationOutcome::KnownCommitted {receipt,finalization:ExternalMutationFinalization::Complete,..} if receipt=="second receipt")
         );
+    }
+    #[tokio::test]
+    async fn projected_unknown_retains_exact_owner_without_a_journal_cycle() {
+        let uuid = Uuid::from_u128(1);
+        let location = "s3://bucket/table/metadata/v1.metadata.json".to_string();
+        let digest = "a".repeat(64);
+        let (journal, context) = catalog_journal_with_attribution(AttributionPlan::ExactMetadata {
+            table_uuid: uuid,
+            location: location.clone(),
+            digest: digest.clone(),
+        });
+        let weak = Arc::downgrade(&journal.state);
+        let entry = journal
+            .claim_dispatch()
+            .unwrap()
+            .begin_dispatch(&context, &MemoryDispatchBarrier)
+            .await
+            .unwrap();
+        journal.conclude_entry(
+            entry,
+            DispatchEvidence::Unknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "lost reply",
+                ),
+                observation: ProtocolObservation::default(),
+            },
+        );
+        let ExternalMutationOutcome::CommitUnknown { evidence, .. } =
+            journal.catalog_entry_outcome(entry)
+        else {
+            panic!("unknown");
+        };
+        assert!(
+            journal
+                .current_checked()
+                .unwrap()
+                .evidence
+                .process_local_payload()
+                .is_none()
+        );
+        let wire = evidence.try_to_wire_v1().unwrap();
+        let decoded = ExternalMutationEvidence::try_from_wire_v1(&wire).unwrap();
+        assert_eq!(decoded, evidence);
+        assert!(
+            PublicationJournal::<String>::from_evidence(&decoded)
+                .unwrap()
+                .is_none()
+        );
+        assert!(PublicationJournal::<u8>::from_evidence(&evidence).is_err());
+        drop(journal);
+        assert!(weak.upgrade().is_some());
+        let (original, original_entry) = PublicationJournal::<String>::from_evidence(&evidence)
+            .unwrap()
+            .unwrap();
+        assert_eq!(original_entry, entry);
+        let proof = PositiveAttributionObservation::ExactMetadata {
+            table_uuid: uuid,
+            location,
+            digest,
+        };
+        original
+            .append_positive_proof(entry.0, proof.clone())
+            .unwrap();
+        assert!(original.append_positive_proof(entry.0, proof).is_err());
+        assert!(
+            matches!(original.catalog_entry_outcome(entry), ExternalMutationOutcome::KnownCommitted { receipt, .. } if receipt == "namespace receipt")
+        );
+        {
+            let state = original.state.lock().unwrap();
+            let record = state.entries.get(&entry.0).unwrap();
+            assert!(matches!(
+                record.phase,
+                EntryPhase::Concluded(DispatchEvidence::Unknown { .. })
+            ));
+            assert!(record.positive_proof.is_some());
+        }
+        drop(original);
+        drop(evidence);
+        assert!(
+            weak.upgrade().is_none(),
+            "no strong owner cycle in journal evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_attachment_cannot_be_reused_for_another_operation() {
+        let (journal, context) = catalog_journal();
+        let entry = journal
+            .claim_dispatch()
+            .unwrap()
+            .begin_dispatch(&context, &MemoryDispatchBarrier)
+            .await
+            .unwrap();
+        journal.conclude_entry(
+            entry,
+            DispatchEvidence::Unknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "lost reply",
+                ),
+                observation: ProtocolObservation::default(),
+            },
+        );
+        let ExternalMutationOutcome::CommitUnknown { evidence, .. } =
+            journal.catalog_entry_outcome(entry)
+        else {
+            panic!("unknown");
+        };
+        let changed = ExternalMutationEvidence::try_new(
+            evidence.schema_version(),
+            evidence.descriptor().clone(),
+            evidence.incarnation(),
+            ConnectorMutationOperationId::new(),
+            evidence.operation_kind(),
+            evidence.provider_payload().clone(),
+        )
+        .unwrap()
+        .with_process_local_payload(evidence.process_local_payload().unwrap().clone())
+        .unwrap();
+        assert!(
+            matches!(PublicationJournal::<String>::from_evidence(&changed), Err(error) if error.kind() == ConnectorErrorKind::InvalidRequest)
+        );
+        assert!(matches!(
+            journal.catalog_entry_outcome(entry),
+            ExternalMutationOutcome::CommitUnknown { .. }
+        ));
     }
 }

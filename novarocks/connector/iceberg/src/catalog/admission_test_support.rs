@@ -32,15 +32,24 @@ use super::{
 
 type FrozenRecorder =
     Arc<dyn Fn(&[crate::iceberg::TableRequirement], &[crate::iceberg::TableUpdate]) + Send + Sync>;
+type CompletionTransformer = Arc<
+    dyn Fn(
+            super::publication_dispatch::DispatchCompletion,
+        ) -> super::publication_dispatch::DispatchCompletion
+        + Send
+        + Sync,
+>;
 struct AdmittedCatalog {
     inner: Arc<dyn NovaRocksCatalog>,
     recorder: Option<FrozenRecorder>,
+    completion_transformer: Option<CompletionTransformer>,
 }
 
 pub(crate) fn all_admitted(inner: Arc<dyn NovaRocksCatalog>) -> Arc<dyn NovaRocksCatalog> {
     Arc::new(AdmittedCatalog {
         inner,
         recorder: None,
+        completion_transformer: None,
     })
 }
 
@@ -51,8 +60,50 @@ pub(crate) fn all_admitted_recording(
     Arc::new(AdmittedCatalog {
         inner,
         recorder: Some(recorder),
+        completion_transformer: None,
     })
 }
+/// Lose the first actually-Applied reply after the real dispatch exits.
+/// This test owner never publishes a substitute mutation or fabricates proof.
+pub(crate) fn all_admitted_recording_with_lost_reply(
+    inner: Arc<dyn NovaRocksCatalog>,
+    recorder: FrozenRecorder,
+) -> Arc<dyn NovaRocksCatalog> {
+    let lost = std::sync::atomic::AtomicBool::new(false);
+    let transformer = Arc::new(
+        move |completion: super::publication_dispatch::DispatchCompletion| {
+            if matches!(
+                &completion.evidence,
+                crate::commit::attempt::observation::DispatchEvidence::Applied { .. }
+            ) && !lost.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                // Dropping the completion also drops its unrun optional finalizer.
+                // The retained Unknown cannot claim that work completed.
+                super::publication_dispatch::DispatchCompletion::evidence(
+                    crate::commit::attempt::observation::DispatchEvidence::Unknown {
+                        failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                            novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                            "Injected reply loss after the real catalog applied; owner finalization was not observed",
+                        ),
+                        observation: crate::commit::attempt::observation::ProtocolObservation {
+                            adapter: "test-lost-reply",
+                            stage: "after-applied",
+                            ..Default::default()
+                        },
+                    },
+                )
+            } else {
+                completion
+            }
+        },
+    );
+    Arc::new(AdmittedCatalog {
+        inner,
+        recorder: Some(recorder),
+        completion_transformer: Some(transformer),
+    })
+}
+
 impl std::fmt::Debug for AdmittedCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdmittedCatalog")
@@ -64,6 +115,7 @@ impl std::fmt::Debug for AdmittedCatalog {
 struct RecordedDispatch {
     inner: Box<dyn super::publication_dispatch::PreparedCatalogDispatch>,
     recorder: FrozenRecorder,
+    completion_transformer: Option<CompletionTransformer>,
     requirements: Vec<crate::iceberg::TableRequirement>,
     updates: Vec<crate::iceberg::TableUpdate>,
 }
@@ -74,7 +126,11 @@ impl super::publication_dispatch::PreparedCatalogDispatch for RecordedDispatch {
         context: super::publication::EvidenceContext,
     ) -> super::publication_dispatch::DispatchCompletion {
         (self.recorder)(&self.requirements, &self.updates);
-        self.inner.dispatch_once(context).await
+        let completion = self.inner.dispatch_once(context).await;
+        match &self.completion_transformer {
+            Some(transformer) => transformer(completion),
+            None => completion,
+        }
     }
 }
 
@@ -86,6 +142,12 @@ impl NovaRocksCatalog for AdmittedCatalog {
     ) -> Result<(), ConnectorError> {
         self.inner.bind_publication_generation(generation)
     }
+    fn positive_attribution_finalization(
+        &self,
+    ) -> novarocks_spi::connector::ExternalMutationFinalization {
+        self.inner.positive_attribution_finalization()
+    }
+
     fn evidence_policy(&self) -> crate::catalog::publication::CatalogEvidencePolicy {
         self.inner.evidence_policy()
     }
@@ -161,6 +223,7 @@ impl NovaRocksCatalog for AdmittedCatalog {
                 dispatch: Box::new(RecordedDispatch {
                     inner: dispatch,
                     recorder: recorder.clone(),
+                    completion_transformer: self.completion_transformer.clone(),
                     requirements,
                     updates,
                 }),
@@ -351,6 +414,16 @@ impl NovaRocksCatalog for AdmittedCatalog {
         _evidence: ConditionalCreateEvidence,
     ) -> Result<ConditionalCreateVerdict, ConnectorError> {
         self.inner.adjudicate_conditional_create(_evidence).await
+    }
+
+    async fn adjudicate_conditional_create_for_read(
+        &self,
+        evidence: ConditionalCreateEvidence,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<ConditionalCreateVerdict, ConnectorError> {
+        self.inner
+            .adjudicate_conditional_create_for_read(evidence, binding)
+            .await
     }
 
     async fn new_transaction(&self, _request: TransactionRequest) -> CatalogTransactionStart {

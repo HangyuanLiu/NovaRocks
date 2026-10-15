@@ -24,7 +24,7 @@ use crate::catalog::publication_dispatch::{PreparationResult, PreparedPublicatio
 use crate::commit::publication_descriptor::RecoveryBinding;
 use std::future::Future;
 
-impl<R: Clone + Send + Sync> PublicationJournal<R> {
+impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
     pub(crate) async fn publish_once<F, Fut>(
         &self,
         preparation: ConnectorRequestContext,
@@ -253,7 +253,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
     }
 }
 
-impl<R: Clone + Send + Sync> PublicationJournal<R> {
+impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
     pub(crate) fn observe_prepared(
         &self,
         inner: Arc<dyn super::super::prepared::PublicationPreparer>,
@@ -291,7 +291,7 @@ struct PreparedObservedPublisher<R> {
     journal: PublicationJournal<R>,
 }
 #[async_trait]
-impl<R: Clone + Send + Sync> Publisher for PreparedObservedPublisher<R> {
+impl<R: Clone + Send + Sync + 'static> Publisher for PreparedObservedPublisher<R> {
     async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
         self.inner.load_target(attempt).await
     }

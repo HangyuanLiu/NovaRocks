@@ -1134,30 +1134,112 @@ impl HadoopFileSystemCatalog {
         expected_metadata_location: &str,
         expected_metadata_digest: &str,
     ) -> std::result::Result<HadoopCreateReconciliation, String> {
-        let ident = TableIdent::from_strs([namespace, table])
-            .map_err(|error| format!("build Hadoop table identity: {error}"))?;
+        self.reconcile_create_using_io(
+            namespace,
+            table,
+            expected_uuid,
+            expected_metadata_location,
+            expected_metadata_digest,
+            &self.file_io,
+            || Ok(()),
+            crate::catalog::error::map_read_error,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn reconcile_create_attempt_for_read(
+        &self,
+        namespace: &str,
+        table: &str,
+        expected_uuid: &str,
+        expected_metadata_location: &str,
+        expected_metadata_digest: &str,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> std::result::Result<HadoopCreateReconciliation, novarocks_spi::connector::ConnectorError>
+    {
+        use novarocks_spi::connector::{
+            ConnectorError, ConnectorErrorKind, ConnectorOperationControl,
+        };
+        let context = binding.request_context().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Conditional-create observation requires the original request context",
+            )
+        })?;
+        context.check_active()?;
+        let ident = TableIdent::from_strs([namespace, table]).map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!("build Hadoop table identity: {error}"),
+            )
+        })?;
+        let file_io =
+            crate::fs_io::build_file_io_for_location(&self.table_location(&ident), binding);
+        self.reconcile_create_using_io(
+            namespace,
+            table,
+            expected_uuid,
+            expected_metadata_location,
+            expected_metadata_digest,
+            &file_io,
+            || context.check_active(),
+            |error| {
+                context
+                    .check_active()
+                    .err()
+                    .unwrap_or_else(|| crate::catalog::error::map_read_error(error))
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_create_using_io(
+        &self,
+        namespace: &str,
+        table: &str,
+        expected_uuid: &str,
+        expected_metadata_location: &str,
+        expected_metadata_digest: &str,
+        file_io: &FileIO,
+        check: impl Fn() -> std::result::Result<(), novarocks_spi::connector::ConnectorError>,
+        map_read_failure: impl Fn(&Error) -> novarocks_spi::connector::ConnectorError,
+    ) -> std::result::Result<HadoopCreateReconciliation, novarocks_spi::connector::ConnectorError>
+    {
+        let ident = TableIdent::from_strs([namespace, table]).map_err(|error| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                format!("build Hadoop table identity: {error}"),
+            )
+        })?;
         let table_location = self.table_location(&ident);
         let canonical_v1 = Self::metadata_path(&table_location, 1);
         if canonical_v1 != expected_metadata_location {
             return Ok(HadoopCreateReconciliation::Foreign);
         }
-        if !self
-            .file_io
+        check()?;
+        let exists = file_io
             .exists(&canonical_v1)
             .await
-            .map_err(|error| format!("probe authoritative Hadoop v1 metadata: {error}"))?
-        {
+            .map_err(|error| map_read_failure(&error))?;
+        check()?;
+        if !exists {
             return Ok(HadoopCreateReconciliation::Absent);
         }
-        let bytes = self
-            .file_io
+        let bytes = file_io
             .new_input(&canonical_v1)
-            .map_err(|error| format!("open authoritative Hadoop v1 metadata: {error}"))?
+            .map_err(|error| map_read_failure(&error))?
             .read()
             .await
-            .map_err(|error| format!("read authoritative Hadoop v1 metadata: {error}"))?;
-        let metadata: TableMetadata = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("decode authoritative Hadoop v1 metadata: {error}"))?;
+            .map_err(|error| map_read_failure(&error))?;
+        check()?;
+        let metadata: TableMetadata = serde_json::from_slice(&bytes).map_err(|error| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                format!("decode authoritative Hadoop v1 metadata: {error}"),
+            )
+        })?;
         if metadata.uuid().to_string() != expected_uuid
             || hex_digest(&bytes) != expected_metadata_digest
         {

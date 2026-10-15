@@ -126,6 +126,12 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         ))
     }
 
+    fn positive_attribution_finalization(
+        &self,
+    ) -> novarocks_spi::connector::ExternalMutationFinalization {
+        novarocks_spi::connector::ExternalMutationFinalization::Complete
+    }
+
     fn evidence_policy(&self) -> super::publication::CatalogEvidencePolicy {
         self.delegate.evidence_policy
     }

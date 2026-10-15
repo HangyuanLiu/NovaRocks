@@ -576,6 +576,12 @@ impl IcebergWriteSessionControl {
                 }
             }
         };
+        if let Some(evidence) = journal
+            .current_entry()
+            .and_then(|entry| journal.entry_evidence(entry))
+        {
+            handle.retain_recovery_evidence(evidence)?;
+        }
         let ExternalMutationOutcome::KnownCommitted {
             effect,
             receipt,

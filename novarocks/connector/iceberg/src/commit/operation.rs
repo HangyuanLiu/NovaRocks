@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::access_binding::IcebergReadBinding;
@@ -74,6 +74,7 @@ struct OperationState {
     location: String,
     binding: IcebergReadBinding,
     request: ConnectorRequestContext,
+    preparation: OnceLock<ConnectorRequestContext>,
     cancellation: FileCancellation,
     runtime: IcebergCatalogRuntime,
     permits: Arc<Semaphore>,
@@ -135,6 +136,7 @@ impl IcebergCommitOperation {
                 location,
                 binding,
                 request,
+                preparation: OnceLock::new(),
                 cancellation,
                 runtime,
                 permits: Arc::new(Semaphore::new(limits.io_requests as usize)),
@@ -150,7 +152,23 @@ impl IcebergCommitOperation {
     }
 
     pub(crate) fn request_context(&self) -> &ConnectorRequestContext {
-        &self.inner.request
+        self.inner.request_context()
+    }
+
+    /// Freeze the logical retry window before any load or asynchronous owner
+    /// preparation. Retries inherit this deadline; evidence and cleanup use
+    /// their independent grants after publication becomes possible.
+    pub(crate) fn bind_preparation_deadline(&self, deadline: Instant) -> Result<()> {
+        let preparation = self
+            .inner
+            .preparation
+            .get_or_init(|| self.inner.request.clone().with_earlier_deadline(deadline));
+        if preparation.deadline() > deadline {
+            return Err(invalid(
+                "Commit operation preparation deadline is already bound",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn token(&self) -> OperationToken {
@@ -179,7 +197,9 @@ impl IcebergCommitOperation {
         let admission: Arc<dyn IcebergWriteAdmission> = self.inner.clone();
         let file_io = build_admitted_file_io_for_location(
             &self.inner.location,
-            self.inner.binding.for_request(self.inner.request.clone()),
+            self.inner
+                .binding
+                .for_request(self.request_context().clone()),
             admission,
         );
         Ok(IcebergCommitAttempt {
@@ -260,9 +280,10 @@ impl IcebergCommitOperation {
 
     pub(crate) async fn pause(&self, duration: Duration) -> Result<()> {
         self.check_active()?;
+        let cancellation = self.inner.preparation_cancellation();
         tokio::select! {
             biased;
-            error = self.inner.cancellation.ended() => Err(stopped_error(error)),
+            error = cancellation.ended() => Err(stopped_error(error)),
             _ = tokio::time::sleep(duration) => self.check_active(),
         }
     }
@@ -501,10 +522,24 @@ impl ArtifactWriter for IcebergCommitAttempt {
     }
 }
 
+impl OperationState {
+    fn request_context(&self) -> &ConnectorRequestContext {
+        self.preparation.get().unwrap_or(&self.request)
+    }
+
+    fn preparation_cancellation(&self) -> FileCancellation {
+        self.cancellation
+            .clone()
+            .with_deadline(Some(self.request_context().deadline()))
+    }
+}
+
 #[async_trait::async_trait]
 impl IcebergWriteAdmission for OperationState {
     fn check_active(&self) -> Result<()> {
-        self.cancellation.check().map_err(stopped_error)
+        self.preparation_cancellation()
+            .check()
+            .map_err(stopped_error)
     }
     fn check_output_active(&self, object: &ObjectIdentity) -> Result<()> {
         self.check_active()?;
@@ -521,7 +556,7 @@ impl IcebergWriteAdmission for OperationState {
         Ok(())
     }
     fn cancellation(&self) -> FileCancellation {
-        self.cancellation.clone()
+        self.preparation_cancellation()
     }
     fn runtime(&self) -> IcebergCatalogRuntime {
         self.runtime.clone()
@@ -552,9 +587,10 @@ impl IcebergWriteAdmission for OperationState {
     }
     async fn io_permit(&self) -> Result<OwnedSemaphorePermit> {
         self.check_active()?;
+        let cancellation = self.preparation_cancellation();
         let permit = tokio::select! {
             biased;
-            error = self.cancellation.ended() => return Err(stopped_error(error)),
+            error = cancellation.ended() => return Err(stopped_error(error)),
             permit = self.permits.clone().acquire_owned() => permit.map_err(|_|
                 invalid("Iceberg operation I/O admission closed"))?,
         };

@@ -381,6 +381,17 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
             .await
     }
 
+    fn positive_attribution_finalization(
+        &self,
+    ) -> novarocks_spi::connector::ExternalMutationFinalization {
+        novarocks_spi::connector::ExternalMutationFinalization::Failed(
+            novarocks_spi::connector::ConnectorMutationFailure::new(
+                novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                "Positive attribution does not observe Hadoop publication cache finalization",
+            ),
+        )
+    }
+
     fn evidence_policy(&self) -> super::publication::CatalogEvidencePolicy {
         self.delegate.evidence_policy
     }
@@ -804,6 +815,40 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
             ),
             Err(failure) => map_publish_failure(&failure, &facts),
         }
+    }
+
+    async fn adjudicate_conditional_create_for_read(
+        &self,
+        evidence: ConditionalCreateEvidence,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<ConditionalCreateVerdict, ConnectorError> {
+        let result = self
+            .client
+            .reconcile_create_attempt_for_read(
+                &evidence.namespace,
+                &evidence.table,
+                &evidence.expected_table_uuid,
+                &evidence.metadata_location,
+                &evidence.metadata_digest,
+                binding,
+            )
+            .await?;
+        Ok(match result {
+            crate::hadoop_catalog::HadoopCreateReconciliation::Committed {
+                finalization_failure,
+            } => ConditionalCreateVerdict::Committed {
+                finalization_failure: Some(Arc::from(finalization_failure.unwrap_or_else(|| {
+                    "Conditional-create attribution does not observe hint or cache finalization"
+                        .to_owned()
+                }))),
+            },
+            crate::hadoop_catalog::HadoopCreateReconciliation::Absent => {
+                ConditionalCreateVerdict::Absent
+            }
+            crate::hadoop_catalog::HadoopCreateReconciliation::Foreign => {
+                ConditionalCreateVerdict::Foreign
+            }
+        })
     }
 
     async fn adjudicate_conditional_create(

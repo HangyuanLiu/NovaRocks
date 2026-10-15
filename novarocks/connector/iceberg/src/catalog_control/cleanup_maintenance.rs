@@ -469,7 +469,14 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
         self.ensure_owner(request.plan.owner())?;
         let (payload, batch) =
             self.prepared_records(&request.plan, &request.prepared, &request.context)?;
-        let outcomes = execute_frozen_batch(&self.runtime, &payload, &batch, &request.context)?;
+        let outcomes = execute_frozen_batch(
+            &self.runtime,
+            &self.key,
+            request.plan.operation_id(),
+            &payload,
+            &batch,
+            &request.context,
+        )?;
         let digest = domain_digest(RECEIPT_DOMAIN, &canonical(&outcomes)?);
         receipt_value(
             &self.descriptor,
@@ -656,6 +663,8 @@ fn table_uuid_from_payload(payload: &PlanPayload) -> Result<uuid::Uuid, Connecto
 
 fn execute_frozen_batch(
     runtime: &IcebergMetadataContext,
+    owner: &ConnectorProviderBindingKey,
+    operation_id: novarocks_spi::connector::ConnectorCleanupOperationId,
     payload: &PlanPayload,
     batch: &[ManifestRecord],
     context: &ConnectorRequestContext,
@@ -676,6 +685,8 @@ fn execute_frozen_batch(
                 ..
             } => execute_owned_ref(
                 runtime,
+                owner,
+                operation_id,
                 payload,
                 record.ordinal,
                 name,
@@ -748,6 +759,8 @@ fn execute_frozen_batch(
 )]
 fn execute_owned_ref(
     runtime: &IcebergMetadataContext,
+    owner: &ConnectorProviderBindingKey,
+    operation_id: novarocks_spi::connector::ConnectorCleanupOperationId,
     payload: &PlanPayload,
     ordinal: u32,
     name: &str,
@@ -757,57 +770,150 @@ fn execute_owned_ref(
     created_at_ms: i64,
     context: &ConnectorRequestContext,
 ) -> Result<ReceiptRecord, ConnectorError> {
-    runtime
-        .control_state()
-        .invalidate_table(&payload.namespace, &payload.table);
-    let physical = runtime
-        .load_table_for_request(&payload.namespace, &payload.table, context)
-        .map_err(unavailable)?;
-    let expected = OwnedRefCandidate {
-        name: name.to_string(),
-        head_snapshot_id: expected_head_snapshot_id,
-        provenance_version,
-        provenance_digest: decode_owned_ref_provenance_digest(provenance_digest_hex)?,
-        created_at_ms,
+    use crate::commit::model::{AttemptToken, OperationToken, RequestShape};
+    use novarocks_spi::connector::{
+        ConnectorMutationOperationId, ExternalMutationEvidence, ExternalMutationOutcome,
     };
-    if physical.table.metadata().uuid().to_string() != payload.table_uuid
-        || !matches_owned_ref_candidate(
-            physical.table.metadata(),
-            &payload.namespace,
-            &payload.table,
-            &expected,
-        )
-    {
-        return receipt(
-            ordinal,
-            ObjectOutcome::Failed,
-            Some("owned ref provenance changed before exact retirement".to_string()),
-        );
-    }
-    let catalog = runtime.novarocks_catalog().vendored_client();
-    let loaded_table = physical.table.clone();
-    let table_uuid = payload.table_uuid.clone();
-    let name = name.to_string();
-    let outcome = runtime.resources().catalog_runtime().block_on(async move {
-        crate::commit::drop_branch_if_exact(
-            catalog.as_ref(),
-            &loaded_table,
-            &table_uuid,
-            &name,
-            expected_head_snapshot_id,
-        )
-        .await
-    });
-    match outcome {
-        Ok(Ok(crate::commit::ExactBranchDropOutcome::Retired)) => {
-            receipt(ordinal, ObjectOutcome::Deleted, None)
+    let prepared = runtime.resources().catalog_runtime().observe_preparation(
+        || {
+            let prepare = || -> Result<_, ConnectorError> {
+                let (coordination, physical) = runtime.coordinate_table_for_request(
+                    &payload.namespace,
+                    &payload.table,
+                    context,
+                )?;
+                let expected = OwnedRefCandidate {
+                    name: name.to_string(),
+                    head_snapshot_id: expected_head_snapshot_id,
+                    provenance_version,
+                    provenance_digest: decode_owned_ref_provenance_digest(provenance_digest_hex)?,
+                    created_at_ms,
+                };
+                if physical.table.metadata().uuid().to_string() != payload.table_uuid
+                    || !matches_owned_ref_candidate(
+                        physical.table.metadata(),
+                        &payload.namespace,
+                        &payload.table,
+                        &expected,
+                    )
+                {
+                    return Ok(None);
+                }
+                let Some(change) = crate::commit::RefActionPlan::prepare_exact_drop(
+                    &physical.table,
+                    &payload.table_uuid,
+                    name,
+                    expected_head_snapshot_id,
+                ) else {
+                    return Ok(None);
+                };
+                let token = OperationToken::from_mutation(
+                    ConnectorMutationOperationId::from_bytes(operation_id.to_bytes()),
+                );
+                let frozen = crate::commit::staging::freeze_existing_change(
+                    physical.table.identifier().clone(),
+                    "main",
+                    physical.table.metadata(),
+                    physical.table.metadata_location().ok_or_else(|| {
+                        invalid("Owned ref retirement has no authoritative metadata location")
+                    })?,
+                    RequestShape::RefRetention,
+                    AttemptToken::new(token, ordinal),
+                    change,
+                    context,
+                )
+                .map_err(|error| invalid(error.to_string()))?;
+                Ok(Some((coordination, frozen)))
+            };
+            prepare().map_err(crate::catalog::publication_dispatch::PreparationFailure::from)
+        },
+        |error: &crate::catalog::publication_dispatch::PreparationFailure| error.0.clone(),
+    );
+    let (_coordination, frozen) = match prepared {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => {
+            return receipt(
+                ordinal,
+                ObjectOutcome::Failed,
+                Some("owned ref provenance changed before exact retirement".to_owned()),
+            );
         }
-        Ok(Ok(crate::commit::ExactBranchDropOutcome::Abandoned)) => receipt(
-            ordinal,
-            ObjectOutcome::Failed,
-            Some("owned ref changed before exact retirement".to_string()),
-        ),
-        Ok(Err(error)) | Err(error) => receipt(ordinal, ObjectOutcome::Unknown, Some(error)),
+        Err(crate::catalog::publication_dispatch::PreparationFailure(failure)) => {
+            return receipt(ordinal, ObjectOutcome::Failed, Some(failure.to_string()));
+        }
+    };
+    let descriptor = ConnectorInstanceDescriptor {
+        provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")?,
+        instance_id: owner.instance_id.clone(),
+    };
+    let external_evidence = ExternalMutationEvidence::try_new(
+        1,
+        descriptor,
+        owner.incarnation,
+        ConnectorMutationOperationId::from_bytes(operation_id.to_bytes()),
+        "cleanup-owned-ref-retire",
+        canonical(
+            &serde_json::json!({"ordinal":ordinal,"namespace":payload.namespace,"table":payload.table,"table_uuid":payload.table_uuid,"ref":name,"head":expected_head_snapshot_id}),
+        )?,
+    )?;
+    let journal = crate::commit::attempt::observation::PublicationJournal::for_runtime(
+        frozen.artifacts().attempt().operation(),
+        runtime.resources().catalog_runtime(),
+    );
+    journal
+        .record(
+            external_evidence,
+            receipt(ordinal, ObjectOutcome::Deleted, None)?,
+            &frozen,
+        )
+        .map_err(|error| internal(error.to_string()))?;
+    let catalog = Arc::clone(runtime.novarocks_catalog());
+    let policy = catalog.evidence_policy();
+    let publication = journal.clone();
+    let preparation = context.clone();
+    let result = runtime.resources().catalog_runtime().block_on(async move {
+        publication
+            .publish_once(
+                preparation,
+                policy,
+                move |descriptor, generation, original| async move {
+                    catalog
+                        .prepare_frozen_publication(
+                            frozen,
+                            CatalogOperation::DropBranch,
+                            None,
+                            descriptor,
+                            generation,
+                            original,
+                        )
+                        .await
+                },
+            )
+            .await
+    });
+    let outcome = match result {
+        Ok(Ok(entry)) => journal.catalog_entry_outcome(entry),
+        Ok(Err(error)) => journal
+            .catalog_bridge_failure(format!("Owned ref publication invocation failed: {error}")),
+        Err(error) => {
+            journal.catalog_bridge_failure(format!("Owned ref publication bridge failed: {error}"))
+        }
+    };
+    match outcome {
+        ExternalMutationOutcome::KnownCommitted { receipt, .. } => Ok(receipt),
+        ExternalMutationOutcome::KnownUncommitted { failure, .. } => {
+            let reason = if failure.kind()
+                == novarocks_spi::connector::ConnectorMutationFailureKind::Conflict
+            {
+                "owned ref changed before exact retirement".to_owned()
+            } else {
+                failure.to_string()
+            };
+            receipt(ordinal, ObjectOutcome::Failed, Some(reason))
+        }
+        ExternalMutationOutcome::CommitUnknown { failure, .. } => {
+            receipt(ordinal, ObjectOutcome::Unknown, Some(failure.to_string()))
+        }
     }
 }
 

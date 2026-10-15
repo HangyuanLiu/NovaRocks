@@ -58,6 +58,7 @@ pub struct RewriteManifestsOutcome {
 /// 1. Table has no current snapshot (empty table).
 /// 2. Manifest list has ≤ 1 entry.
 /// 3. All (partition_spec_id, content) groups have exactly 1 manifest.
+#[cfg(test)]
 pub async fn run_rewrite_manifests(
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
@@ -69,6 +70,7 @@ pub async fn run_rewrite_manifests(
 /// marker to the replace snapshot. The metadata-maintenance adapter supplies a
 /// marker and will later use the typed frozen-plan entrypoint; keeping this
 /// narrow helper makes marker placement testable independently.
+#[cfg(test)]
 pub async fn run_rewrite_manifests_with_marker(
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
@@ -98,6 +100,7 @@ pub async fn run_rewrite_manifests_with_marker(
 }
 
 /// Runs one frozen-plan attempt without the legacy OCC retry loop.
+#[cfg(test)]
 pub async fn run_rewrite_manifests_once_with_marker(
     catalog: Arc<dyn Catalog>,
     table: crate::iceberg::table::Table,
@@ -107,11 +110,13 @@ pub async fn run_rewrite_manifests_once_with_marker(
     run_rewrite_manifests_with_table(catalog, table, file_io, marker).await
 }
 
+#[cfg(test)]
 fn generate_snapshot_id() -> i64 {
     let bytes = uuid::Uuid::new_v4().into_bytes();
     i64::from_be_bytes(bytes[..8].try_into().expect("UUID prefix is eight bytes")).saturating_abs()
 }
 
+#[cfg(test)]
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -119,6 +124,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 fn metadata_dir(table: &crate::iceberg::table::Table) -> String {
     format!("{}/metadata", table.metadata().location())
 }
@@ -127,6 +133,7 @@ fn metadata_dir(table: &crate::iceberg::table::Table) -> String {
     clippy::too_many_arguments,
     reason = "Manifest-list rewriting keeps its existing explicit commit inputs to preserve lifecycle ownership."
 )]
+#[cfg(test)]
 async fn write_manifest_list(
     file_io: &FileIO,
     out_path: &str,
@@ -166,6 +173,7 @@ async fn write_manifest_list(
         .map_err(|error| format!("close manifest-list output: {error}"))
 }
 
+#[cfg(test)]
 async fn run_rewrite_manifests_one_attempt(
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
@@ -179,6 +187,7 @@ async fn run_rewrite_manifests_one_attempt(
 /// Run one manifest rewrite from a caller-bound table and FileIO. The catalog
 /// remains the metadata commit owner; all manifest I/O uses the supplied
 /// action-scoped FileIO.
+#[cfg(test)]
 async fn run_rewrite_manifests_with_table(
     catalog: Arc<dyn Catalog>,
     table: crate::iceberg::table::Table,
@@ -374,6 +383,7 @@ async fn run_rewrite_manifests_with_table(
     Ok(outcome)
 }
 
+#[cfg(test)]
 fn checked_i32_metric(value: usize, name: &str) -> Result<i32, crate::iceberg::Error> {
     i32::try_from(value).map_err(|_| {
         crate::iceberg::Error::new(
@@ -584,9 +594,25 @@ async fn merge_manifest_group(
     new_snapshot_id: i64,
     format_version: FormatVersion,
 ) -> Result<ManifestFile, crate::iceberg::Error> {
-    // All manifests in the group share the same partition_spec_id and content.
-    let spec_id = group[0].partition_spec_id;
-    let content = group[0].content;
+    let first = group
+        .first()
+        .ok_or_else(|| rewrite_error("Manifest merge requires a nonempty input group"))?;
+    let spec_id = first.partition_spec_id;
+    let content = first.content;
+    if group
+        .iter()
+        .any(|manifest| manifest.partition_spec_id != spec_id || manifest.content != content)
+    {
+        return Err(rewrite_error(
+            "Manifest merge input group has conflicting spec or content identities",
+        ));
+    }
+    if format_version == FormatVersion::V1 && content == ManifestContentType::Deletes {
+        return Err(crate::iceberg::Error::new(
+            crate::iceberg::ErrorKind::FeatureUnsupported,
+            "V1 tables cannot contain delete manifests",
+        ));
+    }
 
     // Look up partition spec and schema from the table metadata.
     let partition_spec = table_metadata
@@ -612,13 +638,21 @@ async fn merge_manifest_group(
         (FormatVersion::V2, ManifestContentType::Deletes) => builder.build_v2_deletes(),
         (FormatVersion::V3, ManifestContentType::Data) => builder.build_v3_data(),
         (FormatVersion::V3, ManifestContentType::Deletes) => builder.build_v3_deletes(),
-        // V1 deletes don't exist in iceberg spec; handle gracefully.
-        (FormatVersion::V1, ManifestContentType::Deletes) => builder.build_v1(),
+        (FormatVersion::V1, ManifestContentType::Deletes) => {
+            unreachable!("V1 delete manifests were rejected before output construction")
+        }
     };
 
     // Collect all live entries from all manifests in the group.
     for manifest_file in group {
         let manifest = crate::manifest::load_manifest(&manifest_file, file_io).await?;
+        if manifest.metadata().partition_spec().spec_id() != spec_id
+            || *manifest.metadata().content() != content
+        {
+            return Err(rewrite_error(
+                "Manifest header contradicts its frozen list descriptor",
+            ));
+        }
 
         // For V3 row-lineage: stamp an explicit first_row_id on each data file
         // so that the value is preserved after merge. When INSERT writes data
@@ -629,17 +663,14 @@ async fn merge_manifest_group(
         // the read path (read.rs:338: df.first_row_id().or(manifest fallback))
         // uses the explicit per-file value, preserving the §5.4 invariant.
         //
-        // manifest_file.first_row_id is a u64 (Option<u64>); convert to i64
-        // for computation. We use the source manifest's first_row_id as the
-        // base and add a cumulative offset for each entry within it.
-        //
-        // If the source manifest has first_row_id=None (V2 table, no row
-        // lineage), we leave the data_file.first_row_id unchanged (None),
-        // preserving the V2 no-op path.
+        // Reuse the IRU-5 inheritance cursor. Explicit file IDs do not
+        // consume a manifest range; absent IDs use only real list assignment.
         let manifest_first_row_id: Option<i64> = manifest_file
             .first_row_id
-            .map(|v| i64::try_from(v).expect("manifest first_row_id fits in i64"));
-        let mut cumulative_offset: i64 = 0;
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| rewrite_error("Manifest first_row_id exceeds i64"))?;
+        let mut row_ids = crate::commit::staging::FirstRowIdInheritance::new(manifest_first_row_id);
 
         for entry_ref in manifest.entries() {
             let entry: &ManifestEntry = entry_ref.as_ref();
@@ -654,33 +685,14 @@ async fn merge_manifest_group(
             // The sequence numbers and snapshot_id from the original entry are
             // preserved to maintain the causal ordering invariants.
             //
-            // We use add_existing_file() which requires explicit snapshot_id,
-            // sequence_number, and file_sequence_number — these come from the
-            // ManifestEntry's inherited fields (guaranteed non-None after
-            // load_manifest() calls inherit_data() internally).
-            //
-            // Fallback: if sequence_number or file_sequence_number is None
-            // (e.g. from a V1 manifest), use the manifest's sequence_number.
-            let snap_id = entry.snapshot_id.unwrap_or(manifest_file.added_snapshot_id);
-            let seq = entry
-                .sequence_number
-                .unwrap_or(manifest_file.sequence_number);
-            let file_seq = entry.file_sequence_number.or(Some(seq));
+            // load_manifest applies only the protocol's explicit inheritance.
+            // Carried files require those actual facts, never guessed defaults.
+            let (snap_id, seq, file_seq) = carried_identity(entry)?;
 
             let orig_df = &entry.data_file;
-            let record_count = orig_df.record_count() as i64;
-
-            // Compute stamped first_row_id:
-            //  - If data_file already has an explicit first_row_id (Some), preserve it.
-            //  - If manifest has a first_row_id but data_file doesn't, stamp it:
-            //    first_row_id = manifest_first_row_id + cumulative_offset.
-            //  - If neither has a value (V2 no row-lineage), leave as None.
-            let stamped_first_row_id = match (manifest_first_row_id, orig_df.first_row_id()) {
-                (_, Some(existing)) => Some(existing), // already explicit, preserve
-                (Some(m_first), None) => Some(m_first + cumulative_offset),
-                (None, None) => None, // V2: no row lineage
-            };
-            cumulative_offset += record_count;
+            // Explicit file IDs do not consume inherited row-ID space. The
+            // same staging resolver owns data/delete and overflow semantics.
+            let stamped_first_row_id = row_ids.resolve(orig_df, entry.status)?;
 
             let data_file =
                 clone_data_file_with_first_row_id(orig_df, spec_id, stamped_first_row_id).map_err(
@@ -698,6 +710,181 @@ async fn merge_manifest_group(
     }
 
     writer.write_manifest_file().await
+}
+
+fn carried_identity(
+    entry: &ManifestEntry,
+) -> Result<(i64, i64, Option<i64>), crate::iceberg::Error> {
+    let snapshot = entry
+        .snapshot_id
+        .ok_or_else(|| rewrite_error("Carried manifest entry has no original snapshot identity"))?;
+    let sequence = entry
+        .sequence_number
+        .filter(|sequence| *sequence >= 0)
+        .ok_or_else(|| rewrite_error("Carried manifest entry has no actual data sequence"))?;
+    if entry
+        .file_sequence_number
+        .is_some_and(|sequence| sequence < 0)
+    {
+        return Err(rewrite_error(
+            "Carried manifest entry has a negative file sequence",
+        ));
+    }
+    Ok((snapshot, sequence, entry.file_sequence_number))
+}
+
+/// One operation owns reusable merged manifests; each staging attempt owns
+/// only its manifest-list. Reuse requires exact source descriptors in the
+/// latest target snapshot, including sequence/row-lineage facts.
+#[derive(Clone)]
+struct ReusableRewrite {
+    sources: Vec<ManifestFile>,
+    outputs: Vec<ManifestFile>,
+}
+
+pub(crate) struct RewriteManifestsPreparer {
+    reusable: Mutex<Option<ReusableRewrite>>,
+}
+impl RewriteManifestsPreparer {
+    pub(crate) fn new() -> Self {
+        Self {
+            reusable: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
+    async fn prepare(
+        &self,
+        view: &crate::commit::staging::StagedView<'_>,
+        intent: &crate::commit::model::OperationIntent,
+    ) -> crate::iceberg::Result<crate::commit::staging::PreparedChange> {
+        use crate::commit::model::{ArtifactClass, ArtifactKind};
+        use crate::commit::staging::PreparedChange;
+        let metadata = view.metadata();
+        view.artifacts().check_active()?;
+        crate::document_storage::observation::validate_managed_rewrite_attachment(metadata)
+            .map_err(|error| {
+                crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, error.message())
+                    .with_source(error)
+            })?;
+        let parent = metadata.snapshot_for_ref(intent.target_ref());
+        let no_op = || PreparedChange {
+            requirements: vec![TableRequirement::RefSnapshotIdMatch {
+                r#ref: intent.target_ref().to_owned(),
+                snapshot_id: parent.map(|snapshot| snapshot.snapshot_id()),
+            }],
+            updates: Vec::new(),
+        };
+        let Some(parent) = parent else {
+            return Ok(no_op());
+        };
+        let latest =
+            crate::manifest::load_manifest_list(parent, view.artifacts().file_io(), metadata)
+                .await?;
+        view.artifacts().check_active()?;
+        let latest = latest.entries();
+        let cached = self
+            .reusable
+            .lock()
+            .map_err(|_| rewrite_error("Manifest reuse state is poisoned"))?
+            .clone();
+        let reusable =
+            match cached.filter(|cache| rewrite_sources_are_current(&cache.sources, latest)) {
+                Some(cache) => cache,
+                None => {
+                    // This is a policy operation: invalidated selections are
+                    // replanned, rather than treated as an explicit-input promise.
+                    let groups = group_manifests_by_spec_and_content(latest);
+                    if groups.values().all(|group| group.len() <= 1) {
+                        return Ok(no_op());
+                    }
+                    let snapshot_id = crate::commit::staging::new_snapshot_id(metadata);
+                    let mut sources = Vec::new();
+                    let mut outputs = Vec::new();
+                    for group in groups.values().filter(|group| group.len() > 1) {
+                        let object = view
+                            .artifacts()
+                            .allocate(ArtifactClass::Operation, ArtifactKind::Manifest)?;
+                        let output = merge_manifest_group(
+                            view.artifacts().file_io(),
+                            metadata,
+                            group,
+                            object.path(),
+                            snapshot_id,
+                            metadata.format_version(),
+                        )
+                        .await?;
+                        view.artifacts().check_active()?;
+                        sources.extend(group.iter().cloned());
+                        outputs.push(output);
+                    }
+                    let cache = ReusableRewrite { sources, outputs };
+                    *self
+                        .reusable
+                        .lock()
+                        .map_err(|_| rewrite_error("Manifest reuse state is poisoned"))? =
+                        Some(cache.clone());
+                    cache
+                }
+            };
+        let snapshot_id = crate::commit::staging::new_snapshot_id(metadata);
+        let mut manifests = latest
+            .iter()
+            .filter(|manifest| {
+                !reusable
+                    .sources
+                    .iter()
+                    .any(|source| source.manifest_path == manifest.manifest_path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut manifest in reusable.outputs.clone() {
+            // List-level introduction/sequence is attempt-local; immutable
+            // merged entries retain their exact original file/snapshot facts.
+            manifest.added_snapshot_id = snapshot_id;
+            manifest.sequence_number = -1;
+            manifests.push(manifest);
+        }
+        let properties = finalize_snapshot_summary(
+            HashMap::from([
+                (
+                    "replaced-manifests-count".to_owned(),
+                    reusable.sources.len().to_string(),
+                ),
+                (
+                    "added-manifests-count".to_owned(),
+                    reusable.outputs.len().to_string(),
+                ),
+            ]),
+            Some(parent.summary()),
+            metadata.uuid(),
+            parent.snapshot_id(),
+            snapshot_id,
+        )?;
+        crate::commit::overwrite::prepare_snapshot_change(
+            view,
+            intent,
+            snapshot_id,
+            Operation::Replace,
+            manifests,
+            properties,
+            false,
+        )
+        .await
+    }
+}
+
+/// Existence is insufficient: only exact membership of the latest list
+/// preserves a selected manifest's inherited sequence and row-ID meaning.
+fn rewrite_sources_are_current(sources: &[ManifestFile], latest: &[ManifestFile]) -> bool {
+    sources
+        .iter()
+        .all(|source| latest.iter().any(|current| current == source))
+}
+fn rewrite_error(message: &str) -> crate::iceberg::Error {
+    crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, message)
 }
 
 #[cfg(test)]
@@ -829,5 +1016,129 @@ mod document_attachment_tests {
         assert!(
             finalize_snapshot_summary(HashMap::new(), Some(&previous), table_uuid, 41, 99).is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod row_id_rewrite_tests {
+    use super::*;
+    use crate::iceberg::spec::{
+        NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Struct, TableMetadataBuilder,
+        Type,
+    };
+    #[test]
+    fn carried_entry_requires_actual_snapshot_and_data_sequence_and_preserves_file_sequence_none() {
+        let file = DataFileBuilder::default()
+            .content(crate::iceberg::spec::DataContentType::Data)
+            .file_path("memory://rewrite/carried.parquet".into())
+            .file_format(crate::iceberg::spec::DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .record_count(1)
+            .file_size_in_bytes(10)
+            .build()
+            .unwrap();
+        let mut entry = ManifestEntry {
+            status: ManifestStatus::Existing,
+            snapshot_id: Some(77),
+            sequence_number: Some(4),
+            file_sequence_number: None,
+            data_file: file,
+        };
+        assert_eq!(carried_identity(&entry).unwrap(), (77, 4, None));
+        entry.file_sequence_number = Some(2);
+        assert_eq!(carried_identity(&entry).unwrap(), (77, 4, Some(2)));
+        entry.sequence_number = None;
+        assert_eq!(
+            carried_identity(&entry).unwrap_err().kind(),
+            crate::iceberg::ErrorKind::DataInvalid
+        );
+        entry.sequence_number = Some(4);
+        entry.snapshot_id = None;
+        assert_eq!(
+            carried_identity(&entry).unwrap_err().kind(),
+            crate::iceberg::ErrorKind::DataInvalid
+        );
+    }
+    #[tokio::test]
+    async fn explicit_rows_do_not_shift_the_next_inherited_file_during_real_v3_merge() {
+        let io = FileIO::new_with_memory();
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap();
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "memory://rewrite/table".into(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let mut writer = ManifestWriterBuilder::new(
+            io.new_output("memory://rewrite/source.avro").unwrap(),
+            Some(11),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().as_ref().clone(),
+        )
+        .build_v3_data();
+        let file = |path: &str, first: Option<i64>, count| {
+            DataFileBuilder::default()
+                .content(crate::iceberg::spec::DataContentType::Data)
+                .file_path(path.to_owned())
+                .file_format(crate::iceberg::spec::DataFileFormat::Parquet)
+                .partition(Struct::empty())
+                .partition_spec_id(0)
+                .record_count(count)
+                .file_size_in_bytes(20)
+                .first_row_id(first)
+                .build()
+                .unwrap()
+        };
+        writer
+            .add_existing_file(
+                file("memory://rewrite/explicit.parquet", Some(700), 5),
+                11,
+                5,
+                Some(5),
+            )
+            .unwrap();
+        writer
+            .add_file(file("memory://rewrite/inherited.parquet", None, 3), 10)
+            .unwrap();
+        let mut source = writer.write_manifest_file().await.unwrap();
+        source.first_row_id = Some(100);
+        source.sequence_number = 10;
+        let merged = merge_manifest_group(
+            &io,
+            &metadata,
+            &[source],
+            "memory://rewrite/merged.avro",
+            22,
+            FormatVersion::V3,
+        )
+        .await
+        .unwrap();
+        let actual = crate::manifest::load_manifest(&merged, &io).await.unwrap();
+        let actual = actual
+            .entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.data_file().file_path().to_owned(),
+                    entry.data_file().first_row_id(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(actual["memory://rewrite/explicit.parquet"], Some(700));
+        assert_eq!(actual["memory://rewrite/inherited.parquet"], Some(100));
     }
 }

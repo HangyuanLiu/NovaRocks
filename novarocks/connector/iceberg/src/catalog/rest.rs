@@ -536,6 +536,12 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         })
     }
 
+    fn positive_attribution_finalization(
+        &self,
+    ) -> novarocks_spi::connector::ExternalMutationFinalization {
+        novarocks_spi::connector::ExternalMutationFinalization::Complete
+    }
+
     fn evidence_policy(&self) -> super::publication::CatalogEvidencePolicy {
         self.delegate.evidence_policy
     }
@@ -877,6 +883,34 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 Ok(IcebergLoadedTable::deferred_rest(frozen, access_delegation))
             }
         }
+    }
+
+    async fn load_complete_metadata_for_read(
+        &self,
+        table: CatalogTableName,
+        binding: crate::access_binding::IcebergReadBinding,
+        validator: Option<&super::CatalogMetadataValidator>,
+    ) -> Result<super::CatalogMetadataLoad, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        let context = binding.request_context().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Complete metadata load requires the original admitted request context",
+            )
+        })?;
+        context.check_active()?;
+        let ident = super::delegate::table_ident(&table)?;
+        let result = self
+            .delegate
+            .listing
+            .run(
+                context,
+                self.endpoints
+                    .load_complete_metadata(&ident, validator, context),
+            )
+            .await?;
+        context.check_active()?;
+        Ok(result)
     }
 
     async fn load_commit_base(

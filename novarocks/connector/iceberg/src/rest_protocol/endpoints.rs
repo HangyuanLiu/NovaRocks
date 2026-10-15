@@ -101,6 +101,21 @@ pub(crate) enum ConditionalTableLoad {
     NotModified,
 }
 
+/// A validator for exactly one complete representation from one immutable
+/// catalog generation/session/auth owner. Fields never leave this module.
+#[derive(Clone)]
+pub(crate) struct CatalogMetadataValidator {
+    endpoints: Arc<RestEndpoints>,
+    binding: Arc<SessionBinding>,
+    url: String,
+    etag: HeaderValue,
+}
+impl fmt::Debug for CatalogMetadataValidator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CatalogMetadataValidator { .. }")
+    }
+}
+
 /// Where a NovaRocks read ended.
 enum Answer {
     /// A success status with its unread body.
@@ -280,8 +295,28 @@ impl RestEndpoints {
         delegated: bool,
         etag: Option<&HeaderValue>,
     ) -> Result<ConditionalTableLoad, ConnectorError> {
-        const OPERATION: &str = "load table";
         let binding = self.binding().await?;
+        self.load_table_conditional_request(
+            table,
+            delegated,
+            etag,
+            &binding,
+            binding.table_url(table),
+            &RequestContext::for_read(),
+        )
+        .await
+    }
+
+    async fn load_table_conditional_request(
+        &self,
+        table: &TableIdent,
+        delegated: bool,
+        etag: Option<&HeaderValue>,
+        binding: &SessionBinding,
+        url: String,
+        context: &RequestContext,
+    ) -> Result<ConditionalTableLoad, ConnectorError> {
+        const OPERATION: &str = "load table";
         let mut headers = binding.request_headers(delegated.then_some(VENDED_CREDENTIALS));
         if let Some(etag) = etag {
             headers.insert(reqwest::header::IF_NONE_MATCH, etag.clone());
@@ -294,13 +329,9 @@ impl RestEndpoints {
             .owner
             .http()
             .send_once(
-                Ok(RestRequest::new(
-                    Method::GET,
-                    binding.table_url(table),
-                    headers,
-                )),
+                Ok(RestRequest::new(Method::GET, url, headers)),
                 &[200, 304],
-                &RequestContext::for_read(),
+                context,
             )
             .await;
         match (stage, body) {
@@ -326,6 +357,81 @@ impl RestEndpoints {
             _ => Err(unavailable(
                 "Iceberg REST load table failed without a complete response".into(),
             )),
+        }
+    }
+
+    /// GC always asks for all valid snapshots. Conditional validation never
+    /// crosses endpoint generation, session/auth owner, route or query shape.
+    pub(crate) async fn load_complete_metadata(
+        self: &Arc<Self>,
+        table: &TableIdent,
+        validator: Option<&CatalogMetadataValidator>,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<crate::catalog::CatalogMetadataLoad, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        if validator.is_some_and(|value| !Arc::ptr_eq(&value.endpoints, self)) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Metadata validator belongs to another catalog generation",
+            ));
+        }
+        let binding = self.binding().await?;
+        context.check_active()?;
+        let mut url = reqwest::Url::parse(&binding.table_url(table)).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Complete metadata route is invalid",
+            )
+        })?;
+        if url.query_pairs().any(|(name, _)| name == "snapshots") {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Complete metadata route already defines a snapshot representation",
+            ));
+        }
+        url.query_pairs_mut().append_pair("snapshots", "all");
+        let url = url.to_string();
+        if validator.is_some_and(|value| !Arc::ptr_eq(&value.binding, &binding) || value.url != url)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Metadata validator belongs to another complete representation",
+            ));
+        }
+        let request_context = RequestContext::with_deadline(context.deadline().into());
+        let loaded = self
+            .load_table_conditional_request(
+                table,
+                false,
+                validator.map(|value| &value.etag),
+                &binding,
+                url.clone(),
+                &request_context,
+            )
+            .await?;
+        context.check_active()?;
+        match loaded {
+            ConditionalTableLoad::Complete {
+                table,
+                delegation: _,
+                etag,
+            } => {
+                let validator = etag.map(|etag| CatalogMetadataValidator {
+                    endpoints: Arc::clone(self),
+                    binding,
+                    url,
+                    etag,
+                });
+                crate::catalog::metadata_read::complete_metadata(
+                    table.metadata().clone(),
+                    table.metadata_location(),
+                    validator,
+                )
+            }
+            ConditionalTableLoad::NotModified => {
+                Ok(crate::catalog::CatalogMetadataLoad::NotModified)
+            }
         }
     }
 

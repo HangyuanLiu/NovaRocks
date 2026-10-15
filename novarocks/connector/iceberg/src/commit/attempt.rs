@@ -273,7 +273,25 @@ impl RetryPolicy {
         })
     }
 
-    fn backoff(self, retry: u32) -> Duration {
+    pub(crate) const fn retries(self) -> u32 {
+        self.retries
+    }
+    pub(crate) const fn total_timeout(self) -> Duration {
+        self.total_timeout
+    }
+    pub(crate) fn backoff(self, retry: u32) -> Duration {
+        let ceiling = self.backoff_ceiling(retry);
+        // The property lower/upper bounds remain hard bounds. Jitter does not
+        // grant extra retry time or affect an already-dispatched request.
+        let millis = rand::Rng::gen_range(
+            &mut rand::thread_rng(),
+            self.min_wait.as_millis()..=ceiling.as_millis(),
+        );
+        Duration::from_millis(
+            u64::try_from(millis).expect("retry bounds originated as u64 milliseconds"),
+        )
+    }
+    fn backoff_ceiling(self, retry: u32) -> Duration {
         self.min_wait
             .saturating_mul(1u32.checked_shl(retry).unwrap_or(u32::MAX))
             .min(self.max_wait)
@@ -302,6 +320,14 @@ pub(crate) async fn run(
         .await;
     }
     let started = Instant::now();
+    let deadline = started
+        .checked_add(policy.total_timeout)
+        .map_or(operation.request_context().deadline(), |deadline| {
+            deadline.min(operation.request_context().deadline())
+        });
+    if let Err(error) = operation.bind_preparation_deadline(deadline) {
+        return rejected(operation, before_dispatch_failure(&error)).await;
+    }
     let mut attempt_number = 0;
     loop {
         // This segment covers only preparation. Returning from the helper
@@ -972,7 +998,14 @@ mod tests {
             HashMap::from([("write.target-file-size-bytes".into(), "malformed".into())]);
         let defaults = RetryPolicy::from_properties(&properties).unwrap();
         assert_eq!(defaults.retries, 4);
-        assert_eq!(defaults.backoff(30), Duration::from_secs(60));
+        assert_eq!(defaults.backoff_ceiling(30), Duration::from_secs(60));
+        for retry in [0, 1, 4, 30] {
+            for _ in 0..32 {
+                let wait = defaults.backoff(retry);
+                assert!(wait >= defaults.min_wait);
+                assert!(wait <= defaults.backoff_ceiling(retry));
+            }
+        }
         for (key, value) in [
             ("commit.retry.num-retries", "-1"),
             ("commit.retry.min-wait-ms", "bad"),

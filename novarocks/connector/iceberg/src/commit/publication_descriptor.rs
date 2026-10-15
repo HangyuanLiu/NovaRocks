@@ -73,6 +73,40 @@ pub(crate) enum PositiveAttributionObservation {
     },
 }
 impl AttributionPlan {
+    /// Extract only the positive probe frozen for this request. Missing markers
+    /// and current ref state provide no observation; the journal checks exact
+    /// UUID, snapshot and marker bytes before accepting the returned facts.
+    pub(crate) fn observe_table_metadata(
+        &self,
+        metadata: &crate::iceberg::spec::TableMetadata,
+    ) -> Option<PositiveAttributionObservation> {
+        match self {
+            Self::Snapshot {
+                snapshot_id,
+                marker_key,
+                ..
+            } => {
+                let snapshot = metadata.snapshot_by_id(*snapshot_id)?;
+                Some(PositiveAttributionObservation::SnapshotMarker {
+                    table_uuid: metadata.uuid(),
+                    snapshot_id: *snapshot_id,
+                    marker_key: marker_key.clone(),
+                    marker_value: snapshot
+                        .summary()
+                        .additional_properties
+                        .get(marker_key)?
+                        .clone(),
+                })
+            }
+            Self::Property { key, .. } => Some(PositiveAttributionObservation::PropertyMarker {
+                table_uuid: metadata.uuid(),
+                key: key.clone(),
+                value: metadata.properties().get(key)?.clone(),
+            }),
+            _ => None,
+        }
+    }
+
     pub(crate) fn matches_observation(&self, observation: &PositiveAttributionObservation) -> bool {
         match (self, observation) {
             (
@@ -308,6 +342,7 @@ impl PublicationDescriptor {
                                 "novarocks.write.session.v1"
                                     | "novarocks.connector.data-mutation.v1"
                                     | "novarocks.connector.maintenance.v1"
+                                    | "novarocks.connector.maintenance.v2"
                                     | "novarocks.mv.publication_id"
                             )
                         })
@@ -325,6 +360,7 @@ impl PublicationDescriptor {
                         matches!(
                             key.as_str(),
                             "novarocks.connector.maintenance.v1"
+                                | "novarocks.connector.maintenance.v2"
                                 | "novarocks.ctas.operation-id"
                                 | "novarocks.documents.update.operation-id.v1"
                         )

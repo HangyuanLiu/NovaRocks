@@ -414,15 +414,22 @@ fn accept_loop(listener: TcpListener, state: Arc<ServerState>) {
     }
 }
 
+// The shutdown handle retained by TestServer must not keep a panicked
+// connection actor alive from the client's point of view.
+struct ConnectionShutdown(TcpStream);
+impl Drop for ConnectionShutdown {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(Shutdown::Both);
+    }
+}
+
 fn serve_connection(stream: TcpStream, state: Arc<ServerState>) {
-    let Ok(mut writer) = stream.try_clone() else {
+    let Ok(writer) = stream.try_clone() else {
         return;
     };
+    let mut writer = ConnectionShutdown(writer);
     let mut reader = BufReader::new(stream);
-    serve_requests(&mut reader, &mut writer, &state);
-    // The server keeps a handle for shutdown, so dropping this thread's
-    // handles alone would leave the connection open.
-    let _ = writer.shutdown(Shutdown::Both);
+    serve_requests(&mut reader, &mut writer.0, &state);
 }
 
 fn serve_requests(reader: &mut BufReader<TcpStream>, writer: &mut TcpStream, state: &ServerState) {
@@ -718,4 +725,28 @@ pub(crate) fn bearer_identity(token: &str) -> crate::access_binding::IcebergRest
     crate::access_binding::IcebergRestAuthMaterial::Bearer {
         token: novarocks_fs::SecretValue::new(token),
     }
+}
+
+#[test]
+fn panicked_connection_actor_closes_the_peer_before_server_shutdown() {
+    let server = TestServer::start(Script::new().on_fn("GET", "/panic", |_, _| {
+        panic!("Injected fixture handler panic");
+    }));
+    let mut peer = TcpStream::connect(server.url().trim_start_matches("http://")).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    peer.write_all(b"GET /panic HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut first = [0u8; 1];
+    match peer.read(&mut first) {
+        Ok(0) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ) => {}
+        other => {
+            panic!("Panicked actor must close its peer without waiting for the server: {other:?}")
+        }
+    }
+    assert_eq!(server.count("GET", "/panic"), 1);
 }
