@@ -2079,7 +2079,7 @@ fn encode_table_execute(value: &IcebergTableExecuteHandle) -> dto::IcebergTableE
                 dto::IcebergRewritePositionDeleteFilesHandle {
                     table_handle: Some(encode_table(handle.table_handle())),
                     artifact: Some(dto::IcebergRewriteArtifactContentId {
-                        artifact_location: handle.artifact().artifact_location().to_string(),
+                        operation_id: handle.artifact().operation_id().to_bytes().to_vec(),
                         artifact_digest_hex: handle.artifact().artifact_digest_hex().to_string(),
                     }),
                     group_digest_hex: handle.group_digest_hex().to_string(),
@@ -2155,7 +2155,7 @@ fn decode_table_execute(
                                 )?,
                                 {
                                     let opaque_arguments = (
-                                        &artifact.artifact_location,
+                                        novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(artifact.operation_id.as_slice().try_into().map_err(|_| codec_error("table_execute.rewrite.operation_id", ConnectorCodecErrorKind::InvalidValue, "Iceberg rewrite operation identity must be 16 bytes"))?),
                                         &artifact.artifact_digest_hex,
                                     );
                                     observe_opaque(context, || {

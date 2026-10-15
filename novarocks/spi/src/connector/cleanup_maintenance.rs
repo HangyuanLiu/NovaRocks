@@ -27,8 +27,9 @@ use uuid::Uuid;
 
 use super::{
     ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorMetadata, ConnectorProviderBindingKey, ConnectorRequestContext,
-    ConnectorTableHandle, ProviderBindingEpoch,
+    ConnectorInstanceId, ConnectorMetadata, ConnectorProcessLocalPayload,
+    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorTableHandle,
+    ProviderBindingEpoch,
 };
 
 pub const CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION: u16 = 2;
@@ -514,7 +515,6 @@ impl fmt::Debug for ConnectorCleanupPlanningRequest {
 pub struct ConnectorCleanupPlanSummary {
     candidate_count: u64,
     total_bytes: u64,
-    manifest_parts: u32,
     batch_count: u32,
 }
 
@@ -522,11 +522,9 @@ impl ConnectorCleanupPlanSummary {
     pub fn try_new(
         candidate_count: u64,
         total_bytes: u64,
-        manifest_parts: u32,
         batch_count: u32,
     ) -> Result<Self, ConnectorError> {
         if batch_count > MAX_CONNECTOR_CLEANUP_BATCHES
-            || manifest_parts > 64
             || (candidate_count == 0 && batch_count != 0)
             || (candidate_count > 0 && batch_count == 0)
             || candidate_count
@@ -541,7 +539,6 @@ impl ConnectorCleanupPlanSummary {
         Ok(Self {
             candidate_count,
             total_bytes,
-            manifest_parts,
             batch_count,
         })
     }
@@ -552,9 +549,6 @@ impl ConnectorCleanupPlanSummary {
     pub const fn total_bytes(self) -> u64 {
         self.total_bytes
     }
-    pub const fn manifest_parts(self) -> u32 {
-        self.manifest_parts
-    }
     pub const fn batch_count(self) -> u32 {
         self.batch_count
     }
@@ -562,12 +556,11 @@ impl ConnectorCleanupPlanSummary {
     fn digest_into(self, hash: &mut Sha256) {
         hash.update(self.candidate_count.to_be_bytes());
         hash.update(self.total_bytes.to_be_bytes());
-        hash.update(self.manifest_parts.to_be_bytes());
         hash.update(self.batch_count.to_be_bytes());
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct ConnectorCleanupPlan {
     schema_version: u16,
     owner: ConnectorProviderBindingKey,
@@ -578,6 +571,7 @@ pub struct ConnectorCleanupPlan {
     summary: ConnectorCleanupPlanSummary,
     provider_payload: Bytes,
     plan_digest: [u8; 32],
+    manifest: ConnectorProcessLocalPayload,
 }
 
 impl ConnectorCleanupPlan {
@@ -587,6 +581,7 @@ impl ConnectorCleanupPlan {
         manifest_digest: [u8; 32],
         summary: ConnectorCleanupPlanSummary,
         provider_payload: Bytes,
+        manifest: ConnectorProcessLocalPayload,
     ) -> Result<Self, ConnectorError> {
         request.validate()?;
         validate_payload(&provider_payload, "plan")?;
@@ -607,6 +602,7 @@ impl ConnectorCleanupPlan {
             summary,
             provider_payload,
             plan_digest,
+            manifest,
         })
     }
 
@@ -620,6 +616,7 @@ impl ConnectorCleanupPlan {
         summary: ConnectorCleanupPlanSummary,
         provider_payload: Bytes,
         plan_digest: [u8; 32],
+        manifest: ConnectorProcessLocalPayload,
     ) -> Result<Self, ConnectorError> {
         let plan = Self {
             schema_version: CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION,
@@ -631,9 +628,14 @@ impl ConnectorCleanupPlan {
             summary,
             provider_payload,
             plan_digest,
+            manifest,
         };
         plan.validate()?;
         Ok(plan)
+    }
+
+    pub fn manifest(&self) -> &ConnectorProcessLocalPayload {
+        &self.manifest
     }
 
     pub const fn schema_version(&self) -> u16 {
@@ -668,7 +670,6 @@ impl ConnectorCleanupPlan {
         ConnectorCleanupPlanSummary::try_new(
             self.summary.candidate_count,
             self.summary.total_bytes,
-            self.summary.manifest_parts,
             self.summary.batch_count,
         )?;
         validate_payload(&self.provider_payload, "plan")?;
@@ -689,6 +690,22 @@ impl ConnectorCleanupPlan {
         Ok(())
     }
 }
+
+impl PartialEq for ConnectorCleanupPlan {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.owner == other.owner
+            && self.operation_id == other.operation_id
+            && self.request_digest == other.request_digest
+            && self.base_state_digest == other.base_state_digest
+            && self.manifest_digest == other.manifest_digest
+            && self.summary == other.summary
+            && self.provider_payload == other.provider_payload
+            && self.plan_digest == other.plan_digest
+    }
+}
+
+impl Eq for ConnectorCleanupPlan {}
 
 impl fmt::Debug for ConnectorCleanupPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1706,6 +1723,55 @@ mod tests {
     fn table_handle() -> ConnectorTableHandle {
         ConnectorTableHandle::try_new(owner().instance_id, Bytes::from_static(b"table"))
             .expect("test table handle")
+    }
+
+    #[test]
+    fn cleanup_plan_payload_shares_lifetime_and_does_not_change_identity() {
+        let request = ConnectorCleanupPlanningRequest::try_new(
+            ConnectorCleanupOperationId::new(),
+            owner(),
+            ConnectorCleanupOperation::remove_unreferenced_objects(table_handle(), 1).unwrap(),
+            context(),
+        )
+        .unwrap();
+        let content = Arc::new(String::from("private frozen candidates"));
+        let weak = Arc::downgrade(&content);
+        let plan = ConnectorCleanupPlan::try_new(
+            &request,
+            [1; 32],
+            [2; 32],
+            ConnectorCleanupPlanSummary::try_new(1, 10, 1).unwrap(),
+            Bytes::from_static(b"plan"),
+            ConnectorProcessLocalPayload::new(owner(), content),
+        )
+        .unwrap();
+        let clone = plan.clone();
+        assert!(Arc::ptr_eq(
+            plan.manifest()
+                .value::<String>(owner().instance_id())
+                .unwrap(),
+            clone
+                .manifest()
+                .value::<String>(owner().instance_id())
+                .unwrap()
+        ));
+        let other_content = ConnectorCleanupPlan::try_new(
+            &request,
+            [1; 32],
+            [2; 32],
+            plan.summary(),
+            plan.provider_payload().clone(),
+            ConnectorProcessLocalPayload::new(owner(), Arc::new(123u64)),
+        )
+        .unwrap();
+        assert_eq!(plan, other_content);
+        assert_eq!(plan.plan_digest(), other_content.plan_digest());
+        assert!(!format!("{plan:?}").contains("private frozen candidates"));
+        plan.validate().unwrap();
+        drop(plan);
+        assert!(weak.upgrade().is_some());
+        drop(clone);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

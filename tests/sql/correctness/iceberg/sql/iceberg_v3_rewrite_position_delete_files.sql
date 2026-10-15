@@ -48,9 +48,14 @@ CREATE TABLE dv_proc_${uuid0}.ns_${uuid0}.orders (
   "format-version" = "3",
   "write.row-lineage" = "true"
 );
-INSERT INTO dv_proc_${uuid0}.ns_${uuid0}.orders VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300), (4, 40, 400);
+INSERT INTO dv_proc_${uuid0}.ns_${uuid0}.orders VALUES (1, 10, 100), (2, 20, 200);
+INSERT INTO dv_proc_${uuid0}.ns_${uuid0}.orders VALUES (3, 30, 300), (4, 40, 400);
+INSERT INTO dv_proc_${uuid0}.ns_${uuid0}.orders VALUES (5, 50, 500), (6, 60, 600);
+INSERT INTO dv_proc_${uuid0}.ns_${uuid0}.orders VALUES (7, 70, 700), (8, 80, 800);
 DELETE FROM dv_proc_${uuid0}.ns_${uuid0}.orders WHERE id = 2;
 DELETE FROM dv_proc_${uuid0}.ns_${uuid0}.orders WHERE id = 4;
+DELETE FROM dv_proc_${uuid0}.ns_${uuid0}.orders WHERE id = 6;
+DELETE FROM dv_proc_${uuid0}.ns_${uuid0}.orders WHERE id = 8;
 
 -- query 2
 -- @db=dv_proc_${uuid0}.ns_${uuid0}

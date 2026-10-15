@@ -93,6 +93,7 @@ pub struct IcebergWriteTargetPlan {
     route: Option<ConnectorWriteRouteFacts>,
     routing_proof: Option<ConnectorWriteCohortRoutingProof>,
     rewrite_source: Option<ConnectorWriteRewriteSource>,
+    rewrite_group_digest: Option<[u8; 32]>,
 }
 
 impl IcebergWriteTargetPlan {
@@ -121,6 +122,13 @@ impl IcebergWriteTargetPlan {
     pub const fn routing_proof(&self) -> Option<&ConnectorWriteCohortRoutingProof> {
         self.routing_proof.as_ref()
     }
+    pub(crate) fn with_rewrite_group_digest(mut self, digest: [u8; 32]) -> Self {
+        self.rewrite_group_digest = Some(digest);
+        self
+    }
+    pub const fn rewrite_group_digest(&self) -> Option<[u8; 32]> {
+        self.rewrite_group_digest
+    }
     pub fn into_parts(
         self,
     ) -> (
@@ -130,6 +138,7 @@ impl IcebergWriteTargetPlan {
         Option<ConnectorWriteRouteFacts>,
         Option<ConnectorWriteCohortRoutingProof>,
         Option<ConnectorWriteRewriteSource>,
+        Option<[u8; 32]>,
     ) {
         (
             self.ordinal,
@@ -138,6 +147,7 @@ impl IcebergWriteTargetPlan {
             self.route,
             self.routing_proof,
             self.rewrite_source,
+            self.rewrite_group_digest,
         )
     }
 }
@@ -436,6 +446,7 @@ pub fn plan_branch_session(
             input: plan.input().clone(),
             route: plan.route().cloned(),
             routing_proof,
+            rewrite_group_digest: None,
             rewrite_source: input
                 .copy_on_write
                 .get(index)

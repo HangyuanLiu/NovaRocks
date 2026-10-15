@@ -38,6 +38,7 @@
 mod publication;
 mod recovery_codec;
 
+// Design: ADR-0177 (docs/adr/ADR-0177-attempt-local-maintenance-inputs-and-single-rewrite-plan.md)
 use crate::commit::model::EntryIdentity;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -1762,8 +1763,15 @@ pub(crate) fn session_plan_from_targets(
     let plans = targets
         .into_iter()
         .map(|target| {
-            let (ordinal, writer, input, route, routing_proof, rewrite_source) =
-                target.into_parts();
+            let (
+                ordinal,
+                writer,
+                input,
+                route,
+                routing_proof,
+                rewrite_source,
+                rewrite_group_digest,
+            ) = target.into_parts();
             let statistics = write_statistics_contract(
                 &writer,
                 &input,
@@ -1793,6 +1801,10 @@ pub(crate) fn session_plan_from_targets(
             };
             let plan = match rewrite_source {
                 Some(source) => plan.with_rewrite_source(source),
+                None => plan,
+            };
+            let plan = match rewrite_group_digest {
+                Some(digest) => plan.with_rewrite_group_digest(digest),
                 None => plan,
             };
             Ok(plan)
@@ -2065,7 +2077,7 @@ impl IcebergWriteSessionControl {
             }
             ConnectorWriteSessionFlavor::RowMutation => CatalogOperation::RowMutation,
             ConnectorWriteSessionFlavor::CopyOnWrite { .. } => CatalogOperation::CopyOnWrite,
-            ConnectorWriteSessionFlavor::DistributedRewrite(shape) => match shape {
+            ConnectorWriteSessionFlavor::DistributedRewrite { shape, .. } => match shape {
                 ConnectorDistributedRewriteShape::DataFiles { .. } => {
                     CatalogOperation::RewriteDataFiles
                 }
@@ -2108,10 +2120,18 @@ impl IcebergWriteSessionControl {
                 )
             }
             None => {
-                let physical = self
-                    .runtime
-                    .load_table_for_request(namespace, table_name, &request.context)
-                    .map_err(|error| unavailable(error.to_string()))?;
+                // Begin must observe the catalog after planning, even when FE shares one request cache.
+                let physical = if matches!(
+                    &request.flavor,
+                    ConnectorWriteSessionFlavor::DistributedRewrite { .. }
+                ) {
+                    self.runtime
+                        .observe_table_for_request(namespace, table_name, &request.context)
+                } else {
+                    self.runtime
+                        .load_table_for_request(namespace, table_name, &request.context)
+                }
+                .map_err(|error| unavailable(error.to_string()))?;
                 let cow_read_access = if matches!(
                     &request.flavor,
                     ConnectorWriteSessionFlavor::CopyOnWrite { .. }
@@ -2226,6 +2246,49 @@ impl IcebergWriteSessionControl {
             Some(_) => None,
             None => crate::ref_snapshot::resolve_branch_head_snapshot_id(&metadata, target_ref)
                 .map_err(|error| invalid(error.to_string()))?,
+        };
+        let frozen_rewrite = match &request.flavor {
+            ConnectorWriteSessionFlavor::DistributedRewrite { shape, frozen } => {
+                let content = frozen
+                    .value::<crate::distributed_rewrite::FrozenRewritePlanContent>(
+                        self.key.instance_id.as_str(),
+                    )?;
+                let expected_kind = match shape {
+                    ConnectorDistributedRewriteShape::DataFiles { .. } => {
+                        novarocks_spi::connector::REWRITE_DATA_FILES_KIND
+                    }
+                    ConnectorDistributedRewriteShape::PositionDeletes { .. } => {
+                        novarocks_spi::connector::REWRITE_POSITION_DELETES_KIND
+                    }
+                };
+                if content.namespace != namespace
+                    || content.table != table_name
+                    || content.target_ref != target_ref
+                    || content.operation_kind != expected_kind
+                {
+                    return Err(internal(
+                        "Iceberg frozen rewrite header differs from the write request",
+                    ));
+                }
+                if content.table_uuid != metadata.uuid().to_string() {
+                    return Err(invalid("Iceberg frozen rewrite table was replaced"));
+                }
+                if content.base_snapshot_id != base_snapshot_id {
+                    return Err(invalid("Iceberg rewrite target ref moved after planning"));
+                }
+                if content.schema_id != metadata.current_schema_id()
+                    || content.default_spec_id != metadata.default_partition_spec_id()
+                {
+                    return Err(invalid(
+                        "Iceberg frozen rewrite table metadata changed after planning",
+                    ));
+                }
+                if content.groups.is_empty() {
+                    return Err(internal("Iceberg frozen rewrite plan has no groups"));
+                }
+                Some(content)
+            }
+            _ => None,
         };
         if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } =
             &request.flavor
@@ -2432,12 +2495,14 @@ impl IcebergWriteSessionControl {
                 )?
             }
             ConnectorWriteSessionFlavor::RowMutation => plan_row_mutation_branches(&material)?,
-            ConnectorWriteSessionFlavor::DistributedRewrite(shape) => {
+            ConnectorWriteSessionFlavor::DistributedRewrite { shape, .. } => {
+                let content = frozen_rewrite
+                    .ok_or_else(|| internal("Iceberg rewrite lost its frozen plan"))?;
                 let table = table.as_ref().ok_or_else(|| {
                     invalid("Iceberg distributed rewrite requires a loaded target table")
                 })?;
                 let groups =
-                    self.freeze_rewrite_groups(table, &metadata, base_snapshot_id, *shape)?;
+                    self.rewrite_branches_from_frozen(table, &metadata, content, *shape)?;
                 plan_distributed_rewrite_branches(&material, *shape, &groups)?
             }
             ConnectorWriteSessionFlavor::CopyOnWrite {
@@ -2493,7 +2558,7 @@ impl IcebergWriteSessionControl {
             copy_on_write,
             branches,
         } = plan;
-        let (handle, targets) = plan_branch_session(
+        let (handle, mut targets) = plan_branch_session(
             IcebergWriteSessionId::new(),
             IcebergBranchSessionPlanInput {
                 flavor,
@@ -2510,6 +2575,23 @@ impl IcebergWriteSessionControl {
                 branches,
             },
         )?;
+        if let Some(content) = frozen_rewrite {
+            if targets.len() != content.groups.len() {
+                return Err(internal(
+                    "Iceberg rewrite branch count differs from frozen groups",
+                ));
+            }
+            targets = targets
+                .into_iter()
+                .zip(&content.groups)
+                .map(|(target, group)| {
+                    let digest: [u8; 32] =
+                        crate::distributed_rewrite::decode_digest(&group.group_digest_hex)
+                            .map_err(|error| internal(error.to_string()))?;
+                    Ok(target.with_rewrite_group_digest(digest))
+                })
+                .collect::<Result<Vec<_>, ConnectorError>>()?;
+        }
         let handle = if handle.flavor() == IcebergWriteFlavor::StagedCreate {
             handle
         } else {
@@ -2559,101 +2641,49 @@ impl IcebergWriteSessionControl {
             .map_err(unavailable)
     }
 
-    /// Freeze the rewrite groups a distributed rewrite seals one branch each
-    /// for.
-    ///
-    /// Grouping is the provider's decision and reuses the existing rewrite
-    /// planner, so a group here is the same group the rewrite path already
-    /// cuts — which is why the shape's selection facts travel with the session:
-    /// a position-delete rewrite's group set depends on them, and a second
-    /// planner run that guessed them would seal a different branch count than
-    /// the frozen plan has cohorts. Everything this touches is a read of the
-    /// frozen base snapshot.
-    fn freeze_rewrite_groups(
+    /// Build writers from the attempt's one frozen selection, preserving cohort order.
+    fn rewrite_branches_from_frozen(
         &self,
         table: &crate::iceberg::table::Table,
         metadata: &TableMetadata,
-        base_snapshot_id: Option<i64>,
+        content: &crate::distributed_rewrite::FrozenRewritePlanContent,
         shape: ConnectorDistributedRewriteShape,
     ) -> Result<Vec<IcebergFrozenRewriteBranch>, ConnectorError> {
-        // Without a base snapshot there is nothing to rewrite at all, and a
-        // rewrite that silently became an append would republish rows it never
-        // read.
-        let Some(snapshot_id) = base_snapshot_id else {
-            return Ok(Vec::new());
-        };
-        let owned = table.clone();
-        let files = self
-            .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                crate::manifest::extract_data_files_with_stats_at(&owned, snapshot_id).await
-            })
-            .map_err(|error| unavailable(error.to_string()))?
-            .map_err(unavailable)?;
-        if files.is_empty() {
-            return Ok(Vec::new());
-        }
         match shape {
-            ConnectorDistributedRewriteShape::DataFiles { .. } => {
-                let live = crate::distributed_rewrite::live_delete_file_paths_at(
-                    &self.runtime,
-                    table,
-                    snapshot_id,
-                )?;
-                Ok(
-                    crate::distributed_rewrite::plan_data_file_groups(files, &live)?
-                        .into_iter()
-                        .map(|group| IcebergFrozenRewriteBranch {
-                            group,
-                            delete_targets: Vec::new(),
-                        })
-                        .collect(),
-                )
-            }
-            ConnectorDistributedRewriteShape::PositionDeletes {
-                rewrite_all,
-                min_input_files,
-            } => {
-                // The delete writer resolves a data file's partition and row
-                // count through the merge target frozen for it, so each group's
-                // data files are kept beside the group rather than re-read
-                // later from a generation that may have moved.
-                let by_path = files
-                    .iter()
-                    .map(|file| (file.path.clone(), file.clone()))
-                    .collect::<BTreeMap<_, _>>();
-                crate::distributed_rewrite::plan_position_delete_groups(
-                    files,
-                    rewrite_all,
-                    min_input_files,
-                )?
-                .into_iter()
-                .map(|group| {
-                    let delete_targets = group
-                        .data_files
-                        .iter()
-                        .map(|file| {
-                            let frozen = by_path.get(&file.path).ok_or_else(|| {
-                                corrupt(format!(
-                                    "Iceberg rewrite group names data file {} the frozen snapshot does not hold",
-                                    file.path
-                                ))
-                            })?;
-                            // No old reference: the rewrite reads the group's
-                            // deletion vectors through its own scan and
-                            // republishes their positions, so the writer has
-                            // nothing left to merge.
-                            frozen_delete_merge_target(frozen, metadata, snapshot_id, Vec::new())
-                        })
-                        .collect::<Result<Vec<_>, ConnectorError>>()?;
-                    Ok(IcebergFrozenRewriteBranch {
-                        group,
-                        delete_targets,
-                    })
+            ConnectorDistributedRewriteShape::DataFiles { .. } => Ok(content
+                .groups
+                .iter()
+                .cloned()
+                .map(|group| IcebergFrozenRewriteBranch {
+                    group,
+                    delete_targets: Vec::new(),
                 })
-                .collect()
+                .collect()),
+            ConnectorDistributedRewriteShape::PositionDeletes { .. } => {
+                let snapshot_id = content
+                    .base_snapshot_id
+                    .ok_or_else(|| internal("Iceberg rewrite has no starting snapshot"))?;
+                let owned = table.clone();
+                let files = self
+                    .runtime
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(async move {
+                        crate::manifest::extract_data_files_with_stats_at(&owned, snapshot_id).await
+                    })
+                    .map_err(|error| unavailable(error.to_string()))?
+                    .map_err(unavailable)?;
+                let by_path = files
+                    .into_iter()
+                    .map(|file| (file.path.clone(), file))
+                    .collect::<BTreeMap<_, _>>();
+                content.groups.iter().map(|group| {
+                    let delete_targets = group.data_files.iter().map(|file| {
+                        let frozen = by_path.get(&file.path).ok_or_else(|| corrupt(format!("Iceberg frozen rewrite data file {} is missing from the starting snapshot", file.path)))?;
+                        frozen_delete_merge_target(frozen, metadata, snapshot_id, Vec::new())
+                    }).collect::<Result<Vec<_>, ConnectorError>>()?;
+                    Ok(IcebergFrozenRewriteBranch { group: group.clone(), delete_targets })
+                }).collect()
             }
         }
     }
@@ -3035,11 +3065,11 @@ pub(crate) fn session_freezes_old_deletes(
         //
         // A distributed rewrite seals no session-wide freeze even when its
         // branch is a delete branch. Its branches own disjoint groups, so each
-        // one's merge target is frozen per branch by `freeze_rewrite_groups`;
+        // one's merge target is frozen per branch by the frozen plan;
         // and a rewrite supersedes nothing anyway -- it reads the old artifacts
         // through its own scan and its commit retires exactly them.
         ConnectorWriteSessionFlavor::StagedCreate(_)
-        | ConnectorWriteSessionFlavor::DistributedRewrite(_)
+        | ConnectorWriteSessionFlavor::DistributedRewrite { .. }
         | ConnectorWriteSessionFlavor::CopyOnWrite { .. } => false,
     }
 }

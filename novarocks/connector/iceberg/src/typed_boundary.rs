@@ -1442,28 +1442,26 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             return Ok(None);
         };
         let metadata = physical.table.metadata();
-        let loaded = crate::distributed_rewrite::load_frozen_rewrite_group(
-            &self.runtime,
-            physical.table.file_io(),
-            &crate::distributed_rewrite::IcebergRewriteGroupPayloadV1 {
-                version: crate::distributed_rewrite::GROUP_PAYLOAD_VERSION,
-                group_digest_hex: group.group_digest_hex().to_string(),
-                artifact_digest_hex: group.artifact_digest_hex().to_string(),
-                artifact_location: group.artifact_location().to_string(),
-            },
-        )?;
-        let snapshot_id =
-            validate_rewrite_position_delete_artifact(name, metadata, &loaded.artifact)?;
+        let content = group
+            .content()
+            .value::<crate::distributed_rewrite::FrozenRewritePlanContent>(
+                self.descriptor.instance_id.as_str(),
+            )?
+            .clone();
+        content.validate_identity(group.operation_id(), group.artifact_digest_hex())?;
+        content.group(group.group_digest_hex())?;
+        let snapshot_id = validate_rewrite_position_delete_artifact(name, metadata, &content)?;
         let table_handle = pinned_table_handle(name, metadata, Some(snapshot_id))?;
         let procedure_handle = IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(
             IcebergRewritePositionDeleteFilesHandle::try_new(
                 table_handle.clone(),
                 IcebergRewriteArtifactContentId::try_new(
-                    group.artifact_location(),
+                    group.operation_id(),
                     group.artifact_digest_hex(),
                 )?,
                 group.group_digest_hex(),
-            )?,
+            )?
+            .with_content(content),
         );
         Ok(Some(
             crate::typed_read::IcebergRuntimeRelation::TableExecute(
@@ -1876,12 +1874,8 @@ impl IcebergTypedBoundary {
                 &self.runtime,
                 &physical.table,
                 snapshot_id,
-                &crate::distributed_rewrite::IcebergRewriteGroupPayloadV1 {
-                    version: crate::distributed_rewrite::GROUP_PAYLOAD_VERSION,
-                    group_digest_hex: rewrite.group_digest_hex().to_string(),
-                    artifact_digest_hex: rewrite.artifact().artifact_digest_hex().to_string(),
-                    artifact_location: rewrite.artifact().artifact_location().to_string(),
-                },
+                rewrite.content()?.as_ref(),
+                rewrite.group_digest_hex(),
                 request_context,
             )?;
         let deletes = selected

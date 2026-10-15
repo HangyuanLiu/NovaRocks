@@ -1321,4 +1321,352 @@ mod tests {
             }
         }
     }
+
+    // Transfer the sentinel's sole strong reference into the provider session.
+    // A retained result or adapter must not keep attempt-owned content alive.
+    struct ReleaseRewritePort {
+        content: Mutex<Option<Arc<()>>>,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        noop: bool,
+        cohort_fails: bool,
+        abort_fails: bool,
+        commit: Result<RewriteCommit, String>,
+        finalization: Result<RewriteReceiptFacts, String>,
+    }
+
+    struct ReleaseRewriteSession {
+        _content: Arc<()>,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        noop: bool,
+        cohort_fails: bool,
+        abort_fails: bool,
+        commit: Result<RewriteCommit, String>,
+        finalization: Result<RewriteReceiptFacts, String>,
+    }
+
+    impl DistributedRewriteSession for ReleaseRewriteSession {
+        fn plan_facts(&self) -> RewritePlanFacts {
+            self.calls.lock().unwrap().push("plan");
+            RewritePlanFacts {
+                noop: self.noop,
+                cohort_count: 1,
+                input_bytes: 1,
+            }
+        }
+
+        fn execute_cohort(&mut self, ordinal: usize) -> Result<(), TerminalError> {
+            assert_eq!(ordinal, 0);
+            self.calls.lock().unwrap().push("cohort");
+            if self.cohort_fails {
+                Err(TerminalError::failed("cohort failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn commit(&mut self) -> Result<RewriteCommit, String> {
+            self.calls.lock().unwrap().push("commit");
+            self.commit.clone()
+        }
+
+        fn finalize_committed(&mut self) -> Result<RewriteReceiptFacts, String> {
+            self.calls.lock().unwrap().push("finalize");
+            self.finalization.clone()
+        }
+
+        fn abort(&mut self, _reason: String) -> Result<(), String> {
+            self.calls.lock().unwrap().push("abort");
+            if self.abort_fails {
+                Err("abort reply lost".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl TableMaintenanceEffectPort for ReleaseRewritePort {
+        fn reject_user_action_on_mv(&self, _target: &MaintenanceTarget) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn execute_metadata(
+            &self,
+            _request: MaintenanceActionRequest,
+        ) -> Result<MaintenanceActionOutcome, String> {
+            unreachable!("release test never executes metadata")
+        }
+
+        fn begin_rewrite<'a>(
+            &'a self,
+            _target: &MaintenanceTarget,
+            _intent: RewriteIntent,
+        ) -> Result<Box<dyn DistributedRewriteSession + 'a>, String> {
+            Ok(Box::new(ReleaseRewriteSession {
+                _content: self.content.lock().unwrap().take().expect("begin once"),
+                calls: self.calls.clone(),
+                noop: self.noop,
+                cohort_fails: self.cohort_fails,
+                abort_fails: self.abort_fails,
+                commit: self.commit.clone(),
+                finalization: self.finalization.clone(),
+            }))
+        }
+
+        fn begin_cleanup<'a>(
+            &'a self,
+            _target: &MaintenanceTarget,
+            _older_than_ms: i64,
+        ) -> Result<Box<dyn CleanupSession + 'a>, String> {
+            unreachable!("rewrite release test never starts cleanup")
+        }
+    }
+
+    #[test]
+    fn rewrite_terminal_paths_release_attempt_content() {
+        let cases = [
+            ("noop", None, vec!["plan"]),
+            (
+                "cohort failure",
+                Some(MaintenanceJobState::KnownUncommitted),
+                vec!["plan", "cohort", "abort"],
+            ),
+            (
+                "cohort abort failure",
+                Some(MaintenanceJobState::CommitUnknown),
+                vec!["plan", "cohort", "abort"],
+            ),
+            (
+                "commit error",
+                Some(MaintenanceJobState::CommitUnknown),
+                vec!["plan", "cohort", "commit"],
+            ),
+            (
+                "provider finalization failure",
+                Some(MaintenanceJobState::KnownCommittedFinalizationFailed),
+                vec!["plan", "cohort", "commit"],
+            ),
+            (
+                "finalize error",
+                Some(MaintenanceJobState::KnownCommittedFinalizationFailed),
+                vec!["plan", "cohort", "commit", "finalize"],
+            ),
+            (
+                "receipt projection error",
+                Some(MaintenanceJobState::KnownCommittedFinalizationFailed),
+                vec!["plan", "cohort", "commit", "finalize"],
+            ),
+            (
+                "committed",
+                None,
+                vec!["plan", "cohort", "commit", "finalize"],
+            ),
+            (
+                "uncommitted",
+                Some(MaintenanceJobState::KnownUncommitted),
+                vec!["plan", "cohort", "commit", "abort"],
+            ),
+            (
+                "uncommitted abort failure",
+                Some(MaintenanceJobState::KnownUncommitted),
+                vec!["plan", "cohort", "commit", "abort"],
+            ),
+            (
+                "unknown",
+                Some(MaintenanceJobState::CommitUnknown),
+                vec!["plan", "cohort", "commit"],
+            ),
+        ];
+        let product = TableMaintenanceProduct::new(None);
+        for (name, expected_state, expected_calls) in cases {
+            let content = Arc::new(());
+            let weak = Arc::downgrade(&content);
+            let port = ReleaseRewritePort {
+                content: Mutex::new(Some(content)),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                noop: name == "noop",
+                cohort_fails: name.starts_with("cohort"),
+                abort_fails: name.ends_with("abort failure"),
+                commit: match name {
+                    "commit error" => Err("commit reply lost".to_string()),
+                    "provider finalization failure" => Ok(RewriteCommit::KnownCommitted {
+                        finalization_failed: Some("provider finalize failed".to_string()),
+                    }),
+                    "uncommitted" | "uncommitted abort failure" => {
+                        Ok(RewriteCommit::KnownUncommitted {
+                            failure: "conflict".to_string(),
+                        })
+                    }
+                    "unknown" => Ok(RewriteCommit::CommitUnknown {
+                        failure: "receipt lost".to_string(),
+                    }),
+                    _ => Ok(RewriteCommit::KnownCommitted {
+                        finalization_failed: None,
+                    }),
+                },
+                finalization: if name == "finalize error" {
+                    Err("projection unavailable".to_string())
+                } else {
+                    Ok(RewriteReceiptFacts {
+                        input_data_files: if name == "receipt projection error" {
+                            u64::MAX
+                        } else {
+                            1
+                        },
+                        ..RewriteReceiptFacts::default()
+                    })
+                },
+            };
+            assert!(weak.upgrade().is_some(), "{name}: fixture owns content");
+            let result = product.execute_rewrite_terminal(
+                &port,
+                &target(),
+                RewriteIntent::DataFiles { rewrite_all: true },
+            );
+            assert_eq!(
+                result.as_ref().err().map(|error| error.state),
+                expected_state,
+                "{name}: terminal classification"
+            );
+            assert_eq!(*port.calls.lock().unwrap(), expected_calls, "{name}");
+            assert!(port.content.lock().unwrap().is_none(), "{name}: began");
+            assert!(
+                weak.upgrade().is_none(),
+                "{name}: terminal result and live port must release content"
+            );
+        }
+    }
+
+    struct ReleaseCleanupPort {
+        content: Mutex<Option<Arc<()>>>,
+        executed: Arc<Mutex<bool>>,
+        terminal: Result<CleanupTerminal, String>,
+    }
+
+    struct ReleaseCleanupSession {
+        _content: Arc<()>,
+        executed: Arc<Mutex<bool>>,
+        terminal: Result<CleanupTerminal, String>,
+    }
+
+    impl CleanupSession for ReleaseCleanupSession {
+        fn candidates(&self) -> &[CleanupCandidate] {
+            &[CleanupCandidate::Object]
+        }
+
+        fn select_owned_refs(&mut self, _candidate_indexes: &[usize]) -> Result<(), String> {
+            unreachable!("object cleanup has no owned refs")
+        }
+
+        fn execute(&mut self) -> Result<CleanupTerminal, String> {
+            *self.executed.lock().unwrap() = true;
+            self.terminal.clone()
+        }
+    }
+
+    impl TableMaintenanceEffectPort for ReleaseCleanupPort {
+        fn reject_user_action_on_mv(&self, _target: &MaintenanceTarget) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn execute_metadata(
+            &self,
+            _request: MaintenanceActionRequest,
+        ) -> Result<MaintenanceActionOutcome, String> {
+            unreachable!("cleanup release test never executes metadata")
+        }
+
+        fn begin_rewrite<'a>(
+            &'a self,
+            _target: &MaintenanceTarget,
+            _intent: RewriteIntent,
+        ) -> Result<Box<dyn DistributedRewriteSession + 'a>, String> {
+            unreachable!("cleanup release test never starts rewrite")
+        }
+
+        fn begin_cleanup<'a>(
+            &'a self,
+            _target: &MaintenanceTarget,
+            _older_than_ms: i64,
+        ) -> Result<Box<dyn CleanupSession + 'a>, String> {
+            Ok(Box::new(ReleaseCleanupSession {
+                _content: self.content.lock().unwrap().take().expect("begin once"),
+                executed: self.executed.clone(),
+                terminal: self.terminal.clone(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_terminal_paths_release_attempt_content() {
+        let cases = [
+            (
+                Ok(CleanupTerminal::KnownCommitted {
+                    locations: vec!["orphan.parquet".to_string()],
+                }),
+                None,
+            ),
+            (
+                Err("cleanup execution failed".to_string()),
+                Some("cleanup execution failed"),
+            ),
+            (
+                Ok(CleanupTerminal::KnownUncommitted {
+                    failure: "conflict".to_string(),
+                }),
+                Some("orphan cleanup was not applied"),
+            ),
+            (
+                Ok(CleanupTerminal::CommitUnknown {
+                    failure: "receipt lost".to_string(),
+                }),
+                Some("orphan cleanup dispatch outcome is unknown"),
+            ),
+            (
+                Ok(CleanupTerminal::KnownCommittedFinalizationFailed {
+                    failure: "projection unavailable".to_string(),
+                }),
+                Some("orphan cleanup committed but finalization failed"),
+            ),
+        ];
+        let product = TableMaintenanceProduct::new(None).with_safe_gc_age(Duration::ZERO);
+        for (terminal, expected_error) in cases {
+            let content = Arc::new(());
+            let weak = Arc::downgrade(&content);
+            let port = ReleaseCleanupPort {
+                content: Mutex::new(Some(content)),
+                executed: Arc::new(Mutex::new(false)),
+                terminal,
+            };
+            assert!(weak.upgrade().is_some(), "fixture owns content");
+            let result = product
+                .execute_action(
+                    &port,
+                    MaintenanceActionRequest::RemoveOrphanFiles {
+                        target: target(),
+                        older_than_ms: 1,
+                    },
+                )
+                .await;
+            match expected_error {
+                Some(message) => assert!(
+                    result
+                        .as_ref()
+                        .expect_err("cleanup failed")
+                        .message
+                        .contains(message)
+                ),
+                None => assert!(matches!(
+                    result.as_ref().expect("cleanup committed"),
+                    MaintenanceActionOutcome::RemoveOrphanFiles { orphan_file_locations }
+                        if orphan_file_locations == &["orphan.parquet".to_string()]
+                )),
+            }
+            assert!(*port.executed.lock().unwrap(), "cleanup reached dispatch");
+            assert!(port.content.lock().unwrap().is_none(), "cleanup began");
+            assert!(
+                weak.upgrade().is_none(),
+                "terminal result and live port must release content"
+            );
+        }
+    }
 }

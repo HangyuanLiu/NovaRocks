@@ -67,10 +67,7 @@ pub enum ConnectorDistributedRewriteOperation {
 /// shape instead would let a caller turn a data rewrite into a delete rewrite by
 /// signing a different input.
 ///
-/// The selection facts travel with the kind rather than being re-derived. A
-/// provider cuts the same groups twice — once when it freezes the plan, once
-/// when it seals the session — and which delete artifacts a rewrite selected is
-/// not a function of the target alone.
+/// The selection facts travel with the kind rather than being re-derived. The provider freezes groups once and the session consumes that selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectorDistributedRewriteShape {
     /// Republish the target's data files.
@@ -250,75 +247,64 @@ impl ConnectorDistributedRewritePlanSummary {
     }
 }
 
-/// The immutable external artifact one rewrite cohort's group lives in.
-///
-/// A distributed rewrite freezes its whole selection into one artifact before
-/// any cohort exists, then cuts it into groups. A cohort whose input is not
-/// table rows names its group here instead of pinning a data file set: the
-/// group is resolved back to its exact artifact list by the provider that
-/// wrote it, and the commit replaces precisely that list.
-///
-/// The artifact is named by location *and* content digest, because a
-/// replacement written at the same location is a different plan.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// One cohort's attempt-local immutable input, owned by its provider.
+#[derive(Clone, Debug)]
 pub struct ConnectorFrozenRewriteGroup {
     schema_name: Arc<str>,
     table_name: Arc<str>,
-    artifact_location: Arc<str>,
+    operation_id: ConnectorWriteOperationId,
     artifact_digest: [u8; 32],
+    content: super::ConnectorProcessLocalPayload,
 }
-
+impl PartialEq for ConnectorFrozenRewriteGroup {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_name == other.schema_name
+            && self.table_name == other.table_name
+            && self.operation_id == other.operation_id
+            && self.artifact_digest == other.artifact_digest
+    }
+}
+impl Eq for ConnectorFrozenRewriteGroup {}
 impl ConnectorFrozenRewriteGroup {
     pub fn try_new(
         schema_name: impl AsRef<str>,
         table_name: impl AsRef<str>,
-        artifact_location: impl AsRef<str>,
+        operation_id: ConnectorWriteOperationId,
         artifact_digest: [u8; 32],
+        content: super::ConnectorProcessLocalPayload,
     ) -> Result<Self, ConnectorError> {
-        let schema_name = schema_name.as_ref();
-        let table_name = table_name.as_ref();
-        let artifact_location = artifact_location.as_ref();
-        if schema_name.is_empty() || table_name.is_empty() {
+        if schema_name.as_ref().is_empty() || table_name.as_ref().is_empty() {
             return Err(invalid(
                 "distributed rewrite cohort group requires a schema-qualified relation name",
             ));
         }
-        if artifact_location.is_empty()
-            || artifact_location.len() > MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES
-            || artifact_location.ends_with('/')
-        {
-            return Err(invalid(
-                "distributed rewrite cohort artifact location must be a non-empty bounded object location",
-            ));
-        }
         Ok(Self {
-            schema_name: Arc::from(schema_name),
-            table_name: Arc::from(table_name),
-            artifact_location: Arc::from(artifact_location),
+            schema_name: Arc::from(schema_name.as_ref()),
+            table_name: Arc::from(table_name.as_ref()),
+            operation_id,
             artifact_digest,
+            content,
         })
     }
-
     pub fn schema_name(&self) -> &str {
         &self.schema_name
     }
-
     pub fn table_name(&self) -> &str {
         &self.table_name
     }
-
-    pub fn artifact_location(&self) -> &str {
-        &self.artifact_location
+    pub const fn operation_id(&self) -> ConnectorWriteOperationId {
+        self.operation_id
     }
-
     pub const fn artifact_digest(&self) -> [u8; 32] {
         self.artifact_digest
     }
-
+    pub fn content(&self) -> &super::ConnectorProcessLocalPayload {
+        &self.content
+    }
     fn digest_into(&self, hash: &mut Sha256) {
         digest_bytes(hash, self.schema_name.as_bytes());
         digest_bytes(hash, self.table_name.as_bytes());
-        digest_bytes(hash, self.artifact_location.as_bytes());
+        hash.update(self.operation_id.to_bytes());
         hash.update(self.artifact_digest);
     }
 }
@@ -516,8 +502,7 @@ pub struct ConnectorDistributedRewritePlan {
     owner: ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     /// The exact operation this plan froze. It is kept whole rather than
-    /// reduced to a kind and a target, because everything downstream that must
-    /// re-cut the same groups needs its selection facts too.
+    /// reduced to a kind and a target; downstream consumers share its frozen selection.
     operation: ConnectorDistributedRewriteOperation,
     request_digest: [u8; 32],
     state_digest: [u8; 32],
@@ -525,6 +510,7 @@ pub struct ConnectorDistributedRewritePlan {
     summary: ConnectorDistributedRewritePlanSummary,
     provider_payload: Bytes,
     cohorts: Vec<ConnectorDistributedRewriteCohortPlan>,
+    frozen: super::ConnectorProcessLocalPayload,
     plan_digest: [u8; 32],
 }
 
@@ -537,6 +523,7 @@ impl ConnectorDistributedRewritePlan {
         summary: ConnectorDistributedRewritePlanSummary,
         provider_payload: Bytes,
         mut cohorts: Vec<ConnectorDistributedRewriteCohortPlan>,
+        frozen: super::ConnectorProcessLocalPayload,
     ) -> Result<Self, ConnectorError> {
         request.validate()?;
         validate_payload(&provider_payload, "plan")?;
@@ -577,6 +564,7 @@ impl ConnectorDistributedRewritePlan {
             summary,
             provider_payload,
             cohorts,
+            frozen,
             plan_digest,
         })
     }
@@ -594,8 +582,7 @@ impl ConnectorDistributedRewritePlan {
         &self.operation
     }
     /// What this plan rewrites, and how it selected it. A session sealed from
-    /// this plan must cut the same groups, so it is told the same facts rather
-    /// than left to infer them from the writer input.
+    /// this plan consumes its frozen groups; writer input cannot define the selection.
     pub const fn shape(&self) -> ConnectorDistributedRewriteShape {
         self.operation.shape()
     }
@@ -619,6 +606,9 @@ impl ConnectorDistributedRewritePlan {
     }
     pub fn provider_payload(&self) -> &Bytes {
         &self.provider_payload
+    }
+    pub fn frozen(&self) -> &super::ConnectorProcessLocalPayload {
+        &self.frozen
     }
     pub fn cohorts(&self) -> &[ConnectorDistributedRewriteCohortPlan] {
         &self.cohorts
@@ -1122,8 +1112,12 @@ mod tests {
             ConnectorFrozenRewriteGroup::try_new(
                 "db",
                 "orders",
-                "s3://warehouse/db/orders/_rewrite/0199",
+                ConnectorWriteOperationId::from_bytes([1; 16]),
                 [5; 32],
+                super::super::ConnectorProcessLocalPayload::new(
+                    request().owner().clone(),
+                    Arc::new(()),
+                ),
             )
             .unwrap(),
         )
@@ -1200,6 +1194,7 @@ mod tests {
             ConnectorDistributedRewritePlanSummary::default(),
             Bytes::new(),
             vec![cohort([3; 32])],
+            super::super::ConnectorProcessLocalPayload::new(request.owner().clone(), Arc::new(())),
         )
         .unwrap();
         let second = ConnectorDistributedRewritePlan::try_new(
@@ -1209,6 +1204,7 @@ mod tests {
             ConnectorDistributedRewritePlanSummary::default(),
             Bytes::new(),
             vec![cohort([4; 32])],
+            super::super::ConnectorProcessLocalPayload::new(request.owner().clone(), Arc::new(())),
         )
         .unwrap();
 
@@ -1372,6 +1368,10 @@ mod tests {
                     ConnectorDistributedRewritePlanSummary::default(),
                     Bytes::new(),
                     vec![cohort(preparation)],
+                    super::super::ConnectorProcessLocalPayload::new(
+                        request.owner().clone(),
+                        Arc::new(())
+                    ),
                 )
                 .is_err()
             );

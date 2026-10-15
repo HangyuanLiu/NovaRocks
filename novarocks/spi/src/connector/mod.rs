@@ -42,6 +42,7 @@ mod mv_storage_observation;
 mod original_result_scope;
 mod payload_retention;
 mod predicate;
+mod process_local;
 pub mod provider;
 mod provider_binding;
 mod publication;
@@ -205,7 +206,7 @@ pub use metadata_maintenance::{
     ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
     ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReceiptSummary,
     ConnectorMetadataMaintenanceResolver, EXPIRE_TABLE_VERSIONS_KIND,
-    MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES, MAX_CONNECTOR_METADATA_MAINTENANCE_PATH_BYTES,
+    MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES,
     MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES, REWRITE_METADATA_LAYOUT_KIND,
 };
 pub use mutation::{
@@ -365,3 +366,5 @@ pub use write::{
     MAX_CONNECTOR_WRITE_RECEIPT_BYTES, WriteCommitEvidenceLedger, WriteCommitEvidenceLimits,
     WriteCommitEvidenceUsage,
 };
+
+pub use process_local::ConnectorProcessLocalPayload;

@@ -34,7 +34,6 @@ use super::{
 pub const CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION: u16 = 1;
 pub const MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES: usize = 16 * 1024;
-pub const MAX_CONNECTOR_METADATA_MAINTENANCE_PATH_BYTES: usize = 16 * 1024;
 
 const REQUEST_DOMAIN: &[u8] = b"novarocks.connector-metadata-maintenance.request.v1\0";
 const PLAN_DOMAIN: &[u8] = b"novarocks.connector-metadata-maintenance.plan.v1\0";

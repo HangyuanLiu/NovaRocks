@@ -195,7 +195,7 @@ fn project(
                 Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(rewrite)) => {
                     let content_digest =
                         decode_hex(rewrite.artifact().artifact_digest_hex(), work)?;
-                    let evidence = work.copy(rewrite.artifact().artifact_location().as_bytes())?;
+                    let evidence = work.opaque(|| rewrite.artifact().evidence())?;
                     work.opaque(|| {
                         ConnectorReadArtifactCoverage::exact(
                             selection_digest,
@@ -377,7 +377,7 @@ mod tests {
         let procedure = IcebergRewritePositionDeleteFilesHandle::try_new(
             table.clone(),
             IcebergRewriteArtifactContentId::try_new(
-                "s3://warehouse/rewrite.json",
+                novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([1; 16]),
                 "01".repeat(32),
             )
             .unwrap(),
@@ -495,7 +495,16 @@ mod tests {
         };
         assert_eq!(*source_selection_digest, facts.selection_digest());
         assert_eq!(*content_digest, [1; 32]);
-        assert_eq!(evidence.as_ref(), b"s3://warehouse/rewrite.json");
+        assert_eq!(
+            evidence.as_ref(),
+            super::super::table_execute::IcebergRewriteArtifactContentId::try_new(
+                novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([1; 16]),
+                "01".repeat(32)
+            )
+            .unwrap()
+            .evidence()
+            .as_slice()
+        );
         assert!(facts.coverage_evidence().is_empty());
     }
     #[test]

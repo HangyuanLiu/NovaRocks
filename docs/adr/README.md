@@ -131,7 +131,8 @@ code-anchors:
 - ADR-0018 — 静态 Connector predicate 为何以 Exact/PruningOnly/Unsupported 协商、而不扩展 native wire（active）
 - ADR-0133 — 分布式 writer 为何是普通执行算子、产物走数据流、且只有 FE 能提交（active）
 - ADR-0024 — 无需 BE staging 的 data mutation 为何使用 FE-only frozen plan 与 marker-only reconcile（active）
-- ADR-0028 — metadata maintenance 为何由 FE 以 exact lease、durable plan 与 marker reconcile 执行（active）
+- ADR-0028 — metadata maintenance 为何由 FE 以 exact lease、durable plan 与 marker reconcile 执行（active；持久计划、恢复、私有产物与回收条款由 ADR-0177 部分替代，FE-only capability、准确 generation 与原子 marker 保留）
+- [ADR-0177](ADR-0177-attempt-local-maintenance-inputs-and-single-rewrite-plan.md) — 维护输入为何只驻留当前尝试，且重写读取、writer 与提交为何共用同一份冻结计划（active；部分替代 ADR-0028）
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（active）
 - ADR-0130 — Connector role binding 为何每个进程角色只发布一个 complete generation（active）
@@ -417,6 +418,7 @@ fallback 模糊 owner 和故障语义。
 - ADR-0083 — 表维护 execution port 为何必须随 query assembly 归 Frontend，不能以 Core cohort bridge 留存（active）
 - ADR-0110 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
 - ADR-0111 — Frontend maintenance/statistics job 为何是 ProcessRuntime，而 GC first-observation 是 Accelerator（active）
+- [ADR-0177](ADR-0177-attempt-local-maintenance-inputs-and-single-rewrite-plan.md) — 维护输入为何只驻留当前尝试，且重写读取、writer 与提交为何共用同一份冻结计划（active；部分替代 ADR-0028）
 - ADR-0057 — MV 维护事实为何按「是否需要 provider runtime IO」切成观测口投影与 SPI capability 两条通道（active）
 
 #### 历史

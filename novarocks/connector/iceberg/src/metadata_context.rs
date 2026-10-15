@@ -300,6 +300,45 @@ impl IcebergMetadataContext {
         .map_err(|(_, message)| message)
     }
 
+    /// Observe a mutation admission frontier without reusing planning caches.
+    /// Keep the original deadline, stop view and credential collector for this attempt.
+    pub(crate) fn observe_table_for_request(
+        &self,
+        namespace: &str,
+        table: &str,
+        request_context: &ConnectorRequestContext,
+    ) -> Result<IcebergPhysicalTable, String> {
+        ConnectorOperationControl::check_active(request_context)
+            .map_err(|error| error.to_string())?;
+        let namespace = normalize_identifier(namespace)?;
+        let table = normalize_identifier(table)?;
+        let loaded = self
+            .observe_table_classified(
+                &namespace,
+                &table,
+                request_context.vended_credential_lease_collection(),
+                Some(request_context),
+            )
+            .map_err(|(_, message)| message)?;
+        ConnectorOperationControl::check_active(request_context)
+            .map_err(|error| error.to_string())?;
+        let renewal = loaded.attempt_access_if_vended();
+        let binding = self
+            .resources
+            .planning_binding()
+            .for_request(request_context.clone());
+        let mut scoped = IcebergPhysicalTable::request_scoped(
+            &loaded.table,
+            binding,
+            self.resources.catalog_runtime().iceberg_runtime().clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        if let Some(renewal) = renewal {
+            scoped = scoped.with_attempt_access(renewal);
+        }
+        Ok(scoped)
+    }
+
     /// Request-scoped variant retaining provider error classification for the
     /// typed read boundary, where `NotFound` remains distinct from a control
     /// failure. Vended materialization still stays request-local and bypasses
