@@ -2356,11 +2356,28 @@ impl IcebergWriteSessionControl {
                 ConnectorWriteSessionFlavor::CopyOnWrite { .. }
             ),
         )?;
-        let authored_input = crate::commit::write_preparation::freeze_write_input_request(
-            writer_metadata,
-            &request.input,
-            &request.context,
-        )?;
+        let authored_input = if matches!(
+            &request.flavor,
+            ConnectorWriteSessionFlavor::DistributedRewrite {
+                shape: ConnectorDistributedRewriteShape::PositionDeletes { .. },
+                ..
+            }
+        ) {
+            // The retained rewrite header, exact object/base and groups were
+            // checked above. Only this provider-owned artifact relation uses
+            // file_path/pos; ordinary scan identities are still _file/_pos.
+            crate::commit::write_preparation::freeze_position_delete_rewrite_input(
+                writer_metadata,
+                &request.input,
+                &request.context,
+            )?
+        } else {
+            crate::commit::write_preparation::freeze_write_input_request(
+                writer_metadata,
+                &request.input,
+                &request.context,
+            )?
+        };
         crate::commit::write_preparation::validate_session_write_input_request(
             &request.input,
             &authored_input,

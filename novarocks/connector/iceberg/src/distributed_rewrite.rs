@@ -780,7 +780,6 @@ fn rewrite_execution_schema(
     novarocks_connector_contract::ConnectorReadExecutionSchema,
     novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
 > {
-    use novarocks_connector_contract::{ConnectorReadExecutionSchema, PureProviderCompileError};
     if matches!(
         operation,
         ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
@@ -797,6 +796,18 @@ fn rewrite_execution_schema(
             creation,
         );
     }
+    delete_artifact_execution_schema(creation)
+}
+
+/// The frozen position-delete artifact reader and its rewrite writer share
+/// this provider-owned declaration. These names are not scan metadata aliases.
+pub(crate) fn delete_artifact_execution_schema(
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<
+    novarocks_connector_contract::ConnectorReadExecutionSchema,
+    novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+> {
+    use novarocks_connector_contract::{ConnectorReadExecutionSchema, PureProviderCompileError};
     let mut fields = creation.reserve(2)?;
     let mut bindings = creation.reserve(2)?;
     for (name, primitive) in [

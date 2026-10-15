@@ -3974,21 +3974,61 @@ impl FrozenRewriteLake {
             target_ref: prep.target_ref().clone(),
             intent: prep.intent(),
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
-                fields: prep
-                    .input()
-                    .fields()
-                    .iter()
-                    .map(|b| {
-                        novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
-                            b.field().clone(),
-                            b.execution_type()
-                                .expect("rewrite field declaration")
-                                .clone(),
-                        )
-                        .expect("frozen writer declaration")
-                    })
-                    .collect(),
+            input: {
+                use novarocks_spi::connector::{
+                    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
+                    ConnectorWriteInputRequest,
+                };
+                let fields = |bindings: &[ConnectorWriteFieldBinding]| {
+                    bindings
+                        .iter()
+                        .map(|binding| {
+                            ConnectorWriteFieldRequest::try_new_typed(
+                                binding.field().clone(),
+                                binding
+                                    .execution_type()
+                                    .expect("rewrite field declaration")
+                                    .clone(),
+                            )
+                            .expect("frozen writer declaration")
+                        })
+                        .collect()
+                };
+                // Preserve the actual provider preparation, as FE does. In
+                // particular, delete artifacts are not ordinary data fields.
+                match prep.input() {
+                    ConnectorWriteInputShape::Data { fields: input } => {
+                        ConnectorWriteInputRequest::Data {
+                            fields: fields(input),
+                        }
+                    }
+                    ConnectorWriteInputShape::RowLineage {
+                        data_fields,
+                        row_identity_fields,
+                    } => ConnectorWriteInputRequest::RowLineage {
+                        data_fields: fields(data_fields),
+                        row_identity_fields: fields(row_identity_fields),
+                    },
+                    ConnectorWriteInputShape::PositionDelete {
+                        identity_fields,
+                        partition_source_fields,
+                    } => ConnectorWriteInputRequest::PositionDelete {
+                        identity_fields: fields(identity_fields),
+                        partition_source_fields: fields(partition_source_fields),
+                    },
+                    ConnectorWriteInputShape::DeletionVector {
+                        identity_fields,
+                        partition_source_fields,
+                    } => ConnectorWriteInputRequest::DeletionVector {
+                        identity_fields: fields(identity_fields),
+                        partition_source_fields: fields(partition_source_fields),
+                    },
+                    ConnectorWriteInputShape::EqualityDelete { equality_fields } => {
+                        ConnectorWriteInputRequest::EqualityDelete {
+                            equality_fields: fields(equality_fields),
+                        }
+                    }
+                }
             },
             base: None,
             flavor: ConnectorWriteSessionFlavor::DistributedRewrite {
@@ -4486,6 +4526,147 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
     let plan = lake.plan(true);
     assert_eq!(plan.cohorts().len(), 2);
     assert_eq!(lake.inventory(), before);
+    // The real planner freezes file_path/pos artifact identities. Enter C1
+    // using that exact preparation, rather than testing only its read splits.
+    // These requests must never gain ordinary scan-metadata alias authority.
+    let source_snapshot = lake.table().metadata().current_snapshot_id();
+    for case in 0..11 {
+        let mut request = lake.request(&plan);
+        let novarocks_spi::connector::ConnectorWriteInputRequest::DeletionVector {
+            identity_fields,
+            ..
+        } = &mut request.input
+        else {
+            panic!("frozen position-delete preparation")
+        };
+        match case {
+            0 => {
+                identity_fields.pop();
+            }
+            1 => {
+                identity_fields[0] =
+                    novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                        Field::new("_file", DataType::Utf8, false),
+                        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+                    )
+                    .unwrap();
+            }
+            2 => identity_fields.swap(0, 1),
+            3 | 4 => {
+                let data_type = if case == 3 {
+                    DataType::Int32
+                } else {
+                    DataType::Int64
+                };
+                let nullable = case == 4;
+                identity_fields[1] =
+                    novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                        Field::new("pos", data_type.clone(), nullable),
+                        novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+                    )
+                    .unwrap();
+            }
+            5 => request.flavor = ConnectorWriteSessionFlavor::Ordinary,
+            6 => {
+                request.input = novarocks_spi::connector::ConnectorWriteInputRequest::Data {
+                    fields: Vec::new(),
+                }
+            }
+            7..=10 => {
+                let content = plan
+                    .frozen()
+                    .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
+                    .unwrap();
+                let mut content = content.as_ref().clone();
+                let mut owner = lake.control.binding_key().clone();
+                match case {
+                    7 => content.artifact.table_uuid = "replaced".into(),
+                    8 => content.artifact.target_ref = "another".into(),
+                    9 => content.artifact.base_snapshot_id = None,
+                    10 => owner.instance_id = ConnectorInstanceId::parse("foreign").unwrap(),
+                    _ => unreachable!(),
+                }
+                request.flavor = ConnectorWriteSessionFlavor::DistributedRewrite {
+                    shape: plan.shape(),
+                    frozen: ConnectorProcessLocalPayload::new(owner, Arc::new(content)),
+                };
+            }
+            _ => unreachable!(),
+        }
+        let error = lake.control.begin_write(request).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            if matches!(case, 8 | 10) {
+                ConnectorErrorKind::Internal
+            } else {
+                ConnectorErrorKind::InvalidRequest
+            },
+            "case {case}: {error}"
+        );
+        assert_eq!(
+            lake.inventory(),
+            before,
+            "rejected begin {case} wrote an artifact"
+        );
+        assert_eq!(
+            lake.table().metadata().current_snapshot_id(),
+            source_snapshot
+        );
+    }
+    let writer = lake.control.begin_write(lake.request(&plan)).unwrap();
+    assert_eq!(writer.targets().len(), plan.cohorts().len());
+    for target in writer.targets() {
+        assert_eq!(
+            lake.adapter
+                .writer_handle(target.handle())
+                .unwrap()
+                .branch(),
+            IcebergWriteBranch::DeletionVector
+        );
+        let ConnectorWriteInputShape::DeletionVector {
+            identity_fields,
+            partition_source_fields,
+        } = target.input()
+        else {
+            panic!("position-delete writer lost its artifact input")
+        };
+        assert!(partition_source_fields.is_empty());
+        assert_eq!(identity_fields.len(), 2);
+        for (binding, (name, data_type)) in identity_fields
+            .iter()
+            .zip([("file_path", DataType::Utf8), ("pos", DataType::Int64)])
+        {
+            assert_eq!(binding.field(), &Field::new(name, data_type.clone(), false));
+            assert_eq!(
+                binding.execution_type().unwrap(),
+                &novarocks_type_contract::FunctionValueType::new(data_type, false)
+            );
+        }
+    }
+    assert_eq!(
+        lake.inventory(),
+        before,
+        "C1 begin must not write artifacts"
+    );
+    let aborted = lake
+        .control
+        .abort_write(
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionAbortRequest {
+                commit: writer.commit_handle(),
+                context: request_context(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        aborted,
+        ConnectorWriteAbortOutcome::KnownUncommitted { .. }
+    ));
+    drop(writer);
+    assert_eq!(lake.inventory(), before);
+    assert_eq!(
+        lake.table().metadata().current_snapshot_id(),
+        source_snapshot
+    );
     let descriptor = descriptor("rewrite-local");
     let catalog = CatalogHandle::new(
         descriptor.instance_id.clone(),
