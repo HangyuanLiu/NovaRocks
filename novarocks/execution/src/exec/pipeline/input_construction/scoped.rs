@@ -164,6 +164,18 @@ pub struct ObservedInputConstructionFactory {
     _creation: Arc<CreatorGuard>,
 }
 impl ObservedInputConstructionFactory {
+    /// Pure geometry of the SAME actual scope holder allocations. This is
+    /// request evidence only; the original host still admits both creations.
+    pub fn schema_scope_allocation_layouts()
+    -> Result<[Layout; 2], novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    {
+        Ok([
+            novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<
+                CreatorGuard,
+            >())?,
+            Layout::new::<Scope>(),
+        ])
+    }
     pub fn try_new(
         profile: InputConstructionProfile,
         host: Arc<dyn InputConstructionRequestHost>,
@@ -197,7 +209,7 @@ impl ObservedInputConstructionFactory {
         profile: InputConstructionProfile,
         host: Arc<dyn InputConstructionRequestHost>,
     ) -> Result<Arc<CreatorGuard>, ConstructionFailure> {
-        let layout = arc_layout::<CreatorGuard>()?;
+        let layout = Self::schema_scope_allocation_layouts()?[0];
         if profile.max_requests < 1 || layout.size() > profile.max_request_bytes {
             return Err(exhausted());
         }
@@ -215,7 +227,7 @@ impl ObservedInputConstructionFactory {
     fn begin_scope(&self) -> Result<Box<dyn InputConstructionOwner>, ConstructionFailure> {
         self.control.checkpoint(0)?;
         let guard = Self::creator(self.profile, self.host.clone())?;
-        guard.request(Layout::new::<Scope>())?;
+        guard.request(Self::schema_scope_allocation_layouts()?[1])?;
         Ok(Box::new(Scope {
             guard,
             control: self.control.clone(),

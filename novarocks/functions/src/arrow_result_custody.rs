@@ -18,6 +18,7 @@
 //! Lifetime transfer for one already-authorized Arrow result backing group.
 //! This author changes buffer custody only, never bytes, schema or row meaning.
 
+use crate::ScalarResourceError;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostShared;
 use crate::kernel_control::invalid;
@@ -28,7 +29,13 @@ use arrow_array::{Array, ArrayRef, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
+use novarocks_type_contract::owned_resources::layout::arc_layout;
+use std::{alloc::Layout, marker::PhantomData};
 use std::{any::Any, panic::RefUnwindSafe, sync::Arc};
+
+use crate::source_custody_resources::{
+    SourceCustodyRequestFacts, SourceRequestPricing, model_failure,
+};
 
 /// Declaration order is significant: all original buffers die before their
 /// host charge. Keeping the whole original group alive also prevents releasing
@@ -48,6 +55,12 @@ fn checked_add(a: usize, b: usize) -> Result<usize, KernelFailure> {
 }
 fn checked_mul(a: usize, b: usize) -> Result<usize, KernelFailure> {
     a.checked_mul(b).ok_or(KernelFailure::ResourceExhausted)
+}
+fn extent_add(a: usize, b: usize) -> Result<usize, ScalarResourceError> {
+    a.checked_add(b).ok_or(ScalarResourceError::Arithmetic)
+}
+fn extent_mul(a: usize, b: usize) -> Result<usize, ScalarResourceError> {
+    a.checked_mul(b).ok_or(ScalarResourceError::Arithmetic)
 }
 
 /// Conservative private Bytes Arc header upper for the pinned Arrow 58.4.0
@@ -79,14 +92,14 @@ pub fn preflight_buffer_adoption_structure<H>(
 }
 
 fn custom_buffer_metadata() -> Result<usize, KernelFailure> {
-    // The custom allocation additionally creates its real BufferCustodian Arc.
-    // Splitting the existing eleven-word bound preserves the original policy.
-    checked_add(
-        original_buffer_header_upper_bound()?,
-        checked_add(
-            size_of::<BufferCustodian<OpaqueRetainedCharge>>(),
-            checked_mul(size_of::<usize>(), 3)?,
-        )?,
+    custom_buffer_metadata_facts().map_err(model_failure)
+}
+fn custom_buffer_metadata_facts() -> Result<usize, ScalarResourceError> {
+    let word = size_of::<usize>();
+    // Arc<BufferCustodian> plus Arc<Bytes>, including both reference headers.
+    extent_add(
+        size_of::<BufferCustodian<OpaqueRetainedCharge>>(),
+        extent_mul(word, 11)?,
     )
 }
 
@@ -216,10 +229,17 @@ pub(crate) fn custody_node_metadata_upper_bound(
     has_nulls: bool,
     children: usize,
 ) -> Result<usize, KernelFailure> {
-    let buffers = checked_add(data_buffers, usize::from(has_nulls))?;
-    let vector_bytes = checked_add(
-        checked_mul(data_buffers, size_of::<Buffer>())?,
-        checked_mul(children, size_of::<ArrayData>())?,
+    custody_node_metadata_facts(data_buffers, has_nulls, children).map_err(model_failure)
+}
+fn custody_node_metadata_facts(
+    data_buffers: usize,
+    has_nulls: bool,
+    children: usize,
+) -> Result<usize, ScalarResourceError> {
+    let buffers = extent_add(data_buffers, usize::from(has_nulls))?;
+    let vector_bytes = extent_add(
+        extent_mul(data_buffers, size_of::<Buffer>())?,
+        extent_mul(children, size_of::<ArrayData>())?,
     )?;
     // ArrayDataBuilder, the resulting ArrayData, and the original borrowed data
     // can coexist. make_array may own child ArrayRefs and one concrete body.
@@ -233,14 +253,208 @@ pub(crate) fn custody_node_metadata_upper_bound(
     .into_iter()
     .max()
     .expect("known supported scalar Arrow bodies");
-    let mut bytes = checked_add(checked_mul(size_of::<ArrayData>(), 3)?, vector_bytes)?;
-    bytes = checked_add(
+    let mut bytes = extent_add(extent_mul(size_of::<ArrayData>(), 3)?, vector_bytes)?;
+    bytes = extent_add(
         bytes,
-        checked_add(concrete_body, checked_mul(size_of::<usize>(), 3)?)?,
+        extent_add(concrete_body, extent_mul(size_of::<usize>(), 3)?)?,
     )?;
-    bytes = checked_add(bytes, checked_mul(buffers, custom_buffer_metadata()?)?)?;
-    bytes = checked_add(bytes, checked_mul(children, size_of::<ArrayRef>())?)?;
+    bytes = extent_add(bytes, extent_mul(buffers, custom_buffer_metadata_facts()?)?)?;
+    bytes = extent_add(bytes, extent_mul(children, size_of::<ArrayRef>())?)?;
     Ok(bytes)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FlatByteKind {
+    Binary,
+    Utf8,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequestUpper {
+    pub(crate) bytes: usize,
+    pub(crate) requests: usize,
+}
+/// Original default byte-builder finish and direct opaque custody only.
+/// Payload capacities and allocator metadata have their own source authors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FlatDirectByteFacts {
+    pub(crate) finish_global: RequestUpper,
+    pub(crate) custody_global: RequestUpper,
+    pub(crate) custody_typed: RequestUpper,
+    pub(crate) finish_global_peak_extra: usize,
+    pub(crate) custody_global_peak_extra: usize,
+    pub(crate) custody_typed_peak_extra: usize,
+    pub(crate) global_retained_metadata_upper: usize,
+    pub(crate) typed_retained_metadata_upper: usize,
+    pub(crate) original_metadata_stock_upper: usize,
+    pub(crate) settlement_metadata_upper: usize,
+}
+
+/// Facts from the actual private direct-opaque types, without constructing an
+/// array, charge, holder or fabricated validity bitmap. Validity is an upper
+/// shape, not a claim that the original builder will actually create it.
+pub(crate) fn direct_flat_byte_facts(
+    kind: FlatByteKind,
+    validity_upper: bool,
+) -> Result<FlatDirectByteFacts, ScalarResourceError> {
+    crate::scalar_resources::require_arrow_model()?;
+    let shared = |payload: Layout| {
+        arc_layout(payload)
+            .map(|layout| layout.size())
+            .map_err(|_| ScalarResourceError::Arithmetic)
+    };
+    // Pinned Bytes is bounded by 48/8; this is not its private representation.
+    let bytes_arc =
+        shared(Layout::from_size_align(48, 8).map_err(|_| ScalarResourceError::Arithmetic)?)?;
+    let array_arc = shared(match kind {
+        FlatByteKind::Binary => Layout::new::<arrow_array::BinaryArray>(),
+        FlatByteKind::Utf8 => Layout::new::<arrow_array::StringArray>(),
+    })?;
+    let holder = HostShared::<OriginalBacking<OpaqueRetainedCharge>>::allocation_layout().size();
+    let custodian = shared(Layout::new::<BufferCustodian<OpaqueRetainedCharge>>())?;
+    let buffers = extent_add(2, usize::from(validity_upper))?;
+    let b = size_of::<Buffer>();
+    let original = extent_add(extent_mul(buffers, bytes_arc)?, array_arc)?;
+    let finish = extent_add(
+        extent_add(original, extent_mul(4, b)?)?,
+        extent_mul(4, size_of::<i32>())?,
+    )?;
+    let custody = extent_add(
+        extent_add(
+            extent_mul(6, b)?,
+            extent_mul(buffers, extent_add(custodian, bytes_arc)?)?,
+        )?,
+        array_arc,
+    )?;
+    // A dependent Arrow build may enable validation. Cover the three original
+    // sites conservatively; their scratch lives sequentially, not all at once.
+    let validation = Layout::array::<arrow_data::BufferSpec>(2)
+        .map_err(|_| ScalarResourceError::Arithmetic)?
+        .size();
+    Ok(FlatDirectByteFacts {
+        finish_global: RequestUpper {
+            bytes: extent_add(finish, validation)?,
+            requests: extent_add(buffers, 4)?,
+        },
+        custody_global: RequestUpper {
+            bytes: extent_add(custody, extent_mul(2, validation)?)?,
+            requests: extent_add(6, extent_mul(2, buffers)?)?,
+        },
+        custody_typed: RequestUpper {
+            bytes: holder,
+            requests: 1,
+        },
+        finish_global_peak_extra: extent_add(finish, validation)?,
+        custody_global_peak_extra: extent_add(original, extent_add(custody, validation)?)?,
+        custody_typed_peak_extra: holder,
+        global_retained_metadata_upper: extent_add(
+            extent_add(original, extent_add(array_arc, extent_mul(2, b)?)?)?,
+            extent_mul(buffers, extent_add(custodian, bytes_arc)?)?,
+        )?,
+        typed_retained_metadata_upper: holder,
+        original_metadata_stock_upper: original,
+        settlement_metadata_upper: custody_node_metadata_facts(2, validity_upper, 0)?,
+    })
+}
+
+#[cfg(test)]
+mod flat_byte_pricing_tests {
+    use super::*;
+    use arrow_array::builder::{BinaryBuilder, StringBuilder};
+
+    #[test]
+    fn direct_flat_byte_zero_rows_keep_original_two_buffers_and_actual_private_holder() {
+        for kind in [FlatByteKind::Binary, FlatByteKind::Utf8] {
+            let original: ArrayRef = match kind {
+                FlatByteKind::Binary => Arc::new(BinaryBuilder::new().finish()),
+                FlatByteKind::Utf8 => Arc::new(StringBuilder::new().finish()),
+            };
+            let data = original.to_data();
+            assert_eq!(original.len(), 0);
+            assert_eq!(data.buffers().len(), 2);
+            assert_eq!(data.buffers()[0].capacity(), 4100);
+            assert_eq!(data.buffers()[1].capacity(), 1024);
+            assert!(data.nulls().is_none());
+            let facts = direct_flat_byte_facts(kind, false).unwrap();
+            // Three original validation sites are conservative extra requests.
+            assert_eq!(facts.finish_global.requests, 6);
+            assert_eq!(facts.custody_global.requests, 10);
+            assert_eq!(facts.custody_typed.requests, 1);
+            assert_eq!(
+                facts.custody_typed.bytes,
+                HostShared::<OriginalBacking<OpaqueRetainedCharge>>::allocation_layout().size()
+            );
+            assert_eq!(
+                facts.typed_retained_metadata_upper,
+                facts.custody_typed.bytes
+            );
+            assert_eq!(
+                facts.settlement_metadata_upper,
+                custody_metadata_upper_bound(&data, &mut EvaluationCheckpoints::new(&Control))
+                    .unwrap()
+            );
+            assert!(facts.finish_global_peak_extra < facts.custody_global_peak_extra);
+        }
+    }
+    struct Control;
+    impl KernelEvaluationControl for Control {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+            unreachable!()
+        }
+    }
+    #[test]
+    fn direct_flat_byte_nullable_shape_covers_real_original_validity_and_settlement() {
+        for kind in [FlatByteKind::Binary, FlatByteKind::Utf8] {
+            let original: ArrayRef = match kind {
+                FlatByteKind::Binary => {
+                    let mut builder = BinaryBuilder::new();
+                    builder.append_value(b"body");
+                    builder.append_null();
+                    Arc::new(builder.finish())
+                }
+                FlatByteKind::Utf8 => {
+                    let mut builder = StringBuilder::new();
+                    builder.append_value("body");
+                    builder.append_null();
+                    Arc::new(builder.finish())
+                }
+            };
+            let data = original.to_data();
+            assert!(data.nulls().is_some());
+            let base = direct_flat_byte_facts(kind, false).unwrap();
+            let nullable = direct_flat_byte_facts(kind, true).unwrap();
+            assert_eq!(
+                nullable.finish_global.requests,
+                base.finish_global.requests + 1
+            );
+            assert_eq!(
+                nullable.custody_global.requests,
+                base.custody_global.requests + 2
+            );
+            assert_eq!(nullable.custody_typed, base.custody_typed);
+            assert!(nullable.global_retained_metadata_upper > base.global_retained_metadata_upper);
+            assert_eq!(
+                nullable.settlement_metadata_upper,
+                custody_metadata_upper_bound(&data, &mut EvaluationCheckpoints::new(&Control))
+                    .unwrap()
+            );
+        }
+    }
+    #[test]
+    fn direct_flat_byte_checked_metadata_keeps_original_arithmetic_failure_projection() {
+        for (buffers, children) in [(usize::MAX, 0), (0, usize::MAX)] {
+            assert_eq!(
+                custody_node_metadata_facts(buffers, false, children),
+                Err(ScalarResourceError::Arithmetic)
+            );
+            assert_eq!(
+                custody_node_metadata_upper_bound(buffers, false, children),
+                Err(KernelFailure::ResourceExhausted)
+            );
+        }
+    }
 }
 
 fn wrap_buffer<C: Send + Sync + 'static>(
@@ -698,6 +912,38 @@ impl<C: Send + Sync + 'static> Clone for SourceBackingOwner<C> {
     }
 }
 impl<C: Send + Sync + 'static> SourceBackingOwner<C> {
+    /// Fresh typed holder requests, without allocating or granting capacity.
+    pub fn owned_request_facts() -> Result<SourceCustodyRequestFacts, crate::ScalarResourceError> {
+        crate::scalar_resources::require_arrow_model()?;
+        SourceCustodyRequestFacts::owned(
+            HostShared::<C>::allocation_layout(),
+            HostAggregateAllocator::metadata_allocation_bytes(),
+        )
+    }
+
+    /// Move an already-paid source into a dedicated cold direct allocator.
+    /// The caller funds the prefix before entry and qualifies its callbacks.
+    /// Failure drops C: surviving raw aliases still need their original owner.
+    pub fn try_from_owned_direct(
+        backing: C,
+        host: Arc<dyn crate::AggregateStateAllocator>,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<Self, KernelFailure> {
+        work.flush()?;
+        crate::scalar_resources::require_arrow_model().map_err(model_failure)?;
+        let capability = OpaqueRetainedCharge::try_new(Arc::clone(&host))?;
+        drop(capability);
+        work.flush()?;
+        let allocator = HostAggregateAllocator::try_new(Arc::clone(&host))?;
+        work.flush()?;
+        let backing = HostShared::try_new_direct(backing, allocator.clone(), work)?;
+        Ok(Self {
+            backing,
+            allocator,
+            host,
+        })
+    }
+
     pub fn try_from_owned(
         backing: C,
         host: Arc<dyn crate::AggregateStateAllocator>,
@@ -740,6 +986,90 @@ impl<C: Send + Sync + 'static> SourceBackingOwner<C> {
 struct SourceCustody<C: Send + Sync + 'static> {
     source: SourceBackingOwner<C>,
     metadata: OpaqueRetainedCharge,
+}
+
+fn source_request_pricing<C: Send + Sync + 'static>() -> SourceRequestPricing {
+    SourceRequestPricing {
+        group: HostShared::<OriginalBacking<SourceCustody<C>>>::allocation_layout(),
+        custodian: Layout::new::<BufferCustodian<SourceCustody<C>>>(),
+        bufferless: Layout::new::<BufferlessResult<SourceCustody<C>>>(),
+    }
+}
+
+/// A sealed request packet borrowing the exact audited source continuation.
+/// The caller supplies the original source premise and its actual paid owner;
+/// neither schema nor as_any alone certifies an arbitrary Array implementation.
+pub struct PreparedSourceCustody<'source, C: Send + Sync + 'static> {
+    original: &'source ArrayRef,
+    facts: SourceCustodyRequestFacts,
+    identity: PhantomData<C>,
+}
+impl<'source, C: Send + Sync + 'static> PreparedSourceCustody<'source, C> {
+    /// No ArrayData, ArrayRef clone, Field clone, or grant is created here.
+    /// The caller has already funded the preparation prefix and callbacks.
+    pub fn prepare(
+        original: &'source ArrayRef,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<Self, KernelFailure> {
+        work.flush()?;
+        crate::scalar_resources::require_arrow_model().map_err(model_failure)?;
+        let pricing = source_request_pricing::<C>();
+        let facts =
+            crate::array_backing_geometry::source_request_facts(original.as_ref(), &pricing, work)?;
+        Ok(Self {
+            original,
+            facts,
+            identity: PhantomData,
+        })
+    }
+    pub const fn request_facts(&self) -> SourceCustodyRequestFacts {
+        self.facts
+    }
+
+    /// Consume the same source loan under an already-paid complete operation.
+    /// Only GLOBAL metadata is transferred from this same-host reservation;
+    /// typed blocks have separate host grants. The original source is not paid
+    /// again. This path borrows work and owns neither completion nor a journal.
+    ///
+    /// The caller's qualified GLOBAL physical owner must survive real free,
+    /// including outer Arc/Weak tails after the opaque charge has exited.
+    pub fn retain(
+        self,
+        source: &SourceBackingOwner<C>,
+        reservation: &mut OpaqueReservation,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<ArrayRef, KernelFailure> {
+        work.flush()?;
+        if !reservation.belongs_to_allocator(&source.allocator) {
+            return Err(invalid(
+                "source custody uses a different actual reservation host",
+            ));
+        }
+        if self.facts.global_peak_upper() > reservation.remaining_bytes() {
+            return Err(invalid(
+                "source custody exceeds its complete operation reservation",
+            ));
+        }
+        let mut metadata = OpaqueRetainedCharge::try_new(Arc::clone(&source.host))?;
+        metadata.reconcile_under_reservation(self.facts.global_retained_upper(), reservation)?;
+        work.flush()?;
+        let data = self.original.to_data();
+        work.flush()?;
+        let owner = HostShared::try_new_direct(
+            OriginalBacking {
+                original: Arc::clone(self.original),
+                data,
+                custody: SourceCustody {
+                    source: source.clone(),
+                    metadata,
+                },
+            },
+            source.allocator.clone(),
+            work,
+        )?;
+        // Same original buffer transform, rebox, refcounts, and destruction.
+        wrap_original_group(owner, work)
+    }
 }
 
 /// Alias one original source array while transferring its ACTUAL input owner

@@ -34,6 +34,8 @@ from pathlib import Path
 DATASKETCHES = "datasketches"
 EXECUTION = "novarocks-execution"
 FUNCTIONS = "novarocks-functions"
+FUNCTION_CONTRACT = "novarocks-function-contract"
+CONSTANT_CONTRACT = "novarocks-constant-contract"
 TYPE_CONTRACT = "novarocks-type-contract"
 RESULT_CONTRACT = "novarocks-result-contract"
 CONSTANT_CONTRACT = "novarocks-constant-contract"
@@ -46,6 +48,13 @@ SERVER = "novarocks-server"
 
 ROLE_PACKAGES = {FRONTEND_APPLICATION, NATIVE_ADAPTER, SERVER}
 ALLOWED_PRODUCTION_DATASKETCHES_OWNERS = {EXECUTION, FUNCTIONS, ICEBERG_FUNCTIONS}
+FUNCTIONS_INTERNAL_CLOSURE = {
+    FUNCTIONS,
+    FUNCTION_CONTRACT,
+    CONSTANT_CONTRACT,
+    TYPE_CONTRACT,
+    RESULT_CONTRACT,
+}
 FORBIDDEN_ICEBERG_FUNCTIONS_CLOSURE = {
     EXECUTION,
     NATIVE_ADAPTER,
@@ -217,6 +226,7 @@ def verify_dependency_boundary(metadata, repo_root):
     require_exact_dependency(
         iceberg_functions, DATASKETCHES, kind=None, features={"theta"}
     )
+    require_exact_dependency(functions, DATASKETCHES, kind=None, features={"hll"})
     require_exact_dependency(
         execution,
         ICEBERG_FUNCTIONS,
@@ -245,13 +255,10 @@ def verify_dependency_boundary(metadata, repo_root):
         for name in normal_closure(metadata, ICEBERG_FUNCTIONS)
         if name.startswith("novarocks-")
     }
-    # Functions carries exact type/result vocabulary, immutable typed constants,
-    # and original call requests. These contracts own no runtime or provider
-    # authority; arbitrary internal owners remain outside this exact closure.
-    expected_internal = {
-        ICEBERG_FUNCTIONS, FUNCTIONS, TYPE_CONTRACT, RESULT_CONTRACT,
-        CONSTANT_CONTRACT, FUNCTION_CONTRACT,
-    }
+    # Shared computation uses only these neutral function, constant, type and
+    # result contracts. The provider contribution adds only its own package.
+    # The forbidden set still fences execution, role and provider capabilities.
+    expected_internal = FUNCTIONS_INTERNAL_CLOSURE | {ICEBERG_FUNCTIONS}
     if iceberg_internal != expected_internal:
         fail(
             f"{ICEBERG_FUNCTIONS} internal normal closure must be exactly "
@@ -273,9 +280,7 @@ def verify_dependency_boundary(metadata, repo_root):
         if name.startswith("novarocks-")
     }
     # Keep the same exact pure vocabulary closure for the scalar owner.
-    expected_functions_internal = {
-        FUNCTIONS, TYPE_CONTRACT, RESULT_CONTRACT, CONSTANT_CONTRACT, FUNCTION_CONTRACT,
-    }
+    expected_functions_internal = FUNCTIONS_INTERNAL_CLOSURE
     if functions_internal != expected_functions_internal:
         fail(
             f"{FUNCTIONS} internal normal closure must be exactly "

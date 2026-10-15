@@ -1255,6 +1255,34 @@ mod tests {
         }
     }
     #[test]
+    fn complete_scalar_identities_preserve_largeint_and_variant_without_source_tags() {
+        let large: ArrayRef =
+            Arc::new(FixedSizeBinaryArray::try_from_iter([[0_u8; 16]].into_iter()).unwrap());
+        let variant: ArrayRef = Arc::new(LargeBinaryArray::from(vec![&[0xff, 0x00][..]]));
+        for (array, marker, value_type) in [
+            (large, ValueLogicalType::LargeInt, ScalarValueType::LargeInt),
+            (variant, ValueLogicalType::Variant, ScalarValueType::Variant),
+        ] {
+            let plain = chunk(Arc::clone(&array), Some(marker), None);
+            let marked = chunk(array, Some(marker), Some("forged"));
+            let expected = schema(value_type, true);
+            assert_eq!(
+                encode(&plain, Arc::clone(&expected), 1),
+                encode(&marked, expected, 1)
+            );
+        }
+        let uuid = chunk(
+            Arc::new(FixedSizeBinaryArray::try_from_iter([[0_u8; 16]].into_iter()).unwrap()),
+            Some(ValueLogicalType::Uuid),
+            None,
+        );
+        assert_eq!(
+            validate_to_completion(&uuid, &schema(ScalarValueType::LargeInt, true)),
+            Err(NativeScalarLeafError::LogicalMetadata)
+        );
+    }
+
+    #[test]
     fn variant_and_json_preserve_the_declared_domain_without_formatting() {
         let variant = chunk(
             Arc::new(LargeBinaryArray::from(vec![&[0xff, 0x00][..]])),

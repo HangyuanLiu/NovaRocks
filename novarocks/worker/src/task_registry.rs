@@ -1473,7 +1473,9 @@ impl TaskExecutionRegistry {
         let prepared = match self.task_host.install_receiver(
             &transaction.descriptor,
             input,
-            transaction.cell.preparation_stop_view(),
+            transaction
+                .cell
+                .preparation_stop_view(self.config.gate_poll_interval),
         ) {
             Ok(prepared) => prepared,
             Err(rejection) => {

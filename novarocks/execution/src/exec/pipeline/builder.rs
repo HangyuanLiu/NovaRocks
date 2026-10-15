@@ -42,6 +42,8 @@ pub(crate) use compiled::family_fixture::{
 pub(crate) use compiled::{compiled_statistics_finish_fixture, compiled_statistics_writer_fixture};
 mod local;
 pub(crate) use compiled::build_compiled_pipeline_graph;
+#[cfg(any(test, feature = "test-support"))]
+pub use compiled::build_compiled_pipeline_graph_for_test;
 pub(crate) use local::build_native_pipeline_graph_for_local_program_with_runtime_settings;
 
 use crate::runtime_filter as execution;
@@ -3627,4 +3629,11 @@ mod tests {
 
         assert_eq!(local_exchange_source_count(&graph), 0);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn compiled_root_result_fixture(
+    project: Option<bool>,
+) -> Arc<novarocks_local_program::LocalProgram> {
+    compiled::values_tests::root_result_boundary_tests::boundary_program(project)
 }

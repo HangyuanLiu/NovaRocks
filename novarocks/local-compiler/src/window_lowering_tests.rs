@@ -1111,3 +1111,105 @@ fn sum_min_max_over_prepare_through_their_installed_window_kernels() {
         assert!(kernel.contract().aggregate().is_some());
     }
 }
+
+struct WindowOutputHost {
+    reject: bool,
+    calls: Vec<crate::ProjectOutputRequestFacts>,
+    completed: usize,
+}
+impl crate::ProjectMetadataScope for WindowOutputHost {
+    type HostError = std::io::Error;
+    fn materialize<C, B>(
+        &mut self,
+        facts: &crate::ProjectOutputRequestFacts,
+        body: B,
+    ) -> Result<crate::ProjectMetadataOutput, crate::ProjectMetadataFailure<Self::HostError, C>>
+    where
+        C: From<FragmentCompileError>,
+        B: FnOnce() -> Result<crate::ProjectMetadataOutput, C>,
+    {
+        self.calls.push(*facts);
+        if self.reject {
+            return Err(crate::ProjectMetadataFailure::Host(std::io::Error::other(
+                "original Window output funding refusal",
+            )));
+        }
+        let output = body().map_err(crate::ProjectMetadataFailure::Body)?;
+        assert!(output.exprs.is_empty());
+        assert!(output.expr_slot_ids.is_empty());
+        assert_eq!(output.layout.schema().metadata().capacity(), 0);
+        self.completed += 1;
+        Ok(output)
+    }
+}
+
+fn compile_hosted_window_output(
+    host: &mut WindowOutputHost,
+) -> Result<LocalProgram, FragmentCompileError> {
+    let catalog = catalog();
+    let source = Arc::try_unwrap(package(&mixed(), &catalog)).unwrap();
+    let source = Arc::new(source.with_original_metadata_namespace(
+        novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace::from_original_loans(Arc::from([])),
+    ));
+    let providers =
+        PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Control).unwrap();
+    let validated = validate_fragment_providers(source, &providers, &Control).unwrap();
+    crate::compile_fragment_with_project_metadata_host(
+        validated,
+        &catalog,
+        LocalCompileOptions {
+            pipeline_dop: NonZeroUsize::new(1).unwrap(),
+            root_sink_dop: Some(NonZeroUsize::new(1).unwrap()),
+            kernel_abi: KernelAbiVersion::CURRENT,
+            constants: constant_policy(),
+            exchange_wait: std::time::Duration::from_secs(120),
+        },
+        &Control,
+        host,
+    )
+}
+
+#[test]
+fn window_typed_output_actual_birth_is_inside_original_compile_observer() {
+    // This is the pure callback/body contract. Native tests separately prove
+    // original GLOBAL funding, attributed allocation origins and last aliases.
+    let direct = try_compile(&mixed()).unwrap();
+    let mut host = WindowOutputHost {
+        reject: false,
+        calls: Vec::new(),
+        completed: 0,
+    };
+    let hosted = compile_hosted_window_output(&mut host).unwrap();
+    assert_eq!(host.calls.len(), 1);
+    assert_eq!(host.calls[0].node, WINDOW);
+    assert!(host.calls[0].requests.allocation_requests_upper_bound > 0);
+    assert!(host.calls[0].requests.allocation_request_bytes_upper_bound > 0);
+    assert_eq!(host.completed, 1);
+    let direct = direct.graph().nodes()[direct.graph().root().index()].output_layout();
+    let hosted = hosted.graph().nodes()[hosted.graph().root().index()].output_layout();
+    assert_eq!(hosted.schema(), direct.schema());
+    assert_eq!(hosted.slots(), direct.slots());
+    for ordinal in 0..hosted.slots().len() {
+        assert_eq!(
+            hosted.value_binding_at(ordinal),
+            direct.value_binding_at(ordinal)
+        );
+    }
+}
+
+#[test]
+fn window_typed_output_funding_refusal_precedes_actual_birth() {
+    let mut host = WindowOutputHost {
+        reject: true,
+        calls: Vec::new(),
+        completed: 0,
+    };
+    let error = compile_hosted_window_output(&mut host).unwrap_err();
+    assert_eq!(host.calls.len(), 1);
+    assert_eq!(host.calls[0].node, WINDOW);
+    assert_eq!(host.completed, 0);
+    let FragmentCompileError::ProjectMetadataHost { error } = error else {
+        panic!("the original funding cause must remain nominal");
+    };
+    assert_eq!(error.to_string(), "original Window output funding refusal");
+}

@@ -22,6 +22,7 @@ use crate::physical_package_v2::definition_sources::tests::{
 use crate::physical_package_v2::encode::{PackageEncodeError, encode_fragment_package};
 use crate::physical_package_v2::provider_sources::tests::checked_read;
 use crate::physical_package_v2::test_support::{decode_limits, encode_limits};
+use crate::physical_type_v2::PackageTypeMaterializationScope;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
@@ -508,4 +509,118 @@ fn runtime_filter_package_roundtrips_its_plan_binding_slice_byte_identically() {
         matches!(shapeless, PackageDecodeError::Node(_)),
         "{shapeless}"
     );
+}
+
+struct TypeScope {
+    calls: usize,
+    ran: usize,
+    refuse: bool,
+}
+impl PackageTypeMaterializationScope for TypeScope {
+    type HostError = u32;
+    fn materialize<C, B>(
+        &mut self,
+        _: &PackageTypeProjectionFacts,
+        body: B,
+    ) -> Result<crate::physical_type_v2::DecodedTypeTable, ProjectionFailure<C, u32>>
+    where
+        C: From<TypeCodecError>,
+        B: FnOnce() -> Result<crate::physical_type_v2::DecodedTypeTable, C>,
+    {
+        self.calls += 1;
+        if self.refuse {
+            return Err(ProjectionFailure::Host(79));
+        }
+        self.ran += 1;
+        body().map_err(ProjectionFailure::Codec)
+    }
+}
+#[test]
+fn whole_package_type_host_keeps_original_bytes_and_every_checkpoint() {
+    let model = model();
+    for (name, package) in fixtures() {
+        let bytes = encode(&package).unwrap();
+        let direct = Control::default();
+        let expected = decode_fragment_package(&bytes, &model, &decode_limits(), &direct).unwrap();
+        let hosted = Control::default();
+        let mut host = TypeScope {
+            calls: 0,
+            ran: 0,
+            refuse: false,
+        };
+        let actual = decode_fragment_package_with_type_host(
+            &bytes,
+            &model,
+            &decode_limits(),
+            &hosted,
+            &mut host,
+        )
+        .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        assert_eq!(
+            encode(&actual).unwrap(),
+            encode(&expected).unwrap(),
+            "{name}"
+        );
+        assert_eq!(
+            *hosted.trace.lock().unwrap(),
+            *direct.trace.lock().unwrap(),
+            "{name}"
+        );
+        assert_eq!((host.calls, host.ran), (2, 2), "{name}");
+    }
+}
+#[test]
+fn whole_package_type_host_refusal_is_nominal_without_completion_callback() {
+    let bytes = encode(&rich_package()).unwrap();
+    let model = model();
+    let mut host = TypeScope {
+        calls: 0,
+        ran: 0,
+        refuse: true,
+    };
+    let original = Control::default();
+    assert!(matches!(
+        decode_fragment_package_with_type_host(
+            &bytes,
+            &model,
+            &decode_limits(),
+            &original,
+            &mut host
+        ),
+        Err(ProjectionFailure::Host(79))
+    ));
+    let length = original.trace.lock().unwrap().len();
+    // This callback would refuse the ordinary footer. It must never be called
+    // after the same host refusal, or replace that original nominal cause.
+    let stop = Control {
+        stop: Some((length, CompileControlError::Cancelled)),
+        trace: Mutex::new(Vec::new()),
+    };
+    let mut host = TypeScope {
+        calls: 0,
+        ran: 0,
+        refuse: true,
+    };
+    assert!(matches!(
+        decode_fragment_package_with_type_host(&bytes, &model, &decode_limits(), &stop, &mut host),
+        Err(ProjectionFailure::Host(79))
+    ));
+    assert_eq!(stop.trace.lock().unwrap().len(), length);
+    assert_eq!((host.calls, host.ran), (1, 0));
+    let mut host = TypeScope {
+        calls: 0,
+        ran: 0,
+        refuse: false,
+    };
+    assert!(matches!(
+        decode_fragment_package_with_type_host(
+            &[0x80],
+            &model,
+            &decode_limits(),
+            &Control::default(),
+            &mut host
+        ),
+        Err(ProjectionFailure::Codec(_))
+    ));
+    assert_eq!((host.calls, host.ran), (0, 0));
 }

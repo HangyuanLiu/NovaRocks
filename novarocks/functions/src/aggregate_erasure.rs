@@ -58,6 +58,7 @@ impl PreparedAggregateHandle {
             policy: kernel.memory_policy(),
             invocation_data: kernel.has_invocation_data(),
             emission_context: kernel.requires_emission_context(),
+            helper_memory: kernel.requires_helper_memory(),
             kernel,
         });
         control
@@ -358,7 +359,7 @@ impl Drop for AggregateStateSlot<'_> {
 /// latches this frame. The host separately latches the entire operator and
 /// must not rebuild a frame to replay an already mutated successful prefix.
 pub struct AggregateBatchInvocation<'frame> {
-    inner: Box<dyn BatchExecution + 'frame>,
+    inner: LeasedBatchExecution<'frame>,
 }
 impl AggregateBatchInvocation<'_> {
     pub fn run(&mut self, control: &dyn KernelEvaluationControl) -> Result<(), KernelFailure> {
@@ -374,7 +375,7 @@ impl AggregateBatchInvocation<'_> {
 
 /// Same erased row loop, with the lossless whole invocation failure channel.
 pub struct AggregateEvaluationBatchInvocation<'frame> {
-    inner: Box<dyn BatchExecution + 'frame>,
+    inner: LeasedBatchExecution<'frame>,
 }
 impl AggregateEvaluationBatchInvocation<'_> {
     pub fn run(&mut self, control: &dyn KernelEvaluationControl) -> Result<(), EvaluationFailure> {
@@ -384,6 +385,24 @@ impl AggregateEvaluationBatchInvocation<'_> {
         self.inner.retained_preparation_bytes()
     }
     pub fn rows_processed(&self) -> usize {
+        self.inner.rows_processed()
+    }
+}
+
+/// Declaration order destroys the pointee and deallocates its actual Box
+/// before returning the helper reservation. The wrapper itself stays inline.
+struct LeasedBatchExecution<'frame> {
+    inner: Box<dyn BatchExecution + 'frame>,
+    _helper_lease: Option<crate::opaque_memory::OpaqueReservation>,
+}
+impl LeasedBatchExecution<'_> {
+    fn retained_preparation_bytes(&self) -> usize {
+        self.inner.retained_preparation_bytes()
+    }
+    fn run(&mut self, control: &dyn KernelEvaluationControl) -> Result<(), EvaluationFailure> {
+        self.inner.run(control)
+    }
+    fn rows_processed(&self) -> usize {
         self.inner.rows_processed()
     }
 }
@@ -441,7 +460,7 @@ pub(crate) trait ErasedAggregateOps: Send + Sync + fmt::Debug {
         input: SelectedAggregateUpdateInput<'frame, 'frame>,
         allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<Box<dyn BatchExecution + 'frame>, EvaluationFailure>;
+    ) -> Result<LeasedBatchExecution<'frame>, EvaluationFailure>;
     fn prepare_merge<'frame, 'storage: 'frame>(
         &'frame self,
         states: &'frame mut [AggregateStateSlot<'storage>],
@@ -449,7 +468,7 @@ pub(crate) trait ErasedAggregateOps: Send + Sync + fmt::Debug {
         input: SelectedAggregateMergeInput<'frame, 'frame>,
         allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<Box<dyn BatchExecution + 'frame>, EvaluationFailure>;
+    ) -> Result<LeasedBatchExecution<'frame>, EvaluationFailure>;
     fn emit(
         &self,
         states: &[AggregateStateSlot<'_>],
@@ -467,11 +486,13 @@ struct TypedOps<K: PreparedAggregateKernel> {
     policy: AggregateStateMemoryPolicy,
     invocation_data: bool,
     emission_context: bool,
+    helper_memory: bool,
 }
 impl<K: PreparedAggregateKernel> TypedOps<K> {
     fn validate_metadata(&self) -> Result<(), KernelFailure> {
         if self.kernel.has_invocation_data() != self.invocation_data
             || self.kernel.requires_emission_context() != self.emission_context
+            || self.kernel.requires_helper_memory() != self.helper_memory
             || self.kernel.memory_policy() != self.policy
             || !Arc::ptr_eq(self.kernel.contract(), &self.contract)
         {
@@ -531,6 +552,7 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
             || kernel.memory_policy() != self.policy
             || kernel.has_invocation_data() != self.invocation_data
             || kernel.requires_emission_context() != self.emission_context
+            || kernel.requires_helper_memory() != self.helper_memory
         {
             return Err(internal(
                 "local aggregate phase replaced its immutable declaration",
@@ -595,7 +617,15 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
         input: SelectedAggregateUpdateInput<'frame, 'frame>,
         allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<Box<dyn BatchExecution + 'frame>, EvaluationFailure> {
+    ) -> Result<LeasedBatchExecution<'frame>, EvaluationFailure> {
+        let helper_lease = if self.helper_memory {
+            Some(crate::aggregate_helper_memory::reserve_frame_backing(
+                allocator.as_ref(),
+                Layout::new::<UpdateFrame<'_, '_, K>>(),
+            )?)
+        } else {
+            None
+        };
         self.validate_metadata()?;
         let invocation = AggregateUpdateInvocation::try_new_evaluation_for_installed(
             self,
@@ -605,14 +635,17 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
             allocator,
             control,
         )?;
-        Ok(Box::new(UpdateFrame {
-            adapter: self,
-            states,
-            mapping,
-            invocation,
-            processed: 0,
-            finished: false,
-        }))
+        Ok(LeasedBatchExecution {
+            inner: Box::new(UpdateFrame {
+                adapter: self,
+                states,
+                mapping,
+                invocation,
+                processed: 0,
+                finished: false,
+            }),
+            _helper_lease: helper_lease,
+        })
     }
     fn prepare_merge<'frame, 'storage: 'frame>(
         &'frame self,
@@ -621,7 +654,15 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
         input: SelectedAggregateMergeInput<'frame, 'frame>,
         allocator: Option<Arc<dyn crate::AggregateStateAllocator>>,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<Box<dyn BatchExecution + 'frame>, EvaluationFailure> {
+    ) -> Result<LeasedBatchExecution<'frame>, EvaluationFailure> {
+        let helper_lease = if self.helper_memory {
+            Some(crate::aggregate_helper_memory::reserve_frame_backing(
+                allocator.as_ref(),
+                Layout::new::<MergeFrame<'_, '_, K>>(),
+            )?)
+        } else {
+            None
+        };
         self.validate_metadata()?;
         let invocation = AggregateMergeInvocation::try_new_evaluation(
             self.kernel.as_ref(),
@@ -630,14 +671,17 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
             allocator,
             control,
         )?;
-        Ok(Box::new(MergeFrame {
-            adapter: self,
-            states,
-            mapping,
-            invocation,
-            processed: 0,
-            finished: false,
-        }))
+        Ok(LeasedBatchExecution {
+            inner: Box::new(MergeFrame {
+                adapter: self,
+                states,
+                mapping,
+                invocation,
+                processed: 0,
+                finished: false,
+            }),
+            _helper_lease: helper_lease,
+        })
     }
     fn emit(
         &self,
@@ -648,7 +692,20 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
         control: &dyn KernelEvaluationControl,
     ) -> Result<ArrayRef, EvaluationFailure> {
         self.validate_metadata()?;
+        // The lease outlives the observer's actual private backing. Returned
+        // causes keep their original responsibility after this scope exits.
+        let _helper_lease = if self.helper_memory {
+            Some(crate::aggregate_helper_memory::reserve_observation_backing(
+                allocator,
+            )?)
+        } else {
+            None
+        };
         let observed = crate::kernel_control::KernelControlObservation::new(control);
+        if _helper_lease.is_some() {
+            // Warm the fresh journal exclusively, with no control callback.
+            observed.finish(Ok(()))?;
+        }
         let control = &observed as &dyn KernelEvaluationControl;
         // Each mapping was checked before this private dispatch, and immutable
         // slot borrows keep initialization and exact owner identity unchanged.

@@ -350,6 +350,7 @@ pub(crate) fn prepare_pipeline_execution(
         runtime_filter_session,
         event_sink,
         false,
+        None,
     )
 }
 
@@ -387,6 +388,7 @@ pub fn prepare_report_neutral_pipeline_execution(
         runtime_filter_session,
         event_sink,
         true,
+        None,
     )
 }
 
@@ -409,6 +411,9 @@ fn prepare_pipeline_execution_inner(
     runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
     event_sink: Arc<dyn FragmentEventSink>,
     report_neutral: bool,
+    mut schema_preparation: Option<
+        &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
+    >,
 ) -> ExecutionResult<PreparedPipelineExecution> {
     let dep_manager = DependencyManager::new();
     let terminal_scan_ops = scan_bindings.terminal_ops();
@@ -458,6 +463,7 @@ fn prepare_pipeline_execution_inner(
         backend_num,
         event_sink,
         report_neutral,
+        schema_preparation,
     )
 }
 
@@ -540,6 +546,7 @@ pub(crate) fn prepare_report_neutral_local_program_pipeline_execution(
         None,
         event_sink,
         true,
+        None,
     )
 }
 
@@ -606,6 +613,38 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
     runtime_state: Arc<RuntimeState>,
     event_sink: Arc<dyn FragmentEventSink>,
 ) -> ExecutionResult<PreparedPipelineExecution> {
+    prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation(
+        program,
+        time_slice,
+        sink,
+        exchange_bindings,
+        scan_bindings,
+        writer_bindings,
+        exchange_finst_id,
+        profiler,
+        pipeline_dop,
+        runtime_state,
+        event_sink,
+        None,
+    )
+}
+
+pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation(
+    program: Arc<novarocks_local_program::LocalProgram>,
+    time_slice: Duration,
+    sink: Box<dyn OperatorFactory>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    exchange_finst_id: Option<(i64, i64)>,
+    profiler: Option<Profiler>,
+    pipeline_dop: i32,
+    runtime_state: Arc<RuntimeState>,
+    event_sink: Arc<dyn FragmentEventSink>,
+    schema_preparation: Option<
+        &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
+    >,
+) -> ExecutionResult<PreparedPipelineExecution> {
     for node_id in exchange_bindings.node_ids() {
         let binding = exchange_bindings
             .get(node_id)
@@ -669,6 +708,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
         None,
         event_sink,
         true,
+        schema_preparation,
     )
 }
 
@@ -690,6 +730,9 @@ fn prepare_pipeline_execution_from_graph(
     backend_num: Option<i32>,
     event_sink: Arc<dyn FragmentEventSink>,
     report_neutral: bool,
+    mut schema_preparation: Option<
+        &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
+    >,
 ) -> ExecutionResult<PreparedPipelineExecution> {
     let ctx = Arc::new(if report_neutral {
         FragmentContext::new_report_neutral(
@@ -727,7 +770,12 @@ fn prepare_pipeline_execution_from_graph(
         }
 
         let pipeline = Pipeline::new(pipeline_plan.id, factories, pipeline_plan.dop);
-        let drivers = pipeline.instantiate_drivers(&ctx)?;
+        let drivers = match schema_preparation.as_mut() {
+            Some(observer) => {
+                pipeline.instantiate_drivers_with_schema_preparation(&ctx, Some(*observer))?
+            }
+            None => pipeline.instantiate_drivers(&ctx)?,
+        };
         all_drivers.extend(drivers);
     }
 

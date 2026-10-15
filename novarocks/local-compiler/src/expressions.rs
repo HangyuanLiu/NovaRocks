@@ -1591,10 +1591,10 @@ fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                 !window || aggregate_nodes.is_some()
             }
             PhysicalCallSite::Aggregate { .. }
+            | PhysicalCallSite::TopNState { .. }
             | PhysicalCallSite::Table { .. }
             | PhysicalCallSite::WriterPartial { .. }
             | PhysicalCallSite::WriterFinal { .. } => aggregate_nodes.is_some(),
-            _ => false,
         };
         if !admitted {
             return Err(ExpressionLoweringError::UnsupportedCall(site).into());
@@ -2786,4 +2786,4 @@ fn arithmetic_operator(
 
 #[cfg(test)]
 #[path = "checked_reference_tests.rs"]
-mod checked_reference_tests;
+pub(crate) mod checked_reference_tests;

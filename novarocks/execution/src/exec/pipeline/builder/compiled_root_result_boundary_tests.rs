@@ -18,7 +18,7 @@
 //! RootResult boundary probes using the original checked package fixture.
 use super::*;
 
-fn boundary_program(project: Option<bool>) -> Arc<LocalProgram> {
+pub(crate) fn boundary_program(project: Option<bool>) -> Arc<LocalProgram> {
     let mut builder = FragmentBuilder::new(FragmentId::new(57));
     let values = super::super::family_fixture::values(
         &mut builder,
@@ -114,4 +114,230 @@ fn compiled_root_result_boundary_covers_nonproject_values_root() {
         ProgramNodeKind::Values { .. }
     ));
     assert_eq!(int64_rows(&run(&program)), vec![vec![Some(7)]]);
+}
+
+use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
+use crate::exec::operators::compiled_expression::CompiledProjectProcessorFactory;
+use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::runtime::fragment::{ExecutionFailureCause, ExecutionResult};
+use crate::runtime::preparation_metadata::{CompiledSchemaPreparationScope, CompiledSchemaSite};
+use crate::runtime::runtime_state::RuntimeErrorState;
+use novarocks_local_program::{ProgramNodeId, StaticLayout};
+
+struct RecordingSchemaScope {
+    program: Arc<LocalProgram>,
+    expected: CompiledSchemaSite,
+    refuse: bool,
+    calls: usize,
+    bodies: usize,
+    output: Option<ChunkSchemaRef>,
+}
+impl CompiledSchemaPreparationScope for RecordingSchemaScope {
+    fn prepare(
+        &mut self,
+        program: &Arc<LocalProgram>,
+        site: CompiledSchemaSite,
+        layout: &StaticLayout,
+        body: &mut dyn FnMut() -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
+        self.calls += 1;
+        assert!(Arc::ptr_eq(program, &self.program));
+        assert_eq!(site, self.expected);
+        let node = match site {
+            CompiledSchemaSite::Project(node) | CompiledSchemaSite::AnalyticOutput(node) => node,
+            CompiledSchemaSite::FinalResult => program.graph().root(),
+        };
+        assert!(std::ptr::eq(
+            layout,
+            program.graph().nodes()[node.index()].output_layout(),
+        ));
+        if self.refuse {
+            return Err(novarocks_functions::KernelFailure::ResourceExhausted.into());
+        }
+        self.bodies += 1;
+        body()
+    }
+}
+
+fn schema_scope(program: &Arc<LocalProgram>, site: CompiledSchemaSite) -> RecordingSchemaScope {
+    RecordingSchemaScope {
+        program: Arc::clone(program),
+        expected: site,
+        refuse: false,
+        calls: 0,
+        bodies: 0,
+        output: None,
+    }
+}
+
+fn hosted_project_factory(
+    program: Arc<LocalProgram>,
+    node: ProgramNodeId,
+    error: Arc<RuntimeErrorState>,
+    host: &mut RecordingSchemaScope,
+) -> ExecutionResult<Box<dyn crate::exec::pipeline::operator::Operator>> {
+    let factory = CompiledProjectProcessorFactory::try_new(program, node, error)?;
+    prepare_project(factory, host)
+}
+fn hosted_final_factory(
+    program: Arc<LocalProgram>,
+    error: Arc<RuntimeErrorState>,
+    host: &mut RecordingSchemaScope,
+) -> ExecutionResult<Box<dyn crate::exec::pipeline::operator::Operator>> {
+    let factory = CompiledProjectProcessorFactory::try_new_final_result_boundary(program, error)?;
+    prepare_project(factory, host)
+}
+fn prepare_project(
+    factory: CompiledProjectProcessorFactory,
+    host: &mut RecordingSchemaScope,
+) -> ExecutionResult<Box<dyn crate::exec::pipeline::operator::Operator>> {
+    let mut operator = factory.create(1, 0);
+    let tracker =
+        crate::runtime::mem_tracker::MemTracker::new_root("Project schema observer fixture");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    operator.set_construction_factory(
+        super::super::aggregate_fixture::runtime_construction_factory(
+            tracker,
+            Arc::new(RuntimeErrorState::default()),
+        ),
+    );
+    crate::runtime::preparation_metadata::prepare_operator_schema_for_test(
+        operator.as_mut(),
+        host,
+    )?;
+    let output = operator
+        .prepared_schema_for_test()
+        .expect("the real Project prepared its output");
+    let node = match host.expected {
+        CompiledSchemaSite::Project(node) | CompiledSchemaSite::AnalyticOutput(node) => node,
+        CompiledSchemaSite::FinalResult => host.program.graph().root(),
+    };
+    let direct = ChunkSchema::from_compiled_layout(
+        host.program.graph().nodes()[node.index()].output_layout(),
+    )
+    .unwrap();
+    assert_eq!(output.slot_ids(), direct.slot_ids());
+    assert_eq!(output.arrow_schema_ref(), direct.arrow_schema_ref());
+    host.output = Some(output);
+    Ok(operator)
+}
+
+#[test]
+fn compiled_project_schema_scope_preserves_both_actual_factory_sites() {
+    for computed in [false, true] {
+        let program = boundary_program(Some(computed));
+        let node = program.graph().root();
+        let error = Arc::new(RuntimeErrorState::default());
+        let mut host = schema_scope(&program, CompiledSchemaSite::Project(node));
+        let direct = CompiledProjectProcessorFactory::try_new(
+            Arc::clone(&program),
+            node,
+            Arc::clone(&error),
+        )
+        .unwrap();
+        let hosted =
+            hosted_project_factory(Arc::clone(&program), node, Arc::clone(&error), &mut host)
+                .unwrap();
+        assert_eq!(hosted.name(), direct.name());
+        assert_eq!((host.calls, host.bodies), (1, 1));
+        assert!(host.output.is_some());
+
+        let mut host = schema_scope(&program, CompiledSchemaSite::FinalResult);
+        let direct = CompiledProjectProcessorFactory::try_new_final_result_boundary(
+            Arc::clone(&program),
+            Arc::clone(&error),
+        )
+        .unwrap();
+        let hosted = hosted_final_factory(program, error, &mut host).unwrap();
+        assert_eq!(hosted.name(), direct.name());
+        assert_eq!((host.calls, host.bodies), (1, 1));
+    }
+    // The terminal boundary may borrow a Values root. It does not claim a
+    // Project constructor merely because its schema uses the same port.
+    let program = boundary_program(None);
+    let mut host = schema_scope(&program, CompiledSchemaSite::FinalResult);
+    hosted_final_factory(program, Arc::new(RuntimeErrorState::default()), &mut host).unwrap();
+    assert_eq!((host.calls, host.bodies), (1, 1));
+}
+
+#[test]
+fn compiled_project_schema_scope_refusal_runs_neither_original_body() {
+    let program = boundary_program(Some(true));
+    for site in [
+        CompiledSchemaSite::Project(program.graph().root()),
+        CompiledSchemaSite::FinalResult,
+    ] {
+        let mut host = schema_scope(&program, site);
+        host.refuse = true;
+        let error = Arc::new(RuntimeErrorState::default());
+        let result = match site {
+            CompiledSchemaSite::Project(node) => {
+                hosted_project_factory(Arc::clone(&program), node, error, &mut host)
+            }
+            CompiledSchemaSite::FinalResult => {
+                hosted_final_factory(Arc::clone(&program), error, &mut host)
+            }
+            CompiledSchemaSite::AnalyticOutput(_) => {
+                panic!("the Project fixture contains no Analytic schema site")
+            }
+        };
+        let failure = result
+            .err()
+            .expect("the host refused before schema construction");
+        assert_eq!(
+            failure.cause(),
+            &ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::ResourceExhausted)
+        );
+        assert_eq!((host.calls, host.bodies), (1, 0));
+        assert!(host.output.is_none());
+    }
+}
+
+#[test]
+fn compiled_project_schema_scope_keeps_original_early_factory_errors() {
+    let program = boundary_program(None);
+    for (node, expected) in [
+        (program.graph().root(), "compiled node is not a Project"),
+        (
+            ProgramNodeId::new(usize::MAX),
+            "compiled Project node is absent",
+        ),
+    ] {
+        let mut host = schema_scope(&program, CompiledSchemaSite::Project(node));
+        let error = Arc::new(RuntimeErrorState::default());
+        let direct = CompiledProjectProcessorFactory::try_new(
+            Arc::clone(&program),
+            node,
+            Arc::clone(&error),
+        )
+        .err()
+        .unwrap();
+        let failure = hosted_project_factory(Arc::clone(&program), node, error, &mut host)
+            .err()
+            .unwrap();
+        assert_eq!(direct, expected);
+        assert_eq!(failure.cause(), &ExecutionFailureCause::Pipeline(direct));
+        assert_eq!((host.calls, host.bodies), (0, 0));
+    }
+    let program = crate::exec::expr::compiled_program::tests::program(
+        crate::exec::expr::compiled_program::tests::SeedMode::Input,
+        false,
+    );
+    let mut host = schema_scope(&program, CompiledSchemaSite::FinalResult);
+    let error = Arc::new(RuntimeErrorState::default());
+    let direct = CompiledProjectProcessorFactory::try_new_final_result_boundary(
+        Arc::clone(&program),
+        Arc::clone(&error),
+    )
+    .err()
+    .unwrap();
+    let failure = hosted_final_factory(program, error, &mut host)
+        .err()
+        .unwrap();
+    assert_eq!(
+        direct,
+        "final result boundary requires its actual RootResult sink"
+    );
+    assert_eq!(failure.cause(), &ExecutionFailureCause::Pipeline(direct));
+    assert_eq!((host.calls, host.bodies), (0, 0));
 }

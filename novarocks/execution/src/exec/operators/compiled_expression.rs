@@ -39,14 +39,21 @@ use novarocks_local_program::{
 };
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use crate::exec::expr::compiled_program::{
+    CompiledExpressionInstance, input_source::CompiledInputLoan,
+};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
-#[path = "runtime_kernel_memory.rs"]
-pub(super) mod runtime_kernel_memory;
+pub(super) use crate::runtime::kernel_memory as runtime_kernel_memory;
+#[cfg(test)]
+#[path = "runtime_kernel_memory_tests.rs"]
+mod runtime_kernel_memory_tests;
+#[cfg(feature = "test-support")]
+#[path = "runtime_scalar_memory_test_support.rs"]
+pub(crate) mod runtime_scalar_memory_test_support;
 
 /// Kernel control backed by the fragment's runtime error state: a recorded
 /// failure or cancellation refuses the next checkpoint, and waits are
@@ -54,7 +61,7 @@ pub(super) mod runtime_kernel_memory;
 pub(crate) struct RuntimeKernelControl {
     error: Arc<RuntimeErrorState>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
-    allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    allocator: Option<Arc<super::compiled_aggregate::TrackedStateAllocator>>,
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
 }
 impl RuntimeKernelControl {
@@ -108,20 +115,47 @@ impl RuntimeKernelControl {
     pub(crate) fn allocator(
         &self,
     ) -> Option<Arc<dyn novarocks_functions::AggregateStateAllocator>> {
-        self.allocator.clone()
+        self.allocator.as_ref().map(|host| {
+            let actual: Arc<dyn novarocks_functions::AggregateStateAllocator> = host.clone();
+            actual
+        })
+    }
+    /// Borrow the SAME concrete host whose original dyn Arc created this
+    /// instance. Equality checks existing owners; it grants no new authority.
+    pub(crate) fn invocation_host(
+        &self,
+        original: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    ) -> Result<
+        &super::compiled_aggregate::TrackedStateAllocator,
+        novarocks_functions::ScalarResourceError,
+    > {
+        let Some(host) = &self.allocator else {
+            return Err(novarocks_functions::ScalarResourceError::Invariant(
+                "whole-invocation runtime has no concrete allocation host",
+            ));
+        };
+        let actual: Arc<dyn novarocks_functions::AggregateStateAllocator> = host.clone();
+        if !original.is_some_and(|original| Arc::ptr_eq(original, &actual)) {
+            return Err(novarocks_functions::ScalarResourceError::Invariant(
+                "whole-invocation instance allocation host differs from its runtime owner",
+            ));
+        }
+        Ok(host)
     }
 }
 impl KernelEvaluationControl for RuntimeKernelControl {
     fn checkpoint(&self, _work_units: u32) -> Result<(), KernelFailure> {
-        if self.error.error().is_some() {
+        if self.error.is_stopped() {
             return Err(KernelFailure::Cancelled);
         }
         Ok(())
     }
     fn wait(&self, duration: Duration) -> Result<(), KernelFailure> {
-        self.error
-            .wait_interruptibly(duration)
-            .map_err(|_| KernelFailure::Cancelled)
+        if self.error.wait_until_stopped(duration) {
+            Err(KernelFailure::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -135,14 +169,36 @@ pub(crate) fn evaluate_all(
     instance: &mut CompiledExpressionInstance,
     site: ProgramExpressionRootSite,
     input: &RecordBatch,
-    control: &dyn KernelEvaluationControl,
+    control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {
     evaluate_selection(
         instance,
         site,
-        input,
+        CompiledInputLoan::RecordBatch(input),
         Selection::all(input.num_rows()),
         if input.num_rows() == 0 {
+            novarocks_functions::ScalarInvocationActivation::ValidateOnly
+        } else {
+            novarocks_functions::ScalarInvocationActivation::Activated
+        },
+        control,
+    )
+}
+
+/// The actual Chunk callers borrow its original attached authority. No
+/// authority is retained after this synchronous evaluation returns.
+pub(crate) fn evaluate_chunk_all(
+    instance: &mut CompiledExpressionInstance,
+    site: ProgramExpressionRootSite,
+    input: &Chunk,
+    control: &RuntimeKernelControl,
+) -> ExecutionResult<ArrayRef> {
+    evaluate_selection(
+        instance,
+        site,
+        CompiledInputLoan::from_chunk(input),
+        Selection::all(input.record_batch().num_rows()),
+        if input.record_batch().num_rows() == 0 {
             novarocks_functions::ScalarInvocationActivation::ValidateOnly
         } else {
             novarocks_functions::ScalarInvocationActivation::Activated
@@ -160,7 +216,7 @@ pub(crate) fn evaluate_selected(
     site: ProgramExpressionRootSite,
     input: &RecordBatch,
     rows: &[usize],
-    control: &dyn KernelEvaluationControl,
+    control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {
     let selection = Selection::try_sparse(input.num_rows(), rows).map_err(|_| {
         ExecutionFailure::from(KernelFailure::Internal(KernelDiagnostic::new(
@@ -172,20 +228,31 @@ pub(crate) fn evaluate_selected(
     } else {
         novarocks_functions::ScalarInvocationActivation::Activated
     };
-    evaluate_selection(instance, site, input, selection, activation, control)
+    evaluate_selection(
+        instance,
+        site,
+        CompiledInputLoan::RecordBatch(input),
+        selection,
+        activation,
+        control,
+    )
 }
 
 fn evaluate_selection(
     instance: &mut CompiledExpressionInstance,
     site: ProgramExpressionRootSite,
-    input: &RecordBatch,
+    input: CompiledInputLoan<'_>,
     selection: Selection<'_>,
     activation: novarocks_functions::ScalarInvocationActivation,
-    control: &dyn KernelEvaluationControl,
+    control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {
     // Required callers supply their actual row-demand policy. Direct Frame
     // callers may activate an empty invocation (e.g. the original IF else).
-    let result = instance.evaluate_evaluation(input, selection, activation, control)?;
+    let mut journal = crate::runtime::scalar_memory::RuntimeScalarMemoryJournal::default();
+    let mut scope =
+        crate::runtime::scalar_memory::RuntimeScalarMemoryScope::new(control, &mut journal);
+    let result =
+        instance.evaluate_input_runtime(input, selection, activation, control, &mut scope)?;
     let (selection, values, errors) = result.into_parts();
     if let Some(error) = errors.into_vec().into_iter().next() {
         return Err(RequiredExpressionRowError::try_new(site, selection, error)?.into());
@@ -273,6 +340,7 @@ pub struct CompiledProjectProcessorFactory {
     sites: Vec<ProgramExpressionRootSite>,
     final_identity_slots: Option<Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>>,
     layout_node: ProgramNodeId,
+    preparation_site: crate::runtime::preparation_metadata::CompiledSchemaSite,
     error: Arc<RuntimeErrorState>,
 }
 impl CompiledProjectProcessorFactory {
@@ -310,6 +378,7 @@ impl CompiledProjectProcessorFactory {
             sites: Vec::new(),
             final_identity_slots: Some(pairs),
             layout_node: root,
+            preparation_site: crate::runtime::preparation_metadata::CompiledSchemaSite::FinalResult,
             error,
         })
     }
@@ -382,6 +451,9 @@ impl CompiledProjectProcessorFactory {
             sites,
             final_identity_slots,
             layout_node: node,
+            preparation_site: crate::runtime::preparation_metadata::CompiledSchemaSite::Project(
+                node,
+            ),
             error,
         })
     }
@@ -397,6 +469,7 @@ impl OperatorFactory for CompiledProjectProcessorFactory {
             sites: self.sites.clone(),
             final_identity_slots: self.final_identity_slots.clone(),
             layout_node: self.layout_node,
+            preparation_site: self.preparation_site,
             output: None,
             construction: None,
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
@@ -413,6 +486,7 @@ struct CompiledProjectProcessor {
     sites: Vec<ProgramExpressionRootSite>,
     final_identity_slots: Option<Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>>,
     layout_node: ProgramNodeId,
+    preparation_site: crate::runtime::preparation_metadata::CompiledSchemaSite,
     output: Option<ChunkSchemaRef>,
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     control: RuntimeKernelControl,
@@ -421,7 +495,69 @@ struct CompiledProjectProcessor {
     finishing: bool,
     finished: bool,
 }
+#[cfg(test)]
+pub(crate) fn project_chunk_with_source_observer(
+    program: Arc<LocalProgram>,
+    chunk: Chunk,
+    observer: Arc<crate::exec::expr::compiled_program::input_source::SlotSourceObserver>,
+) -> ExecutionResult<Chunk> {
+    let factory = CompiledProjectProcessorFactory::try_new(
+        program,
+        ProgramNodeId::new(3),
+        Arc::new(RuntimeErrorState::default()),
+    )?;
+    let mut processor = CompiledProjectProcessor {
+        name: factory.name,
+        program: factory.program,
+        sites: factory.sites,
+        final_identity_slots: factory.final_identity_slots,
+        layout_node: factory.layout_node,
+        preparation_site: factory.preparation_site,
+        output: None,
+        construction: None,
+        control: RuntimeKernelControl::new(factory.error),
+        instances: None,
+        pending: None,
+        finishing: false,
+        finished: false,
+    };
+    let tracker =
+        crate::runtime::mem_tracker::MemTracker::new_root("slot source fixture construction");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    processor.set_construction_factory(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+        crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+        tracker, Arc::new(RuntimeErrorState::default()),
+    )?);
+    processor.prepare()?;
+    assert!(processor.final_identity_slots.is_none());
+    instances(
+        &mut processor.instances,
+        &processor.program,
+        &processor.sites,
+        &processor.control,
+    )?;
+    for instance in processor.instances.as_mut().unwrap() {
+        instance.observe_slot_source(Arc::clone(&observer));
+    }
+    let state = RuntimeState::default();
+    processor.push_chunk(&state, chunk)?;
+    processor
+        .pull_chunk(&state)?
+        .ok_or_else(|| "source fixture Project has no output".into())
+}
 impl Operator for CompiledProjectProcessor {
+    #[cfg(any(test, feature = "test-support"))]
+    fn prepared_schema_for_test(&self) -> Option<ChunkSchemaRef> {
+        self.output.clone()
+    }
+    fn compiled_schema_preparation_site(
+        &self,
+    ) -> Option<(
+        &Arc<LocalProgram>,
+        crate::runtime::preparation_metadata::CompiledSchemaSite,
+    )> {
+        Some((&self.program, self.preparation_site))
+    }
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -560,12 +696,7 @@ impl ProcessorOperator for CompiledProjectProcessor {
         let instances = self.instances.as_mut().expect("instances were created");
         let mut columns = project_reserve(self.sites.len(), owner.as_ref())?;
         for (instance, site) in instances.iter_mut().zip(&self.sites) {
-            columns.push(evaluate_all(
-                instance,
-                *site,
-                chunk.record_batch(),
-                &self.control,
-            )?);
+            columns.push(evaluate_chunk_all(instance, *site, &chunk, &self.control)?);
         }
         self.pending = Some(materialize_project_output_owned(
             columns,
@@ -733,14 +864,20 @@ impl ProcessorOperator for CompiledFilterProcessor {
                 Arc::clone(&self.program), node, &self.control, self.control.allocator(),
             )?);
         }
+        let mut journal = crate::runtime::scalar_memory::RuntimeScalarMemoryJournal::default();
+        let mut scope = crate::runtime::scalar_memory::RuntimeScalarMemoryScope::new(
+            &self.control,
+            &mut journal,
+        );
         let truth = self
             .instance
             .as_mut()
             .expect("instance was created")
-            .evaluate_required(
+            .evaluate_required_runtime(
                 chunk.record_batch(),
                 Selection::all(chunk.record_batch().num_rows()),
                 &self.control,
+                &mut scope,
             )?;
         let truth = truth
             .as_any()
@@ -778,4 +915,18 @@ impl ProcessorOperator for CompiledFilterProcessor {
         }
         Ok(())
     }
+}
+
+/// Select the same runtime factory for component fixtures. Typed schema creation
+/// still occurs only under the factory installed on the actual operator.
+#[cfg(feature = "test-support")]
+pub fn prepare_project_factory_for_test(
+    program: Arc<LocalProgram>,
+    node: Option<ProgramNodeId>,
+    error: Arc<RuntimeErrorState>,
+) -> ExecutionResult<CompiledProjectProcessorFactory> {
+    Ok(match node {
+        Some(node) => CompiledProjectProcessorFactory::try_new(program, node, error)?,
+        None => CompiledProjectProcessorFactory::try_new_final_result_boundary(program, error)?,
+    })
 }

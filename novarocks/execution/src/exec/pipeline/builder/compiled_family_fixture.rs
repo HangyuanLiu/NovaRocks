@@ -47,7 +47,7 @@ use novarocks_type_contract::{
     FunctionValueType, PureCompileControl, SemanticParameters,
 };
 
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchema, OutputColumnMetadata};
 use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
 use crate::exec::pipeline::binding::ExchangeBindings;
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
@@ -59,6 +59,54 @@ impl PureCompileControl for FixtureControl {
     fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
         Ok(())
     }
+}
+
+impl novarocks_functions::KernelEvaluationControl for FixtureControl {
+    fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+        Ok(())
+    }
+    fn wait(&self, _: Duration) -> Result<(), novarocks_functions::KernelFailure> {
+        panic!("column metadata fixture never waits")
+    }
+}
+
+/// A declared constant input with an admitted original columns Vec. Only
+/// container metadata is paid here; this does not grant payload authority.
+pub(super) fn paid_input(
+    program: &LocalProgram,
+    tracker: &Arc<crate::runtime::mem_tracker::MemTracker>,
+) -> Chunk {
+    let node = &program.graph().nodes()[0];
+    let novarocks_local_program::ProgramNodeKind::Values { values } = node.kind() else {
+        panic!("fixture input is not Values");
+    };
+    let source = values.batch().expect("fixture Values are constant");
+    let construction_tracker =
+        crate::runtime::mem_tracker::MemTracker::new_root("paid-input-typed-construction");
+    construction_tracker
+        .install_limit_once(64 * 1024 * 1024)
+        .unwrap();
+    let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+        crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+        construction_tracker,
+        Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+    ).unwrap();
+    let schema = factory
+        .create_compiled_chunk_schema(node.output_layout())
+        .unwrap();
+    let metadata = OutputColumnMetadata::try_new(
+        source.num_columns(),
+        crate::exec::operators::compiled_aggregate::expression_allocation_host(tracker.clone()),
+        &FixtureControl,
+    )
+    .unwrap();
+    let mut columns = Vec::new();
+    columns.try_reserve_exact(source.num_columns()).unwrap();
+    columns.extend(source.columns().iter().cloned());
+    let batch =
+        arrow::record_batch::RecordBatch::try_new(schema.arrow_schema_ref(), columns).unwrap();
+    let owner = factory.begin_typed_construction(&schema).unwrap();
+    Chunk::try_new_with_output_column_metadata(batch, schema, metadata, owner.as_ref()).unwrap()
 }
 
 pub(super) fn int64(nullable: bool) -> FunctionValueType {
@@ -309,15 +357,32 @@ pub(crate) fn compile(package: Arc<FragmentPackage>, dop: usize) -> Arc<LocalPro
 /// Prepare and run the program with its frozen driver count; a preparation
 /// or execution failure is returned as text.
 pub(super) fn try_run(program: &Arc<LocalProgram>) -> Result<Vec<Chunk>, String> {
+    try_run_in(program, None)
+}
+
+/// A declared original query tracker for resource-owning component fixtures.
+/// Other family fixtures keep their original untracked inputs unchanged.
+pub(super) fn run_with_tracker(
+    program: &Arc<LocalProgram>,
+    tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
+) -> Vec<Chunk> {
+    try_run_in(program, Some(tracker))
+        .unwrap_or_else(|error| panic!("tracked compiled program runs: {error}"))
+}
+fn try_run_in(
+    program: &Arc<LocalProgram>,
+    tracker: Option<Arc<crate::runtime::mem_tracker::MemTracker>>,
+) -> Result<Vec<Chunk>, String> {
+    let tracked = tracker.is_some();
     let state = Arc::new(RuntimeState::new(
         None,
         None,
         None,
         None,
         None,
-        Some(crate::runtime::mem_tracker::MemTracker::new_root(
-            "compiled family fixture",
-        )),
+        Some(tracker.unwrap_or_else(|| {
+            crate::runtime::mem_tracker::MemTracker::new_root("compiled family fixture")
+        })),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ));
     let output = ResultSinkHandle::new();
@@ -333,7 +398,14 @@ pub(super) fn try_run(program: &Arc<LocalProgram>) -> Result<Vec<Chunk>, String>
         Arc::new(NoopFragmentEventSink),
     )
     .map_err(|error| error.to_string())?;
-    prepared.start().join().map_err(|error| error.to_string())?;
+    let running = prepared.start();
+    running.join().map_err(|error| error.to_string())?;
+    if tracked {
+        assert!(
+            running.stopped_fact().is_some(),
+            "successful join proves actual driver exit"
+        );
+    }
     Ok(output.take_chunks())
 }
 

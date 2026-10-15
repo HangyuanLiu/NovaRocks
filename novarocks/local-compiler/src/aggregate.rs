@@ -190,6 +190,48 @@ fn lower_core_with_creation<H>(
             (FragmentCompileError::Invalid("finalizing aggregate has a partial grouping")).into(),
         );
     }
+    let layout = lower_output_layout_with_creation(
+        package,
+        node,
+        slots,
+        width,
+        "local_aggregate",
+        work,
+        creation,
+    )?;
+    Ok(LoweredAggregate {
+        kind: ProgramNodeKind::Aggregate {
+            input,
+            group_by: keys,
+            functions,
+            need_finalize,
+            input_is_intermediate: !calls.is_empty() && merging,
+            // Runtime-filter graphs are refused before lowering; streaming
+            // pre-aggregation is a local freedom this compiler does not take.
+            topn_filters: Vec::new(),
+            streaming_preaggregation_mode: None,
+        },
+        layout,
+        fact: CompiledAggregate {
+            grouping: match grouping {
+                AggregateGrouping::Partial => CompiledAggregateGrouping::Partial,
+                AggregateGrouping::Complete => CompiledAggregateGrouping::Complete,
+            },
+        },
+    })
+}
+
+/// Materialize this relation's actual output ValueDefs, not its child's fields.
+pub(crate) fn lower_output_layout_with_creation<H>(
+    package: &FragmentPackage,
+    node: &PhysicalNode,
+    slots: &[SlotId],
+    width: usize,
+    family: &str,
+    work: &mut CompileCheckpoints<'_>,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<StaticLayout, crate::FragmentCreationError<H>> {
+    let values = package.fragment().values();
     let result = package
         .result()
         .filter(|result| result.output.columns == node.output.columns);
@@ -220,7 +262,7 @@ fn lower_core_with_creation<H>(
                 )?
             }
             None => crate::typed_layout::local_name_with_creation(
-                "local_aggregate",
+                family,
                 node.id.get(),
                 ordinal,
                 work,
@@ -234,26 +276,7 @@ fn lower_core_with_creation<H>(
     work.flush()?;
     let layout = typed_layout.finish_with_creation(slots, work, creation)?;
     work.flush()?;
-    Ok(LoweredAggregate {
-        kind: ProgramNodeKind::Aggregate {
-            input,
-            group_by: keys,
-            functions,
-            need_finalize,
-            input_is_intermediate: !calls.is_empty() && merging,
-            // Runtime-filter graphs are refused before lowering; streaming
-            // pre-aggregation is a local freedom this compiler does not take.
-            topn_filters: Vec::new(),
-            streaming_preaggregation_mode: None,
-        },
-        layout,
-        fact: CompiledAggregate {
-            grouping: match grouping {
-                AggregateGrouping::Partial => CompiledAggregateGrouping::Partial,
-                AggregateGrouping::Complete => CompiledAggregateGrouping::Complete,
-            },
-        },
-    })
+    Ok(layout)
 }
 
 /// Copy the full selection from its physical author's immutable declaration.
@@ -320,7 +343,7 @@ pub(crate) fn freeze_binding_with_creation<H>(
     Ok(Arc::new(frozen))
 }
 
-fn lower_call<H>(
+pub(crate) fn lower_call<H>(
     node: &PhysicalNode,
     call: &AggregateCall,
     expressions: &BTreeMap<ExprId, ProgramExprId>,
@@ -431,11 +454,16 @@ pub(crate) fn prepare_aggregate_calls<
     work: &mut CompileCheckpoints<'_>,
     creation: crate::expressions::CallCreation<'_, F>,
 ) -> Result<(), crate::expressions::ExpressionCreationFailure<H>> {
-    let mut prepared = 0usize;
+    let mut prepared = [0usize; 2];
     for node in package.fragment().nodes().values() {
         work.step()?;
-        let NodeKind::Aggregate { calls, .. } = &node.kind else {
-            continue;
+        let (calls, family) = match &node.kind {
+            NodeKind::Aggregate { calls, .. } => (calls, AggregateCallFamily::Aggregate),
+            NodeKind::TopN {
+                reduction: novarocks_physical_plan::TopNReduction::GroupedStates { calls, .. },
+                ..
+            } => (calls, AggregateCallFamily::TopNState),
+            _ => continue,
         };
         let local = *nodes.get(&node.id).ok_or(ExpressionLoweringError::Invalid(
             "aggregate node has no local node",
@@ -445,32 +473,34 @@ pub(crate) fn prepare_aggregate_calls<
                 ExpressionLoweringError::Invalid("aggregate call ordinal exhausted")
             })?;
             let token = prepare_call(
-                package, functions, effects, node, ordinal, call, work, creation,
+                package, functions, effects, node, family, ordinal, call, work, creation,
             )?;
-            if tokens
-                .insert(
-                    ProgramCallSite::Aggregate {
-                        node: local,
-                        call: ordinal,
-                    },
-                    token,
-                )
-                .is_some()
-            {
+            let site = match family {
+                AggregateCallFamily::Aggregate => ProgramCallSite::Aggregate {
+                    node: local,
+                    call: ordinal,
+                },
+                AggregateCallFamily::TopNState => ProgramCallSite::TopNState {
+                    node: local,
+                    call: ordinal,
+                },
+            };
+            if tokens.insert(site, token).is_some() {
                 return Err(ExpressionLoweringError::Invalid(
                     "aggregate call site is prepared twice",
                 )
                 .into());
             }
-            prepared += 1;
+            prepared[family.index()] += 1;
             work.step()?;
         }
     }
-    // Every frozen relational aggregate claim names one actual call.
-    let mut frozen = 0usize;
+    let mut frozen = [0usize; 2];
     for site in package.calls().entries().keys() {
-        if matches!(site, PhysicalCallSite::Aggregate { .. }) {
-            frozen += 1;
+        match site {
+            PhysicalCallSite::Aggregate { .. } => frozen[0] += 1,
+            PhysicalCallSite::TopNState { .. } => frozen[1] += 1,
+            _ => {}
         }
         work.step()?;
     }
@@ -483,20 +513,52 @@ pub(crate) fn prepare_aggregate_calls<
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum AggregateCallFamily {
+    Aggregate,
+    TopNState,
+}
+impl AggregateCallFamily {
+    const fn index(self) -> usize {
+        match self {
+            Self::Aggregate => 0,
+            Self::TopNState => 1,
+        }
+    }
+}
+
 fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     functions: &PureEngineFunctionCatalog,
     effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     node: &PhysicalNode,
+    family: AggregateCallFamily,
     ordinal: u32,
     call: &AggregateCall,
     work: &mut CompileCheckpoints<'_>,
     creation: crate::expressions::CallCreation<'_, F>,
 ) -> Result<PureCallSpecialization, crate::expressions::ExpressionCreationFailure<H>> {
-    let site = PhysicalCallSite::Aggregate {
-        node: node.id,
-        call: ordinal,
+    let site = match family {
+        AggregateCallFamily::Aggregate => PhysicalCallSite::Aggregate {
+            node: node.id,
+            call: ordinal,
+        },
+        AggregateCallFamily::TopNState => PhysicalCallSite::TopNState {
+            node: node.id,
+            call: ordinal,
+        },
     };
+    if matches!(family, AggregateCallFamily::TopNState)
+        && (!matches!(call.binding.phase, AggregatePhase::Intermediate { .. })
+            || call.arguments.len() != 1
+            || call.distinct
+            || !call.order_by.is_empty())
+    {
+        return Err(ExpressionLoweringError::Invalid(
+            "TopNState requires one exact Intermediate state channel",
+        )
+        .into());
+    }
     let binding = &call.binding;
     let function = &binding.function;
     if function.kind != FunctionKind::Aggregate {
@@ -577,7 +639,12 @@ fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
         })?;
         let root = ExpressionRootSite {
             node: node.id,
-            role: if (argument as usize) < call.arguments.len() {
+            role: if matches!(family, AggregateCallFamily::TopNState) {
+                ExpressionRootRole::TopNStateArgument {
+                    call: ordinal,
+                    argument,
+                }
+            } else if (argument as usize) < call.arguments.len() {
                 ExpressionRootRole::AggregateArgument {
                     call: ordinal,
                     argument,

@@ -1556,3 +1556,132 @@ fn frozen_provider_nominal_properties_and_native_nested_domains_survive_complete
         .unwrap();
     assert!(!bytes.is_empty());
 }
+
+#[test]
+fn complete_nominal_table_and_window_use_exact_declarations_and_refuse_old_revisions() {
+    use crate::schema_mapping::nominal_declaration::NominalSourceDomain;
+    let schema = Schema::builder()
+        .with_fields(vec![
+            Arc::new(NestedField::optional(
+                1,
+                "n",
+                Type::Primitive(PrimitiveType::Fixed(16)),
+            )),
+            Arc::new(NestedField::required(
+                2,
+                "h",
+                Type::Primitive(PrimitiveType::Binary),
+            )),
+            Arc::new(NestedField::optional(
+                3,
+                "b",
+                Type::Primitive(PrimitiveType::Binary),
+            )),
+        ])
+        .build()
+        .unwrap();
+    let domains = BTreeMap::from([
+        (1, NominalSourceDomain::LargeInt),
+        (2, NominalSourceDomain::Hll),
+        (3, NominalSourceDomain::Bitmap),
+    ]);
+    let handle = IcebergTableHandle::try_new(table_handle_params(&schema, None))
+        .unwrap()
+        .with_nominal_declarations(domains.clone())
+        .unwrap();
+    let columns = [3, 1, 2, 1]
+        .map(|id| IcebergColumnHandle::base_column_of(&schema, id).unwrap())
+        .to_vec();
+    let fields = columns.iter().map(column_field).collect::<Vec<_>>();
+    let relation = IcebergRuntimeRelation::Table(handle.clone());
+    let fixture = Fixture {
+        source: source_for(&relation),
+        domains: BTreeMap::new(),
+        published_source: None,
+        published_bindings: None,
+        relation,
+        columns: columns.clone(),
+        fields: fields.clone(),
+        metadata: None,
+        work_source: ConnectorReadWorkSource::RuntimeSplits,
+    };
+    let fixture = published(&fixture);
+    assert_unchanged(&fixture.build());
+    for revision in [2, 3, 4, 5] {
+        let old = fixture.build_modified(None, None, Some(revision));
+        assert_provider(&old, ConnectorCodecErrorKind::VersionMismatch);
+    }
+    for revision in [3, 4, 5] {
+        let old = fixture.build_modified(
+            None,
+            Some(bytes::Bytes::from_static(b"invalid private body")),
+            Some(revision),
+        );
+        let error = ConnectorReadProgramRecipe::try_compile_with_provider(
+            &old,
+            &IcebergReadRecipeCompiler,
+            &Control::accept(),
+        )
+        .unwrap_err();
+        let ConnectorReadProgramCompileError::Provider(error) = error else {
+            panic!("expected exact provider ABI rejection");
+        };
+        assert_eq!(error.kind(), ConnectorCodecErrorKind::VersionMismatch);
+        assert_eq!(error.path().to_string(), "header.codec_revision");
+    }
+    let invalid_current = fixture.build_modified(
+        None,
+        Some(bytes::Bytes::from_static(b"invalid private body")),
+        None,
+    );
+    let error = ConnectorReadProgramRecipe::try_compile_with_provider(
+        &invalid_current,
+        &IcebergReadRecipeCompiler,
+        &Control::accept(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ConnectorReadProgramCompileError::Provider(ref error)
+        if error.kind() != ConnectorCodecErrorKind::VersionMismatch)
+    );
+    let mut wrong = fixture.clone();
+    let mut wrong_declarations = domains.clone();
+    wrong_declarations.insert(3, NominalSourceDomain::Hll);
+    wrong.relation = IcebergRuntimeRelation::Table(
+        handle
+            .clone()
+            .with_nominal_declarations(wrong_declarations)
+            .unwrap(),
+    );
+    assert_provider(&wrong.build(), ConnectorCodecErrorKind::InconsistentFields);
+
+    let to = handle.read_domain().unwrap().clone();
+    let from = crate::delete_semantics::test_read_domain(&schema, &[], 10);
+    let window = IcebergChangeWindowHandle::try_new(IcebergChangeWindowHandleParams {
+        schema_table_name: handle.schema_table_name().clone(),
+        table_schema_json: handle.table_schema_json().into(),
+        columns: columns[..3].to_vec(),
+        name_mapping_json: None,
+        from_snapshot_id_exclusive: 10,
+        to_snapshot_id_inclusive: 11,
+        from_read_domain: from,
+        to_read_domain: to,
+        partition_spec_jsons: handle.partition_spec_jsons().clone(),
+    })
+    .unwrap()
+    .with_nominal_declarations(domains)
+    .unwrap();
+    let relation = IcebergRuntimeRelation::ChangeWindow(window);
+    let window_fixture = Fixture {
+        source: source_for(&relation),
+        domains: BTreeMap::new(),
+        published_source: None,
+        published_bindings: None,
+        relation,
+        columns,
+        fields,
+        metadata: None,
+        work_source: ConnectorReadWorkSource::RuntimeSplits,
+    };
+    assert_unchanged(&published(&window_fixture).build());
+}

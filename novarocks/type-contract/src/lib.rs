@@ -152,6 +152,7 @@ pub use to_base64_source::{
 pub mod result_render_type;
 pub mod result_scalar_type;
 
+pub use owned_resources::metadata_request::{CompleteMetadataRequestFacts, MetadataRequestError};
 mod value_domain_cast;
 pub use value_domain_cast::{
     default_json_structure_carrier_cast_supported, is_default_json_structure_cast,

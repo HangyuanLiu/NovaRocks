@@ -37,7 +37,7 @@ impl OwnedValue {
     fn into_value<'a>(
         self,
         selection: Selection<'a>,
-        work: &mut Work<'_>,
+        work: &mut Work<'_, '_>,
     ) -> Result<Value<'a>, KernelFailure> {
         Ok(match self {
             Self::Constant(value) => Value::Constant(value),
@@ -89,7 +89,7 @@ impl Frame {
         rows: Vec<usize>,
         activation: novarocks_functions::ScalarInvocationActivation,
         parent_ordinals: Vec<usize>,
-        work: &mut Work<'_>,
+        work: &mut Work<'_, '_>,
     ) -> Result<Self, KernelFailure> {
         // A demand-zero invocation does not construct or interleave a result
         // before its original arity Data. Retain the actual domain storage,
@@ -163,7 +163,7 @@ impl Frame {
         arity: usize,
         next_is_pure: bool,
         batch_rows: usize,
-        work: &mut Work<'_>,
+        work: &mut Work<'_, '_>,
     ) -> Result<Option<Vec<usize>>, KernelFailure> {
         if matches!(shape, ControlShape::Conjunction | ControlShape::Disjunction)
             && self.boolean.is_none()
@@ -293,7 +293,7 @@ impl Frame {
         child: Child,
         source_shape: novarocks_type_contract::TemporalSourceShape,
         batch_rows: usize,
-        work: &mut Work<'_>,
+        work: &mut Work<'_, '_>,
     ) -> Result<(), KernelFailure> {
         let mut rows = Vec::with_capacity(child.ordinals.len());
         for &ordinal in &child.ordinals {
@@ -378,7 +378,7 @@ impl Frame {
         program: &novarocks_local_program::ExpressionProgram,
         negated: bool,
         batch_rows: usize,
-        work: &mut Work<'_>,
+        work: &mut Work<'_, '_>,
     ) -> Result<(), KernelFailure> {
         let ordinal = self
             .next
@@ -496,7 +496,7 @@ impl Frame {
         child: Child,
         program: &novarocks_local_program::ExpressionProgram,
         batch_rows: usize,
-        work: &mut Work<'_>,
+        work: &mut Work<'_, '_>,
     ) -> Result<(), KernelFailure> {
         use novarocks_functions::native_inlist::{InRows, signed_equality_observed};
         let ordinal = self
@@ -618,7 +618,7 @@ impl Frame {
         demand: EvaluationDemand,
         child_is_pure: bool,
         batch_rows: usize,
-        work: &mut Work<'_>,
+        work: &mut Work<'_, '_>,
     ) -> Result<(), KernelFailure> {
         if let ControlShape::Membership { .. } = shape {
             return self.attach_membership(child, program, batch_rows, work);
@@ -896,14 +896,14 @@ impl Frame {
 pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
     program: &novarocks_local_program::ExpressionProgram,
     root: ProgramExpressionRootSite,
-    input: &RecordBatch,
+    input: CompiledInputLoan<'_>,
     input_node: Option<(ProgramNodeId, ProgramChannelLayoutRole)>,
     selection: Selection<'a>,
     activation: novarocks_functions::ScalarInvocationActivation,
     instances: &mut BTreeMap<ProgramUseRef, scalar_invocation::CallInstance>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     effects: &BTreeMap<ProgramUseRef, ScopedExpressionEffects>,
-    work: &mut Work<'_>,
+    work: &mut Work<'_, '_>,
 ) -> Result<Value<'a>, E> {
     let checked = program.checked();
     let typed = checked.channels().expressions();
@@ -1068,12 +1068,14 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                             invalid("slot source differs from actual root input port").into()
                         );
                     }
-                    OwnedValue::Column(Arc::clone(
-                        input
-                            .columns()
-                            .get(*ordinal as usize)
-                            .ok_or_else(|| invalid("slot source ordinal is absent"))?,
-                    ))
+                    let column = input
+                        .checked_column(*ordinal as usize)
+                        .ok_or_else(|| invalid("slot source ordinal is absent"))?;
+                    // Obtain the source at the original checked Slot. Current
+                    // kernels still consume only the evaluated array; this
+                    // synchronous borrow neither captures nor wraps its owner.
+                    let (array, _source) = column.into_parts();
+                    OwnedValue::Column(Arc::clone(array))
                 }
                 StaticExprKind::PreparedLike { negated, .. } => {
                     if frame.children.len() != 2 {
@@ -1481,7 +1483,7 @@ fn assemble(
     row_errors: &mut BTreeMap<usize, RowDataError>,
     ty: &DataType,
     selection: Selection<'_>,
-    work: &mut Work<'_>,
+    work: &mut Work<'_, '_>,
 ) -> Result<OwnedValue, KernelFailure> {
     // The shared pure assembly receives only already-evaluated compact values.
     // Frame scheduling and its original lazy row demand remain in this host.
@@ -1531,7 +1533,7 @@ fn between_comparison_operand<'a>(
     parent_rows: &[usize],
     selection: Selection<'a>,
     batch_rows: usize,
-    work: &mut Work<'_>,
+    work: &mut Work<'_, '_>,
 ) -> Result<Value<'a>, KernelFailure> {
     let mut rows = Vec::with_capacity(child.ordinals.len());
     for &parent in &child.ordinals {
@@ -1578,7 +1580,7 @@ fn evaluate_comparison<'a>(
     left: &Value<'_>,
     right: &Value<'_>,
     selection: Selection<'a>,
-    work: &mut Work<'_>,
+    work: &mut Work<'_, '_>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     // Borrow the original callback; a nested comparison's footer cannot
     // observe again after any of its seven originating refusal categories.
@@ -1675,7 +1677,7 @@ fn evaluate_arithmetic<'a>(
     left: &Value<'_>,
     right: &Value<'_>,
     selection: Selection<'a>,
-    work: &mut Work<'_>,
+    work: &mut Work<'_, '_>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     use arrow::array::{
         Decimal128Array, Decimal256Array, Float64Array, Int16Array, Int32Array, Int64Array,
@@ -1850,7 +1852,7 @@ fn evaluate_cast<'a>(
     recipe: &novarocks_functions::PreparedCastRecipe,
     child: &Value<'_>,
     selection: Selection<'a>,
-    work: &mut Work<'_>,
+    work: &mut Work<'_, '_>,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     use arrow::array::{
         Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -2124,7 +2126,7 @@ struct TemporalValues {
     result: Option<(ArrayRef, Vec<usize>)>,
 }
 fn temporal_math<T>(
-    work: &mut Work<'_>,
+    work: &mut Work<'_, '_>,
     body: impl FnOnce(
         &mut novarocks_functions::EvaluationCheckpoints<'_>,
     ) -> Result<
@@ -2152,7 +2154,7 @@ fn temporal_math<T>(
     Ok(value)
 }
 impl TemporalValues {
-    fn new(rows: usize, work: &mut Work<'_>) -> Result<Self, KernelFailure> {
+    fn new(rows: usize, work: &mut Work<'_, '_>) -> Result<Self, KernelFailure> {
         work.flush()?;
         let mut seconds = Vec::new();
         seconds
@@ -2173,7 +2175,7 @@ impl TemporalValues {
         ordinals: &[usize],
         values: &[Option<i64>],
         fill_null: bool,
-        work: &mut Work<'_>,
+        work: &mut Work<'_, '_>,
     ) -> Result<(), KernelFailure> {
         if ordinals.len() != values.len() {
             return Err(invalid("temporal dense source length differs"));
@@ -2215,7 +2217,7 @@ impl TemporalValues {
         domain: Selection<'_>,
         ordinals: &[usize],
         array: ArrayRef,
-        work: &mut Work<'_>,
+        work: &mut Work<'_, '_>,
     ) -> Result<Option<String>, KernelFailure> {
         use novarocks_functions::builtin::calendar_time_text_shared as math;
         use novarocks_type_contract::{TemporalSourceRole as R, TemporalSourceShape as S};
@@ -2340,7 +2342,7 @@ impl TemporalValues {
         &self,
         errors: &BTreeMap<usize, RowDataError>,
         domain: Selection<'_>,
-        work: &mut Work<'_>,
+        work: &mut Work<'_, '_>,
     ) -> Result<bool, KernelFailure> {
         use novarocks_functions::builtin::calendar_time_text_shared as math;
         if self.seconds.len() != domain.len() {
@@ -2362,7 +2364,7 @@ impl TemporalValues {
         shape: ControlShape,
         errors: &mut BTreeMap<usize, RowDataError>,
         domain: Selection<'_>,
-        work: &mut Work<'_>,
+        work: &mut Work<'_, '_>,
     ) -> Result<OwnedValue, KernelFailure> {
         use novarocks_functions::builtin::calendar_time_text_shared as math;
         let ControlShape::TemporalSource(shape) = shape else {
@@ -2425,7 +2427,7 @@ mod between_comparison_control_tests;
 
 fn in_event(
     event: novarocks_functions::native_inlist::InObservation,
-    work: &mut Work<'_>,
+    work: &mut Work<'_, '_>,
 ) -> Result<(), KernelFailure> {
     match event {
         novarocks_functions::native_inlist::InObservation::Step => work.step(),
@@ -2444,7 +2446,7 @@ fn in_observed<T>(
         Err(novarocks_functions::native_inlist::InError::Data(message)) => Err(internal(&message)),
     }
 }
-fn duplicate_child(child: &Child, work: &mut Work<'_>) -> Result<Child, KernelFailure> {
+fn duplicate_child(child: &Child, work: &mut Work<'_, '_>) -> Result<Child, KernelFailure> {
     let mut ordinals = Vec::with_capacity(child.ordinals.len());
     for &ordinal in &child.ordinals {
         ordinals.push(ordinal);
@@ -2475,7 +2477,7 @@ fn validate_membership_phase(
     output: &SelectedValues<'_>,
     selection: Selection<'_>,
     expected: &novarocks_type_contract::FunctionValueType,
-    work: &mut Work<'_>,
+    work: &mut Work<'_, '_>,
 ) -> Result<(), KernelFailure> {
     if output.errors().is_empty() {
         return novarocks_functions::validate_evaluated_argument_observed(
