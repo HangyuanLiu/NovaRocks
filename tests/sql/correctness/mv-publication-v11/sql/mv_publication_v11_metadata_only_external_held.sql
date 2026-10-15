@@ -87,7 +87,7 @@ print("MV_EXTERNAL_REQUEST_FROZEN", snapshot)
 
 -- query 4
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=2,metadata-only-last=true,failed-table-commits=1
+-- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=2,slot-changes=0,metadata-only-last=true,failed-table-commits=1
 -- @publication_service_hold=ns_${uuid0}.target_mv,actor=shell
 -- @publication_catalog_concurrent_shell=request_file="${TMPDIR:-/tmp}/novarocks-mv-frozen-main-${uuid0}.json"; response_file="${TMPDIR:-/tmp}/novarocks-mv-frozen-main-${uuid0}.response.json"; status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' --request POST --header 'Content-Type: application/json' --data-binary "@$request_file" '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}/tables/target_mv')"; if [ "$status" != 409 ]; then printf 'frozen external status=%s\n' "$status" >&2; python3 -c 'import json,sys; body=json.load(open(sys.argv[1])); print(str(body.get("error", {}).get("message", "unexpected success"))[:400], file=sys.stderr)' "$response_file"; exit 1; fi
 SET CATALOG mvfrozen_${uuid0};

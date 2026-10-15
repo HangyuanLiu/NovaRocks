@@ -186,7 +186,7 @@ SELECT 1;
 -- query 19
 -- @skip_result_check=true
 -- @result_contains=MANAGEABLE
--- @mv_rest_document_graph=ns_${uuid0}.orders_rollup,publications=1,table-commits=3
+-- @mv_rest_document_graph=ns_${uuid0}.orders_rollup,publications=1,slot-changes=1,table-commits=3
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
 
 -- query 20
@@ -195,7 +195,7 @@ INSERT INTO mvsc_${uuid0}.ns_${uuid0}.orders VALUES ('east', 'online', 1000), ('
 
 -- query 21
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.orders_rollup,publications=2,table-commits=4,full-overwrite-last=true
+-- @mv_rest_document_graph=ns_${uuid0}.orders_rollup,publications=2,slot-changes=1,table-commits=4,full-overwrite-last=true
 SET CATALOG mvsc_${uuid0};
 USE ns_${uuid0};
 REFRESH MATERIALIZED VIEW orders_rollup FULL WITH SYNC MODE;

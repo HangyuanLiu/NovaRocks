@@ -57,7 +57,7 @@ INSERT INTO mvmeta_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
 
 -- query 5
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_filtered,publications=0
+-- @mv_rest_document_graph=ns_${uuid0}.mv_filtered,publications=0,slot-changes=0
 SET CATALOG mvmeta_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW mv_filtered
@@ -68,7 +68,7 @@ AS SELECT k, v FROM fact WHERE v > 0;
 
 -- query 6
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_filtered,publications=1
+-- @mv_rest_document_graph=ns_${uuid0}.mv_filtered,publications=1,slot-changes=0
 REFRESH MATERIALIZED VIEW mv_filtered WITH SYNC MODE;
 
 -- query 7
@@ -77,7 +77,7 @@ INSERT INTO mvmeta_${uuid0}.ns_${uuid0}.fact VALUES ('west', -1);
 
 -- query 8
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_filtered,publications=2,metadata-only-last=true
+-- @mv_rest_document_graph=ns_${uuid0}.mv_filtered,publications=2,slot-changes=0,metadata-only-last=true
 REFRESH MATERIALIZED VIEW mv_filtered WITH SYNC MODE;
 
 -- query 9

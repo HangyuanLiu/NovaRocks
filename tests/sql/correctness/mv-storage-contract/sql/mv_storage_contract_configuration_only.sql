@@ -57,7 +57,7 @@ INSERT INTO mvcfg_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
 
 -- query 5
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=0
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=0,slot-changes=0
 SET CATALOG mvcfg_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW mv_config
@@ -68,12 +68,12 @@ AS SELECT k, v FROM fact;
 
 -- query 6
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=0
 REFRESH MATERIALIZED VIEW mv_config WITH SYNC MODE;
 
 -- query 7
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,table-commits=3
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=1,table-commits=3
 ALTER MATERIALIZED VIEW mv_config PAUSE REFRESH;
 
 -- query 8
@@ -83,7 +83,7 @@ SHOW MATERIALIZED VIEWS;
 
 -- query 9
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,table-commits=4
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=2,table-commits=4
 ALTER MATERIALIZED VIEW mv_config SET REFRESH ASYNC ON CHANGE;
 
 -- query 10
@@ -94,12 +94,12 @@ SHOW MATERIALIZED VIEWS;
 
 -- query 11
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,table-commits=5
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=3,table-commits=5
 ALTER MATERIALIZED VIEW mv_config SET REFRESH DEFERRED MANUAL;
 
 -- query 12
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,table-commits=6
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=1,slot-changes=4,table-commits=6
 ALTER MATERIALIZED VIEW mv_config RESUME REFRESH;
 
 -- query 13
@@ -117,7 +117,7 @@ SHOW MATERIALIZED VIEWS;
 -- A later publication observes the revised C but still uses the same D/L/P
 -- dependencies. Its metadata-only snapshot must preserve the final policy.
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=2,table-commits=7
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=2,slot-changes=4,table-commits=7
 REFRESH MATERIALIZED VIEW mv_config WITH SYNC MODE;
 
 -- query 16

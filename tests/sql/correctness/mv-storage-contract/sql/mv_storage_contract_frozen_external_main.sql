@@ -86,7 +86,7 @@ print("MV_EXTERNAL_REQUEST_FROZEN", snapshot)
 
 -- query 4
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=2
+-- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=2,slot-changes=0
 REFRESH MATERIALIZED VIEW target_mv FULL WITH SYNC MODE;
 
 -- query 5

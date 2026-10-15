@@ -59,7 +59,7 @@ authoritative current list.
 | `lnp-3a-mv-rebuild` | Product-topology acceptance: MV rebuild after a lake wipe | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
 | `lnp-3c-runtime-cut` | Product-topology acceptance: runtime-state cut across an FE restart | `novarocks/frontend-application/src/state_family/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
 | `lnp-3d-mv-accelerator` | Product-topology acceptance: Accelerator wipe, restart and isolation | `novarocks/mv-application/**`, `novarocks/catalog-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
-| `mv-storage-contract` | MV storage-contract product gate: documents, lake-only recovery, operator continuation | `novarocks/mv-application/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; the runner starts it **its own** REST Catalog and MinIO (see below) |
+| `mv-storage-contract` | MV storage-contract product gate: inline keyed documents, compact publications, slot snapshots, DV logical rows, external cleanup, lake-only recovery and operator continuation | `novarocks/mv-application/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; the runner starts it **its own** REST Catalog and MinIO (see below) |
 | `mv-storage-physical-occ` | External target commit wins against a frozen MV publication without an MV P attachment | `novarocks/frontend-application/src/mv/**`, `tests/fixtures/iceberg-rest-publication/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; separate private REST Catalog and MinIO |
 | `mv-publication-v11` | Both MV/external commit orders inside REST after requirement validation, including full, incremental append, metadata-only, and repartition MV publications | `novarocks/frontend-application/src/mv/**`, `tests/fixtures/iceberg-rest-publication/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; the runner builds the checked-in hook image and uses private REST and MinIO |
 | `low-cardinality` | Dictionary encoding fast paths and their value domains | `novarocks/execution/src/exec/dict_encode.rs`, `novarocks/execution/src/exec/expr/{dict_decode,dict_peel}.rs` | — |
@@ -94,7 +94,9 @@ table only routes a change to the right suite.
 
 LNP-3A/LNP-3D、`mv-storage-contract` 及现有 system MV 场景保留原 SQL、`.result`、独立 graph 与隔离串行要求；不扩展旧 CALL、`@imv_stateless_rebuild` 或 `@imv_accelerator_wipe_restart`。当前测试擦除是一次实际 FE launch 与整个 MV Accelerator family 的授权，先由 MV owner 停止 admission 并 actual join 后台，不是逐 MV 或 whole-StateStore 删除接口。正常 `mv/state-store-restart` 的保留缓存对照不等同冷恢复。
 
-`mv_storage_contract_shared_document_revisions.sql` query 5/6 的裸 package/provenance CALL 按规则需就近声明 `test-capability:mv-document-observation`，只授权非破坏观察，不授予 wipe，也不消费 wipe 次数。这两步已补齐 tag，并保留原六个普通标签；完整 storage-contract 十个 case 已通过，SQL/expected/oracle 保持原样。验证范围与未运行项见 [G2 验证记录](../../../docs/guides/development/tst-g2-validation-status.md)。
+文档图指令 `@mv_rest_document_graph=<namespace>.<table>,publications=N,slot-changes=M` 分别计数保留的唯一发布与明确槽变更；REST 成功提交默认 `1+N+M`，外部过期后显式给累计 `table-commits`。每次检查递归 LIST 表目录 `metadata/novarocks-documents/` 与私有仓库 `_novarocks/document-staging/`，拒绝文档对象与 LIST 失败，不读历史 metadata。`logical-rows`、`total-records` 和 `delete-files-min` 用于 DV 的逻辑行数断言；旧 `deferred-sidecars-min` 不再接受。用例与 runner 由 MV owner 维护，publication/配置/持久格式变更必跑；显式串行 suite 在原生 1FE+3BE 私有 fixture 上 verify，故障 shell 负责临时文件退出，runner 负责角色与 fixture 收尾。单元测试手写冻结格式向量，不依赖产品 codec 或 recording。
+
+`mv_storage_contract_shared_document_revisions.sql` 的 package/provenance CALL 由独立 REST oracle 承接：CREATE 验证当前 D/L/B 闭包与配置槽，两次发布验证紧凑 P 严格布局及共享同一 B/D/L，历史解释也从当前属性池解析。只服务旧图形的两个 CALL、对应 result_contains 和两处观察授权 tag 成对退出；spine 与 LNP-3A/LNP-3D 的实际 wipe/restart 性质继续保留。测试入口本身、system 的普通产物拒绝与恢复消费者由各自 owner 维护。历史 G2 收据见 [G2 验证记录](../../../docs/guides/development/tst-g2-validation-status.md)，不代表新格式 SQL 已运行。
 
 | 唯一后续产品 owner | 必须承接的现有保护 |
 |---|---|

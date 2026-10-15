@@ -399,7 +399,8 @@ pub struct QueryMeta {
     /// resuming a target nothing had closed.
     pub mv_resume_management: Option<MvResumeManagementDirective>,
     /// Inspect the isolated REST target after publication and prove that every
-    /// retained P pins its own snapshot and the same table-level D/L revisions.
+    /// retained publication resolves B/D/L in current properties; count carried
+    /// slot snapshots separately and reject document sidecar objects.
     pub mv_rest_document_graph: Option<String>,
     /// Require a substring to occur in at least one runner-owned BE log.
     pub be_log_contains: Vec<String>,
