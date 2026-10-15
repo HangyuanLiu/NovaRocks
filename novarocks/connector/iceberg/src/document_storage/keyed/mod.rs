@@ -22,9 +22,14 @@ pub(crate) mod envelope;
 pub(crate) mod keys;
 pub(crate) mod limits;
 pub(crate) mod record;
+pub(crate) mod resolution;
+pub(crate) mod retention;
 pub(crate) mod view;
 
 pub(crate) use view::{project_full_view, project_view, reference_closure};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod calculation_test_support;
