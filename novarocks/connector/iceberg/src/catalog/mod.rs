@@ -684,6 +684,43 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     /// need an authoritative enumeration must surface the refusal.
     async fn view_exists(&self, view: CatalogTableName) -> Result<bool, ConnectorError>;
 
+    #[cfg(not(test))]
+    async fn view_exists_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<bool, ConnectorError>;
+    #[cfg(test)]
+    async fn view_exists_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<bool, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        let result = self.view_exists(view).await?;
+        context.check_active()?;
+        Ok(result)
+    }
+    #[cfg(not(test))]
+    async fn load_view_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError>;
+    #[cfg(test)]
+    async fn load_view_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        let result = self.load_view(view).await?;
+        context.check_active()?;
+        Ok(result)
+    }
+
     /// Enumerate views. See [`NovaRocksCatalog::view_exists`] on why this is
     /// not allowed to answer with an empty vector when it cannot answer.
     async fn list_views_for_request(
@@ -724,6 +761,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     // ---- B. Direct mutations -------------------------------------------
 
     /// Create a view. A catalog without views answers `Unsupported`.
+    #[cfg(test)]
     async fn create_view(
         &self,
         namespace: CatalogNamespaceName,
@@ -737,6 +775,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     }
 
     /// Replace a view's definition; the replacement freezes the view UUID.
+    #[cfg(test)]
     async fn replace_view(
         &self,
         replace: view_request::ValidatedViewReplace,
@@ -749,6 +788,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     }
 
     /// Drop a view.
+    #[cfg(test)]
     async fn drop_view(&self, view: CatalogTableName) -> CatalogOutcome<CatalogTableName> {
         CatalogOutcome::unsupported(format!(
             "{} Iceberg catalog does not support views ({view})",

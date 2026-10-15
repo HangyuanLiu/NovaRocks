@@ -288,6 +288,7 @@ impl RestEndpoints {
     }
 
     /// Create a view from its validated first version.
+    #[cfg(test)]
     pub(crate) async fn create_view(
         &self,
         namespace: &NamespaceIdent,
@@ -306,6 +307,7 @@ impl RestEndpoints {
     }
 
     /// Replace a view's definition; `expect` carries the frozen view UUID.
+    #[cfg(test)]
     pub(crate) async fn replace_view(
         &self,
         replace: &ValidatedViewReplace,
@@ -323,6 +325,7 @@ impl RestEndpoints {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn drop_view(&self, view: &TableIdent) -> MutationOutcome {
         self.mutate::<()>(
             Method::DELETE,

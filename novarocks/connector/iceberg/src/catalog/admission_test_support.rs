@@ -170,6 +170,7 @@ impl NovaRocksCatalog for AdmittedCatalog {
         self.inner.commit_dispatch(ident, target_ref, marker)
     }
 
+    #[cfg(test)]
     async fn create_view(
         &self,
         namespace: super::CatalogNamespaceName,
@@ -178,6 +179,7 @@ impl NovaRocksCatalog for AdmittedCatalog {
         self.inner.create_view(namespace, creation).await
     }
 
+    #[cfg(test)]
     async fn replace_view(
         &self,
         replace: super::view_request::ValidatedViewReplace,
@@ -185,6 +187,7 @@ impl NovaRocksCatalog for AdmittedCatalog {
         self.inner.replace_view(replace).await
     }
 
+    #[cfg(test)]
     async fn drop_view(
         &self,
         view: super::CatalogTableName,
@@ -241,6 +244,20 @@ impl NovaRocksCatalog for AdmittedCatalog {
         self.inner.load_table(table).await
     }
 
+    async fn view_exists_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<bool, ConnectorError> {
+        self.inner.view_exists_for_request(view, context).await
+    }
+    async fn load_view_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+        self.inner.load_view_for_request(view, context).await
+    }
     async fn view_exists(&self, view: CatalogTableName) -> Result<bool, ConnectorError> {
         self.inner.view_exists(view).await
     }

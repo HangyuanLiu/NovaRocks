@@ -107,6 +107,13 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         ) {
             return execute_namespace_publication(self, &request);
         }
+        if matches!(
+            &request.operation,
+            ConnectorCatalogMutationOperation::CreateView { .. }
+                | ConnectorCatalogMutationOperation::DropView { .. }
+        ) {
+            return execute_view_publication(self, &request);
+        }
         // Every catalog creates through the create-table transaction. Which
         // receipt shape comes back is decided by what the publication proof
         // actually carries, not by asking which kind of catalog this is.
@@ -385,26 +392,6 @@ fn validate_context(
 /// Nothing is lost by returning two states here: the caller reads dispatch
 /// certainty off the error's kind and turns an unknown into `CommitUnknown`,
 /// so `Unavailable` is the unknown rather than a flat failure.
-fn catalog_effect<T>(
-    outcome: crate::catalog::error::CatalogOutcome<T>,
-) -> Result<ExternalMutationEffect, ConnectorError> {
-    match outcome {
-        crate::catalog::error::CatalogOutcome::KnownCommitted { .. } => {
-            Ok(ExternalMutationEffect::Applied)
-        }
-        crate::catalog::error::CatalogOutcome::KnownUncommitted { failure } => {
-            Err(map_mutation_failure(&failure))
-        }
-        crate::catalog::error::CatalogOutcome::CommitUnknown { failure, .. } => {
-            Err(unavailable(failure.to_string()))
-        }
-        crate::catalog::error::CatalogOutcome::Unsupported(reason) => Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            reason.message().to_string(),
-        )),
-    }
-}
-
 fn execute_operation(
     provider: &IcebergMetadata,
     operation: &ConnectorCatalogMutationOperation,
@@ -425,72 +412,10 @@ fn execute_operation(
             policy,
             data_disposition,
         } => drop_table(provider, table, *policy, *data_disposition, context),
-        ConnectorCatalogMutationOperation::CreateView {
-            view,
-            columns,
-            definition,
-            comment,
-            properties,
-            policy,
-        } => {
-            ensure_owner(provider, &view.instance_id)?;
-            // The collision probe enumerates the namespace and observes the
-            // production listing bound: an over-bound namespace refuses the
-            // create instead of answering from a partial listing.
-            if provider
-                .runtime()
-                .list_tables_for_request(
-                    &view.namespace,
-                    context,
-                    novarocks_spi::connector::ConnectorListingBound::V1,
-                )
-                .map_err(|(kind, message)| ConnectorError::new(kind, message))?
-                .iter()
-                .any(|table| table.eq_ignore_ascii_case(&view.view))
-            {
-                return Err(already_exists(
-                    "a table with the requested Iceberg view name already exists",
-                ));
-            }
-            let exists =
-                super::views::view_exists(provider.runtime(), &view.namespace, &view.view)?;
-            match (*policy, exists) {
-                (CreateOrReplacePolicy::NoOpIfExists, true) => {
-                    return Ok(ExternalMutationEffect::NoOp);
-                }
-                (CreateOrReplacePolicy::FailIfExists, true) => {
-                    return Err(already_exists("Iceberg view already exists"));
-                }
-                _ => {}
-            }
-            let outcome = super::views::create_view(
-                provider.runtime(),
-                &view.namespace,
-                &view.view,
-                columns,
-                definition,
-                comment.as_deref(),
-                exists && *policy == CreateOrReplacePolicy::ReplaceIfExists,
-                &view_properties(properties)?,
-            )
-            .map_err(map_view_error)?;
-            catalog_effect(outcome)
-        }
-        ConnectorCatalogMutationOperation::DropView { view, policy } => {
-            ensure_owner(provider, &view.instance_id)?;
-            let exists =
-                super::views::view_exists(provider.runtime(), &view.namespace, &view.view)?;
-            if !exists {
-                return if *policy == DropPolicy::NoOpIfMissing {
-                    Ok(ExternalMutationEffect::NoOp)
-                } else {
-                    Err(not_found("Iceberg view does not exist"))
-                };
-            }
-            let outcome = super::views::drop_view(provider.runtime(), &view.namespace, &view.view)
-                .map_err(map_view_error)?;
-            catalog_effect(outcome)
-        }
+        ConnectorCatalogMutationOperation::CreateView { .. }
+        | ConnectorCatalogMutationOperation::DropView { .. } => Err(internal(
+            "View mutation must use its prepared publication journal",
+        )),
         ConnectorCatalogMutationOperation::AlterSchema { table, changes } => {
             ensure_owner(provider, &table.instance_id)?;
             alter_schema(provider.runtime(), table, changes, context)
@@ -2181,11 +2106,171 @@ fn update_table(
         .map_err(|error| map_iceberg_message(action, error))
 }
 
+fn execute_view_publication(
+    provider: &IcebergMetadata,
+    request: &ConnectorCatalogMutationRequest,
+) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    use crate::catalog::catalog_request::CatalogPublicationRequest;
+    use crate::catalog::publication_dispatch::{PreparationFailure, PreparationResult};
+    enum PreparedView {
+        NoOp(ConnectorCatalogMutationReceipt),
+        Mutation {
+            request: crate::catalog::catalog_request::FrozenCatalogPublication,
+            evidence: ExternalMutationEvidence,
+            receipt: ConnectorCatalogMutationReceipt,
+        },
+    }
+    let preparation = (|| -> PreparationResult<_> {
+        let (view, create) = match &request.operation {
+            ConnectorCatalogMutationOperation::CreateView { view, .. } => (view, true),
+            ConnectorCatalogMutationOperation::DropView { view, .. } => (view, false),
+            _ => return Err(internal("View publication requires a view mutation").into()),
+        };
+        ensure_owner(provider, &view.instance_id)?;
+        let namespace = normalize_identifier(&view.namespace).map_err(invalid)?;
+        let name = normalize_identifier(&view.view).map_err(invalid)?;
+        if create
+            && provider
+                .runtime()
+                .list_tables_for_request(
+                    &namespace,
+                    &request.context,
+                    novarocks_spi::connector::ConnectorListingBound::V1,
+                )
+                .map_err(|(kind, message)| ConnectorError::new(kind, message))?
+                .iter()
+                .any(|table| table.eq_ignore_ascii_case(&name))
+        {
+            return Err(PreparationFailure(ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::AlreadyExists,
+                "a table with the requested Iceberg view name already exists",
+            )));
+        }
+        let exists =
+            super::views::view_exists(provider.runtime(), &namespace, &name, &request.context)?;
+        let seed = receipt(provider, request.operation_id, request.operation.kind())?;
+        let publication = match &request.operation {
+            ConnectorCatalogMutationOperation::CreateView {
+                columns,
+                definition,
+                comment,
+                properties,
+                policy,
+                ..
+            } => {
+                if exists {
+                    match policy {
+                        CreateOrReplacePolicy::NoOpIfExists => return Ok(PreparedView::NoOp(seed)),
+                        CreateOrReplacePolicy::FailIfExists => {
+                            return Err(PreparationFailure(ConnectorMutationFailure::new(
+                                ConnectorMutationFailureKind::AlreadyExists,
+                                "Iceberg view already exists",
+                            )));
+                        }
+                        CreateOrReplacePolicy::ReplaceIfExists => (),
+                    }
+                }
+                let (definition, properties) = super::views::prepare_definition(
+                    columns,
+                    definition,
+                    comment.as_deref(),
+                    &view_properties(properties)?,
+                )
+                .map_err(invalid)?;
+                if exists {
+                    let current = super::views::load_view_metadata_for_request(
+                        provider.runtime(),
+                        &namespace,
+                        &name,
+                        &request.context,
+                    )?;
+                    let ident =
+                        TableIdent::new(NamespaceIdent::new(namespace.clone()), name.clone());
+                    let replacement = crate::catalog::view_request::ValidatedViewReplace::validate(
+                        ident, &current, definition, properties,
+                    )
+                    .map_err(invalid)?;
+                    CatalogPublicationRequest::ReplaceView(replacement)
+                } else {
+                    let creation = crate::catalog::view_request::ViewCreate::validate(
+                        name.clone(),
+                        definition,
+                        properties,
+                    )
+                    .map_err(invalid)?;
+                    CatalogPublicationRequest::CreateView {
+                        namespace: CatalogNamespaceName::new(namespace.clone()),
+                        creation,
+                    }
+                }
+            }
+            ConnectorCatalogMutationOperation::DropView { policy, .. } => {
+                if !exists {
+                    return if *policy == DropPolicy::NoOpIfMissing {
+                        Ok(PreparedView::NoOp(seed))
+                    } else {
+                        Err(not_found("Iceberg view does not exist").into())
+                    };
+                }
+                CatalogPublicationRequest::DropView(CatalogTableName::new(
+                    namespace.clone(),
+                    name.clone(),
+                ))
+            }
+            _ => unreachable!(),
+        }
+        .freeze(request.operation_id.to_bytes())?;
+        let target = match publication.attribution() {
+            crate::commit::publication_descriptor::AttributionPlan::ViewOperation {
+                view_uuid: Some(uuid),
+                operation_id,
+            } => IcebergMutationEvidenceTarget::ViewOperation {
+                namespace,
+                view: name,
+                view_uuid: uuid.to_string(),
+                operation_marker: operation_id.clone(),
+            },
+            _ => IcebergMutationEvidenceTarget::View {
+                namespace,
+                view: name,
+                should_exist: create,
+            },
+        };
+        let evidence = evidence(
+            provider,
+            request.operation_id,
+            request.operation.kind(),
+            target,
+        )?;
+        Ok(PreparedView::Mutation {
+            request: publication,
+            evidence,
+            receipt: seed,
+        })
+    })();
+    match preparation {
+        Err(PreparationFailure(failure)) => Ok(ExternalMutationOutcome::KnownUncommitted {
+            failure,
+            cleanup: ExternalMutationFinalization::Complete,
+        }),
+        Ok(PreparedView::NoOp(receipt)) => Ok(ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::NoOp,
+            receipt,
+            finalization: ExternalMutationFinalization::Complete,
+        }),
+        Ok(PreparedView::Mutation {
+            request: publication,
+            evidence,
+            receipt: seed,
+        }) => execute_catalog_publication(provider, request, publication, evidence, seed),
+    }
+}
+
 fn execute_namespace_publication(
     provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
-    use crate::catalog::catalog_request::{CatalogPublicationRequest, CatalogResponseDocument};
+    use crate::catalog::catalog_request::CatalogPublicationRequest;
     let namespace = match &request.operation {
         ConnectorCatalogMutationOperation::CreateNamespace { namespace, .. }
         | ConnectorCatalogMutationOperation::DropNamespace { namespace, .. } => namespace,
@@ -2240,6 +2325,17 @@ fn execute_namespace_publication(
         Ok(prepared) => prepared,
         Err(error) => return Ok(known_uncommitted(error)),
     };
+    execute_catalog_publication(provider, request, frozen, evidence, seed)
+}
+
+fn execute_catalog_publication(
+    provider: &IcebergMetadata,
+    request: &ConnectorCatalogMutationRequest,
+    frozen: crate::catalog::catalog_request::FrozenCatalogPublication,
+    evidence: ExternalMutationEvidence,
+    seed: ConnectorCatalogMutationReceipt,
+) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    use crate::catalog::catalog_request::CatalogResponseDocument;
     let journal = crate::commit::attempt::observation::PublicationJournal::new(
         crate::commit::model::OperationToken::from_mutation(request.operation_id),
     );
@@ -2285,9 +2381,9 @@ fn execute_namespace_publication(
     Ok(match result {
         Ok(Ok(entry)) => journal.catalog_entry_outcome(entry),
         Ok(Err(error)) => journal
-            .catalog_bridge_failure(format!("Namespace publication invocation failed: {error}")),
+            .catalog_bridge_failure(format!("Catalog publication invocation failed: {error}")),
         Err(error) => {
-            journal.catalog_bridge_failure(format!("Namespace publication bridge failed: {error}"))
+            journal.catalog_bridge_failure(format!("Catalog publication bridge failed: {error}"))
         }
     })
 }
@@ -3110,17 +3206,11 @@ fn reconcile_evidence(
                 )),
             }
         }
-        IcebergMutationEvidenceTarget::View {
-            namespace,
-            view,
-            should_exist,
-        } => {
-            let exists = super::views::view_exists(provider.runtime(), &namespace, &view)?;
-            if exists == should_exist {
-                ambiguous("Iceberg view postcondition matches but cannot be attributed")
-            } else {
-                uncommitted("Iceberg view mutation postcondition is absent")
-            }
+        IcebergMutationEvidenceTarget::ViewOperation { .. } => {
+            ambiguous("Iceberg view replacement requires its exact positive operation proof")
+        }
+        IcebergMutationEvidenceTarget::View { .. } => {
+            ambiguous("Iceberg view mutation has no attributable positive proof")
         }
         IcebergMutationEvidenceTarget::TableVersion {
             namespace,
@@ -3572,6 +3662,7 @@ fn map_iceberg_message(action: &str, error: crate::iceberg::Error) -> ConnectorE
     ConnectorError::new(mapped.kind(), format!("{action}: {mapped}"))
 }
 
+#[cfg(test)]
 fn map_view_error(error: String) -> ConnectorError {
     if error.starts_with("unknown view:") {
         not_found(error)
@@ -4554,6 +4645,544 @@ mod tests {
                 (_, other) => panic!("Unexpected namespace preparation outcome: {other:?}"),
             }
             assert!(server.requests().iter().all(|r| r.method == "GET"));
+        }
+    }
+
+    fn view_request(provider: &IcebergMetadata, mode: &str) -> ConnectorCatalogMutationRequest {
+        let view = novarocks_spi::connector::ConnectorViewIdentity {
+            instance_id: provider.descriptor().instance_id.clone(),
+            namespace: "db".into(),
+            view: "v".into(),
+        };
+        ConnectorCatalogMutationRequest {
+            operation_id: ConnectorMutationOperationId::new(),
+            target: ConnectorProviderBindingKey {
+                instance_id: provider.descriptor().instance_id.clone(),
+                incarnation: provider.incarnation(),
+            },
+            operation: if mode == "drop" {
+                ConnectorCatalogMutationOperation::DropView {
+                    view,
+                    policy: DropPolicy::FailIfMissing,
+                }
+            } else {
+                ConnectorCatalogMutationOperation::CreateView { view,
+                columns: vec![ConnectorColumnDefinition { name: "a".into(), data_type: ConnectorDataType::Int, nullable: true, aggregation: None, default: None }],
+                definition: novarocks_spi::connector::ConnectorViewDefinition {
+                    dialect: novarocks_spi::connector::ConnectorViewDialect::StarRocks,
+                    raw_sql: "select 1 as a".into(), default_catalog: Some("source".into()), default_namespace: "source_db".into(),
+                    source_format: Some(novarocks_spi::connector::ConnectorViewSourceFormat::EffectiveUserSourceV1),
+                }, comment: None, properties: vec![],
+                policy: if mode == "replace" { CreateOrReplacePolicy::ReplaceIfExists } else { CreateOrReplacePolicy::FailIfExists },
+            }
+            },
+            context: context(),
+        }
+    }
+
+    fn complete_view_response() -> serde_json::Value {
+        serde_json::json!({"metadata-location":"s3://warehouse/db/v/metadata/1.json", "metadata": {
+            "view-uuid":"00000000-0000-0000-0000-000000000001", "format-version":1,
+            "location":"s3://warehouse/db/v", "current-version-id":1,
+            "versions":[{"version-id":1, "schema-id":0, "timestamp-ms":1600000000000_i64,
+                "summary":{}, "representations":[{"type":"sql", "sql":"select 1 as a", "dialect":"starrocks"}], "default-namespace":["db"]}],
+            "version-log":[{"version-id":1, "timestamp-ms":1600000000000_i64}],
+            "schemas":[{"type":"struct", "schema-id":0, "fields":[{"id":1, "name":"a", "required":false, "type":"int"}]}], "properties":{}
+        }})
+    }
+
+    #[test]
+    fn view_journal_keeps_exact_evidence_once_without_full_response_materialization() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for mode in ["create", "replace", "drop"] {
+            for code in [200, 204, 409, 401, 403, 419, 404, 503] {
+                if (mode == "drop" && code == 200) || (mode != "drop" && code == 204) {
+                    continue;
+                }
+                let method = if mode == "drop" { "DELETE" } else { "POST" };
+                let path = if mode == "create" {
+                    "/v1/namespaces/db/views"
+                } else {
+                    "/v1/namespaces/db/views/v"
+                };
+                // Valid minimal attribution, deliberately invalid full ViewMetadata.
+                let success = serde_json::json!({"metadata-location":"s3://warehouse/db/v/metadata/2.json",
+                    "metadata":{"view-uuid":"00000000-0000-0000-0000-000000000001"}});
+                let server = TestServer::start(
+                    Script::new()
+                        .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                        .on(
+                            "GET",
+                            "/v1/namespaces/db/tables",
+                            Reply::json(200, &serde_json::json!({"identifiers":[]})),
+                        )
+                        .on(
+                            "HEAD",
+                            "/v1/namespaces/db/views/v",
+                            Reply::status(if mode == "create" { 404 } else { 200 }),
+                        )
+                        .on(
+                            "GET",
+                            "/v1/namespaces/db/views/v",
+                            Reply::json(200, &complete_view_response()),
+                        )
+                        .on(
+                            method,
+                            path,
+                            if code == 200 {
+                                Reply::json(200, &success)
+                            } else {
+                                Reply::status(code)
+                            },
+                        ),
+                );
+                let (_executor, provider) = variant_definition_provider(&server.url());
+                match (
+                    code,
+                    provider.execute(view_request(&provider, mode)).unwrap(),
+                ) {
+                    (
+                        200 | 204,
+                        ExternalMutationOutcome::KnownCommitted {
+                            effect: ExternalMutationEffect::Applied,
+                            ..
+                        },
+                    ) => (),
+                    (
+                        409 | 401 | 403 | 419,
+                        ExternalMutationOutcome::KnownUncommitted { failure, .. },
+                    ) => assert_eq!(
+                        failure.kind(),
+                        match code {
+                            409 if mode == "create" => ConnectorMutationFailureKind::AlreadyExists,
+                            409 => ConnectorMutationFailureKind::Conflict,
+                            401 | 419 => ConnectorMutationFailureKind::Unauthenticated,
+                            403 => ConnectorMutationFailureKind::PermissionDenied,
+                            _ => unreachable!(),
+                        }
+                    ),
+                    (404 | 503, ExternalMutationOutcome::CommitUnknown { evidence, .. }) => {
+                        if mode == "replace" {
+                            let decoded =
+                                decode_mutation_evidence(evidence.provider_payload()).unwrap();
+                            let IcebergMutationEvidenceTarget::ViewOperation {
+                                view_uuid,
+                                operation_marker,
+                                ..
+                            } = decoded.target
+                            else {
+                                panic!("Replacement lost its exact operation proof facts")
+                            };
+                            assert_eq!(view_uuid, "00000000-0000-0000-0000-000000000001");
+                            let sent: serde_json::Value =
+                                serde_json::from_slice(&server.requests_to("POST", path)[0].body)
+                                    .unwrap();
+                            let version = sent["updates"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .find(|u| u["action"] == "add-view-version")
+                                .unwrap();
+                            assert_eq!(
+                                version["view-version"]["summary"]["novarocks.operation-id"],
+                                operation_marker
+                            );
+                            assert_eq!(
+                                uuid::Uuid::parse_str(&operation_marker)
+                                    .unwrap()
+                                    .get_version_num(),
+                                7
+                            );
+                        }
+                        let before = server.requests().len();
+                        assert!(matches!(
+                            provider
+                                .reconcile(ConnectorCatalogMutationReconcileRequest {
+                                    evidence,
+                                    context: context()
+                                })
+                                .unwrap(),
+                            ExternalMutationOutcome::CommitUnknown { .. }
+                        ));
+                        assert_eq!(
+                            server.requests().len(),
+                            before,
+                            "No presence/absence inference or mutation replay"
+                        );
+                    }
+                    (_, other) => panic!("Unexpected {mode} {code}: {other:?}"),
+                }
+                assert_eq!(server.requests_to(method, path).len(), 1);
+                if mode == "create" {
+                    let sent: serde_json::Value =
+                        serde_json::from_slice(&server.requests_to("POST", path)[0].body).unwrap();
+                    assert!(
+                        sent["view-version"]["summary"]
+                            .get("novarocks.operation-id")
+                            .is_none()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn view_preflight_keeps_no_ops_typed_refusals_and_table_collision() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for case in [
+            "create-noop",
+            "exists",
+            "drop-noop",
+            "missing",
+            "table-collision",
+        ] {
+            let is_drop = case == "drop-noop" || case == "missing";
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/tables",
+                        Reply::json(
+                            200,
+                            &if case == "table-collision" {
+                                serde_json::json!({"identifiers":[{"namespace":["db"],"name":"v"}]})
+                            } else {
+                                serde_json::json!({"identifiers":[]})
+                            },
+                        ),
+                    )
+                    .on(
+                        "HEAD",
+                        "/v1/namespaces/db/views/v",
+                        Reply::status(if is_drop { 404 } else { 200 }),
+                    ),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let mut request = view_request(&provider, if is_drop { "drop" } else { "create" });
+            match &mut request.operation {
+                ConnectorCatalogMutationOperation::CreateView { policy, .. }
+                    if case == "create-noop" =>
+                {
+                    *policy = CreateOrReplacePolicy::NoOpIfExists
+                }
+                ConnectorCatalogMutationOperation::DropView { policy, .. }
+                    if case == "drop-noop" =>
+                {
+                    *policy = DropPolicy::NoOpIfMissing
+                }
+                _ => (),
+            }
+            match (case, provider.execute(request).unwrap()) {
+                (
+                    "create-noop" | "drop-noop",
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::NoOp,
+                        ..
+                    },
+                ) => (),
+                (
+                    "exists" | "table-collision",
+                    ExternalMutationOutcome::KnownUncommitted { failure, .. },
+                ) => assert_eq!(failure.kind(), ConnectorMutationFailureKind::AlreadyExists),
+                ("missing", ExternalMutationOutcome::KnownUncommitted { failure, .. }) => {
+                    assert_eq!(failure.kind(), ConnectorMutationFailureKind::NotFound)
+                }
+                (_, other) => panic!("Unexpected {case} preflight: {other:?}"),
+            }
+            assert!(
+                server
+                    .requests()
+                    .iter()
+                    .all(|r| r.method == "GET" || r.method == "HEAD")
+            );
+            if case == "table-collision" {
+                assert!(
+                    server
+                        .requests_to("HEAD", "/v1/namespaces/db/views/v")
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn view_reads_and_mutation_preflight_observe_the_original_stop_during_io() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for action in ["exists", "load", "create"] {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/tables",
+                        Reply::json(200, &serde_json::json!({"identifiers":[]})),
+                    )
+                    .on(
+                        "HEAD",
+                        "/v1/namespaces/db/views/v",
+                        Reply::status(404).with_delay(Duration::from_millis(250)),
+                    )
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/views/v",
+                        Reply::json(200, &complete_view_response())
+                            .with_delay(Duration::from_millis(250)),
+                    ),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+            let context = ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(30),
+                stop.view(),
+                65536,
+                262144,
+            )
+            .unwrap();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    let mut request = view_request(&provider, "create");
+                    request.context = context;
+                    if action == "create" {
+                        assert!(matches!(provider.execute(request).unwrap(), ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == ConnectorMutationFailureKind::Cancelled));
+                    } else {
+                        let ConnectorCatalogMutationOperation::CreateView { view, .. } = request.operation else { unreachable!() };
+                        let request = novarocks_spi::connector::ConnectorViewRequest { view, context: request.context };
+                        let error = if action == "exists" {
+                            novarocks_spi::connector::ConnectorViewMetadata::view_exists(&provider, request).unwrap_err()
+                        } else {
+                            novarocks_spi::connector::ConnectorViewMetadata::load_view(&provider, request).unwrap_err()
+                        };
+                        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
+                    }
+                });
+                let method = if action == "load" { "GET" } else { "HEAD" };
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while server
+                    .requests_to(method, "/v1/namespaces/db/views/v")
+                    .is_empty()
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "View read did not reach controlled I/O"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                stop.request_stop();
+                worker.join().unwrap();
+            });
+            assert!(
+                server
+                    .requests()
+                    .iter()
+                    .all(|r| r.method == "GET" || r.method == "HEAD")
+            );
+        }
+    }
+
+    #[test]
+    fn view_identity_and_local_name_refusals_precede_session_io() {
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        let server = TestServer::start(Script::new());
+        let (_executor, provider) = variant_definition_provider(&server.url());
+        for mode in ["create", "replace", "drop"] {
+            for invalid in ["nested-instance", "generation", "name"] {
+                let mut request = view_request(&provider, mode);
+                if invalid == "generation" {
+                    request.target.incarnation = ProviderBindingEpoch::from_bytes([99; 16]);
+                }
+                let (ConnectorCatalogMutationOperation::CreateView { view, .. }
+                | ConnectorCatalogMutationOperation::DropView { view, .. }) =
+                    &mut request.operation
+                else {
+                    unreachable!()
+                };
+                if invalid == "nested-instance" {
+                    view.instance_id =
+                        novarocks_spi::connector::ConnectorInstanceId::parse("foreign").unwrap();
+                }
+                if invalid == "name" {
+                    view.view = "bad/name".into();
+                }
+                assert!(
+                    matches!(provider.execute(request).unwrap(), ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == ConnectorMutationFailureKind::InvalidRequest)
+                );
+            }
+        }
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn view_each_preparation_read_stops_or_expires_without_mutation() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for phase in ["listing", "head", "replacement"] {
+            for cancel in [true, false] {
+                let delayed = if cancel {
+                    Duration::from_millis(250)
+                } else {
+                    Duration::from_secs(2)
+                };
+                let server = TestServer::start(
+                    Script::new()
+                        .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                        .on(
+                            "GET",
+                            "/v1/namespaces/db/tables",
+                            Reply::json(200, &serde_json::json!({"identifiers":[]})).with_delay(
+                                if phase == "listing" {
+                                    delayed
+                                } else {
+                                    Duration::ZERO
+                                },
+                            ),
+                        )
+                        .on(
+                            "HEAD",
+                            "/v1/namespaces/db/views/v",
+                            Reply::status(if phase == "replacement" { 200 } else { 404 })
+                                .with_delay(if phase == "head" {
+                                    delayed
+                                } else {
+                                    Duration::ZERO
+                                }),
+                        )
+                        .on(
+                            "GET",
+                            "/v1/namespaces/db/views/v",
+                            Reply::json(200, &complete_view_response()).with_delay(
+                                if phase == "replacement" {
+                                    delayed
+                                } else {
+                                    Duration::ZERO
+                                },
+                            ),
+                        ),
+                );
+                let (_executor, provider) = variant_definition_provider(&server.url());
+                let mut request = view_request(
+                    &provider,
+                    if phase == "replacement" {
+                        "replace"
+                    } else {
+                        "create"
+                    },
+                );
+                let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+                request.context = ConnectorRequestContext::try_new(
+                    Instant::now()
+                        + if cancel {
+                            Duration::from_secs(30)
+                        } else {
+                            Duration::from_secs(1)
+                        },
+                    stop.view(),
+                    65536,
+                    262144,
+                )
+                .unwrap();
+                let (method, path) = match phase {
+                    "listing" => ("GET", "/v1/namespaces/db/tables"),
+                    "head" => ("HEAD", "/v1/namespaces/db/views/v"),
+                    _ => ("GET", "/v1/namespaces/db/views/v"),
+                };
+                let outcome = std::thread::scope(|scope| {
+                    let worker = scope.spawn(|| provider.execute(request));
+                    if cancel {
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while server.requests_to(method, path).is_empty() {
+                            assert!(
+                                Instant::now() < deadline,
+                                "View preparation did not reach the controlled phase"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        stop.request_stop();
+                    }
+                    worker.join().unwrap().unwrap()
+                });
+                assert!(
+                    matches!(outcome, ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == if cancel { ConnectorMutationFailureKind::Cancelled } else { ConnectorMutationFailureKind::DeadlineExceeded })
+                );
+                assert_eq!(
+                    server.requests_to(method, path).len(),
+                    1,
+                    "Original deadline must cover the actual {phase} wait"
+                );
+                assert!(
+                    server
+                        .requests()
+                        .iter()
+                        .all(|r| r.method == "GET" || r.method == "HEAD")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn view_actual_publication_entry_refuses_dialect_loss_and_invalid_history_before_mutation() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for case in ["dialect", "history-create", "history-replace"] {
+            let mut current = complete_view_response();
+            if case == "dialect" {
+                current["metadata"]["versions"][0]["representations"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(
+                        serde_json::json!({"type":"sql", "sql":"select 1 as a", "dialect":"spark"}),
+                    );
+            }
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/tables",
+                        Reply::json(200, &serde_json::json!({"identifiers":[]})),
+                    )
+                    .on(
+                        "HEAD",
+                        "/v1/namespaces/db/views/v",
+                        Reply::status(if case == "history-create" { 404 } else { 200 }),
+                    )
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/views/v",
+                        Reply::json(200, &current),
+                    ),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let mut request = view_request(
+                &provider,
+                if case == "history-create" {
+                    "create"
+                } else {
+                    "replace"
+                },
+            );
+            if case != "dialect" {
+                let ConnectorCatalogMutationOperation::CreateView { properties, .. } =
+                    &mut request.operation
+                else {
+                    unreachable!()
+                };
+                properties.push(("version.history.num-entries".into(), "0".into()));
+            }
+            let outcome = provider.execute(request).unwrap();
+            let ExternalMutationOutcome::KnownUncommitted { failure, .. } = outcome else {
+                panic!("View local validation did not prove zero dispatch")
+            };
+            assert_eq!(failure.kind(), ConnectorMutationFailureKind::InvalidRequest);
+            assert!(failure.to_string().contains(if case == "dialect" {
+                "drop SQL dialects"
+            } else {
+                "version.history.num-entries"
+            }));
+            assert!(
+                server
+                    .requests()
+                    .iter()
+                    .all(|r| r.method == "GET" || r.method == "HEAD")
+            );
         }
     }
 

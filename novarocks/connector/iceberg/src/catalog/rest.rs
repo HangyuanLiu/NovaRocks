@@ -840,6 +840,38 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         super::CatalogCommitBase::from_table(frozen.materialize(file_io)?)
     }
 
+    async fn view_exists_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<bool, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        let result = self
+            .delegate
+            .listing
+            .run(&context, self.view_exists(view))
+            .await?;
+        context.check_active()?;
+        Ok(result)
+    }
+
+    async fn load_view_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        let result = self
+            .delegate
+            .listing
+            .run(&context, self.load_view(view))
+            .await?;
+        context.check_active()?;
+        Ok(result)
+    }
+
     async fn view_exists(&self, view: CatalogTableName) -> Result<bool, ConnectorError> {
         let ident = super::delegate::table_ident(&view)?;
         self.endpoints.view_exists(&ident).await
@@ -1099,6 +1131,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         }
     }
 
+    #[cfg(test)]
     async fn create_view(
         &self,
         namespace: CatalogNamespaceName,
@@ -1118,6 +1151,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         view_outcome(outcome.evidence, target)
     }
 
+    #[cfg(test)]
     async fn replace_view(
         &self,
         replace: super::view_request::ValidatedViewReplace,
@@ -1133,6 +1167,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         view_outcome(outcome.evidence, target)
     }
 
+    #[cfg(test)]
     async fn drop_view(&self, view: CatalogTableName) -> CatalogOutcome<CatalogTableName> {
         let ident = match super::delegate::table_ident(&view) {
             Ok(ident) => ident,
@@ -1246,6 +1281,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
 }
 
 /// The owner outcome of a view mutation's evidence.
+#[cfg(test)]
 fn view_outcome(
     evidence: RestEvidence,
     target: CatalogTableName,

@@ -513,6 +513,26 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         )
     }
 
+    async fn view_exists_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<bool, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        self.view_exists(view).await
+    }
+
+    async fn load_view_for_request(
+        &self,
+        view: CatalogTableName,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        context.check_active()?;
+        self.load_view(view).await
+    }
+
     async fn view_exists(&self, _view: CatalogTableName) -> Result<bool, ConnectorError> {
         Err(super::views_unsupported("view_exists"))
     }
