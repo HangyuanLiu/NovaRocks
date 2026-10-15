@@ -11,6 +11,7 @@ workspace = true
 doctest = false
 
 [dependencies]
+novarocks-failure-contract.workspace = true
 bytes.workspace = true
 novarocks-types.workspace = true
 novarocks-result-contract.workspace = true

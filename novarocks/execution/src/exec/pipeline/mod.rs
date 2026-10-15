@@ -35,6 +35,7 @@ pub mod driver;
 pub mod executor;
 pub mod fragment_context;
 pub mod global_driver_executor;
+pub mod input;
 pub mod operator;
 pub mod operator_factory;
 #[expect(
@@ -43,3 +44,6 @@ pub mod operator_factory;
 )]
 pub mod pipeline;
 pub mod schedule;
+pub mod shape;
+pub mod step;
+pub mod step_context;

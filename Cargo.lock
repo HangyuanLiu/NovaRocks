@@ -3804,6 +3804,7 @@ dependencies = [
  "novarocks-connector-iceberg-functions",
  "novarocks-execution-contract",
  "novarocks-failpoint",
+ "novarocks-failure-contract",
  "novarocks-functions",
  "novarocks-local-compiler",
  "novarocks-local-program",
@@ -3845,6 +3846,7 @@ name = "novarocks-execution-contract"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "novarocks-failure-contract",
  "novarocks-result-contract",
  "novarocks-types",
  "uuid",
@@ -3861,6 +3863,10 @@ dependencies = [
  "socket2 0.6.5",
  "tokio",
 ]
+
+[[package]]
+name = "novarocks-failure-contract"
+version = "0.1.0"
 
 [[package]]
 name = "novarocks-frontend-application"

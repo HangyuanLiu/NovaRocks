@@ -11,6 +11,7 @@ workspace = true
 doctest = false
 
 [dependencies]
+novarocks-failure-contract.workspace = true
 novarocks-failpoint = { workspace = true }
 novarocks-result-contract.workspace = true
 arrow.workspace = true
