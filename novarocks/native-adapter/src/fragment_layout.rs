@@ -20,13 +20,9 @@
 //! All values here are immutable projections from the native plan wire.  The
 //! Backend remains the owner of plan lowering and fragment lifecycle.
 
-#[cfg(test)]
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_execution::exec::chunk::{ChunkSchemaRef, ChunkSlotSchema};
-#[cfg(test)]
-use novarocks_execution::exec::fragment::program::{ExchangeInputContract, FragmentNodeId};
 #[cfg(test)]
 use novarocks_proto_codec::FieldPath;
 #[cfg(test)]
@@ -102,11 +98,12 @@ pub(crate) fn decode_output_layout(
 fn decode_exchange_contracts(
     root: &plan::DistributedNode,
     path: FieldPath,
-) -> Result<BTreeMap<FragmentNodeId, ExchangeInputContract>, NativeFragmentDecodeError> {
+) -> Result<
+    novarocks_execution::exec::fragment::program::ExchangeInputContracts,
+    NativeFragmentDecodeError,
+> {
     crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
-        decoder
-            .exchange_contracts(root, path)
-            .map(|contracts| contracts.into_parts().0.into_iter().collect())
+        decoder.exchange_contracts(root, path)
     })
 }
 #[cfg(test)]

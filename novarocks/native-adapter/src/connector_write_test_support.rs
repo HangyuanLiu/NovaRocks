@@ -44,7 +44,6 @@ use novarocks_spi::connector::{
     ConnectorWriteHandleWireDecoder,
 };
 use novarocks_types::{QueryExecutionId, UniqueId};
-use std::sync::Arc;
 
 pub const TEST_WRITE_CATALOG: &str = "write_catalog";
 const TEST_WRITE_PROVIDER: &str = "test";

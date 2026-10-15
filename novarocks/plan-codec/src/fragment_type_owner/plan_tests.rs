@@ -65,8 +65,8 @@ fn typed_plan_roundtrip_references_original_complete_fragment_owner() {
             .r#type
             .as_ref()
             .unwrap()
-            .kind
-            .is_none()
+            .value_binding_id
+            .is_some()
     );
     let mut work = CompileCheckpoints::try_new(&CodecTestControl, CompilePhase::Decode).unwrap();
     let decoded = decode_execution_type_table_observed(
