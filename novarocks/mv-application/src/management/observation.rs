@@ -521,6 +521,39 @@ impl ManagementObservationState {
         self.apply_current_observation(fresh)
     }
 
+    /// Consume the current ticket even when a keyed provider observation fails.
+    /// The retained lease mints the fresh capability; callers cannot substitute
+    /// a historical view or reapply the same observation ticket.
+    pub fn complete_keyed_current_observation(
+        &mut self,
+        pending: PendingManagementObservation,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<
+        (
+            ManagementObservationPhase,
+            novarocks_spi::connector::KeyedDocumentView,
+        ),
+        ManagementObservationError,
+    > {
+        self.consume_current_request(pending.request_id)?;
+        let (fresh, view) = match pending.complete_keyed(lease, request) {
+            Ok(observation) => observation,
+            Err(error) => {
+                if matches!(
+                    error,
+                    ManagementObservationError::Ownership(ManagementOwnershipError::TargetReplaced)
+                ) {
+                    self.phase = ManagementObservationPhase::ClosedObjectReplacement;
+                    self.liveness.close();
+                }
+                return Err(error);
+            }
+        };
+        let phase = self.apply_current_observation(fresh)?;
+        Ok((phase, view))
+    }
+
     pub fn record_registration_terminal(
         &mut self,
         terminal: super::EffectTerminalFact,
