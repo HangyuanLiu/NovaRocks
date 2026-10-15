@@ -77,6 +77,15 @@ use novarocks_spi::connector::{ConnectorError, ConnectorListingBound, ConnectorM
 
 use self::error::{CatalogOutcome, CatalogUnsupported};
 
+/// Snapshot metadata requested from a catalog. Other catalogs may return all
+/// snapshots; REST requests omit the parameter for the default full load.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum SnapshotLoading {
+    #[default]
+    All,
+    Refs,
+}
+
 /// A namespace this catalog can be asked about.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct CatalogNamespaceName {
@@ -539,6 +548,27 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         table: CatalogTableName,
     ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError>;
 
+    /// Load metadata with an explicit snapshot scope. Non-REST catalogs keep
+    /// their existing complete metadata behavior.
+    async fn load_table_with_snapshots(
+        &self,
+        table: CatalogTableName,
+        _snapshots: SnapshotLoading,
+    ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+        self.load_table(table).await
+    }
+
+    /// Retain the read's authorized metadata I/O while selecting its snapshot
+    /// scope. REST overrides this; filesystem catalogs still return all facts.
+    async fn load_table_for_read_with_snapshots(
+        &self,
+        table: CatalogTableName,
+        binding: crate::access_binding::IcebergReadBinding,
+        _snapshots: SnapshotLoading,
+    ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+        self.load_table_for_read(table, binding).await
+    }
+
     /// Load one table for an admitted read without retaining that read's
     /// control in the catalog generation. A filesystem catalog overrides this
     /// to bind its metadata and version-hint reads to the caller's FileIO.
@@ -563,6 +593,16 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
                 .with_source(error)
         })?;
         CatalogCommitBase::from_table(self.vendored_client().load_table(&ident).await?)
+    }
+
+    /// Reload an operation baseline with the requested snapshot scope.
+    async fn load_commit_base_with_snapshots(
+        &self,
+        table: CatalogTableName,
+        file_io: crate::iceberg::io::FileIO,
+        _snapshots: SnapshotLoading,
+    ) -> crate::iceberg::Result<CatalogCommitBase> {
+        self.load_commit_base(table, file_io).await
     }
 
     /// Whether the view exists.

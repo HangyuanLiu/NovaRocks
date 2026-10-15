@@ -283,6 +283,23 @@ impl IcebergMetadataContext {
             .map_err(|(_, message)| message)
     }
 
+    /// Load a selected snapshot scope without reusing complete metadata for
+    /// refs-only observations, or caching refs-only responses as full loads.
+    pub(crate) fn load_table_with_snapshots(
+        &self,
+        namespace: &str,
+        table: &str,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<IcebergPhysicalTable, String> {
+        if snapshots == crate::catalog::SnapshotLoading::All {
+            return self.load_table(namespace, table);
+        }
+        let namespace = normalize_identifier(namespace)?;
+        let table = normalize_identifier(table)?;
+        self.observe_table_classified_with_snapshots(&namespace, &table, None, None, snapshots)
+            .map_err(|(_, message)| message)
+    }
+
     /// Load one table for an admitted request. A vended response is immediately
     /// rebound to this request's storage resolver and is never cached.
     pub(crate) fn load_table_for_request(
@@ -300,6 +317,28 @@ impl IcebergMetadataContext {
         .map_err(|(_, message)| message)
     }
 
+    /// Load an explicit REST snapshot scope without allowing a partial
+    /// observation into the complete-metadata caches.
+    pub(crate) fn load_table_for_request_with_snapshots(
+        &self,
+        namespace: &str,
+        table: &str,
+        request_context: &ConnectorRequestContext,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<IcebergPhysicalTable, String> {
+        match snapshots {
+            crate::catalog::SnapshotLoading::All => {
+                self.load_table_for_request(namespace, table, request_context)
+            }
+            crate::catalog::SnapshotLoading::Refs => self.observe_table_for_request_with_snapshots(
+                namespace,
+                table,
+                request_context,
+                snapshots,
+            ),
+        }
+    }
+
     /// Observe a mutation admission frontier without reusing planning caches.
     /// Keep the original deadline, stop view and credential collector for this attempt.
     pub(crate) fn observe_table_for_request(
@@ -308,16 +347,32 @@ impl IcebergMetadataContext {
         table: &str,
         request_context: &ConnectorRequestContext,
     ) -> Result<IcebergPhysicalTable, String> {
+        self.observe_table_for_request_with_snapshots(
+            namespace,
+            table,
+            request_context,
+            crate::catalog::SnapshotLoading::All,
+        )
+    }
+
+    pub(crate) fn observe_table_for_request_with_snapshots(
+        &self,
+        namespace: &str,
+        table: &str,
+        request_context: &ConnectorRequestContext,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<IcebergPhysicalTable, String> {
         ConnectorOperationControl::check_active(request_context)
             .map_err(|error| error.to_string())?;
         let namespace = normalize_identifier(namespace)?;
         let table = normalize_identifier(table)?;
         let loaded = self
-            .observe_table_classified(
+            .observe_table_classified_with_snapshots(
                 &namespace,
                 &table,
                 request_context.vended_credential_lease_collection(),
                 Some(request_context),
+                snapshots,
             )
             .map_err(|(_, message)| message)?;
         ConnectorOperationControl::check_active(request_context)
@@ -690,6 +745,23 @@ impl IcebergMetadataContext {
         credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
         request_context: Option<&ConnectorRequestContext>,
     ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        self.observe_table_classified_with_snapshots(
+            namespace,
+            table,
+            credential_lease_collection,
+            request_context,
+            crate::catalog::SnapshotLoading::All,
+        )
+    }
+
+    fn observe_table_classified_with_snapshots(
+        &self,
+        namespace: &str,
+        table: &str,
+        credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
+        request_context: Option<&ConnectorRequestContext>,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
         let ident = TableIdent::from_strs([namespace, table])
             .map_err(|error| invalid_request(format!("build Iceberg table identity: {error}")))?;
         let owner = Arc::clone(self.novarocks_catalog());
@@ -705,8 +777,12 @@ impl IcebergMetadataContext {
             .catalog_runtime()
             .block_on(async move {
                 match read_binding {
-                    Some(binding) => owner.load_table_for_read(target, binding).await,
-                    None => owner.load_table(target).await,
+                    Some(binding) => {
+                        owner
+                            .load_table_for_read_with_snapshots(target, binding, snapshots)
+                            .await
+                    }
+                    None => owner.load_table_with_snapshots(target, snapshots).await,
                 }
             })
             .map_err(unavailable)?
@@ -770,7 +846,7 @@ impl IcebergMetadataContext {
         // FileIO. Only its resource-free facts may enter the request cache;
         // the complete table may enter the generation cache only without a
         // request binding.
-        if request_context.is_none() {
+        if request_context.is_none() && snapshots == crate::catalog::SnapshotLoading::All {
             self.control_state
                 .physical_table_cache()
                 .insert(&namespace, &table, physical.clone())

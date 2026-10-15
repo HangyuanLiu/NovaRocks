@@ -464,27 +464,51 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         &self,
         table: CatalogTableName,
     ) -> Result<IcebergLoadedTable, ConnectorError> {
+        self.load_table_with_snapshots(table, super::SnapshotLoading::All)
+            .await
+    }
+
+    async fn load_table_with_snapshots(
+        &self,
+        table: CatalogTableName,
+        snapshots: super::SnapshotLoading,
+    ) -> Result<IcebergLoadedTable, ConnectorError> {
         let ident = super::delegate::table_ident(&table)?;
+        let delegated = self.access_delegation == RestAccessDelegationMode::Vended;
+        let (frozen, delegation) = self
+            .endpoints
+            .load_table_with_snapshots(&ident, delegated, snapshots)
+            .await?;
         match self.access_delegation {
-            RestAccessDelegationMode::Static => self
-                .endpoints
-                .upstream()
-                .await
-                .map(|upstream| upstream as &dyn crate::iceberg::Catalog)?
-                .load_table(&ident)
-                .await
-                .map(|table| {
-                    IcebergLoadedTable::new(table, IcebergAccessDelegation::static_binding())
-                })
-                .map_err(|error| {
+            RestAccessDelegationMode::Static => {
+                let file_io = self.endpoints.static_file_io().ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Unavailable,
+                        "Iceberg REST static generation has no storage factory",
+                    )
+                })?;
+                let table = frozen.materialize(file_io).map_err(|error| {
                     super::error::map_read_error(&sanitize_upstream_error(&error, "table load"))
-                }),
+                })?;
+                Ok(IcebergLoadedTable::new(
+                    table,
+                    IcebergAccessDelegation::static_binding(),
+                ))
+            }
             RestAccessDelegationMode::Vended => {
-                let (frozen, delegation) = self.endpoints.load_table(&ident, true).await?;
                 let access_delegation = parse_rest_delegation(delegation)?;
                 Ok(IcebergLoadedTable::deferred_rest(frozen, access_delegation))
             }
         }
+    }
+
+    async fn load_table_for_read_with_snapshots(
+        &self,
+        table: CatalogTableName,
+        _binding: crate::access_binding::IcebergReadBinding,
+        snapshots: super::SnapshotLoading,
+    ) -> Result<IcebergLoadedTable, ConnectorError> {
+        self.load_table_with_snapshots(table, snapshots).await
     }
 
     async fn load_commit_base(
@@ -492,13 +516,27 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         table: CatalogTableName,
         file_io: crate::iceberg::io::FileIO,
     ) -> crate::iceberg::Result<super::CatalogCommitBase> {
+        self.load_commit_base_with_snapshots(table, file_io, super::SnapshotLoading::All)
+            .await
+    }
+
+    async fn load_commit_base_with_snapshots(
+        &self,
+        table: CatalogTableName,
+        file_io: crate::iceberg::io::FileIO,
+        snapshots: super::SnapshotLoading,
+    ) -> crate::iceberg::Result<super::CatalogCommitBase> {
         let ident = super::delegate::table_ident(&table).map_err(|error| {
             crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, error.to_string())
                 .with_source(error)
         })?;
         let (frozen, _response_delegation) = self
             .endpoints
-            .load_table(&ident, true)
+            .load_table_with_snapshots(
+                &ident,
+                self.access_delegation == RestAccessDelegationMode::Vended,
+                snapshots,
+            )
             .await
             .map_err(|error| {
                 let kind = match error.kind() {
@@ -2351,6 +2389,110 @@ mod evidence_tests {
                     .unwrap(),
             )
             .build()
+    }
+
+    /// Loading has one NovaRocks response decoder in both modes; Static uses
+    /// the generation's FileIO and never requests storage delegation. Existing
+    /// staged-response coverage does not exercise ordinary default/refs GETs.
+    #[tokio::test]
+    async fn ordinary_loads_share_novarocks_decoding_in_static_and_vended_modes() {
+        use crate::catalog::SnapshotLoading;
+        use crate::rest_protocol::endpoints::RestEndpoints;
+        use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+        for mode in [
+            RestAccessDelegationMode::Static,
+            RestAccessDelegationMode::Vended,
+        ] {
+            let mut response = staged_response();
+            response["metadata-location"] =
+                serde_json::json!("s3://warehouse/.staging/t/metadata/1.json");
+            // Response-local FileIO settings are not authoritative in Static.
+            response["config"] = serde_json::json!({"s3.endpoint": "http://untrusted.invalid"});
+            let expected_uuid = response["metadata"]["table-uuid"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let server = scripted(
+                "GET",
+                "/v1/namespaces/db/tables/t",
+                Reply::json(200, &response),
+            );
+            let (upstream, vended_endpoints) =
+                crate::catalog_runtime::build_vended_rest_generation_for_test(
+                    HashMap::from([("uri".to_string(), server.url())]),
+                    None,
+                    crate::iceberg::Runtime::try_current().expect("test runtime"),
+                )
+                .await
+                .unwrap();
+            let endpoints = if mode == RestAccessDelegationMode::Static {
+                let handle = tokio::runtime::Handle::current();
+                let binding = crate::access_binding::IcebergReadBinding::new(
+                    None,
+                    FsAccessResolver::new(),
+                    Arc::new(TokioFileIoRuntime::new(handle.clone())),
+                    Arc::new(TokioFileTaskSpawner::new(handle)),
+                );
+                Arc::new(RestEndpoints::new(
+                    upstream,
+                    Arc::clone(vended_endpoints.owner()),
+                    vended_endpoints.runtime().clone(),
+                    Some(crate::fs_io::build_storage_factory_for_location(
+                        "s3://warehouse",
+                        binding,
+                    )),
+                    Default::default(),
+                    false,
+                ))
+            } else {
+                vended_endpoints
+            };
+            let owner = NovaRocksRestCatalog::new(endpoints, None, mode);
+            for snapshots in [SnapshotLoading::All, SnapshotLoading::Refs] {
+                let loaded = if snapshots == SnapshotLoading::All {
+                    owner.load_table(CatalogTableName::new("db", "t")).await
+                } else {
+                    owner
+                        .load_table_with_snapshots(CatalogTableName::new("db", "t"), snapshots)
+                        .await
+                }
+                .expect("ordinary table load");
+                let (materialization, delegation) = loaded.into_parts();
+                match mode {
+                    RestAccessDelegationMode::Static => {
+                        assert!(delegation.into_vended_lease_seed().is_none());
+                        let table = materialization.into_static_table().unwrap();
+                        assert_eq!(table.metadata().uuid().to_string(), expected_uuid);
+                        assert_eq!(
+                            table.metadata_location(),
+                            Some("s3://warehouse/.staging/t/metadata/1.json")
+                        );
+                        assert_eq!(table.identifier().name(), "t");
+                    }
+                    RestAccessDelegationMode::Vended => {
+                        assert!(delegation.into_vended_lease_seed().is_some());
+                        assert!(matches!(
+                            materialization,
+                            crate::loaded_table::IcebergLoadedTableMaterialization::DeferredRest(_)
+                        ));
+                    }
+                }
+            }
+            let requests = server.requests_to("GET", "/v1/namespaces/db/tables/t");
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].query(), None);
+            assert_eq!(requests[1].query(), Some("snapshots=refs"));
+            for request in requests {
+                assert_eq!(
+                    request.header("x-iceberg-access-delegation"),
+                    if mode == RestAccessDelegationMode::Static {
+                        None
+                    } else {
+                        Some("vended-credentials")
+                    }
+                );
+            }
+        }
     }
 
     #[tokio::test]

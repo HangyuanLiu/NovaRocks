@@ -281,6 +281,20 @@ impl SessionBinding {
         ])
     }
 
+    /// A full load keeps the historical URL; refs loading asks the server to
+    /// return only snapshots reached directly by refs.
+    pub(crate) fn load_table_url(
+        &self,
+        table: &TableIdent,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> String {
+        let mut url = self.table_url(table);
+        if snapshots == crate::catalog::SnapshotLoading::Refs {
+            url.push_str("?snapshots=refs");
+        }
+        url
+    }
+
     pub(crate) fn views_url(&self, namespace: &NamespaceIdent) -> String {
         self.url(&["namespaces", &namespace.to_url_string(), "views"])
     }
@@ -557,6 +571,14 @@ mod tests {
         assert_eq!(
             binding.view_url(&view),
             "http://catalog:8181/api//v1/ws/main/namespaces/a\u{1f}b/views/v"
+        );
+        assert_eq!(
+            binding.load_table_url(&view, crate::catalog::SnapshotLoading::All),
+            binding.table_url(&view)
+        );
+        assert_eq!(
+            binding.load_table_url(&view, crate::catalog::SnapshotLoading::Refs),
+            "http://catalog:8181/api//v1/ws/main/namespaces/a\u{1f}b/tables/v?snapshots=refs"
         );
         let unprefixed = SessionBinding {
             prefix: None,

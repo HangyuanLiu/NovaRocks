@@ -245,11 +245,21 @@ impl RestEndpoints {
     }
 
     /// Load and freeze one table response. `delegated` sends the access
-    /// delegation header (L23): the vended load and every baseline re-read.
+    /// delegation header (L23) for vended loads and their baseline re-reads.
     pub(crate) async fn load_table(
         &self,
         table: &TableIdent,
         delegated: bool,
+    ) -> Result<(FrozenLoadTable, RestDelegation), ConnectorError> {
+        self.load_table_with_snapshots(table, delegated, crate::catalog::SnapshotLoading::All)
+            .await
+    }
+
+    pub(crate) async fn load_table_with_snapshots(
+        &self,
+        table: &TableIdent,
+        delegated: bool,
+        snapshots: crate::catalog::SnapshotLoading,
     ) -> Result<(FrozenLoadTable, RestDelegation), ConnectorError> {
         const OPERATION: &str = "load table";
         let binding = self.binding().await?;
@@ -258,7 +268,7 @@ impl RestEndpoints {
             .get(
                 OPERATION,
                 &binding,
-                binding.table_url(table),
+                binding.load_table_url(table, snapshots),
                 delegation,
                 &[200, 304],
             )
@@ -722,6 +732,74 @@ mod tests {
                 request.path() != "/v1/config" && request.path() != "/v1/oauth/tokens"
             })
             .collect()
+    }
+
+    /// Refs responses legitimately retain snapshot-log entries whose snapshots
+    /// are omitted. The wire fixture deliberately supplies those independent
+    /// facts instead of deriving expectations through the metadata builder.
+    #[tokio::test]
+    async fn refs_load_uses_the_query_parameter_and_accepts_omitted_historical_snapshots() {
+        use crate::catalog::SnapshotLoading;
+        let mut response = load_response(false);
+        let metadata = &mut response["metadata"];
+        metadata["last-updated-ms"] = serde_json::json!(2000);
+        metadata["last-sequence-number"] = serde_json::json!(2);
+        metadata["current-snapshot-id"] = serde_json::json!(20);
+        metadata["snapshots"] = serde_json::json!([{
+            "snapshot-id": 20, "parent-snapshot-id": 10, "sequence-number": 2,
+            "timestamp-ms": 2000, "manifest-list": "s3://warehouse/db/t/metadata/s20.avro",
+            "summary": {"operation": "append"}, "schema-id": 0,
+        }]);
+        metadata["snapshot-log"] = serde_json::json!([
+            {"timestamp-ms": 1000, "snapshot-id": 10},
+            {"timestamp-ms": 2000, "snapshot-id": 20},
+        ]);
+        metadata["refs"] = serde_json::json!({"main": {"snapshot-id": 20, "type": "branch"}});
+        let server = TestServer::start(
+            Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on(
+                    "GET",
+                    "/v1/namespaces/db/tables/t",
+                    Reply::json(200, &response),
+                ),
+        );
+        let (_upstream, endpoints) = generation(&server, &[], None).await;
+        assert_eq!(SnapshotLoading::default(), SnapshotLoading::All);
+        for delegated in [false, true] {
+            let (frozen, _) = endpoints
+                .load_table_with_snapshots(&table("t"), delegated, SnapshotLoading::Refs)
+                .await
+                .expect("refs metadata parses without historical snapshots");
+            assert_eq!(frozen.metadata().snapshots().len(), 1);
+            assert!(frozen.metadata().snapshot_by_id(10).is_none());
+            assert_eq!(frozen.metadata().history().len(), 2);
+            assert_eq!(frozen.metadata().current_snapshot_id(), Some(20));
+            endpoints
+                .load_table(&table("t"), delegated)
+                .await
+                .expect("default full load");
+        }
+        let requests = non_session(server.requests());
+        assert_eq!(requests.len(), 4);
+        for (index, request) in requests.iter().enumerate() {
+            assert_eq!(
+                request.query(),
+                if index % 2 == 0 {
+                    Some("snapshots=refs")
+                } else {
+                    None
+                }
+            );
+            assert_eq!(
+                request.header(DELEGATION),
+                if index < 2 {
+                    None
+                } else {
+                    Some("vended-credentials")
+                }
+            );
+        }
     }
 
     #[tokio::test]
