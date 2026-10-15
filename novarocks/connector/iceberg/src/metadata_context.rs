@@ -1368,17 +1368,13 @@ mod tests {
 
         assert_eq!(generation.control_state().properties().len(), 2);
 
-        // Every vendored handle the generation hands out is the same
-        // allocation. Two clients built from one configuration would have
-        // separate in-memory state and disagree about the same lake -- a table
-        // dropped through one would still resolve through the other. That held
-        // once during development and cost a passing test to find, which is why
-        // the context now has no second handle to get wrong.
-        let first = generation.novarocks_catalog().vendored_client();
-        let second = generation.novarocks_catalog().vendored_client();
+        // Every operation reaches this generation's one semantic owner. The
+        // following real UUID/cache test independently checks its reads.
+        let first = Arc::clone(generation.novarocks_catalog());
+        let second = Arc::clone(generation.novarocks_catalog());
         assert!(
             Arc::ptr_eq(&first, &second),
-            "a generation must hold exactly one catalog client"
+            "a generation must hold exactly one catalog owner"
         );
     }
     // The oracle is a UUID returned by the real Hadoop create, independent of

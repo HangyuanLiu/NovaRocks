@@ -384,14 +384,6 @@ impl NovaRocksCatalog for AdmittedCatalog {
         self.inner.stage_create_table(_namespace, _creation).await
     }
 
-    async fn commit_staged_table(
-        &self,
-        _commit: crate::iceberg::TableCommit,
-        expectation: super::StagedPublicationExpectation,
-    ) -> super::StagedCommitResult {
-        self.inner.commit_staged_table(_commit, expectation).await
-    }
-
     async fn prepare_conditional_create(
         &self,
         _request: ConditionalCreateRequest,
@@ -497,6 +489,7 @@ pub(crate) async fn publish_ref_change(
 
 /// Publish a fully frozen fixture through the real owner. Tests supply the
 /// original provider identity; the journal owns the only dispatch verdict.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn publish_frozen(
     owner: Arc<dyn NovaRocksCatalog>,
     descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
@@ -504,6 +497,7 @@ pub(crate) async fn publish_frozen(
     request: crate::commit::model::FrozenRequest,
     operation: CatalogOperation,
     context: novarocks_spi::connector::ConnectorRequestContext,
+    staged_expectation: Option<super::StagedPublicationExpectation>,
 ) -> super::error::CatalogOutcome<super::transaction::CommitProof> {
     use novarocks_spi::connector::{ConnectorMutationOperationId, ExternalMutationEvidence};
     owner.bind_publication_generation(generation).unwrap();
@@ -529,7 +523,7 @@ pub(crate) async fn publish_frozen(
                     .prepare_frozen_for_admission_test(
                         request,
                         operation,
-                        None,
+                        staged_expectation,
                         descriptor,
                         generation,
                         preparation,

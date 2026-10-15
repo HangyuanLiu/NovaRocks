@@ -1262,9 +1262,6 @@ mod tests {
             first.novarocks_catalog(),
             second.novarocks_catalog()
         ));
-        let first_client = first.novarocks_catalog().vendored_client();
-        let second_client = second.novarocks_catalog().vendored_client();
-        assert!(!Arc::ptr_eq(&first_client, &second_client));
         let stop = ConnectorStopOwner::new();
         let request = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(5),

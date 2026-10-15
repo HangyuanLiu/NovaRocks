@@ -33,8 +33,6 @@ use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 #[cfg(test)]
 use super::delegate::CatalogDelegate;
 use super::error::CatalogOutcome;
-#[cfg(test)]
-use super::transaction::CommitProof;
 use super::{
     CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, CatalogTablePage,
     ConditionalCreateEvidence, ConditionalCreateVerdict, NovaRocksCatalog,
@@ -49,7 +47,7 @@ use crate::rest_protocol::boundary::sanitize_upstream_error;
 use crate::rest_protocol::endpoints::RestEndpoints;
 use crate::rest_protocol::evidence::{AttributionExpectation, ExpectedSnapshot};
 #[cfg(test)]
-use crate::rest_protocol::evidence::{NotDispatchedCause, RestEvidence, StageVerdict};
+use crate::rest_protocol::evidence::{RestEvidence, StageVerdict};
 
 /// A REST Iceberg catalog.
 ///
@@ -1170,58 +1168,6 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             table: staged.0,
             initialization_updates,
             access_delegation: staged.1,
-        }
-    }
-
-    #[cfg(test)]
-
-    async fn commit_staged_table(
-        &self,
-        commit: crate::iceberg::TableCommit,
-        expectation: super::StagedPublicationExpectation,
-    ) -> super::StagedCommitResult {
-        let target = CatalogTableName::from_identifier(commit.identifier());
-        if let Err(reason) = self.admit_operation(
-            &CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect),
-            &target.into(),
-        ) {
-            return super::StagedCommitResult::Unsupported(reason);
-        }
-        let expect = match AttributionExpectation::ctas_final_commit(
-            expectation.staged_table_uuid,
-            expectation
-                .snapshot_id
-                .map(|snapshot| ExpectedSnapshot::new(snapshot, Some("main".to_string()))),
-            expectation.properties,
-        ) {
-            Ok(expect) => expect,
-            Err(_) => {
-                return super::StagedCommitResult::KnownUncommitted(
-                    novarocks_spi::connector::ConnectorMutationFailure::new(
-                        novarocks_spi::connector::ConnectorMutationFailureKind::Internal,
-                        "staged-create publication expectation exceeds the attribution bounds",
-                    ),
-                );
-            }
-        };
-        // Only the minimal view is decoded: no table object is built (L11).
-        let outcome = self.endpoints.commit_table(commit, &expect, false).await;
-        match outcome.evidence.into_ctas_commit_verdict() {
-            crate::rest_protocol::evidence::CtasCommitVerdict::Committed { receipt } => {
-                super::StagedCommitResult::Committed(
-                    CommitProof::applied(receipt.snapshot_id)
-                        .with_table_uuid(expectation.staged_table_uuid.to_string()),
-                )
-            }
-            crate::rest_protocol::evidence::CtasCommitVerdict::Conflict(failure) => {
-                super::StagedCommitResult::Conflict(failure)
-            }
-            crate::rest_protocol::evidence::CtasCommitVerdict::KnownUncommitted(failure) => {
-                super::StagedCommitResult::KnownUncommitted(failure)
-            }
-            crate::rest_protocol::evidence::CtasCommitVerdict::CommitUnknown {
-                failure, ..
-            } => super::StagedCommitResult::CommitUnknown(failure.message().to_string()),
         }
     }
 
@@ -2364,8 +2310,8 @@ mod evidence_tests {
     use super::NovaRocksRestCatalog;
     use crate::catalog::error::CatalogOutcome;
     use crate::catalog::{
-        CatalogNamespaceName, CatalogTableName, NovaRocksCatalog, StagedCommitResult,
-        StagedCreateStart, StagedPublicationExpectation,
+        CatalogNamespaceName, CatalogTableName, NovaRocksCatalog, StagedCreateStart,
+        StagedPublicationExpectation,
     };
     use crate::catalog_runtime::RestAccessDelegationMode;
     use crate::commit::model::{
@@ -2485,6 +2431,7 @@ mod evidence_tests {
                 frozen_append(20),
                 super::super::admission::CatalogOperation::Append,
                 context,
+                None,
             )
             .await;
             match (expected, result) {
@@ -2715,36 +2662,93 @@ mod evidence_tests {
             (Reply::status(404), "unknown"),
         ] {
             let server = scripted("POST", "/v1/namespaces/db/tables/t", reply);
-            let commit = crate::iceberg::TableCommit::builder()
-                .ident(TableIdent::new(
-                    NamespaceIdent::new("db".into()),
-                    "t".into(),
-                ))
-                .requirements(vec![TableRequirement::NotExist])
-                .updates(vec![])
+            let mut initial_json = staged_response()["metadata"].clone();
+            initial_json["table-uuid"] = serde_json::to_value(staged_uuid).unwrap();
+            let initial: crate::iceberg::spec::TableMetadata =
+                serde_json::from_value(initial_json).unwrap();
+            let token = OperationToken::from_write(
+                novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([2; 16]),
+            );
+            let snapshot = crate::iceberg::spec::Snapshot::builder()
+                .with_snapshot_id(30)
+                .with_sequence_number(1)
+                .with_timestamp_ms(initial.last_updated_ms())
+                .with_manifest_list("s3://warehouse/.staging/t/metadata/30.avro")
+                .with_summary(crate::iceberg::spec::Summary {
+                    operation: crate::iceberg::spec::Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
                 .build();
-            let result = owner(&server)
-                .await
-                .commit_staged_table(
-                    commit,
-                    StagedPublicationExpectation {
-                        staged_table_uuid: staged_uuid,
-                        snapshot_id: Some(30),
-                        properties: vec![marker.clone()],
-                    },
-                )
-                .await;
+            let mut updates = crate::commit::staging::staged_create_updates(&initial).unwrap();
+            updates.extend([
+                TableUpdate::SetProperties {
+                    updates: HashMap::from([marker.clone()]),
+                },
+                TableUpdate::AddSnapshot { snapshot },
+                TableUpdate::SetSnapshotRef {
+                    ref_name: "main".into(),
+                    reference: SnapshotReference::new(
+                        30,
+                        SnapshotRetention::branch(None, None, None),
+                    ),
+                },
+            ]);
+            let frozen = FrozenRequest::new(FrozenRequestParts {
+                shape: RequestShape::Create,
+                target: TableIdent::from_strs(["db", "t"]).unwrap(),
+                target_ref: "main".into(),
+                base: BaseIdentity::Create {
+                    staged: crate::commit::model::StagedCreateIdentity::new(
+                        token,
+                        Arc::new(initial),
+                    ),
+                },
+                requirements: vec![TableRequirement::NotExist],
+                updates,
+                artifacts: AttemptArtifacts::empty(AttemptToken::new(token, 0)),
+            })
+            .unwrap();
+            let context = novarocks_spi::connector::ConnectorRequestContext::try_new(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                64 * 1024,
+                1024 * 1024,
+            )
+            .unwrap();
+            let result = crate::catalog::admission_test_support::publish_frozen(
+                Arc::new(owner(&server).await),
+                novarocks_spi::connector::ConnectorInstanceDescriptor {
+                    provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                        .unwrap(),
+                    instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(
+                        "ctas-owner-fixture",
+                    )
+                    .unwrap(),
+                },
+                novarocks_spi::connector::ProviderBindingEpoch::from_bytes([66; 16]),
+                frozen,
+                super::super::admission::CatalogOperation::CreateTable(
+                    super::super::CatalogCreateIntent::CreateTableAsSelect,
+                ),
+                context,
+                Some(StagedPublicationExpectation {
+                    staged_table_uuid: staged_uuid,
+                    snapshot_id: Some(30),
+                    properties: vec![marker.clone()],
+                }),
+            )
+            .await;
             match (expected, result) {
-                ("committed", StagedCommitResult::Committed(proof)) => {
+                ("committed", CatalogOutcome::KnownCommitted { receipt: proof, .. }) => {
                     assert_eq!(proof.snapshot_id, Some(30))
                 }
-                ("conflict", StagedCommitResult::Conflict(failure)) => {
+                ("conflict", CatalogOutcome::KnownUncommitted { failure }) => {
                     assert_eq!(failure.kind(), Kind::AlreadyExists)
                 }
-                ("uncommitted", StagedCommitResult::KnownUncommitted(failure)) => {
+                ("uncommitted", CatalogOutcome::KnownUncommitted { failure }) => {
                     assert_eq!(failure.kind(), Kind::PermissionDenied)
                 }
-                ("unknown", StagedCommitResult::CommitUnknown(_)) => {}
+                ("unknown", CatalogOutcome::CommitUnknown { .. }) => {}
                 (expected, result) => panic!("expected {expected}, got {result:?}"),
             }
         }

@@ -708,18 +708,6 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
 
     #[cfg(test)]
 
-    async fn commit_staged_table(
-        &self,
-        _commit: crate::iceberg::TableCommit,
-        _expectation: super::StagedPublicationExpectation,
-    ) -> super::StagedCommitResult {
-        super::StagedCommitResult::Unsupported(CatalogUnsupported::new(
-            "Hadoop Iceberg catalog has no staged-create protocol",
-        ))
-    }
-
-    #[cfg(test)]
-
     async fn prepare_conditional_create(
         &self,
         request: ConditionalCreateRequest,

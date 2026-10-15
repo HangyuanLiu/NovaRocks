@@ -374,19 +374,6 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
 
     #[cfg(test)]
 
-    async fn commit_staged_table(
-        &self,
-        _commit: crate::iceberg::TableCommit,
-        _expectation: super::StagedPublicationExpectation,
-    ) -> super::StagedCommitResult {
-        super::StagedCommitResult::Unsupported(self.refuse_operation(
-            CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect),
-            CatalogTableName::from_identifier(_commit.identifier()),
-        ))
-    }
-
-    #[cfg(test)]
-
     async fn prepare_conditional_create(
         &self,
         _request: ConditionalCreateRequest,

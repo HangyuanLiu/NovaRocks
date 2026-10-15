@@ -23,8 +23,6 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::{AttemptArtifacts, OperationToken, invalid};
-#[cfg(test)]
-use crate::iceberg::TableCommit;
 use crate::iceberg::spec::TableMetadata;
 use crate::iceberg::{Result, TableIdent, TableRequirement, TableUpdate};
 
@@ -298,16 +296,6 @@ impl FrozenRequest {
             updates: self.updates(),
         })
         .map(canonical_json)
-    }
-    /// Only the catalog dispatch boundary calls this transitional SDK projection.
-    /// Rust restricted visibility cannot name the sibling catalog module.
-    #[cfg(test)]
-    pub(crate) fn into_table_commit(&self) -> TableCommit {
-        TableCommit::builder()
-            .ident(self.parts.target.clone())
-            .requirements(self.parts.requirements.clone())
-            .updates(self.parts.updates.clone())
-            .build()
     }
 }
 

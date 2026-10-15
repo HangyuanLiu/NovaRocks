@@ -15,8 +15,7 @@ use crate::catalog::error::{CatalogOutcome, CatalogUnsupported};
 use crate::catalog::{
     CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName, CatalogTablePage,
     ConditionalCreateAttempt, ConditionalCreateEvidence, ConditionalCreateReceipt,
-    ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog, StagedCommitResult,
-    StagedCreateStart,
+    ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog, StagedCreateStart,
 };
 
 #[derive(Debug)]
@@ -238,14 +237,6 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
         _namespace: CatalogNamespaceName,
         _creation: crate::iceberg::TableCreation,
     ) -> StagedCreateStart {
-        self.mutation()
-    }
-
-    async fn commit_staged_table(
-        &self,
-        _commit: crate::iceberg::TableCommit,
-        _expectation: crate::catalog::StagedPublicationExpectation,
-    ) -> StagedCommitResult {
         self.mutation()
     }
 

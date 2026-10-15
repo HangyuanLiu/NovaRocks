@@ -128,6 +128,7 @@ pub(crate) async fn append_snapshot_for_test(
         request,
         crate::catalog::admission::CatalogOperation::Append,
         operation.request_context().clone(),
+        None,
     )
     .await;
     match outcome {
@@ -1576,6 +1577,7 @@ mod application_document_publication_trace_tests {
             staged,
             crate::catalog::admission::CatalogOperation::Append,
             operation.request_context().clone(),
+            None,
         )
         .await;
         assert!(

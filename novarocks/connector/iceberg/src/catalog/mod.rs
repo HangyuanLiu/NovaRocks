@@ -357,20 +357,6 @@ pub(crate) struct StagedPublicationExpectation {
     pub(crate) properties: Vec<(String, String)>,
 }
 
-/// What committing a staged create produced.
-#[derive(Debug)]
-#[cfg(test)]
-pub(crate) enum StagedCommitResult {
-    /// The receipt: this publication's snapshot and the table UUID.
-    Committed(transaction::CommitProof),
-    /// A received 409: another table holds the name.
-    Conflict(ConnectorMutationFailure),
-    /// Proven not applied: never dispatched, or rejected before publication.
-    KnownUncommitted(ConnectorMutationFailure),
-    CommitUnknown(String),
-    Unsupported(CatalogUnsupported),
-}
-
 /// The single semantic owner of Iceberg catalog behavior.
 ///
 /// Implementations are chosen once per control generation by
@@ -854,15 +840,6 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         namespace: CatalogNamespaceName,
         creation: crate::iceberg::TableCreation,
     ) -> StagedCreateStart;
-
-    /// Publish a staged create with exactly one assert-create request,
-    /// attributed against `expectation` before any evidence is reported.
-    #[cfg(test)]
-    async fn commit_staged_table(
-        &self,
-        commit: crate::iceberg::TableCommit,
-        expectation: StagedPublicationExpectation,
-    ) -> StagedCommitResult;
 
     /// Stage a conditional create against storage, without publishing it.
     ///
