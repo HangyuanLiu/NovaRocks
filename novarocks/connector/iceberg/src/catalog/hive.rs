@@ -29,17 +29,12 @@ use super::CatalogDropTableReceipt;
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::delegate::CatalogDelegate;
 use super::error::{CatalogOutcome, CatalogUnsupported};
-#[cfg(test)]
-use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use super::{
     CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, ConditionalCreateEvidence,
     ConditionalCreateVerdict, NovaRocksCatalog,
 };
 #[cfg(test)]
-use super::{
-    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateReceipt,
-    ConditionalCreateRequest,
-};
+use super::{ConditionalCreateAttempt, ConditionalCreateReceipt, ConditionalCreateRequest};
 
 /// A Hive Metastore Iceberg catalog.
 ///
@@ -426,38 +421,6 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
                 CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
                 CatalogTableName::new(_evidence.namespace, _evidence.table),
             ),
-        ))
-    }
-
-    #[cfg(test)]
-
-    async fn new_transaction(&self, _request: TransactionRequest) -> CatalogTransactionStart {
-        CatalogTransactionStart::Unsupported(
-            self.refuse_operation(CatalogOperation::Append, _request.target),
-        )
-    }
-
-    #[cfg(test)]
-
-    async fn new_create_table_transaction(
-        &self,
-        request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        CatalogTransactionStart::Unsupported(self.refuse_operation(
-            CatalogOperation::CreateTable(request.intent),
-            request.target,
-        ))
-    }
-
-    #[cfg(test)]
-
-    async fn new_create_or_replace_table_transaction(
-        &self,
-        _request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        CatalogTransactionStart::Unsupported(self.refuse_operation(
-            CatalogOperation::CreateTable(_request.intent),
-            _request.target,
         ))
     }
 }

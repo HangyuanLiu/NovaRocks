@@ -530,9 +530,15 @@ mod tests {
 
         // Upstream addresses the same resources NovaRocks composes (L30).
         let namespace = NamespaceIdent::from_strs(["a", "b"]).unwrap();
-        assert!(!fixture.upstream.namespace_exists(&namespace).await.unwrap());
+        assert!(
+            !fixture
+                .endpoints
+                .namespace_exists(&namespace)
+                .await
+                .unwrap()
+        );
         let table = TableIdent::new(namespace.clone(), "orders".to_string());
-        assert!(!fixture.upstream.table_exists(&table).await.unwrap());
+        assert!(!fixture.endpoints.table_exists(&table).await.unwrap());
         let namespace_path = Url::parse(&binding.namespace_url(&namespace))
             .unwrap()
             .path()

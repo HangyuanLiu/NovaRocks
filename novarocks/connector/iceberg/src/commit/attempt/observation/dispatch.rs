@@ -862,7 +862,7 @@ mod tests {
                 )
                 .on("POST", "/v1/namespaces/db/tables/t", Reply::NeverAnswer),
         );
-        let (_, endpoints) = crate::catalog_runtime::build_vended_rest_generation_for_test(
+        let endpoints = crate::catalog_runtime::build_vended_rest_generation_for_test(
             std::collections::HashMap::from([("uri".into(), server.url())]),
             None,
             crate::iceberg::Runtime::try_current().unwrap(),

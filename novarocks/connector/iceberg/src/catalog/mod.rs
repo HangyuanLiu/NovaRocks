@@ -194,51 +194,6 @@ impl CatalogCreateIntent {
     }
 }
 
-/// The result of asking a catalog to begin a transaction.
-///
-/// The `Ready` arm is what separates this from a plain outcome: admission
-/// succeeded and the caller now holds the single frontier for this operation.
-/// The other three arms are terminal, and `Unsupported` among them is the only
-/// one that promises nothing was attempted.
-#[derive(Debug)]
-#[cfg(test)]
-pub(crate) enum CatalogTransactionStart {
-    Ready(Box<transaction::Transaction>),
-    /// Refused before any external side effect. Safe to report to the user as
-    /// "this catalog cannot do that", and safe to clean up caller-owned state.
-    Unsupported(CatalogUnsupported),
-    /// Admission failed with proof that nothing external was mutated.
-    KnownUncommitted {
-        failure: novarocks_spi::connector::ConnectorMutationFailure,
-    },
-    /// Admission itself may have dispatched a request — a REST staged create
-    /// is a real catalog mutation. Callers must not retry or clean up.
-    // Not constructed yet: no wired constructor dispatches during admission.
-    #[allow(dead_code)]
-    CommitUnknown {
-        failure: novarocks_spi::connector::ConnectorMutationFailure,
-        evidence: error::CatalogCommitEvidence,
-    },
-}
-
-#[cfg(test)]
-
-impl CatalogTransactionStart {
-    /// True when admission failed and left the caller owning everything it
-    /// touched, so caller-owned temporary state is safe to release.
-    ///
-    /// This answers a question only the terminal arms have: a `Ready`
-    /// transaction has not failed at all, and releasing its state is
-    /// [`transaction::Transaction::abort`]'s business, which refuses once the
-    /// outcome is unknown.
-    // No production caller yet: this is the update-commit half of the
-    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
-    #[allow(dead_code)]
-    pub(crate) fn permits_cleanup(&self) -> bool {
-        matches!(self, Self::Unsupported(_) | Self::KnownUncommitted { .. })
-    }
-}
-
 /// A drop that committed, with the exact identity captured before the drop.
 ///
 /// The identity is captured ahead of the catalog request precisely because it
@@ -591,25 +546,6 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     #[cfg(test)]
     fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog>;
 
-    /// The single-dispatch mechanism for one existing-table publication.
-    ///
-    /// Every catalog shares the vendored `update_table` mechanism; the REST
-    /// owner replaces it with its evidence-producing commit (L12).
-    #[cfg(test)]
-    fn commit_dispatch(
-        &self,
-        ident: crate::iceberg::TableIdent,
-        target_ref: Arc<str>,
-        marker: Option<(Arc<str>, Arc<str>)>,
-    ) -> Arc<dyn transaction::CatalogCommitDispatch> {
-        Arc::new(dispatch::UpdateTableDispatch::new(
-            self.vendored_client(),
-            ident,
-            target_ref,
-            marker,
-        ))
-    }
-
     /// The provider-private REST client that may refresh an already-admitted
     /// vended credential scope. Only the REST implementation owns such a
     /// capability; callers never downcast or construct a second catalog.
@@ -906,18 +842,6 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName>;
 
-    // ---- C. Transaction constructors ------------------------------------
-
-    /// Begin a transaction against an existing table.
-    // No production caller yet: this is the update-commit half of the
-    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
-    #[allow(dead_code)]
-    #[cfg(test)]
-    async fn new_transaction(
-        &self,
-        request: transaction::TransactionRequest,
-    ) -> CatalogTransactionStart;
-
     /// Create an invisible target for a staged publication.
     ///
     /// The staged table is not reachable through the catalog until it is
@@ -1008,26 +932,6 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         self.admit_operation(&request.operation, &request.target)?;
         self.admit_initiation(request)
     }
-
-    /// Begin a transaction that creates a table.
-    ///
-    /// The request carries [`CatalogCreateIntent`], and implementations may
-    /// accept one intent while refusing another on the same catalog.
-    #[cfg(test)]
-    async fn new_create_table_transaction(
-        &self,
-        request: transaction::CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart;
-
-    /// Begin a transaction that creates a table or replaces it in place.
-    // No production caller yet: this is the update-commit half of the
-    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
-    #[allow(dead_code)]
-    #[cfg(test)]
-    async fn new_create_or_replace_table_transaction(
-        &self,
-        request: transaction::CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart;
 }
 
 /// The answer of a catalog that cannot hold views. It is given by the owner
@@ -1040,95 +944,6 @@ pub(super) fn views_unsupported(operation: &str) -> ConnectorError {
 }
 
 pub(crate) mod transaction;
-
-/// Begin a publication against an existing table.
-///
-/// Every catalog shares this: the frontier is one `update_table`, and the
-/// updates arrive after the writer runs. Admission here is the identity and
-/// name check, which is exactly the work that must happen before a source
-/// executes.
-// No production caller yet: see the note on `new_transaction`.
-#[allow(dead_code)]
-#[cfg(test)]
-fn start_update_table_transaction(
-    owner: &(impl NovaRocksCatalog + ?Sized),
-    request: transaction::TransactionRequest,
-) -> CatalogTransactionStart {
-    let ident = match delegate::table_ident(&request.target) {
-        Ok(ident) => ident,
-        Err(error) => {
-            return CatalogTransactionStart::KnownUncommitted {
-                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
-                    novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
-                    error.to_string(),
-                ),
-            };
-        }
-    };
-    let mut evidence = error::CatalogCommitEvidence::for_target(request.target.canonical())
-        .with_target_ref(Arc::clone(&request.target_ref))
-        .with_base_snapshot_id(request.base_snapshot_id);
-    if let Some(uuid) = &request.expected_table_uuid {
-        evidence = evidence.with_target_uuid(Arc::clone(uuid));
-    }
-    let dispatch = owner.commit_dispatch(
-        ident,
-        Arc::clone(&request.target_ref),
-        request.marker.clone(),
-    );
-    CatalogTransactionStart::Ready(Box::new(transaction::Transaction::new(
-        request.identity,
-        request.target,
-        transaction::TransactionShape::Existing,
-        evidence,
-        dispatch,
-    )))
-}
-
-/// Begin a publication that creates a table through one catalog request.
-#[cfg(test)]
-fn start_create_table_transaction(
-    delegate: &delegate::CatalogDelegate,
-    request: transaction::CreateTableTransactionRequest,
-) -> CatalogTransactionStart {
-    let namespace = CatalogNamespaceName::new(Arc::clone(&request.target.namespace));
-    let namespace_ident = match delegate::namespace_ident(&namespace) {
-        Ok(ident) => ident,
-        Err(error) => {
-            return CatalogTransactionStart::KnownUncommitted {
-                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
-                    novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
-                    error.to_string(),
-                ),
-            };
-        }
-    };
-    let table_ident = match delegate::table_ident(&request.target) {
-        Ok(ident) => ident,
-        Err(error) => {
-            return CatalogTransactionStart::KnownUncommitted {
-                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
-                    novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
-                    error.to_string(),
-                ),
-            };
-        }
-    };
-    let evidence = error::CatalogCommitEvidence::for_target(request.target.canonical());
-    let dispatch = Arc::new(dispatch::CreateTableDispatch::new(
-        Arc::clone(delegate.client()),
-        namespace_ident,
-        request.creation,
-        table_ident,
-    ));
-    CatalogTransactionStart::Ready(Box::new(transaction::Transaction::new(
-        request.identity,
-        request.target,
-        transaction::TransactionShape::Create(request.intent),
-        evidence,
-        dispatch,
-    )))
-}
 
 #[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]
 #[path = "../hms_listing_probe_tests.rs"]

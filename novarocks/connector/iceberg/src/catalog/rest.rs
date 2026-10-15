@@ -34,18 +34,13 @@ use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::delegate::CatalogDelegate;
 use super::error::CatalogOutcome;
 #[cfg(test)]
-use super::transaction::{CatalogCommitDispatch, CommitDispatchResult, CommitProof};
-#[cfg(test)]
-use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
+use super::transaction::CommitProof;
 use super::{
     CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, CatalogTablePage,
     ConditionalCreateEvidence, ConditionalCreateVerdict, NovaRocksCatalog,
 };
 #[cfg(test)]
-use super::{
-    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateReceipt,
-    ConditionalCreateRequest,
-};
+use super::{ConditionalCreateAttempt, ConditionalCreateReceipt, ConditionalCreateRequest};
 use crate::catalog_runtime::RestAccessDelegationMode;
 use crate::loaded_table::{IcebergAccessDelegation, IcebergLoadedTable, parse_rest_delegation};
 #[cfg(test)]
@@ -566,22 +561,6 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     #[cfg(test)]
     fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
         self.adapter.clone()
-    }
-
-    #[cfg(test)]
-
-    fn commit_dispatch(
-        &self,
-        ident: crate::iceberg::TableIdent,
-        target_ref: Arc<str>,
-        marker: Option<(Arc<str>, Arc<str>)>,
-    ) -> Arc<dyn CatalogCommitDispatch> {
-        Arc::new(RestCommitDispatch {
-            endpoints: Arc::clone(&self.endpoints),
-            ident,
-            target_ref,
-            marker,
-        })
     }
 
     fn vended_credential_refresh_catalog(&self) -> Option<Arc<RestEndpoints>> {
@@ -1328,81 +1307,6 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             "REST Iceberg catalog publishes a create through the catalog, not through a conditional metadata write",
         ))
     }
-
-    #[cfg(test)]
-
-    async fn new_transaction(&self, request: TransactionRequest) -> CatalogTransactionStart {
-        if let Err(reason) =
-            self.admit_operation(&request.operation, &request.target.clone().into())
-        {
-            return CatalogTransactionStart::Unsupported(reason);
-        }
-        super::start_update_table_transaction(self, request)
-    }
-
-    #[cfg(test)]
-
-    async fn new_create_table_transaction(
-        &self,
-        request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        if let Err(reason) = self.admit_operation(
-            &CatalogOperation::CreateTable(request.intent),
-            &request.target.clone().into(),
-        ) {
-            return CatalogTransactionStart::Unsupported(reason);
-        }
-        if self.access_delegation == RestAccessDelegationMode::Vended {
-            // The generic transaction API cannot retain the response-local
-            // lease seed. Do not issue its static REST request and silently
-            // lose the vended authority; T23 must install an attempt consumer
-            // before this direct-create surface can be enabled.
-            return CatalogTransactionStart::Unsupported(super::error::CatalogUnsupported::new(
-                "REST Iceberg vended credentials require a query-attempt lease consumer",
-            ));
-        }
-        match request.intent {
-            CatalogCreateIntent::EmptyTable => {
-                let request = crate::catalog::transaction::CreateTableTransactionRequest {
-                    creation: with_explicit_format_version(request.creation),
-                    ..request
-                };
-                super::start_create_table_transaction(&self.delegate, request)
-            }
-            CatalogCreateIntent::CreateTableAsSelect => {
-                // Same operation rule as admission, so a caller that asked first
-                // and a caller that went straight to the constructor get the
-                // same answer.
-                match self.admit_operation(
-                    &CatalogOperation::CreateTable(request.intent),
-                    &request.target.clone().into(),
-                ) {
-                    Ok(()) => super::start_create_table_transaction(&self.delegate, request),
-                    Err(reason) => CatalogTransactionStart::Unsupported(reason),
-                }
-            }
-        }
-    }
-
-    #[cfg(test)]
-
-    async fn new_create_or_replace_table_transaction(
-        &self,
-        request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        if self.access_delegation == RestAccessDelegationMode::Vended {
-            return CatalogTransactionStart::Unsupported(super::error::CatalogUnsupported::new(
-                "REST Iceberg vended credentials require a query-attempt lease consumer",
-            ));
-        }
-        match self.admit_operation(
-            &CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect),
-            &request.target.clone().into(),
-        ) {
-            Ok(()) => super::start_create_table_transaction(&self.delegate, request),
-            Err(reason) => CatalogTransactionStart::Unsupported(reason),
-        }
-    }
 }
 
 /// The owner outcome of a view mutation's evidence.
@@ -1431,129 +1335,6 @@ fn view_outcome(
         CatalogOutcome::CommitUnknown { failure, evidence } => {
             CatalogOutcome::CommitUnknown { failure, evidence }
         }
-    }
-}
-
-/// The REST owner's evidence-producing publication of a frozen request (L12):
-/// one NovaRocks commit, confirmed from the minimal view only.
-#[derive(Debug)]
-#[cfg(test)]
-struct RestCommitDispatch {
-    endpoints: Arc<RestEndpoints>,
-    ident: crate::iceberg::TableIdent,
-    target_ref: Arc<str>,
-    marker: Option<(Arc<str>, Arc<str>)>,
-}
-
-#[async_trait]
-#[cfg(test)]
-impl CatalogCommitDispatch for RestCommitDispatch {
-    async fn dispatch_once(
-        &self,
-        staged: Option<&crate::commit::model::FrozenRequest>,
-    ) -> CommitDispatchResult {
-        use novarocks_spi::connector::{ConnectorMutationFailure, ConnectorMutationFailureKind};
-        let Some(staged) = staged else {
-            return CommitDispatchResult::Applied(CommitProof::no_op());
-        };
-        if !staged.has_updates() {
-            // Nothing to publish, and nothing is sent.
-            return CommitDispatchResult::Applied(CommitProof::no_op());
-        }
-        if staged.identifier() != &self.ident {
-            return CommitDispatchResult::Uncommitted {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::InvalidRequest,
-                    "staged Iceberg commit target does not match the admitted publication target",
-                ),
-            };
-        }
-        let snapshot = staged
-            .ref_snapshot_after(&self.target_ref)
-            .map(|snapshot| ExpectedSnapshot::new(snapshot, Some(self.target_ref.to_string())));
-        let mut commit = staged.into_table_commit();
-        let requirements = commit.take_requirements();
-        let updates = commit.take_updates();
-        // IRU-5 frozen requests always assert the table UUID (L34).
-        let uuid = requirements
-            .iter()
-            .find_map(|requirement| match requirement {
-                crate::iceberg::TableRequirement::UuidMatch { uuid } => Some(*uuid),
-                _ => None,
-            });
-        let expect = match uuid.map(|uuid| AttributionExpectation::table_commit(uuid, snapshot)) {
-            Some(Ok(expect)) => expect,
-            _ => {
-                let evidence = RestEvidence::NotDispatched {
-                    kind: ConnectorMutationFailureKind::Internal,
-                    cause: NotDispatchedCause::UnfrozenTableUuid,
-                };
-                return CommitDispatchResult::Uncommitted {
-                    failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Internal,
-                        evidence.message(),
-                    ),
-                };
-            }
-        };
-        let commit = crate::iceberg::TableCommit::builder()
-            .ident(self.ident.clone())
-            .requirements(requirements)
-            .updates(updates)
-            .build();
-        let evidence = self
-            .endpoints
-            .commit_table(commit, &expect, false)
-            .await
-            .evidence;
-        let message = evidence.message();
-        match evidence {
-            RestEvidence::Applied { receipt } => {
-                let mut proof = CommitProof::applied(receipt.snapshot_id);
-                proof.metadata_location = receipt.metadata_location.as_deref().map(Arc::from);
-                proof.metadata_predecessor = receipt.metadata_predecessor;
-                CommitDispatchResult::Applied(match receipt.uuid {
-                    Some(uuid) => proof.with_table_uuid(uuid.to_string()),
-                    None => proof,
-                })
-            }
-            RestEvidence::NotDispatched { kind, .. } | RestEvidence::Rejected { kind, .. } => {
-                CommitDispatchResult::Uncommitted {
-                    failure: ConnectorMutationFailure::new(kind, message),
-                }
-            }
-            RestEvidence::Unknown { .. } => CommitDispatchResult::Unknown { message },
-        }
-    }
-
-    async fn adjudicate(&self) -> Result<Option<CommitProof>, ConnectorError> {
-        let Some((key, value)) = &self.marker else {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "this Iceberg publication stamped no operation marker, so its outcome cannot be \
-                 adjudicated after the fact",
-            ));
-        };
-        let (frozen, _) = self.endpoints.load_table(&self.ident, true).await?;
-        let metadata = frozen.metadata();
-        let table_uuid: Arc<str> = Arc::from(metadata.uuid().to_string());
-        let mut matched = None;
-        for snapshot in metadata.snapshots() {
-            if snapshot.summary().additional_properties.get(key.as_ref())
-                == Some(&value.to_string())
-            {
-                if matched.is_some() {
-                    return Err(ConnectorError::new(
-                        ConnectorErrorKind::CorruptData,
-                        "more than one Iceberg snapshot carries the same publication marker",
-                    ));
-                }
-                matched = Some(snapshot.snapshot_id());
-            }
-        }
-        Ok(matched.map(|snapshot_id| {
-            CommitProof::applied(Some(snapshot_id)).with_table_uuid(Arc::clone(&table_uuid))
-        }))
     }
 }
 
@@ -1705,17 +1486,16 @@ mod tests {
         }
 
         async fn catalog(&self) -> NovaRocksRestCatalog {
-            let (_upstream, endpoints) =
-                crate::catalog_runtime::build_vended_rest_generation_for_test(
-                    HashMap::from([(
-                        crate::rest_protocol::wire::REST_CATALOG_PROP_URI.to_string(),
-                        format!("http://{}", self.address),
-                    )]),
-                    None,
-                    crate::iceberg::Runtime::try_current().expect("test runtime"),
-                )
-                .await
-                .expect("REST client");
+            let endpoints = crate::catalog_runtime::build_vended_rest_generation_for_test(
+                HashMap::from([(
+                    crate::rest_protocol::wire::REST_CATALOG_PROP_URI.to_string(),
+                    format!("http://{}", self.address),
+                )]),
+                None,
+                crate::iceberg::Runtime::try_current().expect("test runtime"),
+            )
+            .await
+            .expect("REST client");
             NovaRocksRestCatalog::new(endpoints, None, RestAccessDelegationMode::Vended)
         }
     }
@@ -2583,7 +2363,6 @@ mod evidence_tests {
 
     use super::NovaRocksRestCatalog;
     use crate::catalog::error::CatalogOutcome;
-    use crate::catalog::transaction::CommitDispatchResult;
     use crate::catalog::{
         CatalogNamespaceName, CatalogTableName, NovaRocksCatalog, StagedCommitResult,
         StagedCreateStart, StagedPublicationExpectation,
@@ -2600,7 +2379,7 @@ mod evidence_tests {
     const TABLE_UUID: u128 = 1;
 
     async fn owner(server: &TestServer) -> NovaRocksRestCatalog {
-        let (_upstream, endpoints) = crate::catalog_runtime::build_vended_rest_generation_for_test(
+        let endpoints = crate::catalog_runtime::build_vended_rest_generation_for_test(
             HashMap::from([("uri".to_string(), server.url())]),
             None,
             crate::iceberg::Runtime::try_current().expect("test runtime"),
@@ -2684,31 +2463,48 @@ mod evidence_tests {
         ];
         for (reply, expected) in cases {
             let server = scripted("POST", "/v1/namespaces/db/tables/t", reply);
-            let owner = owner(&server).await;
-            let dispatch = owner.commit_dispatch(
-                TableIdent::new(NamespaceIdent::new("db".into()), "t".into()),
-                Arc::from("main"),
-                None,
-            );
-            let result = dispatch.dispatch_once(Some(&frozen_append(20))).await;
+            let owner: Arc<dyn NovaRocksCatalog> = Arc::new(owner(&server).await);
+            let context = novarocks_spi::connector::ConnectorRequestContext::try_new(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                64 * 1024,
+                1024 * 1024,
+            )
+            .unwrap();
+            let result = crate::catalog::admission_test_support::publish_frozen(
+                owner,
+                novarocks_spi::connector::ConnectorInstanceDescriptor {
+                    provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                        .unwrap(),
+                    instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(
+                        "rest-owner-fixture",
+                    )
+                    .unwrap(),
+                },
+                novarocks_spi::connector::ProviderBindingEpoch::from_bytes([66; 16]),
+                frozen_append(20),
+                super::super::admission::CatalogOperation::Append,
+                context,
+            )
+            .await;
             match (expected, result) {
-                ("applied", CommitDispatchResult::Applied(proof)) => {
+                ("applied", CatalogOutcome::KnownCommitted { receipt: proof, .. }) => {
                     assert_eq!(proof.snapshot_id, Some(20));
                     assert_eq!(
                         proof.table_uuid.as_deref(),
                         Some(Uuid::from_u128(TABLE_UUID).to_string().as_str())
                     );
                 }
-                ("unauthenticated", CommitDispatchResult::Uncommitted { failure }) => {
+                ("unauthenticated", CatalogOutcome::KnownUncommitted { failure }) => {
                     assert_eq!(failure.kind(), Kind::Unauthenticated)
                 }
-                ("denied", CommitDispatchResult::Uncommitted { failure }) => {
+                ("denied", CatalogOutcome::KnownUncommitted { failure }) => {
                     assert_eq!(failure.kind(), Kind::PermissionDenied)
                 }
-                ("conflict", CommitDispatchResult::Uncommitted { failure }) => {
+                ("conflict", CatalogOutcome::KnownUncommitted { failure }) => {
                     assert_eq!(failure.kind(), Kind::Conflict)
                 }
-                ("unknown", CommitDispatchResult::Unknown { .. }) => {}
+                ("unknown", CatalogOutcome::CommitUnknown { .. }) => {}
                 (expected, result) => panic!("expected {expected}, got {result:?}"),
             }
             assert_eq!(server.count("POST", "/v1/namespaces/db/tables/t"), 1);

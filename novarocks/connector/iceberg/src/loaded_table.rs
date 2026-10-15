@@ -2190,7 +2190,6 @@ mod tests {
                 )
                 .await
                 .expect("REST generation")
-                .1
             })
         }
 

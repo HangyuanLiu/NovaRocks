@@ -23,11 +23,10 @@ use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::error::{CatalogOutcome, CatalogUnsupported};
-use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use super::{
-    CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName, CatalogTransactionStart,
-    ConditionalCreateAttempt, ConditionalCreateEvidence, ConditionalCreateReceipt,
-    ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog,
+    CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName, ConditionalCreateAttempt,
+    ConditionalCreateEvidence, ConditionalCreateReceipt, ConditionalCreateRequest,
+    ConditionalCreateVerdict, NovaRocksCatalog,
 };
 
 type FrozenRecorder =
@@ -232,15 +231,6 @@ impl NovaRocksCatalog for AdmittedCatalog {
         })
     }
 
-    fn commit_dispatch(
-        &self,
-        ident: crate::iceberg::TableIdent,
-        target_ref: Arc<str>,
-        marker: Option<(Arc<str>, Arc<str>)>,
-    ) -> Arc<dyn super::transaction::CatalogCommitDispatch> {
-        self.inner.commit_dispatch(ident, target_ref, marker)
-    }
-
     #[cfg(test)]
     async fn create_view(
         &self,
@@ -432,26 +422,6 @@ impl NovaRocksCatalog for AdmittedCatalog {
             .adjudicate_conditional_create_for_read(evidence, binding)
             .await
     }
-
-    async fn new_transaction(&self, _request: TransactionRequest) -> CatalogTransactionStart {
-        self.inner.new_transaction(_request).await
-    }
-
-    async fn new_create_table_transaction(
-        &self,
-        request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        self.inner.new_create_table_transaction(request).await
-    }
-
-    async fn new_create_or_replace_table_transaction(
-        &self,
-        _request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        self.inner
-            .new_create_or_replace_table_transaction(_request)
-            .await
-    }
 }
 
 /// Fixture publication through the real prepared owner and sole journal. The
@@ -563,6 +533,66 @@ pub(crate) async fn publish_frozen(
                         descriptor,
                         generation,
                         preparation,
+                    )
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+    journal.commit_outcome(entry)
+}
+
+/// Drive an already-frozen catalog request through the actual owner and sole
+/// publication journal. This fixture grants no SDK mutation capability.
+pub(crate) async fn publish_catalog(
+    owner: Arc<dyn NovaRocksCatalog>,
+    request: super::catalog_request::FrozenCatalogPublication,
+    operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+    generation: novarocks_spi::connector::ProviderBindingEpoch,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    read_binding: crate::access_binding::IcebergReadBinding,
+) -> super::error::CatalogOutcome<super::transaction::CommitProof> {
+    use novarocks_spi::connector::*;
+    owner.bind_publication_generation(generation).unwrap();
+    let evidence = ExternalMutationEvidence::try_new(
+        2,
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("catalog-fixture").unwrap(),
+        },
+        generation,
+        operation_id,
+        "catalog_fixture",
+        bytes::Bytes::from_static(b"{}"),
+    )
+    .unwrap();
+    let journal = crate::commit::attempt::observation::PublicationJournal::new(
+        crate::commit::model::OperationToken::from_mutation(operation_id),
+    );
+    journal
+        .prepare_catalog(
+            evidence,
+            (),
+            request.targets(),
+            request.request_bytes().to_vec(),
+            request.attribution().clone(),
+            context.clone(),
+        )
+        .unwrap();
+    let policy = owner.evidence_policy();
+    let entry = journal
+        .publish_once(
+            context,
+            policy,
+            move |descriptor, generation, preparation| async move {
+                owner
+                    .prepare_catalog_publication(
+                        request,
+                        descriptor,
+                        generation,
+                        preparation,
+                        Default::default(),
+                        read_binding,
                     )
                     .await
             },

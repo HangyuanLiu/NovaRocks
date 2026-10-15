@@ -69,8 +69,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::catalog::error::CatalogOutcome;
-#[cfg(test)]
-use crate::catalog::transaction::TransactionIdentity;
 use crate::commit::write_stack::domain::{
     IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment, IcebergCommitHandle,
     IcebergContentRange, IcebergDataBranchRecipe, IcebergDocumentPublicationFacts,
@@ -294,25 +292,6 @@ pub(crate) fn validate_context(context: &ConnectorRequestContext) -> Result<(), 
         ));
     }
     Ok(())
-}
-
-#[cfg(test)]
-async fn commit_eager_frontier(
-    frontier: &mut crate::catalog::transaction::Transaction,
-    context: &ConnectorRequestContext,
-) -> Result<
-    crate::catalog::error::CatalogOutcome<crate::catalog::transaction::CommitProof>,
-    ConnectorError,
-> {
-    if let Err(mut error) = validate_context(context) {
-        if let Err(abort_error) = frontier.abort().await {
-            error = error.with_cleanup_context(format!(
-                "Iceberg eager transaction abort failed: {abort_error}"
-            ));
-        }
-        return Err(error);
-    }
-    Ok(frontier.commit().await)
 }
 
 /// One typed fragment resolved against the sealed target set.
@@ -3912,9 +3891,13 @@ mod eager_attempt_io_tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::catalog::CatalogTableName;
-    use crate::catalog::error::CatalogCommitEvidence;
-    use crate::catalog::transaction::{CatalogCommitDispatch, CommitProof, TransactionShape};
+    use crate::catalog::publication_dispatch::{
+        DispatchCompletion, PreparedCatalogDispatch, PreparedPublication,
+    };
+    use crate::catalog::transaction::CommitProof;
+    use crate::commit::attempt::observation::{
+        DispatchEvidence, ProtocolObservation, PublicationJournal,
+    };
     use crate::iceberg::io::{
         FileIO, FileIOBuilder, FileMetadata, FileRead, FileWrite, InputFile, MemoryStorage,
         OutputFile, Storage, StorageConfig, StorageFactory,
@@ -4252,7 +4235,6 @@ mod eager_attempt_io_tests {
     struct CountingDispatch {
         behavior: DispatchBehavior,
         dispatches: AtomicUsize,
-        aborts: AtomicUsize,
     }
 
     impl CountingDispatch {
@@ -4260,44 +4242,100 @@ mod eager_attempt_io_tests {
             Arc::new(Self {
                 behavior,
                 dispatches: AtomicUsize::new(0),
-                aborts: AtomicUsize::new(0),
             })
         }
     }
 
+    struct CountingMechanism {
+        owner: Arc<CountingDispatch>,
+        snapshot_id: Option<i64>,
+    }
     #[async_trait]
-    impl CatalogCommitDispatch for CountingDispatch {
+    impl PreparedCatalogDispatch for CountingMechanism {
         async fn dispatch_once(
-            &self,
-            staged: Option<&crate::commit::model::FrozenRequest>,
-        ) -> crate::catalog::transaction::CommitDispatchResult {
-            assert!(
-                staged.is_some(),
-                "an eager attempt must dispatch its staged commit"
-            );
-            self.dispatches.fetch_add(1, Ordering::SeqCst);
-            crate::catalog::transaction::CommitDispatchResult::from_catalog_result(
-                match self.behavior {
-                    DispatchBehavior::Conflict => Err(IcebergError::new(
-                        ErrorKind::CatalogCommitConflicts,
-                        "injected OCC conflict",
-                    )),
-                    DispatchBehavior::Commit => Ok(CommitProof::applied(Some(1))),
-                    DispatchBehavior::LoseResponse => Err(IcebergError::new(
-                        ErrorKind::Unexpected,
-                        "injected lost response",
-                    )),
+            self: Box<Self>,
+            _: crate::catalog::publication::EvidenceContext,
+        ) -> DispatchCompletion {
+            self.owner.dispatches.fetch_add(1, Ordering::SeqCst);
+            let evidence = match self.owner.behavior {
+                DispatchBehavior::Conflict => DispatchEvidence::Rejected {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Conflict,
+                        "injected confirmed OCC rejection",
+                    ),
+                    observation: ProtocolObservation {
+                        adapter: "test-eager",
+                        stage: "rejected",
+                        ..Default::default()
+                    },
                 },
+                DispatchBehavior::Commit => DispatchEvidence::Applied {
+                    proof: CommitProof::applied(self.snapshot_id),
+                },
+                DispatchBehavior::LoseResponse => DispatchEvidence::Unknown {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        "injected lost response",
+                    ),
+                    observation: ProtocolObservation {
+                        adapter: "test-eager",
+                        stage: "lost-response",
+                        ..Default::default()
+                    },
+                },
+            };
+            DispatchCompletion::evidence(evidence)
+        }
+    }
+
+    /// Owns the unissued capability, never a second mutation verdict. Repeated
+    /// observation reads the original journal without another dispatch.
+    struct JournalFixture {
+        journal: PublicationJournal<()>,
+        request: Option<crate::commit::model::FrozenRequest>,
+        dispatch: Arc<CountingDispatch>,
+    }
+    impl JournalFixture {
+        async fn commit(&mut self) -> CatalogOutcome<CommitProof> {
+            let context = ConnectorRequestContext::try_new(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                64 * 1024,
+                1024 * 1024,
             )
+            .unwrap();
+            self.commit_with_context(&context).await
         }
-
-        async fn adjudicate(&self) -> Result<Option<CommitProof>, ConnectorError> {
-            Ok(None)
-        }
-
-        async fn abort_before_dispatch(&self) -> Result<(), ConnectorError> {
-            self.aborts.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+        async fn commit_with_context(
+            &mut self,
+            context: &ConnectorRequestContext,
+        ) -> CatalogOutcome<CommitProof> {
+            let Some(request) = self.request.take() else {
+                return self
+                    .journal
+                    .commit_outcome(self.journal.current_entry().unwrap());
+            };
+            let dispatch = Arc::clone(&self.dispatch);
+            let entry = self
+                .journal
+                .publish_once(
+                    context.clone(),
+                    Default::default(),
+                    move |descriptor, _, _| async move {
+                        descriptor.validate_frozen(&request)?;
+                        let snapshot_id = request.ref_snapshot_after("main");
+                        Ok(PreparedPublication::Mutation {
+                            binding: None,
+                            dispatch: Box::new(CountingMechanism {
+                                owner: dispatch,
+                                snapshot_id,
+                            }),
+                        })
+                    },
+                )
+                .await
+                .unwrap();
+            self.journal.commit_outcome(entry)
         }
     }
 
@@ -4480,7 +4518,7 @@ mod eager_attempt_io_tests {
     }
 
     struct StagedAttempt {
-        frontier: crate::catalog::transaction::Transaction,
+        frontier: JournalFixture,
         snapshot_id: i64,
         manifest_paths: Vec<String>,
         puffin_path: String,
@@ -4583,15 +4621,30 @@ mod eager_attempt_io_tests {
             .filter(|record| record.object.path().ends_with(".avro"))
             .map(|record| record.object.path().to_string())
             .collect();
-        let mut frontier = crate::catalog::transaction::Transaction::new(
-            TransactionIdentity::new("eager-I/O-test", [attempt; 16]),
-            CatalogTableName::new("db", "t"),
-            TransactionShape::Existing,
-            CatalogCommitEvidence::for_target("db.t")
-                .with_commit_uuid(format!("attempt-{attempt}")),
+        let token = commit.artifacts().attempt().operation();
+        let journal = PublicationJournal::new(token);
+        let evidence = ExternalMutationEvidence::try_new(
+            2,
+            ConnectorInstanceDescriptor {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .unwrap(),
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(
+                    "eager-io-fixture",
+                )
+                .unwrap(),
+            },
+            ProviderBindingEpoch::from_bytes([4; 16]),
+            ConnectorMutationOperationId::from_bytes(token.to_bytes()),
+            "eager_io_fixture",
+            Bytes::from_static(b"{}"),
+        )
+        .unwrap();
+        journal.record(evidence, (), &commit).unwrap();
+        let frontier = JournalFixture {
+            journal,
+            request: Some(commit),
             dispatch,
-        );
-        frontier.stage(commit).expect("stage provider frontier");
+        };
         StagedAttempt {
             frontier,
             snapshot_id,
@@ -4662,12 +4715,20 @@ mod eager_attempt_io_tests {
         )
         .expect("expired context");
 
-        let error = commit_eager_frontier(&mut attempt.frontier, &context)
-            .await
-            .expect_err("elapsed deadline must veto catalog dispatch");
-        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
+        let outcome = attempt.frontier.commit_with_context(&context).await;
+        assert!(
+            matches!(outcome,CatalogOutcome::KnownUncommitted{ref failure}
+            if failure.kind()==ConnectorMutationFailureKind::DeadlineExceeded),
+            "{outcome:?}"
+        );
         assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 0);
-        assert_eq!(dispatch.aborts.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            attempt
+                .frontier
+                .journal
+                .commit_outcome(attempt.frontier.journal.current_entry().unwrap()),
+            CatalogOutcome::KnownUncommitted { .. }
+        ));
 
         fixture
             .table
@@ -4675,6 +4736,18 @@ mod eager_attempt_io_tests {
             .delete(&attempt.puffin_path)
             .await
             .expect("clean test Puffin");
+        assert!(
+            !fixture
+                .table
+                .file_io()
+                .exists(&attempt.puffin_path)
+                .await
+                .unwrap()
+        );
+        for path in &attempt.manifest_paths {
+            fixture.table.file_io().delete(path).await.unwrap();
+            assert!(!fixture.table.file_io().exists(path).await.unwrap());
+        }
     }
 
     #[tokio::test]

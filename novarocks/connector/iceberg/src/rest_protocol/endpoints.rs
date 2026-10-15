@@ -866,7 +866,6 @@ mod tests {
 
     use super::{ConditionalTableLoad, RestEndpoints};
     use crate::iceberg::{NamespaceIdent, TableIdent};
-    use crate::rest_protocol::adapter::RestTransitionalAdapter as RestCatalog;
     use crate::rest_protocol::test_server::{
         RecordedRequest, Reply, Script, TestServer, oauth2_identity,
     };
@@ -878,7 +877,7 @@ mod tests {
         server: &TestServer,
         extra: &[(&str, &str)],
         identity: Option<crate::access_binding::IcebergRestAuthMaterial>,
-    ) -> (Arc<RestCatalog>, Arc<RestEndpoints>) {
+    ) -> Arc<RestEndpoints> {
         let mut properties: HashMap<String, String> = extra
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -958,7 +957,7 @@ mod tests {
                 .on("POST", "/v1/oauth/tokens", Reply::token("fe-token"))
                 .on("GET", "/v1/namespaces/db/tables/t", Reply::status(404)),
         );
-        let (_upstream, endpoints) =
+        let endpoints =
             generation(&server, &[], Some(oauth2_identity("fe-control", "secret"))).await;
 
         assert!(
@@ -1011,7 +1010,7 @@ mod tests {
                         Reply::bytes(200, b"<html>not metadata</html>".to_vec()),
                     ),
             );
-            let (_upstream, endpoints) = generation(&server, &[], None).await;
+            let endpoints = generation(&server, &[], None).await;
 
             assert!(
                 endpoints
@@ -1047,7 +1046,7 @@ mod tests {
                     Reply::json(200, &response),
                 ),
         );
-        let (_upstream, endpoints) = generation(&server, &[], None).await;
+        let endpoints = generation(&server, &[], None).await;
 
         assert!(
             endpoints
@@ -1079,7 +1078,7 @@ mod tests {
                     ),
                 ),
         );
-        let (_upstream, endpoints) = generation(&server, &[], None).await;
+        let endpoints = generation(&server, &[], None).await;
 
         let (frozen, delegation) = endpoints.load_table(&table("t"), true).await.expect("load");
         assert_eq!(delegation.len(), 1);
@@ -1148,7 +1147,7 @@ mod tests {
                     Reply::json(200, &serde_json::json!({"identifiers": []})),
                 ),
         );
-        let (_upstream, endpoints) = generation(&server, &[], None).await;
+        let endpoints = generation(&server, &[], None).await;
         let db = NamespaceIdent::new("db".to_string());
 
         endpoints
@@ -1196,7 +1195,7 @@ mod tests {
                     Reply::redirect(307, "/elsewhere"),
                 ),
         );
-        let (_upstream, endpoints) = generation(&server, &[], None).await;
+        let endpoints = generation(&server, &[], None).await;
 
         let view = endpoints
             .load_view(&table("v"))
@@ -1234,7 +1233,7 @@ mod tests {
                 .on("GET", "/credentials", Reply::status(401))
                 .on("GET", "/v1/namespaces/db/tables/t", Reply::status(401)),
         );
-        let (_upstream, endpoints) = generation(&server, &[], None).await;
+        let endpoints = generation(&server, &[], None).await;
 
         let credentials = endpoints
             .load_credentials(&format!("{}/credentials", server.url()))
@@ -1276,7 +1275,7 @@ mod tests {
                     Reply::json(200, &serde_json::json!({"identifiers": []})),
                 ),
         );
-        let (_upstream, endpoints) = generation(&server, &[], None).await;
+        let endpoints = generation(&server, &[], None).await;
         let db = NamespaceIdent::new("db".to_string());
 
         // Cold session: namespace and table reads race through the same gate.
@@ -1316,7 +1315,7 @@ mod tests {
                     Reply::json(200, &load_response(false)),
                 ),
         );
-        let (_upstream, endpoints) = generation(
+        let endpoints = generation(
             &server,
             &[("header.x-tenant", "t1")],
             Some(oauth2_identity("fe-control", "secret")),
@@ -1380,7 +1379,7 @@ mod tests {
                     ],
                 ),
         );
-        let (_, endpoints) = generation(&server, &[], None).await;
+        let endpoints = generation(&server, &[], None).await;
         let validator = match endpoints
             .load_table_conditional(&table("t"), true, None)
             .await
@@ -1426,7 +1425,7 @@ mod tests {
                     Reply::json(200, &load_response(false)),
                 ),
         );
-        let (_, endpoints) = generation(&server, &[], None).await;
+        let endpoints = generation(&server, &[], None).await;
         assert!(matches!(
             endpoints
                 .load_table_conditional(&table("t"), false, None)
@@ -1451,7 +1450,7 @@ mod tests {
                     .on("GET", "/v1/config", Reply::json(200, &config))
                     .on("GET", "/v1/namespaces/db/tables/t", Reply::status(404)),
             );
-            let (_, endpoints) = generation(&server, &[], None).await;
+            let endpoints = generation(&server, &[], None).await;
             assert!(!endpoints.table_exists(&table("t")).await.unwrap());
             assert!(matches!(
                 endpoints.binding().await.unwrap().idempotency_capability(),

@@ -804,7 +804,7 @@ mod tests {
         fn rest_runtime(server: &TestServer) -> (tokio::runtime::Runtime, IcebergMetadataContext) {
             let executor = tokio::runtime::Runtime::new().expect("runtime");
             let handle = executor.handle().clone();
-            let (_upstream, endpoints) = executor
+            let endpoints = executor
                 .block_on(async {
                     crate::catalog_runtime::build_vended_rest_generation_for_test(
                         HashMap::from([("uri".to_string(), server.url())]),

@@ -33,8 +33,6 @@ use crate::catalog_config::{IcebergCatalogConfiguration, IcebergCatalogKind};
 pub struct IcebergCatalogClient {
     generic: Option<Arc<dyn crate::iceberg::Catalog>>,
     hadoop: Option<Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>>,
-    #[cfg(test)]
-    rest: Option<Arc<crate::rest_protocol::adapter::RestTransitionalAdapter>>,
     rest_endpoints: Option<Arc<crate::rest_protocol::endpoints::RestEndpoints>>,
     rest_access_delegation: RestAccessDelegationMode,
 }
@@ -50,13 +48,6 @@ pub(crate) enum RestAccessDelegationMode {
 impl IcebergCatalogClient {
     pub fn generic(&self) -> Option<&Arc<dyn crate::iceberg::Catalog>> {
         self.generic.as_ref()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn rest(
-        &self,
-    ) -> Option<&Arc<crate::rest_protocol::adapter::RestTransitionalAdapter>> {
-        self.rest.as_ref()
     }
 
     pub fn hadoop(&self) -> Option<&Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>> {
@@ -113,8 +104,6 @@ pub const fn frozen_sdk_listing_parameters() -> (usize, std::time::Duration, std
 
 /// One REST generation's provider-owned endpoints and single session.
 struct RestGeneration {
-    #[cfg(test)]
-    upstream: Arc<crate::rest_protocol::adapter::RestTransitionalAdapter>,
     endpoints: Arc<crate::rest_protocol::endpoints::RestEndpoints>,
 }
 
@@ -211,16 +200,7 @@ async fn assemble_rest_generation(
         declared_routing_headers,
         vending_declared,
     ));
-    #[cfg(test)]
-    let upstream = Arc::new(crate::rest_protocol::adapter::RestTransitionalAdapter::new(
-        Arc::clone(&endpoints),
-    ));
-
-    Ok(RestGeneration {
-        #[cfg(test)]
-        upstream,
-        endpoints,
-    })
+    Ok(RestGeneration { endpoints })
 }
 
 /// A vended REST generation built from raw properties, for tests that drive
@@ -230,13 +210,7 @@ pub(crate) async fn build_vended_rest_generation_for_test(
     properties: HashMap<String, String>,
     identity: Option<crate::access_binding::IcebergRestAuthMaterial>,
     runtime: crate::iceberg::Runtime,
-) -> Result<
-    (
-        Arc<crate::rest_protocol::adapter::RestTransitionalAdapter>,
-        Arc<crate::rest_protocol::endpoints::RestEndpoints>,
-    ),
-    String,
-> {
+) -> Result<Arc<crate::rest_protocol::endpoints::RestEndpoints>, String> {
     let generation = assemble_rest_generation(
         properties,
         Default::default(),
@@ -247,7 +221,7 @@ pub(crate) async fn build_vended_rest_generation_for_test(
         None,
     )
     .await?;
-    Ok((generation.upstream, generation.endpoints))
+    Ok(generation.endpoints)
 }
 
 pub async fn build_hms_catalog(
@@ -338,18 +312,12 @@ pub(crate) async fn build_catalog_client_with_rest_access_delegation(
             Ok(IcebergCatalogClient {
                 generic: Some(generic),
                 hadoop: Some(hadoop),
-                #[cfg(test)]
-                rest: None,
                 rest_endpoints: None,
                 rest_access_delegation: RestAccessDelegationMode::Static,
             })
         }
         IcebergCatalogKind::Rest => {
-            let RestGeneration {
-                #[cfg(test)]
-                upstream,
-                endpoints,
-            } = build_rest_catalog_with_access_delegation(
+            let RestGeneration { endpoints } = build_rest_catalog_with_access_delegation(
                 configuration,
                 binding,
                 rest_access_delegation,
@@ -357,15 +325,9 @@ pub(crate) async fn build_catalog_client_with_rest_access_delegation(
                 activity,
             )
             .await?;
-            #[cfg(test)]
-            let generic: Option<Arc<dyn crate::iceberg::Catalog>> = Some(upstream.clone());
-            #[cfg(not(test))]
-            let generic = None;
             Ok(IcebergCatalogClient {
-                generic,
+                generic: None,
                 hadoop: None,
-                #[cfg(test)]
-                rest: Some(upstream),
                 rest_endpoints: Some(endpoints),
                 rest_access_delegation,
             })
@@ -375,8 +337,6 @@ pub(crate) async fn build_catalog_client_with_rest_access_delegation(
                 build_hms_catalog(configuration, binding, runtime).await?,
             )),
             hadoop: None,
-            #[cfg(test)]
-            rest: None,
             rest_endpoints: None,
             rest_access_delegation: RestAccessDelegationMode::Static,
         }),
@@ -427,7 +387,7 @@ mod tests {
         )
         .await
         .expect("provider catalog");
-        assert!(client.rest().is_none());
+        assert!(client.rest_endpoints().is_none());
         assert!(client.hadoop().is_some());
         assert!(Arc::strong_count(client.generic().expect("Hadoop read client")) >= 1);
     }

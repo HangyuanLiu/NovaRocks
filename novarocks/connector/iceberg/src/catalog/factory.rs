@@ -108,12 +108,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::error::CatalogOutcome;
-    use crate::catalog::transaction::{
-        CreateTableTransactionRequest, TransactionIdentity, TransactionRequest,
-    };
-    use crate::catalog::{
-        CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, CatalogTransactionStart,
-    };
+    use crate::catalog::{CatalogCreateIntent, CatalogNamespaceName, CatalogTableName};
     use crate::iceberg::TableCreation;
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
@@ -169,18 +164,47 @@ mod tests {
             .build()
     }
 
-    fn create_request(
+    async fn create_fixture(
+        owner: Arc<dyn NovaRocksCatalog>,
         namespace: &str,
-        table: &str,
-        intent: CatalogCreateIntent,
-    ) -> CreateTableTransactionRequest {
-        CreateTableTransactionRequest {
-            identity: TransactionIdentity::new("test", [1u8; 16]),
-            target: CatalogTableName::new(namespace, table),
-            intent,
-            creation: creation(table),
-            warehouse: None,
-        }
+        name: &str,
+    ) -> CatalogOutcome<super::super::transaction::CommitProof> {
+        use novarocks_spi::connector::*;
+        let operation_id = ConnectorMutationOperationId::new();
+        let request = owner
+            .freeze_create_publication(
+                super::super::catalog_request::CatalogCreatePublicationRequest {
+                    operation_id: operation_id.to_bytes(),
+                    namespace: CatalogNamespaceName::new(namespace),
+                    creation: creation(name),
+                    no_op_if_exists: false,
+                },
+            )
+            .expect("freeze local create before any I/O");
+        let runtime = tokio::runtime::Handle::current();
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            ConnectorStopOwner::new().view(),
+            64 * 1024,
+            1024 * 1024,
+        )
+        .unwrap();
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        )
+        .for_request(context.clone());
+        super::super::admission_test_support::publish_catalog(
+            owner,
+            request,
+            operation_id,
+            ProviderBindingEpoch::from_bytes([77; 16]),
+            context,
+            binding,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -348,33 +372,24 @@ mod tests {
             CatalogOutcome::KnownCommitted { .. }
         ));
 
-        let empty = catalog
-            .new_create_table_transaction(create_request(
-                "db",
-                "t_empty",
-                CatalogCreateIntent::EmptyTable,
-            ))
-            .await;
+        let empty = create_fixture(Arc::clone(&catalog), "db", "t_empty").await;
         assert!(
-            matches!(empty, CatalogTransactionStart::Ready(_)),
-            "empty-table creation is atomic on this catalog"
+            matches!(empty, CatalogOutcome::KnownCommitted { .. }),
+            "atomic empty create: {empty:?}"
         );
 
         let before = std::fs::read_dir(warehouse.path())
             .expect("warehouse readable")
             .count();
-        let ctas = catalog
-            .new_create_table_transaction(create_request(
-                "db",
-                "t_ctas",
-                CatalogCreateIntent::CreateTableAsSelect,
-            ))
-            .await;
-        let CatalogTransactionStart::Unsupported(reason) = &ctas else {
-            panic!("CTAS must be refused on a Hadoop catalog, got {ctas:?}");
-        };
+        let reason = catalog
+            .admit_operation(
+                &super::super::admission::CatalogOperation::CreateTable(
+                    CatalogCreateIntent::CreateTableAsSelect,
+                ),
+                &CatalogTableName::new("db", "t_ctas").into(),
+            )
+            .expect_err("CTAS must be refused before source execution");
         assert!(reason.message().contains("staged-create"));
-        assert!(ctas.permits_cleanup());
         assert_eq!(
             std::fs::read_dir(warehouse.path())
                 .expect("warehouse readable")
@@ -385,40 +400,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_or_replace_is_refused_where_it_cannot_be_atomic() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
+    async fn frozen_create_cannot_replace_an_existing_hadoop_incarnation() {
+        let warehouse = tempfile::tempdir().unwrap();
         let catalog = adopted(&hadoop_configuration(warehouse.path()))
             .await
-            .expect("catalog");
-        let outcome = catalog
-            .new_create_or_replace_table_transaction(create_request(
-                "db",
-                "t",
-                CatalogCreateIntent::EmptyTable,
-            ))
-            .await;
-        assert!(matches!(outcome, CatalogTransactionStart::Unsupported(_)));
+            .unwrap();
+        assert!(matches!(
+            catalog
+                .create_namespace(CatalogNamespaceName::new("db"))
+                .await,
+            CatalogOutcome::KnownCommitted { .. }
+        ));
+        assert!(matches!(
+            create_fixture(Arc::clone(&catalog), "db", "t").await,
+            CatalogOutcome::KnownCommitted { .. }
+        ));
+        let before = catalog
+            .load_table(CatalogTableName::new("db", "t"))
+            .await
+            .unwrap()
+            .into_parts()
+            .0
+            .into_static_table()
+            .unwrap();
+        let location = before.metadata_location().unwrap();
+        let bytes = before
+            .file_io()
+            .new_input(location)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let collision = create_fixture(Arc::clone(&catalog), "db", "t").await;
+        assert!(
+            matches!(collision,CatalogOutcome::KnownUncommitted{ref failure}
+            if failure.kind()==novarocks_spi::connector::ConnectorMutationFailureKind::AlreadyExists),
+            "{collision:?}"
+        );
+        let after = catalog
+            .load_table(CatalogTableName::new("db", "t"))
+            .await
+            .unwrap()
+            .into_parts()
+            .0
+            .into_static_table()
+            .unwrap();
+        assert_eq!(after.metadata(), before.metadata());
+        assert_eq!(
+            after
+                .file_io()
+                .new_input(location)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            bytes
+        );
     }
 
     #[tokio::test]
-    async fn existing_table_transactions_are_admitted_on_every_catalog() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
+    async fn existing_table_admission_does_not_read_a_target_before_preparation() {
+        let warehouse = tempfile::tempdir().unwrap();
         let catalog = adopted(&hadoop_configuration(warehouse.path()))
             .await
-            .expect("catalog");
-        let start = catalog
-            .new_transaction(TransactionRequest {
-                operation: crate::catalog::admission::CatalogOperation::Append,
-                identity: TransactionIdentity::new("test", [2u8; 16]),
-                target: CatalogTableName::new("db", "t"),
-                target_ref: Arc::from("main"),
-                base_snapshot_id: None,
-                expected_table_uuid: None,
-                marker: None,
-            })
-            .await;
-        assert!(matches!(start, CatalogTransactionStart::Ready(_)));
+            .unwrap();
+        let before = std::fs::read_dir(warehouse.path()).unwrap().count();
+        catalog
+            .admit_operation(
+                &super::super::admission::CatalogOperation::Append,
+                &CatalogTableName::new("db", "absent").into(),
+            )
+            .expect("pure operation admission");
+        assert_eq!(std::fs::read_dir(warehouse.path()).unwrap().count(), before);
     }
+
     #[tokio::test]
     async fn operation_admission_matrix_is_owned_by_each_catalog_before_io() {
         use crate::catalog::admission::*;
@@ -783,19 +838,28 @@ mod tests {
             CatalogCreateIntent::EmptyTable,
             CatalogCreateIntent::CreateTableAsSelect,
         ] {
-            assert!(matches!(
-                owner
-                    .new_create_table_transaction(create_request("db", "t", intent))
-                    .await,
-                CatalogTransactionStart::Unsupported(_)
-            ));
-            assert!(matches!(
-                owner
-                    .new_create_or_replace_table_transaction(create_request("db", "t", intent))
-                    .await,
-                CatalogTransactionStart::Unsupported(_)
-            ));
+            owner
+                .admit_operation(
+                    &super::super::admission::CatalogOperation::CreateTable(intent),
+                    &CatalogTableName::new("db", "t").into(),
+                )
+                .expect_err("HMS refuses each create intent before I/O");
         }
+        let refused = owner
+            .freeze_create_publication(
+                super::super::catalog_request::CatalogCreatePublicationRequest {
+                    operation_id: [1; 16],
+                    namespace: CatalogNamespaceName::new("db"),
+                    creation: creation("t"),
+                    no_op_if_exists: false,
+                },
+            )
+            .err()
+            .expect("HMS has no publication freezer");
+        assert_eq!(
+            refused.0.kind(),
+            novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported
+        );
         assert_eq!(
             endpoint.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock

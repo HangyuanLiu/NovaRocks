@@ -645,7 +645,7 @@ mod establishment_tests {
         .await;
         fixture.ensure_session().await.unwrap();
         let table = TableIdent::new(NamespaceIdent::new("db".to_string()), "orders".to_string());
-        assert!(fixture.upstream.table_exists(&table).await.unwrap());
+        assert!(fixture.endpoints.table_exists(&table).await.unwrap());
         let head = &server.requests_to("HEAD", "/v1/namespaces/db/tables/orders")[0];
         assert_eq!(head.header("authorization"), Some("Bearer role-token"));
         let mut headers = HeaderMap::new();

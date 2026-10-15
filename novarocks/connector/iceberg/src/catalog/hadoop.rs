@@ -30,8 +30,6 @@ use super::admission::{
 };
 use super::delegate::CatalogDelegate;
 use super::error::{CatalogOutcome, CatalogUnsupported};
-#[cfg(test)]
-use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use super::{
     CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, ConditionalCreateEvidence,
     ConditionalCreateVerdict, NovaRocksCatalog,
@@ -39,10 +37,7 @@ use super::{
 #[cfg(test)]
 use super::{CatalogDropTableReceipt, ConditionalCreateFacts};
 #[cfg(test)]
-use super::{
-    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateReceipt,
-    ConditionalCreateRequest,
-};
+use super::{ConditionalCreateAttempt, ConditionalCreateReceipt, ConditionalCreateRequest};
 
 /// A Hadoop filesystem Iceberg catalog.
 ///
@@ -874,109 +869,6 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
                 ConditionalCreateVerdict::Foreign
             }
         })
-    }
-
-    #[cfg(test)]
-
-    async fn new_transaction(&self, request: TransactionRequest) -> CatalogTransactionStart {
-        if let Err(reason) =
-            self.admit_operation(&request.operation, &request.target.clone().into())
-        {
-            return CatalogTransactionStart::Unsupported(reason);
-        }
-        super::start_update_table_transaction(self, request)
-    }
-
-    #[cfg(test)]
-
-    async fn new_create_table_transaction(
-        &self,
-        request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        if let Err(reason) = self.admit_operation(
-            &CatalogOperation::CreateTable(request.intent),
-            &request.target.clone().into(),
-        ) {
-            return CatalogTransactionStart::Unsupported(reason);
-        }
-        match request.intent {
-            CatalogCreateIntent::EmptyTable => {
-                // This catalog's create is a conditional metadata write, not a
-                // catalog call, so the transaction is built around that
-                // primitive rather than around `create_table`.
-                let target = request.target.clone();
-                let namespace = CatalogNamespaceName::new(Arc::clone(&target.namespace));
-                let prepared = self
-                    .prepare_conditional_create(super::ConditionalCreateRequest {
-                        namespace,
-                        creation: request.creation,
-                        operation_id: Arc::from(request.identity.hex()),
-                    })
-                    .await;
-                let Some((attempt, _effect, _witness)) = prepared.into_known_committed() else {
-                    // Preparation sends nothing, so a failure here is proven
-                    // uncommitted; report it without inventing a transaction.
-                    return CatalogTransactionStart::KnownUncommitted {
-                        failure: novarocks_spi::connector::ConnectorMutationFailure::new(
-                            novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
-                            "conditional create could not be prepared",
-                        ),
-                    };
-                };
-                let evidence = super::ConditionalCreateEvidence {
-                    namespace: Arc::clone(&target.namespace),
-                    table: Arc::clone(&target.name),
-                    expected_table_uuid: Arc::clone(&attempt.facts.table_uuid),
-                    metadata_location: Arc::clone(&attempt.facts.metadata_location),
-                    metadata_digest: Arc::clone(&attempt.facts.metadata_digest),
-                };
-                let commit_evidence =
-                    super::error::CatalogCommitEvidence::for_target(target.canonical())
-                        .with_target_uuid(Arc::clone(&attempt.facts.table_uuid))
-                        .with_metadata_location(Arc::clone(&attempt.facts.metadata_location));
-                // What admission observed, so the caller can freeze publication
-                // evidence before anything is dispatched.
-                let admission = super::transaction::AdmissionFacts {
-                    table_uuid: Some(Arc::clone(&attempt.facts.table_uuid)),
-                    metadata_location: Some(Arc::clone(&attempt.facts.metadata_location)),
-                    metadata_digest: Some(Arc::clone(&attempt.facts.metadata_digest)),
-                };
-                CatalogTransactionStart::Ready(Box::new(
-                    super::transaction::Transaction::new(
-                        request.identity,
-                        target,
-                        super::transaction::TransactionShape::Create(request.intent),
-                        commit_evidence,
-                        Arc::new(super::dispatch::ConditionalCreateDispatch::new(
-                            Arc::clone(&self.client),
-                            attempt
-                                .into_hadoop()
-                                .expect("this catalog prepared the attempt"),
-                            evidence,
-                        )),
-                    )
-                    .with_admission_facts(admission),
-                ))
-            }
-            CatalogCreateIntent::CreateTableAsSelect => match self.admit_operation(
-                &CatalogOperation::CreateTable(request.intent),
-                &request.target.clone().into(),
-            ) {
-                Ok(()) => super::start_create_table_transaction(&self.delegate, request),
-                Err(reason) => CatalogTransactionStart::Unsupported(reason),
-            },
-        }
-    }
-
-    #[cfg(test)]
-
-    async fn new_create_or_replace_table_transaction(
-        &self,
-        _request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        CatalogTransactionStart::Unsupported(CatalogUnsupported::new(
-            "Hadoop Iceberg catalog cannot replace a table atomically",
-        ))
     }
 }
 

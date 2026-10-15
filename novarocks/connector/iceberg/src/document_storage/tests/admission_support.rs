@@ -12,12 +12,11 @@ use async_trait::async_trait;
 use novarocks_spi::connector::ConnectorError;
 
 use crate::catalog::error::{CatalogOutcome, CatalogUnsupported};
-use crate::catalog::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use crate::catalog::{
     CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName, CatalogTablePage,
-    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
-    ConditionalCreateReceipt, ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog,
-    StagedCommitResult, StagedCreateStart,
+    ConditionalCreateAttempt, ConditionalCreateEvidence, ConditionalCreateReceipt,
+    ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog, StagedCommitResult,
+    StagedCreateStart,
 };
 
 #[derive(Debug)]
@@ -234,10 +233,6 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
         self.mutation()
     }
 
-    async fn new_transaction(&self, _request: TransactionRequest) -> CatalogTransactionStart {
-        self.mutation()
-    }
-
     async fn stage_create_table(
         &self,
         _namespace: CatalogNamespaceName,
@@ -273,20 +268,6 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
         _evidence: ConditionalCreateEvidence,
     ) -> Result<ConditionalCreateVerdict, ConnectorError> {
         self.read()
-    }
-
-    async fn new_create_table_transaction(
-        &self,
-        _request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        self.mutation()
-    }
-
-    async fn new_create_or_replace_table_transaction(
-        &self,
-        _request: CreateTableTransactionRequest,
-    ) -> CatalogTransactionStart {
-        self.mutation()
     }
 }
 

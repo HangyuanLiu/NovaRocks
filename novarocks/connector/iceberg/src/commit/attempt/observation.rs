@@ -18,6 +18,8 @@
 //! One journal owns each request's dispatch fact, evidence and finalization.
 
 mod dispatch;
+#[cfg(test)]
+mod lifecycle_contract_tests;
 
 use super::{Publisher, Report};
 use crate::catalog::error::CatalogOutcome;
@@ -2012,7 +2014,7 @@ mod tests {
     pub(super) fn catalog_journal() -> (PublicationJournal<String>, ConnectorRequestContext) {
         catalog_journal_with_attribution(AttributionPlan::ObserveOnly)
     }
-    fn catalog_journal_with_attribution(
+    pub(super) fn catalog_journal_with_attribution(
         attribution: AttributionPlan,
     ) -> (PublicationJournal<String>, ConnectorRequestContext) {
         catalog_journal_for_operation(

@@ -313,7 +313,6 @@ mod tests {
         )
         .await
         .unwrap()
-        .1
     }
     fn context(stop: &ConnectorStopOwner) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(

@@ -497,7 +497,7 @@ mod tests {
     const UUID: &str = "1a2b3c4d-0000-4000-8000-000000000001";
 
     async fn adapter(server: &TestServer) -> RestTransitionalAdapter {
-        let (_upstream, endpoints) = crate::catalog_runtime::build_vended_rest_generation_for_test(
+        let endpoints = crate::catalog_runtime::build_vended_rest_generation_for_test(
             HashMap::from([("uri".to_string(), server.url())]),
             None,
             crate::iceberg::Runtime::try_current().expect("test runtime"),

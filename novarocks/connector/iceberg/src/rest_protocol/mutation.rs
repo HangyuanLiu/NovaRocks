@@ -628,7 +628,6 @@ mod tests {
         )
         .await
         .expect("REST generation")
-        .1
     }
 
     fn uuid(text: &str) -> Uuid {
@@ -1015,8 +1014,7 @@ mod tests {
                 crate::iceberg::Runtime::try_current().unwrap(),
             )
             .await
-            .unwrap()
-            .1;
+            .unwrap();
             let outcome = dispatch(&endpoints, Endpoint::TableCommit).await;
             assert_eq!(observed(&outcome.evidence), expected, "{label}");
             assert_eq!(

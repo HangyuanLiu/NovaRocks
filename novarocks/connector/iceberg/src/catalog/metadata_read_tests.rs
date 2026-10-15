@@ -100,7 +100,7 @@ async fn owner_with_identity(
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string())),
     );
-    let (_, endpoints) = crate::catalog_runtime::build_vended_rest_generation_for_test(
+    let endpoints = crate::catalog_runtime::build_vended_rest_generation_for_test(
         properties,
         identity,
         crate::iceberg::Runtime::try_current().unwrap(),

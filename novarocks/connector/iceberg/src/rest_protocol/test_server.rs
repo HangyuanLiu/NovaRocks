@@ -663,7 +663,7 @@ pub(crate) async fn wait_until_requests(
 pub(crate) struct FrontendFixture {
     pub(crate) owner: Arc<super::auth::RestAuthOwner>,
     pub(crate) gate: Arc<super::attempt::SessionGate>,
-    pub(crate) upstream: Arc<super::adapter::RestTransitionalAdapter>,
+    pub(crate) endpoints: Arc<super::endpoints::RestEndpoints>,
     properties: Arc<HashMap<String, String>>,
 }
 
@@ -698,7 +698,7 @@ impl FrontendFixture {
             owner,
             gate,
             properties,
-            upstream: Arc::new(super::adapter::RestTransitionalAdapter::new(endpoints)),
+            endpoints,
         }
     }
 
