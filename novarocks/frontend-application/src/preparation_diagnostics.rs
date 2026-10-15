@@ -526,14 +526,14 @@ impl StatementObservationOwner {
         self: &Arc<Self>,
         nomination: &novarocks_failpoint::target_binding::StatementWorkNomination,
         execution: QueryExecutionId,
-    ) -> Result<(), String> {
+    ) -> Result<Option<novarocks_failpoint::target_binding::StatementWorkNomination>, String> {
         let token = {
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| "statement observation lock poisoned")?;
             if !self.active(&mut state) {
-                return Ok(());
+                return Ok(None);
             }
             state
                 .runs
@@ -546,9 +546,10 @@ impl StatementObservationOwner {
                     return Err("distributed attempt differs from its nominated statement".into());
                 }
                 handle.bind_attempt(execution);
+                return Ok(handle.nomination_for_exact_execution(execution));
             }
         }
-        Ok(())
+        Ok(None)
     }
     pub(crate) fn bound_statement(
         self: &Arc<Self>,
@@ -586,12 +587,32 @@ impl StatementObservationHandle {
     pub(crate) fn nomination(
         &self,
     ) -> Option<novarocks_failpoint::target_binding::StatementWorkNomination> {
+        self.nomination_for_observed_execution(None)
+    }
+
+    /// Refine statement evidence through the existing journal's exact binding.
+    /// Other logical work and superseded attempts keep executing unobserved.
+    pub(crate) fn nomination_for_exact_execution(
+        &self,
+        execution: QueryExecutionId,
+    ) -> Option<novarocks_failpoint::target_binding::StatementWorkNomination> {
+        self.nomination_for_observed_execution(Some(execution))
+    }
+
+    fn nomination_for_observed_execution(
+        &self,
+        execution: Option<QueryExecutionId>,
+    ) -> Option<novarocks_failpoint::target_binding::StatementWorkNomination> {
         let owner = self.owner.as_ref()?.upgrade()?;
         let mut state = owner.state.lock().ok()?;
         if !owner.active(&mut state) {
             return None;
         }
-        let statement = state.run_mut(self)?.statement?;
+        let run = state.run_mut(self)?;
+        if execution.is_some_and(|execution| run.execution != Some(execution)) {
+            return None;
+        }
+        let statement = run.statement?;
         let ProcessBinding::Frontend(process) = owner.cancellation.process() else {
             return None;
         };
@@ -1196,6 +1217,131 @@ mod session_owner_tests {
             self.runner.end_and_join().unwrap();
             std::fs::remove_dir_all(&self.root).unwrap();
         }
+    }
+
+    #[test]
+    fn finite_statement_nomination_only_projects_its_existing_exact_query_binding() {
+        let execution = |low, attempt| {
+            QueryExecutionId::new(
+                QueryId::new(-19, low),
+                novarocks_types::AttemptId::new(attempt).unwrap(),
+            )
+            .unwrap()
+        };
+        let snapshot = |execution_id| {
+            use crate::query_execution::lifecycle_diagnostics::{
+                RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
+            };
+            QueryLifecycleConvergenceSnapshot {
+                execution_id,
+                error_source: None,
+                primary_error: None,
+                runtime_filter: RuntimeFilterTerminalRollupSnapshot::Unavailable(
+                    RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
+                ),
+            }
+        };
+        let fixture = ObserverFixture::new();
+        let session = fixture.session(7, 1);
+        fixture
+            .owner
+            .arm(ObserverFixture::arm("cohorts", 7, "CALL rewrite()"))
+            .unwrap();
+        let mut statement = fixture.service.begin_statement(session.token()).unwrap();
+        let handle = fixture
+            .owner
+            .bind_statement(statement.token(), "CALL rewrite()")
+            .unwrap()
+            .unwrap();
+        let nomination = handle.nomination().unwrap();
+        let first = execution(41, 1);
+        let other_cohort = execution(42, 1);
+        let replacement = execution(41, 2);
+        assert!(handle.nomination_for_exact_execution(first).is_none());
+        assert_eq!(
+            fixture
+                .owner
+                .bind_nominated_attempt(&nomination, first)
+                .unwrap(),
+            Some(nomination.clone())
+        );
+        fixture.owner.publish(&snapshot(first));
+        assert_eq!(
+            fixture
+                .owner
+                .bind_nominated_attempt(&nomination, first)
+                .unwrap(),
+            Some(nomination.clone())
+        );
+        assert!(fixture.owner.peek("cohorts").unwrap().snapshot.is_some());
+        assert!(
+            fixture
+                .owner
+                .bind_nominated_attempt(&nomination, other_cohort)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            handle
+                .nomination_for_exact_execution(other_cohort)
+                .is_none()
+        );
+        assert_eq!(
+            handle.nomination_for_exact_execution(first),
+            Some(nomination.clone())
+        );
+        assert_eq!(
+            fixture
+                .owner
+                .peek("cohorts")
+                .unwrap()
+                .execution_id
+                .as_deref(),
+            Some("-19:41:1")
+        );
+        assert_eq!(
+            fixture
+                .owner
+                .bind_nominated_attempt(&nomination, replacement)
+                .unwrap(),
+            Some(nomination.clone())
+        );
+        assert!(fixture.owner.peek("cohorts").unwrap().snapshot.is_none());
+        assert!(
+            fixture
+                .owner
+                .bind_nominated_attempt(&nomination, first)
+                .unwrap()
+                .is_none()
+        );
+        assert!(handle.nomination_for_exact_execution(first).is_none());
+        assert_eq!(
+            handle.nomination_for_exact_execution(replacement),
+            Some(nomination.clone())
+        );
+        fixture.owner.publish(&snapshot(replacement));
+        assert_eq!(
+            fixture
+                .owner
+                .bind_nominated_attempt(&nomination, replacement)
+                .unwrap(),
+            Some(nomination.clone())
+        );
+        assert!(fixture.owner.peek("cohorts").unwrap().snapshot.is_some());
+        let mut foreign = nomination.clone();
+        foreign.statement_generation += 1;
+        assert!(
+            fixture
+                .owner
+                .bind_nominated_attempt(&foreign, replacement)
+                .is_err()
+        );
+        // The parent statement nomination remains available; projection into
+        // another actual query is what the existing journal refuses.
+        assert_eq!(handle.nomination(), Some(nomination));
+        fixture.owner.drain("cohorts").unwrap();
+        assert!(handle.nomination_for_exact_execution(replacement).is_none());
+        statement.finish();
     }
 
     #[test]

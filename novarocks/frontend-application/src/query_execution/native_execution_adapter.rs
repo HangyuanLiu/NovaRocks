@@ -2100,11 +2100,12 @@ where
             )
             .await?;
             #[cfg(feature = "test-controls")]
-            if let Some(nomination) = state
+            let nominated_execution = state
                 .observation
                 .as_ref()
-                .and_then(|handle| handle.nomination())
-            {
+                .and_then(|handle| handle.nomination_for_exact_execution(request.execution()));
+            #[cfg(feature = "test-controls")]
+            if let Some(nomination) = &nominated_execution {
                 for target in snapshot.targets() {
                     let process = target.process_id().map_err(|error| {
                         attempt_failure(
@@ -2116,7 +2117,7 @@ where
                     let binding = (|| -> Result<(), String> {
                         if let Some(controls) = &state.controls {
                             controls.publish_nominated_binding(
-                                &nomination,
+                                nomination,
                                 process,
                                 request.execution(),
                             )?;
@@ -2134,7 +2135,7 @@ where
                             ] {
                                 observations.publish_nominated_binding(
                                     action,
-                                    &nomination,
+                                    nomination,
                                     process,
                                     request.execution(),
                                 )?;
@@ -2175,12 +2176,7 @@ where
             #[cfg(feature = "test-controls")]
             let owner = {
                 let mut owner = owner;
-                owner.test_placement = state.controls.clone().zip(
-                    state
-                        .observation
-                        .as_ref()
-                        .and_then(|handle| handle.nomination()),
-                );
+                owner.test_placement = state.controls.clone().zip(nominated_execution);
                 owner
             };
             request
