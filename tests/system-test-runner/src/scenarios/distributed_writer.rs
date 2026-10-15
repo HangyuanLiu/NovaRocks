@@ -2279,6 +2279,15 @@ impl Scenario for DistributedWriterFaults {
             let case = fault.case();
             let selected = self.intent.take(ordinal)?;
             context.action(format!("inject {case} and require no snapshot"));
+            // Select the original finite grants before reading their hit baseline.
+            // The SQL execution remains unbound until selected.arm below.
+            for &(index, kind) in &selected.faults {
+                context.handle().arm_selected_query_lifecycle_fault(
+                    index,
+                    kind,
+                    &selected.token,
+                )?;
+            }
             let before_terminals = publication_terminals(context, WRITE_FAMILY)?;
             let before = all_write_counters(context)?;
             let before_injections = fault.injection_marker_count(context, &selected)?;
