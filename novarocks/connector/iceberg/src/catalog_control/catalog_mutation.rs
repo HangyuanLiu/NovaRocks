@@ -1676,6 +1676,13 @@ pub(crate) fn schema_change_commit(
         .with_identifier_field_ids(metadata.current_schema().identifier_field_ids())
         .build()
         .map_err(|error| invalid(format!("build evolved Iceberg schema: {error}")))?;
+    // Scalar integer domain validation above must precede this schema
+    // comparison. An unchanged MODIFY has no schema publication to dispatch.
+    if matches!(change, ConnectorSchemaChange::ModifyColumn { .. })
+        && &new_schema == metadata.current_schema().as_ref()
+    {
+        return Ok(None);
+    }
     let updates = scalar_integer_schema_updates(metadata, change, new_schema, integer_domains)?;
     let commit = crate::commit::existing_commit::existing_table_commit(
         ident,
@@ -6244,12 +6251,28 @@ mod tests {
         let variant_type = Type::Variant(crate::iceberg::spec::VariantType);
         let fields = vec![
             Arc::new(NestedField::optional(1, "payload", variant_type.clone())),
-            Arc::new(NestedField::optional(
-                2,
-                "id",
-                Type::Primitive(PrimitiveType::Int),
-            )),
+            Arc::new(
+                NestedField::required(2, "id", Type::Primitive(PrimitiveType::Int))
+                    .with_doc("existing identifier"),
+            ),
         ];
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+            Schema::builder()
+                .with_fields(fields.clone())
+                .with_identifier_field_ids([2])
+                .build()
+                .unwrap(),
+            crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "memory://existing-variant-schema".to_string(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let ident = || TableIdent::from_strs(["atomic", "events"]).unwrap();
         let path = || ConnectorColumnPath {
             segments: vec!["payload".into()],
         };
@@ -6309,17 +6332,46 @@ mod tests {
                 .expect("existing Variant does not make metadata read-only");
             apply_schema_change(&fields, &change, &mut 3)
                 .expect("existing schema-change semantics remain legal");
+            let commit = schema_change_commit(ident(), &metadata, &change)
+                .expect("existing schema change reaches its commit owner");
+            assert_eq!(
+                commit.is_none(),
+                matches!(change, ConnectorSchemaChange::ModifyColumn { .. }),
+                "the unchanged MODIFY must not publish an identical schema"
+            );
         }
-        assert_eq!(
-            widen_type(&variant_type, variant_type.clone()).unwrap(),
-            variant_type
+        let ordinary_modify = |data_type| ConnectorSchemaChange::ModifyColumn {
+            path: ConnectorColumnPath {
+                segments: vec!["id".into()],
+            },
+            data_type,
+        };
+        assert!(
+            schema_change_commit(ident(), &metadata, &ordinary_modify(ConnectorDataType::Int))
+                .unwrap()
+                .is_none(),
+            "ordinary same-type MODIFY is also a no-op"
         );
         assert!(
-            widen_type(
-                &Type::Primitive(PrimitiveType::Int),
-                Type::Variant(crate::iceberg::spec::VariantType)
+            schema_change_commit(
+                ident(),
+                &metadata,
+                &ordinary_modify(ConnectorDataType::BigInt)
             )
-            .is_err()
+            .unwrap()
+            .is_some(),
+            "a real widening must still publish a schema"
+        );
+        assert_eq!(
+            schema_change_commit(
+                ident(),
+                &metadata,
+                &ordinary_modify(ConnectorDataType::Variant)
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorErrorKind::Unsupported,
+            "MODIFY cannot introduce Variant"
         );
         assert!(server.requests().is_empty());
     }
