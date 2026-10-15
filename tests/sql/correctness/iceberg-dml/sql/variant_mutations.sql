@@ -55,7 +55,7 @@ TRUNCATE TABLE ${case_db}.t_v3_variant_mut;
 SELECT COUNT(*) AS remaining_rows FROM ${case_db}.t_v3_variant_mut;
 
 -- query 8
--- @expect_error=equality-delete keys
+-- @expect_error=does not support writing Iceberg Variant values
 ALTER TABLE ${case_db}.t_v3_variant_mut ADD EQUALITY DELETE (v) VALUES (NULL);
 
 -- query 9
