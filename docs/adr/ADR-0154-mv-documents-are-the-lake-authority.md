@@ -13,9 +13,10 @@ provenance:
   - "discussion: 2026-09-08 MV storage contract and persistence design, accepted revision 7"
   - "implementation: canonical MV document persistence and native REST integration"
 code-anchors:
-  - "novarocks/mv-application/src/persistence/codec/model.rs (DefinitionDocument, InterpretationDocument, PublicationDocument, ConfigurationDocument)"
-  - "novarocks/mv-application/src/persistence/documents.rs (observe_current_management_document_set)"
-  - "novarocks/connector/iceberg/src/document_storage/observation.rs (project_documents)"
+  - "novarocks/mv-application/src/persistence/codec/model.rs (DefinitionDocument, InterpretationDocument, ConfigurationDocument)"
+  - "novarocks/mv-application/src/persistence/codec/keyed.rs (KeyedPublicationDocument)"
+  - "novarocks/mv-application/src/persistence/keyed_documents.rs (decode_current_keyed_documents)"
+  - "novarocks/connector/iceberg/src/document_storage/keyed/view.rs (project_view)"
   - "novarocks/frontend-application/src/mv/domain/staged_create.rs (install_configured_current_projection)"
   - "novarocks/frontend-application/src/mv/domain/iceberg_refresh.rs (update_iceberg_mv_configuration_with_ports)"
 ---
