@@ -1305,37 +1305,21 @@ fn runtime_filter_order_digests_observed<E: From<String>>(
     data_type: &arrow::datatypes::DataType,
     direction: novarocks_physical_plan::SortDirection,
     null_ordering: novarocks_physical_plan::NullOrdering,
-    mut observe: impl FnMut() -> Result<(), E>,
+    observe: impl FnMut() -> Result<(), E>,
 ) -> Result<([u8; 32], [u8; 32]), E> {
-    let mut comparator = Sha256::new();
-    comparator.update(b"novarocks.runtime-filter.comparator");
-    comparator.update(1_u16.to_be_bytes());
-    let mut order = Sha256::new();
-    order.update(b"novarocks.runtime-filter.order-contract");
-    order.update(1_u16.to_be_bytes());
-    let mut emit = |bytes: &[u8]| {
-        for byte in bytes {
-            observe()?;
-            comparator.update([*byte]);
-            order.update([*byte]);
-        }
-        Ok::<_, E>(())
-    };
-    emit(&1_u32.to_be_bytes())?;
-    visit_runtime_filter_key_type(data_type, &mut emit)?;
-    emit(&[match direction {
-        novarocks_physical_plan::SortDirection::Ascending => 1,
-        novarocks_physical_plan::SortDirection::Descending => 2,
-    }])?;
-    emit(&[match null_ordering {
-        novarocks_physical_plan::NullOrdering::First => 1,
-        novarocks_physical_plan::NullOrdering::Last => 2,
-    }])?;
-    let comparator: [u8; 32] = comparator.finalize().into();
-    order.update([1]);
-    order.update(comparator);
-    order.update(1_u16.to_be_bytes());
-    Ok((comparator, order.finalize().into()))
+    use novarocks_local_program::{FilterNullOrder, FilterSortDirection};
+    novarocks_local_program::single_key_ordered_filter_digests_observed(
+        match direction {
+            novarocks_physical_plan::SortDirection::Ascending => FilterSortDirection::Ascending,
+            novarocks_physical_plan::SortDirection::Descending => FilterSortDirection::Descending,
+        },
+        match null_ordering {
+            novarocks_physical_plan::NullOrdering::First => FilterNullOrder::First,
+            novarocks_physical_plan::NullOrdering::Last => FilterNullOrder::Last,
+        },
+        |emit| visit_runtime_filter_key_type(data_type, &mut |bytes| emit(bytes)),
+        observe,
+    )
 }
 
 fn visit_runtime_filter_key_type<E: From<String>>(

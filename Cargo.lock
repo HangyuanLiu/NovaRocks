@@ -4284,6 +4284,7 @@ dependencies = [
  "novarocks-connector-contract",
  "novarocks-constant-contract",
  "novarocks-functions",
+ "novarocks-local-program",
  "novarocks-physical-plan",
  "novarocks-proto-codec",
  "novarocks-proto-models",
