@@ -50,10 +50,9 @@ use super::{
 /// table and filling it afterwards exposes a half-built table to readers, and a
 /// process-local lock does not fence a second writer.
 ///
-/// Views are not special-cased. The Hadoop client does not implement the view
-/// methods, so delegation already yields a typed `Unsupported` — this catalog
-/// format cannot store a view, and saying "no views here" instead would be
-/// answering a question it cannot answer.
+/// This catalog format cannot store a view, so the owner answers every view
+/// question with a typed `Unsupported`; saying "no views here" instead would
+/// be answering a question it cannot answer.
 #[derive(Debug)]
 pub(super) struct NovaRocksHadoopCatalog {
     delegate: CatalogDelegate,
@@ -335,23 +334,23 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         )
     }
 
-    async fn view_exists(&self, view: CatalogTableName) -> Result<bool, ConnectorError> {
-        self.delegate.view_exists(&view).await
+    async fn view_exists(&self, _view: CatalogTableName) -> Result<bool, ConnectorError> {
+        Err(super::views_unsupported("view_exists"))
     }
 
     async fn list_views(
         &self,
-        namespace: CatalogNamespaceName,
-        bound: ConnectorListingBound,
+        _namespace: CatalogNamespaceName,
+        _bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_views(&namespace, bound).await
+        Err(super::views_unsupported("list_views"))
     }
 
     async fn load_view(
         &self,
-        view: CatalogTableName,
+        _view: CatalogTableName,
     ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
-        self.delegate.load_view(&view).await
+        Err(super::views_unsupported("load_view"))
     }
 
     async fn create_namespace(

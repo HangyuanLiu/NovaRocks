@@ -315,7 +315,7 @@ async fn both_ready_waiting_stop_keeps_original_biased_selection_and_never_calls
     let mut call = Box::pin(gate.run_hms(
         &ctx,
         gate.active_observer().unwrap(),
-        HmsListingOperation::Views,
+        HmsListingOperation::Tables,
         Some([9; 32]),
         |invoke| {
             let gate = &gate;
@@ -376,7 +376,7 @@ async fn ready_error_and_unsupported_are_original_failures_not_synthetic_success
         .run_hms(
             &ctx,
             gate.active_observer().unwrap(),
-            HmsListingOperation::Views,
+            HmsListingOperation::Tables,
             None,
             |invoke| async move {
                 sdk_call(Some(&invoke), async {

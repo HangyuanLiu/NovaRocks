@@ -53,16 +53,16 @@ impl NovaRocksCatalog for AdmittedCatalog {
     async fn create_view(
         &self,
         namespace: super::CatalogNamespaceName,
-        creation: crate::iceberg::ViewCreation,
+        creation: super::view_request::ViewCreate,
     ) -> CatalogOutcome<super::CatalogTableName> {
         self.inner.create_view(namespace, creation).await
     }
 
     async fn replace_view(
         &self,
-        commit: crate::iceberg::ViewCommit,
+        replace: super::view_request::ValidatedViewReplace,
     ) -> CatalogOutcome<super::CatalogTableName> {
-        self.inner.replace_view(commit).await
+        self.inner.replace_view(replace).await
     }
 
     async fn drop_view(

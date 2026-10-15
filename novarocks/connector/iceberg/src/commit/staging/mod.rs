@@ -17,6 +17,7 @@
 
 //! Provider-owned canonical staging, without SDK transaction state.
 mod engine;
+mod initialization;
 mod manifests;
 mod normalize;
 mod requirements;
@@ -24,6 +25,7 @@ mod snapshot_id;
 mod view;
 
 pub use engine::{PreparedChange, Preparer, StagingBase, StagingEngine};
+pub use initialization::staged_create_updates;
 pub use manifests::{
     FirstRowIdInheritance, ManifestEntryWrite, ManifestListOutput, write_manifest,
     write_manifest_list,

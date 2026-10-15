@@ -30,10 +30,11 @@ use reqwest::Method;
 use reqwest::header::HeaderValue;
 use serde::Serialize;
 
-use crate::iceberg::spec::{Schema, ViewVersion};
-use crate::iceberg::{
-    NamespaceIdent, TableCommit, TableIdent, ViewCommit, ViewCreation, ViewRequirement, ViewUpdate,
-};
+use uuid::Uuid;
+
+use crate::catalog::view_request::{ValidatedViewReplace, ViewCreate, ViewSchema};
+use crate::iceberg::spec::Schema;
+use crate::iceberg::{NamespaceIdent, TableCommit, TableIdent};
 use crate::iceberg_catalog_rest::{CommitTableRequest, CreateNamespaceRequest, CreateTableRequest};
 use crate::rest_protocol::binding::SessionBinding;
 use crate::rest_protocol::endpoints::{RestEndpoints, VENDED_CREDENTIALS};
@@ -47,25 +48,126 @@ use crate::rest_protocol::minimal_view::{
     MutationView, NamespaceSink, TableResponseSink, ViewMutationSink,
 };
 
-/// `POST .../namespaces/{ns}/views`. NovaRocks owns the view wire shapes: the
-/// upstream REST crate has no view API.
-#[derive(Serialize)]
+// Design: ADR-0176 (docs/adr/ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md)
+// NovaRocks owns the view wire vocabulary: the upstream REST crate has no
+// view API, and the core view types cannot express a request the reference
+// server accepts for an unchanged schema.
+
+/// One view version as the REST specification serializes it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-struct CreateViewRequest {
-    name: String,
+pub(crate) struct ViewVersionWire {
+    pub(crate) version_id: i32,
+    /// `-1` selects the schema added by the same commit.
+    pub(crate) schema_id: i32,
+    pub(crate) timestamp_ms: i64,
+    pub(crate) summary: HashMap<String, String>,
+    pub(crate) representations: Vec<SqlRepresentationWire>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    location: Option<String>,
+    pub(crate) default_catalog: Option<String>,
+    pub(crate) default_namespace: NamespaceIdent,
+}
+
+/// A SQL representation of a view version.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type", rename = "sql")]
+pub(crate) struct SqlRepresentationWire {
+    pub(crate) sql: String,
+    pub(crate) dialect: String,
+}
+
+/// The view metadata updates NovaRocks issues.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "action", rename_all = "kebab-case")]
+pub(crate) enum ViewUpdateWire {
+    /// Carries no `last-column-id`: the server derives it.
+    AddSchema {
+        schema: Box<Schema>,
+    },
+    #[serde(rename_all = "kebab-case")]
+    AddViewVersion {
+        view_version: ViewVersionWire,
+    },
+    /// `-1` selects the version added by the same commit. A replacement
+    /// never names an existing version by number: version IDs are reused
+    /// after history expiry.
+    #[serde(rename_all = "kebab-case")]
+    SetCurrentViewVersion {
+        view_version_id: i32,
+    },
+    SetProperties {
+        updates: HashMap<String, String>,
+    },
+}
+
+/// The view requirements NovaRocks issues.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum ViewRequirementWire {
+    #[serde(rename = "assert-view-uuid")]
+    AssertViewUuid { uuid: Uuid },
+}
+
+/// `POST .../namespaces/{ns}/views`. The server assigns the location.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct CreateViewRequest {
+    name: String,
     schema: Schema,
-    view_version: ViewVersion,
+    view_version: ViewVersionWire,
     properties: HashMap<String, String>,
 }
 
 /// `POST .../namespaces/{ns}/views/{view}`.
-#[derive(Serialize)]
-struct CommitViewRequest {
+#[derive(Debug, PartialEq, Serialize)]
+pub(crate) struct CommitViewRequest {
     identifier: TableIdent,
-    requirements: Vec<ViewRequirement>,
-    updates: Vec<ViewUpdate>,
+    requirements: Vec<ViewRequirementWire>,
+    updates: Vec<ViewUpdateWire>,
+}
+
+impl CreateViewRequest {
+    pub(crate) fn encode(creation: ViewCreate) -> Self {
+        let (name, schema, view_version, properties) = creation.into_parts();
+        Self {
+            name,
+            schema,
+            view_version,
+            properties,
+        }
+    }
+}
+
+impl CommitViewRequest {
+    /// Encode a validated replacement. Semantic validation happened before:
+    /// this only states the replacement in the REST vocabulary. The new
+    /// version is always added and selected as the one this commit adds.
+    pub(crate) fn encode(replace: &ValidatedViewReplace) -> Self {
+        let mut updates = Vec::with_capacity(4);
+        if !replace.properties().is_empty() {
+            updates.push(ViewUpdateWire::SetProperties {
+                updates: replace.properties().clone(),
+            });
+        }
+        if let ViewSchema::New(schema) = replace.schema() {
+            updates.push(ViewUpdateWire::AddSchema {
+                schema: schema.clone(),
+            });
+        }
+        updates.push(ViewUpdateWire::AddViewVersion {
+            view_version: replace.version().clone(),
+        });
+        updates.push(ViewUpdateWire::SetCurrentViewVersion {
+            view_version_id: -1,
+        });
+        Self {
+            identifier: replace.ident().clone(),
+            requirements: vec![ViewRequirementWire::AssertViewUuid {
+                uuid: replace.uuid(),
+            }],
+            updates,
+        }
+    }
 }
 
 /// The classified result of one mutation.
@@ -183,17 +285,13 @@ impl RestEndpoints {
         .await
     }
 
-    /// Create a view. The first version is built exactly as the vendored
-    /// client built it.
+    /// Create a view from its validated first version.
     pub(crate) async fn create_view(
         &self,
         namespace: &NamespaceIdent,
-        creation: ViewCreation,
+        creation: ViewCreate,
     ) -> MutationOutcome {
-        let request = match view_creation_request(creation) {
-            Ok(request) => request,
-            Err(cause) => return not_written(cause, &AttributionExpectation::create_view()),
-        };
+        let request = CreateViewRequest::encode(creation);
         self.mutate(
             Method::POST,
             |binding| binding.views_url(namespace),
@@ -208,18 +306,13 @@ impl RestEndpoints {
     /// Replace a view's definition; `expect` carries the frozen view UUID.
     pub(crate) async fn replace_view(
         &self,
-        mut commit: ViewCommit,
+        replace: &ValidatedViewReplace,
         expect: &AttributionExpectation,
     ) -> MutationOutcome {
-        let ident = commit.identifier().clone();
-        let request = CommitViewRequest {
-            identifier: ident.clone(),
-            requirements: commit.take_requirements(),
-            updates: commit.take_updates(),
-        };
+        let request = CommitViewRequest::encode(replace);
         self.mutate(
             Method::POST,
-            |binding| binding.view_url(&ident),
+            |binding| binding.view_url(replace.ident()),
             Some(&request),
             None,
             expect,
@@ -292,29 +385,6 @@ fn not_written(cause: NotWrittenCause, expect: &AttributionExpectation) -> Mutat
         evidence: classify(&DispatchStage::NotWritten(cause), BodyRead::NotRead, expect),
         document: None,
     }
-}
-
-fn view_creation_request(creation: ViewCreation) -> Result<CreateViewRequest, NotWrittenCause> {
-    let timestamp_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| NotWrittenCause::Build)?
-        .as_millis() as i64;
-    let view_version = ViewVersion::builder()
-        .with_version_id(1)
-        .with_schema_id(creation.schema.schema_id())
-        .with_timestamp_ms(timestamp_ms)
-        .with_summary(creation.summary)
-        .with_representations(creation.representations)
-        .with_default_catalog(creation.default_catalog)
-        .with_default_namespace(creation.default_namespace)
-        .build();
-    Ok(CreateViewRequest {
-        name: creation.name,
-        location: creation.location,
-        schema: creation.schema,
-        view_version,
-        properties: creation.properties,
-    })
 }
 
 /// Read a success body into the endpoint's minimal view: chunk by chunk, or,
@@ -415,14 +485,9 @@ mod tests {
 
     use super::MutationOutcome;
     use crate::catalog::error::CatalogCommitEvidence;
-    use crate::iceberg::spec::{
-        NestedField, PrimitiveType, Schema, SqlViewRepresentation, Type, ViewRepresentation,
-        ViewRepresentations,
-    };
-    use crate::iceberg::{
-        NamespaceIdent, TableCommit, TableIdent, TableRequirement, ViewCommit, ViewCreation,
-        ViewRequirement,
-    };
+    use crate::catalog::view_request::{ValidatedViewReplace, ViewCreate, ViewDefinition};
+    use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type, ViewMetadata};
+    use crate::iceberg::{NamespaceIdent, TableCommit, TableIdent, TableRequirement};
     use crate::rest_protocol::endpoints::RestEndpoints;
     use crate::rest_protocol::evidence::{AttributionExpectation, ExpectedSnapshot, RestEvidence};
     use crate::rest_protocol::test_server::{BodyPlan, Reply, Script, TestServer};
@@ -597,22 +662,51 @@ mod tests {
         }
     }
 
-    fn view_creation() -> ViewCreation {
-        ViewCreation::builder()
-            .name("v".to_string())
-            .location(None)
-            .representations(ViewRepresentations::new(vec![ViewRepresentation::Sql(
-                SqlViewRepresentation {
-                    sql: "select 1".to_string(),
-                    dialect: "starrocks".to_string(),
-                },
-            )]))
-            .schema(schema())
-            .properties(HashMap::new())
-            .default_namespace(NamespaceIdent::new("db".to_string()))
-            .default_catalog(None)
-            .summary(HashMap::new())
-            .build()
+    fn view_definition() -> ViewDefinition {
+        ViewDefinition {
+            schema: schema(),
+            sql: "select 1".to_string(),
+            summary: HashMap::new(),
+            default_catalog: None,
+            default_namespace: NamespaceIdent::new("db".to_string()),
+            timestamp_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn view_creation() -> ViewCreate {
+        ViewCreate::validate("v".to_string(), view_definition(), HashMap::new()).unwrap()
+    }
+
+    /// View `db.v` with one version over schema 0 (`schema()`).
+    fn view_metadata() -> ViewMetadata {
+        serde_json::from_value(serde_json::json!({
+            "view-uuid": VIEW_UUID,
+            "format-version": 1,
+            "location": "s3://warehouse/db/v",
+            "current-version-id": 1,
+            "versions": [{
+                "version-id": 1,
+                "schema-id": 0,
+                "timestamp-ms": 1_600_000_000_000i64,
+                "summary": {},
+                "representations": [{"type": "sql", "sql": "select 0", "dialect": "starrocks"}],
+                "default-namespace": ["db"],
+            }],
+            "version-log": [{"version-id": 1, "timestamp-ms": 1_600_000_000_000i64}],
+            "schemas": [serde_json::to_value(schema()).unwrap()],
+            "properties": {},
+        }))
+        .unwrap()
+    }
+
+    fn view_replace() -> ValidatedViewReplace {
+        ValidatedViewReplace::validate(
+            TableIdent::new(NamespaceIdent::new("db".to_string()), "v".to_string()),
+            &view_metadata(),
+            view_definition(),
+            HashMap::new(),
+        )
+        .unwrap()
     }
 
     async fn dispatch(endpoints: &RestEndpoints, endpoint: Endpoint) -> MutationOutcome {
@@ -652,16 +746,9 @@ mod tests {
             Endpoint::DropTable => endpoints.drop_table(&table()).await,
             Endpoint::CreateView => endpoints.create_view(&db, view_creation()).await,
             Endpoint::ReplaceView => {
-                let commit = ViewCommit::builder()
-                    .ident(TableIdent::new(db.clone(), "v".to_string()))
-                    .requirements(vec![ViewRequirement::UuidMatch {
-                        uuid: uuid(VIEW_UUID),
-                    }])
-                    .updates(vec![])
-                    .build();
                 endpoints
                     .replace_view(
-                        commit,
+                        &view_replace(),
                         &AttributionExpectation::replace_view(uuid(VIEW_UUID)),
                     )
                     .await
@@ -940,7 +1027,172 @@ mod tests {
             assert_cleanup_follows_evidence(&outcome);
         }
     }
+
+    mod view_wire {
+        //! The view request bodies, fixed as JSON. The first version is
+        //! compared with the upstream `ViewVersion` serialization the vendored
+        //! client used, field by field.
+        use super::super::{CommitViewRequest, CreateViewRequest};
+        use super::*;
+        use crate::catalog::view_request::OPERATION_ID_SUMMARY_KEY;
+        use crate::iceberg::spec::{SqlViewRepresentation, ViewRepresentation, ViewVersion};
+
+        fn summary() -> HashMap<String, String> {
+            HashMap::from([("engine-name".to_string(), "novarocks".to_string())])
+        }
+
+        fn definition(schema: Schema, sql: &str) -> ViewDefinition {
+            ViewDefinition {
+                schema,
+                sql: sql.to_string(),
+                summary: summary(),
+                default_catalog: Some("source".to_string()),
+                default_namespace: NamespaceIdent::new("db".to_string()),
+                timestamp_ms: 1_700_000_000_000,
+            }
+        }
+
+        fn two_columns() -> Schema {
+            Schema::builder()
+                .with_fields(vec![
+                    Arc::new(NestedField::required(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        2,
+                        "name",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                ])
+                .build()
+                .unwrap()
+        }
+
+        /// The encoded replacement with its operation identity replaced by a
+        /// known value.
+        fn encoded(replace: &ValidatedViewReplace) -> serde_json::Value {
+            let mut json = serde_json::to_value(CommitViewRequest::encode(replace)).unwrap();
+            for update in json["updates"].as_array_mut().unwrap() {
+                if update["action"] == "add-view-version" {
+                    let summary = &mut update["view-version"]["summary"];
+                    assert!(summary[OPERATION_ID_SUMMARY_KEY].is_string());
+                    summary[OPERATION_ID_SUMMARY_KEY] = "op".into();
+                }
+            }
+            json
+        }
+
+        fn replace(schema: Schema, properties: &[(&str, &str)]) -> ValidatedViewReplace {
+            ValidatedViewReplace::validate(
+                TableIdent::new(NamespaceIdent::new("db".to_string()), "v".to_string()),
+                &view_metadata(),
+                definition(schema, "select 2"),
+                properties
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            )
+            .unwrap()
+        }
+
+        fn version_json(schema_id: i32) -> serde_json::Value {
+            serde_json::json!({
+                "version-id": 2,
+                "schema-id": schema_id,
+                "timestamp-ms": 1_700_000_000_000i64,
+                "summary": {"engine-name": "novarocks", "novarocks.operation-id": "op"},
+                "representations": [{"type": "sql", "sql": "select 2", "dialect": "starrocks"}],
+                "default-catalog": "source",
+                "default-namespace": ["db"],
+            })
+        }
+
+        #[test]
+        fn a_creation_states_the_first_version_without_a_location() {
+            let creation = ViewCreate::validate(
+                "v".to_string(),
+                definition(schema(), "select 1"),
+                HashMap::from([("comment".to_string(), "c".to_string())]),
+            )
+            .unwrap();
+            let json = serde_json::to_value(CreateViewRequest::encode(creation)).unwrap();
+            let upstream = ViewVersion::builder()
+                .with_version_id(1)
+                .with_schema_id(schema().schema_id())
+                .with_timestamp_ms(1_700_000_000_000)
+                .with_summary(summary())
+                .with_representations(
+                    serde_json::from_value(
+                        serde_json::to_value(vec![ViewRepresentation::Sql(
+                            SqlViewRepresentation {
+                                sql: "select 1".to_string(),
+                                dialect: "starrocks".to_string(),
+                            },
+                        )])
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .with_default_catalog(Some("source".to_string()))
+                .with_default_namespace(NamespaceIdent::new("db".to_string()))
+                .build();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "name": "v",
+                    "schema": serde_json::to_value(schema()).unwrap(),
+                    "view-version": serde_json::to_value(&upstream).unwrap(),
+                    "properties": {"comment": "c"},
+                })
+            );
+        }
+
+        #[test]
+        fn an_unchanged_schema_is_referenced_and_the_added_version_selected() {
+            assert_eq!(
+                encoded(&replace(schema(), &[])),
+                serde_json::json!({
+                    "identifier": {"namespace": ["db"], "name": "v"},
+                    "requirements": [{"type": "assert-view-uuid", "uuid": VIEW_UUID}],
+                    "updates": [
+                        {"action": "add-view-version", "view-version": version_json(0)},
+                        {"action": "set-current-view-version", "view-version-id": -1},
+                    ],
+                })
+            );
+        }
+
+        #[test]
+        fn a_changed_schema_is_added_and_properties_come_first() {
+            let mut added = serde_json::to_value(
+                two_columns()
+                    .into_builder()
+                    .with_schema_id(1)
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(added.get("last-column-id").is_none());
+            added["schema-id"] = 1.into();
+            assert_eq!(
+                encoded(&replace(two_columns(), &[("comment", "c")])),
+                serde_json::json!({
+                    "identifier": {"namespace": ["db"], "name": "v"},
+                    "requirements": [{"type": "assert-view-uuid", "uuid": VIEW_UUID}],
+                    "updates": [
+                        {"action": "set-properties", "updates": {"comment": "c"}},
+                        {"action": "add-schema", "schema": added},
+                        {"action": "add-view-version", "view-version": version_json(-1)},
+                        {"action": "set-current-view-version", "view-version-id": -1},
+                    ],
+                })
+            );
+        }
+    }
 }
+
 #[cfg(test)]
 mod scratch_probe {
     #[test]

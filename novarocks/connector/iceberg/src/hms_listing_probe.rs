@@ -390,7 +390,6 @@ impl RecordResponse {
             operation: match r.operation {
                 O::Namespaces => "Namespaces",
                 O::Tables => "Tables",
-                O::Views => "Views",
             },
             target_sha256: r.target_sha256.map(hex32),
             original_deadline_remaining_nanos: nanos,

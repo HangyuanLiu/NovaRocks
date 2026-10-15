@@ -27,36 +27,18 @@ pub(super) struct Selections {
 }
 
 /// Replay once from M: builder-local last-added state spans the entire prefix.
-/// The vendor builder ignores REST add-schema's explicit high-water mark;
-/// restore that public format fact after replay rather than silently losing it.
+/// The builder keeps the column high-water mark at the larger of its prior
+/// value and the highest field ID of an added schema, as a REST server does.
 pub(super) fn replay(
     base: &TableMetadata,
     location: Option<&str>,
     updates: &[TableUpdate],
 ) -> Result<TableMetadata> {
     let mut builder = base.clone().into_builder(location.map(str::to_owned));
-    let mut last_column = base.last_column_id();
     for update in updates {
-        if let TableUpdate::AddSchema {
-            schema,
-            last_column_id,
-        } = update
-        {
-            last_column = last_column
-                .max(schema.highest_field_id())
-                .max(last_column_id.unwrap_or(0));
-        }
         builder = update.clone().apply(builder)?;
     }
-    let metadata = builder.build()?.metadata;
-    if metadata.last_column_id() == last_column {
-        return Ok(metadata);
-    }
-    let mut json = serde_json::to_value(&metadata)
-        .map_err(|e| invalid(format!("Serialize staged metadata: {e}")))?;
-    json["last-column-id"] = last_column.into();
-    serde_json::from_value(json)
-        .map_err(|e| invalid(format!("Restore staged column high-water mark: {e}")))
+    Ok(builder.build()?.metadata)
 }
 
 pub(super) fn normalize(
@@ -65,10 +47,7 @@ pub(super) fn normalize(
     selections: &mut Selections,
 ) -> Result<Option<TableUpdate>> {
     match update {
-        TableUpdate::AddSchema {
-            schema,
-            last_column_id,
-        } => {
+        TableUpdate::AddSchema { schema } => {
             // Identifier fields are a set; SDK iterator-order equality is not
             // semantic equality. Resolve reuse before invoking its allocator.
             let identifiers: std::collections::BTreeSet<_> =
@@ -85,21 +64,13 @@ pub(super) fn normalize(
                 .map(|existing| existing.schema_id())
                 .min()
             {
-                if last_column_id.is_some_and(|id| id > metadata.last_column_id()) {
-                    return Err(invalid(
-                        "Equivalent schema cannot advance the field high-water mark without a new schema",
-                    ));
-                }
                 selections.schema = Some(id);
                 return Ok(None);
             }
             // Ask the format builder for the canonical ID of a new schema.
-            let result = TableUpdate::AddSchema {
-                schema,
-                last_column_id,
-            }
-            .apply(metadata.clone().into_builder(None))?
-            .build()?;
+            let result = TableUpdate::AddSchema { schema }
+                .apply(metadata.clone().into_builder(None))?
+                .build()?;
             let Some(TableUpdate::AddSchema { schema, .. }) = result
                 .changes
                 .into_iter()
@@ -113,10 +84,7 @@ pub(super) fn normalize(
             if metadata.schema_by_id(schema.schema_id()).is_some() {
                 Ok(None)
             } else {
-                Ok(Some(TableUpdate::AddSchema {
-                    schema,
-                    last_column_id,
-                }))
+                Ok(Some(TableUpdate::AddSchema { schema }))
             }
         }
         TableUpdate::AddSpec { spec } => {

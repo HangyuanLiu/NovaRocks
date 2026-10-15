@@ -9,6 +9,9 @@ partially-superseded-by:
   - id: ADR-0175
     scope: "REST crate patch inventory (U1r, R1-R3, R5-R8, R10) and its deletion; ruling 4 temporary REST outcome narrowing; the compromise that authentication uses the SDK session and merged properties"
     link: "ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md"
+  - id: ADR-0176
+    scope: "Ruling 3 retention row for core U2, P8 and View API and its deletion condition: the patches are deleted; staged-create initialization, add-schema and view request vocabulary are owned by the Connector"
+    link: "ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md"
 partially-supersedes:
   - id: ADR-0170
     scope: "Patch allowlist: add iceberg-property-macro; current Iceberg baseline and vendor code anchors"
