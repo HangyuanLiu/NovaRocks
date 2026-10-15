@@ -425,6 +425,76 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     #[allow(dead_code)]
     fn implementation_name(&self) -> &'static str;
 
+    #[cfg(not(test))]
+    fn bind_publication_generation(
+        &self,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+    ) -> Result<(), ConnectorError>;
+    #[cfg(test)]
+    fn bind_publication_generation(
+        &self,
+        _generation: novarocks_spi::connector::ProviderBindingEpoch,
+    ) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn evidence_policy(&self) -> publication::CatalogEvidencePolicy;
+    #[cfg(test)]
+    fn evidence_policy(&self) -> publication::CatalogEvidencePolicy {
+        publication::CatalogEvidencePolicy::default()
+    }
+
+    #[cfg(not(test))]
+    async fn prepare_frozen_publication(
+        &self,
+        request: crate::commit::model::FrozenRequest,
+        operation: admission::CatalogOperation,
+        staged_expectation: Option<StagedPublicationExpectation>,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> publication_dispatch::PreparationResult<publication_dispatch::PreparedPublication>;
+    #[cfg(test)]
+    async fn prepare_frozen_publication(
+        &self,
+        _request: crate::commit::model::FrozenRequest,
+        _operation: admission::CatalogOperation,
+        _staged_expectation: Option<StagedPublicationExpectation>,
+        _descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        _generation: novarocks_spi::connector::ProviderBindingEpoch,
+        _preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> publication_dispatch::PreparationResult<publication_dispatch::PreparedPublication> {
+        Err(publication_dispatch::PreparationFailure(
+            novarocks_spi::connector::ConnectorMutationFailure::new(
+                novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                "Test catalog has not installed a prepared publication mechanism",
+            ),
+        ))
+    }
+
+    /// Explicit test admission capability; production has no policy bypass.
+    #[cfg(test)]
+    async fn prepare_frozen_for_admission_test(
+        &self,
+        request: crate::commit::model::FrozenRequest,
+        operation: admission::CatalogOperation,
+        staged_expectation: Option<StagedPublicationExpectation>,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> publication_dispatch::PreparationResult<publication_dispatch::PreparedPublication> {
+        self.prepare_frozen_publication(
+            request,
+            operation,
+            staged_expectation,
+            descriptor,
+            generation,
+            preparation,
+        )
+        .await
+    }
+
     /// The vendored client this owner wraps.
     ///
     /// Migration seam, removed with the last unmigrated caller. It exists so a

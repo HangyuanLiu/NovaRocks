@@ -318,6 +318,7 @@ pub(crate) async fn build_catalog_client_with_rest_access_delegation(
     rest_access_delegation: RestAccessDelegationMode,
     runtime: crate::iceberg::Runtime,
 ) -> Result<IcebergCatalogClient, String> {
+    crate::catalog::publication::CatalogEvidencePolicy::from_properties(&configuration.properties)?;
     match configuration.kind {
         IcebergCatalogKind::Hadoop => {
             let hadoop = Arc::new(build_hadoop_catalog(configuration, binding, runtime)?);

@@ -65,6 +65,37 @@ impl AdmissionCatalogSpy {
 
 #[async_trait]
 impl NovaRocksCatalog for AdmissionCatalogSpy {
+    fn bind_publication_generation(
+        &self,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+    ) -> Result<(), ConnectorError> {
+        self.inner.bind_publication_generation(generation)
+    }
+    fn evidence_policy(&self) -> crate::catalog::publication::CatalogEvidencePolicy {
+        self.inner.evidence_policy()
+    }
+    async fn prepare_frozen_publication(
+        &self,
+        request: crate::commit::model::FrozenRequest,
+        operation: crate::catalog::admission::CatalogOperation,
+        staged_expectation: Option<crate::catalog::StagedPublicationExpectation>,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> crate::catalog::publication_dispatch::PreparationResult<
+        crate::catalog::publication_dispatch::PreparedPublication,
+    > {
+        let _ = (
+            request,
+            operation,
+            staged_expectation,
+            descriptor,
+            generation,
+            preparation,
+        );
+        self.mutation()
+    }
+
     fn listing_admission(&self) -> Arc<crate::catalog::listing_admission::ListingAdmission> {
         Arc::new(Default::default())
     }

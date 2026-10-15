@@ -66,6 +66,8 @@ pub(super) fn sorted_unique(mut names: Vec<String>) -> Vec<String> {
 #[derive(Debug)]
 pub(super) struct CatalogDelegate {
     client: Arc<dyn Catalog>,
+    pub(super) publication_generation: super::publication::PublicationGeneration,
+    pub(super) evidence_policy: super::publication::CatalogEvidencePolicy,
     pub(super) listing: Arc<super::listing_admission::ListingAdmission>,
 }
 
@@ -73,6 +75,8 @@ impl CatalogDelegate {
     pub(super) fn new(client: Arc<dyn Catalog>) -> Self {
         Self {
             client,
+            publication_generation: Default::default(),
+            evidence_policy: Default::default(),
             listing: Default::default(),
         }
     }

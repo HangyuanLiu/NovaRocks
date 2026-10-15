@@ -18,21 +18,24 @@
 //! Canonical create staging and one-dispatch publication observation.
 
 use super::*;
-use crate::catalog::error::{CatalogCommitEvidence, CatalogOutcome};
-use crate::catalog::transaction::CommitProof;
+use crate::catalog::publication::CatalogEvidencePolicy;
+use crate::catalog::publication_dispatch::{PreparationResult, PreparedPublication};
 use crate::commit::attempt::observation::PublicationJournal;
-use crate::commit::attempt::{self, Publisher, RetryPolicy};
+use crate::commit::attempt::prepared::PublicationPreparer;
+use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::model::{
     AddedContent, ArtifactWriter, FileChanges, FrozenRequest, IsolationLevel, ObjectIdentity,
     OperationIntent, OperationIntentParts, OperationToken, RequestShape, StagedCreateIdentity,
     TableTarget,
 };
 use crate::commit::operation::{IcebergCommitAttempt, IcebergCommitOperation, OperationLimits};
+use crate::commit::publication_descriptor::PublicationDescriptor;
 use crate::commit::recovery::FrozenPublicationFacts;
 use crate::commit::staging::{PreparedChange, Preparer, StagingBase};
 use crate::iceberg::{Error, ErrorKind};
 use async_trait::async_trait;
 use novarocks_spi::connector::ExternalMutationOutcome;
+use novarocks_spi::connector::{ConnectorOperationControl, ProviderBindingEpoch};
 
 fn iceberg_error(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::DataInvalid, message)
@@ -139,7 +142,7 @@ struct CreatePublisher {
 }
 
 #[async_trait]
-impl Publisher for CreatePublisher {
+impl PublicationPreparer for CreatePublisher {
     async fn load_target(
         &self,
         attempt: &IcebergCommitAttempt,
@@ -205,50 +208,33 @@ impl Publisher for CreatePublisher {
         self.journal.record(evidence, receipt, request)
     }
 
-    async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
-        let expected_snapshot_id = request.ref_snapshot_after("main");
-        // This is the original catalog-owner boundary. No frozen update is
-        // appended here, and no SDK transaction predicts its metadata. The
-        // owner attributes the response against this operation's frozen UUID,
-        // snapshot and properties before it reports any evidence (L10, L11).
-        let outcome = self
-            .adapter
+    fn evidence_policy(&self) -> CatalogEvidencePolicy {
+        self.adapter.runtime.novarocks_catalog().evidence_policy()
+    }
+    async fn prepare_dispatch(
+        self: Arc<Self>,
+        request: FrozenRequest,
+        descriptor: PublicationDescriptor,
+        generation: ProviderBindingEpoch,
+        preparation: ConnectorRequestContext,
+    ) -> PreparationResult<PreparedPublication> {
+        preparation.check_active()?;
+        let expectation =
+            publication_expectation(&self.prepared, request.ref_snapshot_after("main"));
+        self.adapter
             .runtime
             .novarocks_catalog()
-            .commit_staged_table(
-                request.into_table_commit(),
-                publication_expectation(&self.prepared, expected_snapshot_id),
+            .prepare_frozen_publication(
+                request,
+                crate::catalog::admission::CatalogOperation::CreateTable(
+                    crate::catalog::CatalogCreateIntent::CreateTableAsSelect,
+                ),
+                Some(expectation),
+                descriptor,
+                generation,
+                preparation,
             )
-            .await;
-        let evidence = || {
-            CatalogCommitEvidence::for_target(format!(
-                "{}.{}",
-                self.prepared
-                    .staged
-                    .table
-                    .identifier()
-                    .namespace
-                    .to_url_string(),
-                self.prepared.staged.table.identifier().name
-            ))
-        };
-        use crate::catalog::StagedCommitResult;
-        match outcome {
-            StagedCommitResult::Committed(proof) => {
-                CatalogOutcome::committed(proof, ExternalMutationEffect::Applied)
-            }
-            StagedCommitResult::Conflict(failure)
-            | StagedCommitResult::KnownUncommitted(failure) => {
-                CatalogOutcome::KnownUncommitted { failure }
-            }
-            StagedCommitResult::CommitUnknown(message) => {
-                CatalogOutcome::unknown(message, evidence())
-            }
-            StagedCommitResult::Unsupported(reason) => CatalogOutcome::uncommitted(
-                ConnectorMutationFailureKind::Unsupported,
-                reason.message(),
-            ),
-        }
+            .await
     }
 }
 
@@ -270,7 +256,7 @@ pub(super) fn publish(
     let policy = RetryPolicy::from_properties(prepared.staged.table.metadata().properties())
         .map_err(|error| invalid(error.to_string()))?;
     let journal = PublicationJournal::new(operation.token());
-    let publisher = journal.observe(Arc::new(CreatePublisher {
+    let publisher = journal.observe_prepared(Arc::new(CreatePublisher {
         adapter: adapter.clone(),
         prepared: prepared.clone(),
         operation_id,

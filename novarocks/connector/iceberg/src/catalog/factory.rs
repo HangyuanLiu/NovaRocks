@@ -43,6 +43,8 @@ impl NovaRocksCatalogFactory {
         configuration: &IcebergCatalogConfiguration,
         client: &crate::catalog_runtime::IcebergCatalogClient,
     ) -> Result<Arc<dyn NovaRocksCatalog>, String> {
+        let evidence_policy =
+            super::publication::CatalogEvidencePolicy::from_properties(&configuration.properties)?;
         let warehouse: Option<Arc<str>> = if configuration.warehouse_uri.is_empty() {
             None
         } else {
@@ -53,21 +55,28 @@ impl NovaRocksCatalogFactory {
                 let hadoop = client.hadoop().cloned().ok_or_else(|| {
                     "Hadoop Iceberg configuration produced no Hadoop client".to_string()
                 })?;
-                Ok(Arc::new(super::hadoop::NovaRocksHadoopCatalog::new(hadoop)))
+                Ok(Arc::new(
+                    super::hadoop::NovaRocksHadoopCatalog::new(hadoop)
+                        .with_evidence_policy(evidence_policy),
+                ))
             }
             IcebergCatalogKind::Rest => {
                 let endpoints = client.rest_endpoints().cloned().ok_or_else(|| {
                     "REST Iceberg configuration produced no REST endpoints".to_string()
                 })?;
-                Ok(Arc::new(super::rest::NovaRocksRestCatalog::new(
-                    endpoints,
-                    warehouse,
-                    client.rest_access_delegation(),
-                )))
+                Ok(Arc::new(
+                    super::rest::NovaRocksRestCatalog::new(
+                        endpoints,
+                        warehouse,
+                        client.rest_access_delegation(),
+                    )
+                    .with_evidence_policy(evidence_policy),
+                ))
             }
-            IcebergCatalogKind::Hive => Ok(Arc::new(super::hive::NovaRocksHiveCatalog::adopt(
-                Arc::clone(client.generic()),
-            ))),
+            IcebergCatalogKind::Hive => Ok(Arc::new(
+                super::hive::NovaRocksHiveCatalog::adopt(Arc::clone(client.generic()))
+                    .with_evidence_policy(evidence_policy),
+            )),
         }
     }
 

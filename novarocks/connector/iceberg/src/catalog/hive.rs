@@ -45,6 +45,14 @@ pub(super) struct NovaRocksHiveCatalog {
 }
 
 impl NovaRocksHiveCatalog {
+    pub(super) fn with_evidence_policy(
+        mut self,
+        policy: super::publication::CatalogEvidencePolicy,
+    ) -> Self {
+        self.delegate.evidence_policy = policy;
+        self
+    }
+
     fn read_only(operation: CatalogOperation) -> CatalogUnsupported {
         CatalogUnsupported::new(format!(
             "Hive Metastore catalog is a read-only compatibility entry: {} is not supported; use an Iceberg REST or Hadoop catalog to write",
@@ -71,6 +79,36 @@ impl NovaRocksHiveCatalog {
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksHiveCatalog {
+    fn bind_publication_generation(
+        &self,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+    ) -> Result<(), ConnectorError> {
+        self.delegate.publication_generation.bind(generation)
+    }
+
+    async fn prepare_frozen_publication(
+        &self,
+        _request: crate::commit::model::FrozenRequest,
+        _operation: super::admission::CatalogOperation,
+        _staged_expectation: Option<super::StagedPublicationExpectation>,
+        _descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        _generation: novarocks_spi::connector::ProviderBindingEpoch,
+        _preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> super::publication_dispatch::PreparationResult<
+        super::publication_dispatch::PreparedPublication,
+    > {
+        Err(super::publication_dispatch::PreparationFailure(
+            novarocks_spi::connector::ConnectorMutationFailure::new(
+                novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                "Hive Metastore catalog is a read-only compatibility entry",
+            ),
+        ))
+    }
+
+    fn evidence_policy(&self) -> super::publication::CatalogEvidencePolicy {
+        self.delegate.evidence_policy
+    }
+
     fn listing_admission(&self) -> Arc<super::listing_admission::ListingAdmission> {
         Arc::clone(&self.delegate.listing)
     }

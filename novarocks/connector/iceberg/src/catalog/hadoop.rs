@@ -60,6 +60,14 @@ pub(super) struct NovaRocksHadoopCatalog {
 }
 
 impl NovaRocksHadoopCatalog {
+    pub(super) fn with_evidence_policy(
+        mut self,
+        policy: super::publication::CatalogEvidencePolicy,
+    ) -> Self {
+        self.delegate.evidence_policy = policy;
+        self
+    }
+
     pub(super) fn new(client: Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>) -> Self {
         Self {
             delegate: CatalogDelegate::new(client.clone()),
@@ -122,6 +130,103 @@ fn map_bounded_read_error(error: &crate::iceberg::Error) -> ConnectorError {
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksHadoopCatalog {
+    fn bind_publication_generation(
+        &self,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+    ) -> Result<(), ConnectorError> {
+        self.delegate.publication_generation.bind(generation)
+    }
+
+    async fn prepare_frozen_publication(
+        &self,
+        request: crate::commit::model::FrozenRequest,
+        operation: super::admission::CatalogOperation,
+        staged_expectation: Option<super::StagedPublicationExpectation>,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> super::publication_dispatch::PreparationResult<
+        super::publication_dispatch::PreparedPublication,
+    > {
+        novarocks_spi::connector::ConnectorOperationControl::check_active(&preparation)?;
+        self.delegate.publication_generation.require(generation)?;
+        descriptor.validate_frozen(&request)?;
+        self.admit_operation(
+            &operation,
+            &CatalogTableName::from_identifier(request.identifier()).into(),
+        )
+        .map_err(|error| {
+            super::publication_dispatch::PreparationFailure(
+                novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                    error.message(),
+                ),
+            )
+        })?;
+        if staged_expectation.is_some() {
+            return Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::FeatureUnsupported,
+                "Hadoop catalog has no staged publication protocol",
+            )
+            .into());
+        }
+        if !request.has_updates()
+            && matches!(
+                request.base(),
+                crate::commit::model::BaseIdentity::Existing { .. }
+            )
+        {
+            return Ok(super::publication_dispatch::PreparedPublication::NoOp);
+        }
+        Arc::clone(&self.client)
+            .prepare_frozen_update(request, preparation)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn prepare_frozen_for_admission_test(
+        &self,
+        request: crate::commit::model::FrozenRequest,
+        operation: CatalogOperation,
+        staged_expectation: Option<super::StagedPublicationExpectation>,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> super::publication_dispatch::PreparationResult<
+        super::publication_dispatch::PreparedPublication,
+    > {
+        novarocks_spi::connector::ConnectorOperationControl::check_active(&preparation)?;
+        self.delegate.publication_generation.require(generation)?;
+        descriptor.validate_frozen(&request)?;
+        operation
+            .validate_target(&CatalogTableName::from_identifier(request.identifier()).into())
+            .map_err(|error| {
+                crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, error.message())
+            })?;
+        if staged_expectation.is_some()
+            || !matches!(
+                request.base(),
+                crate::commit::model::BaseIdentity::Existing { .. }
+            )
+        {
+            return Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::FeatureUnsupported,
+                "Hadoop test publication requires an existing frozen table",
+            )
+            .into());
+        }
+        if !request.has_updates() {
+            return Ok(super::publication_dispatch::PreparedPublication::NoOp);
+        }
+        Arc::clone(&self.client)
+            .prepare_frozen_update(request, preparation)
+            .await
+    }
+
+    fn evidence_policy(&self) -> super::publication::CatalogEvidencePolicy {
+        self.delegate.evidence_policy
+    }
+
     fn listing_admission(&self) -> Arc<super::listing_admission::ListingAdmission> {
         Arc::clone(&self.delegate.listing)
     }

@@ -2320,18 +2320,6 @@ fn execute_application_document_update(
             Ok(snapshot_id) => snapshot_id,
             Err(error) => return Ok(known_uncommitted(invalid(error))),
         };
-    let transaction_request = TransactionRequest {
-        operation: crate::catalog::admission::CatalogOperation::UpdateDocuments,
-        identity: TransactionIdentity::new(
-            "application-document-update",
-            request.operation_id.to_bytes(),
-        ),
-        target: target_name,
-        target_ref: Arc::from("main"),
-        base_snapshot_id,
-        expected_table_uuid: Some(Arc::from(expected_uuid.to_string())),
-        marker: None,
-    };
     let commit = match application_document_update_commit(
         table,
         expected_uuid,
@@ -2343,82 +2331,100 @@ fn execute_application_document_update(
         Ok(commit) => commit,
         Err(error) => return Ok(known_uncommitted(error)),
     };
-    if let Err(error) = validate_context(&request.context) {
-        return Ok(known_uncommitted(error));
+    let commit = match commit.with_base_facts(loaded.table.metadata()) {
+        Ok(commit) => commit,
+        Err(error) => return Ok(known_uncommitted(invalid(error.to_string()))),
+    };
+    let journal = crate::commit::attempt::observation::PublicationJournal::new(
+        crate::commit::model::OperationToken::from_mutation(request.operation_id),
+    );
+    let seed = receipt(provider, request.operation_id, request.operation.kind())?;
+    if let Err(error) = journal.record(external_evidence, seed, &commit) {
+        return Ok(known_uncommitted(invalid(error.to_string())));
     }
     let catalog = Arc::clone(provider.runtime().novarocks_catalog());
-    let outcome = provider
+    let policy = catalog.evidence_policy();
+    let publication = journal.clone();
+    let preparation = request.context.clone();
+    let dispatched = provider
         .runtime()
         .resources()
         .catalog_runtime()
         .block_on(async move {
-            let mut frontier = match catalog.new_transaction(transaction_request).await {
-                CatalogTransactionStart::Ready(frontier) => frontier,
-                CatalogTransactionStart::KnownUncommitted { failure } => {
-                    return Ok(CatalogOutcome::KnownUncommitted { failure });
-                }
-                CatalogTransactionStart::CommitUnknown { failure, evidence } => {
-                    return Ok(CatalogOutcome::CommitUnknown { failure, evidence });
-                }
-                CatalogTransactionStart::Unsupported(error) => {
-                    return Err(ConnectorError::new(
-                        ConnectorErrorKind::Unsupported,
-                        error.to_string(),
-                    ));
-                }
-            };
-            frontier.stage(commit)?;
-            Ok(frontier.commit().await)
+            publication
+                .publish_once(
+                    preparation,
+                    policy,
+                    move |descriptor, generation, preparation| async move {
+                        catalog
+                            .prepare_frozen_publication(
+                                commit,
+                                CatalogOperation::UpdateDocuments,
+                                None,
+                                descriptor,
+                                generation,
+                                preparation,
+                            )
+                            .await
+                    },
+                )
+                .await
         });
-    let catalog_outcome = match outcome {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(error)) => return Ok(known_uncommitted(error)),
+    let outcome = match dispatched {
+        Ok(Ok(entry)) => journal.catalog_entry_outcome(entry),
+        Ok(Err(error)) => journal
+            .catalog_bridge_failure(format!("Document publication invocation failed: {error}")),
         Err(error) => {
-            return Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(&unavailable(error)),
-                evidence: external_evidence,
-            });
+            journal.catalog_bridge_failure(format!("Document publication bridge failed: {error}"))
         }
     };
-    match catalog_outcome {
-        CatalogOutcome::KnownCommitted {
-            effect,
-            receipt: proof,
-            ..
-        } => {
+    let ExternalMutationOutcome::KnownCommitted {
+        effect,
+        receipt: seed,
+        finalization: owner_finalization,
+    } = outcome
+    else {
+        return Ok(outcome);
+    };
+    provider
+        .runtime()
+        .control_state()
+        .invalidate_table_cache(&table.namespace, &table.table);
+    let refreshed = policy
+        .begin_finalization()
+        .and_then(|grant| grant.for_io(&request.context))
+        .and_then(|context| {
             provider
                 .runtime()
-                .control_state()
-                .invalidate_table_cache(&table.namespace, &table.table);
-            let refreshed = provider.runtime().load_table_for_request(
-                &table.namespace,
-                &table.table,
-                &request
-                    .context
-                    .clone()
-                    .without_vended_credential_lease_sink(),
-            );
-            let (committed_version, finalization) = match refreshed {
-                Ok(refreshed) => {
-                    match crate::document_storage::observation::committed_version(&refreshed.table)
-                    {
-                        Ok(version) => (Some(version), ExternalMutationFinalization::Complete),
-                        Err(error) => (
-                            None,
-                            ExternalMutationFinalization::Failed(failure(&internal(format!(
-                                "project committed Iceberg document version: {error}"
-                            )))),
-                        ),
-                    }
-                }
+                .load_table_for_request(&table.namespace, &table.table, &context)
+                .map_err(|error| {
+                    internal(format!("read committed Iceberg document update: {error}"))
+                })
+        });
+    let (committed_version, post_finalization) = match refreshed {
+        Ok(refreshed) => {
+            match crate::document_storage::observation::committed_version(&refreshed.table) {
+                Ok(version) => (Some(version), ExternalMutationFinalization::Complete),
                 Err(error) => (
                     None,
                     ExternalMutationFinalization::Failed(failure(&internal(format!(
-                        "read committed Iceberg document update: {error}"
+                        "project committed Iceberg document version: {error}"
                     )))),
                 ),
-            };
-            let (receipt, finalization) = application_document_committed_receipt(
+            }
+        }
+        Err(error) => (None, ExternalMutationFinalization::Failed(failure(&error))),
+    };
+    let entry = journal
+        .current_entry()
+        .expect("committed document publication has an entry");
+    let proof = match journal.commit_outcome(entry) {
+        CatalogOutcome::KnownCommitted { receipt, .. } => receipt,
+        _ => unreachable!("a committed journal proof cannot be downgraded"),
+    };
+    let (receipt, post_finalization) =
+        if committed_version.is_some() || proof.metadata_location.is_some() {
+            application_document_committed_receipt(
                 provider,
                 request.operation_id,
                 request.operation.kind(),
@@ -2427,30 +2433,39 @@ fn execute_application_document_update(
                     .as_deref()
                     .map(|value| Bytes::copy_from_slice(value.as_bytes())),
                 committed_version,
-                finalization,
-            );
-            Ok(ExternalMutationOutcome::KnownCommitted {
-                effect,
-                receipt,
-                finalization,
-            })
-        }
-        CatalogOutcome::KnownUncommitted { failure } => {
-            Ok(ExternalMutationOutcome::KnownUncommitted {
-                failure,
-                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
-            })
-        }
-        CatalogOutcome::CommitUnknown { failure, .. } => {
-            Ok(ExternalMutationOutcome::CommitUnknown {
-                failure,
-                evidence: external_evidence,
-            })
-        }
-        CatalogOutcome::Unsupported(error) => Ok(known_uncommitted(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            error.to_string(),
-        ))),
+                post_finalization,
+            )
+        } else {
+            (seed, post_finalization)
+        };
+    journal.record_entry_finalization(entry, post_finalization.clone());
+    let finalization = merge_publication_finalization(owner_finalization, post_finalization);
+    Ok(ExternalMutationOutcome::KnownCommitted {
+        effect,
+        receipt,
+        finalization,
+    })
+}
+
+fn merge_publication_finalization(
+    first: ExternalMutationFinalization,
+    second: ExternalMutationFinalization,
+) -> ExternalMutationFinalization {
+    match (first, second) {
+        (
+            ExternalMutationFinalization::Failed(first),
+            ExternalMutationFinalization::Failed(second),
+        ) => ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+            first.kind(),
+            format!(
+                "{}; additional finalization failure: {}",
+                first.message(),
+                second.message()
+            ),
+        )),
+        (failed @ ExternalMutationFinalization::Failed(_), _)
+        | (_, failed @ ExternalMutationFinalization::Failed(_)) => failed,
+        _ => ExternalMutationFinalization::Complete,
     }
 }
 

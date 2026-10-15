@@ -19,16 +19,23 @@
 
 use super::*;
 use crate::catalog::error::{CatalogCommitEvidence, CatalogOutcome};
+use crate::catalog::publication::CatalogEvidencePolicy;
+use crate::catalog::publication_dispatch::{PreparationResult, PreparedPublication};
 use crate::catalog::transaction::CommitProof;
+#[cfg(test)]
+use crate::commit::attempt::Publisher;
 use crate::commit::attempt::observation::PublicationJournal;
-use crate::commit::attempt::{self, Publisher, RetryPolicy, TransitionalPublisher};
+use crate::commit::attempt::prepared::{CatalogPublisher, PublicationPreparer};
+use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::model::{
     AddedContent, ArtifactWriter, Dependency, FileChanges, FrozenRequest, IsolationLevel,
     OperationIntent, OperationIntentParts, RequestShape, TableTarget,
 };
 use crate::commit::operation::{IcebergCommitAttempt, IcebergCommitOperation, OperationLimits};
+use crate::commit::publication_descriptor::PublicationDescriptor;
 use crate::commit::staging::{PreparedChange, Preparer, StagingBase};
 use async_trait::async_trait;
+use novarocks_spi::connector::ProviderBindingEpoch;
 
 pub(super) fn format_error(error: ConnectorError) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, error.message())
@@ -36,14 +43,14 @@ pub(super) fn format_error(error: ConnectorError) -> crate::iceberg::Error {
 }
 
 struct MutationPublisher {
-    inner: TransitionalPublisher,
+    inner: Arc<CatalogPublisher>,
     planned: PlannedIcebergMutation,
     runtime: Arc<IcebergMetadataContext>,
     context: ConnectorRequestContext,
 }
 
 #[async_trait]
-impl Publisher for MutationPublisher {
+impl PublicationPreparer for MutationPublisher {
     async fn load_target(
         &self,
         attempt: &IcebergCommitAttempt,
@@ -114,8 +121,19 @@ impl Publisher for MutationPublisher {
         self.inner.preflight_recovery(request, operation)
     }
 
-    async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
-        self.inner.dispatch_once(request).await
+    fn evidence_policy(&self) -> CatalogEvidencePolicy {
+        self.inner.evidence_policy()
+    }
+    async fn prepare_dispatch(
+        self: Arc<Self>,
+        request: FrozenRequest,
+        descriptor: PublicationDescriptor,
+        generation: ProviderBindingEpoch,
+        preparation: ConnectorRequestContext,
+    ) -> PreparationResult<PreparedPublication> {
+        Arc::clone(&self.inner)
+            .prepare_dispatch(request, descriptor, generation, preparation)
+            .await
     }
 }
 
@@ -261,7 +279,7 @@ impl RegisteredIcebergDataMutationBackend {
                 preflight_journal.record(evidence, receipt, request)
             },
         );
-        let direct = TransitionalPublisher {
+        let direct = Arc::new(CatalogPublisher {
             catalog_operation: match planned {
                 PlannedIcebergMutation::Truncate { .. } => {
                     crate::catalog::admission::CatalogOperation::Truncate
@@ -273,16 +291,10 @@ impl RegisteredIcebergDataMutationBackend {
             catalog: Arc::clone(self.runtime.novarocks_catalog()),
             ident: intent.target().ident.clone(),
             target_ref: intent.target_ref().into(),
-            evidence: CatalogCommitEvidence::for_target(format!(
-                "{}.{}",
-                planned.payload().namespace,
-                planned.payload().table
-            ))
-            .with_target_uuid(planned.payload().table_uuid.clone())
-            .with_commit_uuid(marker.operation_id_hex.clone()),
+            operation: operation.token(),
             recovery_preflight: preflight,
-        };
-        let publisher = journal.observe(Arc::new(MutationPublisher {
+        });
+        let publisher = journal.observe_prepared(Arc::new(MutationPublisher {
             inner: direct,
             planned: planned.clone(),
             runtime: Arc::clone(&self.runtime),
@@ -321,7 +333,23 @@ impl RegisteredIcebergDataMutationBackend {
         });
         let mut outcome = self.project_bridge(&operation, &journal, report)?;
         if let ExternalMutationOutcome::KnownCommitted { finalization, .. } = &mut outcome {
-            if let Err(error) = self.finalize_publication(planned, context) {
+            let result = self
+                .runtime
+                .novarocks_catalog()
+                .evidence_policy()
+                .begin_finalization()
+                .and_then(|grant| grant.for_io(context))
+                .and_then(|context| self.finalize_publication(planned, &context));
+            if let Err(error) = result {
+                if let Some(entry) = journal.current_entry() {
+                    journal.record_entry_finalization(
+                        entry,
+                        ExternalMutationFinalization::Failed(failure(
+                            ConnectorMutationFailureKind::Internal,
+                            error.to_string(),
+                        )),
+                    );
+                }
                 let message = match finalization {
                     ExternalMutationFinalization::Complete => error.to_string(),
                     ExternalMutationFinalization::Failed(existing) => {
@@ -760,11 +788,11 @@ mod tests {
         }
     }
     struct CountedSourcePublisher {
-        inner: MutationPublisher,
+        inner: Arc<MutationPublisher>,
         dispatches: Arc<AtomicUsize>,
     }
     #[async_trait]
-    impl Publisher for CountedSourcePublisher {
+    impl PublicationPreparer for CountedSourcePublisher {
         async fn load_target(
             &self,
             attempt: &IcebergCommitAttempt,
@@ -778,9 +806,20 @@ mod tests {
         ) -> crate::iceberg::Result<()> {
             self.inner.preflight_recovery(request, operation)
         }
-        async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
+        fn evidence_policy(&self) -> CatalogEvidencePolicy {
+            self.inner.evidence_policy()
+        }
+        async fn prepare_dispatch(
+            self: Arc<Self>,
+            request: FrozenRequest,
+            descriptor: PublicationDescriptor,
+            generation: ProviderBindingEpoch,
+            preparation: ConnectorRequestContext,
+        ) -> PreparationResult<PreparedPublication> {
             self.dispatches.fetch_add(1, Ordering::SeqCst);
-            self.inner.dispatch_once(request).await
+            Arc::clone(&self.inner)
+                .prepare_dispatch(request, descriptor, generation, preparation)
+                .await
         }
     }
 
@@ -937,9 +976,9 @@ mod tests {
         let intent = freeze_intent(&planned, &operation, &marker).unwrap();
         let dispatches = Arc::new(AtomicUsize::new(0));
         let journal = PublicationJournal::<ConnectorDataMutationReceipt>::new(operation.token());
-        let publisher = journal.observe(Arc::new(CountedSourcePublisher {
-            inner: MutationPublisher {
-                inner: TransitionalPublisher {
+        let publisher = journal.observe_prepared(Arc::new(CountedSourcePublisher {
+            inner: Arc::new(MutationPublisher {
+                inner: Arc::new(CatalogPublisher {
                     catalog_operation: match planned {
                         PlannedIcebergMutation::Truncate { .. } => {
                             crate::catalog::admission::CatalogOperation::Truncate
@@ -951,15 +990,15 @@ mod tests {
                     catalog: runtime.novarocks_catalog().clone(),
                     ident: intent.target().ident.clone(),
                     target_ref: "main".into(),
-                    evidence: CatalogCommitEvidence::for_target("db.t"),
+                    operation: operation.token(),
                     recovery_preflight: Arc::new(|_, _| {
                         panic!("stopped source must not reach preflight")
                     }),
-                },
+                }),
                 planned: planned.clone(),
                 runtime: source_runtime.clone(),
                 context: context.clone(),
-            },
+            }),
             dispatches: dispatches.clone(),
         }));
         let policy = RetryPolicy::from_properties(before.metadata().properties()).unwrap();

@@ -67,6 +67,14 @@ pub(super) struct NovaRocksRestCatalog {
 }
 
 impl NovaRocksRestCatalog {
+    pub(super) fn with_evidence_policy(
+        mut self,
+        policy: super::publication::CatalogEvidencePolicy,
+    ) -> Self {
+        self.delegate.evidence_policy = policy;
+        self
+    }
+
     pub(super) fn new(
         endpoints: Arc<RestEndpoints>,
         warehouse: Option<Arc<str>>,
@@ -180,6 +188,156 @@ fn accept_rest_page(
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksRestCatalog {
+    fn bind_publication_generation(
+        &self,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+    ) -> Result<(), ConnectorError> {
+        self.endpoints.publication_generation.bind(generation)
+    }
+
+    async fn prepare_frozen_publication(
+        &self,
+        request: crate::commit::model::FrozenRequest,
+        operation: super::admission::CatalogOperation,
+        staged_expectation: Option<super::StagedPublicationExpectation>,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> super::publication_dispatch::PreparationResult<
+        super::publication_dispatch::PreparedPublication,
+    > {
+        novarocks_spi::connector::ConnectorOperationControl::check_active(&preparation)?;
+        self.endpoints.publication_generation.require(generation)?;
+        descriptor.validate_frozen(&request)?;
+        self.admit_operation(
+            &operation,
+            &CatalogTableName::from_identifier(request.identifier()).into(),
+        )
+        .map_err(|error| {
+            super::publication_dispatch::PreparationFailure(
+                novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                    error.message(),
+                ),
+            )
+        })?;
+        use crate::commit::model::BaseIdentity;
+        let snapshot = request
+            .ref_snapshot_after(request.target_ref())
+            .map(|snapshot| ExpectedSnapshot::new(snapshot, Some(request.target_ref().to_owned())));
+        let expect = match request.base() {
+            BaseIdentity::Existing { uuid, .. } => {
+                if staged_expectation.is_some() {
+                    return Err(crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::DataInvalid,
+                        "Existing table publication cannot use staged attribution",
+                    )
+                    .into());
+                }
+                if !request.has_updates() {
+                    return Ok(super::publication_dispatch::PreparedPublication::NoOp);
+                }
+                if request.shape() == crate::commit::model::RequestShape::RefRetention {
+                    AttributionExpectation::ref_retention(*uuid, request.updates())
+                } else {
+                    AttributionExpectation::table_commit(*uuid, snapshot)
+                }
+            }
+            BaseIdentity::Create { staged } => {
+                if operation
+                    != super::admission::CatalogOperation::CreateTable(
+                        super::CatalogCreateIntent::CreateTableAsSelect,
+                    )
+                {
+                    return Err(crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::DataInvalid,
+                        "Staged publication requires its actual create-table-as-select operation",
+                    )
+                    .into());
+                }
+                let expected = staged_expectation.ok_or_else(|| {
+                    crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::DataInvalid,
+                        "Staged publication has no exact frozen attribution expectation",
+                    )
+                })?;
+                let mut frozen_properties = std::collections::BTreeMap::new();
+                for update in request.updates() {
+                    match update {
+                        crate::iceberg::TableUpdate::SetProperties { updates } => frozen_properties
+                            .extend(
+                                updates
+                                    .iter()
+                                    .map(|(key, value)| (key.clone(), value.clone())),
+                            ),
+                        crate::iceberg::TableUpdate::RemoveProperties { removals } => {
+                            for key in removals {
+                                frozen_properties.remove(key);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if expected
+                    .properties
+                    .iter()
+                    .any(|(key, value)| frozen_properties.get(key) != Some(value))
+                {
+                    return Err(crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::DataInvalid,
+                        "Staged attribution properties are absent from the exact frozen request",
+                    )
+                    .into());
+                }
+                if expected.staged_table_uuid != staged.initial_metadata().uuid()
+                    || expected.snapshot_id != request.ref_snapshot_after(request.target_ref())
+                    || !expected
+                        .properties
+                        .iter()
+                        .any(|(key, _)| key == "novarocks.ctas.operation-id")
+                {
+                    return Err(crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::DataInvalid,
+                        "Staged publication attribution differs from its frozen request",
+                    )
+                    .into());
+                }
+                AttributionExpectation::ctas_final_commit(
+                    expected.staged_table_uuid,
+                    snapshot,
+                    expected.properties,
+                )
+            }
+        }
+        .map_err(|_| {
+            crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::DataInvalid,
+                "Frozen REST publication attribution cannot be encoded",
+            )
+        })?;
+        let prepared = crate::rest_protocol::mutation::prepared::PreparedRestMutation::prepare(
+            Arc::clone(&self.endpoints),
+            crate::rest_protocol::mutation::prepared::MutationRoute::CommitTable(
+                request.identifier().clone(),
+            ),
+            &descriptor,
+            generation,
+            &preparation,
+            expect,
+            false,
+            None,
+        )
+        .await?;
+        Ok(super::publication_dispatch::PreparedPublication::Mutation {
+            binding: Some(prepared.binding().clone()),
+            dispatch: Box::new(PreparedRestTablePublication(prepared)),
+        })
+    }
+
+    fn evidence_policy(&self) -> super::publication::CatalogEvidencePolicy {
+        self.delegate.evidence_policy
+    }
+
     fn listing_admission(&self) -> Arc<super::listing_admission::ListingAdmission> {
         Arc::clone(&self.delegate.listing)
     }
@@ -2453,5 +2611,17 @@ mod evidence_tests {
                 (expected, result) => panic!("expected {expected}, got {result:?}"),
             }
         }
+    }
+}
+
+struct PreparedRestTablePublication(crate::rest_protocol::mutation::prepared::PreparedRestMutation);
+#[async_trait]
+impl super::publication_dispatch::PreparedCatalogDispatch for PreparedRestTablePublication {
+    async fn dispatch_once(
+        self: Box<Self>,
+        evidence: super::publication::EvidenceContext,
+    ) -> super::publication_dispatch::DispatchCompletion {
+        let result = self.0.dispatch(evidence).await;
+        super::publication_dispatch::DispatchCompletion::evidence(result.dispatch_evidence())
     }
 }

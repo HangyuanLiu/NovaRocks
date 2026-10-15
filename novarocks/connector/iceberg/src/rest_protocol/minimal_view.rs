@@ -168,6 +168,8 @@ pub(crate) struct TableViewRequest {
     snapshot: Option<i64>,
     target_ref: Option<String>,
     property_keys: Vec<String>,
+    removed_snapshots: Vec<i64>,
+    retention_refs: Vec<String>,
 }
 
 impl TableViewRequest {
@@ -201,7 +203,28 @@ impl TableViewRequest {
             snapshot,
             target_ref,
             property_keys,
+            removed_snapshots: Vec::new(),
+            retention_refs: Vec::new(),
         })
+    }
+
+    pub(crate) fn with_retention(
+        mut self,
+        removed_snapshots: Vec<i64>,
+        refs: Vec<String>,
+    ) -> Result<Self, ViewRequestError> {
+        if refs.iter().any(|name| name.len() > MAX_KEY_LEN) {
+            return Err(ViewRequestError::RefNameTooLong);
+        }
+        self.removed_snapshots = removed_snapshots;
+        self.retention_refs = refs;
+        Ok(self)
+    }
+    pub(crate) fn removed_snapshots(&self) -> &[i64] {
+        &self.removed_snapshots
+    }
+    pub(crate) fn retention_refs(&self) -> &[String] {
+        &self.retention_refs
     }
 
     pub(crate) fn snapshot(&self) -> Option<i64> {
@@ -272,6 +295,8 @@ pub(crate) struct TableResponseView {
     pub(crate) target_ref: Option<RefCheck>,
     /// One entry per requested key, in request order.
     pub(crate) properties: Vec<(String, PropertyValue)>,
+    pub(crate) retention_snapshots: Vec<SnapshotCheck>,
+    pub(crate) retention_refs: Vec<(String, bool, Option<i64>)>,
 }
 
 impl fmt::Debug for TableResponseView {
@@ -300,6 +325,8 @@ pub(crate) enum TableNode {
     TargetRefSnapshotId,
     Properties,
     Property(usize),
+    RetentionRef(usize),
+    RetentionRefSnapshotId(usize),
     MetadataLog,
     MetadataLogEntry,
     MetadataLogFile,
@@ -322,6 +349,9 @@ pub(crate) struct TableResponseSink {
     metadata_location: LocationField,
     table_uuid: Option<String>,
     snapshot_present: bool,
+    retention_snapshots_present: Vec<bool>,
+    retention_refs: Vec<(bool, Option<i64>)>,
+    seen_retention_ref_id: Vec<bool>,
     ref_snapshot_id: Option<i64>,
     properties: Vec<PropertyValue>,
     seen_metadata_log: bool,
@@ -337,6 +367,8 @@ pub(crate) struct TableResponseSink {
 impl TableResponseSink {
     pub(crate) fn new(request: TableViewRequest) -> Self {
         let keys = request.property_keys.len();
+        let removed = request.removed_snapshots.len();
+        let refs = request.retention_refs.len();
         Self {
             request,
             seen_location: false,
@@ -352,6 +384,9 @@ impl TableResponseSink {
             metadata_location: LocationField::Absent,
             table_uuid: None,
             snapshot_present: false,
+            retention_snapshots_present: vec![false; removed],
+            retention_refs: vec![(false, None); refs],
+            seen_retention_ref_id: vec![false; refs],
             ref_snapshot_id: None,
             properties: vec![PropertyValue::Absent; keys],
             seen_metadata_log: false,
@@ -405,8 +440,10 @@ impl ViewSink for TableResponseSink {
                 return Ok(INTEGER_TEXT_LIMIT);
             }
             TableNode::Refs => expect_kind(kind, &[Object, Null], "metadata.refs")?,
-            TableNode::TargetRef => expect_kind(kind, &[Object], "metadata.refs.<target>")?,
-            TableNode::TargetRefSnapshotId => {
+            TableNode::TargetRef | TableNode::RetentionRef(_) => {
+                expect_kind(kind, &[Object], "metadata.refs.<target>")?
+            }
+            TableNode::TargetRefSnapshotId | TableNode::RetentionRefSnapshotId(_) => {
                 expect_kind(kind, &[Number], "metadata.refs.<target>.snapshot-id")?;
                 return Ok(INTEGER_TEXT_LIMIT);
             }
@@ -486,11 +523,16 @@ impl ViewSink for TableResponseSink {
                 self.seen_log_timestamp = true;
                 Some(TableNode::MetadataLogTimestamp)
             }
-            (TableNode::Metadata, "snapshots") if self.request.snapshot.is_some() => {
+            (TableNode::Metadata, "snapshots")
+                if self.request.snapshot.is_some()
+                    || !self.request.removed_snapshots.is_empty() =>
+            {
                 first(&mut self.seen_snapshots, "metadata.snapshots")?;
                 Some(TableNode::Snapshots)
             }
-            (TableNode::Metadata, "refs") if self.request.target_ref.is_some() => {
+            (TableNode::Metadata, "refs")
+                if self.request.target_ref.is_some() || !self.request.retention_refs.is_empty() =>
+            {
                 first(&mut self.seen_refs, "metadata.refs")?;
                 Some(TableNode::Refs)
             }
@@ -515,6 +557,29 @@ impl ViewSink for TableResponseSink {
                     "metadata.refs.<target>.snapshot-id",
                 )?;
                 Some(TableNode::TargetRefSnapshotId)
+            }
+            (TableNode::Refs, name) => {
+                if let Some(index) = self
+                    .request
+                    .retention_refs
+                    .iter()
+                    .position(|key| key == name)
+                {
+                    first(
+                        &mut self.retention_refs[index].0,
+                        "metadata.refs.<retention>",
+                    )?;
+                    Some(TableNode::RetentionRef(index))
+                } else {
+                    None
+                }
+            }
+            (TableNode::RetentionRef(index), "snapshot-id") => {
+                first(
+                    &mut self.seen_retention_ref_id[index],
+                    "metadata.refs.<retention>.snapshot-id",
+                )?;
+                Some(TableNode::RetentionRefSnapshotId(index))
             }
             (TableNode::Properties, name) => {
                 match self
@@ -571,10 +636,24 @@ impl ViewSink for TableResponseSink {
                 if id.is_some() && id == self.request.snapshot {
                     self.snapshot_present = true;
                 }
+                if let Some(id) = id {
+                    if let Some(index) = self
+                        .request
+                        .removed_snapshots
+                        .iter()
+                        .position(|candidate| *candidate == id)
+                    {
+                        self.retention_snapshots_present[index] = true;
+                    }
+                }
             }
             TableNode::TargetRefSnapshotId => {
                 self.ref_snapshot_id =
                     retained_integer(value, "metadata.refs.<target>.snapshot-id")?;
+            }
+            TableNode::RetentionRefSnapshotId(index) => {
+                self.retention_refs[index].1 =
+                    retained_integer(value, "metadata.refs.<retention>.snapshot-id")?;
             }
             TableNode::Property(index) => {
                 self.properties[index] = match value {
@@ -590,6 +669,12 @@ impl ViewSink for TableResponseSink {
     }
 
     fn close(&mut self, node: TableNode) -> Result<(), ScanError> {
+        if node == TableNode::Snapshot
+            && !self.request.removed_snapshots.is_empty()
+            && !self.seen_element_snapshot_id
+        {
+            return Err(ScanError::MissingField("metadata.snapshots[].snapshot-id"));
+        }
         if node == TableNode::MetadataLogEntry {
             use crate::catalog::transaction::MetadataPredecessorObservation;
             self.metadata_predecessor = match (
@@ -624,6 +709,23 @@ impl ViewSink for TableResponseSink {
             .into_iter()
             .zip(self.properties)
             .collect();
+        let retention_snapshots = self
+            .request
+            .removed_snapshots
+            .into_iter()
+            .zip(self.retention_snapshots_present)
+            .map(|(snapshot_id, present)| SnapshotCheck {
+                snapshot_id,
+                present,
+            })
+            .collect();
+        let retention_refs = self
+            .request
+            .retention_refs
+            .into_iter()
+            .zip(self.retention_refs)
+            .map(|(name, (present, snapshot))| (name, present, snapshot))
+            .collect();
         Ok(TableResponseView {
             metadata_location: self.metadata_location,
             metadata_predecessor: if self.metadata_log_invalid {
@@ -632,6 +734,8 @@ impl ViewSink for TableResponseSink {
                 self.metadata_predecessor
             },
             table_uuid: self.table_uuid,
+            retention_snapshots,
+            retention_refs,
             snapshot,
             target_ref,
             properties,

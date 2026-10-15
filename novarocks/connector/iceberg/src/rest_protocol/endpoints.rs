@@ -64,6 +64,7 @@ struct LoadViewResult {
 
 /// One catalog generation's REST session authority and read endpoints.
 pub(crate) struct RestEndpoints {
+    pub(crate) publication_generation: crate::catalog::publication::PublicationGeneration,
     properties: Arc<std::collections::HashMap<String, String>>,
     owner: Arc<RestAuthOwner>,
     gate: Arc<SessionGate>,
@@ -118,6 +119,7 @@ impl RestEndpoints {
         vending_declared: bool,
     ) -> Self {
         Self {
+            publication_generation: Default::default(),
             properties,
             owner,
             gate: Arc::new(SessionGate::default()),

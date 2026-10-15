@@ -51,7 +51,7 @@ impl HadoopFileSystemCatalog {
         }
         // No catalog I/O occurs before the journal's dispatch grant. The old
         // loader can repair a hint and must therefore run in that interval.
-        Ok(PreparedPublication {
+        Ok(PreparedPublication::Mutation {
             binding: None,
             dispatch: Box::new(HadoopPreparedUpdate {
                 client: self,
@@ -426,10 +426,18 @@ mod tests {
                             .clone()
                             .prepare_frozen_update(request, context)
                             .await?;
-                        prepared.dispatch = Box::new(HoldCacheDispatch {
-                            inner: prepared.dispatch,
-                            catalog: owner,
-                        });
+                        prepared = match prepared {
+                            PreparedPublication::Mutation { binding, dispatch } => {
+                                PreparedPublication::Mutation {
+                                    binding,
+                                    dispatch: Box::new(HoldCacheDispatch {
+                                        inner: dispatch,
+                                        catalog: owner,
+                                    }),
+                                }
+                            }
+                            PreparedPublication::NoOp => panic!("existing update must dispatch"),
+                        };
                         Ok(prepared)
                     },
                 )

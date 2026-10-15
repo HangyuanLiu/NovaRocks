@@ -517,6 +517,40 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             .expect("catalog publication has a prepared entry");
         self.catalog_entry_outcome(entry_ref)
     }
+    pub(crate) fn catalog_bridge_failure(&self, message: String) -> ExternalMutationOutcome<R> {
+        let failure =
+            ConnectorMutationFailure::new(ConnectorMutationFailureKind::Unavailable, message);
+        if let Some(entry) = self.current_entry() {
+            match self.entry_phase(entry) {
+                Phase::Committed(_, _, _) | Phase::Rejected(_, _) => {
+                    self.record_entry_finalization(
+                        entry,
+                        ExternalMutationFinalization::Failed(failure),
+                    );
+                }
+                Phase::Issued(checked) => {
+                    return ExternalMutationOutcome::CommitUnknown {
+                        failure,
+                        evidence: checked.evidence,
+                    };
+                }
+                Phase::Unknown(checked, original) => {
+                    return ExternalMutationOutcome::CommitUnknown {
+                        failure: original,
+                        evidence: checked.evidence,
+                    };
+                }
+                _ => {}
+            }
+            self.catalog_entry_outcome(entry)
+        } else {
+            ExternalMutationOutcome::KnownUncommitted {
+                failure,
+                cleanup: ExternalMutationFinalization::Complete,
+            }
+        }
+    }
+
     pub(crate) fn catalog_entry_outcome(
         &self,
         entry_ref: JournalEntryRef,
@@ -590,6 +624,13 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
                         evidence: checked.evidence,
                     }
                 }
+                Phase::Ready | Phase::Waiting => ExternalMutationOutcome::CommitUnknown {
+                    failure,
+                    evidence: self
+                        .current_checked()
+                        .expect("active publication entry")
+                        .evidence,
+                },
                 _ => panic!("Unknown publication follows its checked dispatch"),
             },
         }

@@ -77,7 +77,25 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
                 return Ok(entry_ref);
             }
         };
-        if let Err(error) = claim.bind(prepared.binding) {
+        let (binding, dispatch) = match prepared {
+            PreparedPublication::Mutation { binding, dispatch } => (binding, dispatch),
+            PreparedPublication::NoOp => {
+                if claim
+                    .begin_dispatch(&preparation, &MemoryDispatchBarrier)
+                    .await
+                    .is_ok()
+                {
+                    self.conclude_entry(
+                        entry_ref,
+                        DispatchEvidence::Applied {
+                            proof: CommitProof::no_op(),
+                        },
+                    );
+                }
+                return Ok(entry_ref);
+            }
+        };
+        if let Err(error) = claim.bind(binding) {
             claim.refuse(super::super::before_dispatch_failure(&error));
             return Ok(entry_ref);
         }
@@ -108,7 +126,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
         };
         self.mark_dispatch_start(entry_ref);
         // No statement cancellation branch may drop a dispatched mutation.
-        let completion = prepared.dispatch.dispatch_once(evidence_context).await;
+        let completion = dispatch.dispatch_once(evidence_context).await;
         // This is deliberately the first statement after adapter return.
         self.conclude_entry(entry_ref, completion.evidence);
         if let Some(work) = completion.finalization {
@@ -174,6 +192,85 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
                 ConnectorMutationFailureKind::Internal,
                 "Publication entry has no conclusion",
             ),
+        }
+    }
+}
+
+impl<R: Clone + Send + Sync> PublicationJournal<R> {
+    pub(crate) fn observe_prepared(
+        &self,
+        inner: Arc<dyn super::super::prepared::PublicationPreparer>,
+    ) -> impl Publisher + use<R> {
+        PreparedObservedPublisher {
+            inner,
+            journal: self.clone(),
+        }
+    }
+    fn invocation_error(&self, message: &str) -> CatalogOutcome<CommitProof> {
+        match self.phase() {
+            Phase::Committed(_, _, _)
+            | Phase::Rejected(_, _)
+            | Phase::Unknown(_, _)
+            | Phase::Issued(_) => {
+                self.commit_outcome(self.current_entry().expect("active publication entry"))
+            }
+            Phase::Ready | Phase::Waiting => CatalogOutcome::unknown(
+                message,
+                crate::catalog::error::CatalogCommitEvidence::for_target(
+                    self.descriptor()
+                        .expect("active publication descriptor")
+                        .targets
+                        .join(","),
+                ),
+            ),
+            Phase::Undispatched => {
+                CatalogOutcome::uncommitted(ConnectorMutationFailureKind::Internal, message)
+            }
+        }
+    }
+}
+struct PreparedObservedPublisher<R> {
+    inner: Arc<dyn super::super::prepared::PublicationPreparer>,
+    journal: PublicationJournal<R>,
+}
+#[async_trait]
+impl<R: Clone + Send + Sync> Publisher for PreparedObservedPublisher<R> {
+    async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
+        self.inner.load_target(attempt).await
+    }
+    fn preflight_recovery(
+        &self,
+        request: &FrozenRequest,
+        operation: &IcebergCommitOperation,
+    ) -> Result<()> {
+        self.inner.preflight_recovery(request, operation)?;
+        self.journal
+            .bind_preparation(operation.request_context().clone())
+    }
+    async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
+        let Some(preparation) = self
+            .journal
+            .current_checked()
+            .and_then(|checked| checked.preparation)
+        else {
+            return self
+                .journal
+                .invocation_error("Publication has no admitted preparation context");
+        };
+        let inner = Arc::clone(&self.inner);
+        let result = self
+            .journal
+            .publish_once(
+                preparation,
+                inner.evidence_policy(),
+                move |descriptor, generation, preparation| {
+                    inner.prepare_dispatch(request, descriptor, generation, preparation)
+                },
+            )
+            .await;
+        match result {
+            Ok(entry) => self.journal.commit_outcome(entry),
+            Err(_) => self.journal.invocation_error("Duplicate publication invocation refused; the original journal remains authoritative"),
         }
     }
 }
@@ -301,7 +398,7 @@ mod tests {
                     preparation,
                     CatalogEvidencePolicy::default(),
                     move |_, generation, _| async move {
-                        Ok(PreparedPublication {
+                        Ok(PreparedPublication::Mutation {
                             binding: Some(binding(generation.to_bytes())),
                             dispatch: Box::new(DelayedDispatch {
                                 entered: task_entered,
@@ -362,7 +459,7 @@ mod tests {
                 preparation,
                 CatalogEvidencePolicy::default(),
                 move |_, _, _| async move {
-                    Ok(PreparedPublication {
+                    Ok(PreparedPublication::Mutation {
                         binding: Some(binding([9; 16])),
                         dispatch: Box::new(DelayedDispatch {
                             entered: Arc::new(Notify::new()),
@@ -433,5 +530,27 @@ mod tests {
                 .first_dispatch_ms
                 .is_none()
         );
+    }
+    #[tokio::test]
+    async fn local_noop_concludes_without_a_dispatch_timestamp_or_binding() {
+        let (journal, preparation) = super::super::tests::catalog_journal();
+        let entry = journal
+            .publish_once(
+                preparation,
+                CatalogEvidencePolicy::default(),
+                |_, _, _| async { Ok(PreparedPublication::NoOp) },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            journal.commit_outcome(entry),
+            CatalogOutcome::KnownCommitted {
+                effect: novarocks_spi::connector::ExternalMutationEffect::NoOp,
+                ..
+            }
+        ));
+        let descriptor = journal.entry_descriptor(entry).unwrap();
+        assert!(descriptor.first_dispatch_ms.is_none());
+        assert!(descriptor.binding.is_none());
     }
 }

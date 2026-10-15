@@ -18,11 +18,9 @@
 //! One measured statistics intent, prepared on fresh authoritative metadata.
 
 use super::*;
-use crate::catalog::error::CatalogCommitEvidence;
 use crate::commit::attempt::observation::PublicationJournal;
-use crate::commit::attempt::{
-    self, OwnerPublisher, Publisher, RecoveryPreflight, RetryPolicy, TransitionalPublisher,
-};
+use crate::commit::attempt::prepared::CatalogPublisher;
+use crate::commit::attempt::{self, Publisher, RecoveryPreflight, RetryPolicy};
 use crate::commit::model::{
     ArtifactWriter, BaseIdentity, Dependency, FileChanges, FrozenRequest, IsolationLevel,
     OperationIntent, OperationIntentParts, OperationToken, RequestShape, StartSnapshot,
@@ -213,7 +211,6 @@ fn run_publication(
     journal: &PublicationJournal<StatisticsReceipt>,
     policy: RetryPolicy,
 ) -> ExternalMutationOutcome<StatisticsReceipt> {
-    let observed = journal.observe(publisher);
     let run_operation = operation.clone();
     match operation.runtime().block_on(async move {
         attempt::run(
@@ -221,7 +218,7 @@ fn run_publication(
             &intent,
             &PreparedChange::default(),
             &[preparer.as_ref()],
-            &observed,
+            publisher.as_ref(),
             policy,
         )
         .await
@@ -309,31 +306,27 @@ pub(super) fn publish(
     #[cfg(test)]
     STATISTICS_TRANSACTION_ADMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let journal = PublicationJournal::new(operation.token());
-    let direct = TransitionalPublisher {
+    let publisher = journal.observe_prepared(Arc::new(CatalogPublisher {
         catalog_operation: crate::catalog::admission::CatalogOperation::Statistics,
         catalog: Arc::clone(session.provider.runtime().novarocks_catalog()),
         ident: projection.target.clone(),
         target_ref: "main".into(),
-        evidence: CatalogCommitEvidence::for_target(format!(
-            "{}.{}",
-            session.table_payload.namespace, session.table_payload.table
-        ))
-        .with_target_uuid(projection.uuid.to_string())
-        .with_target_ref("main")
-        .with_commit_uuid(operation.token().to_string()),
-        recovery_preflight: projection.preflight_callback(&journal),
-    };
-    let owner = Arc::new(OwnerPublisher {
-        target: direct,
         operation: operation.token(),
-        marker: None,
-    });
+        recovery_preflight: projection.preflight_callback(&journal),
+    }));
     let preparer = Arc::new(StatisticsDraftPreparer {
         snapshot_id,
         sequence_number,
         drafts,
     });
-    let outcome = run_publication(&operation, intent, preparer, owner, &journal, policy);
+    let outcome = run_publication(
+        &operation,
+        intent,
+        preparer,
+        Arc::new(publisher),
+        &journal,
+        policy,
+    );
     if matches!(outcome, ExternalMutationOutcome::KnownCommitted { .. }) {
         session.provider.runtime().control_state().invalidate_table(
             &session.table_payload.namespace,
@@ -347,7 +340,7 @@ pub(super) fn publish(
 mod tests {
     use super::*;
     use crate::access_binding::IcebergReadBinding;
-    use crate::catalog::error::CatalogOutcome;
+    use crate::catalog::error::{CatalogCommitEvidence, CatalogOutcome};
     use crate::catalog::transaction::CommitProof;
     use crate::commit::operation::IcebergCommitAttempt;
     use crate::commit::staging::StagingBase;
@@ -492,7 +485,7 @@ mod tests {
                 &self.operation,
                 self.projection.intent().unwrap(),
                 preparer,
-                publisher.clone(),
+                Arc::new(publisher.journal.observe(publisher.clone())),
                 &publisher.journal,
                 RetryPolicy::from_properties(self.metadata.properties()).unwrap(),
             )

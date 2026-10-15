@@ -44,7 +44,7 @@ use crate::rest_protocol::evidence::{
     ResponseShape, RestEvidence, classify,
 };
 use crate::rest_protocol::http::{BodyReadError, RequestContext, ResponseBody, RestRequest};
-use crate::rest_protocol::json::{JsonScanner, ScanError, ViewSink, scan_complete};
+use crate::rest_protocol::json::{JsonScanner, ScanError, ViewSink};
 use crate::rest_protocol::minimal_view::{
     MutationView, NamespaceSink, TableResponseSink, ViewMutationSink,
 };
@@ -389,48 +389,27 @@ fn not_written(cause: NotWrittenCause, expect: &AttributionExpectation) -> Mutat
     }
 }
 
-/// Read a success body into the endpoint's minimal view: chunk by chunk, or,
-/// when the caller keeps the document, completely and then scanned once.
+/// Scan and optionally retain a success body in the same bounded read phase.
+/// A retained document never starts a second synchronous attribution parse.
 async fn read_view(
     shape: ResponseShape,
     expect: &AttributionExpectation,
     body: ResponseBody,
     keep_document: bool,
 ) -> (BodyRead<MutationView>, Option<Vec<u8>>) {
-    if keep_document {
-        let bytes = match body.read_to_end().await {
-            Ok(bytes) => bytes,
-            Err(error) => return (BodyRead::Failed(read_failure(error)), None),
-        };
-        let view = match shape {
-            ResponseShape::Table => {
-                scan_complete(table_sink(expect), &bytes).map(MutationView::Table)
-            }
-            ResponseShape::Namespace => {
-                scan_complete(NamespaceSink::new(), &bytes).map(MutationView::Namespace)
-            }
-            ResponseShape::View => {
-                scan_complete(ViewMutationSink::new(), &bytes).map(MutationView::View)
-            }
-        };
-        return match view {
-            Ok(view) => (BodyRead::Complete(view), Some(bytes)),
-            Err(error) => (BodyRead::Failed(BodyReadFailure::Scan(error)), None),
-        };
-    }
     let view = match shape {
-        ResponseShape::Table => stream(body, table_sink(expect))
+        ResponseShape::Table => stream(body, table_sink(expect), keep_document)
             .await
-            .map(MutationView::Table),
-        ResponseShape::Namespace => stream(body, NamespaceSink::new())
+            .map(|(view, document)| (MutationView::Table(view), document)),
+        ResponseShape::Namespace => stream(body, NamespaceSink::new(), keep_document)
             .await
-            .map(MutationView::Namespace),
-        ResponseShape::View => stream(body, ViewMutationSink::new())
+            .map(|(view, document)| (MutationView::Namespace(view), document)),
+        ResponseShape::View => stream(body, ViewMutationSink::new(), keep_document)
             .await
-            .map(MutationView::View),
+            .map(|(view, document)| (MutationView::View(view), document)),
     };
     match view {
-        Ok(view) => (BodyRead::Complete(view), None),
+        Ok((view, document)) => (BodyRead::Complete(view), document),
         Err(failure) => (BodyRead::Failed(failure), None),
     }
 }
@@ -453,12 +432,20 @@ fn table_sink(expect: &AttributionExpectation) -> TableResponseSink {
 }
 
 /// Scan a body chunk by chunk; no raw byte outlives its chunk (L8).
-async fn stream<S: ViewSink>(mut body: ResponseBody, sink: S) -> Result<S::View, BodyReadFailure> {
+async fn stream<S: ViewSink>(
+    mut body: ResponseBody,
+    sink: S,
+    keep_document: bool,
+) -> Result<(S::View, Option<Vec<u8>>), BodyReadFailure> {
     let mut scanner = JsonScanner::new(sink);
+    let mut document = keep_document.then(Vec::new);
     while let Some(chunk) = body.next_chunk().await.map_err(read_failure)? {
         scanner.feed(&chunk).map_err(scan_failure)?;
+        if let Some(document) = &mut document {
+            document.extend_from_slice(&chunk);
+        }
     }
-    scanner.finish().map_err(scan_failure)
+    Ok((scanner.finish().map_err(scan_failure)?, document))
 }
 
 fn scan_failure(error: ScanError) -> BodyReadFailure {

@@ -222,6 +222,15 @@ impl PublicationDescriptor {
         request: Vec<u8>,
         attribution: AttributionPlan,
     ) -> Result<Self> {
+        Self::catalog_with_key(operation_id, targets, request, attribution, Uuid::now_v7())
+    }
+    fn catalog_with_key(
+        operation_id: [u8; 16],
+        targets: Vec<String>,
+        request: Vec<u8>,
+        attribution: AttributionPlan,
+        key: Uuid,
+    ) -> Result<Self> {
         if targets.is_empty() || targets.iter().any(|target| target.is_empty()) {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -231,7 +240,7 @@ impl PublicationDescriptor {
         let fingerprint = Sha256::digest(&request).into();
         Ok(Self {
             operation_id,
-            key: Uuid::now_v7(),
+            key,
             targets,
             table_uuid: attribution.table_uuid(),
             request,
@@ -245,6 +254,21 @@ impl PublicationDescriptor {
         })
     }
     pub(crate) fn frozen(request: &FrozenRequest) -> Result<Self> {
+        Self::frozen_with_key(request, Uuid::now_v7())
+    }
+    pub(crate) fn validate_frozen(&self, request: &FrozenRequest) -> Result<()> {
+        self.validate()?;
+        let mut expected = Self::frozen_with_key(request, self.key)?;
+        expected.binding = self.binding.clone();
+        if self != &expected {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Frozen publication descriptor differs from its exact request facts",
+            ));
+        }
+        Ok(())
+    }
+    fn frozen_with_key(request: &FrozenRequest, key: Uuid) -> Result<Self> {
         let table_uuid = match request.base() {
             BaseIdentity::Existing { uuid, .. } => *uuid,
             BaseIdentity::Create { staged } => staged.initial_metadata().uuid(),
@@ -304,11 +328,12 @@ impl PublicationDescriptor {
             Error::new(ErrorKind::DataInvalid, "Cannot encode frozen publication")
                 .with_source(error)
         })?;
-        let mut descriptor = Self::catalog(
+        let mut descriptor = Self::catalog_with_key(
             request.artifacts().attempt().operation().to_bytes(),
             vec![format!("{}", request.identifier())],
             bytes,
             attribution,
+            key,
         )?;
         descriptor.table_uuid = Some(table_uuid);
         if let Some(facts) = request.base_facts() {

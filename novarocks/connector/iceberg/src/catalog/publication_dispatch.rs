@@ -46,17 +46,22 @@ impl From<novarocks_spi::connector::ConnectorError> for PreparationFailure {
     }
 }
 
-pub(crate) struct PreparedPublication {
-    pub binding: Option<RecoveryBinding>,
-    pub dispatch: Box<dyn PreparedCatalogDispatch>,
+pub(crate) enum PreparedPublication {
+    Mutation {
+        binding: Option<RecoveryBinding>,
+        dispatch: Box<dyn PreparedCatalogDispatch>,
+    },
+    NoOp,
 }
-
 impl std::fmt::Debug for PreparedPublication {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PreparedPublication")
-            .field("bound", &self.binding.is_some())
-            .finish_non_exhaustive()
+        match self {
+            Self::Mutation { binding, .. } => formatter
+                .debug_struct("PreparedPublication::Mutation")
+                .field("bound", &binding.is_some())
+                .finish_non_exhaustive(),
+            Self::NoOp => formatter.write_str("PreparedPublication::NoOp"),
+        }
     }
 }
 

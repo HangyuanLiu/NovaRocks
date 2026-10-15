@@ -30,17 +30,106 @@ use super::{
     ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog,
 };
 
-#[derive(Debug)]
+type FrozenRecorder =
+    Arc<dyn Fn(&[crate::iceberg::TableRequirement], &[crate::iceberg::TableUpdate]) + Send + Sync>;
 struct AdmittedCatalog {
     inner: Arc<dyn NovaRocksCatalog>,
+    recorder: Option<FrozenRecorder>,
 }
 
 pub(crate) fn all_admitted(inner: Arc<dyn NovaRocksCatalog>) -> Arc<dyn NovaRocksCatalog> {
-    Arc::new(AdmittedCatalog { inner })
+    Arc::new(AdmittedCatalog {
+        inner,
+        recorder: None,
+    })
+}
+
+pub(crate) fn all_admitted_recording(
+    inner: Arc<dyn NovaRocksCatalog>,
+    recorder: FrozenRecorder,
+) -> Arc<dyn NovaRocksCatalog> {
+    Arc::new(AdmittedCatalog {
+        inner,
+        recorder: Some(recorder),
+    })
+}
+impl std::fmt::Debug for AdmittedCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmittedCatalog")
+            .field("inner", &self.inner)
+            .field("recording", &self.recorder.is_some())
+            .finish()
+    }
+}
+struct RecordedDispatch {
+    inner: Box<dyn super::publication_dispatch::PreparedCatalogDispatch>,
+    recorder: FrozenRecorder,
+    requirements: Vec<crate::iceberg::TableRequirement>,
+    updates: Vec<crate::iceberg::TableUpdate>,
+}
+#[async_trait]
+impl super::publication_dispatch::PreparedCatalogDispatch for RecordedDispatch {
+    async fn dispatch_once(
+        self: Box<Self>,
+        context: super::publication::EvidenceContext,
+    ) -> super::publication_dispatch::DispatchCompletion {
+        (self.recorder)(&self.requirements, &self.updates);
+        self.inner.dispatch_once(context).await
+    }
 }
 
 #[async_trait]
 impl NovaRocksCatalog for AdmittedCatalog {
+    fn bind_publication_generation(
+        &self,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+    ) -> Result<(), ConnectorError> {
+        self.inner.bind_publication_generation(generation)
+    }
+    fn evidence_policy(&self) -> crate::catalog::publication::CatalogEvidencePolicy {
+        self.inner.evidence_policy()
+    }
+    async fn prepare_frozen_publication(
+        &self,
+        request: crate::commit::model::FrozenRequest,
+        operation: crate::catalog::admission::CatalogOperation,
+        staged_expectation: Option<crate::catalog::StagedPublicationExpectation>,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> crate::catalog::publication_dispatch::PreparationResult<
+        crate::catalog::publication_dispatch::PreparedPublication,
+    > {
+        let requirements = request.requirements().to_vec();
+        let updates = request.updates().to_vec();
+        let prepared = self
+            .inner
+            .prepare_frozen_for_admission_test(
+                request,
+                operation,
+                staged_expectation,
+                descriptor,
+                generation,
+                preparation,
+            )
+            .await?;
+        Ok(match (prepared, &self.recorder) {
+            (
+                super::publication_dispatch::PreparedPublication::Mutation { binding, dispatch },
+                Some(recorder),
+            ) => super::publication_dispatch::PreparedPublication::Mutation {
+                binding,
+                dispatch: Box::new(RecordedDispatch {
+                    inner: dispatch,
+                    recorder: recorder.clone(),
+                    requirements,
+                    updates,
+                }),
+            },
+            (prepared, _) => prepared,
+        })
+    }
+
     fn commit_dispatch(
         &self,
         ident: crate::iceberg::TableIdent,

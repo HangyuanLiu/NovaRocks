@@ -265,6 +265,43 @@ mod application_document_publication_trace_tests {
             self.commits.lock().expect("recording catalog lock").clone()
         }
 
+        fn record_frozen(&self, requirements: &[TableRequirement], updates: &[TableUpdate]) {
+            let recorded = RecordedCommit {
+                requirement_kinds: requirements.iter().map(requirement_kind).collect(),
+                uuid_requirements: requirements
+                    .iter()
+                    .filter_map(|requirement| match requirement {
+                        TableRequirement::UuidMatch { uuid } => Some(*uuid),
+                        _ => None,
+                    })
+                    .collect(),
+                ref_requirements: requirements
+                    .iter()
+                    .filter_map(|requirement| match requirement {
+                        TableRequirement::RefSnapshotIdMatch { r#ref, snapshot_id } => {
+                            Some((r#ref.clone(), *snapshot_id))
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+                update_kinds: updates.iter().map(update_kind).collect(),
+                ref_updates: updates
+                    .iter()
+                    .filter_map(|update| match update {
+                        TableUpdate::SetSnapshotRef {
+                            ref_name,
+                            reference,
+                        } => Some((ref_name.clone(), reference.snapshot_id)),
+                        _ => None,
+                    })
+                    .collect(),
+            };
+            self.commits
+                .lock()
+                .expect("recording catalog lock")
+                .push(recorded);
+        }
+
         fn clear(&self) {
             self.commits.lock().expect("recording catalog lock").clear();
         }
@@ -367,40 +404,7 @@ mod application_document_publication_trace_tests {
             let ident = commit.identifier().clone();
             let requirements = commit.take_requirements();
             let updates = commit.take_updates();
-            let recorded = RecordedCommit {
-                requirement_kinds: requirements.iter().map(requirement_kind).collect(),
-                uuid_requirements: requirements
-                    .iter()
-                    .filter_map(|requirement| match requirement {
-                        TableRequirement::UuidMatch { uuid } => Some(*uuid),
-                        _ => None,
-                    })
-                    .collect(),
-                ref_requirements: requirements
-                    .iter()
-                    .filter_map(|requirement| match requirement {
-                        TableRequirement::RefSnapshotIdMatch { r#ref, snapshot_id } => {
-                            Some((r#ref.clone(), *snapshot_id))
-                        }
-                        _ => None,
-                    })
-                    .collect(),
-                update_kinds: updates.iter().map(update_kind).collect(),
-                ref_updates: updates
-                    .iter()
-                    .filter_map(|update| match update {
-                        TableUpdate::SetSnapshotRef {
-                            ref_name,
-                            reference,
-                        } => Some((ref_name.clone(), reference.snapshot_id)),
-                        _ => None,
-                    })
-                    .collect(),
-            };
-            self.commits
-                .lock()
-                .expect("recording catalog lock")
-                .push(recorded);
+            self.record_frozen(&requirements, &updates);
             self.inner
                 .update_table(
                     crate::iceberg::TableCommit::builder()
@@ -621,7 +625,11 @@ mod application_document_publication_trace_tests {
             );
         // These tests exercise publication protocol outcomes under an explicit
         // admitted owner, independent of Hadoop's product document policy.
-        let owner = crate::catalog::admission_test_support::all_admitted(owner);
+        let recording = catalog.clone();
+        let owner = crate::catalog::admission_test_support::all_admitted_recording(
+            owner,
+            Arc::new(move |requirements, updates| recording.record_frozen(requirements, updates)),
+        );
         let runtime = Arc::new(
             crate::metadata_context::IcebergMetadataContext::with_catalog_for_test(
                 crate::catalog_control::IcebergCatalogControlState::new(configuration),
@@ -1069,7 +1077,11 @@ mod application_document_publication_trace_tests {
         committed_snapshot_id: i64,
     ) {
         let commits = fixture.catalog.commits();
-        assert_eq!(commits.len(), 1, "publication must update_table once");
+        assert_eq!(
+            commits.len(),
+            1,
+            "publication must dispatch one frozen request"
+        );
         assert_eq!(
             commits[0].uuid_requirements,
             vec![fixture.table.metadata().uuid()]

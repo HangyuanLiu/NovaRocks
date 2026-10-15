@@ -281,3 +281,44 @@ mod tests {
         assert_eq!(stalled.count("POST", "/commit"), 1);
     }
 }
+
+/// Bound once by the provider materializer before a generation is exposed.
+/// A caller's epoch is never authority to relabel an existing client/session.
+#[derive(Debug, Default)]
+pub(crate) struct PublicationGeneration(
+    std::sync::OnceLock<novarocks_spi::connector::ProviderBindingEpoch>,
+);
+impl PublicationGeneration {
+    pub(crate) fn bind(
+        &self,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+        let bound = self.0.get_or_init(|| generation);
+        self.validate(*bound, generation)
+    }
+    fn validate(
+        &self,
+        bound: novarocks_spi::connector::ProviderBindingEpoch,
+        actual: novarocks_spi::connector::ProviderBindingEpoch,
+    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+        if bound != actual {
+            return Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "Publication client belongs to another provider generation",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn require(
+        &self,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+        let bound = self.0.get().ok_or_else(|| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "Publication client has no materialized provider generation",
+            )
+        })?;
+        self.validate(*bound, generation)
+    }
+}

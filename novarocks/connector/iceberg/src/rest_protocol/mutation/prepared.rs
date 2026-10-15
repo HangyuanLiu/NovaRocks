@@ -95,6 +95,7 @@ impl PreparedRestMutation {
             ))
         };
         preparation.check_active().map_err(stopped)?;
+        endpoints.publication_generation.require(generation)?;
         descriptor.validate()?;
         // These awaits are session/authentication reads. Their shared attempt
         // remains driven by other waiters if this caller stops waiting.
@@ -340,6 +341,7 @@ mod tests {
         let preparation = context(&stop);
         let descriptor = descriptor();
         let generation = ProviderBindingEpoch::new();
+        endpoints.publication_generation.bind(generation).unwrap();
         let prepared = PreparedRestMutation::prepare(
             endpoints,
             route(),
@@ -401,11 +403,14 @@ mod tests {
             );
             let stop = ConnectorStopOwner::new();
             let preparation = context(&stop);
+            let endpoints = endpoints(&server).await;
+            let generation = ProviderBindingEpoch::new();
+            endpoints.publication_generation.bind(generation).unwrap();
             let prepared = PreparedRestMutation::prepare(
-                endpoints(&server).await,
+                endpoints,
                 route(),
                 &descriptor(),
-                ProviderBindingEpoch::new(),
+                generation,
                 &preparation,
                 expectation(),
                 false,
@@ -429,5 +434,175 @@ mod tests {
             assert_eq!(requests.len(), 1);
             assert!(requests[0].header("idempotency-key").is_none());
         }
+    }
+    #[tokio::test]
+    async fn a_callers_epoch_cannot_relabel_an_existing_rest_session() {
+        let server = TestServer::start(Script::new().on(
+            "GET",
+            "/v1/config",
+            Reply::json(200, &serde_json::json!({"defaults":{},"overrides":{}})),
+        ));
+        let endpoints = endpoints(&server).await;
+        let original = ProviderBindingEpoch::new();
+        endpoints.publication_generation.bind(original).unwrap();
+        let before = server.requests().len();
+        let stop = ConnectorStopOwner::new();
+        let error = PreparedRestMutation::prepare(
+            endpoints.clone(),
+            route(),
+            &descriptor(),
+            ProviderBindingEpoch::new(),
+            &context(&stop),
+            expectation(),
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.0.kind(),
+            novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest
+        );
+        assert!(
+            endpoints
+                .publication_generation
+                .bind(ProviderBindingEpoch::new())
+                .is_err()
+        );
+        assert_eq!(
+            server.requests().len(),
+            before,
+            "foreign generation must fail before session/auth or mutation I/O"
+        );
+    }
+    #[tokio::test]
+    async fn catalog_owner_checks_noop_identity_and_exact_bytes_before_any_http() {
+        use crate::catalog::admission::CatalogOperation;
+        use crate::commit::model::{
+            AttemptArtifacts, AttemptToken, BaseIdentity, FrozenRequest, FrozenRequestParts,
+            OperationToken, RequestShape,
+        };
+        let server = TestServer::start(Script::new().on(
+            "GET",
+            "/v1/config",
+            Reply::json(200, &serde_json::json!({"defaults":{},"overrides":{}})),
+        ));
+        let endpoints = endpoints(&server).await;
+        let owner = crate::catalog::factory::NovaRocksCatalogFactory::adopt_vended_rest_for_test(
+            endpoints,
+            "s3://warehouse",
+        );
+        let generation = ProviderBindingEpoch::new();
+        owner.bind_publication_generation(generation).unwrap();
+        let operation = OperationToken::from_mutation(
+            novarocks_spi::connector::ConnectorMutationOperationId::new(),
+        );
+        let target = TableIdent::new(NamespaceIdent::new("db".into()), "t".into());
+        let request = || {
+            FrozenRequest::new(FrozenRequestParts {
+                shape: RequestShape::MetadataOnly,
+                target: target.clone(),
+                target_ref: "main".into(),
+                base: BaseIdentity::Existing {
+                    uuid: Uuid::nil(),
+                    parent: None,
+                    metadata_location: "s3://warehouse/t/metadata/v1.json".into(),
+                },
+                requirements: vec![crate::iceberg::TableRequirement::UuidMatch {
+                    uuid: Uuid::nil(),
+                }],
+                updates: vec![],
+                artifacts: AttemptArtifacts::empty(AttemptToken::new(operation, 0)),
+            })
+            .unwrap()
+        };
+        let stop = ConnectorStopOwner::new();
+        let before = server.requests().len();
+        let descriptor = PublicationDescriptor::frozen(&request()).unwrap();
+        let prepared = owner
+            .prepare_frozen_publication(
+                request(),
+                CatalogOperation::AlterProperties,
+                None,
+                descriptor.clone(),
+                generation,
+                context(&stop),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            prepared,
+            crate::catalog::publication_dispatch::PreparedPublication::NoOp
+        ));
+        let error = owner
+            .prepare_frozen_publication(
+                request(),
+                CatalogOperation::AlterProperties,
+                None,
+                descriptor.clone(),
+                ProviderBindingEpoch::new(),
+                context(&stop),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.0.kind(),
+            novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest
+        );
+        let wrong_body = PublicationDescriptor::catalog(
+            operation.to_bytes(),
+            vec![target.to_string()],
+            br#"{"requirements":[],"updates":[]}"#.to_vec(),
+            AttributionPlan::ObserveOnly,
+        )
+        .unwrap();
+        assert!(
+            owner
+                .prepare_frozen_publication(
+                    request(),
+                    CatalogOperation::AlterProperties,
+                    None,
+                    wrong_body,
+                    generation,
+                    context(&stop)
+                )
+                .await
+                .is_err()
+        );
+        let fixture = crate::commit::overwrite::preparer_tests::Fixture::new();
+        let metadata = fixture.metadata(crate::iceberg::spec::FormatVersion::V3);
+        let create = FrozenRequest::new(FrozenRequestParts {
+            shape: RequestShape::Create,
+            target,
+            target_ref: "main".into(),
+            base: BaseIdentity::Create {
+                staged: crate::commit::model::StagedCreateIdentity::new(
+                    operation,
+                    Arc::new(metadata),
+                ),
+            },
+            requirements: vec![crate::iceberg::TableRequirement::NotExist],
+            updates: vec![],
+            artifacts: AttemptArtifacts::empty(AttemptToken::new(operation, 1)),
+        })
+        .unwrap();
+        let descriptor = PublicationDescriptor::frozen(&create).unwrap();
+        assert!(
+            owner
+                .prepare_frozen_publication(
+                    create,
+                    CatalogOperation::CreateTable(
+                        crate::catalog::CatalogCreateIntent::CreateTableAsSelect
+                    ),
+                    None,
+                    descriptor,
+                    generation,
+                    context(&stop)
+                )
+                .await
+                .is_err(),
+            "an empty create must not become a local NoOp"
+        );
+        assert_eq!(server.requests().len(), before);
     }
 }

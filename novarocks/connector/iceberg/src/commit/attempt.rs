@@ -18,6 +18,7 @@
 //! One immutable operation, fresh preparation per definite catalog conflict.
 
 pub(crate) mod observation;
+pub(crate) mod prepared;
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
