@@ -821,7 +821,7 @@ fn validate_utf8_controlled(
     bytes: &[u8],
     control: &dyn KernelEvaluationControl,
 ) -> Result<(), ControlledMembershipProbeError> {
-    let quantum = novarocks_functions::MAX_UNOBSERVED_KERNEL_WORK as usize;
+    let quantum = novarocks_execution::runtime_filter::MAX_UNOBSERVED_KERNEL_WORK as usize;
     let mut offset = 0;
     while offset < bytes.len() {
         let end = offset.saturating_add(quantum).min(bytes.len());

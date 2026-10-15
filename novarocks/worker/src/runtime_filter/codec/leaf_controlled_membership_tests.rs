@@ -22,7 +22,7 @@ use super::*;
 struct Running;
 impl KernelEvaluationControl for Running {
     fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
-        assert!(units <= novarocks_functions::MAX_UNOBSERVED_KERNEL_WORK);
+        assert!(units <= novarocks_execution::runtime_filter::MAX_UNOBSERVED_KERNEL_WORK);
         Ok(())
     }
     fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {

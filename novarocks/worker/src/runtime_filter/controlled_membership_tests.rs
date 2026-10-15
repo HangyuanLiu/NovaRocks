@@ -43,7 +43,7 @@ impl Control {
 }
 impl KernelEvaluationControl for Control {
     fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
-        assert!(units <= novarocks_functions::MAX_UNOBSERVED_KERNEL_WORK);
+        assert!(units <= novarocks_execution::runtime_filter::MAX_UNOBSERVED_KERNEL_WORK);
         let total = self.units.fetch_add(units, Ordering::SeqCst) + units;
         if self.refuse_at.is_some_and(|limit| total >= limit) {
             Err(self.cause.clone())

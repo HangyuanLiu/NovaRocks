@@ -476,63 +476,68 @@ fn compiled_ordered_source_idle_passes_original_whole_input_without_query_or_new
 
 #[test]
 fn compiled_ordered_source_query_failure_keeps_the_first_cause_and_closes_real_operations() {
-    let consumer = Consumer::new(Bind::Live);
-    let query = Arc::new(LiteralQuery {
-        calls: AtomicUsize::new(0),
-        failure: Some((2, KernelFailure::Cancelled)),
-    });
-    consumer.script([rf::LivePollOutcome::Updated {
-        snapshot: consumer.snapshot(1, query.clone()),
-        terminal: None,
-    }]);
-    let mut source = SourceCase::new(consumer, None);
-    source.push_original();
-    source.push_original();
-    let stop_observed = Arc::new(AtomicBool::new(false));
-    let stopped = stop_observed.clone();
-    let ticket = source
-        .source
-        .pages
-        .operations
-        .admit(Arc::new(move || {
-            stopped.store(true, Ordering::SeqCst);
-        }))
-        .unwrap();
-    source.bind();
-    let error = source.pull().unwrap_err();
-    assert_eq!(
-        error.cause(),
-        &ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
-    );
-    assert_eq!(query.calls.load(Ordering::SeqCst), 3);
-    assert!(source.consumer.effects.0.lock().unwrap().is_empty());
-    source
-        .consumer
-        .state
-        .error_state()
-        .set_error(KernelFailure::DeadlineExceeded);
-    assert_eq!(source.pull().unwrap_err().cause(), error.cause());
-    assert_eq!(
-        source
-            .consumer
-            .session
-            .cursor
-            .observed
-            .lock()
-            .unwrap()
-            .len(),
-        1
-    );
-    source.operator.cancel();
-    assert_eq!(source.source.pages.stops.load(Ordering::SeqCst), 1);
-    assert!(stop_observed.load(Ordering::SeqCst));
-    assert!(matches!(
-        source.operator.pending_finish(),
-        Some(FinishWatch::Notify(_))
-    ));
-    ticket.end(Ok(()));
-    assert!(source.operator.pending_finish().is_none());
-    source.finish();
+    for cause in [
+        KernelFailure::Cancelled,
+        KernelFailure::DeadlineExceeded,
+        KernelFailure::ResourceExhausted,
+    ] {
+        let consumer = Consumer::new(Bind::Live);
+        let query = Arc::new(LiteralQuery {
+            calls: AtomicUsize::new(0),
+            failure: Some((2, cause.clone())),
+        });
+        consumer.script([rf::LivePollOutcome::Updated {
+            snapshot: consumer.snapshot(1, query.clone()),
+            terminal: None,
+        }]);
+        let mut source = SourceCase::new(consumer, None);
+        source.push_original();
+        source.push_original();
+        let stop_observed = Arc::new(AtomicBool::new(false));
+        let stopped = stop_observed.clone();
+        let ticket = source
+            .source
+            .pages
+            .operations
+            .admit(Arc::new(move || {
+                stopped.store(true, Ordering::SeqCst);
+            }))
+            .unwrap();
+        source.bind();
+        let error = source.pull().unwrap_err();
+        assert_eq!(error.cause(), &ExecutionFailureCause::Kernel(cause.clone()));
+        assert_eq!(query.calls.load(Ordering::SeqCst), 3);
+        assert!(source.consumer.effects.0.lock().unwrap().is_empty());
+        source.consumer.state.error_state().set_error(
+            if cause == KernelFailure::DeadlineExceeded {
+                KernelFailure::Cancelled
+            } else {
+                KernelFailure::DeadlineExceeded
+            },
+        );
+        assert_eq!(source.pull().unwrap_err().cause(), error.cause());
+        assert_eq!(
+            source
+                .consumer
+                .session
+                .cursor
+                .observed
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
+        source.operator.cancel();
+        assert_eq!(source.source.pages.stops.load(Ordering::SeqCst), 1);
+        assert!(stop_observed.load(Ordering::SeqCst));
+        assert!(matches!(
+            source.operator.pending_finish(),
+            Some(FinishWatch::Notify(_))
+        ));
+        ticket.end(Ok(()));
+        assert!(source.operator.pending_finish().is_none());
+        source.finish();
+    }
 }
 
 #[test]
@@ -872,3 +877,6 @@ fn compiled_ordered_source_required_residual_row_error_precedes_invalid_live_sna
     assert!(source.operator.pending_finish().is_none());
     source.finish();
 }
+
+#[path = "compiled_ordered_pipeline_tests.rs"]
+mod pipeline_tests;

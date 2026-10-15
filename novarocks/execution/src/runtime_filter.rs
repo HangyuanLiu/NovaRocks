@@ -42,7 +42,7 @@ pub(crate) use owned::{OrderedTopNAllocationHost, OwnedUtf8OrderKey};
 
 // These are the original Functions control/cause types used by the neutral
 // controlled artifact-query port, not a second Worker control vocabulary.
-pub use novarocks_functions::{KernelEvaluationControl, KernelFailure};
+pub use novarocks_functions::{KernelEvaluationControl, KernelFailure, MAX_UNOBSERVED_KERNEL_WORK};
 
 pub use evaluator::{
     RuntimeFilterArtifactQuery, RuntimeFilterArtifactQueryError, RuntimeFilterControlledQueryError,
