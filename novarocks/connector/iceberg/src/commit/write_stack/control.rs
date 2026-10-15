@@ -100,7 +100,7 @@ use crate::write_descriptor::decode_partition_descriptor;
 pub const ICEBERG_WRITE_SESSION_MARKER_PROPERTY: &str = "novarocks.write.session.v1";
 
 /// The evidence schema version this control produces and accepts.
-pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 3;
+pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 4;
 
 /// The operation-kind tag on the evidence envelope.
 pub const ICEBERG_WRITE_SESSION_OPERATION_KIND: &str = "iceberg.connector_write_session.v1";
@@ -852,6 +852,26 @@ pub(crate) fn session_snapshot_properties(
     session_snapshot_properties_with_documents(handle, staged_data_rows, None)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum FinishDocumentPublication<'a> {
+    Legacy(&'a novarocks_spi::connector::ConnectorDocumentPublicationIntent),
+    Keyed(&'a novarocks_spi::connector::KeyedPublicationIntent),
+}
+impl<'a> FinishDocumentPublication<'a> {
+    fn legacy(self) -> Option<&'a novarocks_spi::connector::ConnectorDocumentPublicationIntent> {
+        match self {
+            Self::Legacy(intent) => Some(intent),
+            Self::Keyed(_) => None,
+        }
+    }
+    fn keyed(self) -> Option<&'a novarocks_spi::connector::KeyedPublicationIntent> {
+        match self {
+            Self::Keyed(intent) => Some(intent),
+            Self::Legacy(_) => None,
+        }
+    }
+}
+
 fn session_snapshot_properties_with_documents(
     handle: &IcebergCommitHandle,
     staged_data_rows: u64,
@@ -1091,13 +1111,13 @@ impl IcebergWriteSessionControl {
     ///
     /// The session's own state machine is the mutual exclusion: `begin_commit`
     /// latches, so a second `finish_write` cannot dispatch a second snapshot.
-    pub fn commit_prepared_set(
+    pub(crate) fn commit_prepared_set(
         &self,
         handle: &IcebergCommitHandle,
         prepared: &ConnectorPreparedWriteSet,
         statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
         frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>>,
-        document_publication: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
+        document_publication: Option<FinishDocumentPublication<'_>>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         #[cfg(feature = "test-controls")]
@@ -1340,13 +1360,18 @@ impl IcebergWriteSessionControl {
             .invalidate_table_cache(facts.namespace(), facts.table_name());
         let table = self
             .runtime
-            .load_table_for_request(
+            .load_table_for_request_with_snapshots(
                 facts.namespace(),
                 facts.table_name(),
                 &context
                     .clone()
                     .without_vended_credential_lease_sink()
                     .after_external_effect(),
+                if handle.document_publication().is_some() {
+                    crate::catalog::SnapshotLoading::Refs
+                } else {
+                    crate::catalog::SnapshotLoading::All
+                },
             )
             .map_err(|error| internal(error.to_string()))?
             .into_table();
@@ -1409,7 +1434,9 @@ fn publication_row_count_from_metadata(
     let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
         internal("committed Iceberg snapshot is absent during managed row-count projection")
     })?;
-    if handle.document_publication().is_some() {
+    if let Some(records) = handle.document_records()? {
+        validate_document_records(snapshot, &records)?;
+    } else if handle.document_publication().is_some() {
         let expected_manifest = handle.document_manifest()?.ok_or_else(|| {
             internal("application-document publication lost its prepared manifest")
         })?;
@@ -1430,6 +1457,21 @@ fn publication_row_count_from_metadata(
                 "committed Iceberg snapshot has an unreadable row count: {error}"
             ))
         })
+}
+
+fn validate_document_records(
+    snapshot: &crate::iceberg::spec::Snapshot,
+    records: &BTreeMap<String, String>,
+) -> Result<(), ConnectorError> {
+    for (key, value) in records {
+        if snapshot.summary().additional_properties.get(key) != Some(value) {
+            return Err(corrupt(format!(
+                "selected publication snapshot {} has mismatching record {key}",
+                snapshot.snapshot_id()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Terminate a session whose empty prepared write set means "do nothing".
@@ -1666,7 +1708,17 @@ impl IcebergWriteSessionControl {
         }
         match matched {
             Some(snapshot_id) => {
-                if decoded.document_manifest_digest.is_some() {
+                if decoded.document_record_digest.is_some() {
+                    let records = handle.document_records()?.ok_or_else(|| {
+                        corrupt("keyed publication evidence lost its exact record bytes")
+                    })?;
+                    validate_document_records(
+                        metadata
+                            .snapshot_by_id(snapshot_id)
+                            .ok_or_else(|| corrupt("selected publication snapshot is absent"))?,
+                        &records,
+                    )?;
+                } else if decoded.document_manifest_digest.is_some() {
                     let expected_manifest = handle.document_manifest()?.ok_or_else(|| {
                         corrupt("Iceberg document publication evidence lost its prepared manifest")
                     })?;
@@ -2122,6 +2174,16 @@ impl IcebergWriteSessionControl {
             None => {
                 // Begin must observe the catalog after planning, even when FE shares one request cache.
                 let physical = if matches!(
+                    &request.flavor,
+                    ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. }
+                ) {
+                    self.runtime.observe_table_for_request_with_snapshots(
+                        namespace,
+                        table_name,
+                        &request.context,
+                        crate::catalog::SnapshotLoading::Refs,
+                    )
+                } else if matches!(
                     &request.flavor,
                     ConnectorWriteSessionFlavor::DistributedRewrite { .. }
                 ) {
@@ -3328,17 +3390,22 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
             handle.document_publication(),
             &request.publication,
         ) {
-            (_, novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::KeyedDocuments(_)) => {
-                return Err(ConnectorError::new(ConnectorErrorKind::Unsupported,
-                    "keyed write publication is not installed"));
+            (Some(frozen), novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::KeyedDocuments(intent)) => {
+                intent.validate_for(frozen.declaration())?;
+                let records = intent.documents.records.iter().map(|record| {
+                    Ok((crate::document_storage::keyed::keys::record_key(&record.owner,&record.name), crate::document_storage::keyed::record::encode_record(record)?))
+                }).collect::<Result<BTreeMap<_,_>,ConnectorError>>()?;
+                handle.bind_document_records(records)?;
+                Some(FinishDocumentPublication::Keyed(intent))
             }
+            (None, novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::KeyedDocuments(_)) => return Err(invalid("ordinary write cannot attach keyed publication records")),
             (
                 Some(frozen),
                 novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::ApplicationDocuments(intent),
             ) => {
                 intent.validate_for(frozen.declaration())?;
                 handle.bind_document_manifest(intent.prepared_documents().provider_token())?;
-                Some(intent)
+                Some(FinishDocumentPublication::Legacy(intent))
             }
             (
                 None,

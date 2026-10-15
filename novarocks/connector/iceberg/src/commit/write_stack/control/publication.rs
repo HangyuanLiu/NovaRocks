@@ -60,7 +60,7 @@ impl WriteRecipe {
     fn freeze(
         handle: &IcebergCommitHandle,
         validated: &[ValidatedFragment<'_>],
-        documents: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
+        documents: Option<FinishDocumentPublication<'_>>,
     ) -> Result<Self, ConnectorError> {
         use crate::commit::model::Dependency;
         let facts = handle.table();
@@ -122,7 +122,29 @@ impl WriteRecipe {
                 sum.checked_add(file.record_count)
                     .ok_or_else(|| corrupt("Staged Iceberg row count overflow"))
             })?;
-        let summary = session_snapshot_properties_with_documents(handle, rows, documents)?;
+        let mut summary = session_snapshot_properties_with_documents(
+            handle,
+            rows,
+            documents.and_then(FinishDocumentPublication::legacy),
+        )?;
+        let keyed_updates = documents
+            .and_then(FinishDocumentPublication::keyed)
+            .map(|intent| {
+                crate::document_storage::keyed::write::publication_updates(
+                    &source,
+                    &intent.documents,
+                )
+            })
+            .transpose()?;
+        if let Some(keyed) = &keyed_updates {
+            for (key, value) in &keyed.summary {
+                if summary.insert(key.clone(), value.clone()).is_some() {
+                    return Err(invalid(
+                        "keyed record conflicts with a provider summary field",
+                    ));
+                }
+            }
+        }
         let dependencies = vec![if matches!(
             handle.commit_op_kind(),
             CommitOpKind::FastAppend | CommitOpKind::Overwrite
@@ -138,11 +160,16 @@ impl WriteRecipe {
         } else {
             PreparedChange::default()
         };
-        if let Some(updates) =
-            publication_metadata_updates(handle.repartition(), documents, &source)?
-        {
+        if let Some(updates) = publication_metadata_updates(
+            handle.repartition(),
+            documents.and_then(FinishDocumentPublication::legacy),
+            &source,
+        )? {
             // Repartition's declarative updates are canonicalized by StagingEngine.
             prefix.updates = updates;
+        }
+        if let Some(keyed) = keyed_updates {
+            prefix.updates.extend(keyed.updates);
         }
         // The writer schema and spec are exact admission facts, independent of the
         // ref dependency. A concurrent schema/spec change never reinterprets files.
@@ -304,6 +331,17 @@ impl WriteRecipe {
             shape: RequestShape::SnapshotProducing,
             summary: self.summary.clone(),
             token: operation.token(),
+        })
+        .map(|intent| {
+            if self
+                .summary
+                .keys()
+                .any(|key| key.starts_with(crate::document_storage::keyed::keys::RECORD_PREFIX))
+            {
+                intent.with_snapshot_loading(crate::catalog::SnapshotLoading::Refs)
+            } else {
+                intent
+            }
         })
     }
 
@@ -512,7 +550,7 @@ impl IcebergWriteSessionControl {
         handle: &IcebergCommitHandle,
         validated: &[ValidatedFragment<'_>],
         statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
-        documents: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
+        documents: Option<FinishDocumentPublication<'_>>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         let operation = IcebergCommitOperation::new(
@@ -805,6 +843,7 @@ pub(super) struct RecoveryPayload {
     pub base_sequence_number: i64,
     pub staging_dir: String,
     pub document_manifest_digest: Option<[u8; 32]>,
+    pub document_record_digest: Option<[u8; 32]>,
     operation_id: [u8; 16],
     attempt: RecoveryAttempt,
     parent_snapshot_id: Option<i64>,
@@ -865,6 +904,7 @@ struct RecoveryTemplate {
     base_sequence_number: i64,
     staging_dir: String,
     document_manifest_digest: Option<[u8; 32]>,
+    document_record_digest: Option<[u8; 32]>,
 }
 
 impl RecoveryTemplate {
@@ -888,6 +928,7 @@ impl RecoveryTemplate {
             base_snapshot_id: handle.table().base_snapshot_id(),
             base_sequence_number: handle.table().base_sequence_number(),
             staging_dir: handle.staging_dir(),
+            document_record_digest: handle.document_records_digest()?,
             document_manifest_digest: handle
                 .document_manifest()?
                 .as_deref()
@@ -977,6 +1018,7 @@ impl RecoveryTemplate {
             base_sequence_number: self.base_sequence_number,
             staging_dir: self.staging_dir.clone(),
             document_manifest_digest: self.document_manifest_digest,
+            document_record_digest: self.document_record_digest,
             operation_id: operation.token().to_bytes(),
             attempt: request.artifacts().attempt().into(),
             parent_snapshot_id: *parent,
@@ -1025,6 +1067,7 @@ impl RecoveryPayload {
             || self.base_sequence_number != expected.base_sequence_number
             || self.staging_dir != expected.staging_dir
             || self.document_manifest_digest != expected.document_manifest_digest
+            || self.document_record_digest != expected.document_record_digest
             || self.metadata_location.is_empty()
         {
             return Err(corrupt(
@@ -1171,6 +1214,7 @@ mod recovery_tests {
                 base_sequence_number: 0,
                 staging_dir: location,
                 document_manifest_digest: None,
+                document_record_digest: None,
             };
             Self {
                 directory,

@@ -143,6 +143,29 @@ pub(crate) fn parse_properties(
     })
 }
 
+/// Validate current interpretation before granting a write or discovery result.
+/// A root may dangle, while the current records must always resolve exactly.
+pub(crate) fn management_marker(
+    metadata: &TableMetadata,
+) -> Result<Option<ConnectorManagedObjectMarker>, KeyedDocumentReadError> {
+    let properties = parse_properties(metadata.properties())?;
+    if let Some(snapshot) = metadata.current_snapshot() {
+        for record in parse_snapshot_records(&snapshot.summary().additional_properties, true)? {
+            reference_closure(&properties.versions, record.binding)?;
+        }
+    }
+    let name = ConnectorSlotName {
+        owner: "novarocks.storage".into(),
+        name: "management".into(),
+    };
+    properties
+        .slots
+        .get(&name)
+        .map(|slot| decode_management(&slot_key(&name), &slot.value.content))
+        .transpose()
+        .map_err(Into::into)
+}
+
 pub(crate) fn project_view(
     metadata: &TableMetadata,
     request: &KeyedDocumentObservationRequest,

@@ -343,10 +343,9 @@ impl IcebergMetadataMaintenanceAdapter {
         validate_frozen_state(&loaded.table, plan, payload)
             .map_err(ExecFailure::KnownUncommitted)?;
         if plan.operation_kind() == novarocks_spi::connector::REWRITE_METADATA_LAYOUT_KIND {
-            crate::document_storage::observation::validate_managed_rewrite_attachment(
-                loaded.table.metadata(),
-            )
-            .map_err(ExecFailure::KnownUncommitted)?;
+            crate::document_storage::keyed::view::management_marker(loaded.table.metadata())
+                .map_err(crate::document_storage::observation::keyed_read_error)
+                .map_err(ExecFailure::KnownUncommitted)?;
         }
         let table = loaded.into_table();
         let file_io = table.file_io().clone();

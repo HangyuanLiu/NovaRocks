@@ -19,7 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const ICEBERG_MUTATION_EVIDENCE_VERSION: u16 = 2;
+pub const ICEBERG_MUTATION_EVIDENCE_VERSION: u16 = 3;
 pub const ICEBERG_STATISTICS_EVIDENCE_VERSION: u16 = 1;
 pub const ICEBERG_STAGED_PUBLICATION_PROOF_VERSION: u16 = 1;
 
@@ -75,6 +75,28 @@ pub enum IcebergMutationEvidenceTarget {
         table: String,
         table_uuid: String,
         before_metadata_location: Option<String>,
+    },
+    KeyedMarkers {
+        namespace: String,
+        table: String,
+        table_uuid: String,
+        operation_id: [u8; 16],
+        properties: std::collections::BTreeMap<String, String>,
+    },
+    KeyedSlotChange {
+        namespace: String,
+        table: String,
+        table_uuid: String,
+        operation_id: [u8; 16],
+        asserted_parent: Option<i64>,
+        preselected_snapshot: i64,
+        slots: Vec<(String, String)>,
+    },
+    KeyedExpiry {
+        namespace: String,
+        table: String,
+        table_uuid: String,
+        operation_id: [u8; 16],
     },
     ApplicationDocuments {
         namespace: String,

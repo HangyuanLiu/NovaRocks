@@ -634,11 +634,15 @@ impl ConnectorMetadata for IcebergMetadata {
             .invalidate_table(&request.table.namespace, &table_name);
         let loaded = self
             .runtime
-            .load_table_classified_with_credential_lease_collection(
+            .observe_table_classified_for_request_with_snapshots(
                 &request.table.namespace,
                 &table_name,
-                request.context.vended_credential_lease_collection(),
-                Some(&request.context),
+                &request.context,
+                if metadata_table_type.is_none() {
+                    crate::catalog::SnapshotLoading::Refs
+                } else {
+                    crate::catalog::SnapshotLoading::All
+                },
             )
             .map_err(classified_control_error)?;
         let metadata = loaded.table.metadata();

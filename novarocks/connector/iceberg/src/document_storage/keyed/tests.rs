@@ -535,3 +535,178 @@ fn present_invalid_file_totals_are_corrupt_instead_of_unknown() {
         assert!(error.message().contains(name));
     }
 }
+
+#[test]
+fn keyed_create_has_six_exact_document_properties_and_null_writers() {
+    let definition = version();
+    let layout = ConnectorDocumentVersion::try_new(
+        "novarocks.mv",
+        "interpretation",
+        format(),
+        vec![],
+        Bytes::from_static(b"layout"),
+    )
+    .unwrap();
+    let binding = ConnectorDocumentVersion::try_new(
+        "novarocks.mv",
+        "binding",
+        format(),
+        vec![
+            ("definition".into(), definition.identity()),
+            ("interpretation".into(), layout.identity()),
+        ],
+        Bytes::from_static(b"binding"),
+    )
+    .unwrap();
+    let configuration = ConnectorSlotValue {
+        format: format(),
+        content: Bytes::from_static(b"C"),
+    };
+    let documents = KeyedCreate {
+        versions: vec![definition, layout, binding.clone()],
+        slots: BTreeMap::from([
+            (slot_name(), configuration.clone()),
+            (
+                ConnectorSlotName::try_new("novarocks.storage", "management").unwrap(),
+                configuration,
+            ),
+        ]),
+        roots: BTreeMap::from([("novarocks.mv".into(), binding.identity())]),
+    };
+    let properties = super::write::create_properties(&documents).unwrap();
+    assert_eq!(properties.len(), 6);
+    assert_eq!(properties.len() + 1, 7); // CTAS operation marker; expectation bound is 32.
+    assert!(properties.len() + 1 < 32);
+    assert_eq!(parse_properties(&properties).unwrap().slots.len(), 2);
+    assert!(
+        parse_properties(&properties)
+            .unwrap()
+            .slots
+            .values()
+            .all(|slot| slot.writer.is_none())
+    );
+}
+
+#[test]
+fn marker_writes_only_its_exact_key_and_replaying_it_is_identical() {
+    let definition = version();
+    let base = metadata(HashMap::from([
+        (
+            version_key(definition.identity()),
+            encode_version(&definition).unwrap(),
+        ),
+        ("comment".into(), "unrelated".into()),
+    ]));
+    let value = ConnectorMarkerValue {
+        format: format(),
+        content: Bytes::from_static(b"intent"),
+    };
+    let documents = KeyedMarkerWrite {
+        markers: BTreeMap::from([(marker_name(), value)]),
+    };
+    let writes = super::write::marker_properties(&base, &documents).unwrap();
+    assert_eq!(writes.len(), 1);
+    assert!(writes.contains_key(&marker_key(&marker_name())));
+    let mut after = base.properties().clone();
+    after.extend(writes.clone());
+    let replay = super::write::marker_properties(&metadata(after.clone()), &documents).unwrap();
+    assert_eq!(replay, writes);
+    after.extend(replay);
+    assert_eq!(after.len(), 3);
+}
+
+#[test]
+fn publication_rewrites_closure_but_ordinary_refresh_does_not_gate_on_history_growth() {
+    let definition = version();
+    let mut properties = HashMap::from([(
+        version_key(definition.identity()),
+        encode_version(&definition).unwrap(),
+    )]);
+    for index in 0..8 {
+        let historical = ConnectorDocumentVersion::try_new(
+            "novarocks.mv",
+            &format!("history-{index}"),
+            format(),
+            vec![],
+            Bytes::from(vec![b'x'; 30_000]),
+        )
+        .unwrap();
+        properties.insert(
+            version_key(historical.identity()),
+            encode_version(&historical).unwrap(),
+        );
+    }
+    assert!(private_property_bytes(&properties) > KEYED_DOCUMENT_PRIVATE_BYTES);
+    let base = metadata(properties);
+    let documents = KeyedPublication {
+        records: vec![record(Some(definition.identity()))],
+        // The MV supplies existing D/L/B bytes for closure reassertion too.
+        versions: vec![definition.clone()],
+        ..Default::default()
+    };
+    let result = super::write::publication_updates(&base, &documents).unwrap();
+    assert_eq!(result.summary.len(), 1);
+    assert!(
+        matches!(&result.updates[..], [crate::iceberg::TableUpdate::SetProperties{updates}] if updates.len()==1 && updates[&version_key(definition.identity())]==encode_version(&definition).unwrap())
+    );
+    let marker = KeyedMarkerWrite {
+        markers: BTreeMap::from([(
+            marker_name(),
+            ConnectorMarkerValue {
+                format: format(),
+                content: Bytes::from_static(b"new"),
+            },
+        )]),
+    };
+    assert!(
+        super::write::marker_properties(&base, &marker)
+            .unwrap_err()
+            .message()
+            .contains("encoded size")
+    );
+}
+
+#[test]
+fn keyed_write_limits_fail_before_a_commit_request_can_be_constructed() {
+    let oversized = ConnectorDocumentVersion::try_new(
+        "novarocks.mv",
+        "large",
+        format(),
+        vec![],
+        Bytes::from(vec![0; 50_000]),
+    )
+    .unwrap();
+    let create = KeyedCreate {
+        versions: vec![oversized],
+        ..Default::default()
+    };
+    assert!(
+        super::write::create_properties(&create)
+            .unwrap_err()
+            .message()
+            .contains("version large")
+    );
+    let documents = KeyedPublication {
+        records: vec![ConnectorSnapshotRecord {
+            payload: Bytes::from(vec![0; 4_096]),
+            ..record(None)
+        }],
+        ..Default::default()
+    };
+    assert!(
+        super::write::publication_updates(&metadata(HashMap::new()), &documents)
+            .unwrap_err()
+            .message()
+            .contains("snapshot record")
+    );
+    let dangling = KeyedCreate {
+        roots: BTreeMap::from([("novarocks.mv".into(), DocumentIdentity::from_bytes([3; 32]))]),
+        ..Default::default()
+    };
+    assert_eq!(
+        super::write::create_properties(&dangling)
+            .unwrap_err()
+            .kind(),
+        ConnectorErrorKind::CorruptData
+    );
+}

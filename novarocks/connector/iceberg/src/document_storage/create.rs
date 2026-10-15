@@ -186,6 +186,19 @@ impl ConnectorDocumentStorageManagement for IcebergDocumentStorage {
     }
 }
 
+pub(crate) fn validate_management_admission(
+    admission: &novarocks_spi::connector::ConnectorDocumentManagementAdmission,
+) -> Result<(), ConnectorError> {
+    let token: AdmissionTokenV1 =
+        serde_json::from_slice(admission.provider_token()).map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                format!("decode Iceberg document admission: {error}"),
+            )
+        })?;
+    validate_admission_token(&token, admission)
+}
+
 fn validate_admission_token(
     token: &AdmissionTokenV1,
     admission: &novarocks_spi::connector::ConnectorDocumentManagementAdmission,

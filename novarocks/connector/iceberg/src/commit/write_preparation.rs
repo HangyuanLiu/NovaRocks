@@ -85,12 +85,15 @@ pub(crate) fn prepare_write(
             format!("decode admitted Iceberg write metadata: {error}"),
         )
     })?;
+    let managed = match crate::document_storage::keyed::view::management_marker(&metadata) {
+        Ok(marker) => marker.is_some(),
+        Err(error) => {
+            return Ok(ConnectorWritePreparationOutcome::Denied(
+                crate::document_storage::observation::keyed_read_error(error),
+            ));
+        }
+    };
     if matches!(request.purpose, ConnectorWriteAdmissionPurpose::OrdinaryDml) {
-        let managed = match crate::document_storage::observation::managed_marker(&metadata) {
-            Ok(_) => true,
-            Err(error) if error.kind() == ConnectorErrorKind::NotFound => false,
-            Err(error) => return Ok(ConnectorWritePreparationOutcome::Denied(error)),
-        };
         if managed
             || metadata
                 .properties()

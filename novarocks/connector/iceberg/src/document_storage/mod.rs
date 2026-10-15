@@ -35,3 +35,5 @@ pub use create::IcebergDocumentStorage;
 pub(crate) use retention::retained_sidecars_for_roots;
 
 pub(crate) mod keyed;
+
+pub(crate) use create::validate_management_admission;

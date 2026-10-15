@@ -1960,6 +1960,7 @@ pub struct IcebergCommitHandle {
     statistics_expectations:
         BTreeMap<WriteTargetOrdinal, Vec<novarocks_spi::connector::StatisticsArtifactIdentity>>,
     document_manifest: std::sync::Mutex<Option<Vec<u8>>>,
+    document_records: std::sync::Mutex<Option<BTreeMap<String, String>>>,
     terminal_finalization: std::sync::Mutex<novarocks_spi::connector::ExternalMutationFinalization>,
     recovery_evidence:
         Arc<std::sync::Mutex<Option<novarocks_spi::connector::ExternalMutationEvidence>>>,
@@ -2214,6 +2215,7 @@ impl IcebergCommitHandle {
             repartition,
             statistics_expectations: BTreeMap::new(),
             document_manifest: std::sync::Mutex::new(None),
+            document_records: std::sync::Mutex::new(None),
             terminal_finalization: std::sync::Mutex::new(
                 novarocks_spi::connector::ExternalMutationFinalization::Complete,
             ),
@@ -2319,6 +2321,56 @@ impl IcebergCommitHandle {
     }
     pub const fn document_publication(&self) -> Option<&IcebergDocumentPublicationFacts> {
         self.document_publication.as_ref()
+    }
+
+    pub(crate) fn bind_document_records(
+        &self,
+        records: BTreeMap<String, String>,
+    ) -> Result<(), ConnectorError> {
+        if self.document_publication.is_none() || records.is_empty() {
+            return Err(invalid(
+                "keyed publication requires a document session and at least one record",
+            ));
+        }
+        let mut bound = self
+            .document_records
+            .lock()
+            .map_err(|_| corrupt("keyed record lock is poisoned"))?;
+        match &*bound {
+            Some(existing) if existing != &records => Err(invalid(
+                "write session is already bound to different keyed record bytes",
+            )),
+            Some(_) => Ok(()),
+            None => {
+                *bound = Some(records);
+                Ok(())
+            }
+        }
+    }
+    pub(crate) fn document_records(
+        &self,
+    ) -> Result<Option<BTreeMap<String, String>>, ConnectorError> {
+        self.document_records
+            .lock()
+            .map(|records| records.clone())
+            .map_err(|_| corrupt("keyed record lock is poisoned"))
+    }
+    pub(crate) fn document_records_digest(&self) -> Result<Option<[u8; 32]>, ConnectorError> {
+        use sha2::{Digest, Sha256};
+        self.document_records()?
+            .map(|records| {
+                let mut digest = Sha256::new();
+                for (key, value) in records {
+                    for bytes in [key.as_bytes(), value.as_bytes()] {
+                        let length = u32::try_from(bytes.len())
+                            .map_err(|_| invalid("keyed record exceeds digest length framing"))?;
+                        digest.update(length.to_be_bytes());
+                        digest.update(bytes);
+                    }
+                }
+                Ok(digest.finalize().into())
+            })
+            .transpose()
     }
 
     pub fn bind_document_manifest(&self, encoded: &[u8]) -> Result<(), ConnectorError> {

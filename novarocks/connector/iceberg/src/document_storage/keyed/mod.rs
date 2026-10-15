@@ -19,12 +19,14 @@
 // Design: ADR-0178 (docs/adr/ADR-0178-inline-keyed-documents-and-snapshot-records.md)
 
 pub(crate) mod envelope;
+pub(crate) mod expiry;
 pub(crate) mod keys;
 pub(crate) mod limits;
 pub(crate) mod record;
 pub(crate) mod resolution;
 pub(crate) mod retention;
 pub(crate) mod view;
+pub(crate) mod write;
 
 pub(crate) use view::{project_full_view, project_view, reference_closure};
 

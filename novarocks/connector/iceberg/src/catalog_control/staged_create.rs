@@ -843,6 +843,9 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 ),
             });
         }
+        for key in request.properties.keys() {
+            crate::document_storage::keyed::write::reject_reserved_property(key)?;
+        }
         {
             let mut operations = self
                 .operations
@@ -1570,11 +1573,10 @@ fn publication_document_properties(
             }
             return Ok(None);
         }
-        ConnectorStagedCreatePublicationPayload::KeyedDocuments(_) => {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "keyed create publication is not installed",
-            ));
+        ConnectorStagedCreatePublicationPayload::KeyedDocuments(intent) => {
+            intent.validate_for_handle(handle)?;
+            return crate::document_storage::keyed::write::create_properties(&intent.documents)
+                .map(Some);
         }
         ConnectorStagedCreatePublicationPayload::ApplicationDocuments(intent) => intent,
     };

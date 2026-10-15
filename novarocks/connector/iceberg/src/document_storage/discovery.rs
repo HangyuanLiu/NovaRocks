@@ -136,17 +136,19 @@ pub(crate) fn discover(
             work.consume_table_load()?;
             let physical = storage
                 .runtime()
-                .load_table_classified_for_request(
+                .observe_table_classified_for_request_with_snapshots(
                     &table_name.namespace,
                     &table_name.name,
                     request.context(),
+                    crate::catalog::SnapshotLoading::Refs,
                 )
                 .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
             let table = physical.into_table();
-            let marker = match super::observation::managed_marker(table.metadata()) {
-                Ok(marker) => marker,
-                Err(error) if error.kind() == ConnectorErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
+            let marker = match super::keyed::view::management_marker(table.metadata())
+                .map_err(super::observation::keyed_read_error)?
+            {
+                Some(marker) => marker,
+                None => continue,
             };
             items.push(ConnectorDocumentDiscoveryItem::try_new(
                 ConnectorTableIdentity {

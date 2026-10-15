@@ -362,21 +362,35 @@ impl IcebergMetadataContext {
         request_context: &ConnectorRequestContext,
         snapshots: crate::catalog::SnapshotLoading,
     ) -> Result<IcebergPhysicalTable, String> {
-        ConnectorOperationControl::check_active(request_context)
-            .map_err(|error| error.to_string())?;
-        let namespace = normalize_identifier(namespace)?;
-        let table = normalize_identifier(table)?;
-        let loaded = self
-            .observe_table_classified_with_snapshots(
-                &namespace,
-                &table,
-                request_context.vended_credential_lease_collection(),
-                Some(request_context),
-                snapshots,
-            )
-            .map_err(|(_, message)| message)?;
-        ConnectorOperationControl::check_active(request_context)
-            .map_err(|error| error.to_string())?;
+        self.observe_table_classified_for_request_with_snapshots(
+            namespace,
+            table,
+            request_context,
+            snapshots,
+        )
+        .map_err(|(_, message)| message)
+    }
+
+    pub(crate) fn observe_table_classified_for_request_with_snapshots(
+        &self,
+        namespace: &str,
+        table: &str,
+        request_context: &ConnectorRequestContext,
+        snapshots: crate::catalog::SnapshotLoading,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        let control_error =
+            |error: novarocks_spi::connector::ConnectorError| (error.kind(), error.to_string());
+        ConnectorOperationControl::check_active(request_context).map_err(control_error)?;
+        let namespace = normalize_identifier(namespace).map_err(invalid_request)?;
+        let table = normalize_identifier(table).map_err(invalid_request)?;
+        let loaded = self.observe_table_classified_with_snapshots(
+            &namespace,
+            &table,
+            request_context.vended_credential_lease_collection(),
+            Some(request_context),
+            snapshots,
+        )?;
+        ConnectorOperationControl::check_active(request_context).map_err(control_error)?;
         let renewal = loaded.attempt_access_if_vended();
         let binding = self
             .resources
@@ -387,7 +401,7 @@ impl IcebergMetadataContext {
             binding,
             self.resources.catalog_runtime().iceberg_runtime().clone(),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(control_error)?;
         if let Some(renewal) = renewal {
             scoped = scoped.with_attempt_access(renewal);
         }
