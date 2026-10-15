@@ -33,10 +33,35 @@ use super::{
 #[derive(Debug)]
 struct AdmittedCatalog {
     inner: Arc<dyn NovaRocksCatalog>,
+    snapshot_trace: Option<Arc<std::sync::Mutex<Vec<super::SnapshotLoading>>>>,
 }
 
 pub(crate) fn all_admitted(inner: Arc<dyn NovaRocksCatalog>) -> Arc<dyn NovaRocksCatalog> {
-    Arc::new(AdmittedCatalog { inner })
+    Arc::new(AdmittedCatalog {
+        inner,
+        snapshot_trace: None,
+    })
+}
+
+pub(crate) fn all_admitted_with_snapshot_trace(
+    inner: Arc<dyn NovaRocksCatalog>,
+    trace: Arc<std::sync::Mutex<Vec<super::SnapshotLoading>>>,
+) -> Arc<dyn NovaRocksCatalog> {
+    Arc::new(AdmittedCatalog {
+        inner,
+        snapshot_trace: Some(trace),
+    })
+}
+
+impl AdmittedCatalog {
+    fn trace_snapshot_loading(&self, snapshots: super::SnapshotLoading) {
+        if let Some(trace) = &self.snapshot_trace {
+            trace
+                .lock()
+                .expect("snapshot loading trace")
+                .push(snapshots);
+        }
+    }
 }
 
 #[async_trait]
@@ -118,7 +143,59 @@ impl NovaRocksCatalog for AdmittedCatalog {
         &self,
         table: CatalogTableName,
     ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+        self.trace_snapshot_loading(super::SnapshotLoading::All);
         self.inner.load_table(table).await
+    }
+
+    async fn load_table_with_snapshots(
+        &self,
+        table: CatalogTableName,
+        snapshots: super::SnapshotLoading,
+    ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+        self.trace_snapshot_loading(snapshots);
+        self.inner.load_table_with_snapshots(table, snapshots).await
+    }
+
+    async fn load_table_for_read(
+        &self,
+        table: CatalogTableName,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+        self.trace_snapshot_loading(super::SnapshotLoading::All);
+        self.inner.load_table_for_read(table, binding).await
+    }
+
+    async fn load_table_for_read_with_snapshots(
+        &self,
+        table: CatalogTableName,
+        binding: crate::access_binding::IcebergReadBinding,
+        snapshots: super::SnapshotLoading,
+    ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+        self.trace_snapshot_loading(snapshots);
+        self.inner
+            .load_table_for_read_with_snapshots(table, binding, snapshots)
+            .await
+    }
+
+    async fn load_commit_base(
+        &self,
+        table: CatalogTableName,
+        file_io: crate::iceberg::io::FileIO,
+    ) -> crate::iceberg::Result<super::CatalogCommitBase> {
+        self.trace_snapshot_loading(super::SnapshotLoading::All);
+        self.inner.load_commit_base(table, file_io).await
+    }
+
+    async fn load_commit_base_with_snapshots(
+        &self,
+        table: CatalogTableName,
+        file_io: crate::iceberg::io::FileIO,
+        snapshots: super::SnapshotLoading,
+    ) -> crate::iceberg::Result<super::CatalogCommitBase> {
+        self.trace_snapshot_loading(snapshots);
+        self.inner
+            .load_commit_base_with_snapshots(table, file_io, snapshots)
+            .await
     }
 
     async fn view_exists(&self, view: CatalogTableName) -> Result<bool, ConnectorError> {

@@ -234,3 +234,33 @@ fn absent_snapshot_selection_is_rejected_without_authorizing_property_delete() {
         ids(&[&orphan])
     );
 }
+
+#[test]
+fn snapshot_retained_byte_diagnostic_counts_shared_closure_once_and_excludes_root_only_versions() {
+    let d = document("definition", vec![]);
+    let b = document("binding", vec![("definition".into(), d.identity())]);
+    let root_only = document("root-only", vec![]);
+    let mut props = properties(&[d.clone(), b.clone(), root_only.clone()]);
+    props.insert(root_key("novarocks.test"), root_only.identity().to_hex());
+    let expected: usize = [d.identity(), b.identity()]
+        .into_iter()
+        .map(|id| {
+            let key = crate::document_storage::keyed::keys::version_key(id);
+            key.len() + props[&key].len()
+        })
+        .sum();
+    let view = full(
+        Some(20),
+        vec![
+            Snapshot::new(10, None).record(record(b"one", Some(b.identity()))),
+            Snapshot::new(20, Some(10)).record(record(b"two", Some(b.identity()))),
+        ],
+        props,
+        vec![],
+    );
+    let metadata = crate::document_storage::keyed::view::metadata_from_token(&view.token).unwrap();
+    assert_eq!(
+        super::snapshot_referenced_bytes(&metadata).unwrap(),
+        expected
+    );
+}

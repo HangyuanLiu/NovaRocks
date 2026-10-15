@@ -250,6 +250,8 @@ mod application_document_publication_trace_tests {
     struct RecordingCatalog {
         inner: Arc<dyn Catalog>,
         commits: Mutex<Vec<RecordedCommit>>,
+        raw_updates: Mutex<Vec<Vec<TableUpdate>>>,
+        next_error: Mutex<Option<crate::iceberg::ErrorKind>>,
     }
 
     impl RecordingCatalog {
@@ -257,6 +259,8 @@ mod application_document_publication_trace_tests {
             Arc::new(Self {
                 inner,
                 commits: Mutex::new(Vec::new()),
+                raw_updates: Mutex::new(Vec::new()),
+                next_error: Mutex::new(None),
             })
         }
 
@@ -266,6 +270,16 @@ mod application_document_publication_trace_tests {
 
         fn clear(&self) {
             self.commits.lock().expect("recording catalog lock").clear();
+            self.raw_updates.lock().unwrap().clear();
+        }
+    }
+
+    impl RecordingCatalog {
+        fn raw_updates(&self) -> Vec<Vec<TableUpdate>> {
+            self.raw_updates.lock().unwrap().clone()
+        }
+        fn fail_next(&self, kind: crate::iceberg::ErrorKind) {
+            assert!(self.next_error.lock().unwrap().replace(kind).is_none());
         }
     }
 
@@ -400,6 +414,14 @@ mod application_document_publication_trace_tests {
                 .lock()
                 .expect("recording catalog lock")
                 .push(recorded);
+            self.raw_updates.lock().unwrap().push(updates.clone());
+            let injected = self.next_error.lock().unwrap().take();
+            if let Some(kind) = injected {
+                return Err(crate::iceberg::Error::new(
+                    kind,
+                    "injected publication response",
+                ));
+            }
             self.inner
                 .update_table(
                     crate::iceberg::TableCommit::builder()
@@ -443,6 +465,7 @@ mod application_document_publication_trace_tests {
         provider: crate::metadata::IcebergMetadata,
         catalog_handle: novarocks_spi::connector::CatalogHandle,
         _warehouse: tempfile::TempDir,
+        load_modes: Arc<Mutex<Vec<crate::catalog::SnapshotLoading>>>,
     }
 
     /// Hadoop intentionally does not grant document-management admission in
@@ -620,7 +643,11 @@ mod application_document_publication_trace_tests {
             );
         // These tests exercise publication protocol outcomes under an explicit
         // admitted owner, independent of Hadoop's product document policy.
-        let owner = crate::catalog::admission_test_support::all_admitted(owner);
+        let load_modes = Arc::new(Mutex::new(Vec::new()));
+        let owner = crate::catalog::admission_test_support::all_admitted_with_snapshot_trace(
+            owner,
+            Arc::clone(&load_modes),
+        );
         let runtime = Arc::new(
             crate::metadata_context::IcebergMetadataContext::with_catalog_for_test(
                 crate::catalog_control::IcebergCatalogControlState::new(configuration),
@@ -630,6 +657,7 @@ mod application_document_publication_trace_tests {
         );
         let provider = crate::metadata::IcebergMetadata::new(descriptor, incarnation, runtime);
         Fixture {
+            load_modes,
             catalog,
             table,
             provider,
@@ -1709,5 +1737,9 @@ mod application_document_publication_trace_tests {
             &unresolved,
         )
         .expect("exact empty document attachment");
+    }
+    mod keyed_session_tests {
+        use super::*;
+        include!("run/keyed_session_tests.rs");
     }
 }

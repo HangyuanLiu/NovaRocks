@@ -64,7 +64,7 @@ impl super::staging::Preparer for OverwritePreparer {
         .await?;
         manifests.extend(write_added_intent_data(view, intent, snapshot_id).await?);
         let operation = match (intent.changes().added.is_empty(), removed.is_empty()) {
-            (false, true) => Operation::Append,
+            (true, true) | (false, true) => Operation::Append,
             (true, false) => Operation::Delete,
             _ => Operation::Overwrite,
         };
@@ -1760,6 +1760,43 @@ pub(crate) mod preparer_tests {
             ];
             let intent = self.intent(&base, "main", Vec::new());
             self.stage(base, &intent, &Seed(seed)).await.0
+        }
+    }
+    #[tokio::test]
+    async fn zero_file_publication_uses_append_with_and_without_an_empty_parent() {
+        let fixture = Fixture::new();
+        let mut base = fixture.metadata(FormatVersion::V2);
+        for _ in 0..2 {
+            let intent = OperationIntent::new(OperationIntentParts {
+                target: TableTarget {
+                    ident: TableIdent::from_strs(["db", "t"]).unwrap(),
+                    uuid: Some(base.uuid()),
+                },
+                target_ref: "main".into(),
+                start: base
+                    .current_snapshot()
+                    .map(|s| crate::commit::model::StartSnapshot {
+                        snapshot_id: s.snapshot_id(),
+                        sequence_number: s.sequence_number(),
+                    }),
+                changes: FileChanges::default(),
+                dependencies: vec![Dependency::RefUnchanged],
+                isolation: IsolationLevel::Snapshot,
+                shape: RequestShape::SnapshotProducing,
+                summary: BTreeMap::from([(
+                    "novarocks.doc.v2.record.novarocks.test~publication".into(),
+                    "2.-.YQ".into(),
+                )]),
+                token: fixture.operation.token(),
+            })
+            .unwrap();
+            let (next, request) = fixture.stage(base, &intent, &OverwritePreparer).await;
+            assert_eq!(
+                next.current_snapshot().unwrap().summary().operation,
+                Operation::Append
+            );
+            assert_eq!(request.artifacts().attempt_owned().len(), 1);
+            base = next;
         }
     }
 }
