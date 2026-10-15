@@ -105,10 +105,10 @@ pub use root_attachment::{
 pub use runtime_filter::{
     FilterConsumerActivation, FilterLateApplyGranularity, FilterMembershipSchema,
     FilterMembershipSchemaError, FilterNullOrder, FilterNullSemantics, FilterOrderKey,
-    FilterProducerKind, FilterReduction, FilterSortDirection, StaticFilterConsumer,
-    StaticFilterContract, StaticFilterError, StaticFilterProducer, encode_filter_key_type,
-    is_ordered_filter_flat_payload_type, single_key_ordered_filter_digests_observed,
-    visit_filter_key_type,
+    FilterOrderKeys, FilterProducerKind, FilterReduction, FilterSortDirection,
+    StaticFilterConsumer, StaticFilterContract, StaticFilterError, StaticFilterProducer,
+    encode_filter_key_type, is_ordered_filter_flat_payload_type,
+    single_key_ordered_filter_digests_observed, visit_filter_key_type,
 };
 pub use sink::{
     MAX_STATIC_SINK_BRANCHES, MAX_STATIC_SINK_COLUMNS, MAX_STATIC_SINK_EXPRESSIONS,

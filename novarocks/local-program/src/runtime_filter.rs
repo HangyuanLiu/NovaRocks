@@ -30,6 +30,10 @@ use arrow_schema::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, Tim
 use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 use sha2::{Digest, Sha256};
 
+#[path = "runtime_filter/order_keys.rs"]
+mod order_keys;
+pub use order_keys::FilterOrderKeys;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FilterNullSemantics {
     NeverMatches,
@@ -130,7 +134,7 @@ pub enum StaticFilterContract {
         value_type: novarocks_type_contract::FunctionValueType,
     },
     Ordered {
-        keys: Arc<[FilterOrderKey]>,
+        keys: FilterOrderKeys,
         comparator_digest: [u8; 32],
         contract_digest: [u8; 32],
     },

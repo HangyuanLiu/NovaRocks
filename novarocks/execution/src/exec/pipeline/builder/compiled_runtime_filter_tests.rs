@@ -1521,11 +1521,13 @@ fn compiled_scan_runtime_filter_shapes_outside_m1_are_refused_by_name() {
             late_apply: FilterLateApplyGranularity::Batch,
         },
         StaticFilterContract::Ordered {
-            keys: Arc::from([FilterOrderKey {
-                value_type: FunctionValueType::new(DataType::Int64, true),
-                direction: FilterSortDirection::Ascending,
-                null_order: FilterNullOrder::First,
-            }]),
+            keys: novarocks_local_program::FilterOrderKeys::from_legacy(Arc::from([
+                FilterOrderKey {
+                    value_type: FunctionValueType::new(DataType::Int64, true),
+                    direction: FilterSortDirection::Ascending,
+                    null_order: FilterNullOrder::First,
+                },
+            ])),
             comparator_digest: [1; 32],
             contract_digest: [2; 32],
         },
@@ -1970,11 +1972,13 @@ fn compiled_hash_join_producer_shapes_outside_m1_are_refused_by_name() {
                 11,
                 FilterProducerKind::TopKSummary,
                 StaticFilterContract::Ordered {
-                    keys: Arc::from([FilterOrderKey {
-                        value_type: FunctionValueType::new(DataType::Int64, true),
-                        direction: FilterSortDirection::Ascending,
-                        null_order: FilterNullOrder::First,
-                    }]),
+                    keys: novarocks_local_program::FilterOrderKeys::from_legacy(Arc::from([
+                        FilterOrderKey {
+                            value_type: FunctionValueType::new(DataType::Int64, true),
+                            direction: FilterSortDirection::Ascending,
+                            null_order: FilterNullOrder::First,
+                        },
+                    ])),
                     comparator_digest: [1; 32],
                     contract_digest: [2; 32],
                 },

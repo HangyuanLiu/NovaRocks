@@ -338,11 +338,13 @@ fn static_utf8_order(
     let comparator_digest: [u8; 32] = hex::decode(comparator).unwrap().try_into().unwrap();
     let contract_digest: [u8; 32] = hex::decode(order).unwrap().try_into().unwrap();
     novarocks_local_program::StaticFilterContract::Ordered {
-        keys: Arc::from([novarocks_local_program::FilterOrderKey {
-            value_type: novarocks_functions::FunctionValueType::new(DataType::Utf8, true),
-            direction,
-            null_order,
-        }]),
+        keys: novarocks_local_program::FilterOrderKeys::from_legacy(Arc::from([
+            novarocks_local_program::FilterOrderKey {
+                value_type: novarocks_functions::FunctionValueType::new(DataType::Utf8, true),
+                direction,
+                null_order,
+            },
+        ])),
         comparator_digest,
         contract_digest,
     }
@@ -440,7 +442,9 @@ fn ordered_topn_owned_frozen_keys_preserve_complete_nullability() {
         let StaticFilterContract::Ordered { keys, .. } = &mut frozen else {
             unreachable!()
         };
-        Arc::make_mut(keys)[0].value_type = value_type.clone();
+        let mut replacement = keys.as_slice().to_vec();
+        replacement[0].value_type = value_type.clone();
+        *keys = replacement.into();
         let tracker = MemTracker::new_root("ordered-frozen-complete-binding");
         let host = OrderedTopNAllocationHost::new(tracker.clone());
         let order = host.utf8_order_contract(&frozen, &Control::pass()).unwrap();
@@ -516,15 +520,20 @@ fn ordered_topn_owned_frozen_key_slots_preserve_control_causes_and_named_uninsta
         unreachable!()
     };
     let wrong_type = StaticFilterContract::Ordered {
-        keys: Arc::from([novarocks_local_program::FilterOrderKey {
-            value_type: novarocks_functions::FunctionValueType::new(DataType::Int64, true),
-            ..keys[0].clone()
-        }]),
+        keys: novarocks_local_program::FilterOrderKeys::from_legacy(Arc::from([
+            novarocks_local_program::FilterOrderKey {
+                value_type: novarocks_functions::FunctionValueType::new(DataType::Int64, true),
+                ..keys[0].clone()
+            },
+        ])),
         comparator_digest: [17; 32],
         contract_digest: [23; 32],
     };
     let wrong_arity = StaticFilterContract::Ordered {
-        keys: Arc::from([keys[0].clone(), keys[0].clone()]),
+        keys: novarocks_local_program::FilterOrderKeys::from_legacy(Arc::from([
+            keys[0].clone(),
+            keys[0].clone(),
+        ])),
         comparator_digest: [17; 32],
         contract_digest: [23; 32],
     };
