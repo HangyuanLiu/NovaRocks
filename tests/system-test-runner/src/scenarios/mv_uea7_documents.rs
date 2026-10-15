@@ -1154,6 +1154,7 @@ fn spark_expire(
     env: &Path,
     table: &str,
 ) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::process::Command;
     let dir = artifact(context, "spark-expire-snapshots")?;
     let sql = dir.join("expire.sql");
@@ -1180,8 +1181,18 @@ fn spark_expire(
     )?;
     let out = novarocks_test_support::capture_command_until(
         command,
-        fs::File::create(dir.join("stdout.log"))?,
-        fs::File::create(dir.join("stderr.log"))?,
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join("stdout.log"))?,
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join("stderr.log"))?,
         context.deadline(),
     )?;
     fs::write(
