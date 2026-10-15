@@ -174,8 +174,9 @@ impl novarocks_spi::connector::ProviderCatalogControlFactory for IcebergCatalogC
             let worker = activity
                 .enter(novarocks_spi::connector::CatalogActivityPhase::MaterializationWorker);
             let binding = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
+                // The activity guard drops last, after the job's permit.
                 let _worker = worker;
+                let _permit = permit;
                 materialize_control_blocking(
                     resources,
                     coordination,

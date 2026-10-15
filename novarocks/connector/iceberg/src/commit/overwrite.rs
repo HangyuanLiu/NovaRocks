@@ -1011,6 +1011,15 @@ pub(crate) mod preparer_tests {
         }
 
         pub(crate) fn new_with_limits(limits: OperationLimits) -> Self {
+            Self::new_with_limits_and_activity(limits, None)
+        }
+        pub(crate) fn new_observed(activity: Arc<crate::activity::GenerationActivity>) -> Self {
+            Self::new_with_limits_and_activity(OperationLimits::default(), Some(activity))
+        }
+        fn new_with_limits_and_activity(
+            limits: OperationLimits,
+            activity: Option<Arc<crate::activity::GenerationActivity>>,
+        ) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let location = format!("file://{}", directory.path().display());
             let runtime = tokio::runtime::Handle::current();
@@ -1020,6 +1029,15 @@ pub(crate) mod preparer_tests {
                 Arc::new(novarocks_fs::TokioFileIoRuntime::new(runtime.clone())),
                 Arc::new(novarocks_fs::TokioFileTaskSpawner::new(runtime.clone())),
             );
+            let catalog_runtime = match activity {
+                Some(activity) => {
+                    crate::resources::IcebergMetadataResources::new(binding.clone(), runtime)
+                        .with_activity(activity)
+                        .catalog_runtime()
+                        .clone()
+                }
+                None => crate::resources::IcebergCatalogRuntime::new(runtime),
+            };
             let stop = ConnectorStopOwner::new();
             let operation = IcebergCommitOperation::new(
                 OperationToken::from_write(ConnectorWriteOperationId::from_bytes([7; 16])),
@@ -1032,7 +1050,7 @@ pub(crate) mod preparer_tests {
                     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
                 )
                 .unwrap(),
-                crate::resources::IcebergCatalogRuntime::new(runtime),
+                catalog_runtime,
                 limits,
             )
             .unwrap();

@@ -304,34 +304,41 @@ pub(crate) async fn run(
     let started = Instant::now();
     let mut attempt_number = 0;
     loop {
-        if let Err(error) = check_window(operation, started, policy) {
-            return rejected(operation, before_dispatch_failure(&error)).await;
-        }
-        let attempt = match operation.begin_attempt() {
-            Ok(attempt) => attempt,
-            Err(error) => return rejected(operation, before_dispatch_failure(&error)).await,
-        };
-        let base = match publisher.load_target(&attempt).await {
-            Ok(base) => base,
-            Err(error) => return rejected(operation, before_dispatch_failure(&error)).await,
-        };
-        if let Err(error) = check_window(operation, started, policy) {
-            return rejected(operation, before_dispatch_failure(&error)).await;
-        }
-        let prepared = prepare(&attempt, intent, base, prefix, preparers).await;
-        let (request, retained) = match prepared {
+        // This segment covers only preparation. Returning from the helper
+        // releases its observation guard before dispatch or rejected cleanup.
+        let prepared = operation
+            .runtime()
+            .observe_preparation_async(
+                async {
+                    check_window(operation, started, policy)
+                        .map_err(|error| before_dispatch_failure(&error))?;
+                    let attempt = operation
+                        .begin_attempt()
+                        .map_err(|error| before_dispatch_failure(&error))?;
+                    let base = publisher
+                        .load_target(&attempt)
+                        .await
+                        .map_err(|error| before_dispatch_failure(&error))?;
+                    check_window(operation, started, policy)
+                        .map_err(|error| before_dispatch_failure(&error))?;
+                    let (request, retained) =
+                        prepare(&attempt, intent, base, prefix, preparers).await?;
+                    check_window(operation, started, policy)
+                        .map_err(|error| before_dispatch_failure(&error))?;
+                    publisher
+                        .preflight_recovery(&request, operation)
+                        .map_err(|error| before_dispatch_failure(&error))?;
+                    check_window(operation, started, policy)
+                        .map_err(|error| before_dispatch_failure(&error))?;
+                    Ok::<_, ConnectorMutationFailure>((attempt, request, retained))
+                },
+                |failure| failure.clone(),
+            )
+            .await;
+        let (attempt, request, retained) = match prepared {
             Ok(prepared) => prepared,
             Err(failure) => return rejected(operation, failure).await,
         };
-        if let Err(error) = check_window(operation, started, policy) {
-            return rejected(operation, before_dispatch_failure(&error)).await;
-        }
-        if let Err(error) = publisher.preflight_recovery(&request, operation) {
-            return rejected(operation, before_dispatch_failure(&error)).await;
-        }
-        if let Err(error) = check_window(operation, started, policy) {
-            return rejected(operation, before_dispatch_failure(&error)).await;
-        }
         match publisher.dispatch_once(request).await {
             CatalogOutcome::KnownCommitted { receipt, .. } => {
                 return Report {
@@ -365,7 +372,13 @@ pub(crate) async fn run(
                 if wait >= left {
                     return rejected(operation, failure).await;
                 }
-                if let Err(error) = operation.pause(wait).await {
+                // Conflict cleanup is complete before this waiting segment;
+                // a stopped backoff remains a typed pre-dispatch failure.
+                if let Err(error) = operation
+                    .runtime()
+                    .observe_preparation_async(operation.pause(wait), before_dispatch_failure)
+                    .await
+                {
                     return rejected(operation, before_dispatch_failure(&error)).await;
                 }
                 attempt_number += 1;
@@ -1199,7 +1212,7 @@ mod tests {
         }
     }
 
-    struct CancelAfterPreparation<'a>(&'a Fixture);
+    struct CancelAfterPreparation<'a>(&'a Fixture, &'a crate::activity::CatalogActivity);
     #[async_trait]
     impl Preparer for CancelAfterPreparation<'_> {
         async fn prepare(
@@ -1208,6 +1221,10 @@ mod tests {
             intent: &OperationIntent,
         ) -> Result<PreparedChange> {
             let change = FastAppendPreparer.prepare(view, intent).await?;
+            use novarocks_spi::connector::{CatalogActivityPhase as P, CatalogActivityReader};
+            let snapshot = self.1.snapshot();
+            assert_eq!(snapshot.phases[P::PreDispatch as usize].inflight, 1);
+            assert_eq!(snapshot.phases[P::Evidence as usize].started, 0);
             self.0.cancel();
             Ok(change)
         }
@@ -1215,7 +1232,16 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_after_artifact_exit_prevents_dispatch_and_cleans_preparation() {
-        let fixture = Fixture::new();
+        use novarocks_spi::connector::{
+            CatalogActivityPhase as P, CatalogActivityReader, CatalogScopeIdentity,
+            ConnectorInstanceId, ConnectorProviderId,
+        };
+        let root = crate::activity::CatalogActivity::new(CatalogScopeIdentity::new(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            ConnectorInstanceId::parse("preparer.actual").unwrap(),
+            uuid::Uuid::now_v7(),
+        ));
+        let fixture = Fixture::new_observed(root.generation());
         let metadata = fixture.metadata(FormatVersion::V3);
         let intent = append_intent(&fixture, &metadata, vec![Dependency::NoReadDependency]);
         let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Commit);
@@ -1223,7 +1249,7 @@ mod tests {
             &fixture.operation,
             &intent,
             &PreparedChange::default(),
-            &[&CancelAfterPreparation(&fixture)],
+            &[&CancelAfterPreparation(&fixture, &root)],
             &publisher,
             policy(),
         )
@@ -1238,6 +1264,10 @@ mod tests {
         );
         assert!(publisher.requests.lock().unwrap().is_empty());
         assert!(fixture.operation.artifacts().unwrap().is_empty());
+        let snapshot = root.snapshot();
+        assert_eq!(snapshot.phases[P::PreDispatch as usize].inflight, 0);
+        assert_eq!(snapshot.phases[P::PreDispatch as usize].exited, 1);
+        assert_eq!(snapshot.events.pre_dispatch_cancelled, 1);
     }
 
     #[tokio::test]

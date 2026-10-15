@@ -231,27 +231,35 @@ impl RegisteredIcebergDataMutationBackend {
             self.runtime.resources().catalog_runtime(),
         );
         // External registered parquet is deliberately never adopted into this ledger.
-        let setup = (|| {
-            let table = self.reload_table(
-                &planned.payload().namespace,
-                &planned.payload().table,
-                context,
-            )?;
-            match planned {
-                PlannedIcebergMutation::Truncate { payload, .. } => {
-                    validate_frozen_table(&table, payload)?
-                }
-                PlannedIcebergMutation::RegisterExistingFiles { payload, .. } => {
-                    validate_add_files_target_shape(&table, payload)?
-                }
-            }
-            anchor_committed_write(&self.runtime, &table)?;
-            let intent = freeze_intent(planned, &operation, marker)
-                .map_err(|error| corrupt(error.to_string()))?;
-            let policy = RetryPolicy::from_properties(planned.source_metadata().properties())
-                .map_err(|error| invalid(error.to_string()))?;
-            Ok::<_, ConnectorError>((intent, policy))
-        })();
+        let setup = self
+            .runtime
+            .resources()
+            .catalog_runtime()
+            .observe_preparation(
+                || {
+                    let table = self.reload_table(
+                        &planned.payload().namespace,
+                        &planned.payload().table,
+                        context,
+                    )?;
+                    match planned {
+                        PlannedIcebergMutation::Truncate { payload, .. } => {
+                            validate_frozen_table(&table, payload)?
+                        }
+                        PlannedIcebergMutation::RegisterExistingFiles { payload, .. } => {
+                            validate_add_files_target_shape(&table, payload)?
+                        }
+                    }
+                    anchor_committed_write(&self.runtime, &table)?;
+                    let intent = freeze_intent(planned, &operation, marker)
+                        .map_err(|error| corrupt(error.to_string()))?;
+                    let policy =
+                        RetryPolicy::from_properties(planned.source_metadata().properties())
+                            .map_err(|error| invalid(error.to_string()))?;
+                    Ok::<_, ConnectorError>((intent, policy))
+                },
+                |error| attempt::before_dispatch_failure(&format_error(error.clone())),
+            );
         let (intent, policy) = match setup {
             Ok(setup) => setup,
             Err(error) => {

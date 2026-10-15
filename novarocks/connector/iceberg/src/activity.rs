@@ -292,6 +292,13 @@ mod tests {
         runtime.block_on(entered.notified());
         assert_eq!(inflight(&root, Phase::Bridge), 1);
         assert_eq!(inflight(&other, Phase::Bridge), 0);
+        let other_resources = resources.clone().with_activity(other.generation());
+        assert_eq!(
+            other_resources.catalog_runtime().block_on(async { 9_u8 }),
+            Ok(9)
+        );
+        assert_eq!(other.snapshot().phases[Phase::Bridge as usize].exited, 1);
+        assert_eq!(inflight(&root, Phase::Bridge), 1);
         assert!(!worker.is_finished());
         exit.notify_one();
         assert_eq!(worker.join().unwrap(), Ok(7));
@@ -300,6 +307,45 @@ mod tests {
             (phase.inflight, phase.exited, phase.elapsed_count),
             (0, 1, 1)
         );
-        assert_eq!(other.snapshot().phases[Phase::Bridge as usize].started, 0);
+        assert_eq!(other.snapshot().phases[Phase::Bridge as usize].started, 1);
+    }
+}
+
+impl crate::resources::IcebergCatalogRuntime {
+    /// Observe one explicit mutation preparation segment. The caller retains
+    /// its original error and remains the sole publication/cleanup authority.
+    /// `classify` must be a pure projection of the existing typed error.
+    pub(crate) fn observe_preparation<T, E>(
+        &self,
+        prepare: impl FnOnce() -> Result<T, E>,
+        classify: impl FnOnce(&E) -> novarocks_spi::connector::ConnectorMutationFailure,
+    ) -> Result<T, E> {
+        let _preparing = self
+            .activity()
+            .map(|owner| owner.enter(novarocks_spi::connector::CatalogActivityPhase::PreDispatch));
+        let result = prepare();
+        if let (Some(owner), Err(error)) = (self.activity(), &result) {
+            owner.preparation_failed(&classify(error));
+        }
+        result
+    }
+
+    /// The guard lives until the supplied future returns or actually drops.
+    /// This does not make non-abortable work cancellation-safe: the existing
+    /// I/O owner must still retain and join that work to its actual exit.
+    /// Do not wrap dispatch/finalization/cleanup or a runtime's ordinary reads.
+    pub(crate) async fn observe_preparation_async<T, E>(
+        &self,
+        preparation: impl std::future::Future<Output = Result<T, E>>,
+        classify: impl FnOnce(&E) -> novarocks_spi::connector::ConnectorMutationFailure,
+    ) -> Result<T, E> {
+        let _preparing = self
+            .activity()
+            .map(|owner| owner.enter(novarocks_spi::connector::CatalogActivityPhase::PreDispatch));
+        let result = preparation.await;
+        if let (Some(owner), Err(error)) = (self.activity(), &result) {
+            owner.preparation_failed(&classify(error));
+        }
+        result
     }
 }

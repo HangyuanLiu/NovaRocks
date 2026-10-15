@@ -2144,6 +2144,230 @@ mod tests {
         assert!(bindings.is_empty());
         assert_eq!(properties, vec![("type".to_string(), "local".to_string())]);
     }
+    struct DrainingControlResolver {
+        entered: tokio::sync::Notify,
+        gate: (std::sync::Mutex<bool>, std::sync::Condvar),
+        old_calls: std::sync::atomic::AtomicUsize,
+        new_calls: std::sync::atomic::AtomicUsize,
+    }
+    impl DrainingControlResolver {
+        fn release(&self) {
+            *self.gate.0.lock().unwrap() = true;
+            self.gate.1.notify_all();
+        }
+    }
+    struct ReleaseDrainingControl(Arc<DrainingControlResolver>);
+    impl Drop for ReleaseDrainingControl {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    impl novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver
+        for DrainingControlResolver
+    {
+        fn resolve_object_store_static(
+            &self,
+            _: &StaticCredentialReference,
+        ) -> Result<novarocks_fs::ObjectStoreSecretMaterial, novarocks_spi::connector::ConnectorError>
+        {
+            Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "test owns only catalog-control identity",
+            ))
+        }
+        fn resolve_catalog_control(
+            &self,
+            reference: &StaticCredentialReference,
+        ) -> Result<
+            novarocks_connector_iceberg::access_binding::IcebergRestAuthMaterial,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            use std::sync::atomic::Ordering::SeqCst;
+            assert_eq!(reference.name(), "control");
+            match reference.generation() {
+                "old" => {
+                    self.old_calls.fetch_add(1, SeqCst);
+                    self.entered.notify_one();
+                    drop(
+                        self.gate
+                            .1
+                            .wait_timeout_while(
+                                self.gate.0.lock().unwrap(),
+                                Duration::from_secs(20),
+                                |released| !*released,
+                            )
+                            .unwrap(),
+                    );
+                }
+                "new" => {
+                    self.new_calls.fetch_add(1, SeqCst);
+                }
+                _ => panic!("unexpected test identity generation"),
+            }
+            Ok(
+                novarocks_connector_iceberg::access_binding::IcebergRestAuthMaterial::Bearer {
+                    token: novarocks_fs::SecretValue::new("local-test-token"),
+                },
+            )
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activity_draining_scope_survives_wrapper_deadline_until_actual_worker_exit() {
+        use novarocks_connector_iceberg::{
+            IcebergControlRoleBindingFactory, access_binding::IcebergReadBinding,
+            resources::IcebergMetadataResources,
+        };
+        use novarocks_spi::connector::CatalogActivityPhase as P;
+        use std::sync::atomic::Ordering::SeqCst;
+        let resolver = Arc::new(DrainingControlResolver {
+            entered: tokio::sync::Notify::new(),
+            gate: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+            old_calls: std::sync::atomic::AtomicUsize::new(0),
+            new_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let _release = ReleaseDrainingControl(resolver.clone());
+        let handle = tokio::runtime::Handle::current();
+        let fs = novarocks_fs::FsAccessResources::new(
+            Arc::new(novarocks_fs::ObjectStoreProviderPool::new(Default::default()).unwrap()),
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
+        );
+        let access =
+            IcebergReadBinding::with_static_metadata_credential_resolver(fs, resolver.clone());
+        let role = Arc::new(IcebergControlRoleBindingFactory::new(
+            IcebergMetadataResources::new(access, handle.clone()),
+            std::num::NonZeroUsize::new(2).unwrap(),
+        ));
+        let control = Arc::new(ConnectorControlHost::with_role_factories(vec![role]).unwrap());
+        let mut service = CatalogApplicationService::unavailable(
+            control.clone(),
+            Arc::new(TestRuntimePublisher),
+            handle,
+            Arc::new(TestReferenceReader),
+        );
+        service.scheduler = ProjectionScheduler::new(
+            CatalogMaterializationConfig::try_new(
+                Duration::from_secs(2),
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+                2,
+            )
+            .unwrap(),
+        );
+        let port = Arc::new(service);
+        let instance = ConnectorInstanceId::parse("catalog.draining").unwrap();
+        let old_id = Uuid::now_v7();
+        let new_id = Uuid::now_v7();
+        assert_ne!(old_id, new_id);
+        let entry = |identity, generation: &str| {
+            CatalogDesiredStateEntry::new(
+                crate::CatalogSourceEntryIdentity::new(identity),
+                crate::CatalogLogicalConfig::try_new(
+                    instance.clone(),
+                    ConnectorProviderId::parse("iceberg").unwrap(),
+                    "Draining",
+                    vec![
+                        ("iceberg.catalog.type".into(), "rest".into()),
+                        ("uri".into(), "http://127.0.0.1:1".into()),
+                    ],
+                    vec![
+                        CatalogCredentialBinding::try_new(
+                            CatalogCredentialPurpose::CatalogControl,
+                            CredentialConsumerRole::Frontend,
+                            CatalogCredentialMode::Static(
+                                StaticCredentialReference::try_new("control", generation).unwrap(),
+                            ),
+                        )
+                        .unwrap(),
+                    ],
+                    1,
+                )
+                .unwrap(),
+            )
+        };
+        let mode = CatalogDesiredStateSourceMode::DynamicStateStore;
+        let (_, work) = port
+            .submit_materialization(entry(old_id, "old"), mode, None)
+            .unwrap();
+        let task_port = port.clone();
+        let old_wrapper =
+            tokio::spawn(async move { task_port.run_materialization(work.unwrap()).await });
+        tokio::time::timeout(Duration::from_secs(5), resolver.entered.notified())
+            .await
+            .expect("old real worker entered");
+        let (_, work) = port
+            .submit_materialization(entry(new_id, "new"), mode, None)
+            .unwrap();
+        port.run_materialization(work.unwrap()).await;
+        let new_epoch = {
+            let lease = control
+                .acquire_current(&instance)
+                .expect("new scope progresses while old worker blocks");
+            lease.binding().incarnation()
+        };
+        // Replacement cancels the old context, but the existing wrapper waits
+        // for its original deadline. It is not manually aborted in this test.
+        tokio::time::timeout(Duration::from_secs(4), old_wrapper)
+            .await
+            .unwrap()
+            .unwrap();
+        fn snapshots(
+            port: &CatalogApplicationService,
+        ) -> Vec<(
+            Uuid,
+            bool,
+            novarocks_spi::connector::CatalogActivitySnapshot,
+        )> {
+            port.catalog_activity_sources()
+                .unwrap()
+                .into_iter()
+                .map(|source| {
+                    let snapshot = source.reader.as_ref().unwrap().snapshot();
+                    (source.identity.source_entry_id(), source.current, snapshot)
+                })
+                .collect()
+        }
+        let rows = snapshots(&port);
+        assert_eq!(rows.len(), 2);
+        let old = rows.iter().find(|row| row.0 == old_id).unwrap();
+        assert!(!old.1);
+        assert_eq!(old.2.phases[P::MaterializationWorker as usize].inflight, 1);
+        assert_eq!(old.2.phases[P::Bridge as usize].inflight, 1);
+        assert_eq!(old.2.generations.len(), 1);
+        assert_eq!(old.2.generations[0].generation, None);
+        let new = rows.iter().find(|row| row.0 == new_id).unwrap();
+        assert!(new.1);
+        assert!(new.2.phases.iter().all(|phase| phase.inflight == 0));
+        assert_eq!(
+            new.2.generations[0].generation.unwrap().as_bytes(),
+            &new_epoch.to_bytes()
+        );
+        assert_eq!(resolver.old_calls.load(SeqCst), 1);
+        assert_eq!(resolver.new_calls.load(SeqCst), 1);
+        drop(rows);
+        resolver.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let rows = snapshots(&port);
+                if rows.len() == 1 && rows[0].0 == new_id && rows[0].1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old actual exit removes the draining weak reader");
+        assert_eq!(
+            control
+                .acquire_current(&instance)
+                .unwrap()
+                .binding()
+                .incarnation(),
+            new_epoch
+        );
+    }
+
     // Lifecycle integration uses the production Iceberg role factory and real
     // generation leases. Local Hadoop construction performs no remote I/O;
     // test-owned runtimes and warehouses are released after every lease exits.

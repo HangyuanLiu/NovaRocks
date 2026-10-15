@@ -386,9 +386,9 @@ impl RegisteredIcebergDataMutationBackend {
             .control_state()
             .invalidate_table_cache(namespace, table);
         self.runtime
-            .load_table_for_request(namespace, table, request_context)
+            .load_table_classified_for_request(namespace, table, request_context)
             .map(|loaded| loaded.into_table())
-            .map_err(map_provider_error)
+            .map_err(|(kind, message)| ConnectorError::new(kind, message))
     }
 }
 

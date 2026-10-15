@@ -592,97 +592,105 @@ fn execute_create_table(
             PublicationReceipts<ConnectorCatalogMutationReceipt>,
         ),
     }
-    let setup = (|| -> PreparationResult<PreparedCreate> {
-        ensure_owner(provider, &table.instance_id)?;
-        table_properties(columns, key, properties)?;
-        request.context.check_active()?;
-        let namespace = normalize_identifier(&table.namespace).map_err(invalid)?;
-        let name = normalize_identifier(&table.table).map_err(invalid)?;
-        let owner = Arc::clone(provider.runtime().novarocks_catalog());
-        let target = CatalogTableName::new(namespace.clone(), name.clone());
-        let seed = receipt(provider, request.operation_id, request.operation.kind())?;
-        let binding = provider
-            .runtime()
-            .resources()
-            .planning_binding()
-            .for_request(request.context.clone());
-        let exists = provider
-            .runtime()
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { owner.table_exists_for_read(target, binding).await })
-            .map_err(unavailable)??;
-        request.context.check_active()?;
-        if exists {
-            return if policy == CreatePolicy::NoOpIfExists {
-                Ok(PreparedCreate::NoOp(seed))
-            } else {
-                Err(PreparationFailure(ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::AlreadyExists,
-                    "Iceberg table already exists",
-                )))
-            };
-        }
-        let owner = Arc::clone(provider.runtime().novarocks_catalog());
-        let target = CatalogNamespaceName::new(namespace.clone());
-        let binding = provider
-            .runtime()
-            .resources()
-            .planning_binding()
-            .for_request(request.context.clone());
-        let exists = provider
-            .runtime()
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { owner.namespace_exists_for_read(target, binding).await })
-            .map_err(unavailable)??;
-        request.context.check_active()?;
-        if !exists {
-            return Err(not_found("Iceberg table namespace does not exist").into());
-        }
-        let (_, creation) = prepare_table_creation(table, columns, key, partitioning, properties)?;
-        let frozen = provider
-            .runtime()
-            .novarocks_catalog()
-            .freeze_create_publication(CatalogCreatePublicationRequest {
-                operation_id: request.operation_id.to_bytes(),
-                namespace: CatalogNamespaceName::new(namespace.clone()),
-                creation,
-                no_op_if_exists: policy == CreatePolicy::NoOpIfExists,
-            })?;
-        let (evidence, applied) = match frozen.conditional_create_facts() {
-            Some(facts) => (
-                hadoop_create_evidence(provider, request, table, &facts)?,
-                hadoop_create_receipt(
-                    provider,
-                    request.operation_id,
-                    request.operation.kind(),
-                    Some(&facts.metadata_location),
-                    &facts.table_uuid,
-                    &facts.metadata_digest,
-                )?,
-            ),
-            None => (
-                evidence(
-                    provider,
-                    request.operation_id,
-                    request.operation.kind(),
-                    IcebergMutationEvidenceTarget::Table {
-                        namespace,
-                        table: name,
-                        should_exist: true,
-                        before_uuid: None,
-                    },
-                )?,
-                seed.clone(),
-            ),
-        };
-        Ok(PreparedCreate::Mutation(
-            frozen,
-            evidence,
-            PublicationReceipts::for_effects(applied, seed),
-        ))
-    })();
+    let setup = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .observe_preparation(
+            || -> PreparationResult<PreparedCreate> {
+                ensure_owner(provider, &table.instance_id)?;
+                table_properties(columns, key, properties)?;
+                request.context.check_active()?;
+                let namespace = normalize_identifier(&table.namespace).map_err(invalid)?;
+                let name = normalize_identifier(&table.table).map_err(invalid)?;
+                let owner = Arc::clone(provider.runtime().novarocks_catalog());
+                let target = CatalogTableName::new(namespace.clone(), name.clone());
+                let seed = receipt(provider, request.operation_id, request.operation.kind())?;
+                let binding = provider
+                    .runtime()
+                    .resources()
+                    .planning_binding()
+                    .for_request(request.context.clone());
+                let exists = provider
+                    .runtime()
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(async move { owner.table_exists_for_read(target, binding).await })
+                    .map_err(unavailable)??;
+                request.context.check_active()?;
+                if exists {
+                    return if policy == CreatePolicy::NoOpIfExists {
+                        Ok(PreparedCreate::NoOp(seed))
+                    } else {
+                        Err(PreparationFailure(ConnectorMutationFailure::new(
+                            ConnectorMutationFailureKind::AlreadyExists,
+                            "Iceberg table already exists",
+                        )))
+                    };
+                }
+                let owner = Arc::clone(provider.runtime().novarocks_catalog());
+                let target = CatalogNamespaceName::new(namespace.clone());
+                let binding = provider
+                    .runtime()
+                    .resources()
+                    .planning_binding()
+                    .for_request(request.context.clone());
+                let exists = provider
+                    .runtime()
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(async move { owner.namespace_exists_for_read(target, binding).await })
+                    .map_err(unavailable)??;
+                request.context.check_active()?;
+                if !exists {
+                    return Err(not_found("Iceberg table namespace does not exist").into());
+                }
+                let (_, creation) =
+                    prepare_table_creation(table, columns, key, partitioning, properties)?;
+                let frozen = provider
+                    .runtime()
+                    .novarocks_catalog()
+                    .freeze_create_publication(CatalogCreatePublicationRequest {
+                        operation_id: request.operation_id.to_bytes(),
+                        namespace: CatalogNamespaceName::new(namespace.clone()),
+                        creation,
+                        no_op_if_exists: policy == CreatePolicy::NoOpIfExists,
+                    })?;
+                let (evidence, applied) = match frozen.conditional_create_facts() {
+                    Some(facts) => (
+                        hadoop_create_evidence(provider, request, table, &facts)?,
+                        hadoop_create_receipt(
+                            provider,
+                            request.operation_id,
+                            request.operation.kind(),
+                            Some(&facts.metadata_location),
+                            &facts.table_uuid,
+                            &facts.metadata_digest,
+                        )?,
+                    ),
+                    None => (
+                        evidence(
+                            provider,
+                            request.operation_id,
+                            request.operation.kind(),
+                            IcebergMutationEvidenceTarget::Table {
+                                namespace,
+                                table: name,
+                                should_exist: true,
+                                before_uuid: None,
+                            },
+                        )?,
+                        seed.clone(),
+                    ),
+                };
+                Ok(PreparedCreate::Mutation(
+                    frozen,
+                    evidence,
+                    PublicationReceipts::for_effects(applied, seed),
+                ))
+            },
+            |error| error.0.clone(),
+        );
     match setup {
         Err(PreparationFailure(failure)) => Ok(ExternalMutationOutcome::KnownUncommitted {
             failure,
@@ -743,83 +751,90 @@ fn execute_drop_table(
         Ok(receipt) => receipt,
         Err(error) => return Ok(known_uncommitted(error)),
     };
-    let setup = (|| -> PreparationResult<_> {
-        ensure_owner(provider, &table.instance_id)?;
-        request.context.check_active()?;
-        let namespace = normalize_identifier(&table.namespace).map_err(invalid)?;
-        let name = normalize_identifier(&table.table).map_err(invalid)?;
-        let target = CatalogTableName::new(namespace.clone(), name.clone());
-        let canonical = target.canonical();
-        let owner = Arc::clone(provider.runtime().novarocks_catalog());
-        let binding = provider
-            .runtime()
-            .resources()
-            .planning_binding()
-            .for_request(request.context.clone());
-        let lookup = target.clone();
-        let exists = provider
-            .runtime()
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { owner.table_exists_for_read(lookup, binding).await })
-            .map_err(unavailable)??;
-        request.context.check_active()?;
-        if !exists {
-            if *policy == DropPolicy::NoOpIfMissing {
-                return Ok(None);
-            }
-            return Err(not_found("Iceberg table does not exist").into());
-        }
-        // Cleanup identity is captured before deletion. A failed capture may
-        // leak objects, but cannot authorize collection of a replacement.
-        let owner = Arc::clone(provider.runtime().novarocks_catalog());
-        let binding = provider
-            .runtime()
-            .resources()
-            .planning_binding()
-            .for_request(request.context.clone());
-        let lookup = target.clone();
-        let loaded = provider
-            .runtime()
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { owner.load_table_for_read(lookup, binding).await })
-            .map_err(unavailable)?;
-        request.context.check_active()?;
-        let captured = match loaded {
-            Ok(loaded) => crate::catalog::CatalogDropTableReceipt {
-                table_uuid: Some(Arc::from(loaded.metadata().uuid().to_string())),
-                table_location: Some(Arc::from(loaded.metadata().location())),
-                metadata_location: loaded.metadata_location().map(Arc::from),
-                last_updated_ms: loaded.metadata().last_updated_ms(),
+    let setup = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .observe_preparation(
+            || -> PreparationResult<_> {
+                ensure_owner(provider, &table.instance_id)?;
+                request.context.check_active()?;
+                let namespace = normalize_identifier(&table.namespace).map_err(invalid)?;
+                let name = normalize_identifier(&table.table).map_err(invalid)?;
+                let target = CatalogTableName::new(namespace.clone(), name.clone());
+                let canonical = target.canonical();
+                let owner = Arc::clone(provider.runtime().novarocks_catalog());
+                let binding = provider
+                    .runtime()
+                    .resources()
+                    .planning_binding()
+                    .for_request(request.context.clone());
+                let lookup = target.clone();
+                let exists = provider
+                    .runtime()
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(async move { owner.table_exists_for_read(lookup, binding).await })
+                    .map_err(unavailable)??;
+                request.context.check_active()?;
+                if !exists {
+                    if *policy == DropPolicy::NoOpIfMissing {
+                        return Ok(None);
+                    }
+                    return Err(not_found("Iceberg table does not exist").into());
+                }
+                // Cleanup identity is captured before deletion. A failed capture may
+                // leak objects, but cannot authorize collection of a replacement.
+                let owner = Arc::clone(provider.runtime().novarocks_catalog());
+                let binding = provider
+                    .runtime()
+                    .resources()
+                    .planning_binding()
+                    .for_request(request.context.clone());
+                let lookup = target.clone();
+                let loaded = provider
+                    .runtime()
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(async move { owner.load_table_for_read(lookup, binding).await })
+                    .map_err(unavailable)?;
+                request.context.check_active()?;
+                let captured = match loaded {
+                    Ok(loaded) => crate::catalog::CatalogDropTableReceipt {
+                        table_uuid: Some(Arc::from(loaded.metadata().uuid().to_string())),
+                        table_location: Some(Arc::from(loaded.metadata().location())),
+                        metadata_location: loaded.metadata_location().map(Arc::from),
+                        last_updated_ms: loaded.metadata().last_updated_ms(),
+                    },
+                    Err(_) => crate::catalog::CatalogDropTableReceipt {
+                        table_uuid: None,
+                        table_location: None,
+                        metadata_location: None,
+                        last_updated_ms: 0,
+                    },
+                };
+                let evidence = evidence(
+                    provider,
+                    request.operation_id,
+                    request.operation.kind(),
+                    IcebergMutationEvidenceTarget::Table {
+                        namespace,
+                        table: name,
+                        should_exist: false,
+                        before_uuid: captured.table_uuid.as_ref().map(ToString::to_string),
+                    },
+                )?;
+                let frozen = CatalogPublicationRequest::DropTable {
+                    table: target,
+                    no_op_if_missing: *policy == DropPolicy::NoOpIfMissing,
+                    purge: *data_disposition == ConnectorDropTableDataDisposition::Purge,
+                    capture: Some(captured.clone()),
+                }
+                .freeze(request.operation_id.to_bytes())?;
+                Ok(Some((frozen, evidence, seed.clone(), canonical, captured)))
             },
-            Err(_) => crate::catalog::CatalogDropTableReceipt {
-                table_uuid: None,
-                table_location: None,
-                metadata_location: None,
-                last_updated_ms: 0,
-            },
-        };
-        let evidence = evidence(
-            provider,
-            request.operation_id,
-            request.operation.kind(),
-            IcebergMutationEvidenceTarget::Table {
-                namespace,
-                table: name,
-                should_exist: false,
-                before_uuid: captured.table_uuid.as_ref().map(ToString::to_string),
-            },
-        )?;
-        let frozen = CatalogPublicationRequest::DropTable {
-            table: target,
-            no_op_if_missing: *policy == DropPolicy::NoOpIfMissing,
-            purge: *data_disposition == ConnectorDropTableDataDisposition::Purge,
-            capture: Some(captured.clone()),
-        }
-        .freeze(request.operation_id.to_bytes())?;
-        Ok(Some((frozen, evidence, seed.clone(), canonical, captured)))
-    })();
+            |error| error.0.clone(),
+        );
     let (frozen, evidence, seed, canonical, captured) = match setup {
         Err(PreparationFailure(failure)) => {
             return Ok(ExternalMutationOutcome::KnownUncommitted {
@@ -2151,134 +2166,150 @@ fn execute_view_publication(
             receipt: ConnectorCatalogMutationReceipt,
         },
     }
-    let preparation = (|| -> PreparationResult<_> {
-        let (view, create) = match &request.operation {
-            ConnectorCatalogMutationOperation::CreateView { view, .. } => (view, true),
-            ConnectorCatalogMutationOperation::DropView { view, .. } => (view, false),
-            _ => return Err(internal("View publication requires a view mutation").into()),
-        };
-        ensure_owner(provider, &view.instance_id)?;
-        let namespace = normalize_identifier(&view.namespace).map_err(invalid)?;
-        let name = normalize_identifier(&view.view).map_err(invalid)?;
-        if create
-            && provider
-                .runtime()
-                .list_tables_for_request(
+    let preparation = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .observe_preparation(
+            || -> PreparationResult<_> {
+                let (view, create) = match &request.operation {
+                    ConnectorCatalogMutationOperation::CreateView { view, .. } => (view, true),
+                    ConnectorCatalogMutationOperation::DropView { view, .. } => (view, false),
+                    _ => return Err(internal("View publication requires a view mutation").into()),
+                };
+                ensure_owner(provider, &view.instance_id)?;
+                let namespace = normalize_identifier(&view.namespace).map_err(invalid)?;
+                let name = normalize_identifier(&view.view).map_err(invalid)?;
+                if create
+                    && provider
+                        .runtime()
+                        .list_tables_for_request(
+                            &namespace,
+                            &request.context,
+                            novarocks_spi::connector::ConnectorListingBound::V1,
+                        )
+                        .map_err(|(kind, message)| ConnectorError::new(kind, message))?
+                        .iter()
+                        .any(|table| table.eq_ignore_ascii_case(&name))
+                {
+                    return Err(PreparationFailure(ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::AlreadyExists,
+                        "a table with the requested Iceberg view name already exists",
+                    )));
+                }
+                let exists = super::views::view_exists(
+                    provider.runtime(),
                     &namespace,
+                    &name,
                     &request.context,
-                    novarocks_spi::connector::ConnectorListingBound::V1,
-                )
-                .map_err(|(kind, message)| ConnectorError::new(kind, message))?
-                .iter()
-                .any(|table| table.eq_ignore_ascii_case(&name))
-        {
-            return Err(PreparationFailure(ConnectorMutationFailure::new(
-                ConnectorMutationFailureKind::AlreadyExists,
-                "a table with the requested Iceberg view name already exists",
-            )));
-        }
-        let exists =
-            super::views::view_exists(provider.runtime(), &namespace, &name, &request.context)?;
-        let seed = receipt(provider, request.operation_id, request.operation.kind())?;
-        let publication = match &request.operation {
-            ConnectorCatalogMutationOperation::CreateView {
-                columns,
-                definition,
-                comment,
-                properties,
-                policy,
-                ..
-            } => {
-                if exists {
-                    match policy {
-                        CreateOrReplacePolicy::NoOpIfExists => return Ok(PreparedView::NoOp(seed)),
-                        CreateOrReplacePolicy::FailIfExists => {
-                            return Err(PreparationFailure(ConnectorMutationFailure::new(
-                                ConnectorMutationFailureKind::AlreadyExists,
-                                "Iceberg view already exists",
-                            )));
-                        }
-                        CreateOrReplacePolicy::ReplaceIfExists => (),
-                    }
-                }
-                let (definition, properties) = super::views::prepare_definition(
-                    columns,
-                    definition,
-                    comment.as_deref(),
-                    &view_properties(properties)?,
-                )
-                .map_err(invalid)?;
-                if exists {
-                    let current = super::views::load_view_metadata_for_request(
-                        provider.runtime(),
-                        &namespace,
-                        &name,
-                        &request.context,
-                    )?;
-                    let ident =
-                        TableIdent::new(NamespaceIdent::new(namespace.clone()), name.clone());
-                    let replacement = crate::catalog::view_request::ValidatedViewReplace::validate(
-                        ident, &current, definition, properties,
-                    )
-                    .map_err(invalid)?;
-                    CatalogPublicationRequest::ReplaceView(replacement)
-                } else {
-                    let creation = crate::catalog::view_request::ViewCreate::validate(
-                        name.clone(),
+                )?;
+                let seed = receipt(provider, request.operation_id, request.operation.kind())?;
+                let publication = match &request.operation {
+                    ConnectorCatalogMutationOperation::CreateView {
+                        columns,
                         definition,
+                        comment,
                         properties,
-                    )
-                    .map_err(invalid)?;
-                    CatalogPublicationRequest::CreateView {
-                        namespace: CatalogNamespaceName::new(namespace.clone()),
-                        creation,
+                        policy,
+                        ..
+                    } => {
+                        if exists {
+                            match policy {
+                                CreateOrReplacePolicy::NoOpIfExists => {
+                                    return Ok(PreparedView::NoOp(seed));
+                                }
+                                CreateOrReplacePolicy::FailIfExists => {
+                                    return Err(PreparationFailure(ConnectorMutationFailure::new(
+                                        ConnectorMutationFailureKind::AlreadyExists,
+                                        "Iceberg view already exists",
+                                    )));
+                                }
+                                CreateOrReplacePolicy::ReplaceIfExists => (),
+                            }
+                        }
+                        let (definition, properties) = super::views::prepare_definition(
+                            columns,
+                            definition,
+                            comment.as_deref(),
+                            &view_properties(properties)?,
+                        )
+                        .map_err(invalid)?;
+                        if exists {
+                            let current = super::views::load_view_metadata_for_request(
+                                provider.runtime(),
+                                &namespace,
+                                &name,
+                                &request.context,
+                            )?;
+                            let ident = TableIdent::new(
+                                NamespaceIdent::new(namespace.clone()),
+                                name.clone(),
+                            );
+                            let replacement =
+                                crate::catalog::view_request::ValidatedViewReplace::validate(
+                                    ident, &current, definition, properties,
+                                )
+                                .map_err(invalid)?;
+                            CatalogPublicationRequest::ReplaceView(replacement)
+                        } else {
+                            let creation = crate::catalog::view_request::ViewCreate::validate(
+                                name.clone(),
+                                definition,
+                                properties,
+                            )
+                            .map_err(invalid)?;
+                            CatalogPublicationRequest::CreateView {
+                                namespace: CatalogNamespaceName::new(namespace.clone()),
+                                creation,
+                            }
+                        }
                     }
+                    ConnectorCatalogMutationOperation::DropView { policy, .. } => {
+                        if !exists {
+                            return if *policy == DropPolicy::NoOpIfMissing {
+                                Ok(PreparedView::NoOp(seed))
+                            } else {
+                                Err(not_found("Iceberg view does not exist").into())
+                            };
+                        }
+                        CatalogPublicationRequest::DropView(CatalogTableName::new(
+                            namespace.clone(),
+                            name.clone(),
+                        ))
+                    }
+                    _ => unreachable!(),
                 }
-            }
-            ConnectorCatalogMutationOperation::DropView { policy, .. } => {
-                if !exists {
-                    return if *policy == DropPolicy::NoOpIfMissing {
-                        Ok(PreparedView::NoOp(seed))
-                    } else {
-                        Err(not_found("Iceberg view does not exist").into())
-                    };
-                }
-                CatalogPublicationRequest::DropView(CatalogTableName::new(
-                    namespace.clone(),
-                    name.clone(),
-                ))
-            }
-            _ => unreachable!(),
-        }
-        .freeze(request.operation_id.to_bytes())?;
-        let target = match publication.attribution() {
-            crate::commit::publication_descriptor::AttributionPlan::ViewOperation {
-                view_uuid: Some(uuid),
-                operation_id,
-            } => IcebergMutationEvidenceTarget::ViewOperation {
-                namespace,
-                view: name,
-                view_uuid: uuid.to_string(),
-                operation_marker: operation_id.clone(),
+                .freeze(request.operation_id.to_bytes())?;
+                let target = match publication.attribution() {
+                    crate::commit::publication_descriptor::AttributionPlan::ViewOperation {
+                        view_uuid: Some(uuid),
+                        operation_id,
+                    } => IcebergMutationEvidenceTarget::ViewOperation {
+                        namespace,
+                        view: name,
+                        view_uuid: uuid.to_string(),
+                        operation_marker: operation_id.clone(),
+                    },
+                    _ => IcebergMutationEvidenceTarget::View {
+                        namespace,
+                        view: name,
+                        should_exist: create,
+                    },
+                };
+                let evidence = evidence(
+                    provider,
+                    request.operation_id,
+                    request.operation.kind(),
+                    target,
+                )?;
+                Ok(PreparedView::Mutation {
+                    request: publication,
+                    evidence,
+                    receipt: seed,
+                })
             },
-            _ => IcebergMutationEvidenceTarget::View {
-                namespace,
-                view: name,
-                should_exist: create,
-            },
-        };
-        let evidence = evidence(
-            provider,
-            request.operation_id,
-            request.operation.kind(),
-            target,
-        )?;
-        Ok(PreparedView::Mutation {
-            request: publication,
-            evidence,
-            receipt: seed,
-        })
-    })();
+            |error| error.0.clone(),
+        );
     match preparation {
         Err(PreparationFailure(failure)) => Ok(ExternalMutationOutcome::KnownUncommitted {
             failure,
@@ -2472,13 +2503,25 @@ fn execute_application_document_update(
     let observation = intent.observation();
     let table = observation.target();
     ensure_owner(provider, &table.instance_id)?;
-    let loaded = match provider.runtime().load_table_for_request(
-        &table.namespace,
-        &table.table,
-        &request.context,
-    ) {
+    let loaded = match provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .observe_preparation(
+            || {
+                provider
+                    .runtime()
+                    .load_table_classified_for_request(
+                        &table.namespace,
+                        &table.table,
+                        &request.context,
+                    )
+                    .map_err(|(kind, message)| ConnectorError::new(kind, message))
+            },
+            failure,
+        ) {
         Ok(loaded) => loaded,
-        Err(error) => return Ok(known_uncommitted(unavailable(error))),
+        Err(error) => return Ok(known_uncommitted(error)),
     };
     if let Err(error) = crate::document_storage::observation::validate_expected_object(
         observation.object_id(),
@@ -6984,6 +7027,118 @@ mod tests {
                 })
                 .expect_err("MV reconcile is crash-only");
             assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        }
+    }
+
+    #[test]
+    fn activity_preflight_reads_before_a_journal_keep_waits_and_typed_stops_visible() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use novarocks_spi::connector::{
+            CatalogActivityPhase as P, CatalogActivityReader, CatalogScopeIdentity,
+        };
+        for kind in ["create", "drop", "view"] {
+            for timed_out in [false, true] {
+                let path = if kind == "view" {
+                    "/v1/namespaces/db/tables"
+                } else {
+                    "/v1/namespaces/atomic/tables/events"
+                };
+                let wire = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+                let get_wire = wire.clone();
+                let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+                let server = TestServer::start(
+                    Script::new()
+                        .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                        .on_fn("GET", path, move |_, _| {
+                            entered_tx.send(()).unwrap();
+                            let (lock, ready) = &*get_wire;
+                            drop(
+                                ready
+                                    .wait_timeout_while(
+                                        lock.lock().unwrap(),
+                                        Duration::from_secs(20),
+                                        |released| !*released,
+                                    )
+                                    .unwrap(),
+                            );
+                            Reply::status(404)
+                        }),
+                );
+                let _server_release = ReleaseProducerRead(wire.clone());
+                let root = crate::activity::CatalogActivity::new(CatalogScopeIdentity::new(
+                    ConnectorProviderId::parse("iceberg").unwrap(),
+                    ConnectorInstanceId::parse("ice").unwrap(),
+                    uuid::Uuid::now_v7(),
+                ));
+                let (_executor, provider) =
+                    variant_definition_provider_observed(&server.url(), Some(root.generation()));
+                let mut request = match kind {
+                    "create" => create_request(
+                        &provider,
+                        ConnectorMutationOperationId::new(),
+                        CreatePolicy::FailIfExists,
+                    ),
+                    "drop" => drop_request(&provider, DropPolicy::FailIfMissing, false),
+                    _ => view_request(&provider, "create"),
+                };
+                let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+                request.context = ConnectorRequestContext::try_new(
+                    Instant::now() + Duration::from_secs(if timed_out { 2 } else { 20 }),
+                    stop.view(),
+                    64 * 1024,
+                    256 * 1024,
+                )
+                .unwrap();
+                std::thread::scope(|threads| {
+                    let release = ReleaseProducerRead(wire.clone());
+                    let worker = threads.spawn(|| provider.execute(request));
+                    entered_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("original-control preflight reached actual GET");
+                    let snapshot = root.snapshot();
+                    assert_eq!(
+                        snapshot.phases[P::PreDispatch as usize].inflight,
+                        1,
+                        "{kind}"
+                    );
+                    assert_eq!(snapshot.phases[P::Bridge as usize].inflight, 1);
+                    assert_eq!(snapshot.phases[P::Dispatch as usize].started, 0);
+                    if !timed_out {
+                        stop.request_stop();
+                    }
+                    let outcome = worker.join().unwrap().unwrap();
+                    let ExternalMutationOutcome::KnownUncommitted { failure, .. } = outcome else {
+                        panic!("preflight cannot publish")
+                    };
+                    assert_eq!(
+                        failure.kind(),
+                        if timed_out {
+                            ConnectorMutationFailureKind::DeadlineExceeded
+                        } else {
+                            ConnectorMutationFailureKind::Cancelled
+                        }
+                    );
+                    let snapshot = root.snapshot();
+                    assert_eq!(snapshot.phases[P::PreDispatch as usize].inflight, 0);
+                    assert_eq!(snapshot.phases[P::PreDispatch as usize].elapsed_count, 1);
+                    assert_eq!(snapshot.phases[P::Bridge as usize].inflight, 0);
+                    assert_eq!(snapshot.phases[P::Dispatch as usize].started, 0);
+                    assert_eq!(
+                        snapshot.events.pre_dispatch_cancelled,
+                        u64::from(!timed_out)
+                    );
+                    assert_eq!(snapshot.events.pre_dispatch_timed_out, u64::from(timed_out));
+                    assert!(
+                        server
+                            .requests()
+                            .iter()
+                            .all(|request| request.method == "GET" || request.method == "HEAD")
+                    );
+                    drop(release);
+                });
+                drop(provider);
+                server.shut_down();
+            }
         }
     }
 

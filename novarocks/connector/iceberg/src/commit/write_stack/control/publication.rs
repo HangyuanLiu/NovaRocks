@@ -528,7 +528,14 @@ impl IcebergWriteSessionControl {
             .resources()
             .catalog_runtime()
             .block_on(async move {
-                let intent = match recipe.intent(&run_operation).await {
+                let intent = match run_operation
+                    .runtime()
+                    .observe_preparation_async(
+                        recipe.intent(&run_operation),
+                        attempt::before_dispatch_failure,
+                    )
+                    .await
+                {
                     Ok(intent) => intent,
                     Err(error) => {
                         return attempt::rejected(
