@@ -193,7 +193,17 @@ impl PendingCreateIntentObservation {
         let catalog = request.catalog_handle.clone();
         let view = lease
             .observe_keyed_documents(request)
-            .map_err(|_| ManagementObservationError::UnsealedObservation)?;
+            .map_err(|error| match error {
+                novarocks_spi::connector::KeyedDocumentReadError::Invalid(error)
+                    if error.table_object_binding_failure()
+                        == Some(
+                            novarocks_spi::connector::ConnectorTableObjectBindingFailure::Replaced,
+                        ) =>
+                {
+                    ManagementObservationError::Ownership(ManagementOwnershipError::TargetReplaced)
+                }
+                _ => ManagementObservationError::UnsealedObservation,
+            })?;
         let slot = view
             .slots
             .get(
@@ -279,7 +289,17 @@ impl PendingManagementObservation {
         }
         let view = lease
             .observe_keyed_documents(request)
-            .map_err(|_| ManagementObservationError::UnsealedObservation)?;
+            .map_err(|error| match error {
+                novarocks_spi::connector::KeyedDocumentReadError::Invalid(error)
+                    if error.table_object_binding_failure()
+                        == Some(
+                            novarocks_spi::connector::ConnectorTableObjectBindingFailure::Replaced,
+                        ) =>
+                {
+                    ManagementObservationError::Ownership(ManagementOwnershipError::TargetReplaced)
+                }
+                _ => ManagementObservationError::UnsealedObservation,
+            })?;
         let slot = view
             .slots
             .get(
