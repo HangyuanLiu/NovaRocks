@@ -700,7 +700,26 @@ impl AggregateStreamingSinkOperator {
         if self.group_states.is_empty() {
             if self.group_by.is_empty() {
                 self.ensure_scalar_group().map_err(|e| e.to_string())?;
-            } else if !self.output_chunk_schema.is_typed() {
+            } else if self.output_chunk_schema.is_typed() {
+                let kernels = self
+                    .kernels
+                    .as_ref()
+                    .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
+                let factory = self
+                    .construction
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+                let chunk = AggregateOutputCreation::begin(
+                    &self.output_chunk_schema,
+                    &self.arena,
+                    &self.group_by,
+                    &kernels.entries,
+                    self.output_intermediate,
+                    factory.as_ref(),
+                )?
+                .finish_empty()?;
+                return Ok(vec![chunk]);
+            } else {
                 let schema = self
                     .output_schema
                     .clone()
@@ -1356,6 +1375,76 @@ mod retained_memory_tests {
             .set_finishing(&RuntimeState::default())
             .expect("finish streaming aggregate");
         state.poll_chunk().expect("streaming aggregate output")
+    }
+
+    // The real streaming sink uses a typed frozen DISTINCT SUM selection and
+    // the original shared state. Empty output is deliberately not enqueued by
+    // that state's existing policy; the common output-author test checks its
+    // exact zero-row arrays, while this checks the actual consumer lifecycle.
+    #[test]
+    fn typed_grouped_empty_streaming_preserves_scalar_null_group_and_finish_lifecycle() {
+        use super::super::typed_empty_tests::{all_null_group, declaration};
+        for (grouped, populated) in [(true, false), (false, false), (true, true)] {
+            let declaration = declaration(grouped);
+            let tracker = declaration.tracker.clone();
+            {
+                let state = AggregateStreamingState::new(1);
+                let factory = AggregateStreamingSinkFactory::new_native(
+                    702,
+                    declaration.arena,
+                    declaration.groups,
+                    declaration.functions,
+                    declaration.function_set,
+                    declaration.resolved,
+                    false,
+                    declaration.schema.clone(),
+                    state.clone(),
+                    vec![],
+                    None,
+                    1,
+                )
+                .unwrap();
+                let mut operator = factory.create(1, 0);
+                operator.set_mem_tracker(tracker.clone());
+                operator.set_construction_factory(declaration.construction);
+                operator.prepare().unwrap();
+                let processor = operator.as_processor_mut().unwrap();
+                let runtime = RuntimeState::default();
+                if populated {
+                    processor.push_chunk(&runtime, all_null_group()).unwrap();
+                }
+                processor.set_finishing(&runtime).unwrap();
+                processor.set_finishing(&runtime).unwrap();
+                assert!(processor.is_finished());
+                let output = state.poll_chunk();
+                if grouped && !populated {
+                    assert!(
+                        output.is_none(),
+                        "the original streaming queue drops zero-row batches"
+                    );
+                } else {
+                    let output = output.unwrap();
+                    assert_eq!(output.len(), 1);
+                    for (actual, declared) in output
+                        .chunk_schema()
+                        .slots()
+                        .iter()
+                        .zip(declaration.schema.slots())
+                    {
+                        assert_eq!(actual.typed_binding(), declared.typed_binding());
+                    }
+                    assert!(output.columns().last().unwrap().is_null(0));
+                }
+                assert!(state.poll_chunk().is_none());
+                assert!(state.is_done());
+            }
+            drop(declaration.schema);
+            assert_eq!(
+                tracker.current(),
+                0,
+                "the actual streaming sink and queued results have exited"
+            );
+        }
     }
 
     #[test]

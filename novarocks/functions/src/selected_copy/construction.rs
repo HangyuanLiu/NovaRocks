@@ -199,22 +199,39 @@ pub fn preflight_null_construction<H>(
 ) -> Result<CopyOperationFacts, CopyConstructionError<H>> {
     let observed = KernelControlObservation::new(control);
     let mut work = EvaluationCheckpoints::new(&observed);
+    preflight_null_construction_with_observation(layout, rows, creation, &mut |boundary| {
+        if boundary {
+            work.flush().map_err(CopyError::Control)
+        } else {
+            work.step().map_err(CopyError::Control)
+        }
+        .map_err(CopyConstructionError::Copy)
+    })
+}
+
+/// The same complete empty-constructor invoice with the caller's original
+/// construction/control cause. Unlike structure-only preflight, this includes
+/// the zero-row offset buffers of bytes and nested arrays.
+pub fn preflight_empty_construction_observed<H>(
+    layout: &novarocks_type_contract::ValueLayout,
+    creation: &mut ValueSchemaCreation<'_, H>,
+    observe: &mut impl FnMut(bool) -> Result<(), H>,
+) -> Result<CopyOperationFacts, CopyConstructionError<H>> {
+    preflight_null_construction_with_observation(layout, 0, creation, &mut |boundary| {
+        observe(boundary).map_err(CopyConstructionError::Creator)
+    })
+}
+
+fn preflight_null_construction_with_observation<H>(
+    layout: &novarocks_type_contract::ValueLayout,
+    rows: usize,
+    creation: &mut ValueSchemaCreation<'_, H>,
+    observe: &mut impl FnMut(bool) -> Result<(), CopyConstructionError<H>>,
+) -> Result<CopyOperationFacts, CopyConstructionError<H>> {
     let mut invoice = take_host::CopyInvoiceTotals::default();
-    let metadata = null_node(
-        layout.data_type(),
-        rows,
-        &mut invoice,
-        false,
-        &mut |boundary| {
-            if boundary {
-                work.flush().map_err(CopyError::Control)
-            } else {
-                work.step().map_err(CopyError::Control)
-            }
-        },
-    )?;
+    let metadata = null_node(layout.data_type(), rows, &mut invoice, false, observe)?;
     let facts = invoice.finish(metadata)?;
-    work.flush().map_err(CopyError::Control)?;
+    observe(true)?;
     creation
         .observe_opaque_upper_bound(facts.operation_peak_bytes())
         .map_err(CopyConstructionError::Creator)?;
@@ -650,6 +667,84 @@ mod tests {
             .unwrap();
         assert_eq!(child.value_offsets(), &[0]);
     }
+    // Protect the complete zero-row author used by typed aggregate output.
+    // The independent Arrow constructor still has one offset for each bytes
+    // node; the observed port must retain the caller's exact refusal/control.
+    // This owner-local unit test has no service or performance prerequisites.
+    #[test]
+    fn empty_observed_full_invoice_keeps_offsets_and_original_creator_cause() {
+        #[derive(Debug, PartialEq)]
+        enum Cause {
+            Stopped,
+            Refused,
+        }
+        for (ty, backing) in [
+            (DataType::Utf8, 64),
+            (
+                DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    true,
+                ))),
+                128,
+            ),
+        ] {
+            let layout = ValueLayout::try_new(&ty, ValueTypeStorageLifetime::pure()).unwrap();
+            let mut charged = 0;
+            let mut request = |_: Layout| Ok::<_, Cause>(());
+            let mut opaque = |bytes| {
+                charged += bytes;
+                Ok::<_, Cause>(())
+            };
+            let mut creation = ValueSchemaCreation::new(
+                ValueTypeStorageLifetime::pure(),
+                &mut request,
+                &mut opaque,
+            );
+            let facts =
+                preflight_empty_construction_observed(&layout, &mut creation, &mut |_| Ok(()))
+                    .unwrap();
+            assert_eq!(facts.retained_new_backing_upper(), backing);
+            assert_eq!(charged, facts.operation_peak_bytes());
+            assert!(charged > facts.metadata_upper_bytes());
+            let array = arrow_array::new_empty_array(&ty);
+            assert_eq!(array.len(), 0);
+            let bytes = if let Some(list) = array.as_any().downcast_ref::<arrow_array::ListArray>()
+            {
+                assert_eq!(list.value_offsets(), &[0]);
+                list.values().as_ref()
+            } else {
+                array.as_ref()
+            };
+            assert_eq!(
+                bytes
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value_offsets(),
+                &[0]
+            );
+
+            let mut opaque = |_: usize| Err(Cause::Refused);
+            let mut creation = ValueSchemaCreation::new(
+                ValueTypeStorageLifetime::pure(),
+                &mut request,
+                &mut opaque,
+            );
+            assert!(matches!(
+                preflight_empty_construction_observed(&layout, &mut creation, &mut |_| Ok(()),),
+                Err(CopyConstructionError::Creator(Cause::Refused))
+            ));
+            // A stop in the borrowed walk occurs before an opaque admission.
+            assert!(matches!(
+                preflight_empty_construction_observed(&layout, &mut creation, &mut |_| Err(
+                    Cause::Stopped
+                ),),
+                Err(CopyConstructionError::Creator(Cause::Stopped))
+            ));
+        }
+    }
+
     #[test]
     fn copy_creator_refusal_preserves_original_cause_before_cancelled_tail() {
         #[derive(Debug, PartialEq)]
