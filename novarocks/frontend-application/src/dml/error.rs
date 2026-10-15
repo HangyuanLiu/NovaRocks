@@ -39,6 +39,7 @@ pub struct DmlError {
     engine_error_code: Option<EngineErrorCode>,
     cow_failure: Option<crate::query_execution::dml::mutation_flow::CowFailure>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
+    staged_create_preparation: Option<Box<DmlStagedCreateFailure>>,
 }
 
 /// DML-local carrier for a SQL analysis error before the frontend client
@@ -162,6 +163,13 @@ impl From<crate::query_execution::dml::mutation_flow::CowFailure> for DmlExecuti
     }
 }
 
+/// Positive stage evidence retained independently of final publication.
+#[derive(Debug)]
+pub struct DmlStagedCreateFailure {
+    pub receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
+    pub finalization: novarocks_spi::connector::ExternalMutationFinalization,
+}
+
 impl DmlError {
     fn cow(error: crate::query_execution::dml::mutation_flow::CowFailure) -> Self {
         Self {
@@ -172,6 +180,7 @@ impl DmlError {
             engine_error_code: None,
             cow_failure: Some(error),
             compile_control: None,
+            staged_create_preparation: None,
         }
     }
     pub(crate) fn take_cow_failure(
@@ -189,6 +198,7 @@ impl DmlError {
             engine_error_code: None,
             cow_failure: None,
             compile_control: None,
+            staged_create_preparation: None,
         }
     }
 
@@ -228,6 +238,7 @@ impl DmlError {
             engine_error_code: None,
             cow_failure: None,
             compile_control: None,
+            staged_create_preparation: None,
         }
     }
 
@@ -246,6 +257,7 @@ impl DmlError {
             engine_error_code: None,
             cow_failure: None,
             compile_control: None,
+            staged_create_preparation: None,
         }
     }
 
@@ -277,6 +289,22 @@ impl DmlError {
 
     pub(crate) const fn engine_error_code(&self) -> Option<EngineErrorCode> {
         self.engine_error_code
+    }
+
+    pub(crate) fn with_unusable_stage(
+        mut self,
+        receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
+        finalization: novarocks_spi::connector::ExternalMutationFinalization,
+    ) -> Self {
+        self.staged_create_preparation = Some(Box::new(DmlStagedCreateFailure {
+            receipt,
+            finalization,
+        }));
+        self
+    }
+
+    pub fn staged_create_preparation(&self) -> Option<&DmlStagedCreateFailure> {
+        self.staged_create_preparation.as_deref()
     }
 
     pub fn publication_terminal(&self) -> Option<&LakePublicationTerminal> {

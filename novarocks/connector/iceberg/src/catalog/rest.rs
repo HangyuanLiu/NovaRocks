@@ -188,6 +188,146 @@ fn accept_rest_page(
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksRestCatalog {
+    fn materialize_staged_create_response(
+        &self,
+        table: CatalogTableName,
+        document: Vec<u8>,
+    ) -> Result<super::StagedCreateMaterial, ConnectorError> {
+        let invalid = |message: &str| ConnectorError::new(ConnectorErrorKind::CorruptData, message);
+        let response =
+            serde_json::from_slice::<crate::rest_protocol::wire::LoadTableResult>(&document)
+                .map_err(|_| invalid("REST stage-create response could not be decoded"))?;
+        let initialization_updates =
+            crate::commit::staging::staged_create_updates(&response.metadata)
+                .map_err(|_| invalid("REST stage-create response has invalid initial metadata"))?;
+        let ident = super::delegate::table_ident(&table)?;
+        let (frozen, delegation) = crate::rest_protocol::deferred::FrozenLoadTable::from_response(
+            ident,
+            response,
+            self.endpoints.runtime().clone(),
+        );
+        let (table, access_delegation) = match self.access_delegation {
+            RestAccessDelegationMode::Static => {
+                let file_io = self
+                    .endpoints
+                    .static_file_io()
+                    .ok_or_else(|| invalid("REST static generation has no storage factory"))?;
+                let table = frozen
+                    .materialize(file_io)
+                    .map_err(|_| invalid("REST staged table could not be materialized"))?;
+                (
+                    crate::loaded_table::IcebergLoadedTableMaterialization::Materialized(table),
+                    IcebergAccessDelegation::static_binding(),
+                )
+            }
+            RestAccessDelegationMode::Vended => (
+                crate::loaded_table::IcebergLoadedTableMaterialization::DeferredRest(frozen),
+                parse_rest_delegation(delegation)
+                    .map_err(|_| invalid("REST staged delegation could not be decoded"))?,
+            ),
+        };
+        Ok(super::StagedCreateMaterial {
+            table,
+            initialization_updates,
+            access_delegation,
+        })
+    }
+
+    async fn prepare_catalog_publication(
+        &self,
+        request: super::catalog_request::FrozenCatalogPublication,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+        document: super::catalog_request::CatalogResponseDocument,
+    ) -> super::publication_dispatch::PreparationResult<
+        super::publication_dispatch::PreparedPublication,
+    > {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        preparation.check_active()?;
+        self.endpoints.publication_generation.require(generation)?;
+        request.validate_descriptor(&descriptor)?;
+        self.admit_operation(&request.operation, &request.target)
+            .map_err(|reason| {
+                super::publication_dispatch::PreparationFailure(
+                    novarocks_spi::connector::ConnectorMutationFailure::new(
+                        novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                        reason.message(),
+                    ),
+                )
+            })?;
+        if request.stage_create {
+            let CatalogAdmissionTarget::Table(table) = &request.target else {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Staged create requires a table target",
+                )
+                .into());
+            };
+            let namespace = CatalogNamespaceName::new(Arc::clone(&table.namespace));
+            if !self
+                .delegate
+                .listing
+                .run(&preparation, self.namespace_exists(namespace))
+                .await?
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    "Staged create namespace does not exist",
+                )
+                .into());
+            }
+        }
+        if request.operation == CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable)
+            && self.access_delegation == RestAccessDelegationMode::Vended
+        {
+            return Err(super::publication_dispatch::PreparationFailure(
+                novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                    "REST ordinary create cannot hand off vended storage credentials; use staged create",
+                ),
+            ));
+        }
+        let prepared = crate::rest_protocol::mutation::prepared::PreparedRestMutation::prepare(
+            Arc::clone(&self.endpoints),
+            request.route,
+            &descriptor,
+            generation,
+            &preparation,
+            request.expectation,
+            request.stage_create,
+            request
+                .stage_create
+                .then_some(crate::rest_protocol::endpoints::VENDED_CREDENTIALS),
+        )
+        .await?;
+        if request.stage_create && self.endpoints.is_vended() {
+            let binding = self.endpoints.established_binding().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "Prepared REST stage has no established session",
+                )
+            })?;
+            crate::rest_protocol::routing::preflight_route(
+                &binding,
+                &self.endpoints.route_admission(),
+            )
+            .map_err(|error| {
+                super::publication_dispatch::PreparationFailure(
+                    novarocks_spi::connector::ConnectorMutationFailure::new(
+                        novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                        error.message(),
+                    ),
+                )
+            })?;
+        }
+        preparation.check_active()?;
+        Ok(super::publication_dispatch::PreparedPublication::Mutation {
+            binding: Some(prepared.binding().clone()),
+            dispatch: Box::new(PreparedRestCatalogPublication { prepared, document }),
+        })
+    }
+
     fn bind_publication_generation(
         &self,
         generation: novarocks_spi::connector::ProviderBindingEpoch,
@@ -2615,6 +2755,24 @@ mod evidence_tests {
 }
 
 struct PreparedRestTablePublication(crate::rest_protocol::mutation::prepared::PreparedRestMutation);
+struct PreparedRestCatalogPublication {
+    prepared: crate::rest_protocol::mutation::prepared::PreparedRestMutation,
+    document: super::catalog_request::CatalogResponseDocument,
+}
+#[async_trait]
+impl super::publication_dispatch::PreparedCatalogDispatch for PreparedRestCatalogPublication {
+    async fn dispatch_once(
+        self: Box<Self>,
+        evidence: super::publication::EvidenceContext,
+    ) -> super::publication_dispatch::DispatchCompletion {
+        let result = self.prepared.dispatch(evidence).await;
+        let evidence = result.dispatch_evidence();
+        // Moving already-read response data is infallible and performs no
+        // materialization. Only the journal will record the conclusion.
+        self.document.retain(result.document);
+        super::publication_dispatch::DispatchCompletion::evidence(evidence)
+    }
+}
 #[async_trait]
 impl super::publication_dispatch::PreparedCatalogDispatch for PreparedRestTablePublication {
     async fn dispatch_once(

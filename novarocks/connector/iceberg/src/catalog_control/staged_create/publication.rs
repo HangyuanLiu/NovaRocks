@@ -255,7 +255,12 @@ pub(super) fn publish(
     let prefix = create_prefix(prepared);
     let policy = RetryPolicy::from_properties(prepared.staged.table.metadata().properties())
         .map_err(|error| invalid(error.to_string()))?;
-    let journal = PublicationJournal::new(operation.token());
+    let journal = prepared
+        .stage_publication
+        .journal
+        .next_frontier()
+        .map_err(|error| internal(error.to_string()))?;
+    prepared.final_publication = Some(journal.clone());
     let publisher = journal.observe_prepared(Arc::new(CreatePublisher {
         adapter: adapter.clone(),
         prepared: prepared.clone(),
@@ -302,6 +307,80 @@ pub(super) fn publish(
             ),
         },
     })
+}
+
+/// Append a fresh exact positive observation to the final request's entry.
+/// The stage frontier remains unchanged and cannot receive this proof.
+pub(super) fn record_observed_publication(
+    prepared: &PreparedOperation,
+    table: &crate::iceberg::table::Table,
+) -> Result<ExternalMutationOutcome<ConnectorStagedCreateReceipt>, ConnectorError> {
+    use crate::commit::publication_descriptor::{AttributionPlan, PositiveAttributionObservation};
+    let journal = prepared
+        .final_publication
+        .as_ref()
+        .ok_or_else(|| invalid("Staged publication has no retained final frontier"))?;
+    let entry = journal
+        .current_entry()
+        .ok_or_else(|| invalid("Staged publication has no final request entry"))?;
+    if let committed @ ExternalMutationOutcome::KnownCommitted { .. } =
+        journal.catalog_entry_outcome(entry)
+    {
+        return Ok(committed);
+    }
+    let descriptor = journal
+        .entry_descriptor(entry)
+        .ok_or_else(|| invalid("Staged publication final request is unavailable"))?;
+    let observation = match &descriptor.attribution {
+        AttributionPlan::Property { key, .. } => {
+            let value =
+                table.metadata().properties().get(key).ok_or_else(|| {
+                    invalid("Observed staged publication has no operation property")
+                })?;
+            PositiveAttributionObservation::PropertyMarker {
+                table_uuid: table.metadata().uuid(),
+                key: key.clone(),
+                value: value.clone(),
+            }
+        }
+        AttributionPlan::Snapshot {
+            snapshot_id,
+            marker_key,
+            ..
+        } => {
+            let snapshot = table
+                .metadata()
+                .snapshot_by_id(*snapshot_id)
+                .ok_or_else(|| invalid("Observed staged publication has no exact snapshot"))?;
+            let value = snapshot
+                .summary()
+                .additional_properties
+                .get(marker_key)
+                .ok_or_else(|| {
+                    invalid("Observed staged publication has no exact snapshot marker")
+                })?;
+            PositiveAttributionObservation::SnapshotMarker {
+                table_uuid: table.metadata().uuid(),
+                snapshot_id: *snapshot_id,
+                marker_key: marker_key.clone(),
+                marker_value: value.clone(),
+            }
+        }
+        _ => {
+            return Err(invalid(
+                "Staged publication has no supported positive attribution probe",
+            ));
+        }
+    };
+    if let Err(error) = journal.append_positive_proof(descriptor.key, observation) {
+        if let committed @ ExternalMutationOutcome::KnownCommitted { .. } =
+            journal.catalog_entry_outcome(entry)
+        {
+            return Ok(committed);
+        }
+        return Err(invalid(error.to_string()));
+    }
+    Ok(journal.catalog_entry_outcome(entry))
 }
 
 #[cfg(test)]
@@ -481,6 +560,10 @@ mod tests {
             )
             .unwrap();
             let prepared = PreparedOperation {
+                stage_publication: super::super::tests::stage_publication_for_test(
+                    ConnectorMutationOperationId::from_bytes(publication_id.to_bytes()),
+                ),
+                final_publication: None,
                 publication_id,
                 handle_digest: [9; 32],
                 staged: RestStagedTableCreate {
@@ -519,6 +602,144 @@ mod tests {
                 context,
                 _stop: stop,
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn positive_observation_appends_only_to_the_retained_final_frontier() {
+        use crate::commit::attempt::observation::{DispatchEvidence, MemoryDispatchBarrier};
+        use crate::commit::publication_descriptor::AttributionPlan;
+        for with_data in [false, true] {
+            let mut fixture = Fixture::new(with_data);
+            let operation_id = fixture.prepared.operation_id();
+            let stage = fixture.prepared.stage_publication.clone();
+            let stage_entry = stage
+                .journal
+                .prepare_catalog(
+                    stage.evidence.clone(),
+                    stage.receipt.clone(),
+                    vec!["db.t".into()],
+                    b"initial stage".to_vec(),
+                    AttributionPlan::ObserveOnly,
+                    fixture.context.clone(),
+                )
+                .unwrap();
+            stage
+                .journal
+                .claim_dispatch()
+                .unwrap()
+                .begin_dispatch(&fixture.context, &MemoryDispatchBarrier)
+                .await
+                .unwrap();
+            stage.journal.conclude_entry(
+                stage_entry,
+                DispatchEvidence::Applied {
+                    proof: crate::catalog::transaction::CommitProof::applied(None),
+                },
+            );
+            let journal = stage.journal.next_frontier().unwrap();
+            fixture.prepared.final_publication = Some(journal.clone());
+            let operation = ensure_operation(
+                &fixture.adapter,
+                &mut fixture.prepared,
+                operation_id,
+                &fixture.context,
+            )
+            .unwrap();
+            let intent = create_intent(&fixture.prepared, operation.token()).unwrap();
+            let publisher = CreatePublisher {
+                adapter: fixture.adapter.clone(),
+                prepared: fixture.prepared.clone(),
+                operation_id,
+                journal: journal.clone(),
+            };
+            let attempt = operation.begin_attempt().unwrap();
+            let mut engine = StagingEngine::begin(
+                publisher.load_target(&attempt).await.unwrap(),
+                &intent,
+                &attempt,
+            )
+            .unwrap();
+            engine
+                .stage_change(create_prefix(&fixture.prepared))
+                .unwrap();
+            if with_data {
+                engine
+                    .stage(&crate::commit::FastAppendPreparer)
+                    .await
+                    .unwrap();
+            }
+            let metadata = engine.metadata().clone();
+            let request = engine.freeze(&[]).unwrap();
+            publisher.preflight_recovery(&request, &operation).unwrap();
+            let entry = journal.current_entry().unwrap();
+            journal
+                .claim_dispatch()
+                .unwrap()
+                .begin_dispatch(&fixture.context, &MemoryDispatchBarrier)
+                .await
+                .unwrap();
+            journal.conclude_entry(
+                entry,
+                DispatchEvidence::Unknown {
+                    failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                        novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                        "injected lost final response",
+                    ),
+                    observation: Default::default(),
+                },
+            );
+            assert!(
+                record_observed_publication(&fixture.prepared, &fixture.prepared.staged.table)
+                    .is_err()
+            );
+            assert!(matches!(
+                journal.catalog_entry_outcome(entry),
+                ExternalMutationOutcome::CommitUnknown { .. }
+            ));
+            let table = crate::iceberg::table::Table::builder()
+                .runtime(
+                    fixture
+                        .adapter
+                        .runtime
+                        .resources()
+                        .catalog_runtime()
+                        .iceberg_runtime()
+                        .clone(),
+                )
+                .identifier(fixture.prepared.staged.table.identifier().clone())
+                .file_io(fixture.prepared.staged.table.file_io().clone())
+                .metadata(metadata)
+                .build()
+                .unwrap();
+            let outcome = record_observed_publication(&fixture.prepared, &table).unwrap();
+            let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome else {
+                panic!("exact final marker must append positive proof")
+            };
+            assert_eq!(
+                receipt.phase(),
+                ConnectorStagedCreateReceiptPhase::Published
+            );
+            let ExternalMutationOutcome::KnownCommitted {
+                receipt: stage_receipt,
+                ..
+            } = stage.journal.catalog_entry_outcome(stage_entry)
+            else {
+                panic!("stage proof remains retained")
+            };
+            assert_eq!(
+                stage_receipt.phase(),
+                ConnectorStagedCreateReceiptPhase::Prepared
+            );
+            assert_eq!(stage.journal.current_entry(), Some(stage_entry));
+            assert_eq!(journal.current_entry(), Some(entry));
+            assert!(
+                matches!(
+                    record_observed_publication(&fixture.prepared, &table).unwrap(),
+                    ExternalMutationOutcome::KnownCommitted { .. }
+                ),
+                "repeated observation projects the already-recorded positive proof"
+            );
         }
     }
 

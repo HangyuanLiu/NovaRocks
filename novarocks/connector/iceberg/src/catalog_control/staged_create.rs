@@ -87,6 +87,37 @@ pub(crate) struct RestStagedTableCreate {
     publication_updates: Vec<TableUpdate>,
 }
 
+/// One request journal survives both initial staging and final publication.
+#[derive(Clone)]
+pub(crate) struct StagePublication {
+    journal: crate::commit::attempt::observation::PublicationJournal<ConnectorStagedCreateReceipt>,
+    receipt: ConnectorStagedCreateReceipt,
+    evidence: ExternalMutationEvidence,
+    policy: crate::catalog::publication::CatalogEvidencePolicy,
+}
+impl StagePublication {
+    fn context(
+        &self,
+        original: &ConnectorRequestContext,
+    ) -> Result<ConnectorRequestContext, ConnectorError> {
+        let entry = self
+            .journal
+            .current_entry()
+            .ok_or_else(|| internal("Stage publication has no entry"))?;
+        self.journal
+            .finalization_context(entry, self.policy)?
+            .for_io(original)
+    }
+    fn fail_finalization(&self, message: impl Into<Arc<str>>) -> ExternalMutationFinalization {
+        let finalization = cleanup_failed(message);
+        if let Some(entry) = self.journal.current_entry() {
+            self.journal
+                .record_entry_finalization(entry, finalization.clone());
+        }
+        finalization
+    }
+}
+
 /// What a staged-create preparation failure proves about dispatch.
 ///
 /// The arms deliberately mirror [`crate::catalog::error::CatalogOutcome`]:
@@ -110,6 +141,7 @@ pub(crate) enum RestStagedPrepareFailure {
     /// publication (D13); its failure keeps its kind.
     StageUncommitted(ConnectorMutationFailure),
     CommitUnknown(String),
+    AppliedButUnusable(String),
 }
 
 impl From<String> for RestStagedPrepareFailure {
@@ -131,7 +163,8 @@ impl From<ConnectorError> for RestStagedPrepareFailure {
 pub(crate) fn prepare_rest_staged_table(
     runtime: &IcebergMetadataContext,
     request_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
-    _operation_id: ConnectorStagedCreateOperationId,
+    stage_publication: Option<&StagePublication>,
+    operation_id: ConnectorStagedCreateOperationId,
     publication_id: novarocks_spi::connector::LakePublicationId,
     namespace_name: &str,
     table_name: &str,
@@ -171,25 +204,11 @@ pub(crate) fn prepare_rest_staged_table(
         &runtime.control_state().configuration().warehouse_uri,
         publication_id,
     )?;
-    let namespace_owner = Arc::clone(&owner);
-    let namespace_probe = crate::catalog::CatalogNamespaceName::new(namespace_name.clone());
-    let exists = runtime
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { namespace_owner.namespace_exists(namespace_probe).await })
-        .map_err(|error| {
-            RestStagedPrepareFailure::KnownUncommitted(format!(
-                "check REST namespace runtime: {error}"
-            ))
-        })?
-        .map_err(|error| {
-            RestStagedPrepareFailure::KnownUncommitted(format!("check REST namespace: {error}"))
-        })?;
-    if !exists {
-        return Err(RestStagedPrepareFailure::KnownUncommitted(format!(
-            "prepare staged Iceberg table failed: namespace {namespace_name} does not exist"
-        )));
-    }
+    let original = request_context.ok_or_else(|| {
+        RestStagedPrepareFailure::KnownUncommitted(
+            "REST staged create has no admitted request context".into(),
+        )
+    })?;
     let (format_version, mut properties) =
         super::catalog_mutation::table_properties(columns, None, properties)?;
     if format_version != crate::iceberg::spec::FormatVersion::V3
@@ -244,50 +263,96 @@ pub(crate) fn prepare_rest_staged_table(
     } else {
         creation.build()
     };
-    // A vended generation must be able to hand execution nodes a route before
-    // anything is staged: a configuration an execution node cannot acquire
-    // under is refused here, with no side effect, rather than after the stage
-    // as an unknown outcome (L25).
-    if let Some(endpoints) = owner.vended_credential_refresh_catalog()
-        && endpoints.is_vended()
-    {
-        let session_endpoints = Arc::clone(&endpoints);
-        let binding = runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { session_endpoints.binding().await })
-            .map_err(|error| {
-                RestStagedPrepareFailure::KnownUncommitted(format!(
-                    "establish REST session runtime: {error}"
-                ))
-            })?
-            .map_err(|error| RestStagedPrepareFailure::KnownUncommitted(error.to_string()))?;
-        crate::rest_protocol::routing::preflight_route(&binding, &endpoints.route_admission())
-            .map_err(|error| RestStagedPrepareFailure::Unsupported(error.message().to_string()))?;
+    let stage = stage_publication.ok_or_else(|| {
+        RestStagedPrepareFailure::KnownUncommitted(
+            "REST staged create has no admitted publication journal".into(),
+        )
+    })?;
+    let target =
+        crate::catalog::CatalogTableName::new(namespace_name.clone(), creation.name.clone());
+    let frozen = crate::catalog::catalog_request::CatalogPublicationRequest::StageCreate {
+        namespace: crate::catalog::CatalogNamespaceName::new(namespace_name.clone()),
+        creation,
     }
+    .freeze(operation_id.to_bytes())
+    .map_err(|error| RestStagedPrepareFailure::KnownUncommitted(error.to_string()))?;
+    let entry = stage
+        .journal
+        .prepare_catalog(
+            stage.evidence.clone(),
+            stage.receipt.clone(),
+            frozen.targets(),
+            frozen.request_bytes().to_vec(),
+            frozen.attribution().clone(),
+            original.clone(),
+        )
+        .map_err(|error| RestStagedPrepareFailure::KnownUncommitted(error.to_string()))?;
+    let document = crate::catalog::catalog_request::CatalogResponseDocument::default();
+    let response = document.clone();
+    let journal = stage.journal.clone();
     let staging_owner = Arc::clone(&owner);
-    let staging_namespace = crate::catalog::CatalogNamespaceName::new(namespace_name.clone());
-    let staged = runtime
-        .resources()
-        .catalog_runtime()
-        .block_on(async move {
-            staging_owner
-                .stage_create_table(staging_namespace, creation)
-                .await
-        })
-        .map_err(|error| {
-            // The runtime bridge fails *around* the request — a thread that
-            // could not spawn and a thread that panicked mid-poll arrive here
-            // as the same string — so it cannot say whether the staged create
-            // reached the server. Same rule as
-            // `catalog::error::classify_bridge_failure`: treat it as a lost
-            // response, never as proof that nothing happened.
-            RestStagedPrepareFailure::CommitUnknown(format!(
-                "prepare staged REST table runtime: {error}"
-            ))
-        })?;
+    let policy = stage.policy;
+    let preparation = original.clone();
+    let dispatched = runtime.resources().catalog_runtime().block_on(async move {
+        journal
+            .publish_once(
+                preparation,
+                policy,
+                move |descriptor, generation, original| async move {
+                    staging_owner
+                        .prepare_catalog_publication(
+                            frozen, descriptor, generation, original, response,
+                        )
+                        .await
+                },
+            )
+            .await
+    });
+    if let Err(error) = dispatched {
+        let _ = stage
+            .journal
+            .catalog_bridge_failure(format!("REST staged create runtime: {error}"));
+    } else if let Ok(Err(error)) = dispatched {
+        let _ = stage
+            .journal
+            .catalog_bridge_failure(format!("REST staged create invocation: {error}"));
+    }
+    match stage.journal.commit_outcome(entry) {
+        crate::catalog::error::CatalogOutcome::KnownCommitted { .. } => {}
+        crate::catalog::error::CatalogOutcome::Unsupported(reason) => {
+            return Err(RestStagedPrepareFailure::Unsupported(
+                reason.message().into(),
+            ));
+        }
+        crate::catalog::error::CatalogOutcome::KnownUncommitted { failure } => {
+            if failure.kind() == ConnectorMutationFailureKind::AlreadyExists {
+                return Err(RestStagedPrepareFailure::Conflict(failure.message().into()));
+            }
+            return Err(RestStagedPrepareFailure::StageUncommitted(failure));
+        }
+        crate::catalog::error::CatalogOutcome::CommitUnknown { failure, .. } => {
+            return Err(RestStagedPrepareFailure::CommitUnknown(
+                failure.message().into(),
+            ));
+        }
+    }
+    // Decisive evidence is already recorded. Everything below is independent
+    // finalization and can only make the positively applied stage unusable.
+    let finalization = stage
+        .context(original)
+        .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
+    let bytes = document.take().ok_or_else(|| {
+        RestStagedPrepareFailure::AppliedButUnusable(
+            "REST stage-create response document is unavailable after attribution".into(),
+        )
+    })?;
+    let staged = owner
+        .materialize_staged_create_response(target, bytes)
+        .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
+    novarocks_spi::connector::ConnectorOperationControl::check_active(&finalization)
+        .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
     let (table, initialization_updates) = match staged {
-        crate::catalog::StagedCreateStart::Staged {
+        crate::catalog::StagedCreateMaterial {
             table,
             initialization_updates,
             access_delegation,
@@ -297,36 +362,36 @@ pub(crate) fn prepare_rest_staged_table(
                     // The stage request has already reached the REST catalog, so
                     // this cannot be reported as an unsupported preflight.  T21
                     // intentionally refuses the possibly-created staged target
-                    // until T23 supplies the query-attempt lease consumer; storing
+                    // without the query-attempt lease consumer; storing
                     // this secret in the staged table/handle would violate the
                     // confidential carrier boundary.
-                    return Err(RestStagedPrepareFailure::CommitUnknown(
+                    return Err(RestStagedPrepareFailure::AppliedButUnusable(
                     "REST staged create returned vended credentials but no query-attempt lease consumer is installed".to_string(),
                 ));
                 };
                 let collection = request_context
                 .vended_credential_lease_collection()
-                .ok_or_else(|| RestStagedPrepareFailure::CommitUnknown(
+                .ok_or_else(|| RestStagedPrepareFailure::AppliedButUnusable(
                     "REST staged create returned vended credentials but the request has no query-attempt lease consumer".to_string(),
                 ))?;
                 // A staged target is not yet addressable through load_table,
                 // so load-table-only delegation cannot renew its authority.
                 // The staging side effect may already exist at this point;
-                // report an unknown outcome instead of returning a handle
+                // report an unusable applied stage instead of returning a handle
                 // whose credentials can expire without a legal renewal path.
-                let refresh_scope = seed
-                    .staged_refresh_scope()
-                    .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
+                let refresh_scope = seed.staged_refresh_scope().map_err(|error| {
+                    RestStagedPrepareFailure::AppliedButUnusable(error.to_string())
+                })?;
                 let endpoints = runtime
                     .novarocks_catalog()
                     .vended_credential_refresh_catalog()
                     .ok_or_else(|| {
-                        RestStagedPrepareFailure::CommitUnknown(
+                        RestStagedPrepareFailure::AppliedButUnusable(
                             "REST staged create vended refresh has no catalog owner".to_string(),
                         )
                     })?;
                 let binding = endpoints.established_binding().ok_or_else(|| {
-                    RestStagedPrepareFailure::CommitUnknown(
+                    RestStagedPrepareFailure::AppliedButUnusable(
                         "REST staged create has no established session".to_string(),
                     )
                 })?;
@@ -337,10 +402,12 @@ pub(crate) fn prepare_rest_staged_table(
                         refresh_scope.endpoint(),
                     ),
                 )
-                .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
+                .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
                 let contribution = seed
                     .into_vended_s3_credential_lease_contribution()
-                    .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?
+                    .map_err(|error| {
+                        RestStagedPrepareFailure::AppliedButUnusable(error.to_string())
+                    })?
                     .with_renewal_path(
                         novarocks_spi::connector::CredentialRenewalPath::CredentialsEndpoint(
                             announcement,
@@ -352,7 +419,7 @@ pub(crate) fn prepare_rest_staged_table(
                             .novarocks_catalog()
                             .vended_credential_refresh_catalog()
                             .ok_or_else(|| {
-                                RestStagedPrepareFailure::CommitUnknown(
+                                RestStagedPrepareFailure::AppliedButUnusable(
                                     "REST staged create vended refresh has no catalog owner"
                                         .to_string(),
                                 )
@@ -361,52 +428,35 @@ pub(crate) fn prepare_rest_staged_table(
                         refresh_scope,
                     ))
                         as Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>)
-                    .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
+                    .map_err(|error| {
+                        RestStagedPrepareFailure::AppliedButUnusable(error.to_string())
+                    })?;
                 collection
                     .offer_vended_s3_credential_lease(contribution)
-                    .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
+                    .map_err(|error| {
+                        RestStagedPrepareFailure::AppliedButUnusable(error.to_string())
+                    })?;
                 let table = table
                     .materialize_for_request(
                         runtime
                             .resources()
                             .planning_binding()
-                            .for_request(request_context.clone()),
+                            .for_request(finalization.clone()),
                     )
-                    .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
+                    .map_err(|error| {
+                        RestStagedPrepareFailure::AppliedButUnusable(error.to_string())
+                    })?;
                 (table, initialization_updates)
             } else {
-                let table = table
-                    .into_static_table()
-                    .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
+                let table = table.into_static_table().map_err(|error| {
+                    RestStagedPrepareFailure::AppliedButUnusable(error.to_string())
+                })?;
                 (table, initialization_updates)
             }
         }
-        crate::catalog::StagedCreateStart::Conflict(error) => {
-            return Err(RestStagedPrepareFailure::Conflict(format!(
-                "prepare staged REST table: {error}"
-            )));
-        }
-        crate::catalog::StagedCreateStart::KnownUncommitted(failure) => {
-            return Err(RestStagedPrepareFailure::StageUncommitted(
-                ConnectorMutationFailure::new(
-                    failure.kind(),
-                    format!("prepare staged REST table: {}", failure.message()),
-                ),
-            ));
-        }
-        crate::catalog::StagedCreateStart::CommitUnknown(error) => {
-            return Err(RestStagedPrepareFailure::CommitUnknown(format!(
-                "prepare staged REST table: {error}"
-            )));
-        }
-        crate::catalog::StagedCreateStart::Unsupported(reason) => {
-            return Err(RestStagedPrepareFailure::Unsupported(
-                reason.message().to_string(),
-            ));
-        }
     };
     if table.metadata().location() != location {
-        return Err(RestStagedPrepareFailure::CommitUnknown(
+        return Err(RestStagedPrepareFailure::AppliedButUnusable(
             "REST stage-create returned a table at a location other than the requested CTAS staging location"
                 .to_string(),
         ));
@@ -424,6 +474,8 @@ pub(crate) fn prepare_rest_staged_table(
             updates: publication_properties,
         });
     }
+    novarocks_spi::connector::ConnectorOperationControl::check_active(&finalization)
+        .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
     Ok(RestStagedTableCreate {
         table,
         initialization_updates,
@@ -507,20 +559,17 @@ fn write_unanchored_ctas_provenance(
     .map(Bytes::from)
     .map_err(|error| internal(format!("encode CTAS unanchored provenance: {error}")))?;
     let location = unanchored_ctas_provenance_location(table_location)?;
-    let file_io = crate::fs_io::build_file_io_for_location(
-        table_location,
-        runtime
-            .resources()
-            .planning_binding()
-            .for_request(request_context.clone()),
-    );
-    let output = file_io
-        .new_output(&location)
-        .map_err(|error| unavailable(error.to_string()))?;
+    let binding = runtime
+        .resources()
+        .planning_binding()
+        .for_request(request_context.clone());
+    let context = request_context.clone();
     runtime
         .resources()
         .catalog_runtime()
-        .block_on(async move { output.write(payload).await })
+        .block_on(async move {
+            crate::fs_io::write_finalization_document(&location, binding, &context, payload).await
+        })
         .map_err(unavailable)?
         .map_err(|error| unavailable(error.to_string()))
 }
@@ -544,6 +593,8 @@ pub struct IcebergStagedCreateAdapter {
 #[derive(Clone)]
 enum OperationState {
     Preparing,
+    StageAppliedUnusable(StagePublication),
+    StageUnknown(StagePublication),
     Prepared(PreparedOperation),
     /// Definite non-publication permits only another bounded cleanup attempt.
     CleanupPending(PreparedOperation),
@@ -555,6 +606,10 @@ enum OperationState {
 
 #[derive(Clone)]
 struct PreparedOperation {
+    stage_publication: StagePublication,
+    final_publication: Option<
+        crate::commit::attempt::observation::PublicationJournal<ConnectorStagedCreateReceipt>,
+    >,
     publication_id: novarocks_spi::connector::LakePublicationId,
     handle_digest: [u8; 32],
     staged: RestStagedTableCreate,
@@ -709,28 +764,20 @@ impl IcebergStagedCreateAdapter {
         );
     }
 
-    /// Report a prepare failure that may already have changed the catalog.
-    ///
-    /// Every caller is past the staged-create dispatch, so the slot is latched
-    /// *before* the report is assembled: a failure while assembling it must
-    /// still leave an operation that no later abort or re-prepare can reopen.
-    fn prepare_commit_unknown(
+    fn prepare_applied_unusable(
         &self,
+        stage: &StagePublication,
         operation_id: ConnectorStagedCreateOperationId,
         message: impl Into<Arc<str>>,
     ) -> Result<ConnectorStagedCreatePrepareOutcome, ConnectorError> {
-        self.set_unknown(operation_id);
-        let evidence = self.evidence(
+        let finalization = stage.fail_finalization(message);
+        self.record_terminal(
             operation_id,
-            "staged-create-prepare",
-            Bytes::copy_from_slice(&operation_id.to_bytes()),
-        )?;
-        Ok(ConnectorStagedCreatePrepareOutcome::CommitUnknown {
-            failure: ConnectorMutationFailure::new(
-                ConnectorMutationFailureKind::Unavailable,
-                message,
-            ),
-            evidence,
+            OperationState::StageAppliedUnusable(stage.clone()),
+        );
+        Ok(ConnectorStagedCreatePrepareOutcome::AppliedButUnusable {
+            receipt: stage.receipt.clone(),
+            finalization,
         })
     }
 
@@ -849,6 +896,23 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 ),
             });
         }
+        let stage_publication = StagePublication {
+            journal: crate::commit::attempt::observation::PublicationJournal::new(
+                crate::commit::model::OperationToken::from_mutation(request.operation_id),
+            ),
+            receipt: self.receipt(
+                request.operation_id,
+                ConnectorStagedCreateReceiptPhase::Prepared,
+                ExternalMutationEffect::Applied,
+                Bytes::copy_from_slice(&request.operation_id.to_bytes()),
+            )?,
+            evidence: self.evidence(
+                request.operation_id,
+                "staged-create-prepare",
+                Bytes::copy_from_slice(&request.operation_id.to_bytes()),
+            )?,
+            policy: self.runtime.novarocks_catalog().evidence_policy(),
+        };
         {
             let mut operations = self
                 .operations
@@ -886,6 +950,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         let result = prepare_rest_staged_table(
             &self.runtime,
             Some(&request.context),
+            Some(&stage_publication),
             request.operation_id,
             request.publication_id,
             &request.table.namespace,
@@ -896,6 +961,16 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         );
         match result {
             Ok(staged) => {
+                let finalization_context = match stage_publication.context(&request.context) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        return self.prepare_applied_unusable(
+                            &stage_publication,
+                            request.operation_id,
+                            error.to_string(),
+                        );
+                    }
+                };
                 let table_location = staged.table.metadata().location().to_string();
                 // Past this point the staged create has been dispatched and
                 // accepted, so no local failure may still be reported as
@@ -913,7 +988,8 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 }) {
                     Ok(provenance) => provenance,
                     Err(error) => {
-                        return self.prepare_commit_unknown(
+                        return self.prepare_applied_unusable(
+                            &stage_publication,
                             request.operation_id,
                             format!(
                                 "derive CTAS unanchored provenance after staged create: {error}"
@@ -924,19 +1000,34 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 let provenance_path = match unanchored_ctas_provenance_location(&table_location) {
                     Ok(path) => path,
                     Err(error) => {
-                        return self
-                            .prepare_commit_unknown(request.operation_id, error.to_string());
+                        return self.prepare_applied_unusable(
+                            &stage_publication,
+                            request.operation_id,
+                            error.to_string(),
+                        );
                     }
                 };
                 if let Err(error) = write_unanchored_ctas_provenance(
                     &self.runtime,
                     &table_location,
                     &provenance,
-                    &request.context,
+                    &finalization_context,
                 ) {
-                    return self.prepare_commit_unknown(
+                    return self.prepare_applied_unusable(
+                        &stage_publication,
                         request.operation_id,
                         format!("persist CTAS unanchored provenance after staged create: {error}"),
+                    );
+                }
+                if let Err(error) =
+                    novarocks_spi::connector::ConnectorOperationControl::check_active(
+                        &finalization_context,
+                    )
+                {
+                    return self.prepare_applied_unusable(
+                        &stage_publication,
+                        request.operation_id,
+                        error.to_string(),
                     );
                 }
                 let payload = Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes());
@@ -960,7 +1051,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                             fields,
                             crate::storage_inspector::prepared_create_partition_fields(
                                 staged.table.metadata(),
-                                &request.context,
+                                &finalization_context,
                             )?,
                             payload.clone(),
                         )?;
@@ -974,7 +1065,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     match managed_handle {
                         Ok(handle) => handle,
                         Err(error) => {
-                            return self.prepare_commit_unknown(
+                            return self.prepare_applied_unusable(&stage_publication,
                                 request.operation_id,
                                 format!(
                                     "freeze document-managed staged target after staged create: {error}"
@@ -990,16 +1081,30 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     ) {
                         Ok(handle) => handle,
                         Err(error) => {
-                            return self.prepare_commit_unknown(
+                            return self.prepare_applied_unusable(
+                                &stage_publication,
                                 request.operation_id,
                                 format!("freeze staged target after staged create: {error}"),
                             );
                         }
                     }
                 };
+                if let Err(error) =
+                    novarocks_spi::connector::ConnectorOperationControl::check_active(
+                        &finalization_context,
+                    )
+                {
+                    return self.prepare_applied_unusable(
+                        &stage_publication,
+                        request.operation_id,
+                        error.to_string(),
+                    );
+                }
                 self.record_terminal(
                     request.operation_id,
                     OperationState::Prepared(PreparedOperation {
+                        stage_publication: stage_publication.clone(),
+                        final_publication: None,
                         publication_id: request.publication_id,
                         handle_digest: handle.digest(),
                         staged,
@@ -1014,12 +1119,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 );
                 Ok(ConnectorStagedCreatePrepareOutcome::Prepared {
                     handle,
-                    receipt: self.receipt(
-                        request.operation_id,
-                        ConnectorStagedCreateReceiptPhase::Prepared,
-                        ExternalMutationEffect::Applied,
-                        payload,
-                    )?,
+                    receipt: stage_publication.receipt.clone(),
                     finalization: ExternalMutationFinalization::Complete,
                 })
             }
@@ -1073,7 +1173,20 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure })
             }
             Err(RestStagedPrepareFailure::CommitUnknown(message)) => {
-                self.prepare_commit_unknown(request.operation_id, message)
+                self.record_terminal(
+                    request.operation_id,
+                    OperationState::StageUnknown(stage_publication.clone()),
+                );
+                Ok(ConnectorStagedCreatePrepareOutcome::CommitUnknown {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        message,
+                    ),
+                    evidence: stage_publication.evidence.clone(),
+                })
+            }
+            Err(RestStagedPrepareFailure::AppliedButUnusable(message)) => {
+                self.prepare_applied_unusable(&stage_publication, request.operation_id, message)
             }
         }
     }
@@ -1363,10 +1476,27 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 ))
             })?;
         validate_publish_evidence(&evidence, &prepared, dispatch_operation_id)?;
+        if let Some(journal) = &prepared.final_publication
+            && let Some(entry) = journal.current_entry()
+            && let novarocks_spi::connector::ExternalMutationOutcome::KnownCommitted {
+                receipt,
+                finalization,
+                ..
+            } = journal.catalog_entry_outcome(entry)
+        {
+            invalidate_prepared(&self.runtime, &prepared);
+            self.record_terminal(operation_id, OperationState::Published);
+            return Ok(
+                ConnectorStagedCreatePublicationAdjudicationOutcome::Published {
+                    receipt,
+                    finalization,
+                },
+            );
+        }
         let ident = prepared.staged.table.identifier();
         let load = self
             .runtime
-            .load_table_for_request(
+            .observe_table_for_request(
                 &ident.namespace.to_url_string(),
                 &ident.name,
                 &request.context,
@@ -1381,18 +1511,38 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     evidence.expected_snapshot_id,
                 ) =>
             {
-                let receipt = publication_receipt(
-                    self,
-                    dispatch_operation_id,
-                    &table,
-                    evidence.expected_snapshot_id,
-                )?;
+                let observed =
+                    match publication::record_observed_publication(&prepared, &table) {
+                        Ok(observed) => observed,
+                        Err(error) => return Ok(
+                            ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
+                                failure: failure_from_connector(error),
+                                evidence: request.evidence,
+                            },
+                        ),
+                    };
+                let novarocks_spi::connector::ExternalMutationOutcome::KnownCommitted {
+                    receipt,
+                    finalization,
+                    ..
+                } = observed
+                else {
+                    return Ok(
+                        ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
+                            failure: ConnectorMutationFailure::new(
+                                ConnectorMutationFailureKind::Internal,
+                                "Exact staged publication observation has no recorded positive proof",
+                            ),
+                            evidence: request.evidence,
+                        },
+                    );
+                };
                 invalidate_prepared(&self.runtime, &prepared);
                 self.record_terminal(operation_id, OperationState::Published);
                 Ok(
                     ConnectorStagedCreatePublicationAdjudicationOutcome::Published {
                         receipt,
-                        finalization: ExternalMutationFinalization::Complete,
+                        finalization,
                     },
                 )
             }
@@ -1538,7 +1688,7 @@ fn publication_expectation(
 
 fn publication_matches(
     table: &crate::iceberg::table::Table,
-    _operation_id: ConnectorStagedCreateOperationId,
+    operation_id: ConnectorStagedCreateOperationId,
     prepared: &PreparedOperation,
     expected_snapshot_id: Option<i64>,
 ) -> bool {
@@ -1855,6 +2005,43 @@ mod tests {
         (adapter, request)
     }
 
+    pub(super) fn stage_publication_for_test(
+        operation_id: ConnectorStagedCreateOperationId,
+    ) -> StagePublication {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+        };
+        let incarnation = ProviderBindingEpoch::new();
+        let owner = ConnectorProviderBindingKey {
+            instance_id: descriptor.instance_id.clone(),
+            incarnation,
+        };
+        StagePublication {
+            journal: crate::commit::attempt::observation::PublicationJournal::new(
+                crate::commit::model::OperationToken::from_mutation(operation_id),
+            ),
+            receipt: ConnectorStagedCreateReceipt::try_new(
+                owner,
+                operation_id,
+                ConnectorStagedCreateReceiptPhase::Prepared,
+                ExternalMutationEffect::Applied,
+                Bytes::copy_from_slice(&operation_id.to_bytes()),
+            )
+            .unwrap(),
+            evidence: ExternalMutationEvidence::try_new(
+                1,
+                descriptor,
+                incarnation,
+                operation_id,
+                "staged-create-prepare",
+                Bytes::new(),
+            )
+            .unwrap(),
+            policy: Default::default(),
+        }
+    }
+
     /// A prepared aggregate with no writer bound, for state-machine tests.
     fn prepared_operation(runtime: &IcebergMetadataContext) -> PreparedOperation {
         let location = "file:///tmp/novarocks-staged-create/table";
@@ -1894,8 +2081,13 @@ mod tests {
             .metadata(metadata)
             .build()
             .expect("table");
+        let publication_id = novarocks_spi::connector::LakePublicationId::new_v7();
         PreparedOperation {
-            publication_id: novarocks_spi::connector::LakePublicationId::new_v7(),
+            stage_publication: stage_publication_for_test(
+                ConnectorMutationOperationId::from_bytes(publication_id.to_bytes()),
+            ),
+            final_publication: None,
+            publication_id,
             handle_digest: [7u8; 32],
             staged: RestStagedTableCreate {
                 table,
@@ -2160,6 +2352,7 @@ mod tests {
         ] {
             let failure = match prepare_rest_staged_table(
                 &runtime,
+                Some(&context()),
                 None,
                 ConnectorMutationOperationId::new(),
                 novarocks_spi::connector::LakePublicationId::new_v7(),
@@ -2186,6 +2379,263 @@ mod tests {
                 server.requests().is_empty(),
                 "admission must not contact namespace or stage-create endpoints"
             );
+        }
+    }
+
+    fn stage_http_adapter(
+        server: &crate::rest_protocol::test_server::TestServer,
+    ) -> (tokio::runtime::Runtime, IcebergStagedCreateAdapter) {
+        let executor = tokio::runtime::Runtime::new().unwrap();
+        let handle = executor.handle().clone();
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[
+                ("iceberg.catalog.type".into(), "rest".into()),
+                ("uri".into(), server.url()),
+                ("warehouse".into(), "s3://warehouse".into()),
+            ],
+        )
+        .unwrap();
+        let binding = IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
+        );
+        let runtime = Arc::new(
+            IcebergMetadataContext::try_new(
+                IcebergCatalogControlState::new(configuration),
+                IcebergMetadataResources::new(binding, handle),
+            )
+            .unwrap(),
+        );
+        (executor, adapter_for(runtime))
+    }
+    fn stage_http_request(
+        adapter: &IcebergStagedCreateAdapter,
+        request_context: ConnectorRequestContext,
+    ) -> ConnectorStagedCreatePrepareRequest {
+        let operation_id = ConnectorMutationOperationId::new();
+        ConnectorStagedCreatePrepareRequest {
+            owner: adapter.owner(),
+            publication_id: novarocks_spi::connector::LakePublicationId::try_from_bytes(
+                operation_id.to_bytes(),
+            )
+            .unwrap(),
+            operation_id,
+            table: ConnectorTableIdentity {
+                instance_id: adapter.descriptor.instance_id.clone(),
+                namespace: Arc::from("db"),
+                table: Arc::from("t"),
+            },
+            columns: vec![ConnectorColumnDefinition {
+                name: Arc::from("id"),
+                data_type: novarocks_spi::connector::ConnectorDataType::BigInt,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            }],
+            partitioning: vec![],
+            properties: BTreeMap::new(),
+            policy: CreatePolicy::FailIfExists,
+            mode: ConnectorStagedCreateMode::Ordinary,
+            context: request_context,
+        }
+    }
+
+    #[test]
+    fn an_attributed_stage_with_unusable_full_metadata_preserves_applied_and_refuses_reuse() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        let uuid = uuid::Uuid::new_v4();
+        let server = TestServer::start(
+            Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on(
+                    "GET",
+                    "/v1/namespaces/db",
+                    Reply::json(
+                        200,
+                        &serde_json::json!({"namespace":["db"],"properties":{}}),
+                    ),
+                )
+                .on(
+                    "POST",
+                    "/v1/namespaces/db/tables",
+                    Reply::json(
+                        200,
+                        &serde_json::json!({
+                            "metadata-location": null, "metadata": {"table-uuid": uuid.to_string()}
+                        }),
+                    ),
+                ),
+        );
+        let (_executor, adapter) = stage_http_adapter(&server);
+        let request = stage_http_request(&adapter, context());
+        let operation_id = request.operation_id;
+        let outcome = adapter.prepare(request.clone()).unwrap();
+        let ConnectorStagedCreatePrepareOutcome::AppliedButUnusable {
+            receipt,
+            finalization,
+        } = outcome
+        else {
+            panic!("a materialization failure cannot erase the attributed stage")
+        };
+        assert_eq!(receipt.operation_id(), operation_id);
+        assert_eq!(receipt.effect(), ExternalMutationEffect::Applied);
+        assert!(matches!(
+            finalization,
+            ExternalMutationFinalization::Failed(_)
+        ));
+        {
+            let operations = adapter.operations.lock().unwrap();
+            let Some(OperationState::StageAppliedUnusable(stage)) = operations.get(&operation_id)
+            else {
+                panic!("unusable stage remains terminal")
+            };
+            let entry = stage.journal.current_entry().unwrap();
+            let crate::catalog::error::CatalogOutcome::KnownCommitted {
+                receipt: proof,
+                finalization,
+                ..
+            } = stage.journal.commit_outcome(entry)
+            else {
+                panic!("journal retains Applied")
+            };
+            assert_eq!(proof.table_uuid.as_deref(), Some(uuid.to_string().as_str()));
+            assert!(matches!(
+                finalization,
+                ExternalMutationFinalization::Failed(_)
+            ));
+            let descriptor = stage.journal.entry_descriptor(entry).unwrap();
+            assert!(descriptor.first_dispatch_ms.is_some());
+            let body: serde_json::Value = serde_json::from_slice(&descriptor.request).unwrap();
+            assert_eq!(body["stage-create"], true);
+        }
+        assert!(adapter.prepare(request).is_err());
+        assert_eq!(server.count("POST", "/v1/namespaces/db/tables"), 1);
+    }
+
+    #[test]
+    fn stage_protocol_rejection_and_unknown_keep_distinct_frontiers_without_replay() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for status in [409, 403, 500] {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db",
+                        Reply::json(
+                            200,
+                            &serde_json::json!({"namespace":["db"],"properties":{}}),
+                        ),
+                    )
+                    .on("POST", "/v1/namespaces/db/tables", Reply::status(status)),
+            );
+            let (_executor, adapter) = stage_http_adapter(&server);
+            let request = stage_http_request(&adapter, context());
+            let operation_id = request.operation_id;
+            let outcome = adapter.prepare(request.clone()).unwrap();
+            match (status, outcome) {
+                (409, ConnectorStagedCreatePrepareOutcome::Conflict { failure }) => {
+                    assert_eq!(failure.kind(), ConnectorMutationFailureKind::AlreadyExists)
+                }
+                (403, ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure }) => {
+                    assert_eq!(
+                        failure.kind(),
+                        ConnectorMutationFailureKind::PermissionDenied
+                    )
+                }
+                (500, ConnectorStagedCreatePrepareOutcome::CommitUnknown { .. }) => {
+                    assert!(adapter.prepare(request).is_err());
+                    let operations = adapter.operations.lock().unwrap();
+                    let Some(OperationState::StageUnknown(stage)) = operations.get(&operation_id)
+                    else {
+                        panic!("unknown stage retains its exact journal")
+                    };
+                    let entry = stage.journal.current_entry().unwrap();
+                    assert!(matches!(
+                        stage.journal.commit_outcome(entry),
+                        crate::catalog::error::CatalogOutcome::CommitUnknown { .. }
+                    ));
+                    assert!(stage.journal.next_frontier().is_err());
+                }
+                (status, outcome) => panic!("unexpected stage verdict for {status}: {outcome:?}"),
+            }
+            assert_eq!(server.count("POST", "/v1/namespaces/db/tables"), 1);
+        }
+    }
+
+    #[test]
+    fn stage_preparation_waits_obey_the_original_deadline_and_stop_before_any_post() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use novarocks_spi::connector::ConnectorStopOwner;
+        for blocked in ["config", "namespace"] {
+            for cancel in [false, true] {
+                let blocked_path = if blocked == "config" {
+                    "/v1/config"
+                } else {
+                    "/v1/namespaces/db"
+                };
+                let script = if blocked == "config" {
+                    Script::new().on("GET", blocked_path, Reply::NeverAnswer)
+                } else {
+                    Script::new()
+                        .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                        .on("GET", blocked_path, Reply::NeverAnswer)
+                };
+                let server = Arc::new(TestServer::start(script));
+                let (_executor, adapter) = stage_http_adapter(&server);
+                let stop = ConnectorStopOwner::new();
+                let context = ConnectorRequestContext::try_new(
+                    Instant::now()
+                        + if cancel {
+                            std::time::Duration::from_secs(2)
+                        } else {
+                            std::time::Duration::from_millis(50)
+                        },
+                    stop.view(),
+                    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+                )
+                .unwrap();
+                let stopper = if cancel {
+                    let observed = server.clone();
+                    Some(std::thread::spawn(move || {
+                        let limit = Instant::now() + std::time::Duration::from_secs(1);
+                        while observed.count("GET", blocked_path) == 0 && Instant::now() < limit {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        stop.request_stop();
+                    }))
+                } else {
+                    None
+                };
+                let outcome = adapter
+                    .prepare(stage_http_request(&adapter, context))
+                    .unwrap();
+                if let Some(stopper) = stopper {
+                    stopper.join().unwrap();
+                }
+                let ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure } = outcome
+                else {
+                    panic!("stopped preparation cannot stage a target")
+                };
+                assert_eq!(
+                    failure.kind(),
+                    if cancel {
+                        ConnectorMutationFailureKind::Cancelled
+                    } else {
+                        ConnectorMutationFailureKind::DeadlineExceeded
+                    }
+                );
+                assert_eq!(
+                    server.count("GET", blocked_path),
+                    1,
+                    "the original preparation waiter actually entered its pending request"
+                );
+                assert_eq!(server.count("POST", "/v1/namespaces/db/tables"), 0);
+            }
         }
     }
 
@@ -2249,29 +2699,37 @@ mod tests {
             ),
         );
 
-        let failure = match prepare_rest_staged_table(
-            &runtime,
-            None,
-            ConnectorMutationOperationId::new(),
-            novarocks_spi::connector::LakePublicationId::new_v7(),
-            "db",
-            "t",
-            &[],
-            &[],
-            &[],
-        ) {
-            Ok(_) => panic!("an undeclared routing header must refuse the vended CTAS"),
-            Err(failure) => failure,
-        };
+        let adapter = adapter_for(Arc::new(runtime));
+        let operation_id = ConnectorMutationOperationId::new();
+        let outcome = adapter
+            .prepare(ConnectorStagedCreatePrepareRequest {
+                owner: adapter.owner(),
+                publication_id: novarocks_spi::connector::LakePublicationId::try_from_bytes(
+                    operation_id.to_bytes(),
+                )
+                .unwrap(),
+                operation_id,
+                table: ConnectorTableIdentity {
+                    instance_id: adapter.descriptor.instance_id.clone(),
+                    namespace: Arc::from("db"),
+                    table: Arc::from("t"),
+                },
+                columns: vec![],
+                partitioning: vec![],
+                properties: BTreeMap::new(),
+                policy: CreatePolicy::FailIfExists,
+                mode: ConnectorStagedCreateMode::Ordinary,
+                context: context(),
+            })
+            .unwrap();
         assert!(
-            matches!(
-                &failure,
-                RestStagedPrepareFailure::Unsupported(message)
-                    if message.contains("x-region")
-                        && message.contains("iceberg.rest.server-routing-headers")
-                        && !message.contains("r1")
-            ),
-            "{failure:?}"
+            matches!(&outcome,
+            ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure }
+                if failure.kind() == ConnectorMutationFailureKind::Unsupported
+                    && failure.message().contains("x-region")
+                    && failure.message().contains("iceberg.rest.server-routing-headers")
+                    && !failure.message().contains("r1")),
+            "{outcome:?}"
         );
         assert_eq!(server.count("GET", "/v1/namespaces/db"), 1);
         assert_eq!(
@@ -2289,6 +2747,7 @@ mod tests {
         assert_eq!(runtime.novarocks_catalog().implementation_name(), "hadoop");
         let failure = match prepare_rest_staged_table(
             &runtime,
+            Some(&context()),
             None,
             ConnectorMutationOperationId::new(),
             novarocks_spi::connector::LakePublicationId::new_v7(),
@@ -2340,6 +2799,7 @@ mod tests {
             .expect_err("admission refuses CTAS without an enumerable staging root");
         let failure = match prepare_rest_staged_table(
             &runtime,
+            Some(&context()),
             None,
             ConnectorMutationOperationId::new(),
             novarocks_spi::connector::LakePublicationId::new_v7(),

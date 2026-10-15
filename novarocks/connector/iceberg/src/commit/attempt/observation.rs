@@ -95,19 +95,22 @@ struct JournalEntry<R> {
 }
 struct JournalState<R> {
     entries: BTreeMap<Uuid, JournalEntry<R>>,
-    current: Option<Uuid>,
+    current: BTreeMap<u64, Uuid>,
+    next_frontier: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct JournalEntryRef(Uuid);
 
 pub(crate) struct PublicationJournal<R> {
     operation: OperationToken,
+    frontier: u64,
     state: Arc<Mutex<JournalState<R>>>,
 }
 impl<R> Clone for PublicationJournal<R> {
     fn clone(&self) -> Self {
         Self {
             operation: self.operation,
+            frontier: self.frontier,
             state: Arc::clone(&self.state),
         }
     }
@@ -127,11 +130,48 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
     pub(crate) fn new(operation: OperationToken) -> Self {
         Self {
             operation,
+            frontier: 0,
             state: Arc::new(Mutex::new(JournalState {
                 entries: BTreeMap::new(),
-                current: None,
+                current: BTreeMap::new(),
+                next_frontier: 1,
             })),
         }
+    }
+    /// A new publication frontier shares the operation's entries but has no
+    /// current request yet. A prior stage proof cannot answer a final publish.
+    pub(crate) fn next_frontier(&self) -> Result<Self> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.entries.values().any(|entry| {
+            !matches!(
+                entry.phase,
+                EntryPhase::Concluded(
+                    DispatchEvidence::Applied { .. }
+                        | DispatchEvidence::Rejected { .. }
+                        | DispatchEvidence::NotDispatched { .. }
+                )
+            )
+        }) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Publication frontier cannot bypass active or unknown evidence",
+            ));
+        }
+        let frontier = state.next_frontier;
+        state.next_frontier = frontier.checked_add(1).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Publication frontier identity exhausted",
+            )
+        })?;
+        Ok(Self {
+            operation: self.operation,
+            frontier,
+            state: Arc::clone(&self.state),
+        })
     }
     fn prepare(&self, checked: Checked<R>) -> Result<()> {
         checked.descriptor.validate()?;
@@ -145,20 +185,16 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state
-            .current
-            .and_then(|key| state.entries.get(&key))
-            .is_some_and(|entry| {
-                !matches!(
-                    entry.phase,
-                    EntryPhase::Concluded(
-                        DispatchEvidence::NotDispatched { .. }
-                            | DispatchEvidence::Rejected { .. }
-                            | DispatchEvidence::Applied { .. }
-                    )
+        if state.entries.values().any(|entry| {
+            !matches!(
+                entry.phase,
+                EntryPhase::Concluded(
+                    DispatchEvidence::NotDispatched { .. }
+                        | DispatchEvidence::Rejected { .. }
+                        | DispatchEvidence::Applied { .. }
                 )
-            })
-        {
+            )
+        }) {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 "Publication cannot prepare while its preceding request is active or unknown",
@@ -186,7 +222,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
                 positive_proof: None,
             },
         );
-        state.current = Some(key);
+        state.current.insert(self.frontier, key);
         Ok(())
     }
     pub(crate) fn record(
@@ -252,7 +288,8 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state
             .current
-            .and_then(|key| state.entries.get(&key))
+            .get(&self.frontier)
+            .and_then(|key| state.entries.get(key))
             .map(|entry| entry.checked.clone())
     }
     fn bind_preparation(&self, preparation: ConnectorRequestContext) -> Result<()> {
@@ -260,7 +297,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let key = state.current.ok_or_else(|| {
+        let key = state.current.get(&self.frontier).copied().ok_or_else(|| {
             Error::new(ErrorKind::DataInvalid, "Publication has no checked request")
         })?;
         let entry = state.entries.get_mut(&key).expect("current entry exists");
@@ -279,7 +316,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let key = state.current.ok_or_else(|| {
+        let key = state.current.get(&self.frontier).copied().ok_or_else(|| {
             Error::new(ErrorKind::DataInvalid, "Publication has no checked request")
         })?;
         let entry = state.entries.get_mut(&key).expect("current entry exists");
@@ -301,6 +338,8 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .current
+            .get(&self.frontier)
+            .copied()
             .map(JournalEntryRef)
     }
     pub(crate) fn conclude_entry(&self, entry_ref: JournalEntryRef, evidence: DispatchEvidence) {
@@ -1259,6 +1298,85 @@ mod tests {
         assert!(operation.artifacts().unwrap().is_empty());
     }
 
+    #[test]
+    fn final_publication_bridge_cannot_reuse_a_successful_stages_entry() {
+        let executor = tokio::runtime::Runtime::new().unwrap();
+        let fixture = executor.block_on(async { Fixture::new() });
+        let metadata = fixture.metadata(FormatVersion::V3);
+        let intent = fixture.intent(&metadata, "main", vec![]);
+        let operation = fixture.operation.clone();
+        let path = fixture.directory.path().join("stage-provenance.json");
+        std::fs::write(&path, b"owned stage provenance").unwrap();
+        operation
+            .adopt_operation_reference(
+                ObjectIdentity::new(format!("file://{}", path.display())).unwrap(),
+            )
+            .unwrap();
+        let (stage, preparation) =
+            catalog_journal_for_operation(operation.token(), AttributionPlan::ObserveOnly);
+        let stage_entry = stage.current_entry().unwrap();
+        let claim = stage.claim_dispatch().unwrap();
+        executor
+            .block_on(claim.begin_dispatch(&preparation, &MemoryDispatchBarrier))
+            .unwrap();
+        stage.conclude_entry(
+            stage_entry,
+            DispatchEvidence::Applied {
+                proof: CommitProof::applied(None),
+            },
+        );
+        let journal = stage.next_frontier().unwrap();
+        assert!(journal.current_entry().is_none());
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let publisher = journal.observe(Arc::new(Fake {
+            operation: operation.clone(),
+            metadata: metadata.clone(),
+            metadata_location: "file:///base.metadata.json".into(),
+            journal: journal.clone(),
+            dispatches: dispatches.clone(),
+            behavior: Behavior::PanicBeforeLoad,
+        }));
+        let run_operation = operation.clone();
+        let error = operation
+            .runtime()
+            .block_on(async move {
+                run(
+                    &run_operation,
+                    &intent,
+                    &PreparedChange::default(),
+                    &[&FastAppendPreparer],
+                    &publisher,
+                    RetryPolicy::from_properties(metadata.properties()).unwrap(),
+                )
+                .await
+            })
+            .unwrap_err();
+        let outcome = executor.block_on(journal.recover_bridge(&operation, error));
+        assert!(matches!(
+            outcome,
+            ExternalMutationOutcome::KnownUncommitted {
+                cleanup: ExternalMutationFinalization::Complete,
+                ..
+            }
+        ));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        assert!(
+            !path.exists(),
+            "undispatched final publication cleans its actual owned artifacts"
+        );
+        assert!(operation.artifacts().unwrap().is_empty());
+        assert!(matches!(
+            stage.commit_outcome(stage_entry),
+            CatalogOutcome::KnownCommitted { .. }
+        ));
+        assert_eq!(stage.current_entry(), Some(stage_entry));
+        assert!(journal.current_entry().is_none());
+        assert!(
+            Arc::ptr_eq(&stage.state, &journal.state),
+            "frontiers retain one journal fact source"
+        );
+    }
+
     #[tokio::test]
     async fn postproof_recovery_reports_residue_and_keeps_every_frozen_publication_root() {
         use crate::commit::model::{AddedContent, ArtifactClass, ArtifactKind, ArtifactWriter};
@@ -1507,9 +1625,16 @@ mod tests {
     fn catalog_journal_with_attribution(
         attribution: AttributionPlan,
     ) -> (PublicationJournal<String>, ConnectorRequestContext) {
+        catalog_journal_for_operation(
+            OperationToken::from_mutation(ConnectorMutationOperationId::from_bytes([3; 16])),
+            attribution,
+        )
+    }
+    fn catalog_journal_for_operation(
+        operation: OperationToken,
+        attribution: AttributionPlan,
+    ) -> (PublicationJournal<String>, ConnectorRequestContext) {
         use novarocks_spi::connector::ConnectorStopOwner;
-        let operation =
-            OperationToken::from_mutation(ConnectorMutationOperationId::from_bytes([3; 16]));
         let journal = PublicationJournal::new(operation);
         let evidence = ExternalMutationEvidence::try_new(
             2,

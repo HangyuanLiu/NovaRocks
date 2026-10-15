@@ -256,6 +256,25 @@ impl PublicationDescriptor {
     pub(crate) fn frozen(request: &FrozenRequest) -> Result<Self> {
         Self::frozen_with_key(request, Uuid::now_v7())
     }
+    pub(crate) fn validate_catalog(
+        &self,
+        operation_id: [u8; 16],
+        targets: Vec<String>,
+        request: Vec<u8>,
+        attribution: AttributionPlan,
+    ) -> Result<()> {
+        self.validate()?;
+        let mut expected =
+            Self::catalog_with_key(operation_id, targets, request, attribution, self.key)?;
+        expected.binding = self.binding.clone();
+        if self != &expected {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Catalog publication descriptor differs from its exact request facts",
+            ));
+        }
+        Ok(())
+    }
     pub(crate) fn validate_frozen(&self, request: &FrozenRequest) -> Result<()> {
         self.validate()?;
         let mut expected = Self::frozen_with_key(request, self.key)?;

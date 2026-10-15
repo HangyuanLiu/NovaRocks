@@ -74,6 +74,19 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
     fn evidence_policy(&self) -> crate::catalog::publication::CatalogEvidencePolicy {
         self.inner.evidence_policy()
     }
+    async fn prepare_catalog_publication(
+        &self,
+        request: crate::catalog::catalog_request::FrozenCatalogPublication,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+        document: crate::catalog::catalog_request::CatalogResponseDocument,
+    ) -> crate::catalog::publication_dispatch::PreparationResult<
+        crate::catalog::publication_dispatch::PreparedPublication,
+    > {
+        let _ = (request, descriptor, generation, preparation, document);
+        self.mutation()
+    }
     async fn prepare_frozen_publication(
         &self,
         request: crate::commit::model::FrozenRequest,

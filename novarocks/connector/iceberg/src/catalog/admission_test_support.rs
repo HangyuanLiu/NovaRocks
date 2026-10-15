@@ -89,6 +89,29 @@ impl NovaRocksCatalog for AdmittedCatalog {
     fn evidence_policy(&self) -> crate::catalog::publication::CatalogEvidencePolicy {
         self.inner.evidence_policy()
     }
+    async fn prepare_catalog_publication(
+        &self,
+        request: crate::catalog::catalog_request::FrozenCatalogPublication,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+        document: crate::catalog::catalog_request::CatalogResponseDocument,
+    ) -> crate::catalog::publication_dispatch::PreparationResult<
+        crate::catalog::publication_dispatch::PreparedPublication,
+    > {
+        self.inner
+            .prepare_catalog_publication(request, descriptor, generation, preparation, document)
+            .await
+    }
+    fn materialize_staged_create_response(
+        &self,
+        table: crate::catalog::CatalogTableName,
+        document: Vec<u8>,
+    ) -> Result<crate::catalog::StagedCreateMaterial, novarocks_spi::connector::ConnectorError>
+    {
+        self.inner
+            .materialize_staged_create_response(table, document)
+    }
     async fn prepare_frozen_publication(
         &self,
         request: crate::commit::model::FrozenRequest,

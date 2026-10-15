@@ -428,6 +428,10 @@ pub enum StandardCtasStageOutcome {
         target: PreparedStandardCtasTarget,
         receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
     },
+    AppliedButUnusable {
+        receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
+        finalization: ExternalMutationFinalization,
+    },
     KnownUncommitted {
         failure: CtasFailure,
     },
@@ -1835,11 +1839,21 @@ impl CtasEngine for DmlExecutionKernel {
                 // maintenance step only after that response has populated the
                 // request-local lease collector. This ordering is universal,
                 // so static and vended catalogs retain one CTAS lifecycle.
-                sweep_unanchored_ctas_roots(
+                if let Err(failure) = sweep_unanchored_ctas_roots(
                     self,
                     &preflight.unanchored_ctas_cleanup_lease,
                     request.context.clone(),
-                )?;
+                ) {
+                    return Ok(StandardCtasStageOutcome::AppliedButUnusable {
+                        receipt,
+                        finalization: ExternalMutationFinalization::Failed(
+                            novarocks_spi::connector::ConnectorMutationFailure::new(
+                                novarocks_spi::connector::ConnectorMutationFailureKind::Internal,
+                                failure.message,
+                            ),
+                        ),
+                    });
+                }
                 *target_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&target));
@@ -1863,6 +1877,13 @@ impl CtasEngine for DmlExecutionKernel {
                     evidence,
                 })
             }
+            ConnectorStagedCreatePrepareOutcome::AppliedButUnusable {
+                receipt,
+                finalization,
+            } => Ok(StandardCtasStageOutcome::AppliedButUnusable {
+                receipt,
+                finalization,
+            }),
         }
     }
 

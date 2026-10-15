@@ -57,6 +57,7 @@
 pub(crate) mod admission;
 #[cfg(test)]
 pub(crate) mod admission_test_support;
+pub(crate) mod catalog_request;
 pub(crate) mod delegate;
 pub(crate) mod dispatch;
 pub(crate) mod error;
@@ -369,6 +370,12 @@ pub(crate) enum StagedCreateStart {
     Unsupported(CatalogUnsupported),
 }
 
+pub(crate) struct StagedCreateMaterial {
+    pub table: crate::loaded_table::IcebergLoadedTableMaterialization,
+    pub initialization_updates: Vec<crate::iceberg::TableUpdate>,
+    pub access_delegation: crate::loaded_table::IcebergAccessDelegation,
+}
+
 /// What the final publication of a staged create must show to be attributed
 /// to this operation (spec 5.7 items 4-6).
 #[derive(Clone, Debug)]
@@ -455,6 +462,36 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         generation: novarocks_spi::connector::ProviderBindingEpoch,
         preparation: novarocks_spi::connector::ConnectorRequestContext,
     ) -> publication_dispatch::PreparationResult<publication_dispatch::PreparedPublication>;
+
+    /// Artifactless requests use the same journal executor as frozen commits.
+    /// Catalogs without this mechanism refuse before external side effects.
+    async fn prepare_catalog_publication(
+        &self,
+        _request: catalog_request::FrozenCatalogPublication,
+        _descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        _generation: novarocks_spi::connector::ProviderBindingEpoch,
+        _preparation: novarocks_spi::connector::ConnectorRequestContext,
+        _document: catalog_request::CatalogResponseDocument,
+    ) -> publication_dispatch::PreparationResult<publication_dispatch::PreparedPublication> {
+        Err(publication_dispatch::PreparationFailure(
+            ConnectorMutationFailure::new(
+                novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                "Catalog has no prepared artifactless publication mechanism",
+            ),
+        ))
+    }
+
+    /// Post-proof materialization has no authority to decide publication.
+    fn materialize_staged_create_response(
+        &self,
+        _table: CatalogTableName,
+        _document: Vec<u8>,
+    ) -> Result<StagedCreateMaterial, ConnectorError> {
+        Err(ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "Catalog has no staged-create response materialization",
+        ))
+    }
     #[cfg(test)]
     async fn prepare_frozen_publication(
         &self,

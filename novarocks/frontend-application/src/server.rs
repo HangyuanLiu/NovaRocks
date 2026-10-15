@@ -1587,6 +1587,19 @@ mod tests {
             )
         }
 
+        fn open_catalog(
+            &self,
+            identity: novarocks_spi::connector::CatalogScopeIdentity,
+        ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
+            Arc::new(EchoingCatalogFactory { identity })
+        }
+    }
+
+    struct EchoingCatalogFactory {
+        identity: novarocks_spi::connector::CatalogScopeIdentity,
+    }
+
+    impl novarocks_spi::connector::ProviderCatalogControlFactory for EchoingCatalogFactory {
         fn materialize(
             &self,
             properties: novarocks_spi::connector::NormalizedCatalogProperties,
@@ -1599,6 +1612,15 @@ mod tests {
             >,
         > {
             use futures::FutureExt;
+
+            assert_eq!(
+                properties.as_catalog_properties().provider_id(),
+                self.identity.provider_id(),
+            );
+            assert_eq!(
+                properties.handle().catalog_name(),
+                self.identity.instance_id(),
+            );
 
             async move {
                 let control =

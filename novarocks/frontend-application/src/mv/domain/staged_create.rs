@@ -204,7 +204,16 @@ pub(crate) fn stage_mv_create_target(
             "MV CREATE staging outcome is unknown and its intent stays unsettled: {}",
             failure.message()
         )),
-        Err(error) => settle_known_uncommitted(management, "stage", error.to_string()),
+        Ok(ConnectorStagedCreatePrepareOutcome::AppliedButUnusable { finalization, .. }) => {
+            Err(format!(
+                "MV CREATE staging was applied but is unusable; its intent stays unsettled: {finalization:?}"
+            ))
+        }
+        // The retained lease conservatively locks a provider error after
+        // dispatch. Only the typed negative arms above release responsibility.
+        Err(error) => Err(format!(
+            "MV CREATE staging failed without negative evidence; its intent stays unsettled: {error}"
+        )),
     }
 }
 
@@ -1468,6 +1477,223 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use novarocks_spi::connector::ConnectorCommittedVersion;
+
+    struct RefusingStage {
+        descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+        incarnation: novarocks_spi::connector::ProviderBindingEpoch,
+        entrance: ManagementEntrance,
+        mode: u8,
+        prepares: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl novarocks_spi::connector::ConnectorStagedCreate for RefusingStage {
+        fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+        fn incarnation(&self) -> novarocks_spi::connector::ProviderBindingEpoch {
+            self.incarnation
+        }
+        fn prepare(
+            &self,
+            request: novarocks_spi::connector::ConnectorStagedCreatePrepareRequest,
+        ) -> Result<ConnectorStagedCreatePrepareOutcome, novarocks_spi::connector::ConnectorError>
+        {
+            use novarocks_spi::connector::*;
+            self.prepares
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                self.entrance.management_phase(&request.table),
+                novarocks_mv_application::management::MvManagementPhase::AwaitingCreateBinding
+            );
+            let failure = ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::Internal,
+                "injected stage failure",
+            );
+            match self.mode {
+                0 => Ok(ConnectorStagedCreatePrepareOutcome::AppliedButUnusable {
+                    receipt: ConnectorStagedCreateReceipt::try_new(
+                        request.owner,
+                        request.operation_id,
+                        ConnectorStagedCreateReceiptPhase::Prepared,
+                        ExternalMutationEffect::Applied,
+                        Bytes::new(),
+                    )
+                    .unwrap(),
+                    finalization: ExternalMutationFinalization::Failed(failure),
+                }),
+                1 => Err(ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    "injected provider dispatch failure",
+                )),
+                2 => Ok(ConnectorStagedCreatePrepareOutcome::Conflict { failure }),
+                3 => Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure }),
+                _ => unreachable!(),
+            }
+        }
+        fn plan_write(
+            &self,
+            _: novarocks_spi::connector::ConnectorStagedWritePlanningRequest,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorStagedWritePlanningBinding,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            panic!("failed stage cannot plan writes")
+        }
+        fn bind_write(
+            &self,
+            _: ConnectorStagedTableHandle,
+            _: ConnectorStagedWriteProof,
+        ) -> Result<(), novarocks_spi::connector::ConnectorError> {
+            panic!("failed stage cannot bind writes")
+        }
+        fn publish(
+            &self,
+            _: ConnectorStagedCreatePublishRequest,
+        ) -> Result<ConnectorStagedCreatePublishOutcome, novarocks_spi::connector::ConnectorError>
+        {
+            panic!("failed stage cannot publish")
+        }
+        fn abort(
+            &self,
+            _: ConnectorStagedCreateAbortRequest,
+        ) -> Result<ConnectorStagedCreateAbortOutcome, novarocks_spi::connector::ConnectorError>
+        {
+            panic!("failed stage cannot abort")
+        }
+        fn adjudicate_publication(
+            &self,
+            _: novarocks_spi::connector::ConnectorStagedCreatePublicationAdjudicationRequest,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorStagedCreatePublicationAdjudicationOutcome,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            panic!("failed stage is not final publication")
+        }
+    }
+    #[test]
+    fn a_non_negative_stage_failure_retains_the_unbound_create_responsibility() {
+        use super::super::test_admission::{AdmittingManagement, catalog_properties};
+        use novarocks_mv_application::management::{
+            DeploymentOwner, ManagementAdmissionError, MvManagementPhase,
+        };
+        use novarocks_spi::connector::*;
+        for mode in 0..4 {
+            let instance_id = ConnectorInstanceId::parse("iceberg").unwrap();
+            let base = novarocks_catalog_application::test_support::test_control_binding_for(
+                instance_id.clone(),
+                8,
+            );
+            let descriptor = base.descriptor().clone();
+            let incarnation = base.incarnation();
+            let entrance = ManagementEntrance::new(
+                DeploymentOwner::parse("deployment-test").unwrap(),
+                ProcessIncarnation::parse("process-test").unwrap(),
+            );
+            let prepares = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stage = Arc::new(RefusingStage {
+                descriptor: descriptor.clone(),
+                incarnation,
+                entrance: entrance.clone(),
+                mode,
+                prepares: prepares.clone(),
+            });
+            let documents = ConnectorDocumentStorageBinding::try_new(
+                descriptor.clone(),
+                incarnation,
+                None,
+                Some(Arc::new(AdmittingManagement {
+                    descriptor: descriptor.clone(),
+                    incarnation,
+                })),
+            )
+            .unwrap();
+            let binding = ConnectorControlBinding::try_new_with_all_capabilities_and_staged_create(
+                descriptor,
+                incarnation,
+                base.metadata().clone(),
+                base.planning().clone(),
+                base.execution_distribution().clone(),
+                None,
+                None,
+                None,
+                Some(stage),
+                None,
+                None,
+            )
+            .unwrap()
+            .with_catalog_properties(catalog_properties(&instance_id))
+            .unwrap()
+            .try_with_document_storage(Some(documents))
+            .unwrap();
+            let planning_lease = ConnectorControlPlanningLease::new(Arc::new(binding), || {});
+            let catalog = planning_lease.binding().catalog_handle().unwrap().clone();
+            let table = ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from("db"),
+                table: Arc::from("new_mv"),
+            };
+            let operation_id = uuid::Uuid::now_v7();
+            let intent = CreateIntent::try_new(
+                catalog.clone(),
+                table.clone(),
+                EffectIdentity::from_bytes(*operation_id.as_bytes()),
+            )
+            .unwrap();
+            let context = ConnectorRequestContext::try_new(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                ConnectorStopOwner::new().view(),
+                4096,
+                65536,
+            )
+            .unwrap();
+            let result = stage_mv_create_target(
+                &entrance,
+                StageMvCreateRequest {
+                    planning_lease,
+                    table: table.clone(),
+                    columns: vec![],
+                    partitioning: vec![],
+                    properties: BTreeMap::new(),
+                    operation_id,
+                    context: &context,
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(prepares.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let replacement = CreateIntent::try_new(
+                catalog,
+                table.clone(),
+                EffectIdentity::from_bytes(*uuid::Uuid::now_v7().as_bytes()),
+            )
+            .unwrap();
+            let next = || {
+                entrance.acquire(
+                    ManagementRequest::for_create_intent(
+                        replacement.clone(),
+                        EffectScope::CATALOG_COMMIT,
+                    ),
+                    || false,
+                )
+            };
+            if mode < 2 {
+                assert_eq!(
+                    entrance.management_phase(&table),
+                    MvManagementPhase::AwaitingCreateBinding
+                );
+                assert!(entrance.begin_unbound_create_observation(&intent).is_ok());
+                assert_eq!(
+                    next().err().unwrap(),
+                    ManagementAdmissionError::EffectUnsettled
+                );
+            } else {
+                assert_eq!(
+                    entrance.management_phase(&table),
+                    MvManagementPhase::NotObserved
+                );
+                assert!(entrance.begin_unbound_create_observation(&intent).is_err());
+                assert!(next().is_ok());
+            }
+        }
+    }
 
     fn output(snapshot_id: i64) -> ConnectorCommittedVersion {
         ConnectorCommittedVersion::try_new(

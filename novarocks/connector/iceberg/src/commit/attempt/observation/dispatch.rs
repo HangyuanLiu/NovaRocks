@@ -553,6 +553,64 @@ mod tests {
         assert!(descriptor.first_dispatch_ms.is_none());
         assert!(descriptor.binding.is_none());
     }
+    #[tokio::test]
+    async fn an_unknown_entry_blocks_every_preallocated_frontier() {
+        let (stage, preparation) = super::super::tests::catalog_journal();
+        stage
+            .publish_once(
+                preparation.clone(),
+                CatalogEvidencePolicy::default(),
+                |_, _, _| async { Ok(PreparedPublication::NoOp) },
+            )
+            .await
+            .unwrap();
+        let first = stage.next_frontier().unwrap();
+        let second = stage.next_frontier().unwrap();
+        let checked = stage.current_checked().unwrap();
+        first
+            .prepare_catalog(
+                checked.evidence.clone(),
+                "final seed".into(),
+                vec!["db.t".into()],
+                b"first".to_vec(),
+                crate::commit::publication_descriptor::AttributionPlan::ObserveOnly,
+                preparation.clone(),
+            )
+            .unwrap();
+        let claim = first.claim_dispatch().unwrap();
+        claim
+            .begin_dispatch(&preparation, &MemoryDispatchBarrier)
+            .await
+            .unwrap();
+        first.conclude_entry(
+            first.current_entry().unwrap(),
+            DispatchEvidence::Unknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "injected unknown",
+                ),
+                observation: Default::default(),
+            },
+        );
+        for frontier in [&first, &second, &stage] {
+            assert!(
+                frontier
+                    .prepare_catalog(
+                        checked.evidence.clone(),
+                        "forbidden seed".into(),
+                        vec!["db.t".into()],
+                        b"again".to_vec(),
+                        crate::commit::publication_descriptor::AttributionPlan::ObserveOnly,
+                        preparation.clone()
+                    )
+                    .is_err()
+            );
+            assert!(frontier.next_frontier().is_err());
+        }
+        assert_eq!(stage.state.lock().unwrap().entries.len(), 2);
+        assert!(second.current_entry().is_none());
+    }
+
     struct BudgetDispatch {
         entered: Arc<Notify>,
         exit: Arc<Notify>,
@@ -733,7 +791,9 @@ mod tests {
                 })
                 .await
         });
-        entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("finalization must enter its controlled work before the readiness bound");
         let original = grant.lock().unwrap().unwrap();
         tokio::time::sleep_until(
             (original.deadline() + std::time::Duration::from_millis(5)).into(),
