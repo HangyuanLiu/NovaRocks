@@ -43,7 +43,6 @@ use novarocks_catalog_application::{CatalogApplicationPort, CatalogCreateCommand
 use novarocks_query_application::api::build_utf8_query_result;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
-use novarocks_sql::literal::arrow_data_type_to_sql_type;
 use novarocks_sql::semantic::command::{
     AlterIcebergTableSqlCommand, CreateTableSqlCommand, IcebergTableSqlAction,
 };
@@ -575,15 +574,7 @@ fn execute_create_table_like(
     let columns = source_table
         .columns
         .iter()
-        .map(|column| {
-            Ok(TableColumnDef {
-                name: column.name.clone(),
-                data_type: arrow_data_type_to_sql_type(&column.data_type)?,
-                nullable: column.nullable,
-                aggregation: None,
-                default: None,
-            })
-        })
+        .map(create_like_column)
         .collect::<Result<Vec<_>, String>>()?;
     execute_create_table_statement(
         executor,
@@ -603,6 +594,24 @@ fn execute_create_table_like(
         current_database,
         connector_context,
     )
+}
+
+/// Copy the source's complete declaration. A shared Arrow carrier alone
+/// cannot distinguish Variant from binary, including inside nested columns.
+fn create_like_column(
+    column: &novarocks_types::schema::ColumnDef,
+) -> Result<TableColumnDef, String> {
+    let declared = column
+        .declared_value_type()
+        .map_err(|error| error.to_string())?;
+    Ok(TableColumnDef {
+        name: column.name.clone(),
+        data_type: novarocks_types::sql_type_from_value_type(&declared)
+            .map_err(|error| error.to_string())?,
+        nullable: column.nullable,
+        aggregation: None,
+        default: None,
+    })
 }
 
 fn execute_show_create_table(
@@ -665,6 +674,82 @@ mod tests {
     use novarocks_parser::ast::Statement;
 
     use super::{CatalogCommandExecutor, lower_semantic_create_catalog};
+
+    #[test]
+    fn create_like_columns_preserve_variant_binary_and_nested_declarations() {
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_types::schema::{ColumnDef, SqlType};
+        use std::sync::Arc;
+        let nested = SqlType::Struct(vec![
+            ("variant".into(), SqlType::Variant),
+            ("binary".into(), SqlType::Binary),
+            ("items".into(), SqlType::Array(Box::new(SqlType::Variant))),
+            (
+                "map".into(),
+                SqlType::Map(Box::new(SqlType::String), Box::new(SqlType::Variant)),
+            ),
+        ]);
+        let nested_carrier = DataType::Struct(
+            vec![
+                Field::new("variant", DataType::LargeBinary, true),
+                Field::new("binary", DataType::Binary, true),
+                Field::new(
+                    "items",
+                    DataType::List(Arc::new(Field::new("element", DataType::LargeBinary, true))),
+                    true,
+                ),
+                Field::new(
+                    "map",
+                    DataType::Map(
+                        Arc::new(Field::new(
+                            "entries",
+                            DataType::Struct(
+                                vec![
+                                    Field::new("key", DataType::Utf8, false),
+                                    Field::new("value", DataType::LargeBinary, true),
+                                ]
+                                .into(),
+                            ),
+                            false,
+                        )),
+                        false,
+                    ),
+                    true,
+                ),
+            ]
+            .into(),
+        );
+        for (declaration, carrier) in [
+            (SqlType::Variant, DataType::LargeBinary),
+            (SqlType::Binary, DataType::Binary),
+            (nested, nested_carrier),
+        ] {
+            let source = ColumnDef {
+                name: "payload".into(),
+                data_type: carrier,
+                nullable: true,
+                write_default: None,
+                logical_type: Some(declaration.clone()),
+            };
+            let copied = super::create_like_column(&source).unwrap();
+            assert_eq!(copied.data_type, declaration);
+            assert_eq!(copied.name, "payload");
+            assert!(copied.nullable);
+        }
+        // An ordinary LargeBinary declaration stays binary; its width alone
+        // must never infer Variant identity.
+        let binary = ColumnDef {
+            name: "raw".into(),
+            data_type: arrow::datatypes::DataType::LargeBinary,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        };
+        assert_eq!(
+            super::create_like_column(&binary).unwrap().data_type,
+            SqlType::Binary
+        );
+    }
 
     #[test]
     fn non_catalog_statement_is_not_claimed() {

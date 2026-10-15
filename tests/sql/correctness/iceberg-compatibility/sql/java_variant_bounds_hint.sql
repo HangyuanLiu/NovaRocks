@@ -25,7 +25,9 @@ shell: set -eu
 receipt_parent="${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/experiments/iceberg-variant"
 mkdir -p "$receipt_parent"
 receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
-"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode bounds --namespace nr_compat_${suite_uuid0} --table java_variant_bounds_${uuid0} --output "$receipt_dir"
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode bounds --namespace nr_compat_${suite_uuid0} --table java_variant_bounds_${uuid0} --output "$receipt_dir" >"$receipt_dir/run.log"
+cat "$receipt_dir/run.log" >&2
+grep -E '^IRU9_(BOUNDS_OK|FIXTURE_COMPLETE)' "$receipt_dir/run.log"
 
 -- query 2
 -- @expect_error=NovaRocks cannot read Variant column statistics written by other engines yet

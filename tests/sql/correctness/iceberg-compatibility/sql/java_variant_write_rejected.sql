@@ -25,7 +25,9 @@ shell: set -eu
 receipt_parent="${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/experiments/iceberg-variant"
 mkdir -p "$receipt_parent"
 receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
-"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode shredded --namespace nr_compat_${suite_uuid0} --table java_variant_rejected_${uuid0} --output "$receipt_dir"
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode shredded --namespace nr_compat_${suite_uuid0} --table java_variant_rejected_${uuid0} --output "$receipt_dir" >"$receipt_dir/run.log"
+cat "$receipt_dir/run.log" >&2
+grep -E '^IRU9_(SHREDDED_OK|FIXTURE_COMPLETE)' "$receipt_dir/run.log"
 
 -- query 2
 -- @expect_error=Iceberg Variant writes are not supported
@@ -48,6 +50,13 @@ ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_
 ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_rejected_${uuid0} ADD FILES FROM 's3://warehouse/iru9-does-not-exist-${uuid0}';
 
 -- query 7
+-- The ordinary id column has no Variant semantics. REST staging admission
+-- must still reject this property before probing or staging the target.
+-- @expect_error=write.parquet.variant-shredding.
+CREATE TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_shredding_ctas_rejected_${uuid0}
+TBLPROPERTIES ('write.parquet.variant-shredding.payload' = 'a:int') AS SELECT 1 AS id;
+
+-- query 8
 -- @result_contains=IRU9_UNCHANGED_OK
 shell: set -eu
 receipt_parent="${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/experiments/iceberg-variant"
@@ -55,6 +64,6 @@ mkdir -p "$receipt_parent"
 receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode unchanged --namespace nr_compat_${suite_uuid0} --table java_variant_rejected_${uuid0} --output "$receipt_dir"
 
--- query 8
+-- query 9
 -- @skip_result_check=true
 DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_rejected_${uuid0} FORCE;
