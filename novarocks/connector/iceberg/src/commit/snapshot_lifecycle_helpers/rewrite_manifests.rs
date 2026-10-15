@@ -347,7 +347,7 @@ async fn run_rewrite_manifests_with_table(
         snapshot_id: new_snapshot_id,
         retention: SnapshotRetention::branch(None, None, None),
     };
-    let updates = vec![
+    let mut updates = vec![
         TableUpdate::AddSnapshot {
             snapshot: new_snapshot,
         },
@@ -356,6 +356,18 @@ async fn run_rewrite_manifests_with_table(
             reference: new_ref,
         },
     ];
+    if metadata
+        .properties()
+        .keys()
+        .any(|key| key.starts_with(crate::document_storage::keyed::keys::PREFIX))
+    {
+        let carry = crate::commit::slot_change::carry_records_and_closure(metadata)?;
+        if !carry.properties.is_empty() {
+            updates.push(TableUpdate::SetProperties {
+                updates: carry.properties,
+            });
+        }
+    }
     let requirements = vec![
         TableRequirement::CurrentSchemaIdMatch {
             current_schema_id: metadata.current_schema_id(),
@@ -533,6 +545,15 @@ fn finalize_snapshot_summary(
             crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
             document_manifest,
         );
+    }
+    if let Some(previous) = previous {
+        for (key, value) in &previous.additional_properties {
+            if key.starts_with(crate::document_storage::keyed::keys::RECORD_PREFIX) {
+                crate::document_storage::keyed::record::decode_record(key, value)
+                    .map_err(document_manifest_error)?;
+                properties.insert(key.clone(), value.clone());
+            }
+        }
     }
     Ok(properties)
 }

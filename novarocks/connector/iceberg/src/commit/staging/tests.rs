@@ -902,6 +902,7 @@ async fn frozen_requests_match_three_stable_rest_goldens() {
             RequestShape::SnapshotProducing => ("snapshot", include_str!("golden/snapshot.json")),
             RequestShape::MetadataOnly => ("metadata", include_str!("golden/metadata.json")),
             RequestShape::Create => ("create", include_str!("golden/create.json")),
+            RequestShape::DocumentExpiry => unreachable!("expiry has a separate golden"),
         };
         let expected: serde_json::Value = serde_json::from_str(golden).unwrap();
         assert_eq!(
@@ -1040,4 +1041,111 @@ async fn new_spec_binds_missing_field_ids_before_rest_freeze() {
         serde_json::json!(1000)
     );
     assert_eq!(json["updates"][1]["spec-id"], serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn document_expiry_asserts_all_observed_refs_and_matches_rest_golden() {
+    let writer = TestWriter::new();
+    let setup = intent(RequestShape::SnapshotProducing);
+    let mut build =
+        StagingEngine::begin(existing(fixture(FormatVersion::V2)), &setup, &writer).unwrap();
+    for id in [11, 12, 13] {
+        build
+            .stage_change(change(append(build.metadata(), id)))
+            .unwrap();
+    }
+    build
+        .stage_change(change(vec![TableUpdate::SetSnapshotRef {
+            ref_name: "audit".into(),
+            reference: SnapshotReference::new(
+                12,
+                SnapshotRetention::Tag {
+                    max_ref_age_ms: None,
+                },
+            ),
+        }]))
+        .unwrap();
+    let base = build.metadata().clone();
+    let expiry = intent(RequestShape::DocumentExpiry);
+    assert!(!expiry.permits_conflict_retry());
+    let mut engine = StagingEngine::begin(existing(base.clone()), &expiry, &writer).unwrap();
+    let key = format!("novarocks.doc.v2.rev.{}", "0".repeat(64));
+    engine
+        .stage_change(change(vec![
+            TableUpdate::RemoveSnapshots {
+                snapshot_ids: vec![11],
+            },
+            TableUpdate::RemoveProperties {
+                removals: vec![key.clone()],
+            },
+        ]))
+        .unwrap();
+    let request = engine.freeze(&[]).unwrap();
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("golden/document-expiry.json")).unwrap();
+    assert_eq!(request.to_rest_json().unwrap(), expected);
+    for id in [12, 13] {
+        let mut engine = StagingEngine::begin(existing(base.clone()), &expiry, &writer).unwrap();
+        let staged = engine.stage_change(change(vec![TableUpdate::RemoveSnapshots {
+            snapshot_ids: vec![id],
+        }]));
+        assert!(
+            staged.is_err() || engine.freeze(&[]).is_err(),
+            "ref head must not be removed"
+        );
+    }
+    let mut only = StagingEngine::begin(existing(base), &expiry, &writer).unwrap();
+    only.stage_change(change(vec![TableUpdate::RemoveProperties {
+        removals: vec![key],
+    }]))
+    .unwrap();
+    assert_eq!(only.freeze(&[]).unwrap().updates().len(), 1);
+}
+
+#[tokio::test]
+async fn document_expiry_rejects_every_effect_outside_its_channel() {
+    let writer = TestWriter::new();
+    let expiry = intent(RequestShape::DocumentExpiry);
+    let base = fixture(FormatVersion::V2);
+    let mut forbidden = append(&base, 11);
+    forbidden.push(TableUpdate::SetProperties {
+        updates: HashMap::from([("novarocks.doc.v2.root.owner".into(), "value".into())]),
+    });
+    for key in [
+        "ordinary",
+        "novarocks.doc.v2.slot.owner~name",
+        "novarocks.doc.v2.rev.invalid",
+    ] {
+        forbidden.push(TableUpdate::RemoveProperties {
+            removals: vec![key.into()],
+        });
+    }
+    for update in forbidden {
+        let mut engine = StagingEngine::begin(existing(base.clone()), &expiry, &writer).unwrap();
+        assert!(engine.stage_change(change(vec![update])).is_err());
+    }
+}
+
+#[tokio::test]
+async fn empty_table_property_expiry_is_fenced_against_first_publication() {
+    let writer = TestWriter::new();
+    let base = fixture(FormatVersion::V2);
+    let expiry = intent(RequestShape::DocumentExpiry);
+    let mut engine = StagingEngine::begin(existing(base.clone()), &expiry, &writer).unwrap();
+    engine
+        .stage_change(change(vec![TableUpdate::RemoveProperties {
+            removals: vec![format!("novarocks.doc.v2.rev.{}", "0".repeat(64))],
+        }]))
+        .unwrap();
+    let request = engine.freeze(&[]).unwrap();
+    let absent = TableRequirement::RefSnapshotIdMatch {
+        r#ref: "main".into(),
+        snapshot_id: None,
+    };
+    assert!(request.requirements().contains(&absent));
+    absent.check(Some(&base)).unwrap();
+    let publish = intent(RequestShape::SnapshotProducing);
+    let mut concurrent = StagingEngine::begin(existing(base.clone()), &publish, &writer).unwrap();
+    concurrent.stage_change(change(append(&base, 11))).unwrap();
+    assert!(absent.check(Some(concurrent.metadata())).is_err());
 }

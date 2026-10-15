@@ -66,6 +66,7 @@ pub struct OperationIntentParts {
 // Design: ADR-0171 (docs/adr/ADR-0171-commit-operation-model.md)
 pub struct OperationIntent {
     parts: OperationIntentParts,
+    snapshot_loading: crate::catalog::SnapshotLoading,
 }
 
 impl OperationIntent {
@@ -86,7 +87,23 @@ impl OperationIntent {
                 "Create intent cannot carry an existing start snapshot",
             ));
         }
-        Ok(Self { parts })
+        Ok(Self {
+            parts,
+            snapshot_loading: crate::catalog::SnapshotLoading::All,
+        })
+    }
+    pub(crate) fn with_snapshot_loading(mut self, mode: crate::catalog::SnapshotLoading) -> Self {
+        self.snapshot_loading = mode;
+        self
+    }
+    pub(crate) fn snapshot_loading(&self) -> crate::catalog::SnapshotLoading {
+        self.snapshot_loading
+    }
+    /// A ref-frozen operation cannot be rebased after another commit wins.
+    pub fn permits_conflict_retry(&self) -> bool {
+        self.shape() != RequestShape::Create
+            && self.shape() != RequestShape::DocumentExpiry
+            && !self.dependencies().contains(&Dependency::RefUnchanged)
     }
     pub fn target(&self) -> &TableTarget {
         &self.parts.target

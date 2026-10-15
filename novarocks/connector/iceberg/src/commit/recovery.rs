@@ -54,6 +54,7 @@ impl From<OperationAuthority> for Authority {
 enum Shape {
     SnapshotProducing,
     MetadataOnly,
+    DocumentExpiry,
     Create,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -174,6 +175,7 @@ impl FrozenPublicationFacts {
         let expected_shape = match shape {
             RequestShape::SnapshotProducing => Shape::SnapshotProducing,
             RequestShape::MetadataOnly => Shape::MetadataOnly,
+            RequestShape::DocumentExpiry => Shape::DocumentExpiry,
             RequestShape::Create => Shape::Create,
         };
         if &self.namespace != identifier.namespace.as_ref()
@@ -262,6 +264,7 @@ impl FrozenPublicationFacts {
             shape: match request.shape() {
                 RequestShape::SnapshotProducing => Shape::SnapshotProducing,
                 RequestShape::MetadataOnly => Shape::MetadataOnly,
+                RequestShape::DocumentExpiry => Shape::DocumentExpiry,
                 RequestShape::Create => Shape::Create,
             },
             namespace: request.identifier().namespace.as_ref().to_vec(),
@@ -294,7 +297,7 @@ impl FrozenPublicationFacts {
                 Base::Existing {
                     metadata_location, ..
                 },
-                Shape::SnapshotProducing | Shape::MetadataOnly,
+                Shape::SnapshotProducing | Shape::MetadataOnly | Shape::DocumentExpiry,
             ) if !metadata_location.is_empty() => {}
             (Base::Create { location, .. }, Shape::Create) if !location.is_empty() => {}
             _ => {

@@ -30,6 +30,7 @@ use crate::iceberg::{Result, TableCommit, TableIdent, TableRequirement, TableUpd
 pub enum RequestShape {
     SnapshotProducing,
     MetadataOnly,
+    DocumentExpiry,
     Create,
 }
 
@@ -97,7 +98,9 @@ impl FrozenRequest {
                     parent,
                     metadata_location,
                 },
-                RequestShape::SnapshotProducing | RequestShape::MetadataOnly,
+                RequestShape::SnapshotProducing
+                | RequestShape::MetadataOnly
+                | RequestShape::DocumentExpiry,
             ) => {
                 if metadata_location.is_empty() {
                     return Err(invalid(
@@ -142,14 +145,51 @@ impl FrozenRequest {
                             "Snapshot-producing request must assert its exact target-ref parent",
                         ));
                     }
-                } else if parts
-                    .requirements
-                    .iter()
-                    .any(|r| matches!(r, TableRequirement::RefSnapshotIdMatch { .. }))
+                } else if parts.shape == RequestShape::MetadataOnly
+                    && parts
+                        .requirements
+                        .iter()
+                        .any(|r| matches!(r, TableRequirement::RefSnapshotIdMatch { .. }))
                 {
                     return Err(invalid(
                         "Metadata-only publication must not acquire a ref CAS",
                     ));
+                }
+                if parts.shape == RequestShape::DocumentExpiry {
+                    // Design: ADR-0178 (docs/adr/ADR-0178-inline-keyed-documents-and-snapshot-records.md)
+                    if parts.requirements.iter().any(|requirement| {
+                        !matches!(
+                            requirement,
+                            TableRequirement::UuidMatch { .. }
+                                | TableRequirement::RefSnapshotIdMatch { .. }
+                        )
+                    }) {
+                        return Err(invalid(
+                            "Document expiry only permits UUID and observed-ref requirements",
+                        ));
+                    }
+                    if !parts
+                        .requirements
+                        .contains(&TableRequirement::RefSnapshotIdMatch {
+                            r#ref: parts.target_ref.clone(),
+                            snapshot_id: *parent,
+                        })
+                    {
+                        return Err(invalid(
+                            "Document expiry must assert its exact target ref, including absence",
+                        ));
+                    }
+                    for update in &parts.updates {
+                        validate_document_expiry_update(update)?;
+                    }
+                    for update in &parts.updates {
+                        if let TableUpdate::RemoveSnapshots { snapshot_ids } = update {
+                            if parts.requirements.iter().any(|requirement| matches!(requirement,
+                                TableRequirement::RefSnapshotIdMatch{snapshot_id:Some(id),..} if snapshot_ids.contains(id))) {
+                                return Err(invalid("Document expiry cannot remove an observed ref head"));
+                            }
+                        }
+                    }
                 }
                 if parts.shape == RequestShape::MetadataOnly
                     && parts.updates.iter().any(|update| {
@@ -442,5 +482,25 @@ mod tests {
         let mut commit = request.into_table_commit();
         assert_eq!(commit.take_updates(), expected_updates);
         assert_eq!(commit.take_requirements(), [TableRequirement::NotExist]);
+    }
+}
+
+/// Expiry has no property write, snapshot creation, ref mutation or file effect.
+pub(crate) fn validate_document_expiry_update(update: &TableUpdate) -> Result<()> {
+    match update {
+        TableUpdate::RemoveSnapshots { .. } => Ok(()),
+        TableUpdate::RemoveProperties { removals }
+            if removals.iter().all(|key| {
+                key.strip_prefix("novarocks.doc.v2.rev.")
+                    .is_some_and(|identity| {
+                        novarocks_spi::connector::DocumentIdentity::parse_hex(identity).is_ok()
+                    })
+            }) =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid(
+            "Document expiry only permits snapshot removal and document-version property removal",
+        )),
     }
 }

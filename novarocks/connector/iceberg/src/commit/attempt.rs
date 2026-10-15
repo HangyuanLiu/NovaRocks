@@ -45,6 +45,23 @@ pub(crate) type Report = PublicationReport<CommitProof, CatalogCommitEvidence>;
 pub(crate) trait Publisher: Send + Sync {
     /// Read the authoritative target; no cached source snapshot is a retry base.
     async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase>;
+    async fn load_target_with_snapshots(
+        &self,
+        attempt: &IcebergCommitAttempt,
+        mode: crate::catalog::SnapshotLoading,
+    ) -> Result<StagingBase> {
+        if mode != crate::catalog::SnapshotLoading::All {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Publisher has no refs-scoped metadata load",
+            ));
+        }
+        self.load_target(attempt).await
+    }
+    /// Expiry receives the exact full observation. It may never reload a base.
+    fn pinned_expiry_base(&self) -> Option<StagingBase> {
+        None
+    }
     /// Encode and bound the complete recovery ledger before publication becomes
     /// possible. Failure here is definitely undispatched.
     fn preflight_recovery(
@@ -72,12 +89,21 @@ pub(crate) struct TransitionalPublisher {
 #[async_trait]
 impl Publisher for TransitionalPublisher {
     async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
+        self.load_target_with_snapshots(attempt, crate::catalog::SnapshotLoading::All)
+            .await
+    }
+    async fn load_target_with_snapshots(
+        &self,
+        attempt: &IcebergCommitAttempt,
+        mode: crate::catalog::SnapshotLoading,
+    ) -> Result<StagingBase> {
         attempt.check_active()?;
         let loaded = self
             .catalog
-            .load_commit_base(
+            .load_commit_base_with_snapshots(
                 crate::catalog::CatalogTableName::from_identifier(&self.ident),
                 attempt.file_io().clone(),
+                mode,
             )
             .await;
         attempt.check_active()?;
@@ -132,6 +158,34 @@ impl Publisher for TransitionalPublisher {
     }
 }
 
+/// Dispatch through the same owner while preserving one observed expiry base.
+pub(crate) struct PinnedExpiryPublisher<'a> {
+    pub inner: std::sync::Arc<dyn Publisher + 'a>,
+    pub base: StagingBase,
+}
+#[async_trait]
+impl Publisher for PinnedExpiryPublisher<'_> {
+    async fn load_target(&self, _attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
+        Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Pinned expiry cannot reload its base",
+        ))
+    }
+    fn pinned_expiry_base(&self) -> Option<StagingBase> {
+        Some(self.base.clone())
+    }
+    fn preflight_recovery(
+        &self,
+        request: &FrozenRequest,
+        operation: &IcebergCommitOperation,
+    ) -> Result<()> {
+        self.inner.preflight_recovery(request, operation)
+    }
+    async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
+        self.inner.dispatch_once(request).await
+    }
+}
+
 /// Eager writes retain the catalog-owner transaction frontier. The request is
 /// complete before admission and is borrowed only by the single dispatch.
 pub(crate) struct OwnerPublisher {
@@ -142,6 +196,13 @@ pub(crate) struct OwnerPublisher {
 
 #[async_trait]
 impl Publisher for OwnerPublisher {
+    async fn load_target_with_snapshots(
+        &self,
+        attempt: &IcebergCommitAttempt,
+        mode: crate::catalog::SnapshotLoading,
+    ) -> Result<StagingBase> {
+        self.target.load_target_with_snapshots(attempt, mode).await
+    }
     async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
         self.target.load_target(attempt).await
     }
@@ -303,7 +364,19 @@ pub(crate) async fn run(
             Ok(attempt) => attempt,
             Err(error) => return rejected(operation, before_dispatch_failure(&error)).await,
         };
-        let base = match publisher.load_target(&attempt).await {
+        let loaded = if intent.shape() == RequestShape::DocumentExpiry {
+            publisher.pinned_expiry_base().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Document expiry requires its exact full-observation base",
+                )
+            })
+        } else {
+            publisher
+                .load_target_with_snapshots(&attempt, intent.snapshot_loading())
+                .await
+        };
+        let base = match loaded {
             Ok(base) => base,
             Err(error) => return rejected(operation, before_dispatch_failure(&error)).await,
         };
@@ -345,7 +418,7 @@ pub(crate) async fn run(
             }
             CatalogOutcome::KnownUncommitted { failure }
                 if failure.kind() == ConnectorMutationFailureKind::Conflict
-                    && intent.shape() != RequestShape::Create
+                    && intent.permits_conflict_retry()
                     && attempt_number < policy.retries =>
             {
                 // An unsuccessful bounded cleanup remains in the ledger; it never permits path reuse.
@@ -555,7 +628,7 @@ mod tests {
     use crate::iceberg::TableUpdate;
     use crate::iceberg::spec::{FormatVersion, Struct, TableMetadata};
     use std::sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -998,6 +1071,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn document_expiry_uses_only_pinned_full_base_and_never_retries_conflict() {
+        for conflict in [false, true] {
+            let fixture = Fixture::new();
+            let metadata = fixture.metadata(FormatVersion::V2);
+            let intent = OperationIntent::new(OperationIntentParts {
+                target: TableTarget {
+                    ident: crate::iceberg::TableIdent::new(
+                        crate::iceberg::NamespaceIdent::new("db".into()),
+                        "t".into(),
+                    ),
+                    uuid: Some(metadata.uuid()),
+                },
+                target_ref: "main".into(),
+                start: None,
+                changes: FileChanges::default(),
+                dependencies: vec![Dependency::NoReadDependency],
+                isolation: IsolationLevel::Snapshot,
+                shape: RequestShape::DocumentExpiry,
+                summary: std::collections::BTreeMap::new(),
+                token: fixture.operation.token(),
+            })
+            .unwrap();
+            let dispatch = if conflict {
+                Dispatch::ConflictThen(metadata.clone())
+            } else {
+                Dispatch::Commit
+            };
+            let inner = Arc::new(ControlledPublisher::new(
+                &fixture,
+                metadata.clone(),
+                dispatch,
+            ));
+            let pinned = PinnedExpiryPublisher {
+                inner: inner.clone(),
+                base: StagingBase::Existing {
+                    metadata: metadata.clone(),
+                    metadata_location: "file:///exact-full-load.metadata.json".into(),
+                },
+            };
+            let prefix = PreparedChange {
+                requirements: vec![],
+                updates: vec![TableUpdate::RemoveProperties {
+                    removals: vec![format!("novarocks.doc.v2.rev.{}", "0".repeat(64))],
+                }],
+            };
+            let report = run(&fixture.operation, &intent, &prefix, &[], &pinned, policy()).await;
+            if conflict {
+                assert!(matches!(
+                    report.publication,
+                    PublicationOutcome::KnownUncommitted(_)
+                ));
+            } else {
+                assert!(matches!(
+                    report.publication,
+                    PublicationOutcome::Committed(_)
+                ));
+            }
+            assert_eq!(inner.loads.load(Ordering::SeqCst), 0);
+            assert_eq!(inner.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn document_expiry_without_a_full_base_is_rejected_without_load_or_dispatch() {
+        let fixture = Fixture::new();
+        let metadata = fixture.metadata(FormatVersion::V2);
+        let intent = OperationIntent::new(OperationIntentParts {
+            target: TableTarget {
+                ident: crate::iceberg::TableIdent::new(
+                    crate::iceberg::NamespaceIdent::new("db".into()),
+                    "t".into(),
+                ),
+                uuid: Some(metadata.uuid()),
+            },
+            target_ref: "main".into(),
+            start: None,
+            changes: FileChanges::default(),
+            dependencies: vec![Dependency::NoReadDependency],
+            isolation: IsolationLevel::Snapshot,
+            shape: RequestShape::DocumentExpiry,
+            summary: std::collections::BTreeMap::new(),
+            token: fixture.operation.token(),
+        })
+        .unwrap();
+        let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Commit);
+        let report = run(
+            &fixture.operation,
+            &intent,
+            &PreparedChange::default(),
+            &[],
+            &publisher,
+            policy(),
+        )
+        .await;
+        assert!(matches!(
+            report.publication,
+            PublicationOutcome::KnownUncommitted(_)
+        ));
+        assert_eq!(publisher.loads.load(Ordering::SeqCst), 0);
+        assert!(publisher.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn read_dependency_conflict_stops_before_a_second_dispatch() {
         let baseline = Fixture::new();
         let metadata = append_state(&baseline, baseline.metadata(FormatVersion::V3), 2).await;
@@ -1011,9 +1187,13 @@ mod tests {
             panic!("dependency must reject")
         };
         assert_eq!(failure.kind(), ConnectorMutationFailureKind::Conflict);
-        assert!(failure.message().contains("RefUnchanged"));
+        assert!(
+            failure
+                .message()
+                .contains("Injected concurrent catalog commit")
+        );
         assert_eq!(publisher.requests.lock().unwrap().len(), 1);
-        assert_eq!(publisher.loads.load(Ordering::SeqCst), 2);
+        assert_eq!(publisher.loads.load(Ordering::SeqCst), 1);
         assert!(fixture.operation.artifacts().unwrap().is_empty());
     }
 

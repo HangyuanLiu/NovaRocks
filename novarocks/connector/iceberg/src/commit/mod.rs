@@ -51,6 +51,7 @@ mod row_mutation_preparation;
 #[cfg(test)]
 pub(crate) mod run;
 mod selected_rewrite;
+pub(crate) mod slot_change;
 pub mod snapshot_lifecycle_helpers;
 pub(crate) mod staging;
 pub mod statistics;

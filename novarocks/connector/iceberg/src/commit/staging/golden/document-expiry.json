@@ -1,0 +1,38 @@
+{
+  "identifier": {
+    "name": "t",
+    "namespace": [
+      "db"
+    ]
+  },
+  "requirements": [
+    {
+      "type": "assert-table-uuid",
+      "uuid": "01010101-0101-0101-0101-010101010101"
+    },
+    {
+      "type": "assert-ref-snapshot-id",
+      "ref": "main",
+      "snapshot-id": 13
+    },
+    {
+      "type": "assert-ref-snapshot-id",
+      "ref": "audit",
+      "snapshot-id": 12
+    }
+  ],
+  "updates": [
+    {
+      "action": "remove-snapshots",
+      "snapshot-ids": [
+        11
+      ]
+    },
+    {
+      "action": "remove-properties",
+      "removals": [
+        "novarocks.doc.v2.rev.0000000000000000000000000000000000000000000000000000000000000000"
+      ]
+    }
+  ]
+}

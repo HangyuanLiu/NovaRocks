@@ -445,6 +445,14 @@ struct ObservedPublisher {
 
 #[async_trait]
 impl Publisher for ObservedPublisher {
+    async fn load_target_with_snapshots(
+        &self,
+        attempt: &IcebergCommitAttempt,
+        mode: crate::catalog::SnapshotLoading,
+    ) -> crate::iceberg::Result<StagingBase> {
+        self.inner.load_target_with_snapshots(attempt, mode).await
+    }
+
     async fn load_target(
         &self,
         attempt: &IcebergCommitAttempt,
