@@ -15,7 +15,7 @@ provenance:
   - "discussion: 2026-10-12 exit of the REST-only core patches (staged-create initialization, add-schema last-column-id, view API)"
   - "discussion: 2026-10-14 ruling that REST services based on Iceberg Java 1.8 and earlier are unsupported"
   - "discussion: 2026-10-14 review of view replacement: version-ID reuse after history expiry, and semantic validation before dispatch"
-  - "PR: (回填)"
+  - "PR: https://github.com/NovaRocks/NovaRocks/pull/1220"
 code-anchors:
   - "novarocks/connector/iceberg/src/commit/staging/initialization.rs (staged_create_updates)"
   - "novarocks/connector/iceberg/src/commit/staging/engine.rs (validate_initialization)"
