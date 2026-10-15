@@ -228,6 +228,17 @@ UEA-4G 的额外原生验收入口是 system scenario `connector/iceberg-delete-
 | 字典 | low-cardinality / null_roundtrip；agg_collection_string_dict_semantics | 编码适配后的值和 NULL，不使用字典编号充当值身份 |
 | NULL 保证 | join / join_left_outer_null_fill；join_full_outer_null_fill | 公开声明反映实际 NULL 扩展，root 精确校验 |
 | 外部字段 | iceberg-ddl / schema_evolution_nested；schema_evolution_reorder | provider 字段身份与演进，不把来源属性当执行类型 |
-| 写入往返 | iceberg-dml / variant_insert；variant_mutations | 原 target/source 事实及完整领域读回 |
+| 写入边界与往返 | iceberg-dml / variant_insert；variant_mutations；write_adaptation_types | Variant 明确拒绝；非 Variant target/source 事实及领域读回 |
 
 涉及冻结 wire、跨 BE exchange 或真实退出时使用现有 `--cluster-mode cross-process --cluster-size 3` 路径；需要 REST/MinIO/Spark 的用例消费原 fixture publication。纯语义或 creator/refusal 的问题优先在所属 crate 验证。实际 case 发现数以 runner 当前发现为准，零命中不算通过；上述示例不代替所属变更冻结的完整必跑集合。
+
+### IRU-9 Iceberg write boundaries
+
+`iceberg-dml` covers Variant expression semantics without writing Variant,
+explicit unsupported write errors, ordinary `STRUCT<metadata,value>` identity,
+and nested binary/string plus decimal write adaptation. `iceberg-ddl` covers
+nested Variant, format-version 3 admission, CREATE LIKE, and rejected shredding
+properties including CTAS without Variant columns. `iceberg-compatibility` uses
+`fixtures/iceberg-variant` for Java-authored Variant/UUID and target-schema cases.
+The restored optimizer and analytic cases retain Variant path hints and window
+value-domain handoff without depending on Variant data-file writing.

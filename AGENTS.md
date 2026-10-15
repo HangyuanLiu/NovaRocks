@@ -351,6 +351,10 @@ Execution, and do not recreate a Backend facade around it.
 - `novarocks/connector/iceberg/**`
   Iceberg control/execution contracts, catalog integrations, and storage facts.
 
+  Iceberg 写出类型边界见 [ADR-0178](docs/adr/ADR-0178-iceberg-write-type-boundary-and-variant-layering.md)：
+  `commit/write_stack/` 冻结完整目标 schema，`commit/frozen_write.rs` 投影 SDK writer schema，
+  `commit/write_adaptation.rs` 适配执行输入；Variant/uuid 数据写出准入与逻辑 Variant 读取分别属于 Provider。
+
   Iceberg 提交契约见 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)。修改前先读：
   - `novarocks/connector/iceberg/src/commit/model/**`：不可变意图、逻辑条目与物理对象身份、继承字段、冻结请求及发布/清理结果。
   - `novarocks/connector/iceberg/src/commit/dependency/**`：按类别惰性读取 metadata、目标 ref 存活集和连续历史窗口，验证操作依赖。

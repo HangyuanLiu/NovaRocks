@@ -54,8 +54,8 @@ Spec 新增能力：
 | Deletion Vector（替代 V2 position-delete） | ✅ | [deletion-vectors](deletion-vectors.md) |
 | Equality-delete 在 V3 下的语义保留 | ✅ | [deletion-vectors](deletion-vectors.md) |
 | Default Value（`initial-default` / `write-default`） | ✅ | [default-values](default-values.md) |
-| Variant 类型（读） | ✅ | [variant](variant.md) |
-| Variant 类型（写） | 🚧 | INSERT happy path ✅（PR #87）；OVERWRITE / DELETE / UPDATE / MERGE 仍 reject。详见 [variant](variant.md) |
+| Variant 类型（读） | ✅ 顶层 | 含 shredded group；嵌套与 manifest Variant bounds 限制见 [variant](variant.md) |
+| Variant 类型（写） | ❌ 数据写出 | INSERT / OVERWRITE / UPDATE / MERGE 与 ADD FILES 拒绝；DV DELETE 等边界见 [variant](variant.md) |
 | Geometry / Geography 类型 | ❌ | [data-types](data-types.md) |
 | Timestamp_ns / Timestamptz_ns | ❌ | [data-types](data-types.md) |
 | Unknown 类型 | ❌ | [data-types](data-types.md) |

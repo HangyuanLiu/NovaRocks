@@ -320,7 +320,9 @@ pub(crate) fn iceberg_type_to_arrow_type(
             ),
             PrimitiveType::Binary => DataType::Binary,
         }),
-        Type::Variant(_) => Ok(DataType::Binary),
+        Type::Variant(_) => {
+            Err("iceberg metadata partition fields do not support Variant".to_owned())
+        }
         other => Err(format!(
             "iceberg metadata partition field must be primitive, got {other:?}"
         )),

@@ -16,36 +16,36 @@
 -- under the License.
 
 -- @order_sensitive=true
--- Test Point: INSERT into a v3 iceberg table with a VARIANT column
--- round-trips through parquet write + read.
--- Method: CREATE … (id INT, v VARIANT) USING iceberg WITH ("format-version"="3"),
---         INSERT VALUES with parse_json, SELECT id, v.
-
+-- Variant writes fail before staging; scalar expressions retain their value domains.
 -- query 1
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.t_v3_variant FORCE;
-CREATE TABLE ${case_db}.t_v3_variant (
-  id INT,
-  v VARIANT
-)
-TBLPROPERTIES (
-  "format-version" = "3"
-);
+CREATE TABLE ${case_db}.t_v3_variant (id INT, v VARIANT)
+TBLPROPERTIES ("format-version" = "3");
+
+-- query 2
+-- @expect_error_tier=drift
+-- @expect_error=Iceberg Variant writes are not supported
 INSERT INTO ${case_db}.t_v3_variant VALUES
   (1, parse_json('{"a":1,"b":"x"}')),
-  (2, parse_json('[10, 20, 30]')),
+  (2, parse_json('[10,20,30]')),
   (3, parse_json('null')),
   (4, NULL);
 
--- query 2 — round-trip through parquet: assert each row's variant
--- payload decodes to the expected logical type. Selecting `v` directly
--- would emit raw [size|metadata|value] bytes whose embedded \n breaks
--- the MySQL row delimiter, so we use variant_typeof for a stable display.
-SELECT id, variant_typeof(v) FROM ${case_db}.t_v3_variant ORDER BY id;
-
--- query 3 — concrete payload probe via the JSON-path accessor.
-SELECT id, get_json_string(v, '$.b') FROM ${case_db}.t_v3_variant WHERE id = 1;
+-- query 3
+SELECT variant_typeof(parse_json('{"a":1}')) AS object_kind,
+       variant_typeof(parse_json('[10,20,30]')) AS array_kind,
+       variant_typeof(parse_json('null')) AS variant_null_kind,
+       variant_typeof(CAST(NULL AS VARIANT)) AS sql_null_kind,
+       parse_json('null') IS NULL AS variant_is_sql_null,
+       CAST(NULL AS VARIANT) IS NULL AS sql_is_null;
 
 -- query 4
+SELECT get_json_string(parse_json('{"a":1,"b":"x"}'), '$.b') AS b;
+
+-- query 5
+SELECT COUNT(*) AS remaining_rows FROM ${case_db}.t_v3_variant;
+
+-- query 6
 -- @skip_result_check=true
 DROP TABLE ${case_db}.t_v3_variant FORCE;

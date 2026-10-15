@@ -2820,7 +2820,17 @@ impl IcebergSystemTableProvider {
         let max_page_rows = self.max_page_rows;
         let load = async move {
             let mut reader = FrozenMetadataReader::new(&binding, &context);
-            let manifest = reader.load_manifest(&relation.manifest).await?;
+            let manifest = reader
+                .load_manifest(&relation.manifest)
+                .await
+                .map_err(|error| {
+                    error.map_message(|message| {
+                        crate::manifest::with_variant_statistics_hint_for_history(
+                            message,
+                            relation.table_has_variant_history,
+                        )
+                    })
+                })?;
             let bytes_read = reader.bytes_read;
             relation.into_page_source(&manifest, max_page_rows, bytes_read)
         };
@@ -2890,6 +2900,7 @@ struct StreamRead {
 
 /// One `$files` split's frozen shape; deciding it reads nothing.
 struct FilesSplitRelation {
+    table_has_variant_history: bool,
     manifest: TrinoManifestFile,
     spec: PartitionSpec,
     schema: SchemaRef,
@@ -2913,6 +2924,7 @@ impl FilesSplitRelation {
         let schema = system_relation_schema(IcebergSystemTableType::Files, &table_schema, &specs)?;
         let projection = project_system_relation_columns(&schema, columns)?;
         Ok(Self {
+            table_has_variant_history: split.table_has_variant_history(),
             manifest: split.manifest().clone(),
             spec,
             schema,
@@ -3208,7 +3220,11 @@ async fn read_snapshot_file_rows(
     let mut rows = Vec::new();
     for manifest_file in &manifests.files {
         let spec = manifest_spec(metadata, manifest_file)?;
-        let manifest = reader.load_manifest(manifest_file).await?;
+        let manifest = reader.load_manifest(manifest_file).await.map_err(|error| {
+            error.map_message(|message| {
+                crate::manifest::with_variant_statistics_hint(message, metadata)
+            })
+        })?;
         budget.consume(1).await;
         rows.extend(manifest_rows(manifest_file, &manifest, &spec, status_rule)?);
     }
@@ -4304,6 +4320,7 @@ mod tests {
         let schema = warehouse.metadata.current_schema().as_ref().clone();
         let spec = identity_spec(&schema, 0, "region");
         let split = FilesTableSplit::try_new(FilesTableSplitParams {
+            table_has_variant_history: false,
             manifest: manifests[0].clone(),
             table_schema_json: serde_json::to_string(&schema).expect("schema json"),
             metadata_table_schema_json: r#"{"relation":"$files"}"#.to_string(),
@@ -4574,6 +4591,7 @@ mod tests {
         let schema = warehouse.metadata.current_schema().as_ref().clone();
         let spec = identity_spec(&schema, 0, "region");
         let split = FilesTableSplit::try_new(FilesTableSplitParams {
+            table_has_variant_history: false,
             manifest: manifests[0].clone(),
             table_schema_json: serde_json::to_string(&schema).expect("schema json"),
             metadata_table_schema_json: r#"{"relation":"$files"}"#.to_string(),

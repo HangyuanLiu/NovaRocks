@@ -49,6 +49,7 @@ fn iceberg_field_def(field: &NestedField) -> IcebergSchemaFieldDef {
             .map(|json| json.to_string())
     });
     IcebergSchemaFieldDef {
+        is_variant: matches!(field.field_type.as_ref(), Type::Variant(_)),
         field_id: field.id,
         name: field.name.clone(),
         initial_default: field.initial_default.clone(),

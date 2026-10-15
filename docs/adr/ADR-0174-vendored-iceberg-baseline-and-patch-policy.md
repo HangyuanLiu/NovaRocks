@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0178
+    scope: "Core U8 Arrow writer schema override retention and Variant read capability deferral; unrelated baseline and patch rules remain active"
+    link: "ADR-0178-iceberg-write-type-boundary-and-variant-layering.md"
   - id: ADR-0175
     scope: "REST crate patch inventory (U1r, R1-R3, R5-R8, R10) and its deletion; ruling 4 temporary REST outcome narrowing; the compromise that authentication uses the SDK session and merged properties"
     link: "ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md"

@@ -19,104 +19,47 @@ under the License.
 
 # Variant 类型（V3）
 
-> Iceberg v3 的 `variant` 用 metadata/value 表示半结构化数据。切到 iceberg-rust 0.11 后，本阶段只迁移类型与保证编译，**不承诺 Iceberg Variant 列的读取、写入或统计功能**。DDL 仍映射为上游 `Type::Variant`；含 Variant 列的写出失败于派发之前，确定未提交的产物由原 owner 清理。旧 INSERT/shredding 转换已删除，上游 writer 的不支持分支保持，待 Provider 物理布局与写出接缝恢复。
->
-> 下文保留表达式和物理机制说明；历史 lake-table 示例标为待恢复，不是当前可运行能力。来源与补丁政策见 [ADR-0174](../../adr/ADR-0174-vendored-iceberg-baseline-and-patch-policy.md)。
+Iceberg `variant` 是逻辑类型。NovaRocks 读取其他引擎写出的顶层 Variant，包括未 shred 的 `metadata/value` group 与包含 `typed_value` 的 shredded group；Provider 在读取边界合并为执行层的 `LargeBinary` 值。普通 `STRUCT<metadata BINARY, value BINARY>` 仍按 STRUCT 读取，字段名与物理形状不赋予 Variant 语义。
 
-| 能力 | 状态 | 备注 |
-| --- | --- | --- |
-| Variant 列读 | 🚧 待恢复 | 0.11 切换仅保证编译，无 Iceberg 读取功能承诺 |
-| Variant 表达式函数（`variant_get` / `variant_extract` / `variant_typeof` / `get_json_string` 等） | 实现保留 | 表达式机制不等于 Iceberg 列读取能力 |
-| `INSERT INTO ... VALUES (parse_json(...))` 写 variant 列 | ❌ 暂不可用 | 旧转换已退出；上游 writer 拒绝 Variant |
-| `INSERT INTO ... SELECT` 写 variant 列 | ❌ 暂不可用 | 同上 |
-| `INSERT OVERWRITE` / `DELETE` / `UPDATE` / `MERGE INTO` / `ADD EQUALITY DELETE` 在 variant-bearing 表 | ❌ 暂不可用 | 当前不支持 Variant 数据路径 |
-| Variant *shredding* 读（`typed_value` 子树） | 🚧 待恢复 | 内核机制保留；无 Iceberg 读取功能承诺 |
-| Variant *shredding* 写 | ❌ 暂不可用 | 属性解析和写出转换已删除 |
-| Variant default value（`initial-default` / `write-default`） | ❌ | |
-| Variant 在 partition spec / sort order / equality_ids | ❌ | spec 禁止；NovaRocks reject |
-| Variant predicate pushdown 到 parquet | ❌ | |
+| 操作 | 支持边界 |
+| --- | --- |
+| 顶层 Variant 读取与表达式求值 | 支持；受下文 manifest 统计限制 |
+| STRUCT / LIST / MAP 中嵌套 Variant | 不支持；投影该基础列时报错，只选其他列仍可读 |
+| CREATE / ALTER ADD 顶层 Variant 列 | 仅 format-version 3；不支持 Variant default |
+| INSERT / OVERWRITE / UPDATE / MERGE / OPTIMIZE 数据重写 | 目标表任意层级含 Variant 时拒绝，包括只插入的 MERGE |
+| CTAS / MV 暂存建表 | 列定义含 Variant 时在 namespace 探测与暂存请求之前拒绝 |
+| ADD FILES | 目标表含 Variant 时拒绝 |
+| DELETE | v3 使用 deletion vector；不因表内存在普通 Variant 列而拒绝 |
+| TRUNCATE | 不写出 Variant 数据文件，沿原有元数据操作路径执行 |
+| ADD EQUALITY DELETE | 等值键不能是 Variant；表内其他 Variant 列不构成全表禁止 |
+| shredding 写入与属性 | 不支持；CREATE / CTAS / ALTER SET 拒绝 `write.parquet.variant-shredding.` 前缀 |
+| Variant 在 partition spec / sort order / equality_ids | 不支持 |
+| Variant predicate pushdown 到 Parquet | 不支持；表达式在执行侧求值 |
 
----
-
-## Variant 读路径（待恢复）
+## 读取与表达式
 
 ```sql
--- 待恢复后的用法示例；当前不保证 Iceberg Variant 列读取
 SELECT id, variant_get(payload, '$.user.id') AS uid
-  FROM t
- WHERE id < 1000;
+FROM t
+WHERE id < 1000;
 ```
 
-待恢复并验证的读取能力：
+`variant_get/try_variant_get(v, path[, type])` 的 path 与 type 必须是字符串字面量。两参形式返回 Variant；三参形式可指定 boolean、int、bigint、float、double、string、date、datetime。missing path 与 Variant null 返回 SQL NULL；类型转换失败时 `variant_get` 报错，`try_variant_get` 返回 NULL。第一个参数也接受 JSON 字符串。坏 JSON 是查询错误。
 
-- 直接 SELECT variant 列（按 binary 返回）
-- 用 variant 表达式函数提取字段（`$.path.to.field`）
-- variant 字段在投影裁剪 / 列裁剪 / runtime filter 中正常参与
+## Manifest 统计限制
 
-## variant_get / try_variant_get 表达式机制（Spark 对齐）
+当前 SDK 不能读取其他引擎写入的 Variant 列 bounds。包含这种统计的 manifest 加载失败时保留原始错误；表的任一历史 schema 出现过 Variant，就追加：
 
-- `variant_get/try_variant_get(v, path[, type])`：`path` 与 `type` 必须是字符串字面量。
-  2 参返回 variant；3 参返回指定类型，`type` ∈ {boolean, int, bigint, float, double, string,
-  date, datetime}。
-- 语义：missing path → NULL；variant null → NULL；cast 失败 → `variant_get` 报错、
-  `try_variant_get` 返回 NULL。
-- 求值经由上游 parquet-variant-compute kernel/语义（与 scan 层 shredded 快路径同属
-  parquet-variant-compute，语义保持一致，IV3-6 决策 B）；旧 `get_variant_*` 家族保持原有
-  宽松强转语义不变，不参与下推优化。
-- 第一个参数也接受 JSON 字符串 / VARCHAR（如 `variant_get(s, '$.a', 'bigint')`，其中 `s`
-  是 JSON 文本）；`parse_json(s)` 先转成 variant 后也可作为第一个参数。坏 JSON 在 raw
-  JSON/VARCHAR 与 `parse_json(s)` 模式下都是查询错误。
-
-## 历史 Variant INSERT 示例（待恢复）
-
-```sql
--- 历史写出示例；当前 INSERT 将失败，不能作为 smoke 或验证入口
-CREATE TABLE t (id INT, v VARIANT) USING iceberg
-  TBLPROPERTIES ("format-version" = "3");
-
-INSERT INTO t VALUES
-  (1, parse_json('{"a":1,"b":"x"}')),
-  (2, parse_json('[10, 20, 30]')),
-  (3, parse_json('null')),
-  (4, NULL);
-
-SELECT id, variant_typeof(v) FROM t ORDER BY id;
--- 1 Object / 2 Array / 3 Null / 4 NULL
-
-SELECT id, get_json_string(v, '$.b') FROM t WHERE id = 1;  -- "x"
+```text
+hint: this table has had Variant columns, and NovaRocks cannot read Variant column statistics written by other engines yet, which may be related (docs/guides/iceberg-v3/variant.md)
 ```
 
-恢复写出时需要承接的物理合同：
+提示只表示可能相关。权限、网络与文件损坏错误也可能带此提示；原错误类别、重试资格与清理事实保持不变。删除 Variant 列不抹去历史 schema，也不保证旧 manifest 已可读。不忽略统计、不跳过失败的 manifest。
 
-- 文件落到 object storage 时是 spec-compliant parquet：variant group 标 `LogicalType::Variant`，使用 required Binary `metadata` 与 nullable Binary `value`，并保持外层字段的 Variant extension
-- 默认非 shredding；shredding 属性接入与 `typed_value` 写出待重新实现和验证
-- `INSERT INTO t SELECT ...` 也须沿正式布局接缝恢复，不留临时转换
+## 写入限制与恢复条件
 
-## 其它 DML
+NovaRocks 当前不写出 Variant Parquet 数据文件。SDK 写出类型仍不支持 Variant，执行载体不能代替 Parquet `LogicalType::Variant`、extension 与统计语义。写入在 provider 准入处返回 `Unsupported`，拒绝时不产生数据文件、暂存请求或提交。
 
-当前 Variant-bearing Iceberg 表不提供 INSERT/OVERWRITE/DELETE/UPDATE/MERGE/equality-delete 的支持承诺。写出路径不会绕过 SDK 的不支持限制，不能通过旧 shredding 属性重新启用。其它引擎写入 Variant 表也不自动意味着 NovaRocks 已能读取它。
+恢复写入需由 Provider 拥有正式的 Variant writer：正确输出 Variant logical annotation、metadata/value 与可选 typed_value，生成规范的统计，保留 field ID、required 与 NULL 语义，并完成独立实现互读及真实 1FE+3BE 数据正确性验证。不能靠 schema override 或仅改 Arrow metadata 恢复。
 
-## ❌ Variant in partition spec / sort order / equality_ids
-
-Spec 禁止；NovaRocks 在 CREATE TABLE / ALTER PARTITION 阶段 reject，错误信息明确说明。
-
-## Variant shredding 机制（待恢复）
-
-Spec optional 能力：在 parquet 物理结构里把"已知 schema 部分"提到 `typed_value` 子树以加速点查 / pushdown。
-
-- **读：待恢复验证。** 原 `unshred_variant` 内核机制仍存在，但必须把上游 Variant Struct 表示、执行层逻辑载体和真实文件读路径接起来，才能重新声明 Iceberg 数据正确性。
-- **写：暂不可用。** 旧 `write.parquet.variant-shredding.<col>` 解析及转换已删除。该属性不再是启用能力的入口；不能用 schema override 绕过上游 writer 的拒绝分支。
-
-## ❌ Variant default value
-
-Spec：variant 列允许 declare DEFAULT。NovaRocks 当前 CREATE TABLE / ALTER ADD COLUMN 在 variant 列上拒绝 DEFAULT。
-
-## ❌ Variant predicate pushdown
-
-Spec：variant 字段 path 提取（`payload:user.id > 1000`）应该可以下推到 parquet 层做剪枝（依赖 parquet variant page index）。NovaRocks 当前在 BE 层 evaluate variant predicate，扫描成本与全表扫描相当。
-
----
-
-## 恢复条件
-
-Provider 的 Variant 物理布局/writer owner 需要统一上游 `Type::Variant`、Struct metadata/value 表示与执行层逻辑载体，再交付读取、写入、统计和相应数据正确性覆盖。被删除、忽略和 SQL 跳过的性质覆盖须逐项重新承接；恢复后更新本指南与 [支持矩阵](reference/support-matrix.md#43-v3-新类型)。
+输入适配与所有权规则见 [ADR-0178](../../adr/ADR-0178-iceberg-write-type-boundary-and-variant-layering.md)。读取功能与写入能力分别验收；完整独立 footer / 跨引擎类型矩阵的跳过不构成互读通过证据。

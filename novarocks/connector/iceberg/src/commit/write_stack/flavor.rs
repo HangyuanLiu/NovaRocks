@@ -106,12 +106,23 @@ pub(crate) struct IcebergSessionMaterial {
 }
 
 impl IcebergSessionMaterial {
-    fn data_plan(&self, input: ConnectorWriteInputShape) -> IcebergDataBranchPlan {
-        IcebergDataBranchPlan {
+    fn data_plan(
+        &self,
+        input: ConnectorWriteInputShape,
+    ) -> Result<IcebergDataBranchPlan, ConnectorError> {
+        let frozen = self
+            .data_recipe
+            .target_schema_json()
+            .ok_or_else(|| invalid("Iceberg data branch requires a frozen target schema"))?;
+        let schema: crate::iceberg::spec::Schema = serde_json::from_str(frozen)
+            .map_err(|error| invalid(format!("invalid frozen Iceberg target schema: {error}")))?;
+        let table = format!("{}.{}", self.table.namespace(), self.table.table_name());
+        crate::commit::validation::deny_unwritable_data_files(&schema, &table)?;
+        Ok(IcebergDataBranchPlan {
             output: self.data_output.clone(),
             recipe: self.data_recipe.clone(),
             input,
-        }
+        })
     }
 
     fn delete_plan(
@@ -200,7 +211,7 @@ pub(crate) fn plan_ordinary_branches(
         return plan_equality_delete_branches(flavor, material);
     }
     let mut branches = vec![IcebergWriteBranchPlan::Data {
-        plan: material.data_plan(material.input.clone()),
+        plan: material.data_plan(material.input.clone())?,
         route: None,
     }];
     if let Some(branch) = ordinary_delete_branch(&material.input) {
@@ -323,7 +334,7 @@ fn plan_publication_branch_list(
                 ));
             }
             vec![IcebergWriteBranchPlan::Data {
-                plan: material.data_plan(material.input.clone()),
+                plan: material.data_plan(material.input.clone())?,
                 route: None,
             }]
         }
@@ -361,7 +372,7 @@ fn plan_publication_branch_list(
                 Vec::new(),
             )?;
             vec![IcebergWriteBranchPlan::Data {
-                plan: material.data_plan(material.input.clone()),
+                plan: material.data_plan(material.input.clone())?,
                 route: Some(route),
             }]
         }
@@ -488,7 +499,7 @@ pub(crate) fn plan_distributed_rewrite_branches(
         .map(|branch| match shape {
             ConnectorDistributedRewriteShape::DataFiles { .. } => {
                 Ok(IcebergWriteBranchPlan::Data {
-                    plan: material.data_plan(material.input.clone()),
+                    plan: material.data_plan(material.input.clone())?,
                     route: None,
                 })
             }
@@ -720,7 +731,7 @@ fn plan_merge_on_read_branches(
         copy_on_write: Vec::new(),
         branches: vec![
             IcebergWriteBranchPlan::Data {
-                plan: material.data_plan(data_input),
+                plan: material.data_plan(data_input)?,
                 route: Some(data_route),
             },
             IcebergWriteBranchPlan::Delete {
@@ -803,7 +814,7 @@ pub(crate) fn plan_copy_on_write_branches(
             selection_bindings,
         )?;
         branches.push(IcebergWriteBranchPlan::Data {
-            plan: material.data_plan(input),
+            plan: material.data_plan(input)?,
             route: Some(route),
         });
     }

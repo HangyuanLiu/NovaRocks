@@ -24,10 +24,131 @@ use std::collections::HashMap;
 use crate::iceberg::spec::{FormatVersion, TableMetadata};
 use crate::iceberg::table::Table;
 use arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 use crate::commit::{
     IcebergUpdateMode, IcebergWriteMode, NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW,
 };
+
+/// A data-file writer cannot encode these logical types, regardless of their
+/// physical Arrow carrier or depth in the target schema.
+// Design: ADR-0178 (docs/adr/ADR-0178-iceberg-write-type-boundary-and-variant-layering.md)
+pub(crate) fn deny_unwritable_data_files(
+    schema: &crate::iceberg::spec::Schema,
+    table: &str,
+) -> Result<(), ConnectorError> {
+    deny_schema_types(schema, table, true)
+}
+
+/// File registration does not encode uuid values. Variant statistics remain
+/// unsupported, so ADD FILES must reject Variant before reading source files.
+pub(crate) fn deny_variant_registration(
+    schema: &crate::iceberg::spec::Schema,
+    table: &str,
+) -> Result<(), ConnectorError> {
+    deny_schema_types(schema, table, false)
+}
+
+fn deny_schema_types(
+    schema: &crate::iceberg::spec::Schema,
+    table: &str,
+    reject_uuid: bool,
+) -> Result<(), ConnectorError> {
+    for field in schema.as_struct().fields() {
+        deny_type(&field.field_type, &field.name, table, reject_uuid)?;
+    }
+    Ok(())
+}
+
+fn deny_type(
+    data_type: &crate::iceberg::spec::Type,
+    path: &str,
+    table: &str,
+    reject_uuid: bool,
+) -> Result<(), ConnectorError> {
+    use crate::iceberg::spec::{PrimitiveType, Type};
+    match data_type {
+        Type::Variant(_) => return Err(unwritable_error("Variant", table, path)),
+        Type::Primitive(PrimitiveType::Uuid) if reject_uuid => {
+            return Err(unwritable_error("uuid", table, path));
+        }
+        Type::Struct(fields) => {
+            for field in fields.fields() {
+                deny_type(
+                    &field.field_type,
+                    &format!("{path}.{}", field.name),
+                    table,
+                    reject_uuid,
+                )?;
+            }
+        }
+        Type::List(list) => {
+            deny_type(
+                &list.element_field.field_type,
+                &format!("{path}.element"),
+                table,
+                reject_uuid,
+            )?;
+        }
+        Type::Map(map) => {
+            deny_type(
+                &map.key_field.field_type,
+                &format!("{path}.key"),
+                table,
+                reject_uuid,
+            )?;
+            deny_type(
+                &map.value_field.field_type,
+                &format!("{path}.value"),
+                table,
+                reject_uuid,
+            )?;
+        }
+        Type::Primitive(_) => {}
+    }
+    Ok(())
+}
+
+fn unwritable_error(kind: &str, table: &str, path: &str) -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::Unsupported,
+        format!("Iceberg {kind} writes are not supported yet: table {table}, column {path}"),
+    )
+}
+
+/// Staged CTAS and MV creation must reject before allocating a location or
+/// querying the catalog; no target metadata exists at that boundary yet.
+pub(crate) fn deny_variant_column_definitions(
+    columns: &[novarocks_spi::connector::ConnectorColumnDefinition],
+    table: &str,
+) -> Result<(), ConnectorError> {
+    fn visit(
+        data_type: &novarocks_spi::connector::ConnectorDataType,
+        path: &str,
+        table: &str,
+    ) -> Result<(), ConnectorError> {
+        use novarocks_spi::connector::ConnectorDataType;
+        match data_type {
+            ConnectorDataType::Variant => return Err(unwritable_error("Variant", table, path)),
+            ConnectorDataType::Array(element) => visit(element, &format!("{path}.element"), table)?,
+            ConnectorDataType::Map(key, value) => {
+                visit(key, &format!("{path}.key"), table)?;
+                visit(value, &format!("{path}.value"), table)?;
+            }
+            ConnectorDataType::Struct(fields) => {
+                for field in fields {
+                    visit(&field.data_type, &format!("{path}.{}", field.name), table)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    for column in columns {
+        visit(&column.data_type, &column.name, table)?;
+    }
+    Ok(())
+}
 
 pub fn row_lineage_property_enabled(props: &HashMap<String, String>) -> bool {
     props
@@ -201,12 +322,14 @@ pub fn ensure_column_id_not_regressed(current: i32, next: i32) -> Result<(), Str
 pub fn row_mutation_strategy_from_metadata(
     metadata: &TableMetadata,
     intent: &novarocks_spi::connector::ConnectorRowMutationIntent,
-) -> Result<novarocks_spi::connector::ConnectorRowMutationStrategy, String> {
+    table: &str,
+) -> Result<novarocks_spi::connector::ConnectorRowMutationStrategy, ConnectorError> {
     use novarocks_spi::connector::{
         ConnectorRowMutationEffect, ConnectorRowMutationIntent, ConnectorRowMutationStrategy,
     };
 
-    ensure_iceberg_write_supported_from_metadata(metadata)?;
+    let invalid = |message| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message);
+    ensure_iceberg_write_supported_from_metadata(metadata).map_err(invalid)?;
 
     match intent {
         ConnectorRowMutationIntent::Delete => {
@@ -217,6 +340,7 @@ pub fn row_mutation_strategy_from_metadata(
             }
         }
         ConnectorRowMutationIntent::Update | ConnectorRowMutationIntent::Merge { .. } => {
+            deny_unwritable_data_files(metadata.current_schema(), table)?;
             // An insert-only MERGE rewrites nothing: no live row is matched, so
             // there is no copy-on-write rewrite to express and the mutation is
             // append-shaped. Resolving it before the update-mode property keeps
@@ -230,7 +354,8 @@ pub fn row_mutation_strategy_from_metadata(
             let mode = select_update_mode_from_properties(
                 metadata.format_version(),
                 metadata.properties(),
-            )?;
+            )
+            .map_err(invalid)?;
             if intent.accepts(ConnectorRowMutationEffect::Delete) {
                 return Ok(ConnectorRowMutationStrategy::MergeOnRead);
             }
@@ -622,7 +747,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "IRU-9: Variant is unavailable until IRU-9 restores it"]
     fn ensure_no_variant_in_partition_spec_rejects_variant_partition_column() {
         use crate::iceberg::spec::{NestedField, PartitionField, PrimitiveType, Transform, Type};
         let table = make_table_with(
@@ -635,7 +759,7 @@ mod tests {
                 source_id: 2,
                 field_id: 1000,
                 name: "v_part".to_string(),
-                transform: Transform::Identity,
+                transform: Transform::Void,
             }],
             vec![],
         );
@@ -660,11 +784,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "IRU-9: Variant is unavailable until IRU-9 restores it"]
     fn ensure_no_variant_in_sort_order_rejects_variant_sort_column() {
-        use crate::iceberg::spec::{
-            NestedField, NullOrder, PrimitiveType, SortDirection, SortField, Transform, Type,
-        };
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Type};
         let table = make_table_with(
             vec![
                 NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
@@ -672,16 +793,136 @@ mod tests {
                     .into(),
             ],
             vec![],
-            vec![SortField {
-                source_id: 2,
-                transform: Transform::Identity,
-                direction: SortDirection::Ascending,
-                null_order: NullOrder::First,
-            }],
+            vec![],
         );
-        let err = ensure_no_variant_in_sort_order(&table).expect_err("must reject");
+        // SDK construction refuses non-primitive sort sources. Decode a
+        // persisted catalog record so the provider guard is exercised on the
+        // unsupported metadata it exists to reject, without changing the SDK.
+        let mut record = serde_json::to_value(table.metadata()).expect("metadata JSON");
+        record["sort-orders"] = serde_json::json!([{
+            "order-id": 1,
+            "fields": [{
+                "source-id": 2, "transform": "identity",
+                "direction": "asc", "null-order": "nulls-first"
+            }]
+        }]);
+        record["default-sort-order-id"] = serde_json::json!(1);
+        let metadata: TableMetadata = serde_json::from_value(record).expect("persisted metadata");
+        let err =
+            ensure_no_variant_in_sort_order_from_metadata(&metadata).expect_err("must reject");
         assert!(err.contains("'v'"), "{err}");
         assert!(err.contains("sort"), "{err}");
+    }
+
+    #[test]
+    fn data_file_admission_checks_every_nested_logical_type() {
+        use crate::iceberg::spec::{
+            ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type, VariantType,
+        };
+        let uuid = Type::Primitive(PrimitiveType::Uuid);
+        let variant = Type::Variant(VariantType);
+        for (data_type, suffix, kind) in [
+            (variant.clone(), "", "Variant"),
+            (uuid.clone(), "", "uuid"),
+            (
+                Type::Struct(StructType::new(vec![
+                    NestedField::optional(2, "leaf", variant.clone()).into(),
+                ])),
+                ".leaf",
+                "Variant",
+            ),
+            (
+                Type::List(ListType::new(
+                    NestedField::list_element(2, uuid.clone(), false).into(),
+                )),
+                ".element",
+                "uuid",
+            ),
+            (
+                Type::Map(MapType::optional(
+                    2,
+                    Type::Primitive(PrimitiveType::String),
+                    3,
+                    variant,
+                )),
+                ".value",
+                "Variant",
+            ),
+            (
+                Type::Map(MapType::optional(
+                    2,
+                    uuid,
+                    3,
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                ".key",
+                "uuid",
+            ),
+        ] {
+            let schema = Schema::builder()
+                .with_fields(vec![NestedField::optional(1, "payload", data_type).into()])
+                .build()
+                .unwrap();
+            let error =
+                deny_unwritable_data_files(&schema, "ice.db.t").expect_err("unsupported write");
+            assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+            assert_eq!(
+                error.message(),
+                format!(
+                    "Iceberg {kind} writes are not supported yet: table ice.db.t, column payload{suffix}"
+                )
+            );
+            if kind == "uuid" {
+                deny_variant_registration(&schema, "ice.db.t")
+                    .expect("uuid ADD FILES does not encode values");
+            } else {
+                assert_eq!(
+                    deny_variant_registration(&schema, "ice.db.t")
+                        .unwrap_err()
+                        .kind(),
+                    ConnectorErrorKind::Unsupported
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn variant_and_uuid_reject_update_and_insert_only_merge_but_allow_delete() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Type, VariantType};
+        use novarocks_spi::connector::{
+            ConnectorRowMutationEffect, ConnectorRowMutationIntent, ConnectorRowMutationStrategy,
+        };
+        for data_type in [
+            Type::Variant(VariantType),
+            Type::Primitive(PrimitiveType::Uuid),
+        ] {
+            let table = make_table_with(
+                vec![NestedField::optional(1, "payload", data_type).into()],
+                vec![],
+                vec![],
+            );
+            for intent in [
+                ConnectorRowMutationIntent::Update,
+                ConnectorRowMutationIntent::Merge {
+                    effects: vec![ConnectorRowMutationEffect::Insert],
+                },
+            ] {
+                let error =
+                    row_mutation_strategy_from_metadata(table.metadata(), &intent, "ice.db.t")
+                        .unwrap_err();
+                assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+                assert!(error.message().contains("column payload"), "{error}");
+            }
+            assert_eq!(
+                row_mutation_strategy_from_metadata(
+                    table.metadata(),
+                    &ConnectorRowMutationIntent::Delete,
+                    "ice.db.t"
+                )
+                .unwrap(),
+                ConnectorRowMutationStrategy::DeletionVector
+            );
+        }
     }
 
     /// UPDATE and MERGE additionally require the row-lineage property, not just
@@ -737,6 +978,7 @@ mod tests {
             row_mutation_strategy_from_metadata(
                 &strategy_metadata(FormatVersion::V3, &[]),
                 &ConnectorRowMutationIntent::Delete,
+                "ice.db.t",
             )
             .expect("v3 delete"),
             ConnectorRowMutationStrategy::DeletionVector
@@ -746,6 +988,7 @@ mod tests {
             row_mutation_strategy_from_metadata(
                 &strategy_metadata(FormatVersion::V2, &[]),
                 &ConnectorRowMutationIntent::Delete,
+                "ice.db.t",
             )
             .expect("v2 delete"),
             ConnectorRowMutationStrategy::PositionDelete
@@ -759,6 +1002,7 @@ mod tests {
             row_mutation_strategy_from_metadata(
                 &strategy_metadata(FormatVersion::V2, &[("write.row-lineage", "true")]),
                 &ConnectorRowMutationIntent::Delete,
+                "ice.db.t",
             )
             .expect("v2 row-lineage delete"),
             ConnectorRowMutationStrategy::PositionDelete
@@ -774,6 +1018,7 @@ mod tests {
             row_mutation_strategy_from_metadata(
                 &strategy_metadata(FormatVersion::V3, &[ROW_LINEAGE_ON]),
                 &ConnectorRowMutationIntent::Update,
+                "ice.db.t",
             )
             .expect("default is copy-on-write"),
             ConnectorRowMutationStrategy::CopyOnWrite
@@ -786,6 +1031,7 @@ mod tests {
                     &[ROW_LINEAGE_ON, (NOVAROCKS_UPDATE_MODE, "merge-on-read")]
                 ),
                 &ConnectorRowMutationIntent::Update,
+                "ice.db.t",
             )
             .expect("declared merge-on-read"),
             ConnectorRowMutationStrategy::MergeOnRead
@@ -794,17 +1040,19 @@ mod tests {
         let v2 = row_mutation_strategy_from_metadata(
             &strategy_metadata(FormatVersion::V2, &[ROW_LINEAGE_ON]),
             &ConnectorRowMutationIntent::Update,
+            "ice.db.t",
         )
         .expect_err("UPDATE needs v3 row lineage");
-        assert!(v2.contains("row-lineage"), "{v2}");
+        assert!(v2.message().contains("row-lineage"), "{v2}");
 
         let v3_without_row_lineage = row_mutation_strategy_from_metadata(
             &strategy_metadata(FormatVersion::V3, &[]),
             &ConnectorRowMutationIntent::Update,
+            "ice.db.t",
         )
         .expect_err("UPDATE needs the row-lineage property, not just v3");
         assert!(
-            v3_without_row_lineage.contains("row-lineage"),
+            v3_without_row_lineage.message().contains("row-lineage"),
             "{v3_without_row_lineage}"
         );
 
@@ -814,9 +1062,10 @@ mod tests {
                 &[ROW_LINEAGE_ON, (NOVAROCKS_UPDATE_MODE, "sideways")],
             ),
             &ConnectorRowMutationIntent::Update,
+            "ice.db.t",
         )
         .expect_err("unknown update mode must fail");
-        assert!(unsupported.contains("sideways"), "{unsupported}");
+        assert!(unsupported.message().contains("sideways"), "{unsupported}");
     }
 
     #[test]
@@ -840,6 +1089,7 @@ mod tests {
                         ConnectorRowMutationEffect::Insert,
                     ],
                 },
+                "ice.db.t",
             )
             .expect("merge with delete"),
             ConnectorRowMutationStrategy::MergeOnRead
@@ -859,6 +1109,7 @@ mod tests {
                         ConnectorRowMutationEffect::Insert,
                     ],
                 },
+                "ice.db.t",
             )
             .expect("merge without delete"),
             ConnectorRowMutationStrategy::CopyOnWrite
@@ -866,7 +1117,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "IRU-9: Variant is unavailable until IRU-9 restores it"]
     fn spi5h_strategy_runs_the_write_support_guards_first() {
         use crate::iceberg::spec::{
             FormatVersion, NestedField, PartitionField, PrimitiveType, Transform, Type,
@@ -884,7 +1134,7 @@ mod tests {
                 source_id: 2,
                 field_id: 1000,
                 name: "v_part".to_string(),
-                transform: Transform::Identity,
+                transform: Transform::Void,
             }],
             vec![],
         );
@@ -893,8 +1143,9 @@ mod tests {
         let err = row_mutation_strategy_from_metadata(
             table.metadata(),
             &ConnectorRowMutationIntent::Delete,
+            "ice.db.t",
         )
         .expect_err("variant partition column must be rejected before a strategy is named");
-        assert!(err.contains("variant"), "{err}");
+        assert!(err.message().contains("variant"), "{err}");
     }
 }

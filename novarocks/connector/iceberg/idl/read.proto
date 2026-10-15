@@ -429,6 +429,7 @@ message TrinoManifestFile {
 }
 
 message FilesTableSplit {
+  bool table_has_variant_history = 8;
   TrinoManifestFile manifest = 1;
   string table_schema_json = 2;
   string metadata_table_schema_json = 3;

@@ -234,6 +234,11 @@ pub(crate) fn insert_intent_support_denial(
     ) {
         return None;
     }
+    if let Err(error) =
+        crate::commit::validation::deny_unwritable_data_files(metadata.current_schema(), target_fqn)
+    {
+        return Some(error);
+    }
     let invalid =
         |message: String| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message);
 
@@ -1035,6 +1040,53 @@ mod tests {
             ConnectorWritePreparationOutcome::Prepared(preparation) => preparation,
             ConnectorWritePreparationOutcome::Denied(error) => {
                 panic!("expected a prepared admission, got denial: {error}")
+            }
+        }
+    }
+
+    #[test]
+    fn variant_and_uuid_data_admission_denies_before_input_binding() {
+        for data_type in [
+            Type::Variant(crate::iceberg::spec::VariantType),
+            Type::Primitive(PrimitiveType::Uuid),
+        ] {
+            let metadata = TableMetadataBuilder::new(
+                Schema::builder()
+                    .with_fields(vec![NestedField::optional(1, "payload", data_type).into()])
+                    .build()
+                    .unwrap(),
+                PartitionSpec::unpartition_spec().into_unbound(),
+                SortOrder::unsorted_order(),
+                "file:///warehouse/db/t".to_owned(),
+                FormatVersion::V3,
+                HashMap::new(),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+            for intent in [
+                ConnectorWriteIntent::Append,
+                ConnectorWriteIntent::Overwrite,
+                ConnectorWriteIntent::PartitionOverwrite,
+            ] {
+                let denied = insert_intent_support_denial(&metadata, intent, "main", "ice.db.t")
+                    .expect("data-file writes are denied");
+                assert_eq!(denied.kind(), ConnectorErrorKind::Unsupported);
+                assert!(denied.message().contains("column payload"), "{denied}");
+            }
+            let owner = owner();
+            let payload = table_payload(Some(table_info(&metadata)));
+            // This request asks for absent id/name columns: the type denial
+            // must win before any input declaration or execution allocation.
+            for purpose in [
+                ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+            ] {
+                let request = data_request(&owner, &payload, purpose);
+                let denied = expect_denied(prepare_write(request, &owner).unwrap());
+                assert_eq!(denied.kind(), ConnectorErrorKind::Unsupported);
+                assert!(denied.message().contains("ice.db.t"), "{denied}");
             }
         }
     }

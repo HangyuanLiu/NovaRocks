@@ -56,7 +56,7 @@ use crate::commit::write_stack::domain::{
     IcebergDataFileArtifact, IcebergDeletionVectorArtifact, IcebergEqualityDeleteFileArtifact,
     IcebergPositionDeleteFileArtifact, IcebergWriteBranch, IcebergWriterHandle,
 };
-use crate::commit::write_stack::equality_schema::resolve_equality_columns;
+use crate::commit::write_stack::equality_schema::equality_delete_target_from_recipe;
 use crate::commit::write_stack::old_delete::read_and_merge_old_deletes;
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
 use crate::commit::{DeletionVector, write_single_deletion_vector_puffin};
@@ -249,12 +249,16 @@ impl IcebergDataStackWriter {
                 "Iceberg data writer handle carries no data branch recipe",
             )
         })?;
-        let input_schema = recipe.input_schema().cloned().ok_or_else(|| {
-            error(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg data writer handle carries no frozen input schema",
-            )
-        })?;
+        let target_schema_json =
+            recipe
+                .target_schema_json()
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    error(
+                        ConnectorErrorKind::InvalidRequest,
+                        "Iceberg data writer handle carries no frozen input schema",
+                    )
+                })?;
         let binding = execution.binding.for_request(request.context.clone());
         let facts = FrozenDataWriteFacts {
             format_version: handle.table().format_version(),
@@ -264,7 +268,7 @@ impl IcebergDataStackWriter {
             partition_source_column_names: recipe.partition_source_column_names().to_vec(),
             partition_column_names: recipe.partition_column_names().to_vec(),
             transform_exprs: recipe.transform_exprs().to_vec(),
-            data_input_schema: input_schema,
+            target_schema_json,
             parquet_row_group_size_bytes: handle.output().parquet_row_group_size_bytes(),
         };
         let context =
@@ -739,7 +743,7 @@ struct IcebergEqualityDeleteStackWriter {
     request_context: ConnectorRequestContext,
     file_io: crate::iceberg::io::FileIO,
     staging_dir: String,
-    columns: Vec<crate::commit::EqualityDeleteColumn>,
+    target: super::equality_schema::EqualityDeleteFileTarget,
     equality_field_ids: Vec<i32>,
     partition: IcebergArtifactPartition,
     fragments: Vec<ConnectorCommitFragment>,
@@ -759,7 +763,7 @@ impl IcebergEqualityDeleteStackWriter {
                 "Iceberg equality-delete writer handle carries no equality recipe",
             )
         })?;
-        let columns = resolve_equality_columns(recipe, &request.expected_schema)?;
+        let target = equality_delete_target_from_recipe(recipe, &request.expected_schema)?;
         let equality_field_ids = recipe.field_ids();
         let binding = execution.binding.for_request(request.context.clone());
         let file_io = build_staged_file_io(&binding, handle.table().data_location())
@@ -787,7 +791,7 @@ impl IcebergEqualityDeleteStackWriter {
             request_context: request.context,
             file_io,
             staging_dir,
-            columns,
+            target,
             equality_field_ids,
             partition,
             fragments: Vec::new(),
@@ -825,7 +829,7 @@ impl ConnectorBatchWriter for IcebergEqualityDeleteStackWriter {
             &self.file_io,
             &self.staging_dir,
             self.handle.table().default_partition_spec_id(),
-            self.columns.clone(),
+            self.target.clone(),
             batch,
         )
         .await

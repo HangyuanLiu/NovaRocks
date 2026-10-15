@@ -51,5 +51,22 @@ ALTER TABLE p SET TBLPROPERTIES ('novarocks.future' = 'whatever');
 ALTER TABLE p UNSET TBLPROPERTIES ('last-column-id');
 
 -- query 8
+-- @expect_error_tier=drift
+-- @expect_error=write.parquet.variant-shredding.
+ALTER TABLE p SET TBLPROPERTIES ('write.parquet.variant-shredding.payload' = 'a:int');
+
+-- query 9
+-- @expect_error_tier=drift
+-- @expect_error=write.parquet.variant-shredding.
+CREATE TABLE shredding_create (id INT) TBLPROPERTIES ('write.parquet.variant-shredding.payload' = 'a:int');
+
+-- query 10
+-- This table has no Variant columns: properties must still fail before CTAS catalog requests.
+-- @expect_error_tier=drift
+-- @expect_error=write.parquet.variant-shredding.
+CREATE TABLE shredding_ctas TBLPROPERTIES ('write.parquet.variant-shredding.payload' = 'a:int')
+AS SELECT 1 AS id;
+
+-- query 11
 DROP TABLE p;
 DROP DATABASE iceberg_ddl_cat_${suite_uuid0}.tblprops_reject_${uuid0};

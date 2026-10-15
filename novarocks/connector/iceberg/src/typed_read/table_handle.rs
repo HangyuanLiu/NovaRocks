@@ -41,6 +41,28 @@ use super::column_handle::{
     ColumnIdentityCategory, IcebergColumnHandle, decode_tuple_domain, encode_tuple_domain, invalid,
 };
 
+fn nested_variant_path(data_type: &crate::iceberg::spec::Type, path: &str) -> Option<String> {
+    use crate::iceberg::spec::Type;
+    fn visit(data_type: &Type, path: String) -> Option<String> {
+        match data_type {
+            Type::Variant(_) => Some(path),
+            Type::Struct(fields) => fields
+                .fields()
+                .iter()
+                .find_map(|field| visit(&field.field_type, format!("{path}.{}", field.name))),
+            Type::List(list) => visit(&list.element_field.field_type, format!("{path}.element")),
+            Type::Map(map) => visit(&map.key_field.field_type, format!("{path}.key"))
+                .or_else(|| visit(&map.value_field.field_type, format!("{path}.value"))),
+            Type::Primitive(_) => None,
+        }
+    }
+    if matches!(data_type, Type::Variant(_)) {
+        None
+    } else {
+        visit(data_type, path.to_owned())
+    }
+}
+
 /// Maximum number of partition specs one pinned snapshot may reference.
 pub const MAX_PARTITION_SPECS: usize = 4096;
 
@@ -611,6 +633,18 @@ impl IcebergTableHandle {
         let mut handle = self.clone();
         handle.projected_columns = assignments.projected_column_set();
         for column in &handle.projected_columns {
+            let base_type =
+                super::column_handle::parse_type(column.base_type_json(), "base_type_json")?;
+            if let Some(path) =
+                nested_variant_path(&base_type, column.base_column_identity().name())
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    format!(
+                        "reading Iceberg Variant nested inside STRUCT, LIST or MAP is not supported: column {path}"
+                    ),
+                ));
+            }
             if column.scalar_integer_domain()
                 != handle
                     .scalar_integer_domains
@@ -1107,6 +1141,77 @@ pub(super) mod tests {
 
         let result = handle.apply_filter(&constraint).expect("apply filter");
         assert_eq!(result.remaining_expression(), Some(&expression));
+    }
+
+    #[test]
+    fn projection_rejects_only_selected_bases_with_nested_variant() {
+        use crate::iceberg::spec::{
+            ListType, MapType, NestedField, PrimitiveType, StructType, Type, VariantType,
+        };
+        for (data_type, suffix) in [
+            (
+                Type::Struct(StructType::new(vec![
+                    NestedField::optional(3, "leaf", Type::Variant(VariantType)).into(),
+                ])),
+                ".leaf",
+            ),
+            (
+                Type::List(ListType::new(
+                    NestedField::list_element(3, Type::Variant(VariantType), false).into(),
+                )),
+                ".element",
+            ),
+            (
+                Type::Map(MapType::optional(
+                    3,
+                    Type::Primitive(PrimitiveType::String),
+                    4,
+                    Type::Variant(VariantType),
+                )),
+                ".value",
+            ),
+        ] {
+            let schema = Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "safe", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "payload", data_type).into(),
+                ])
+                .build()
+                .unwrap();
+            let mut params = table_handle_params(&schema, None);
+            params.format_version = 3;
+            let handle = IcebergTableHandle::try_new(params).unwrap();
+            let safe = IcebergColumnHandle::base_column_of(&schema, 1).unwrap();
+            handle
+                .apply_projection(
+                    &OrderedAssignments::try_new(vec![
+                        Assignment::try_new("safe", safe, ConnectorValueType::BigInt).unwrap(),
+                    ])
+                    .unwrap(),
+                )
+                .unwrap();
+            let nested = IcebergColumnHandle::base_column_of(&schema, 2).unwrap();
+            let result = handle.apply_projection(
+                &OrderedAssignments::try_new(vec![
+                    Assignment::try_new("nested", nested, ConnectorValueType::NonComparable)
+                        .unwrap(),
+                ])
+                .unwrap(),
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("nested Variant must refuse projection"),
+            };
+            assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+            assert!(
+                error.message().contains(&format!("column payload{suffix}")),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            nested_variant_path(&Type::Variant(VariantType), "top"),
+            None
+        );
     }
 
     #[test]

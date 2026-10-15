@@ -31,10 +31,6 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::default_value::ICEBERG_INITIAL_DEFAULT_META_KEY;
 use crate::iceberg::spec::{MappedField, NameMapping};
-use crate::row_lineage_synth::{
-    ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-    ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
-};
 use crate::scan_model::{IcebergSchemaDef, IcebergSchemaFieldDef};
 
 /// Convert one frozen Iceberg schema into the SQL read carrier exposed by the
@@ -310,49 +306,6 @@ pub fn apply_name_mapping_to_schema(
     )))
 }
 
-/// Re-annotate a generic native writer schema with the frozen Iceberg field-ID
-/// tree carried by a provider write handle.  The generic carrier owns Arrow
-/// types; Iceberg owns physical field identity and defaults.
-pub fn annotate_schema_from_scan_model(
-    input_schema: &SchemaRef,
-    iceberg_schema: &IcebergSchemaDef,
-) -> Result<SchemaRef, String> {
-    let fields = input_schema
-        .fields()
-        .iter()
-        .map(|field| {
-            if is_write_virtual_column(field.name()) {
-                return Ok(field.as_ref().clone());
-            }
-            if let Some(field_id) = reserved_row_lineage_field_id(field)? {
-                let mut metadata = field.metadata().clone();
-                metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
-                return Ok(Field::new(
-                    field.name(),
-                    field.data_type().clone(),
-                    field.is_nullable(),
-                )
-                .with_metadata(metadata));
-            }
-            let frozen = iceberg_schema
-                .fields
-                .iter()
-                .find(|candidate| candidate.name == field.name().as_str())
-                .ok_or_else(|| {
-                    format!(
-                        "Iceberg writer column {} is missing its frozen schema field",
-                        field.name()
-                    )
-                })?;
-            apply_scan_field_id_recursive(field.as_ref(), frozen)
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(Arc::new(Schema::new_with_metadata(
-        fields,
-        input_schema.metadata().clone(),
-    )))
-}
-
 /// Re-annotate a read output schema with the provider-owned field facts carried
 /// by the frozen Iceberg schema: parquet field IDs and each column's
 /// spec-encoded initial default. iceberg-rust's Arrow conversion drops initial
@@ -386,31 +339,6 @@ pub fn annotate_read_schema_from_scan_model(
     )))
 }
 
-fn is_write_virtual_column(name: &str) -> bool {
-    matches!(name, "_file" | "_pos" | "__change_op") || name.starts_with("__nr_var_")
-}
-
-fn reserved_row_lineage_field_id(field: &Field) -> Result<Option<i32>, String> {
-    let field_id = if field.name().eq_ignore_ascii_case(ICEBERG_ROW_ID_COL) {
-        ICEBERG_RESERVED_FIELD_ID_ROW_ID
-    } else if field
-        .name()
-        .eq_ignore_ascii_case(ICEBERG_LAST_UPDATED_SEQ_COL)
-    {
-        ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
-    } else {
-        return Ok(None);
-    };
-    if field.data_type() != &DataType::Int64 {
-        return Err(format!(
-            "Iceberg reserved row-lineage column {} expects Int64, got {:?}",
-            field.name(),
-            field.data_type()
-        ));
-    }
-    Ok(Some(field_id))
-}
-
 fn apply_scan_field_id_recursive(
     field: &Field,
     frozen: &IcebergSchemaFieldDef,
@@ -430,7 +358,7 @@ fn apply_scan_field_id_recursive(
         // Parquet VARIANT is one Iceberg primitive field whose physical Arrow
         // carrier is a Struct. Its metadata/value children are encoding
         // details, not independently identified Iceberg nested fields.
-        data_type if is_variant_struct_data_type(data_type) => data_type.clone(),
+        data_type if frozen.is_variant => data_type.clone(),
         DataType::Struct(children) => DataType::Struct(
             children
                 .iter()
@@ -684,6 +612,48 @@ mod tests {
     }
 
     #[test]
+    fn metadata_value_struct_annotation_preserves_real_child_ids() {
+        let source = IcebergSchema::builder()
+            .with_fields(vec![
+                NestedField::optional(
+                    1,
+                    "payload",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(
+                            2,
+                            "metadata",
+                            Type::Primitive(PrimitiveType::Binary),
+                        )
+                        .into(),
+                        NestedField::optional(3, "value", Type::Primitive(PrimitiveType::Binary))
+                            .into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+        let arrow = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "payload",
+            DataType::Struct(
+                vec![
+                    Field::new("metadata", DataType::Binary, true),
+                    Field::new("value", DataType::Binary, true),
+                ]
+                .into(),
+            ),
+            true,
+        )]));
+        let frozen = crate::schema_facts::iceberg_schema_def(&source);
+        let output = annotate_read_schema_from_scan_model(&arrow, &frozen).unwrap();
+        let DataType::Struct(children) = output.field(0).data_type() else {
+            panic!("struct");
+        };
+        assert_eq!(children[0].metadata()[PARQUET_FIELD_ID_META_KEY], "2");
+        assert_eq!(children[1].metadata()[PARQUET_FIELD_ID_META_KEY], "3");
+    }
+
+    #[test]
     fn frozen_variant_annotation_keeps_physical_children_opaque() {
         let field = Field::new(
             "v",
@@ -697,6 +667,7 @@ mod tests {
             true,
         );
         let frozen = IcebergSchemaFieldDef {
+            is_variant: true,
             field_id: 7,
             name: "v".to_string(),
             initial_default: None,

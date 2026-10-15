@@ -46,3 +46,15 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-compatibility --mode verify
 ```
+
+## IRU-9 Variant and write-boundary coverage
+
+The `java_variant_*` cases use the pinned Java API fixture in
+`tests/sql/fixtures/iceberg-variant/` to read unshredded/shredded Variant,
+exercise the manifest-statistics hint, isolate nested projection, and check
+Variant write refusal and DV deletion. `java_uuid_write_rejected` checks UUID
+write/equality-key refusal while retaining supported deletion.
+`java_timestamptz_write_adaptation` writes to a Java-authored target under a
+non-UTC session timezone and exercises the same target in equality deletion.
+The exhaustive independent footer and Spark type matrices are waived for this
+IRU-9 execution; these cases do not claim that validation.

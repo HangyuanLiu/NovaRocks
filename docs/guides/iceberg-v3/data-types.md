@@ -42,10 +42,20 @@ under the License.
 | `binary` | `BINARY` / `VARBINARY` | ✅ | |
 | `fixed[N]` | `FIXED(N)` | ✅ | |
 | `decimal(P,S)` | `DECIMAL(P,S)` | ✅ | 含写入 + 比较 + cast |
-| `uuid` | `UUID` | ✅ | 基础支持 |
+| `uuid` | — | 读支持 / 写不支持 | 外部表列可读；SQL 不提供 `UUID` 类型关键字 |
 | `timestamp_ns` (V3) | — | ❌ | TODO |
 | `timestamptz_ns` (V3) | — | ❌ | TODO |
 | `unknown` (V3) | — | ❌ | TODO |
+
+### uuid 与写出目标类型
+
+uuid 列可从外部 Iceberg 表读取。NovaRocks 不提供 SQL `UUID` 类型关键字；不能把它当成普通 FIXED/BINARY 后写回。目标表任意层级含 uuid 时，INSERT、OVERWRITE、UPDATE、MERGE 与 OPTIMIZE 数据重写拒绝。uuid 等值键的 ADD EQUALITY DELETE 拒绝；普通键的 equality delete、DV/position DELETE、TRUNCATE 与 uuid 表 ADD FILES 不因 uuid 被全表禁止。
+
+恢复 uuid 写入需要正式保留 UUID 逻辑类型和 Parquet UUID 标注的 writer，并完成独立引擎读取验证，不能只输出 16 字节 FIXED 载体。
+
+### timestamptz 写出
+
+Provider 冻结的 Iceberg 目标 schema 保留 timestamp 与 timestamptz 的区别。写出 SDK Arrow schema 对 timestamptz / timestamptz_ns 使用 `+00:00`；输入适配仅附加 UTC 标签，不改变整数时间值，因此 Parquet 标为 `isAdjustedToUTC=true`。执行载体上没有 timezone 标签不代表目标是不带时区的 timestamp。timestamp / timestamp_ns 保持 `isAdjustedToUTC=false`。
 
 ### ❌ V3 纳秒时间戳（`timestamp_ns` / `timestamptz_ns`）
 
@@ -90,11 +100,11 @@ CREATE TABLE t (
 
 ### ✅ Variant（读）
 
-详见 [variant.md](variant.md)。读路径完整支持，**写路径 IcebergSink 仍会拒绝 variant 列**。
+详见 [variant.md](variant.md)。支持外部表的顶层 Variant（含 shredded group）；嵌套 Variant 与其他引擎写入的 Variant manifest bounds 暂不支持。
 
 ### ❌ Variant（写）
 
-见 [variant.md](variant.md)。spec 要求把 metadata + value 两个 binary stream 写到 parquet；NovaRocks 写端尚未实现。
+见 [variant.md](variant.md)。含 Variant 列的数据写出与 ADD FILES 在 Provider 准入时拒绝；DV DELETE、TRUNCATE 与非 Variant 等值键的 equality delete 保留原有路径。
 
 ### ❌ Geometry / Geography（V3 空间类型）
 

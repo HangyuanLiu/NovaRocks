@@ -294,16 +294,22 @@ pub(super) fn data_recipe<E>(
         transforms.push(transform(&field.transform)?);
     }
     // All partition lookup errors still precede the same public default codec.
-    let plan = projection::SchemaOnlyPlan::inspect(schema, scope).map_err(Failure::Projection)?;
+    let length = projection::count(schema.as_ref(), scope).map_err(Failure::Projection)?;
     let validation_total = add(total, validation.maximum_whole_validator_temporary)?;
-    // Existing try_new constructs a BTreeSet<&String> for duplicate names;
-    // its cumulative split-node recipe is a separately required current input.
-    // It cannot be asserted zero merely because the Strings already exist.
     let btree_temporary = duplicate_name_tree_upper::<E>(fields.len())?;
-    let checked = plan
-        .authorize(add(validation_total, btree_temporary)?, scope)
-        .map_err(Failure::Projection)?;
-    let backing = checked.build().map_err(Failure::Projection)?;
+    // The complete JSON is allocated once after authorizing its exact bytes and
+    // Arc layout. The original holder stays attached until actual graph exit.
+    let retained = target_schema_retained_upper::<E>(length)?;
+    check(
+        scope,
+        add(add(validation_total, btree_temporary)?, retained)?,
+    )?;
+    let target_schema_json =
+        projection::exact_json(schema.as_ref(), length, scope).map_err(Failure::Projection)?;
+    let backing = crate::commit::write_stack::domain::IcebergCowTargetSchemaBacking::from_checked(
+        target_schema_json,
+        scope.original_guard(),
+    );
     scope.check_active().map_err(Failure::Original)?;
     let recipe =
         IcebergDataBranchRecipe::try_new_cow(backing, sources, names, transforms, row_lineage)
@@ -314,6 +320,17 @@ pub(super) fn data_recipe<E>(
     }
     Ok(recipe)
 }
+pub(super) fn target_schema_retained_upper<E>(length: u64) -> Result<u64, Failure<E>> {
+    let a = align_of::<crate::commit::write_stack::domain::IcebergCowTargetSchemaBacking>()
+        .max(align_of::<usize>()) as u64;
+    let header = add(2 * size_of::<usize>() as u64, a - 1)? / a * a;
+    let backing = add(
+        header,
+        size_of::<crate::commit::write_stack::domain::IcebergCowTargetSchemaBacking>() as u64,
+    )?;
+    add(add(backing, a - 1)? / a * a, length)
+}
+
 // Pinned std BTree B=6, a leaf/internal upper: parent pointer, two u16,
 // 11 reference keys, 11 unit values, 12 edge pointers, all-field alignment pad.
 // Inserting n references allocates <=2n+1 nodes cumulatively; this safe upper
@@ -745,5 +762,84 @@ mod signed_input_type_tests {
                 .count(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod target_schema_tests {
+    use super::*;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Scope {
+        totals: Mutex<Vec<u64>>,
+        deny: Option<usize>,
+        minted: AtomicUsize,
+        exited: Arc<AtomicUsize>,
+    }
+    struct Holder(Arc<AtomicUsize>);
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl OriginalScope<&'static str> for Scope {
+        fn check_active(&self) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn check_total(&self, total: u64) -> Result<(), &'static str> {
+            let mut totals = self.totals.lock().unwrap();
+            totals.push(total);
+            if self.deny == Some(totals.len()) {
+                Err("original resource refusal")
+            } else {
+                Ok(())
+            }
+        }
+        fn original_guard(&self) -> novarocks_spi::connector::ConnectorPayloadRetentionGuard {
+            self.minted.fetch_add(1, Ordering::SeqCst);
+            novarocks_spi::connector::ConnectorPayloadRetentionGuard::new(Holder(
+                self.exited.clone(),
+            ))
+        }
+    }
+    fn scope(deny: Option<usize>) -> Scope {
+        Scope {
+            totals: Mutex::new(vec![]),
+            deny,
+            minted: AtomicUsize::new(0),
+            exited: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+    #[test]
+    fn cow_complete_schema_authorizes_before_json_allocation_and_publishes_no_refused_recipe() {
+        let metadata = crate::commit::write_stack::test_support::staged_table_metadata();
+        let validation = LocationValidationUpper {
+            maximum_whole_validator_temporary: 0,
+        };
+        let denied = scope(Some(2));
+        assert!(matches!(
+            data_recipe(&metadata, false, 40, &validation, &denied),
+            Err(Failure::Original("original resource refusal"))
+        ));
+        assert_eq!(denied.minted.load(Ordering::SeqCst), 0);
+        let accepted = scope(None);
+        let recipe = data_recipe(&metadata, false, 40, &validation, &accepted).unwrap();
+        assert_eq!(accepted.minted.load(Ordering::SeqCst), 1);
+        let actual_json = recipe.target_schema_json().unwrap();
+        assert_eq!(
+            actual_json,
+            serde_json::to_string(metadata.current_schema().as_ref()).unwrap()
+        );
+        let totals = accepted.totals.lock().unwrap();
+        let retained =
+            target_schema_retained_upper::<&'static str>(actual_json.len() as u64).unwrap();
+        assert_eq!(totals[1] - totals[0], retained);
+        let clone = recipe.clone();
+        drop(recipe);
+        assert_eq!(accepted.exited.load(Ordering::SeqCst), 0);
+        drop(clone);
+        assert_eq!(accepted.exited.load(Ordering::SeqCst), 1);
     }
 }

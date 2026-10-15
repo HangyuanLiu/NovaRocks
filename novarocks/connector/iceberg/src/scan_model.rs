@@ -149,6 +149,9 @@ pub struct IcebergDeleteFileInfo {
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct IcebergSchemaFieldDef {
+    /// Logical Variant identity frozen by the provider, never inferred from
+    /// metadata/value-shaped Arrow children.
+    pub is_variant: bool,
     pub field_id: i32,
     pub name: String,
     #[serde(skip)]

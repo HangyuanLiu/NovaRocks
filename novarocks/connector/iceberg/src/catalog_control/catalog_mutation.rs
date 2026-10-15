@@ -656,6 +656,9 @@ fn execute_create_table(
     policy: CreatePolicy,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
     ensure_owner(provider, &table.instance_id)?;
+    // Definition support is decided before namespace or table probes.
+    let (definition_version, _) = table_properties(columns, key, properties)?;
+    validate_variant_columns(columns, definition_version)?;
     // An existing target is settled here, before anything is dispatched.
     // `CreatePolicy` is the caller's statement about what an existing table
     // means -- `IF NOT EXISTS` makes it a no-op, a plain create makes it a
@@ -960,11 +963,56 @@ fn map_mutation_failure(
     ConnectorError::new(kind, failure.to_string())
 }
 
+const VARIANT_SHREDDING_PROPERTY_PREFIX: &str = "write.parquet.variant-shredding.";
+
+pub(crate) fn reject_variant_shredding_properties(
+    input: &[(Arc<str>, Arc<str>)],
+) -> Result<(), ConnectorError> {
+    for (key, _) in input {
+        reject_variant_shredding_property(key)?;
+    }
+    Ok(())
+}
+
+fn reject_variant_shredding_property(key: &str) -> Result<(), ConnectorError> {
+    if key.starts_with(VARIANT_SHREDDING_PROPERTY_PREFIX) {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            format!(
+                "Iceberg table property prefix `{VARIANT_SHREDDING_PROPERTY_PREFIX}` is not supported"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_variant_columns(
+    columns: &[ConnectorColumnDefinition],
+    format_version: FormatVersion,
+) -> Result<(), ConnectorError> {
+    for column in columns {
+        let variant = super::type_mapping::validate_variant_definition(
+            &column.data_type,
+            &column.name,
+            false,
+        )
+        .map_err(|message| ConnectorError::new(ConnectorErrorKind::Unsupported, message))?;
+        if variant && format_version != FormatVersion::V3 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg Variant columns require format-version 3",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn table_properties(
     columns: &[ConnectorColumnDefinition],
     key: Option<&ConnectorTableKey>,
     input: &[(Arc<str>, Arc<str>)],
 ) -> Result<(FormatVersion, BTreeMap<String, String>), ConnectorError> {
+    reject_variant_shredding_properties(input)?;
     let mut format_version = FormatVersion::V2;
     let mut properties = BTreeMap::new();
     for (key, value) in input {
@@ -1409,6 +1457,9 @@ fn property_updates(
     let mut sets = HashMap::new();
     let mut removals = Vec::new();
     for change in changes {
+        if let ConnectorPropertyChange::Set { key, .. } = change {
+            reject_variant_shredding_property(key)?;
+        }
         let key = match change {
             ConnectorPropertyChange::Set { key, .. }
             | ConnectorPropertyChange::Unset { key, .. } => key.as_ref(),
@@ -1521,6 +1572,27 @@ fn alter_schema(
         .load_table_for_request(&table.namespace, &table.table, context)
         .map_err(unavailable)?;
     let metadata = loaded.table.metadata();
+    if let ConnectorSchemaChange::AddColumn { parent, column, .. } = change {
+        let path = parent
+            .segments
+            .iter()
+            .map(AsRef::as_ref)
+            .chain(std::iter::once(column.name.as_ref()))
+            .collect::<Vec<&str>>()
+            .join(".");
+        let variant = super::type_mapping::validate_variant_definition(
+            &column.data_type,
+            &path,
+            !parent.segments.is_empty(),
+        )
+        .map_err(|message| ConnectorError::new(ConnectorErrorKind::Unsupported, message))?;
+        if variant && metadata.format_version() != FormatVersion::V3 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg Variant columns require format-version 3",
+            ));
+        }
+    }
     // Reserved lineage columns are an engine contract rather than observed
     // schema fields, so reject them before any lookup can report them absent.
     reject_reserved_schema_change(change)?;
@@ -5887,5 +5959,64 @@ mod tests {
             409,
         ));
         assert!(!commit_may_be_unknown(conflict.kind()));
+    }
+    #[test]
+    fn variant_ddl_support_checks_new_definitions_and_format() {
+        let column = |data_type| ConnectorColumnDefinition {
+            name: Arc::from("payload"),
+            data_type,
+            nullable: true,
+            aggregation: None,
+            default: None,
+        };
+        let top = column(ConnectorDataType::Variant);
+        assert_eq!(
+            validate_variant_columns(&[top.clone()], FormatVersion::V2)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Unsupported
+        );
+        validate_variant_columns(&[top], FormatVersion::V3).unwrap();
+        for data_type in [
+            ConnectorDataType::Array(Box::new(ConnectorDataType::Variant)),
+            ConnectorDataType::Map(
+                Box::new(ConnectorDataType::String),
+                Box::new(ConnectorDataType::Variant),
+            ),
+            ConnectorDataType::Struct(vec![novarocks_spi::connector::ConnectorStructField {
+                name: Arc::from("v"),
+                data_type: ConnectorDataType::Variant,
+                nullable: true,
+            }]),
+        ] {
+            let error =
+                validate_variant_columns(&[column(data_type)], FormatVersion::V3).unwrap_err();
+            assert!(error.message().contains("nested"));
+            assert!(error.message().contains("payload."));
+        }
+        // Adding a Variant to an existing STRUCT is nested even if the new
+        // column definition itself is a leaf.
+        assert!(
+            super::super::type_mapping::validate_variant_definition(
+                &ConnectorDataType::Variant,
+                "s.v",
+                true,
+            )
+            .unwrap_err()
+            .contains("s.v")
+        );
+        validate_variant_columns(&[column(ConnectorDataType::Int)], FormatVersion::V2).unwrap();
+    }
+
+    #[test]
+    fn shredding_properties_are_rejected_without_interpreting_values() {
+        let properties = vec![(
+            Arc::from("write.parquet.variant-shredding.payload"),
+            Arc::from("false"),
+        )];
+        let error = reject_variant_shredding_properties(&properties).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert!(table_properties(&[], None, &properties).is_err());
+        assert!(reject_variant_shredding_property("write.parquet.compression-codec").is_ok());
     }
 }

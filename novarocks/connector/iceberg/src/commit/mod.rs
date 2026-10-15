@@ -58,6 +58,7 @@ pub(crate) mod truncate;
 pub mod types;
 mod update_cow;
 pub mod validation;
+mod write_adaptation;
 pub mod write_control;
 pub mod write_fence;
 pub mod write_io;
@@ -65,7 +66,7 @@ mod write_preparation;
 mod write_shared;
 pub mod write_stack;
 
-pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
+pub(crate) use equality_delete_writer::write_equality_delete_file;
 pub use mv_provenance::{
     MV_PUBLICATION_PROVENANCE_PROP, MV_PUBLICATION_PROVENANCE_VERSION, MV_REFRESH_ROW_COUNT_PROP,
     MvPublicationProvenanceV2, ProvenanceBase, RefreshTechnique, waterline_hash_for,

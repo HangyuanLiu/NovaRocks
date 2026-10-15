@@ -76,7 +76,6 @@ use crate::commit::write_stack::old_delete::{
 };
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
 use crate::delete_file::{IcebergFileContent, IcebergFileFormat};
-use crate::scan_model::IcebergSchemaDef;
 use crate::wire::dto;
 use crate::write_descriptor::{IcebergPartitionDescriptor, IcebergPartitionValueDescriptor};
 
@@ -703,24 +702,11 @@ impl IcebergWriteValueCodec {
     fn encode_recipe(
         &self,
         recipe: &IcebergDataBranchRecipe,
-        path: FieldPath,
+        _path: FieldPath,
     ) -> Result<dto::IcebergDataBranchRecipe, ConnectorWriteCodecError> {
-        // The schema's own definition makes JSON its serialized form: the two
-        // `Literal` convenience fields are `#[serde(skip)]` and their durable
-        // spellings travel as `initial_default_json` / `write_default_json`.
-        let input_schema_json = recipe
-            .input_schema()
-            .map(|schema| {
-                serde_json::to_string(schema).map_err(|error| {
-                    self.invalid(
-                        path.field("input_schema_json"),
-                        format!("encode Iceberg data writer input schema failed: {error}"),
-                    )
-                })
-            })
-            .transpose()?;
+        let target_schema_json = recipe.target_schema_json().map(str::to_owned);
         Ok(dto::IcebergDataBranchRecipe {
-            input_schema_json,
+            target_schema_json,
             partition_source_column_names: recipe.partition_source_column_names().to_vec(),
             partition_column_names: recipe.partition_column_names().to_vec(),
             transform_exprs: recipe.transform_exprs().to_vec(),
@@ -742,27 +728,14 @@ impl IcebergWriteValueCodec {
                     "an Iceberg data branch requires its data recipe",
                 ))
             })?;
-            let input_schema = recipe
-                .input_schema_json
+            let target_schema = recipe
+                .target_schema_json
                 .as_deref()
-                .map(|json| {
-                    {
-                        let arguments = (json,);
-                        observe_value_opaque(context, || {
-                            serde_json::from_str::<IcebergSchemaDef>(arguments.0)
-                        })?
-                    }
-                    .map_err(|error| {
-                        spi_codec_error(self.invalid(
-                            path.field("input_schema_json"),
-                            format!("decode Iceberg data writer input schema failed: {error}"),
-                        ))
-                    })
-                })
+                .map(|json| copy_value_string(json, context))
                 .transpose()?;
             {
                 let arguments = (
-                    input_schema,
+                    target_schema,
                     copy_value_strings(&recipe.partition_source_column_names, context)?,
                     copy_value_strings(&recipe.partition_column_names, context)?,
                     copy_value_strings(&recipe.transform_exprs, context)?,
@@ -951,10 +924,9 @@ impl IcebergWriteValueCodec {
                 .map(|column| dto::IcebergEqualityDeleteColumn {
                     name: column.name().to_string(),
                     field_id: column.field_id(),
-                    data_type: column.data_type().to_string(),
-                    nullable: column.nullable(),
                 })
                 .collect(),
+            field_schema_json: recipe.field_schema_json().to_owned(),
         }
     }
 
@@ -976,19 +948,10 @@ impl IcebergWriteValueCodec {
             for (index, column) in recipe.columns.iter().enumerate() {
                 columns.push(
                     {
-                        let arguments = (
-                            copy_value_string(&column.name, context)?,
-                            column.field_id,
-                            copy_value_string(&column.data_type, context)?,
-                            column.nullable,
-                        );
+                        let arguments =
+                            (copy_value_string(&column.name, context)?, column.field_id);
                         observe_value_opaque(context, || {
-                            IcebergEqualityDeleteColumnFacts::try_new(
-                                arguments.0,
-                                arguments.1,
-                                arguments.2,
-                                arguments.3,
-                            )
+                            IcebergEqualityDeleteColumnFacts::try_new(arguments.0, arguments.1)
                         })?
                     }
                     .map_err(|error| {
@@ -1000,9 +963,12 @@ impl IcebergWriteValueCodec {
                 context.observe_compile_step()?;
             }
             {
-                let arguments = (columns,);
+                let arguments = (
+                    columns,
+                    copy_value_string(&recipe.field_schema_json, context)?,
+                );
                 observe_value_opaque(context, || {
-                    IcebergEqualityDeleteRecipe::try_new(arguments.0)
+                    IcebergEqualityDeleteRecipe::try_new(arguments.0, arguments.1)
                 })?
             }
             .map_err(|error| spi_codec_error(self.rejected(path, &error)))
@@ -1777,7 +1743,6 @@ mod tests {
         equality_delete_recipe, merge_target, parquet_ref, puffin_ref, sample_metrics,
         sample_partition, table_facts,
     };
-    use crate::scan_model::IcebergSchemaFieldDef;
 
     fn adapter(catalog: &str, version: u8) -> IcebergWriteAdapter {
         let instance_id = ConnectorInstanceId::parse(catalog).expect("instance id");
@@ -1897,18 +1862,8 @@ mod tests {
         IcebergWriterOutput::try_new(format, Compression::SNAPPY, None).expect("output")
     }
 
-    fn schema() -> IcebergSchemaDef {
-        IcebergSchemaDef {
-            fields: vec![IcebergSchemaFieldDef {
-                field_id: 1,
-                name: "k1".to_string(),
-                initial_default: None,
-                write_default: None,
-                initial_default_json: Some("7".to_string()),
-                write_default_json: None,
-                children: Vec::new(),
-            }],
-        }
+    fn schema() -> String {
+        serde_json::json!({"type":"struct","schema-id":3,"fields":[{"id":1,"name":"k1","required":false,"type":"long","initial-default":7}]}).to_string()
     }
 
     fn data_handle() -> IcebergWriterHandle {
@@ -2094,7 +2049,7 @@ mod tests {
         match (left.data(), right.data()) {
             (None, None) => {}
             (Some(left), Some(right)) => {
-                assert_eq!(left.input_schema(), right.input_schema());
+                assert_eq!(left.target_schema_json(), right.target_schema_json());
                 assert_eq!(
                     left.partition_source_column_names(),
                     right.partition_source_column_names()
@@ -2748,7 +2703,7 @@ mod tests {
         let facets = generation();
         let recovered = round_trip_handle(&facets, &data_handle());
         let recipe = recovered.data().expect("a data branch keeps its recipe");
-        assert_eq!(recipe.input_schema(), Some(&schema()));
+        assert_eq!(recipe.target_schema_json(), Some(schema().as_str()));
         assert!(recipe.row_lineage());
         assert_eq!(
             recovered.output().parquet_row_group_size_bytes(),
@@ -3233,7 +3188,7 @@ mod tests {
     // Insert INSIDE commit::write_stack::codec::tests; reuse original facets/table_facts/output.
     #[test]
     fn cow_shared_data_recipe_uses_the_original_writer_handle_wire_and_decodes_owned() {
-        use crate::commit::write_stack::domain::IcebergCowSchemaBacking;
+        use crate::commit::write_stack::domain::IcebergCowTargetSchemaBacking;
         use novarocks_spi::connector::ConnectorPayloadRetentionGuard;
         use std::sync::{
             Arc,
@@ -3248,8 +3203,8 @@ mod tests {
         let dropped = Arc::new(AtomicUsize::new(0));
         let guard = ConnectorPayloadRetentionGuard::new(Witness(dropped.clone()));
         // This known finite existing codec fixture does not claim a FE authorization.
-        // SchemaOnlyPlan whole-before-growth is tested separately on V1/V2/V3.
-        let backing = IcebergCowSchemaBacking::from_checked(schema(), guard);
+        // Complete target JSON authorization is tested on the COW constructor.
+        let backing = IcebergCowTargetSchemaBacking::from_checked(schema(), guard);
         let old_recipe = IcebergDataBranchRecipe::try_new(
             Some(schema()),
             vec!["d".into()],
@@ -3294,8 +3249,8 @@ mod tests {
         assert_eq!(cow_wire, old_wire);
         let decoded = decode_private_handle(&facets, &cow_wire, private_limits()).unwrap();
         assert_eq!(
-            decoded.data().unwrap().input_schema(),
-            old.data().unwrap().input_schema()
+            decoded.data().unwrap().target_schema_json(),
+            old.data().unwrap().target_schema_json()
         );
         assert_eq!(
             decoded.data().unwrap().partition_source_column_names(),
@@ -3313,13 +3268,13 @@ mod tests {
         let decoded_clone = decoded.clone();
         // Real codec decode uses ordinary Owned; no extra variant/tag/guard on wire.
         assert!(!std::ptr::eq(
-            decoded.data().unwrap().input_schema().unwrap(),
-            decoded_clone.data().unwrap().input_schema().unwrap()
+            decoded.data().unwrap().target_schema_json().unwrap(),
+            decoded_clone.data().unwrap().target_schema_json().unwrap()
         ));
         let cow_last = cow.clone();
         assert!(std::ptr::eq(
-            cow.data().unwrap().input_schema().unwrap(),
-            cow_last.data().unwrap().input_schema().unwrap()
+            cow.data().unwrap().target_schema_json().unwrap(),
+            cow_last.data().unwrap().target_schema_json().unwrap()
         ));
         drop(cow);
         assert_eq!(dropped.load(Ordering::SeqCst), 0);

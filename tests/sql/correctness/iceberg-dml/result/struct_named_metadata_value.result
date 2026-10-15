@@ -1,0 +1,5 @@
+-- query 2
+id	metadata_hex	value_hex	whole_null
+1	0100	FF00	0
+2	NULL		0
+3	NULL	NULL	1

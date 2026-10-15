@@ -114,7 +114,7 @@ message IcebergWriterOutput {
 }
 
 message IcebergDataBranchRecipe {
-  optional string input_schema_json = 1;
+  optional string target_schema_json = 1;
   repeated string partition_source_column_names = 2;
   repeated string partition_column_names = 3;
   repeated string transform_exprs = 4;
@@ -138,12 +138,12 @@ message IcebergOldDeleteArtifactRef {
 message IcebergEqualityDeleteColumn {
   string name = 1;
   int32 field_id = 2;
-  string data_type = 3;
-  bool nullable = 4;
+  reserved 3, 4;
 }
 
 message IcebergEqualityDeleteRecipe {
   repeated IcebergEqualityDeleteColumn columns = 1;
+  string field_schema_json = 2;
 }
 
 message IcebergOldDeleteMergeTarget {
