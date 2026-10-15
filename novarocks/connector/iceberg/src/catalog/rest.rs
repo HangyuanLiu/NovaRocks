@@ -984,6 +984,27 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         self.endpoints.load_view(&ident).await
     }
 
+    async fn load_table_for_read(
+        &self,
+        table: CatalogTableName,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<IcebergLoadedTable, ConnectorError> {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        let context = binding.request_context().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Table load requires an admitted request context",
+            )
+        })?;
+        let loaded = self
+            .delegate
+            .listing
+            .run(context, self.load_table(table))
+            .await?;
+        context.check_active()?;
+        Ok(loaded)
+    }
+
     async fn create_namespace(
         &self,
         namespace: CatalogNamespaceName,
@@ -2465,14 +2486,13 @@ mod tests {
                 "{outcome:?}"
             );
         }
-        // DROP first observes existence while freezing evidence, then again
-        // at its own admission. Neither read creates a physical table.
+        // A missing DROP is settled by its original-context existence probe.
+        // No evidence preparation repeats the lookup or materializes FileIO.
         assert_eq!(
             server.list_requests(),
             [
                 "/v1/namespaces/db/tables/present",
-                "/v1/namespaces/db/tables/missing",
-                "/v1/namespaces/db/tables/missing",
+                "/v1/namespaces/db/tables/missing"
             ]
         );
     }

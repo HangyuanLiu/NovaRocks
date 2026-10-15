@@ -67,6 +67,19 @@ pub(crate) struct ProtocolObservation {
     pub status_code: Option<u16>,
     pub header_names: Vec<String>,
 }
+/// A narrow capability minted only from one exact Applied journal entry.
+/// NoOp, rejection, and raw Unknown cannot authorize object collection.
+pub(crate) struct AppliedDropWitness(crate::catalog::catalog_request::DropPublicationScope);
+impl AppliedDropWitness {
+    pub(crate) fn proves_capture(
+        &self,
+        target: &str,
+        capture: &crate::catalog::CatalogDropTableReceipt,
+    ) -> bool {
+        self.0.proves_capture(target, capture)
+    }
+}
+
 /// Both valid receipt projections are built before dispatch. The recorded
 /// effect selects facts; receipt projection never decides publication.
 #[derive(Clone)]
@@ -375,6 +388,30 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             key,
             completed: false,
         })
+    }
+    pub(crate) fn applied_drop_witness(
+        &self,
+        entry: JournalEntryRef,
+        scope: &crate::catalog::catalog_request::DropPublicationScope,
+    ) -> Option<AppliedDropWitness> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.current.get(&self.frontier) != Some(&entry.0) {
+            return None;
+        }
+        let entry = state.entries.get(&entry.0)?;
+        match &entry.phase {
+            EntryPhase::Concluded(DispatchEvidence::Applied { proof })
+                if proof.effect == novarocks_spi::connector::ExternalMutationEffect::Applied =>
+            {
+                scope
+                    .matches_targets(&entry.checked.descriptor.targets)
+                    .then(|| AppliedDropWitness(scope.clone()))
+            }
+            _ => None,
+        }
     }
     pub(crate) fn current_entry(&self) -> Option<JournalEntryRef> {
         self.state

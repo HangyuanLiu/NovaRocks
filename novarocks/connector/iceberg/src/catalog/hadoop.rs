@@ -218,6 +218,20 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
                 &preparation,
             );
         }
+        if request.operation == CatalogOperation::DropTable {
+            request.table_drop_policy()?;
+            let CatalogAdmissionTarget::Table(table) = &request.target else {
+                return Err(crate::iceberg::Error::new(
+                    crate::iceberg::ErrorKind::DataInvalid,
+                    "Table drop requires a table target",
+                )
+                .into());
+            };
+            preparation.check_active()?;
+            return Ok(
+                Arc::clone(&self.client).prepare_table_drop(super::delegate::table_ident(table)?)
+            );
+        }
         if !matches!(
             request.operation,
             CatalogOperation::CreateNamespace | CatalogOperation::DropNamespace

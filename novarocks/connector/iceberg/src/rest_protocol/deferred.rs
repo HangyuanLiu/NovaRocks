@@ -116,6 +116,10 @@ impl FrozenLoadTable {
         )
     }
 
+    pub(crate) fn metadata_location(&self) -> Option<&str> {
+        self.metadata_location.as_deref()
+    }
+
     pub(crate) fn metadata(&self) -> &TableMetadata {
         &self.metadata
     }

@@ -16,6 +16,7 @@
 // under the License.
 
 mod create_publication;
+mod drop_publication;
 /// HadoopFileSystemCatalog — a Hadoop-catalog-compatible implementation of the
 /// iceberg `Catalog` trait.
 ///
@@ -149,6 +150,11 @@ enum HadoopCatalogTestFault {
     AfterConditionalResponseLoss,
     AfterExistingConditionalResponseLoss,
     BeforeConditionalReadEvidenceExpiry,
+    BeforeCanonicalDrop,
+    AfterCanonicalDropResponseLoss,
+    AfterDropHintEvidenceExpiry,
+    BeforeDropHintDelete,
+    AfterDropHintResponseLoss,
     BeforeHintWrite,
     AfterMetadataWriteEvidenceExpiry,
     AfterHintWriteResponseLoss,

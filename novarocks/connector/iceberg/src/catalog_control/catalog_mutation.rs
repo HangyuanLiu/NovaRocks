@@ -136,6 +136,12 @@ impl ConnectorCatalogMutation for IcebergMetadata {
                 *policy,
             );
         }
+        if matches!(
+            &request.operation,
+            ConnectorCatalogMutationOperation::DropTable { .. }
+        ) {
+            return execute_drop_table(self, &request);
+        }
         if let ConnectorCatalogMutationOperation::AlterRef {
             table,
             action:
@@ -399,18 +405,15 @@ fn execute_operation(
     match operation {
         ConnectorCatalogMutationOperation::CreateTable { .. } => Err(ConnectorError::new(
             ConnectorErrorKind::Internal,
-            "Iceberg CREATE TABLE is published through the create-table transaction, \
-             so it must not reach the effect-only mutation path",
+            "Iceberg CREATE TABLE must use its prepared publication journal",
         )),
         ConnectorCatalogMutationOperation::CreateNamespace { .. }
         | ConnectorCatalogMutationOperation::DropNamespace { .. } => Err(internal(
             "Namespace mutation must use its prepared publication journal",
         )),
-        ConnectorCatalogMutationOperation::DropTable {
-            table,
-            policy,
-            data_disposition,
-        } => drop_table(provider, table, *policy, *data_disposition, context),
+        ConnectorCatalogMutationOperation::DropTable { .. } => Err(internal(
+            "Table drop must use its prepared publication journal",
+        )),
         ConnectorCatalogMutationOperation::CreateView { .. }
         | ConnectorCatalogMutationOperation::DropView { .. } => Err(internal(
             "View mutation must use its prepared publication journal",
@@ -722,6 +725,152 @@ fn execute_create_table(
 /// a cleanup request needs. A drop whose response was lost enqueues nothing and
 /// deletes nothing — those objects leak, and identity-aware collection reclaims
 /// them later by re-proving they are dead.
+fn execute_drop_table(
+    provider: &IcebergMetadata,
+    request: &ConnectorCatalogMutationRequest,
+) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    use crate::catalog::catalog_request::CatalogPublicationRequest;
+    use crate::catalog::publication_dispatch::{PreparationFailure, PreparationResult};
+    use crate::commit::attempt::observation::PublicationReceipts;
+    let ConnectorCatalogMutationOperation::DropTable {
+        table,
+        policy,
+        data_disposition,
+    } = &request.operation
+    else {
+        return Ok(known_uncommitted(internal(
+            "Table drop requires a drop operation",
+        )));
+    };
+    let seed = match receipt(provider, request.operation_id, request.operation.kind()) {
+        Ok(receipt) => receipt,
+        Err(error) => return Ok(known_uncommitted(error)),
+    };
+    let setup = (|| -> PreparationResult<_> {
+        ensure_owner(provider, &table.instance_id)?;
+        request.context.check_active()?;
+        let namespace = normalize_identifier(&table.namespace).map_err(invalid)?;
+        let name = normalize_identifier(&table.table).map_err(invalid)?;
+        let target = CatalogTableName::new(namespace.clone(), name.clone());
+        let canonical = target.canonical();
+        let owner = Arc::clone(provider.runtime().novarocks_catalog());
+        let binding = provider
+            .runtime()
+            .resources()
+            .planning_binding()
+            .for_request(request.context.clone());
+        let lookup = target.clone();
+        let exists = provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move { owner.table_exists_for_read(lookup, binding).await })
+            .map_err(unavailable)??;
+        request.context.check_active()?;
+        if !exists {
+            if *policy == DropPolicy::NoOpIfMissing {
+                return Ok(None);
+            }
+            return Err(not_found("Iceberg table does not exist").into());
+        }
+        // Cleanup identity is captured before deletion. A failed capture may
+        // leak objects, but cannot authorize collection of a replacement.
+        let owner = Arc::clone(provider.runtime().novarocks_catalog());
+        let binding = provider
+            .runtime()
+            .resources()
+            .planning_binding()
+            .for_request(request.context.clone());
+        let lookup = target.clone();
+        let loaded = provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move { owner.load_table_for_read(lookup, binding).await })
+            .map_err(unavailable)?;
+        request.context.check_active()?;
+        let captured = match loaded {
+            Ok(loaded) => crate::catalog::CatalogDropTableReceipt {
+                table_uuid: Some(Arc::from(loaded.metadata().uuid().to_string())),
+                table_location: Some(Arc::from(loaded.metadata().location())),
+                metadata_location: loaded.metadata_location().map(Arc::from),
+                last_updated_ms: loaded.metadata().last_updated_ms(),
+            },
+            Err(_) => crate::catalog::CatalogDropTableReceipt {
+                table_uuid: None,
+                table_location: None,
+                metadata_location: None,
+                last_updated_ms: 0,
+            },
+        };
+        let evidence = evidence(
+            provider,
+            request.operation_id,
+            request.operation.kind(),
+            IcebergMutationEvidenceTarget::Table {
+                namespace,
+                table: name,
+                should_exist: false,
+                before_uuid: captured.table_uuid.as_ref().map(ToString::to_string),
+            },
+        )?;
+        let frozen = CatalogPublicationRequest::DropTable {
+            table: target,
+            no_op_if_missing: *policy == DropPolicy::NoOpIfMissing,
+            purge: *data_disposition == ConnectorDropTableDataDisposition::Purge,
+            capture: Some(captured.clone()),
+        }
+        .freeze(request.operation_id.to_bytes())?;
+        Ok(Some((frozen, evidence, seed.clone(), canonical, captured)))
+    })();
+    let (frozen, evidence, seed, canonical, captured) = match setup {
+        Err(PreparationFailure(failure)) => {
+            return Ok(ExternalMutationOutcome::KnownUncommitted {
+                failure,
+                cleanup: ExternalMutationFinalization::Complete,
+            });
+        }
+        Ok(None) => {
+            return Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
+                receipt: seed,
+                finalization: ExternalMutationFinalization::Complete,
+            });
+        }
+        Ok(Some(value)) => value,
+    };
+    let (outcome, witness) = execute_catalog_publication_recorded(
+        provider,
+        request,
+        frozen,
+        evidence,
+        PublicationReceipts::same(seed),
+    )?;
+    if matches!(
+        outcome,
+        ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            ..
+        }
+    ) {
+        provider
+            .runtime()
+            .control_state()
+            .invalidate_table_cache(&table.namespace, &table.table);
+        if *data_disposition == ConnectorDropTableDataDisposition::Purge {
+            if let Some(cleanup) = witness.as_ref().and_then(|witness| {
+                crate::catalog_control::drop_cleanup::PostCommitCleanupRequest::from_journal_drop(
+                    canonical, &captured, witness,
+                )
+            }) {
+                provider.runtime().drop_cleanup().enqueue(cleanup);
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+#[cfg(test)]
 fn drop_table(
     provider: &IcebergMetadata,
     table: &ConnectorTableIdentity,
@@ -729,61 +878,26 @@ fn drop_table(
     data_disposition: ConnectorDropTableDataDisposition,
     context: &ConnectorRequestContext,
 ) -> Result<ExternalMutationEffect, ConnectorError> {
-    ensure_owner(provider, &table.instance_id)?;
-    if !provider
-        .runtime()
-        .table_exists_for_request(&table.namespace, &table.table, context)
-        .map_err(unavailable)?
-    {
-        return if policy == DropPolicy::NoOpIfMissing {
-            Ok(ExternalMutationEffect::NoOp)
-        } else {
-            Err(not_found("Iceberg table does not exist"))
-        };
-    }
-    let runtime = provider.runtime();
-    let catalog = std::sync::Arc::clone(runtime.novarocks_catalog());
-    let name =
-        crate::catalog::CatalogTableName::new(table.namespace.as_ref(), table.table.as_ref());
-    let canonical = name.canonical();
-    let outcome = runtime
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { catalog.drop_table(name).await })
-        .map_err(unavailable)?;
-
-    // Cache invalidation is post-outcome finalization. It cannot change what
-    // the catalog did, so its result never downgrades a committed drop.
-    runtime
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-
-    use crate::catalog::error::CatalogOutcome;
-    match outcome {
-        CatalogOutcome::Unsupported(reason) => Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            reason.message().to_string(),
-        )),
-        CatalogOutcome::KnownUncommitted { failure } => Err(map_mutation_failure(&failure)),
-        // Nothing is enqueued and nothing is deleted. The objects leak on
-        // purpose: the drop may have landed, and acting on that guess is how
-        // live data disappears.
-        CatalogOutcome::CommitUnknown { failure, .. } => Err(ConnectorError::new(
-            ConnectorErrorKind::Unavailable,
-            failure.to_string(),
-        )),
-        committed => {
-            let (receipt, effect, witness) = committed
-                .into_known_committed()
-                .expect("the remaining arm is the committed one");
-            if data_disposition == ConnectorDropTableDataDisposition::Purge
-                && let Some(request) =
-                    crate::catalog_control::drop_cleanup::PostCommitCleanupRequest::
-                        from_committed_drop(canonical, &receipt, &witness)
-            {
-                runtime.drop_cleanup().enqueue(request);
-            }
-            Ok(effect)
+    let request = ConnectorCatalogMutationRequest {
+        operation_id: ConnectorMutationOperationId::new(),
+        target: novarocks_spi::connector::ConnectorProviderBindingKey {
+            instance_id: provider.descriptor().instance_id.clone(),
+            incarnation: provider.incarnation(),
+        },
+        operation: ConnectorCatalogMutationOperation::DropTable {
+            table: table.clone(),
+            policy,
+            data_disposition,
+        },
+        context: context.clone(),
+    };
+    match execute_drop_table(provider, &request)? {
+        ExternalMutationOutcome::KnownCommitted { effect, .. } => Ok(effect),
+        ExternalMutationOutcome::KnownUncommitted { failure, .. } => {
+            Err(map_mutation_failure(&failure))
+        }
+        ExternalMutationOutcome::CommitUnknown { failure, .. } => {
+            Err(unavailable(failure.to_string()))
         }
     }
 }
@@ -2273,7 +2387,27 @@ fn execute_catalog_publication_with_receipts(
         ConnectorCatalogMutationReceipt,
     >,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    execute_catalog_publication_recorded(provider, request, frozen, evidence, receipts)
+        .map(|(outcome, _)| outcome)
+}
+
+fn execute_catalog_publication_recorded(
+    provider: &IcebergMetadata,
+    request: &ConnectorCatalogMutationRequest,
+    frozen: crate::catalog::catalog_request::FrozenCatalogPublication,
+    evidence: ExternalMutationEvidence,
+    receipts: crate::commit::attempt::observation::PublicationReceipts<
+        ConnectorCatalogMutationReceipt,
+    >,
+) -> Result<
+    (
+        ExternalMutationOutcome<ConnectorCatalogMutationReceipt>,
+        Option<crate::commit::attempt::observation::AppliedDropWitness>,
+    ),
+    ConnectorError,
+> {
     use crate::catalog::catalog_request::CatalogResponseDocument;
+    let drop_scope = frozen.drop_scope();
     let journal = crate::commit::attempt::observation::PublicationJournal::new(
         crate::commit::model::OperationToken::from_mutation(request.operation_id),
     );
@@ -2285,7 +2419,7 @@ fn execute_catalog_publication_with_receipts(
         frozen.attribution().clone(),
         request.context.clone(),
     ) {
-        return Ok(known_uncommitted(invalid(error.to_string())));
+        return Ok((known_uncommitted(invalid(error.to_string())), None));
     }
     let catalog = Arc::clone(provider.runtime().novarocks_catalog());
     let policy = catalog.evidence_policy();
@@ -2316,14 +2450,20 @@ fn execute_catalog_publication_with_receipts(
                 )
                 .await
         });
-    Ok(match result {
+    let outcome = match result {
         Ok(Ok(entry)) => journal.catalog_entry_outcome(entry),
         Ok(Err(error)) => journal
             .catalog_bridge_failure(format!("Catalog publication invocation failed: {error}")),
         Err(error) => {
             journal.catalog_bridge_failure(format!("Catalog publication bridge failed: {error}"))
         }
-    })
+    };
+    let witness = journal.current_entry().and_then(|entry| {
+        drop_scope
+            .as_ref()
+            .and_then(|scope| journal.applied_drop_witness(entry, scope))
+    });
+    Ok((outcome, witness))
 }
 
 fn execute_application_document_update(
@@ -4464,9 +4604,14 @@ mod tests {
         let server = TestServer::start(Script::new());
         let (_executor, provider) = variant_definition_provider(&server.url());
         let table = CatalogTableName::new("db", "t");
-        let original = CatalogPublicationRequest::DropTable(table.clone())
-            .freeze([9; 16])
-            .unwrap();
+        let original = CatalogPublicationRequest::DropTable {
+            table: table.clone(),
+            no_op_if_missing: false,
+            purge: false,
+            capture: None,
+        }
+        .freeze([9; 16])
+        .unwrap();
         let descriptor = crate::commit::publication_descriptor::PublicationDescriptor::catalog(
             [9; 16],
             original.targets(),
@@ -5942,6 +6087,194 @@ mod tests {
                 assert!(receipt.committed_version().is_none());
             }
             other => panic!("existing NoOp must carry no attempted identity: {other:?}"),
+        }
+    }
+
+    fn drop_request(
+        provider: &IcebergMetadata,
+        policy: DropPolicy,
+        purge: bool,
+    ) -> ConnectorCatalogMutationRequest {
+        let mut request = create_request(
+            provider,
+            ConnectorMutationOperationId::new(),
+            CreatePolicy::FailIfExists,
+        );
+        let ConnectorCatalogMutationOperation::CreateTable { table, .. } = &request.operation
+        else {
+            unreachable!()
+        };
+        request.operation = ConnectorCatalogMutationOperation::DropTable {
+            table: table.clone(),
+            policy,
+            data_disposition: if purge {
+                ConnectorDropTableDataDisposition::Purge
+            } else {
+                ConnectorDropTableDataDisposition::Retain
+            },
+        };
+        request
+    }
+
+    #[test]
+    fn drop_journal_only_hands_captured_identity_to_purge_after_applied() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for purge in [false, true] {
+            for code in [200, 204, 409, 401, 403, 419, 404, 408, 429, 503] {
+                let metadata = test_metadata(HashMap::new());
+                let uuid = metadata.uuid().to_string();
+                let server = TestServer::start(Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on("GET", "/v1/namespaces/atomic/tables/events", Reply::json(200, &serde_json::json!({"metadata-location":"memory://warehouse/managed/mv/metadata/old.json", "metadata":metadata})))
+                .on("DELETE", "/v1/namespaces/atomic/tables/events", Reply::status(code)));
+                let (_executor, provider) = variant_definition_provider(&server.url());
+                let outcome = provider
+                    .execute(drop_request(&provider, DropPolicy::FailIfMissing, purge))
+                    .unwrap();
+                match (code, outcome) {
+                    (
+                        200 | 204,
+                        ExternalMutationOutcome::KnownCommitted {
+                            effect: ExternalMutationEffect::Applied,
+                            ..
+                        },
+                    ) => (),
+                    (
+                        409 | 401 | 403 | 419,
+                        ExternalMutationOutcome::KnownUncommitted { failure, .. },
+                    ) => assert_eq!(
+                        failure.kind(),
+                        match code {
+                            409 => ConnectorMutationFailureKind::Conflict,
+                            401 | 419 => ConnectorMutationFailureKind::Unauthenticated,
+                            _ => ConnectorMutationFailureKind::PermissionDenied,
+                        }
+                    ),
+                    (_, ExternalMutationOutcome::CommitUnknown { evidence, .. }) => {
+                        assert!(matches!(
+                            provider
+                                .reconcile(ConnectorCatalogMutationReconcileRequest {
+                                    evidence,
+                                    context: context()
+                                })
+                                .unwrap(),
+                            ExternalMutationOutcome::CommitUnknown { .. }
+                        ))
+                    }
+                    (_, other) => panic!("unexpected drop {code}: {other:?}"),
+                }
+                assert_eq!(
+                    server
+                        .requests_to("DELETE", "/v1/namespaces/atomic/tables/events")
+                        .len(),
+                    1
+                );
+                let captured = provider.runtime().drop_cleanup().take_eligible(i64::MAX);
+                assert_eq!(
+                    captured.len(),
+                    usize::from(purge && matches!(code, 200 | 204))
+                );
+                if let Some(captured) = captured.first() {
+                    assert_eq!(captured.table_uuid.as_ref(), uuid);
+                    assert_eq!(
+                        captured.table_location.as_ref(),
+                        "memory://warehouse/managed/mv"
+                    );
+                    assert_eq!(
+                        captured.metadata_location.as_deref(),
+                        Some("memory://warehouse/managed/mv/metadata/old.json")
+                    );
+                    assert!(captured.created_at_ms > 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn drop_capture_read_uses_original_control_before_delete_or_cleanup() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for cancel in [false, true] {
+            let path = "/v1/namespaces/atomic/tables/events";
+            let server = TestServer::start(Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on_sequence("GET", path, vec![Reply::json(200, &serde_json::json!({})),
+                    Reply::json(200, &serde_json::json!({"metadata-location":"memory://metadata/old.json", "metadata":test_metadata(HashMap::new())})).with_delay(Duration::from_secs(2))])
+                .on("DELETE", path, Reply::status(204)));
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+            let mut request = drop_request(&provider, DropPolicy::FailIfMissing, true);
+            request.context = ConnectorRequestContext::try_new(
+                Instant::now()
+                    + if cancel {
+                        Duration::from_secs(10)
+                    } else {
+                        Duration::from_millis(100)
+                    },
+                stop.view(),
+                65536,
+                131072,
+            )
+            .unwrap();
+            let started = Instant::now();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| provider.execute(request).unwrap());
+                if cancel {
+                    let until = Instant::now() + Duration::from_secs(5);
+                    while server.requests_to("GET", path).len() < 2 {
+                        assert!(Instant::now() < until, "capture GET did not start");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    stop.request_stop();
+                }
+                assert!(
+                    matches!(worker.join().unwrap(),ExternalMutationOutcome::KnownUncommitted{failure,..} if failure.kind()== if cancel {ConnectorMutationFailureKind::Cancelled} else {ConnectorMutationFailureKind::DeadlineExceeded})
+                );
+            });
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "capture ignored request control"
+            );
+            assert!(server.requests_to("DELETE", path).is_empty());
+            assert_eq!(provider.runtime().drop_cleanup().pending_len(), 0);
+        }
+    }
+
+    #[test]
+    fn drop_no_op_and_missing_capture_cannot_authorize_cleanup() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for present in [false, true] {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/atomic/tables/events",
+                        if present {
+                            Reply::json(200, &serde_json::json!({"not":"table metadata"}))
+                        } else {
+                            Reply::status(404)
+                        },
+                    )
+                    .on(
+                        "DELETE",
+                        "/v1/namespaces/atomic/tables/events",
+                        Reply::status(204),
+                    ),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let outcome = provider
+                .execute(drop_request(&provider, DropPolicy::NoOpIfMissing, true))
+                .unwrap();
+            assert!(
+                matches!(outcome,ExternalMutationOutcome::KnownCommitted { effect,.. } if effect == if present { ExternalMutationEffect::Applied } else { ExternalMutationEffect::NoOp })
+            );
+            assert_eq!(
+                server
+                    .requests_to("DELETE", "/v1/namespaces/atomic/tables/events")
+                    .len(),
+                usize::from(present)
+            );
+            assert_eq!(provider.runtime().drop_cleanup().pending_len(), 0);
         }
     }
 

@@ -54,7 +54,12 @@ pub(crate) enum CatalogPublicationRequest {
         namespace: CatalogNamespaceName,
         creation: TableCreation,
     },
-    DropTable(CatalogTableName),
+    DropTable {
+        table: CatalogTableName,
+        no_op_if_missing: bool,
+        purge: bool,
+        capture: Option<super::CatalogDropTableReceipt>,
+    },
     CreateView {
         namespace: CatalogNamespaceName,
         creation: super::view_request::ViewCreate,
@@ -90,6 +95,26 @@ enum FrozenCatalogPayload {
     HadoopCreate(Box<crate::hadoop_catalog::HadoopCreateAttempt>),
 }
 
+/// Constructible only by an actual frozen table drop with explicit policy.
+#[derive(Clone)]
+pub(crate) struct DropPublicationScope {
+    targets: Vec<String>,
+    target: Arc<str>,
+    capture: super::CatalogDropTableReceipt,
+}
+impl DropPublicationScope {
+    pub(crate) fn proves_capture(
+        &self,
+        target: &str,
+        capture: &super::CatalogDropTableReceipt,
+    ) -> bool {
+        self.target.as_ref() == target && self.capture == *capture
+    }
+    pub(crate) fn matches_targets(&self, targets: &[String]) -> bool {
+        self.targets == targets
+    }
+}
+
 pub(crate) struct FrozenCatalogPublication {
     operation_id: [u8; 16],
     pub(super) operation: CatalogOperation,
@@ -99,9 +124,31 @@ pub(crate) struct FrozenCatalogPublication {
     namespace_no_op: Option<bool>,
     pub(super) namespace_has_properties: bool,
     table_create_no_op: Option<bool>,
+    table_drop_policy: Option<(bool, bool)>,
+    table_drop_capture: Option<super::CatalogDropTableReceipt>,
     attribution: AttributionPlan,
 }
 impl FrozenCatalogPublication {
+    pub(crate) fn drop_scope(&self) -> Option<DropPublicationScope> {
+        if self.operation != CatalogOperation::DropTable || !self.table_drop_policy?.1 {
+            return None;
+        }
+        let capture = self.table_drop_capture.as_ref()?;
+        if capture.table_uuid.is_none()
+            || capture.table_location.is_none()
+            || capture.last_updated_ms <= 0
+        {
+            return None;
+        }
+        let CatalogAdmissionTarget::Table(target) = &self.target else {
+            return None;
+        };
+        Some(DropPublicationScope {
+            targets: self.targets(),
+            target: target.canonical(),
+            capture: capture.clone(),
+        })
+    }
     pub(crate) fn targets(&self) -> Vec<String> {
         // Bind the actual operation, structured name and local policy even
         // when two endpoints use identical empty HTTP bodies. Display names
@@ -121,6 +168,14 @@ impl FrozenCatalogPublication {
         });
         if let Some(no_op) = self.table_create_no_op {
             scope["table-create-no-op"] = no_op.into();
+        }
+        if let Some((no_op, purge)) = self.table_drop_policy {
+            scope["table-drop-no-op"] = no_op.into();
+            scope["table-drop-purge"] = purge.into();
+            scope["table-drop-capture"] = self.table_drop_capture.as_ref().map(|capture| serde_json::json!({
+                "uuid": capture.table_uuid.as_deref(), "location": capture.table_location.as_deref(),
+                "metadata-location": capture.metadata_location.as_deref(), "last-updated-ms": capture.last_updated_ms,
+            })).unwrap_or(serde_json::Value::Null);
         }
         vec![scope.to_string()]
     }
@@ -184,6 +239,8 @@ impl FrozenCatalogPublication {
             namespace_no_op: None,
             namespace_has_properties: false,
             table_create_no_op: Some(no_op_if_exists),
+            table_drop_policy: None,
+            table_drop_capture: None,
             attribution,
         })
     }
@@ -198,6 +255,17 @@ impl FrozenCatalogPublication {
             _ => Err(novarocks_spi::connector::ConnectorError::new(novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
                 "Conditional Hadoop publication requires its exact frozen metadata request and policy").into()),
         }
+    }
+    pub(super) fn table_drop_policy(&self) -> Result<(bool, bool)> {
+        if self.operation == CatalogOperation::DropTable {
+            if let Some(policy) = self.table_drop_policy {
+                return Ok(policy);
+            }
+        }
+        Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Table drop requires its frozen policy and disposition",
+        ))
     }
     pub(crate) fn attribution(&self) -> &AttributionPlan {
         &self.attribution
@@ -257,6 +325,8 @@ impl CatalogPublicationRequest {
         let mut attribution = AttributionPlan::ObserveOnly;
         let mut stage_create = false;
         let mut table_create_no_op = None;
+        let mut table_drop_policy = None;
+        let mut table_drop_capture = None;
         let mut namespace_no_op = None;
         let mut namespace_has_properties = false;
         let (operation, target, route, expectation, request) = match self {
@@ -345,7 +415,14 @@ impl CatalogPublicationRequest {
                     encode(&body)?,
                 )
             }
-            Self::DropTable(table) => {
+            Self::DropTable {
+                table,
+                no_op_if_missing,
+                purge,
+                capture,
+            } => {
+                table_drop_policy = Some((no_op_if_missing, purge));
+                table_drop_capture = capture;
                 let ident = super::delegate::table_ident(&table).map_err(invalid_target)?;
                 (
                     CatalogOperation::DropTable,
@@ -420,6 +497,8 @@ impl CatalogPublicationRequest {
             namespace_no_op,
             namespace_has_properties,
             table_create_no_op,
+            table_drop_policy,
+            table_drop_capture,
             attribution,
         })
     }
@@ -447,9 +526,14 @@ mod tests {
     fn descriptor_binds_actual_endpoint_structured_target_and_local_policy() {
         let id = [9; 16];
         let table = CatalogTableName::new("db", "t");
-        let source = CatalogPublicationRequest::DropTable(table.clone())
-            .freeze(id)
-            .unwrap();
+        let source = CatalogPublicationRequest::DropTable {
+            table: table.clone(),
+            no_op_if_missing: false,
+            purge: false,
+            capture: None,
+        }
+        .freeze(id)
+        .unwrap();
         let descriptor = PublicationDescriptor::catalog(
             id,
             source.targets(),
@@ -464,7 +548,12 @@ mod tests {
                 namespace: CatalogNamespaceName::new("db.t"),
                 no_op_if_missing: false,
             },
-            CatalogPublicationRequest::DropTable(CatalogTableName::new("db.t", "")),
+            CatalogPublicationRequest::DropTable {
+                table: CatalogTableName::new("db.t", ""),
+                no_op_if_missing: false,
+                purge: false,
+                capture: None,
+            },
         ] {
             let other = other.freeze(id);
             if let Ok(other) = other {
