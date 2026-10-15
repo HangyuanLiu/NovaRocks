@@ -2130,9 +2130,9 @@ mod tests {
             "writer_multiplex_schema",
             ProtocolErrorKind::InvalidValue,
         );
-        assert!(
-            error.contains("value layout cannot carry field metadata or dictionary encoding"),
-            "{error}"
+        assert_eq!(
+            error.protocol().expect("the exact protocol error").detail(),
+            "runtime encoding is forbidden in value layout",
         );
     }
 

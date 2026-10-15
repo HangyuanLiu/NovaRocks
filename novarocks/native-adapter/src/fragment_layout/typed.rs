@@ -402,7 +402,12 @@ fn decode_output_layout_typed_core<H, F: novarocks_type_contract::ValueSchemaCre
             return Err(protocol(
                 path.clone().index(index).field("column_id"),
                 ProtocolErrorKind::InconsistentFields,
-                format!("duplicate OutputColumn.column_id {}", pair[0].0),
+                format!(
+                    "duplicate OutputColumn.column_id {} at index {} (first seen at index {})",
+                    pair[0].0,
+                    index,
+                    pair[0].1.min(pair[1].1),
+                ),
             ));
         }
     }
@@ -422,7 +427,10 @@ fn decode_output_layout_typed_core<H, F: novarocks_type_contract::ValueSchemaCre
             protocol(
                 path.clone().index(index).field("type"),
                 ProtocolErrorKind::MissingField,
-                "OutputColumn.type missing",
+                format!(
+                    "OutputColumn.type missing for column_id={} name='{}' at index {}",
+                    column.column_id, column.name, index,
+                ),
             )
         })?;
         let value = types
