@@ -1607,11 +1607,11 @@ fn complete_nominal_table_and_window_use_exact_declarations_and_refuse_old_revis
     };
     let fixture = published(&fixture);
     assert_unchanged(&fixture.build());
-    for revision in [2, 3, 4, 5] {
+    for revision in [2, 3, 4, 5, 6] {
         let old = fixture.build_modified(None, None, Some(revision));
         assert_provider(&old, ConnectorCodecErrorKind::VersionMismatch);
     }
-    for revision in [3, 4, 5] {
+    for revision in [3, 4, 5, 6] {
         let old = fixture.build_modified(
             None,
             Some(bytes::Bytes::from_static(b"invalid private body")),

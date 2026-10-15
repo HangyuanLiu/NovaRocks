@@ -431,7 +431,7 @@ mod tests {
             PLAN_TREE,
         )
         .unwrap();
-        for prior_revision in [4, 5, 6] {
+        for prior_revision in [4, 5] {
             let prior = novarocks_version::derive_repository_native_compatibility_material(
                 native_carrier_declarations(manifest.contracts()).unwrap(),
                 [0x31; 32],
