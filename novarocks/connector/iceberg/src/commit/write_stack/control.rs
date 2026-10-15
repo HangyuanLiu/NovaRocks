@@ -2470,7 +2470,11 @@ impl IcebergWriteSessionControl {
             // pure branch planner.
             equality: match &signed {
                 ConnectorWriteInputShape::EqualityDelete { equality_fields } => {
-                    Some(equality_delete_recipe(writer_metadata, equality_fields)?)
+                    Some(equality_delete_recipe(
+                        writer_metadata,
+                        equality_fields,
+                        &format!("{}.{}", self.key.instance_id.as_str(), request.table),
+                    )?)
                 }
                 _ => None,
             },
@@ -3204,6 +3208,7 @@ fn sign_input_shape(
 pub(crate) fn equality_delete_recipe(
     metadata: &TableMetadata,
     fields: &[ConnectorWriteFieldBinding],
+    target_fqn: &str,
 ) -> Result<crate::commit::write_stack::domain::IcebergEqualityDeleteRecipe, ConnectorError> {
     use crate::commit::write_stack::domain::{
         IcebergEqualityDeleteColumnFacts, IcebergEqualityDeleteRecipe,
@@ -3241,8 +3246,17 @@ pub(crate) fn equality_delete_recipe(
                     field.name()
                 )));
             }
-            crate::commit::frozen_write::validate_writer_type(&iceberg_field.field_type)
-                .map_err(|message| ConnectorError::new(ConnectorErrorKind::Unsupported, message))?;
+            crate::commit::frozen_write::validate_writer_type(&iceberg_field.field_type).map_err(
+                |message| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        format!(
+                            "{message}: table `{target_fqn}`, column `{}`",
+                            iceberg_field.name
+                        ),
+                    )
+                },
+            )?;
             projected.push(iceberg_field.clone());
             IcebergEqualityDeleteColumnFacts::try_new(field.name().to_string(), iceberg_field.id)
         })

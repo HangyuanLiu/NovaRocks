@@ -118,9 +118,11 @@ pub(crate) fn prepare_write(
         // Reuse session admission's exact logical-key projection. The same
         // FixedSizeBinary carrier may represent uuid or ordinary fixed data;
         // neither the application nor the carrier can decide this policy.
-        if let Err(error) =
-            crate::commit::write_stack::control::equality_delete_recipe(&metadata, equality_fields)
-        {
+        if let Err(error) = crate::commit::write_stack::control::equality_delete_recipe(
+            &metadata,
+            equality_fields,
+            &target_fqn,
+        ) {
             return Ok(ConnectorWritePreparationOutcome::Denied(error));
         }
     }
@@ -1362,6 +1364,9 @@ mod tests {
                 let error = expect_denied(outcome);
                 assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
                 assert!(error.message().contains("uuid"));
+                assert!(error.message().contains("table `ice.db.t`"));
+                assert!(error.message().contains("column `uuid_key`"));
+                assert!(!error.retryable_before_progress());
             } else {
                 let preparation = expect_prepared(outcome);
                 let ConnectorWriteInputShape::EqualityDelete { equality_fields } =
