@@ -205,7 +205,7 @@ fn map_error(error: RootSchemaBackingError) -> RootArrayStorageError {
     match error {
         RootSchemaBackingError::CapacityExceeded => RootArrayStorageError::CapacityExceeded,
         RootSchemaBackingError::WorkExceeded => RootArrayStorageError::WorkExceeded,
-        RootSchemaBackingError::UnsupportedType => RootArrayStorageError::UnsupportedCarrier,
+        RootSchemaBackingError::UnsupportedType => RootArrayStorageError::UnsupportedSchemaType,
         RootSchemaBackingError::UnknownSchemaMetadataOwner
         | RootSchemaBackingError::UnknownFieldMetadataOwner
         | RootSchemaBackingError::UninspectedOriginIndex => {

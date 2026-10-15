@@ -837,6 +837,15 @@ impl RootResultSession for NativeRootResultSession {
                 novarocks_execution::exec::chunk::RootArrayStorageError::UnsupportedCarrier => {
                     "root input inspection refused an unsupported carrier"
                 }
+                novarocks_execution::exec::chunk::RootArrayStorageError::UnsupportedSchemaType => {
+                    "root input inspection refused an unsupported schema or origin-index type"
+                }
+                novarocks_execution::exec::chunk::RootArrayStorageError::CarrierDowncastMismatch => {
+                    "root input inspection refused a nonstandard physical array type"
+                }
+                novarocks_execution::exec::chunk::RootArrayStorageError::CarrierOuterOwnerMismatch => {
+                    "root input inspection refused an array wrapper with a distinct outer owner"
+                }
                 novarocks_execution::exec::chunk::RootArrayStorageError::UnknownMetadataOwner => {
                     unknown_metadata
                 }
