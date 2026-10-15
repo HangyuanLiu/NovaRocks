@@ -514,8 +514,19 @@ impl ProcessorOperator for StreamScanSourceOperator {
                     self.end_delivery();
                     return Err(error.into());
                 }
-                Poll::Ready(Some(Ok(chunk))) => {
+                Poll::Ready(Some(Ok(mut chunk))) => {
                     self.wake_generation = None;
+                    if self.filter.requires_input_accounting() {
+                        let tracker = self.output_tracker.as_ref().ok_or(
+                            crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                        )?;
+                        // Use the original whole-source author before any
+                        // ordered transformation borrows or retains this input.
+                        // An existing provider charge remains its sole owner.
+                        chunk.try_transfer_to_typed(tracker).map_err(
+                            crate::exec::pipeline::operator::ConstructionFailure::Memory,
+                        )?;
+                    }
                     self.filter.poll_live_updates()?;
                     let Some(chunk) =
                         self.filter

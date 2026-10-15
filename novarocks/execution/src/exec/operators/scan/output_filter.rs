@@ -195,6 +195,13 @@ impl ScanDriverFilter {
             ordered.bind_construction_factory(factory);
         }
     }
+    /// The ordered composition borrows the real input before its filter/slice
+    /// creators retain it. Its original whole-source handoff must precede that
+    /// borrow; a provider token is preserved by the existing handoff author.
+    pub(super) fn requires_input_accounting(&self) -> bool {
+        self.compiled_ordered.is_some()
+    }
+
     pub(super) fn restrict_limit(
         &mut self,
         chunk: Chunk,

@@ -883,3 +883,6 @@ mod pipeline_tests;
 
 #[path = "compiled_ordered_membership_source_tests.rs"]
 mod membership_tests;
+
+#[path = "compiled_ordered_page_source_tests.rs"]
+mod page_source_tests;
