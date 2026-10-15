@@ -34,9 +34,9 @@ use crate::commit::staging::StagingBase;
 use crate::iceberg::{Error, ErrorKind, Result};
 use async_trait::async_trait;
 use novarocks_spi::connector::{
-    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorOperationControl,
-    ConnectorRequestContext, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome,
+    ConnectorError, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorOperationControl, ConnectorRequestContext, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -89,6 +89,8 @@ struct JournalEntry<R> {
     // Independent dimensions: attaching finalization or positive observation
     // never replaces the original dispatch evidence.
     finalization: ExternalMutationFinalization,
+    finalization_grant:
+        Option<std::result::Result<crate::catalog::publication::EvidenceContext, ConnectorError>>,
     positive_proof: Option<CommitProof>,
 }
 struct JournalState<R> {
@@ -180,6 +182,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
                 checked,
                 phase: EntryPhase::Prepared,
                 finalization: ExternalMutationFinalization::Complete,
+                finalization_grant: None,
                 positive_proof: None,
             },
         );
@@ -315,6 +318,49 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
         );
         entry.phase = EntryPhase::Concluded(evidence);
     }
+    /// Adapter and producer finalization share one finite phase grant. A
+    /// subsequent projection cannot restart the deadline after cache work.
+    pub(crate) fn finalization_context(
+        &self,
+        entry_ref: JournalEntryRef,
+        policy: crate::catalog::publication::CatalogEvidencePolicy,
+    ) -> std::result::Result<crate::catalog::publication::EvidenceContext, ConnectorError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state.entries.get_mut(&entry_ref.0).ok_or_else(|| {
+            ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "Publication finalization requires an entry owned by this journal",
+            )
+        })?;
+        let positively_applied = matches!(
+            entry.phase,
+            EntryPhase::Concluded(DispatchEvidence::Applied { .. })
+        ) || (matches!(
+            entry.phase,
+            EntryPhase::Concluded(DispatchEvidence::Unknown { .. })
+        ) && entry.positive_proof.is_some());
+        if !positively_applied {
+            return Err(ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "Publication finalization requires positive applied evidence",
+            ));
+        }
+        let grant = entry
+            .finalization_grant
+            .get_or_insert_with(|| policy.begin_finalization())
+            .clone()?;
+        if grant.expired() {
+            return Err(ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::DeadlineExceeded,
+                "Publication finalization deadline elapsed; no new finalization I/O may start",
+            ));
+        }
+        Ok(grant)
+    }
+
     pub(crate) fn record_entry_finalization(
         &self,
         entry_ref: JournalEntryRef,

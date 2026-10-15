@@ -333,11 +333,13 @@ impl RegisteredIcebergDataMutationBackend {
         });
         let mut outcome = self.project_bridge(&operation, &journal, report)?;
         if let ExternalMutationOutcome::KnownCommitted { finalization, .. } = &mut outcome {
-            let result = self
-                .runtime
-                .novarocks_catalog()
-                .evidence_policy()
-                .begin_finalization()
+            let result = journal
+                .finalization_context(
+                    journal
+                        .current_entry()
+                        .expect("committed data mutation has a publication entry"),
+                    self.runtime.novarocks_catalog().evidence_policy(),
+                )
                 .and_then(|grant| grant.for_io(context))
                 .and_then(|context| self.finalize_publication(planned, &context));
             if let Err(error) = result {

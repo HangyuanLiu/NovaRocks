@@ -130,7 +130,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
         // This is deliberately the first statement after adapter return.
         self.conclude_entry(entry_ref, completion.evidence);
         if let Some(work) = completion.finalization {
-            let finalization = match policy.begin_finalization() {
+            let finalization = match self.finalization_context(entry_ref, policy) {
                 Ok(context) => work.run(context).await,
                 Err(error) => ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
                     ConnectorMutationFailureKind::Internal,
@@ -552,5 +552,223 @@ mod tests {
         let descriptor = journal.entry_descriptor(entry).unwrap();
         assert!(descriptor.first_dispatch_ms.is_none());
         assert!(descriptor.binding.is_none());
+    }
+    struct BudgetDispatch {
+        entered: Arc<Notify>,
+        exit: Arc<Notify>,
+        grant: Arc<std::sync::Mutex<Option<EvidenceContext>>>,
+    }
+    struct UnexpectedFinalization(Arc<AtomicUsize>);
+    #[async_trait]
+    impl FinalizationWork for UnexpectedFinalization {
+        async fn run(self: Box<Self>, _: EvidenceContext) -> ExternalMutationFinalization {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ExternalMutationFinalization::Complete
+        }
+    }
+    struct NonAppliedDispatch {
+        evidence: DispatchEvidence,
+        polls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl PreparedCatalogDispatch for NonAppliedDispatch {
+        async fn dispatch_once(self: Box<Self>, _: EvidenceContext) -> DispatchCompletion {
+            DispatchCompletion {
+                evidence: self.evidence,
+                finalization: Some(Box::new(UnexpectedFinalization(self.polls))),
+            }
+        }
+    }
+    #[tokio::test]
+    async fn finalization_requires_positive_evidence_and_never_polls_non_applied_work() {
+        let failure = ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Unavailable,
+            "injected non-applied evidence",
+        );
+        for evidence in [
+            DispatchEvidence::Unknown {
+                failure: failure.clone(),
+                observation: Default::default(),
+            },
+            DispatchEvidence::Rejected {
+                failure: failure.clone(),
+                observation: Default::default(),
+            },
+            DispatchEvidence::NotDispatched {
+                failure: failure.clone(),
+            },
+        ] {
+            let (journal, preparation) = super::super::tests::catalog_journal();
+            let entry = journal.current_entry().unwrap();
+            assert_eq!(
+                journal
+                    .finalization_context(entry, CatalogEvidencePolicy::default())
+                    .unwrap_err()
+                    .kind(),
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+            );
+            let polls = Arc::new(AtomicUsize::new(0));
+            let dispatch = NonAppliedDispatch {
+                evidence,
+                polls: polls.clone(),
+            };
+            journal
+                .publish_once(
+                    preparation,
+                    CatalogEvidencePolicy::default(),
+                    move |_, _, _| async move {
+                        Ok(PreparedPublication::Mutation {
+                            binding: None,
+                            dispatch: Box::new(dispatch),
+                        })
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(polls.load(Ordering::SeqCst), 0);
+            assert!(
+                journal.state.lock().unwrap().entries[&entry.0]
+                    .finalization_grant
+                    .is_none()
+            );
+            assert_eq!(
+                journal
+                    .finalization_context(entry, CatalogEvidencePolicy::default())
+                    .unwrap_err()
+                    .kind(),
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+            );
+        }
+    }
+    #[tokio::test]
+    async fn repeated_finalization_requests_reuse_the_exact_grant() {
+        let (journal, preparation) = super::super::tests::catalog_journal();
+        let entry = journal
+            .publish_once(
+                preparation,
+                CatalogEvidencePolicy::default(),
+                |_, _, _| async { Ok(PreparedPublication::NoOp) },
+            )
+            .await
+            .unwrap();
+        let first = journal
+            .finalization_context(entry, CatalogEvidencePolicy::default())
+            .unwrap();
+        let second = journal
+            .finalization_context(
+                entry,
+                CatalogEvidencePolicy {
+                    finalization: std::time::Duration::from_secs(60),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(first.started(), second.started());
+        assert_eq!(first.deadline(), second.deadline());
+        let (foreign, _) = super::super::tests::catalog_journal();
+        assert!(
+            foreign
+                .finalization_context(entry, CatalogEvidencePolicy::default())
+                .is_err()
+        );
+    }
+    #[async_trait]
+    impl PreparedCatalogDispatch for BudgetDispatch {
+        async fn dispatch_once(self: Box<Self>, _: EvidenceContext) -> DispatchCompletion {
+            DispatchCompletion {
+                evidence: DispatchEvidence::Applied {
+                    proof: CommitProof::applied(None),
+                },
+                finalization: Some(Box::new(BudgetFinalization {
+                    entered: self.entered,
+                    exit: self.exit,
+                    grant: self.grant,
+                })),
+            }
+        }
+    }
+    struct BudgetFinalization {
+        entered: Arc<Notify>,
+        exit: Arc<Notify>,
+        grant: Arc<std::sync::Mutex<Option<EvidenceContext>>>,
+    }
+    #[async_trait]
+    impl FinalizationWork for BudgetFinalization {
+        async fn run(self: Box<Self>, context: EvidenceContext) -> ExternalMutationFinalization {
+            *self.grant.lock().unwrap() = Some(context);
+            self.entered.notify_one();
+            // Simulate already started local work: retain its owner to actual
+            // exit even when no further finalization I/O may be started.
+            self.exit.notified().await;
+            assert!(context.expired());
+            ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::DeadlineExceeded,
+                "injected finalization completed after its phase deadline",
+            ))
+        }
+    }
+    #[tokio::test]
+    async fn producer_projection_cannot_restart_an_adapters_finalization_budget() {
+        let (journal, preparation) = super::super::tests::catalog_journal();
+        let entered = Arc::new(Notify::new());
+        let exit = Arc::new(Notify::new());
+        let grant = Arc::new(std::sync::Mutex::new(None));
+        let policy = CatalogEvidencePolicy {
+            finalization: std::time::Duration::from_millis(5),
+            ..Default::default()
+        };
+        let observed = journal.clone();
+        let mechanism = BudgetDispatch {
+            entered: entered.clone(),
+            exit: exit.clone(),
+            grant: grant.clone(),
+        };
+        let task = tokio::spawn(async move {
+            observed
+                .publish_once(preparation, policy, move |_, _, _| async move {
+                    Ok(PreparedPublication::Mutation {
+                        binding: None,
+                        dispatch: Box::new(mechanism),
+                    })
+                })
+                .await
+        });
+        entered.notified().await;
+        let original = grant.lock().unwrap().unwrap();
+        tokio::time::sleep_until(
+            (original.deadline() + std::time::Duration::from_millis(5)).into(),
+        )
+        .await;
+        let entry = journal.current_entry().unwrap();
+        assert!(matches!(
+            journal.commit_outcome(entry),
+            CatalogOutcome::KnownCommitted { .. }
+        ));
+        assert!(
+            !task.is_finished(),
+            "finalization still owns its started local work"
+        );
+        let error = journal
+            .finalization_context(
+                entry,
+                CatalogEvidencePolicy {
+                    finalization: std::time::Duration::from_secs(60),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::DeadlineExceeded
+        );
+        exit.notify_one();
+        task.await.unwrap().unwrap();
+        assert!(matches!(
+            journal.commit_outcome(entry),
+            CatalogOutcome::KnownCommitted {
+                finalization: ExternalMutationFinalization::Failed(_),
+                ..
+            }
+        ));
     }
 }

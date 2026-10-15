@@ -583,11 +583,13 @@ impl IcebergWriteSessionControl {
                 });
         let enriched = match snapshot_id {
             Some(snapshot_id) => {
-                let rows = match self
-                    .runtime
-                    .novarocks_catalog()
-                    .evidence_policy()
-                    .begin_finalization()
+                let rows = match journal
+                    .finalization_context(
+                        journal
+                            .current_entry()
+                            .expect("committed write has a publication entry"),
+                        self.runtime.novarocks_catalog().evidence_policy(),
+                    )
                     .and_then(|grant| grant.for_io(context))
                 {
                     Ok(finalization_context) => {

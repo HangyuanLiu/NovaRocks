@@ -2391,9 +2391,9 @@ fn execute_application_document_update(
         .runtime()
         .control_state()
         .invalidate_table_cache(&table.namespace, &table.table);
-    let refreshed = policy
-        .begin_finalization()
-        .and_then(|grant| grant.for_io(&request.context))
+    let refreshed = journal.finalization_context(
+        journal.current_entry().expect("committed document update has a publication entry"), policy,
+    ).and_then(|grant| grant.for_io(&request.context))
         .and_then(|context| {
             provider
                 .runtime()
