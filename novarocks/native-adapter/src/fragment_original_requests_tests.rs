@@ -79,6 +79,9 @@ fn expression(pool: u32, row: u32) -> expr::Expr {
     }
 }
 fn source() -> (plan::PlanFragment, FunctionValueType) {
+    source_with_original_constant(true)
+}
+fn source_with_original_constant(has_constant: bool) -> (plan::PlanFragment, FunctionValueType) {
     // The fixture is an explicit scalar author, not a type inferred from IPC.
     let value = FunctionValueType::new(DataType::Int64, false);
     let field = Arc::new(Field::new("original constant", DataType::Int64, false));
@@ -107,13 +110,20 @@ fn source() -> (plan::PlanFragment, FunctionValueType) {
     .unwrap();
     assert_eq!(pool.resource_facts().metadata_bytes, source_metadata_bytes);
     let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Encode).unwrap();
-    let roots = [ExecutionTypeRoot {
-        id: 0,
-        value: &value,
-    }];
+    let wrong_scalar_type = FunctionValueType::new(DataType::Boolean, false);
+    let roots = [
+        ExecutionTypeRoot {
+            id: 0,
+            value: &value,
+        },
+        ExecutionTypeRoot {
+            id: 1,
+            value: &wrong_scalar_type,
+        },
+    ];
     let execution = ExecutionTypeTableBuilder::new(&roots)
         .encode_observed::<std::convert::Infallible>(
-            ExecutionTypeTableLimits::for_validated_root_count(1).unwrap(),
+            ExecutionTypeTableLimits::for_validated_root_count(2).unwrap(),
             &mut |_| Ok(()),
             &mut work,
         )
@@ -143,7 +153,7 @@ fn source() -> (plan::PlanFragment, FunctionValueType) {
             kind: Some(call_request::original_function_argument::Kind::Value(
                 call_request::OriginalValueArgument {
                     value_type_id: Some(0),
-                    constant: Some(reference(0, 0)),
+                    constant: has_constant.then(|| reference(0, 0)),
                 },
             )),
         }],
@@ -241,6 +251,86 @@ fn native_namespace_constant_references_keep_actual_rows_and_pool_identity() {
     assert!(tracker.current() > 0);
     drop(first);
     assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn native_scalar_request_none_keeps_its_fact_while_validating_physical_constant_sources() {
+    for has_constant in [false, true] {
+        let (source, _) = source_with_original_constant(has_constant);
+        let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+            "native scalar original constant facts",
+        );
+        let creation = NativeTypeConstruction::try_with_control(tracker.clone(), &Control).unwrap();
+        let mut resources = NativeDecodeResources::try_new(&creation).unwrap();
+        let types = decode_fragment_type_owner(&source, &mut resources).unwrap();
+        let requests = decode_original_requests(&source, &types, &mut resources).unwrap();
+        let validate = |argument: expr::Expr, resources: &mut NativeDecodeResources<'_>| {
+            requests.validate_scalar_actual_arguments(
+                0,
+                &[argument],
+                &types.execution,
+                resources,
+                FieldPath::root("scalar").field("args"),
+            )
+        };
+        validate(expression(0, 0), &mut resources).unwrap();
+        if !has_constant {
+            // A row address exists for actual evaluation, but the binding
+            // request still provides no compile-time ConstantValue.
+            validate(expression(0, 1), &mut resources).unwrap();
+            assert!(matches!(
+                requests.request(0, &mut resources).unwrap().arguments[0],
+                novarocks_physical_plan::StaticFunctionArgument::Value { constant: None, .. }
+            ));
+        } else {
+            // Even an equal value in another pool is not the captured source.
+            for wrong in [expression(0, 1), expression(u32::MAX, 0)] {
+                let error = validate(wrong, &mut resources).unwrap_err();
+                assert!(error.contains("constant address"), "{error}");
+            }
+        }
+        // None never waives actual namespace, row, complete-type or literal
+        // validation. These checks apply before a scalar actor is selected.
+        let mut missing_pool = expression(0, 0);
+        let Some(expr::expr::Kind::ConstantReference(reference)) = &mut missing_pool.kind else {
+            panic!("constant reference fixture");
+        };
+        reference.pool_id = None;
+        let unknown_pool = expression(7, 0);
+        let outside_row = expression(0, 2);
+        let mut unknown_type = expression(0, 0);
+        unknown_type.r#type.as_mut().unwrap().value_binding_id = Some(99);
+        let mut wrong_type = expression(0, 0);
+        wrong_type.r#type.as_mut().unwrap().value_binding_id = Some(1);
+        let mut wrong_nullability = expression(0, 0);
+        wrong_nullability.nullable = true;
+        let mut inline = expression(0, 0);
+        inline.kind = Some(expr::expr::Kind::Literal(Default::default()));
+        for wrong in [
+            missing_pool,
+            unknown_pool,
+            outside_row,
+            unknown_type,
+            wrong_type,
+            wrong_nullability,
+            inline,
+        ] {
+            assert!(validate(wrong, &mut resources).is_err());
+        }
+        let request = requests.request(0, &mut resources).unwrap();
+        assert!(matches!(
+            request.arguments[0],
+            novarocks_physical_plan::StaticFunctionArgument::Value { constant, .. }
+                if constant == has_constant.then(|| novarocks_physical_plan::ConstantReference {
+                    pool: ConstantPoolId::new(0), ordinal: 0,
+                })
+        ));
+        resources.finish().unwrap();
+        drop(requests);
+        drop(types);
+        drop(creation);
+        assert_eq!(tracker.current(), 0);
+    }
 }
 
 #[test]

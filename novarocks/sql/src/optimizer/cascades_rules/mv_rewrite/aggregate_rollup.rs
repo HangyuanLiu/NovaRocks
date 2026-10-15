@@ -47,9 +47,9 @@ pub(crate) struct RollupItem {
     pub mv_output_index: usize,
     /// Rollup function name ("sum"/"min"/"max"); for Direct this is unused.
     pub rollup_fn: &'static str,
-    /// True when the query aggregate is COUNT-like and the query has no
-    /// group-by: SUM over an empty input yields NULL where COUNT must
-    /// yield 0, so the result needs COALESCE(_, 0).
+    /// COUNT rolls up through nullable SUM, so restore its exact non-null
+    /// result with COALESCE(_, 0). Grouped aggregation still emits no row
+    /// when its input has no group.
     pub needs_coalesce: bool,
 }
 
@@ -180,7 +180,6 @@ pub(crate) fn plan_rollup(
             }
             work.step()?;
         }
-        let scalar_query = query_group_by.is_empty();
         let mut items = Vec::with_capacity(query_aggregates.len());
         for q in query_aggregates {
             work.step()?;
@@ -217,7 +216,7 @@ pub(crate) fn plan_rollup(
             items.push(RollupItem {
                 mv_output_index: mv_idx,
                 rollup_fn,
-                needs_coalesce: is_count && scalar_query,
+                needs_coalesce: is_count,
             });
         }
         Ok(Some(RollupPlan {
@@ -460,8 +459,8 @@ mod tests {
         // count(*) rolls up over MV output `c` (index 3) with rollup_fn=sum.
         assert_eq!(plan.items[1].mv_output_index, 3);
         assert_eq!(plan.items[1].rollup_fn, "sum");
-        // query has a group-by, so no scalar-count coalesce needed.
-        assert!(!plan.items[1].needs_coalesce);
+        // SUM remains nullable; preserve COUNT's non-null published type.
+        assert!(plan.items[1].needs_coalesce);
     }
 
     #[test]
