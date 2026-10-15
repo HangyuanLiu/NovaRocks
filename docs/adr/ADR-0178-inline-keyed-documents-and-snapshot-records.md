@@ -16,11 +16,11 @@ provenance:
   - "discussion: 2026-10-15 accepted implementation contract including conflict termination and dangling-root repair"
 code-anchors:
   - "novarocks/spi/src/connector/document_storage/mod.rs (document identity and keyed storage contracts)"
-  - "novarocks/connector/iceberg/src/document_storage/mod.rs (keyed codec, views, resolution and retention)"
+  - "novarocks/connector/iceberg/src/document_storage/keyed/mod.rs (keyed codec, views, resolution and retention)"
   - "novarocks/connector/iceberg/src/commit/model/request.rs (RequestShape)"
   - "novarocks/connector/iceberg/src/commit/attempt.rs (run, RetryPolicy)"
   - "novarocks/connector/iceberg/src/commit/snapshot_lifecycle_helpers/rewrite_manifests.rs (snapshot record carry)"
-  - "novarocks/mv-application/src/persistence/documents.rs (MV persistence mapping)"
+  - "novarocks/mv-application/src/persistence/keyed_documents.rs (MV version, slot and snapshot-record mapping)"
   - "novarocks/frontend-application/src/mv/domain/iceberg_refresh.rs (configuration slot changes)"
 ---
 

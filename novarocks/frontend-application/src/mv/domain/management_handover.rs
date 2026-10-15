@@ -254,8 +254,12 @@ fn refuse_unready_phase(phase: MvManagementPhase) -> Result<(), String> {
         MvManagementPhase::Stopping => {
             Err("MV owner handover refused: this process is stopping".to_string())
         }
-        MvManagementPhase::OwnerMismatch | MvManagementPhase::IncarnationMismatch => Err(
-            "MV owner handover refused: a fresh Current observation found another management owner or incarnation"
+        MvManagementPhase::OwnerMismatch => Err(
+            "MV owner handover refused: a fresh Current observation found another deployment managing this target; request handover from that owner"
+                .to_string(),
+        ),
+        MvManagementPhase::IncarnationMismatch => Err(
+            "MV owner handover refused: a fresh Current observation found another process incarnation managing this target; request handover from that owner"
                 .to_string(),
         ),
     }
@@ -313,6 +317,7 @@ mod tests {
                 "no bound object yet",
             ),
             (MvManagementPhase::Stopping, "process is stopping"),
+            (MvManagementPhase::OwnerMismatch, "another deployment"),
             (
                 MvManagementPhase::IncarnationMismatch,
                 "another process incarnation",
