@@ -1564,9 +1564,31 @@ fn alter_schema(
     {
         return Err(invalid("Iceberg column defaults require format-version 3"));
     }
+    let Some(commit) =
+        schema_change_commit(table_ident(table).map_err(invalid)?, metadata, change)?
+    else {
+        return Ok(ExternalMutationEffect::NoOp);
+    };
+    update_table(runtime, commit, "alter Iceberg schema")?;
+    runtime
+        .control_state()
+        .invalidate_table_cache(&table.namespace, &table.table);
+    Ok(ExternalMutationEffect::Applied)
+}
+
+/// The commit of one validated schema change against `metadata`, or `None`
+/// when the change is a no-op. `add-schema` carries no column high-water
+/// mark: the server keeps it at the larger of its prior value and the new
+/// schema's highest field ID, and the last-assigned-field-id requirement
+/// fences concurrent schema changes.
+pub(crate) fn schema_change_commit(
+    ident: TableIdent,
+    metadata: &crate::iceberg::spec::TableMetadata,
+    change: &ConnectorSchemaChange,
+) -> Result<Option<TableCommit>, ConnectorError> {
     let integer_domains = crate::scalar_integer_domain::metadata_declarations(metadata)?;
     if scalar_integer_modify_is_noop(metadata.current_schema(), &integer_domains, change)? {
-        return Ok(ExternalMutationEffect::NoOp);
+        return Ok(None);
     }
     let mut next_id = metadata
         .last_column_id()
@@ -1585,7 +1607,7 @@ fn alter_schema(
         .map_err(|error| invalid(format!("build evolved Iceberg schema: {error}")))?;
     let updates = scalar_integer_schema_updates(metadata, change, new_schema, integer_domains)?;
     let commit = crate::commit::existing_commit::existing_table_commit(
-        table_ident(table).map_err(invalid)?,
+        ident,
         metadata,
         vec![
             TableRequirement::CurrentSchemaIdMatch {
@@ -1598,11 +1620,7 @@ fn alter_schema(
         updates,
     )
     .map_err(|error| internal(error.to_string()))?;
-    update_table(runtime, commit, "alter Iceberg schema")?;
-    runtime
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(ExternalMutationEffect::Applied)
+    Ok(Some(commit))
 }
 
 fn scalar_integer_modify_is_noop(
@@ -1737,12 +1755,8 @@ fn scalar_integer_schema_updates(
             crate::scalar_integer_domain::encode(&integer_domains)?,
         );
     }
-    let next_last_column_id = metadata.last_column_id().max(new_schema.highest_field_id());
     let mut updates = vec![
-        TableUpdate::AddSchema {
-            schema: new_schema,
-            last_column_id: Some(next_last_column_id),
-        },
+        TableUpdate::AddSchema { schema: new_schema },
         TableUpdate::SetCurrentSchema { schema_id: -1 },
     ];
     if !domain_properties.is_empty() {

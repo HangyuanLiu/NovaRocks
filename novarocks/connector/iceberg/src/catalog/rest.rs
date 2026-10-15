@@ -680,12 +680,14 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         }) else {
             return unknown("REST stage-create response could not be decoded");
         };
-        // Core patch P8 derives the initialization updates until IRU-13b.
-        let initialization_updates = match response.metadata.staged_create_initialization_updates()
-        {
-            Ok(updates) => updates,
-            Err(_) => return unknown("REST stage-create response has invalid initial metadata"),
-        };
+        // The first commit restates the server's staged metadata exactly.
+        let initialization_updates =
+            match crate::commit::staging::staged_create_updates(&response.metadata) {
+                Ok(updates) => updates,
+                Err(_) => {
+                    return unknown("REST stage-create response has invalid initial metadata");
+                }
+            };
         let (frozen, delegation) = crate::rest_protocol::deferred::FrozenLoadTable::from_response(
             table_ident,
             response,
@@ -772,9 +774,9 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     async fn create_view(
         &self,
         namespace: CatalogNamespaceName,
-        creation: crate::iceberg::ViewCreation,
+        creation: super::view_request::ViewCreate,
     ) -> CatalogOutcome<CatalogTableName> {
-        let target = CatalogTableName::new(Arc::clone(&namespace.namespace), creation.name.clone());
+        let target = CatalogTableName::new(Arc::clone(&namespace.namespace), creation.name());
         let ident = match super::delegate::namespace_ident(&namespace) {
             Ok(ident) => ident,
             Err(error) => {
@@ -790,34 +792,15 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
 
     async fn replace_view(
         &self,
-        commit: crate::iceberg::ViewCommit,
+        replace: super::view_request::ValidatedViewReplace,
     ) -> CatalogOutcome<CatalogTableName> {
-        let mut commit = commit;
-        let target = CatalogTableName::from_identifier(commit.identifier());
-        let ident = commit.identifier().clone();
-        let requirements = commit.take_requirements();
-        let updates = commit.take_updates();
-        // A replacement must name the incarnation it was produced from.
-        let uuid = requirements
-            .iter()
-            .map(|requirement| match requirement {
-                crate::iceberg::ViewRequirement::UuidMatch { uuid } => *uuid,
-            })
-            .next();
-        let commit = crate::iceberg::ViewCommit::builder()
-            .ident(ident)
-            .requirements(requirements)
-            .updates(updates)
-            .build();
-        let Some(uuid) = uuid else {
-            return CatalogOutcome::uncommitted(
-                novarocks_spi::connector::ConnectorMutationFailureKind::Internal,
-                "REST view replacement does not freeze the view UUID",
-            );
-        };
+        let target = CatalogTableName::from_identifier(replace.ident());
         let outcome = self
             .endpoints
-            .replace_view(commit, &AttributionExpectation::replace_view(uuid))
+            .replace_view(
+                &replace,
+                &AttributionExpectation::replace_view(replace.uuid()),
+            )
             .await;
         view_outcome(outcome.evidence, target)
     }
@@ -2118,7 +2101,7 @@ mod evidence_tests {
         OperationToken, RequestShape,
     };
     use crate::iceberg::spec::{SnapshotReference, SnapshotRetention};
-    use crate::iceberg::{NamespaceIdent, TableIdent, TableRequirement, TableUpdate, ViewCommit};
+    use crate::iceberg::{NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
     use crate::rest_protocol::test_server::{Reply, Script, TestServer};
 
     const TABLE_UUID: u128 = 1;
@@ -2304,23 +2287,6 @@ mod evidence_tests {
             matches!(outcome, CatalogOutcome::CommitUnknown { .. }),
             "{outcome:?}"
         );
-
-        // A replacement without a frozen view UUID is never sent.
-        let server = scripted("POST", "/v1/namespaces/db/views/v", Reply::status(200));
-        let commit = ViewCommit::builder()
-            .ident(TableIdent::new(
-                NamespaceIdent::new("db".into()),
-                "v".into(),
-            ))
-            .requirements(vec![])
-            .updates(vec![])
-            .build();
-        let outcome = owner(&server).await.replace_view(commit).await;
-        let CatalogOutcome::KnownUncommitted { failure } = &outcome else {
-            panic!("expected a local refusal, got {outcome:?}");
-        };
-        assert_eq!(failure.kind(), Kind::Internal);
-        assert_eq!(server.count("POST", "/v1/namespaces/db/views/v"), 0);
     }
 
     fn staged_response() -> serde_json::Value {

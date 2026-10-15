@@ -179,36 +179,12 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
 
     async fn list_views_for_request(
         &self,
-        namespace: CatalogNamespaceName,
-        context: novarocks_spi::connector::ConnectorRequestContext,
-        bound: ConnectorListingBound,
+        _namespace: CatalogNamespaceName,
+        _context: novarocks_spi::connector::ConnectorRequestContext,
+        _bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        if let Some(observer) = self.delegate.listing.active_observer() {
-            use sha2::Digest;
-            let target = Some(sha2::Sha256::digest(namespace.namespace.as_bytes()).into());
-            return self
-                .delegate
-                .listing
-                .run_hms(
-                    &context,
-                    observer,
-                    super::hms_listing_observer::HmsListingOperation::Views,
-                    target,
-                    |invocation| async move {
-                        self.delegate
-                            .list_views_observed(&namespace, bound, &invocation)
-                            .await
-                    },
-                )
-                .await;
-        }
-        {
-            self.delegate
-                .listing
-                .run(&context, self.list_views(namespace, bound))
-                .await
-        }
+        // Not admitted as a listing: there is nothing to list.
+        Err(super::views_unsupported("list_views"))
     }
 
     async fn namespace_exists(
@@ -242,23 +218,23 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         })
     }
 
-    async fn view_exists(&self, view: CatalogTableName) -> Result<bool, ConnectorError> {
-        self.delegate.view_exists(&view).await
+    async fn view_exists(&self, _view: CatalogTableName) -> Result<bool, ConnectorError> {
+        Err(super::views_unsupported("view_exists"))
     }
 
     async fn list_views(
         &self,
-        namespace: CatalogNamespaceName,
-        bound: ConnectorListingBound,
+        _namespace: CatalogNamespaceName,
+        _bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.delegate.list_views(&namespace, bound).await
+        Err(super::views_unsupported("list_views"))
     }
 
     async fn load_view(
         &self,
-        view: CatalogTableName,
+        _view: CatalogTableName,
     ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
-        self.delegate.load_view(&view).await
+        Err(super::views_unsupported("load_view"))
     }
 
     async fn create_namespace(

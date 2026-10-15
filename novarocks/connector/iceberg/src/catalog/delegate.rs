@@ -23,18 +23,6 @@
 //! reads and single-frontier mutation mechanisms live here once; each owner
 //! selects which post-dispatch errors may prove a definite rejection.
 //!
-//! # Why views need no per-catalog code
-//!
-//! The vendored `Catalog` trait gives its view methods default bodies that
-//! return `ErrorKind::FeatureUnsupported`. The REST client overrides all of
-//! them; the Hive and Hadoop clients override none. Plain delegation therefore
-//! already produces a real answer on REST and a typed `Unsupported` elsewhere.
-//!
-//! The behavior this replaces did the opposite on purpose: it checked for a
-//! REST client and answered `false` / empty for the others, converting "this
-//! catalog cannot answer" into "this catalog says no". Removing that
-//! short-circuit *is* the fix — there is nothing to reimplement.
-
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
@@ -228,80 +216,6 @@ impl CatalogDelegate {
         let ident = table_ident(table)?;
         self.client
             .load_table(&ident)
-            .await
-            .map_err(|error| map_read_error(&error))
-    }
-
-    pub(super) async fn view_exists(
-        &self,
-        view: &CatalogTableName,
-    ) -> Result<bool, ConnectorError> {
-        let ident = table_ident(view)?;
-        self.client
-            .view_exists(&ident)
-            .await
-            .map_err(|error| map_read_error(&error))
-    }
-
-    /// The vendored clients expose view enumeration only as one complete
-    /// listing, so the bound is enforced on that listing as it is retained.
-    pub(super) async fn list_views(
-        &self,
-        namespace: &CatalogNamespaceName,
-        bound: ConnectorListingBound,
-    ) -> Result<Vec<String>, ConnectorError> {
-        self.list_views_inner(
-            namespace,
-            bound,
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            None,
-        )
-        .await
-    }
-
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub(super) async fn list_views_observed(
-        &self,
-        namespace: &CatalogNamespaceName,
-        bound: ConnectorListingBound,
-        invocation: &super::hms_listing_observer::Invocation,
-    ) -> Result<Vec<String>, ConnectorError> {
-        self.list_views_inner(namespace, bound, Some(invocation))
-            .await
-    }
-
-    async fn list_views_inner(
-        &self,
-        namespace: &CatalogNamespaceName,
-        bound: ConnectorListingBound,
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")] invocation: Option<
-            &super::hms_listing_observer::Invocation,
-        >,
-    ) -> Result<Vec<String>, ConnectorError> {
-        let ident = namespace_ident(namespace)?;
-        let mut collector = ConnectorListingCollector::new(bound)?;
-        let views = {
-            let sdk = self.client.list_views(&ident);
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            let result = super::hms_listing_observer::sdk_call(invocation, sdk).await;
-            #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
-            let result = sdk.await;
-            result
-        }
-        .map_err(|error| map_read_error(&error))?;
-        for view in views {
-            collector.push(view.name)?;
-        }
-        Ok(sorted_unique(collector.finish()?))
-    }
-
-    pub(super) async fn load_view(
-        &self,
-        view: &CatalogTableName,
-    ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
-        let ident = table_ident(view)?;
-        self.client
-            .load_view(&ident)
             .await
             .map_err(|error| map_read_error(&error))
     }

@@ -47,7 +47,7 @@ use crate::runtime::Runtime;
 use crate::spec::{
     EncryptedKey, FormatVersion, PartitionStatisticsFile, Schema, SchemaId, Snapshot,
     SnapshotReference, SortOrder, StatisticsFile, TableMetadata, TableMetadataBuilder,
-    UnboundPartitionSpec, ViewFormatVersion, ViewMetadata, ViewRepresentations, ViewVersion,
+    UnboundPartitionSpec, ViewFormatVersion, ViewRepresentations, ViewVersion,
 };
 use crate::table::Table;
 use crate::{Error, ErrorKind, Result};
@@ -122,59 +122,6 @@ pub trait Catalog: Debug + Sync + Send {
 
     /// Update a table to the catalog.
     async fn update_table(&self, commit: TableCommit) -> Result<Table>;
-
-    /// Create a new view inside the namespace. Only catalogs with view
-    /// support (e.g. REST) override the default.
-    async fn create_view(
-        &self,
-        _namespace: &NamespaceIdent,
-        _creation: ViewCreation,
-    ) -> Result<ViewMetadata> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "create_view is not supported by this catalog",
-        ))
-    }
-
-    /// Load a view's metadata from the catalog.
-    async fn load_view(&self, _view: &TableIdent) -> Result<ViewMetadata> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "load_view is not supported by this catalog",
-        ))
-    }
-
-    /// Commit updates to an existing view.
-    async fn update_view(&self, _commit: ViewCommit) -> Result<ViewMetadata> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "update_view is not supported by this catalog",
-        ))
-    }
-
-    /// Drop a view from the catalog.
-    async fn drop_view(&self, _view: &TableIdent) -> Result<()> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "drop_view is not supported by this catalog",
-        ))
-    }
-
-    /// Check if a view exists in the catalog.
-    async fn view_exists(&self, _view: &TableIdent) -> Result<bool> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "view_exists is not supported by this catalog",
-        ))
-    }
-
-    /// List views in the namespace.
-    async fn list_views(&self, _namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "list_views is not supported by this catalog",
-        ))
-    }
 }
 
 /// Common interface for all catalog builders.
@@ -574,14 +521,6 @@ pub enum TableUpdate {
     AddSchema {
         /// The schema to add.
         schema: Schema,
-        /// Iceberg REST `add-schema` MetadataUpdate carries the new
-        /// `last-column-id` so a server applying the update knows the
-        /// monotonically-increasing high-watermark even if the schema
-        /// itself dropped the previously-highest field. `None` omits the
-        /// field on the wire (used for create-table where the server
-        /// derives it from `schema.highest_field_id()`).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        last_column_id: Option<i32>,
     },
     /// Set table's current schema
     #[serde(rename_all = "kebab-case")]
@@ -1022,8 +961,7 @@ pub struct ViewCreation {
     /// The name of the view.
     pub name: String,
     /// The view's base location; used to create metadata file locations
-    #[builder(default)]
-    pub location: Option<String>,
+    pub location: String,
     /// Representations for the view.
     pub representations: ViewRepresentations,
     /// The schema of the view.
@@ -1099,45 +1037,6 @@ pub enum ViewUpdate {
         /// View version id to set as current, or -1 to set last added version
         view_version_id: i32,
     },
-}
-
-/// ViewRequirement represents a validation the catalog must perform before
-/// applying a view commit.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
-pub enum ViewRequirement {
-    /// The view UUID must match the requirement's `uuid`.
-    #[serde(rename = "assert-view-uuid")]
-    UuidMatch {
-        /// Uuid of the view to assert.
-        uuid: Uuid,
-    },
-}
-
-/// ViewCommit represents a commit of view updates to the catalog.
-#[derive(Debug, TypedBuilder)]
-#[builder(build_method(vis = "pub"))]
-pub struct ViewCommit {
-    ident: TableIdent,
-    requirements: Vec<ViewRequirement>,
-    updates: Vec<ViewUpdate>,
-}
-
-impl ViewCommit {
-    /// The identifier of the view to update.
-    pub fn identifier(&self) -> &TableIdent {
-        &self.ident
-    }
-
-    /// Take the requirements out of the commit.
-    pub fn take_requirements(&mut self) -> Vec<ViewRequirement> {
-        take(&mut self.requirements)
-    }
-
-    /// Take the updates out of the commit.
-    pub fn take_updates(&mut self) -> Vec<ViewUpdate> {
-        take(&mut self.updates)
-    }
 }
 
 mod _serde_set_statistics {
@@ -1678,7 +1577,6 @@ mod tests {
         "#,
             TableUpdate::AddSchema {
                 schema: test_schema.clone(),
-                last_column_id: Some(3),
             },
         );
 
@@ -1717,7 +1615,6 @@ mod tests {
         "#,
             TableUpdate::AddSchema {
                 schema: test_schema.clone(),
-                last_column_id: None,
             },
         );
     }
