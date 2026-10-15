@@ -28,8 +28,8 @@ use uuid::Uuid;
 use super::{
     ConnectorCommittedPartitioning, ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorNamespaceIdentity,
-    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorTableIdentity,
-    ProviderBindingEpoch,
+    ConnectorProcessLocalPayload, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorTableIdentity, ProviderBindingEpoch,
 };
 
 /// Largest provider-owned reconciliation payload accepted by the control plane.
@@ -740,7 +740,7 @@ impl fmt::Debug for ConnectorCatalogMutationReceipt {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct ExternalMutationEvidence {
     schema_version: u16,
     descriptor: ConnectorInstanceDescriptor,
@@ -748,7 +748,21 @@ pub struct ExternalMutationEvidence {
     operation_id: ConnectorMutationOperationId,
     operation_kind: Arc<str>,
     provider_payload: Bytes,
+    // An in-process owner is neither a wire fact nor an evidence identity.
+    process_local_payload: Option<ConnectorProcessLocalPayload>,
 }
+
+impl PartialEq for ExternalMutationEvidence {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.descriptor == other.descriptor
+            && self.incarnation == other.incarnation
+            && self.operation_id == other.operation_id
+            && self.operation_kind == other.operation_kind
+            && self.provider_payload == other.provider_payload
+    }
+}
+impl Eq for ExternalMutationEvidence {}
 
 impl ExternalMutationEvidence {
     pub fn try_new(
@@ -772,7 +786,40 @@ impl ExternalMutationEvidence {
             operation_id,
             operation_kind: operation_kind.into(),
             provider_payload,
+            process_local_payload: None,
         })
+    }
+
+    /// Retain a provider-owned in-process observation owner. Attachment must
+    /// match the complete generation; it never changes serializable evidence.
+    pub fn with_process_local_payload(
+        mut self,
+        payload: ConnectorProcessLocalPayload,
+    ) -> Result<Self, ConnectorError> {
+        payload.validate_owner(&ConnectorProviderBindingKey {
+            instance_id: self.descriptor.instance_id.clone(),
+            incarnation: self.incarnation,
+        })?;
+        if self.process_local_payload.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "external mutation evidence already retains a process-local owner",
+            ));
+        }
+        self.process_local_payload = Some(payload);
+        Ok(self)
+    }
+
+    pub fn process_local_payload(&self) -> Option<&ConnectorProcessLocalPayload> {
+        self.process_local_payload.as_ref()
+    }
+
+    /// A journal stores the identity facts without a back-reference to itself.
+    /// The returned value has identical digest, wire representation and equality.
+    pub fn without_process_local_payload(&self) -> Self {
+        let mut detached = self.clone();
+        detached.process_local_payload = None;
+        detached
     }
 
     pub const fn schema_version(&self) -> u16 {
@@ -1206,7 +1253,8 @@ mod tests {
     use crate::connector::{
         ConnectorCommittedPartitionField, ConnectorCommittedPartitioning, ConnectorErrorKind,
         ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorManagedPartitionTransform,
-        ConnectorProviderId, ConnectorTableIdentity, ProviderBindingEpoch,
+        ConnectorProcessLocalPayload, ConnectorProviderBindingKey, ConnectorProviderId,
+        ConnectorTableIdentity, ProviderBindingEpoch,
     };
 
     #[test]
@@ -1321,6 +1369,93 @@ mod tests {
         let decoded = ExternalMutationEvidence::try_from_wire_v1(&wire).expect("decode evidence");
         assert_eq!(decoded, evidence);
         assert_eq!(decoded.digest(), evidence.digest());
+    }
+
+    #[test]
+    fn external_mutation_evidence_local_owner_preserves_wire_identity_and_exact_lifetime() {
+        let bare = evidence();
+        let wire = bare.try_to_wire_v1().unwrap();
+        let owner = ConnectorProviderBindingKey {
+            instance_id: bare.descriptor().instance_id.clone(),
+            incarnation: bare.incarnation(),
+        };
+        let content = Arc::new(String::from("provider-private-owner"));
+        let weak = Arc::downgrade(&content);
+        let attached = bare
+            .clone()
+            .with_process_local_payload(ConnectorProcessLocalPayload::new(owner, content.clone()))
+            .unwrap();
+        drop(content);
+        assert_eq!(attached, bare);
+        assert_eq!(attached.digest(), bare.digest());
+        assert_eq!(attached.try_to_wire_v1().unwrap(), wire);
+        let clone = attached.clone();
+        let decoded = ExternalMutationEvidence::try_from_wire_v1(&wire).unwrap();
+        let detached = attached.without_process_local_payload();
+        assert_eq!(decoded, attached);
+        assert!(decoded.process_local_payload().is_none());
+        assert!(detached.process_local_payload().is_none());
+        assert_eq!(
+            clone
+                .process_local_payload()
+                .unwrap()
+                .value::<String>("analytics")
+                .unwrap()
+                .as_str(),
+            "provider-private-owner"
+        );
+        assert!(!format!("{attached:?}").contains("provider-private-owner"));
+        drop(attached);
+        assert!(weak.upgrade().is_some());
+        drop(clone);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn external_mutation_evidence_rejects_foreign_or_replaced_local_owner() {
+        let evidence = evidence();
+        let exact = ConnectorProviderBindingKey {
+            instance_id: evidence.descriptor().instance_id.clone(),
+            incarnation: evidence.incarnation(),
+        };
+        for owner in [
+            ConnectorProviderBindingKey {
+                incarnation: ProviderBindingEpoch::new(),
+                ..exact.clone()
+            },
+            ConnectorProviderBindingKey {
+                instance_id: ConnectorInstanceId::parse("other").unwrap(),
+                ..exact.clone()
+            },
+        ] {
+            assert_eq!(
+                evidence
+                    .clone()
+                    .with_process_local_payload(ConnectorProcessLocalPayload::new(
+                        owner,
+                        Arc::new(1_u8)
+                    ))
+                    .unwrap_err()
+                    .kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
+        }
+        let attached = evidence
+            .with_process_local_payload(ConnectorProcessLocalPayload::new(
+                exact.clone(),
+                Arc::new(1_u8),
+            ))
+            .unwrap();
+        assert_eq!(
+            attached
+                .with_process_local_payload(ConnectorProcessLocalPayload::new(
+                    exact,
+                    Arc::new(2_u8)
+                ))
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
     }
 
     #[test]
