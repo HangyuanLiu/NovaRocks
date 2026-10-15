@@ -446,3 +446,6 @@ fn ordered_filter_creator_zero_delta_keeps_a_real_cold_extent_for_a_declared_pro
     drop(output);
     assert_eq!(tracker.current(), 0);
 }
+
+#[path = "ordered_filter_refusal_tests.rs"]
+mod resource_refusal_tests;

@@ -60,7 +60,9 @@ use crate::exec::operators::compiled_sort::CompiledSortProcessorFactory;
 use crate::exec::operators::compiled_table_function::CompiledTableFunctionProcessorFactory;
 use crate::exec::operators::compiled_unpivot::CompiledUnpivotProcessorFactory;
 use crate::exec::operators::compiled_window::CompiledWindowProcessorFactory;
-use crate::exec::operators::runtime_filter::CompiledRuntimeFilterConsumers;
+use crate::exec::operators::runtime_filter::{
+    CompiledOrderedScanFactory, CompiledRuntimeFilterConsumers,
+};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime_filter::OrderedTopNAllocationHost;
@@ -355,13 +357,44 @@ fn compiled_runtime_filter_consumers(
     ctx: &PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
 ) -> Result<Option<Arc<CompiledRuntimeFilterConsumers>>, String> {
+    compiled_runtime_filter_consumers_selected(
+        owner,
+        display_owner,
+        program,
+        id,
+        bindings,
+        ctx,
+        error,
+        false,
+    )
+}
+
+/// The ordered Scan keeps full-list root ordinals while sharing the original
+/// blocking membership gate and contract author.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This is the original builder context plus the explicit Scan selection policy"
+)]
+fn compiled_runtime_filter_consumers_selected(
+    owner: &'static str,
+    display_owner: &'static str,
+    program: &Arc<LocalProgram>,
+    id: ProgramNodeId,
+    bindings: &[FilterConsumerAtExpr],
+    ctx: &PipelineBuildContext,
+    error: &Arc<RuntimeErrorState>,
+    omit_ordered: bool,
+) -> Result<Option<Arc<CompiledRuntimeFilterConsumers>>, String> {
     if bindings.is_empty() {
         return Ok(None);
     }
     let mut contracts = Vec::with_capacity(bindings.len());
-    for binding in bindings {
+    for (ordinal, binding) in bindings.iter().enumerate() {
         let consumer = &binding.consumer;
         if matches!(consumer.contract(), StaticFilterContract::Ordered { .. }) {
+            if omit_ordered {
+                continue;
+            }
             return Err(format!(
                 "compiled {display_owner} at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
                 id.index(),
@@ -376,9 +409,16 @@ fn compiled_runtime_filter_consumers(
             ));
         }
         runtime_filter_session(&ctx.runtime_filter_execution, consumer.binding_id())?;
-        contracts.push(runtime_filter_consumer_contract(consumer)?);
+        contracts.push((
+            u32::try_from(ordinal)
+                .map_err(|_| "compiled runtime-filter binding count exceeds u32")?,
+            runtime_filter_consumer_contract(consumer)?,
+        ));
     }
-    CompiledRuntimeFilterConsumers::try_new(
+    if contracts.is_empty() {
+        return Ok(None);
+    }
+    CompiledRuntimeFilterConsumers::try_new_at_ordinals(
         owner,
         Arc::clone(program),
         id,
@@ -607,17 +647,36 @@ fn build_node(
                     id.index()
                 ).into());
             }
+            let ordered_binding = runtime_filters.iter().find(|binding| matches!(binding.consumer.contract(), StaticFilterContract::Ordered { .. }));
+            let ordered_factory = if let Some(binding) = ordered_binding {
+                if !matches!(binding.consumer.contract(), StaticFilterContract::Ordered { keys, .. }
+                    if matches!(keys.as_slice(), [key] if key.value_type.data_type() == &arrow::datatypes::DataType::Utf8
+                        && novarocks_local_program::is_ordered_filter_flat_payload_type(&key.value_type))) {
+                    return Err(format!(
+                        "compiled scan at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
+                        id.index(), binding.consumer.binding_id(),
+                    ).into());
+                }
+                let Some(context) = ordered else {
+                    // The original text-only test bridge installs no new
+                    // ordered resources. Production freezes its real context
+                    // before entering this typed builder.
+                    return Err(format!(
+                        "compiled scan at local node {} runtime-filter binding_id={} with an ordered-domain contract is not executable yet",
+                        id.index(), binding.consumer.binding_id(),
+                    ).into());
+                };
+                Some(CompiledOrderedScanFactory::try_new(
+                    Arc::clone(program), id,
+                    Arc::clone(runtime_filter_session(&ctx.runtime_filter_execution, binding.consumer.binding_id())?),
+                    &context.host, &context.control,
+                )?)
+            } else { None };
             // Consumers are built first, so a refused binding builds no driver.
-            let runtime_filters = compiled_runtime_filter_consumers(
-                "Scan",
-                "scan",
-                program,
-                id,
-                runtime_filters,
-                ctx,
-                error,
+            let runtime_filters = compiled_runtime_filter_consumers_selected(
+                "Scan", "scan", program, id, runtime_filters, ctx, error, ordered_factory.is_some(),
             )?;
-            if limit.is_some() {
+            if limit.is_some() && ordered_factory.is_none() {
                 return Err(format!(
                     "compiled scan at local node {} with a scan limit is not executable yet",
                     id.index()
@@ -629,7 +688,7 @@ fn build_node(
             })?;
             // The residual is the scan's own TruthOnly root over its output;
             // it is built first so a refused root binds no driver.
-            let residual = (!residuals.is_empty())
+            let mut residual = (!residuals.is_empty())
                 .then(|| {
                     CompiledFilterProcessorFactory::try_new(
                         Arc::clone(program),
@@ -645,11 +704,15 @@ fn build_node(
             // downstream DOP without duplicating the Task's reader capability.
             // Its runtime filters gate the first read and filter every chunk
             // before the handoff.
-            let source: Box<dyn OperatorFactory> = Box::new(StreamScanSourceFactory::new_compiled(
-                node_id,
-                op,
-                runtime_filters,
-            ));
+            let source: Box<dyn OperatorFactory> = if let Some(factory) = ordered_factory {
+                let context = ordered.expect("validated original ordered Task context");
+                Box::new(StreamScanSourceFactory::new_compiled_ordered(
+                    node_id, op, runtime_filters, factory, residual.take(), *limit,
+                    context.host.clone(), context.control.clone(),
+                ))
+            } else {
+                Box::new(StreamScanSourceFactory::new_compiled(node_id, op, runtime_filters))
+            };
             let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
             let mut build = PipelineBuildResult {
                 pipeline,

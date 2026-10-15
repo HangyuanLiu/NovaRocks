@@ -19,6 +19,10 @@
 //! its conjuncts, then its runtime filters, then its LIMIT, in that order.
 
 use std::sync::Arc;
+#[path = "compiled_ordered_output.rs"]
+mod compiled_ordered_output;
+use compiled_ordered_output::CompiledOrderedOutputDriver;
+pub(super) use compiled_ordered_output::CompiledOrderedOutputFactory;
 
 use arrow::array::BooleanArray;
 use arrow::compute::filter_record_batch;
@@ -48,6 +52,7 @@ const ROWS_READ: &str = "RowsRead";
 /// one and hands each driver its own [`ScanDriverFilter`].
 #[derive(Clone)]
 pub(super) struct ScanOutputFilter {
+    compiled_ordered: Option<CompiledOrderedOutputFactory>,
     conjunct: Option<ScanConjunct>,
     ordered_live: Option<NativeOrderedLiveConsumerSet>,
     blocking: Option<ScanBlockingConsumers>,
@@ -69,6 +74,7 @@ enum ScanBlockingConsumers {
 pub(super) struct ScanDriverFilter {
     filter: ScanOutputFilter,
     compiled_keys: Option<CompiledRuntimeFilterKeys>,
+    compiled_ordered: Option<CompiledOrderedOutputDriver>,
 }
 
 /// A legacy scan conjunct and the arena it is evaluated against.
@@ -92,6 +98,7 @@ impl ScanOutputFilter {
             arena,
         });
         Self {
+            compiled_ordered: None,
             conjunct,
             ordered_live,
             blocking: blocking.map(ScanBlockingConsumers::Arena),
@@ -103,22 +110,43 @@ impl ScanOutputFilter {
     /// chunk is handed downstream as read.
     pub(super) fn compiled(consumers: Option<Arc<CompiledRuntimeFilterConsumers>>) -> Self {
         Self {
+            compiled_ordered: None,
             conjunct: None,
             ordered_live: None,
             blocking: consumers.map(ScanBlockingConsumers::Compiled),
         }
     }
 
+    pub(super) fn compiled_ordered(
+        consumers: Option<Arc<CompiledRuntimeFilterConsumers>>,
+        ordered: CompiledOrderedOutputFactory,
+    ) -> Self {
+        let mut filter = Self::compiled(consumers);
+        filter.compiled_ordered = Some(ordered);
+        filter
+    }
+
     /// The filter one driver applies: the consumer states stay shared with
     /// every other driver, while compiled key instances are the driver's own.
     pub(super) fn for_driver(&self) -> ScanDriverFilter {
         let compiled_keys = match &self.blocking {
-            Some(ScanBlockingConsumers::Compiled(consumers)) => Some(consumers.driver_keys()),
+            Some(ScanBlockingConsumers::Compiled(consumers)) => {
+                Some(match &self.compiled_ordered {
+                    Some(ordered) => {
+                        consumers.driver_keys_controlled(ordered.host.scalar_allocator())
+                    }
+                    None => consumers.driver_keys(),
+                })
+            }
             Some(ScanBlockingConsumers::Arena(_)) | None => None,
         };
         ScanDriverFilter {
             filter: self.clone(),
             compiled_keys,
+            compiled_ordered: self
+                .compiled_ordered
+                .as_ref()
+                .map(|factory| factory.for_driver()),
         }
     }
 
@@ -135,10 +163,14 @@ impl ScanDriverFilter {
     pub(super) fn bind_runtime_state(
         &mut self,
         state: &crate::runtime::runtime_state::RuntimeState,
-    ) {
+    ) -> ExecutionResult<()> {
         if let Some(keys) = &mut self.compiled_keys {
             keys.bind_runtime_state(state);
         }
+        if let Some(ordered) = &mut self.compiled_ordered {
+            ordered.bind(state)?;
+        }
+        Ok(())
     }
 
     pub(super) fn bind_mem_tracker(
@@ -146,7 +178,32 @@ impl ScanDriverFilter {
         tracker: std::sync::Arc<crate::runtime::mem_tracker::MemTracker>,
     ) {
         if let Some(keys) = &mut self.compiled_keys {
-            keys.bind_mem_tracker(tracker);
+            keys.bind_mem_tracker(Arc::clone(&tracker));
+        }
+        if let Some(ordered) = &mut self.compiled_ordered {
+            ordered.bind_mem_tracker(tracker);
+        }
+    }
+    pub(super) fn bind_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        if let Some(keys) = &mut self.compiled_keys {
+            keys.bind_construction_factory(Arc::clone(&factory));
+        }
+        if let Some(ordered) = &mut self.compiled_ordered {
+            ordered.bind_construction_factory(factory);
+        }
+    }
+    pub(super) fn restrict_limit(
+        &mut self,
+        chunk: Chunk,
+        limit: Option<usize>,
+        rows_before: usize,
+    ) -> ExecutionResult<Option<Chunk>> {
+        match &mut self.compiled_ordered {
+            Some(ordered) => ordered.restrict_limit(chunk, limit, rows_before),
+            None => Ok(Some(chunk)),
         }
     }
     pub(super) fn ordered_live(&self) -> Option<&NativeOrderedLiveConsumerSet> {
@@ -176,6 +233,12 @@ impl ScanDriverFilter {
     ) -> ExecutionResult<Option<Chunk>> {
         let filter = &self.filter;
         let Some(chunk) = filter.apply_conjunct_predicate(chunk, profiles)? else {
+            return Ok(None);
+        };
+        let Some(chunk) = (match self.compiled_ordered.as_mut() {
+            Some(ordered) => ordered.apply(chunk, profiles, event_sink)?,
+            None => Some(chunk),
+        }) else {
             return Ok(None);
         };
         let Some(chunk) = (match filter.ordered_live.as_ref() {

@@ -37,7 +37,8 @@ use crate::runtime_filter::artifact::{
     ResidentMembershipIndex,
 };
 use crate::runtime_filter::codec::leaf::{
-    ArtifactCodecError, MembershipProbe, indexed_membership_contains,
+    ArtifactCodecError, ControlledMembershipProbeError, MembershipProbe,
+    indexed_membership_contains, indexed_membership_contains_controlled,
     indexed_membership_range_may_match,
 };
 
@@ -55,7 +56,7 @@ pub enum BackendRuntimeFilterArtifactQuery {
     },
 }
 
-enum OrderedQueryMode<'a> {
+enum ScalarQueryMode<'a> {
     Legacy,
     Controlled(&'a dyn KernelEvaluationControl),
 }
@@ -142,6 +143,36 @@ impl BackendRuntimeFilterArtifactQuery {
         })
     }
 
+    fn membership_matches_scalar(
+        artifact: &PhysicalArtifact,
+        data_type: &DataType,
+        value: RuntimeFilterScalarRef<'_>,
+        mode: ScalarQueryMode<'_>,
+    ) -> Result<bool, RuntimeFilterControlledQueryError> {
+        let index = artifact
+            .membership_index()
+            .ok_or(RuntimeFilterArtifactQueryError::ContractViolation)?;
+        let probe = membership_probe(value, data_type)?;
+        match mode {
+            ScalarQueryMode::Legacy => {
+                indexed_membership_contains(artifact.canonical_bytes(), index, probe)
+                    .map_err(|cause| map_query_error(cause).into())
+            }
+            ScalarQueryMode::Controlled(control) => indexed_membership_contains_controlled(
+                artifact.canonical_bytes(),
+                index,
+                probe,
+                control,
+            )
+            .map_err(|cause| match cause {
+                ControlledMembershipProbeError::Codec(cause) => map_query_error(cause).into(),
+                ControlledMembershipProbeError::Kernel(cause) => {
+                    RuntimeFilterControlledQueryError::Kernel(cause)
+                }
+            }),
+        }
+    }
+
     fn ordered_range(&self) -> Result<&RangeResidentData, RuntimeFilterArtifactQueryError> {
         let Self::Ordered { artifact, .. } = self else {
             return Err(RuntimeFilterArtifactQueryError::ContractViolation);
@@ -167,20 +198,20 @@ impl BackendRuntimeFilterArtifactQuery {
     fn ordered_matches_scalar(
         &self,
         value: Option<OrderedScalarRef<'_>>,
-        mode: OrderedQueryMode<'_>,
+        mode: ScalarQueryMode<'_>,
     ) -> Result<bool, RuntimeFilterControlledQueryError> {
         let range = self.ordered_range()?;
         let value = OrderedTupleRef::Single(value);
         let bound = OrderedTupleRef::Owned(&range.bound);
         let ordering = match mode {
-            OrderedQueryMode::Legacy => {
+            ScalarQueryMode::Legacy => {
                 range.contract.compare_borrowed(value, bound).map_err(|_| {
                     RuntimeFilterControlledQueryError::Artifact(
                         RuntimeFilterArtifactQueryError::ContractViolation,
                     )
                 })?
             }
-            OrderedQueryMode::Controlled(control) => range
+            ScalarQueryMode::Controlled(control) => range
                 .contract
                 .compare_borrowed_controlled(value, bound, control)
                 .map_err(|error| match error {
@@ -207,7 +238,8 @@ impl RuntimeFilterArtifactQuery for BackendRuntimeFilterArtifactQuery {
 
     fn controlled_scalar_query(&self) -> Option<&dyn RuntimeFilterControlledScalarQuery> {
         match self {
-            Self::Ordered {
+            Self::Membership { .. }
+            | Self::Ordered {
                 data_type: DataType::Utf8,
                 ..
             } => Some(self),
@@ -221,10 +253,9 @@ impl RuntimeFilterArtifactQuery for BackendRuntimeFilterArtifactQuery {
                 artifact,
                 null_semantics,
                 ..
-            } => Ok(*null_semantics == RuntimeFilterNullSemantics::NullSafeEqual
-                && artifact.contains_null()),
+            } => Ok(membership_matches_null(artifact, *null_semantics)),
             Self::Ordered { .. } => self
-                .ordered_matches_scalar(None, OrderedQueryMode::Legacy)
+                .ordered_matches_scalar(None, ScalarQueryMode::Legacy)
                 .map_err(legacy_query_error),
         }
     }
@@ -248,18 +279,14 @@ impl RuntimeFilterArtifactQuery for BackendRuntimeFilterArtifactQuery {
                 artifact,
                 data_type,
                 ..
-            } => indexed_membership_contains(
-                artifact.canonical_bytes(),
-                artifact
-                    .membership_index()
-                    .ok_or(RuntimeFilterArtifactQueryError::ContractViolation)?,
-                membership_probe(value, data_type)?,
-            )
-            .map_err(map_query_error),
+            } => {
+                Self::membership_matches_scalar(artifact, data_type, value, ScalarQueryMode::Legacy)
+                    .map_err(legacy_query_error)
+            }
             Self::Ordered { data_type, .. } => {
                 self.ordered_range()?;
                 let scalar = ordered_scalar_ref(value, data_type)?;
-                self.ordered_matches_scalar(Some(scalar), OrderedQueryMode::Legacy)
+                self.ordered_matches_scalar(Some(scalar), ScalarQueryMode::Legacy)
                     .map_err(legacy_query_error)
             }
         }
@@ -308,16 +335,18 @@ impl RuntimeFilterControlledScalarQuery for BackendRuntimeFilterArtifactQuery {
         control: &dyn KernelEvaluationControl,
     ) -> Result<bool, RuntimeFilterControlledQueryError> {
         control.checkpoint(0)?;
-        if !matches!(
-            self,
+        match self {
+            Self::Membership {
+                artifact,
+                null_semantics,
+                ..
+            } => Ok(membership_matches_null(artifact, *null_semantics)),
             Self::Ordered {
                 data_type: DataType::Utf8,
                 ..
-            }
-        ) {
-            return Err(RuntimeFilterArtifactQueryError::Unsupported.into());
+            } => self.ordered_matches_scalar(None, ScalarQueryMode::Controlled(control)),
+            _ => Err(RuntimeFilterArtifactQueryError::Unsupported.into()),
         }
-        self.ordered_matches_scalar(None, OrderedQueryMode::Controlled(control))
     }
 
     fn non_null_value_may_match_controlled(
@@ -326,17 +355,35 @@ impl RuntimeFilterControlledScalarQuery for BackendRuntimeFilterArtifactQuery {
         control: &dyn KernelEvaluationControl,
     ) -> Result<bool, RuntimeFilterControlledQueryError> {
         control.checkpoint(0)?;
-        let Self::Ordered {
-            data_type: DataType::Utf8,
-            ..
-        } = self
-        else {
-            return Err(RuntimeFilterArtifactQueryError::Unsupported.into());
-        };
-        self.ordered_range()?;
-        let scalar = ordered_scalar_ref(value, &DataType::Utf8)?;
-        self.ordered_matches_scalar(Some(scalar), OrderedQueryMode::Controlled(control))
+        match self {
+            Self::Membership {
+                artifact,
+                data_type,
+                ..
+            } => Self::membership_matches_scalar(
+                artifact,
+                data_type,
+                value,
+                ScalarQueryMode::Controlled(control),
+            ),
+            Self::Ordered {
+                data_type: DataType::Utf8,
+                ..
+            } => {
+                self.ordered_range()?;
+                let scalar = ordered_scalar_ref(value, &DataType::Utf8)?;
+                self.ordered_matches_scalar(Some(scalar), ScalarQueryMode::Controlled(control))
+            }
+            _ => Err(RuntimeFilterArtifactQueryError::Unsupported.into()),
+        }
     }
+}
+
+fn membership_matches_null(
+    artifact: &PhysicalArtifact,
+    null_semantics: RuntimeFilterNullSemantics,
+) -> bool {
+    null_semantics == RuntimeFilterNullSemantics::NullSafeEqual && artifact.contains_null()
 }
 
 fn map_query_error(error: ArtifactCodecError) -> RuntimeFilterArtifactQueryError {
@@ -804,3 +851,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "controlled_membership_tests.rs"]
+mod controlled_membership_tests;

@@ -122,6 +122,18 @@ pub(super) fn physical_filter(
 }
 
 fn ordered_fixture() -> Fixture {
+    ordered_fixture_with_residual(None)
+}
+fn ordered_fixture_with_residual(residual: Option<ScanResidualAuthor>) -> Fixture {
+    ordered_fixture_with_parameters(
+        residual,
+        novarocks_type_contract::SemanticParameters::try_new([]).unwrap(),
+    )
+}
+fn ordered_fixture_with_parameters(
+    residual: Option<ScanResidualAuthor>,
+    parameters: novarocks_type_contract::SemanticParameters,
+) -> Fixture {
     let key =
         |value: Option<&str>| value.map_or(LiteralValue::Null, |v| LiteralValue::Utf8(v.into()));
     let rows = [
@@ -137,7 +149,7 @@ fn ordered_fixture() -> Fixture {
     .into_iter()
     .map(|(k, v)| vec![key(k), LiteralValue::Int64(v)])
     .collect::<Vec<_>>();
-    fixture_with_source(
+    fixture_with_source_parameters(
         &[FunctionValueType::new(DataType::Utf8, true)],
         &rows,
         &[(0, true, true)],
@@ -145,6 +157,8 @@ fn ordered_fixture() -> Fixture {
         false,
         false,
         true,
+        residual,
+        parameters,
     )
 }
 

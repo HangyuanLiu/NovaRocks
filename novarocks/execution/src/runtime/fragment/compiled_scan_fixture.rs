@@ -255,6 +255,16 @@ pub(crate) fn add_typed_scan(
     types: &[ValueType],
     dynamic_filters: Vec<StaticScanDynamicFilter>,
 ) -> (Vec<ValueId>, FrozenConnectorRead) {
+    add_typed_scan_with_residual(builder, node, types, dynamic_filters, |_, _| Box::default())
+}
+
+pub(crate) fn add_typed_scan_with_residual(
+    builder: &mut FragmentBuilder,
+    node: NodeId,
+    types: &[ValueType],
+    dynamic_filters: Vec<StaticScanDynamicFilter>,
+    residual: impl FnOnce(&mut FragmentBuilder, &[ValueId]) -> Box<[ExprId]>,
+) -> (Vec<ValueId>, FrozenConnectorRead) {
     // This scripted source declares one physical stream, as the original
     // ordered Scan compiler fixture does. Partial driver DOP stays explicit.
     let frozen = typed_frozen_read_with_distribution(types, dynamic_filters, true);
@@ -280,6 +290,7 @@ pub(crate) fn add_typed_scan(
                 .unwrap()
         })
         .collect::<Vec<_>>();
+    let residuals = residual(builder, &values);
     let properties = PhysicalProperties {
         distribution: Distribution::Singleton,
         row_multiplicity: RowMultiplicity::SingleCopy,
@@ -315,7 +326,7 @@ pub(crate) fn add_typed_scan(
                     max_batch_bytes: 4096,
                 },
                 provider_outputs: columns.into_iter().zip(values.iter().copied()).collect(),
-                residuals: Box::default(),
+                residuals,
                 derived_values: Box::default(),
             },
             values.clone().into_boxed_slice(),
@@ -535,7 +546,7 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
 }
 
 /// One complete eager use tree per physical root site in one root domain.
-fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
+pub(crate) fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
     struct Author<'a> {
         fragment: &'a Fragment,
         next: u32,
@@ -547,8 +558,10 @@ fn root_uses(fragment: &Fragment) -> PhysicalRootUses {
             self.next += 1;
             let args = match &self.fragment.expressions().get(expr).unwrap().kind {
                 ExprKind::Binary { left, right, .. } => vec![*left, *right],
-                ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
-                _ => panic!("the scan fixture has only comparisons, values and literals"),
+                ExprKind::Literal(_) | ExprKind::Constant(_) | ExprKind::Value(_) => vec![],
+                _ => panic!(
+                    "the scan fixture has only binary expressions, values, literals and constants"
+                ),
             };
             let arguments = args
                 .iter()

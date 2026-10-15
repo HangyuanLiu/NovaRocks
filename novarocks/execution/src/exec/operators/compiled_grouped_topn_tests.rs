@@ -157,6 +157,56 @@ fn fixture_with_source(
     independent_n_limits: bool,
     ordered_scan: bool,
 ) -> Fixture {
+    fixture_with_source_residual(
+        key_types,
+        rows,
+        ranking,
+        limit,
+        n_lists,
+        independent_n_limits,
+        ordered_scan,
+        None,
+    )
+}
+
+type ScanResidualAuthor = fn(
+    &mut FragmentBuilder,
+    NodeId,
+    &[novarocks_physical_plan::ValueId],
+) -> Box<[novarocks_physical_plan::ExprId]>;
+fn fixture_with_source_residual(
+    key_types: &[FunctionValueType],
+    rows: &[Vec<LiteralValue>],
+    ranking: &[(usize, bool, bool)],
+    limit: usize,
+    n_lists: bool,
+    independent_n_limits: bool,
+    ordered_scan: bool,
+    residual: Option<ScanResidualAuthor>,
+) -> Fixture {
+    fixture_with_source_parameters(
+        key_types,
+        rows,
+        ranking,
+        limit,
+        n_lists,
+        independent_n_limits,
+        ordered_scan,
+        residual,
+        novarocks_type_contract::SemanticParameters::try_new([]).unwrap(),
+    )
+}
+fn fixture_with_source_parameters(
+    key_types: &[FunctionValueType],
+    rows: &[Vec<LiteralValue>],
+    ranking: &[(usize, bool, bool)],
+    limit: usize,
+    n_lists: bool,
+    independent_n_limits: bool,
+    ordered_scan: bool,
+    residual: Option<ScanResidualAuthor>,
+    parameters: novarocks_type_contract::SemanticParameters,
+) -> Fixture {
     assert!(!independent_n_limits || n_lists);
     let groups = key_types.len();
     assert_eq!(ranking.len(), groups);
@@ -201,15 +251,19 @@ fn fixture_with_source(
     let (columns, constants, reads) = if ordered_scan {
         assert!(!n_lists && !independent_n_limits);
         assert_eq!(key_types, &[FunctionValueType::new(DataType::Utf8, true)]);
-        let (columns, read) = crate::runtime::fragment::scan::compiled_fixture::add_typed_scan(
-            &mut builder,
-            source,
-            &types,
-            vec![novarocks_connector_contract::StaticScanDynamicFilter::new(
-                ordered_tests::FILTER.get(),
-                Arc::from("v0"),
-            )],
-        );
+        let (columns, read) =
+            crate::runtime::fragment::scan::compiled_fixture::add_typed_scan_with_residual(
+                &mut builder,
+                source,
+                &types,
+                vec![novarocks_connector_contract::StaticScanDynamicFilter::new(
+                    ordered_tests::FILTER.get(),
+                    Arc::from("v0"),
+                )],
+                |builder, values| {
+                    residual.map_or_else(Box::default, |author| author(builder, source, values))
+                },
+            );
         (
             columns,
             ConstantPools::empty(),
@@ -416,8 +470,9 @@ fn fixture_with_source(
             ty: definition.values()[value].ty.clone(),
         })
         .collect();
-    let mut plan =
-        PlanBuilder::new(PlanVersionId::try_new([121; 16]).unwrap()).with_constant_pools(constants);
+    let mut plan = PlanBuilder::new(PlanVersionId::try_new([121; 16]).unwrap())
+        .with_constant_pools(constants)
+        .with_semantic_parameters(parameters);
     plan.add_fragment(definition).unwrap();
     plan.set_result_port(ResultPort {
         scalar_schema: None,

@@ -734,6 +734,7 @@ impl ProcessorOperator for CompiledProjectProcessor {
 /// Filter by the original ordered Filter or Scan TruthOnly predicate roots.
 /// Both preserve the exact
 /// input port and keep only rows whose complete predicate is TRUE.
+#[derive(Clone)]
 pub struct CompiledFilterProcessorFactory {
     name: String,
     program: Arc<LocalProgram>,

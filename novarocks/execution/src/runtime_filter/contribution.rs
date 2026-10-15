@@ -2194,6 +2194,32 @@ fn visit_scalar_ref(
     }
     Ok(())
 }
+/// Compare borrowed bytes in bounded public work windows. This is the same
+/// byte-order leaf used by ordered UTF8 and resident membership probes; it
+/// neither validates UTF8 nor supplies a frozen comparison contract.
+pub fn compare_bytes_controlled(
+    a: &[u8],
+    b: &[u8],
+    control: &dyn novarocks_functions::KernelEvaluationControl,
+) -> Result<Ordering, novarocks_functions::KernelFailure> {
+    let mut ordering = Ordering::Equal;
+    let quantum = novarocks_functions::MAX_UNOBSERVED_KERNEL_WORK as usize;
+    for (a, b) in a.chunks(quantum).zip(b.chunks(quantum)) {
+        ordering = a.cmp(b);
+        // Each public byte comparison has bounded input. Report its
+        // actual work before exposing even an early unequal result.
+        control.checkpoint(a.len().max(b.len()) as u32)?;
+        if ordering != Ordering::Equal {
+            break;
+        }
+    }
+    Ok(if ordering == Ordering::Equal {
+        a.len().cmp(&b.len())
+    } else {
+        ordering
+    })
+}
+
 fn compare_scalar_ref(
     left: OrderedScalarRef<'_>,
     right: OrderedScalarRef<'_>,
@@ -2209,26 +2235,7 @@ fn compare_scalar_ref(
         (OrderedScalarRef::LargeInt(a), OrderedScalarRef::LargeInt(b)) => a.cmp(&b),
         (OrderedScalarRef::Utf8(a), OrderedScalarRef::Utf8(b)) => {
             work.flush()?;
-            let mut ordering = Ordering::Equal;
-            let quantum = novarocks_functions::MAX_UNOBSERVED_KERNEL_WORK as usize;
-            for (a, b) in a
-                .as_bytes()
-                .chunks(quantum)
-                .zip(b.as_bytes().chunks(quantum))
-            {
-                ordering = a.cmp(b);
-                // Each public byte comparison has bounded input. Report its
-                // actual work before exposing even an early unequal result.
-                control.checkpoint(a.len().max(b.len()) as u32)?;
-                if ordering != Ordering::Equal {
-                    break;
-                }
-            }
-            if ordering == Ordering::Equal {
-                a.len().cmp(&b.len())
-            } else {
-                ordering
-            }
+            compare_bytes_controlled(a.as_bytes(), b.as_bytes(), control)?
         }
         (OrderedScalarRef::Date32(a), OrderedScalarRef::Date32(b)) => a.cmp(&b),
         (OrderedScalarRef::Timestamp(a), OrderedScalarRef::Timestamp(b)) => a.cmp(&b),

@@ -27,7 +27,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use novarocks_execution::runtime_filter::{
-    LogicalVersion, RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics,
+    KernelEvaluationControl, KernelFailure, LogicalVersion, RuntimeFilterMembershipSchema,
+    RuntimeFilterNullSemantics,
     contribution::{self, ValueDomainDelta},
 };
 
@@ -589,22 +590,104 @@ pub enum MembershipProbe<'a> {
     Decimal128(i128),
 }
 
+/// The original codec refusal and interruption remain distinct at the
+/// resident probe boundary. Neither branch carries a row outcome or effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControlledMembershipProbeError {
+    Codec(ArtifactCodecError),
+    Kernel(KernelFailure),
+}
+impl From<ArtifactCodecError> for ControlledMembershipProbeError {
+    fn from(error: ArtifactCodecError) -> Self {
+        Self::Codec(error)
+    }
+}
+impl From<KernelFailure> for ControlledMembershipProbeError {
+    fn from(error: KernelFailure) -> Self {
+        Self::Kernel(error)
+    }
+}
+
+enum MembershipQueryMode<'a> {
+    Legacy,
+    Controlled(&'a dyn KernelEvaluationControl),
+}
+impl MembershipQueryMode<'_> {
+    fn checkpoint(&self, units: u32) -> Result<(), ControlledMembershipProbeError> {
+        if let Self::Controlled(control) = self {
+            control.checkpoint(units)?;
+        }
+        Ok(())
+    }
+    fn compare_utf8(
+        &self,
+        encoded: &[u8],
+        offset: usize,
+        needle: &str,
+    ) -> Result<Ordering, ControlledMembershipProbeError> {
+        match self {
+            Self::Legacy => Ok(read_indexed_utf8(encoded, offset)?.cmp(needle)),
+            Self::Controlled(control) => {
+                let bytes = read_indexed_utf8_bytes(encoded, offset)?;
+                validate_utf8_controlled(bytes, *control)?;
+                Ok(contribution::compare_bytes_controlled(
+                    bytes,
+                    needle.as_bytes(),
+                    *control,
+                )?)
+            }
+        }
+    }
+}
+
 pub fn indexed_membership_contains(
     encoded: &[u8],
     index: &ResidentMembershipIndex,
     probe: MembershipProbe<'_>,
 ) -> Result<bool, ArtifactCodecError> {
+    indexed_membership_contains_with(encoded, index, probe, MembershipQueryMode::Legacy).map_err(
+        |error| match error {
+            ControlledMembershipProbeError::Codec(error) => error,
+            ControlledMembershipProbeError::Kernel(_) => {
+                unreachable!("legacy membership has no refusing control")
+            }
+        },
+    )
+}
+
+pub fn indexed_membership_contains_controlled(
+    encoded: &[u8],
+    index: &ResidentMembershipIndex,
+    probe: MembershipProbe<'_>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<bool, ControlledMembershipProbeError> {
+    indexed_membership_contains_with(
+        encoded,
+        index,
+        probe,
+        MembershipQueryMode::Controlled(control),
+    )
+}
+
+fn indexed_membership_contains_with(
+    encoded: &[u8],
+    index: &ResidentMembershipIndex,
+    probe: MembershipProbe<'_>,
+    mode: MembershipQueryMode<'_>,
+) -> Result<bool, ControlledMembershipProbeError> {
+    mode.checkpoint(0)?;
     match index {
         ResidentMembershipIndex::EmptyDomain => Ok(false),
         ResidentMembershipIndex::Utf8 { length_offsets, .. } => {
             let MembershipProbe::Utf8(needle) = probe else {
-                return Err(ArtifactCodecError::ContractViolation);
+                return Err(ArtifactCodecError::ContractViolation.into());
             };
             let mut low = 0usize;
             let mut high = length_offsets.len();
             while low < high {
+                mode.checkpoint(1)?;
                 let middle = low + (high - low) / 2;
-                match read_indexed_utf8(encoded, length_offsets[middle])?.cmp(needle) {
+                match mode.compare_utf8(encoded, length_offsets[middle], needle)? {
                     Ordering::Less => low = middle + 1,
                     Ordering::Greater => high = middle,
                     Ordering::Equal => return Ok(true),
@@ -625,12 +708,13 @@ pub fn indexed_membership_contains(
                 .checked_mul(*width)
                 .ok_or(ArtifactCodecError::LengthOverflow)?;
             if bytes.len() != expected_len {
-                return Err(ArtifactCodecError::Truncated);
+                return Err(ArtifactCodecError::Truncated.into());
             }
             let needle = fixed_probe(*tag, probe)?;
             let mut low = 0usize;
             let mut high = *count;
             while low < high {
+                mode.checkpoint(1)?;
                 let middle = low + (high - low) / 2;
                 let value = fixed_value_at(bytes, middle, *width)?;
                 match compare_fixed(*tag, value, needle)? {
@@ -719,10 +803,44 @@ pub fn indexed_membership_range_may_match(
     }
 }
 
-fn read_indexed_utf8(encoded: &[u8], offset: usize) -> Result<&str, ArtifactCodecError> {
+fn read_indexed_utf8_bytes(encoded: &[u8], offset: usize) -> Result<&[u8], ArtifactCodecError> {
     let mut reader = Reader::new(encoded.get(offset..).ok_or(ArtifactCodecError::Truncated)?);
     let len = usize::try_from(reader.u64()?).map_err(|_| ArtifactCodecError::LengthOverflow)?;
-    std::str::from_utf8(reader.take(len)?).map_err(|_| ArtifactCodecError::NonCanonicalPayload)
+    reader.take(len)
+}
+
+fn read_indexed_utf8(encoded: &[u8], offset: usize) -> Result<&str, ArtifactCodecError> {
+    std::str::from_utf8(read_indexed_utf8_bytes(encoded, offset)?)
+        .map_err(|_| ArtifactCodecError::NonCanonicalPayload)
+}
+
+// Validate bounded standard-library windows. An incomplete code point at a
+// window boundary is carried into the next window by retaining its <=3-byte
+// suffix. No full-value validation, decoding or temporary String is needed.
+fn validate_utf8_controlled(
+    bytes: &[u8],
+    control: &dyn KernelEvaluationControl,
+) -> Result<(), ControlledMembershipProbeError> {
+    let quantum = novarocks_functions::MAX_UNOBSERVED_KERNEL_WORK as usize;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = offset.saturating_add(quantum).min(bytes.len());
+        let window = &bytes[offset..end];
+        let validated = std::str::from_utf8(window);
+        control.checkpoint(window.len() as u32)?;
+        match validated {
+            Ok(_) => offset = end,
+            Err(error) if error.error_len().is_none() && end < bytes.len() => {
+                let valid = error.valid_up_to();
+                if valid == 0 {
+                    return Err(ArtifactCodecError::NonCanonicalPayload.into());
+                }
+                offset += valid;
+            }
+            Err(_) => return Err(ArtifactCodecError::NonCanonicalPayload.into()),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1191,3 +1309,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "leaf_controlled_membership_tests.rs"]
+mod controlled_membership_tests;

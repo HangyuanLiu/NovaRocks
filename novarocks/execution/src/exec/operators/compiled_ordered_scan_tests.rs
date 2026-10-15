@@ -224,7 +224,9 @@ struct Consumer {
 }
 impl Consumer {
     fn new(mode: Bind) -> Self {
-        let mut fixture = ordered_fixture();
+        Self::with_fixture(mode, ordered_fixture())
+    }
+    fn with_fixture(mode: Bind, mut fixture: Fixture) -> Self {
         let tracker = MemTracker::new_root("compiled-ordered-scan-real-owner");
         fixture.input.try_transfer_to_typed(&tracker).unwrap();
         let state = state(tracker.clone());
@@ -648,3 +650,6 @@ fn compiled_ordered_scan_guard_refuses_a_legal_topk_reduction_without_rewriting_
     assert_eq!(topk.reduction(), reduction);
     assert_eq!(topk.contract(), original.contract());
 }
+
+#[path = "compiled_ordered_source_tests.rs"]
+mod source_tests;

@@ -396,6 +396,55 @@ pub(crate) trait RuntimeFilterKeyProvider {
 
     /// The key of the binding at position `binding` of the set over `input`.
     fn evaluate_key(&mut self, binding: usize, input: &Chunk) -> Result<ArrayRef, Self::Error>;
+
+    /// The original decoder and mask application policy. A direct ordered
+    /// Scan overrides only this policy to retain its controlled output stock.
+    fn apply_snapshot(
+        &mut self,
+        input: Chunk,
+        array: &ArrayRef,
+        snapshot: &execution::RuntimeFilterSnapshot,
+    ) -> Result<RuntimeFilterApplication, Self::Error> {
+        apply_legacy_runtime_filter_snapshot(input, array, snapshot)
+    }
+}
+
+fn apply_legacy_runtime_filter_snapshot<E: From<String>>(
+    input: Chunk,
+    array: &ArrayRef,
+    snapshot: &execution::RuntimeFilterSnapshot,
+) -> Result<RuntimeFilterApplication, E> {
+    let outcome = execution::evaluator::evaluate_rows(
+        snapshot.binding_id(),
+        snapshot.logical_version(),
+        snapshot.artifact_query().as_ref(),
+        array,
+    )
+    .map_err(|error| error.to_string())?;
+    let execution::RuntimeFilterRowEvaluation::Evaluated { mask, .. } = outcome.evaluation() else {
+        return Ok(RuntimeFilterApplication::NotEvaluated(input));
+    };
+    let effect = outcome
+        .effect()
+        .expect("evaluated runtime-filter row outcome has an effect");
+    let output = if mask.iter().all(|value| value == Some(true)) {
+        Some(input)
+    } else if mask.iter().all(|value| value != Some(true)) {
+        None
+    } else {
+        let filtered =
+            filter_record_batch(&input.record_batch(), mask).map_err(|error| error.to_string())?;
+        Some(Chunk::try_new_like(filtered, &input)?)
+    };
+    Ok(RuntimeFilterApplication::Evaluated { output, effect })
+}
+
+pub(crate) enum RuntimeFilterApplication {
+    NotEvaluated(Chunk),
+    Evaluated {
+        output: Option<Chunk>,
+        effect: execution::RuntimeFilterRowEffect,
+    },
 }
 
 /// Runtime filters one consumer applies to its input, shared by every driver
@@ -764,41 +813,21 @@ impl RuntimeFilterConsumerState {
                 return Ok((None, effects));
             };
             let array = keys.evaluate_key(index, &input)?;
-            let mask = match predicate {
+            let applied = match predicate {
                 NativeConsumerPredicateForApply::Execution(snapshot) => {
-                    let outcome = execution::evaluator::evaluate_rows(
-                        snapshot.binding_id(),
-                        snapshot.logical_version(),
-                        snapshot.artifact_query().as_ref(),
-                        &array,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    match outcome.evaluation() {
-                        execution::RuntimeFilterRowEvaluation::Evaluated { mask, .. } => {
-                            effects.push(
-                                outcome
-                                    .effect()
-                                    .expect("evaluated runtime-filter row outcome has an effect"),
-                            );
-                            mask.clone()
-                        }
-                        execution::RuntimeFilterRowEvaluation::NotEvaluated { .. } => {
-                            self.inner.bindings.lock().expect("native RF consumer lock")[index]
-                                .state = NativeConsumerBindingState::PassThrough;
-                            current = Some(input);
-                            continue;
-                        }
-                    }
+                    keys.apply_snapshot(input, &array, &snapshot)?
                 }
             };
-            if mask.iter().all(|value| value == Some(true)) {
-                current = Some(input);
-            } else if mask.iter().all(|value| value != Some(true)) {
-                current = None;
-            } else {
-                let filtered =
-                    filter_record_batch(&input.record_batch(), &mask).map_err(|e| e.to_string())?;
-                current = Some(Chunk::try_new_like(filtered, &input)?);
+            match applied {
+                RuntimeFilterApplication::NotEvaluated(input) => {
+                    self.inner.bindings.lock().expect("native RF consumer lock")[index].state =
+                        NativeConsumerBindingState::PassThrough;
+                    current = Some(input);
+                }
+                RuntimeFilterApplication::Evaluated { output, effect } => {
+                    effects.push(effect);
+                    current = output;
+                }
             }
         }
         Ok((current, effects))

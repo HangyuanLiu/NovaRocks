@@ -57,11 +57,90 @@ struct FilterTransaction {
     _work: ArrowWorkBudget,
 }
 
-struct FilteredBatchBacking {
-    raw: RecordBatch,
-    _raw_columns: OpaqueRetainedCharge,
+struct FilteredBatchBacking<R, C> {
+    raw: R,
+    _raw_columns: C,
     _input: Chunk,
     _ledger: AdditionalBufferLedger,
+}
+
+// A slice retains its original typed constructor and its paid column Vec as
+// one raw Chunk. A filter's Arrow result has its separate capacity charge.
+// The shared adoption author borrows either batch without cloning a Vec.
+trait OrderedRawBatch {
+    fn record_batch(&self) -> &RecordBatch;
+}
+impl OrderedRawBatch for RecordBatch {
+    fn record_batch(&self) -> &RecordBatch {
+        self
+    }
+}
+impl OrderedRawBatch for Chunk {
+    fn record_batch(&self) -> &RecordBatch {
+        Chunk::record_batch(self)
+    }
+}
+
+struct SliceTransaction {
+    raw: Option<Chunk>,
+    input: Option<Chunk>,
+    ledger: Option<AdditionalBufferLedger>,
+    _work: ArrowWorkBudget,
+}
+
+fn adopt_ordered_output<R: OrderedRawBatch + Send + Sync + 'static, C: Send + Sync + 'static>(
+    body: FilteredBatchBacking<R, C>,
+    host: Arc<dyn AggregateStateAllocator>,
+    authority: &OpaqueRetainedCharge,
+    work: &mut EvaluationCheckpoints<'_>,
+    control: &dyn KernelEvaluationControl,
+    construction: &dyn InputConstructionOwner,
+) -> ExecutionResult<Chunk> {
+    let schema = body._input.chunk_schema_ref();
+    let ledger = body._ledger.clone();
+    let backing = SourceBackingOwner::try_from_owned_direct(body, Arc::clone(&host), work)?;
+    let metadata = OutputColumnMetadata::try_new(
+        backing.borrowed().raw.record_batch().num_columns(),
+        Arc::clone(&host),
+        control,
+    )?;
+    // This local guard destroys partially wrapped columns before their
+    // already admitted container keeper on every return path.
+    struct WrappedColumns {
+        columns: Vec<ArrayRef>,
+        metadata: OutputColumnMetadata,
+    }
+    let mut wrapped = WrappedColumns {
+        columns: Vec::new(),
+        metadata,
+    };
+    wrapped
+        .columns
+        .try_reserve_exact(backing.borrowed().raw.record_batch().num_columns())
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    if wrapped.columns.capacity() != backing.borrowed().raw.record_batch().num_columns() {
+        return Err(invalid(
+            "ordered scan wrapped column capacity differs from its admitted request",
+        )
+        .into());
+    }
+    for original in backing.borrowed().raw.record_batch().columns() {
+        let prepared = PreparedSourceCustody::prepare(original, work)?;
+        let mut reservation =
+            authority.reserve_operation(prepared.request_facts().global_peak_upper())?;
+        wrapped
+            .columns
+            .push(prepared.retain(&backing, &mut reservation, work)?);
+    }
+    let options = RecordBatchOptions::new()
+        .with_row_count(Some(backing.borrowed().raw.record_batch().num_rows()));
+    let batch =
+        RecordBatch::try_new_with_options(schema.arrow_schema_ref(), wrapped.columns, &options)
+            .map_err(|error| ExecutionFailure::from(format!("compiled Filter: {error}")))?;
+    let mut output =
+        Chunk::try_new_with_output_column_metadata(batch, schema, wrapped.metadata, construction)?;
+    output.attach_additional_buffers(ledger)?;
+    Ok(output)
 }
 
 fn shape(input: &Chunk) -> Result<ArrowWorkShape, KernelFailure> {
@@ -109,6 +188,97 @@ pub(crate) fn normalize_filter_mask_observed(
 }
 
 impl Chunk {
+    /// The ordered source's explicit LIMIT view. Even an unfiltered native or
+    /// provider input needs custody on every returned Array/Buffer alias.
+    pub(crate) fn slice_ordered_scan_controlled(
+        self,
+        offset: usize,
+        length: usize,
+        host: Arc<dyn AggregateStateAllocator>,
+        control: &dyn KernelEvaluationControl,
+        construction: &dyn InputConstructionOwner,
+    ) -> ExecutionResult<Self> {
+        if !self.chunk_schema().is_typed() || !self.source_authority().is_attached() {
+            return Err(
+                invalid("ordered scan slicing requires its actual typed source authority").into(),
+            );
+        }
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > self.len())
+        {
+            return Err(
+                invalid("ordered scan slice is outside its explicit source contract").into(),
+            );
+        }
+        for slot in self.chunk_schema().slots() {
+            let ty = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
+                slot.typed_binding().clone(),
+            )
+            .map_err(|_| invalid("ordered scan slice has an invalid complete payload type"))?;
+            if !novarocks_local_program::is_ordered_filter_flat_payload_type(&ty) {
+                return Err(invalid(
+                    "ordered scan slice does not support this complete payload type",
+                )
+                .into());
+            }
+        }
+        let authority = OpaqueRetainedCharge::try_new(Arc::clone(&host))?;
+        let _prefix =
+            authority.reserve_operation(source_custody_prefix_facts().requests().bytes())?;
+        let mut work = EvaluationCheckpoints::new(control);
+        work.flush()?;
+        let public_work = ArrowWorkBudget::admit(Arc::clone(&host), shape(&self)?)?;
+        let ledger = AdditionalBufferLedger::prepare(&self, Arc::clone(&host), control)?;
+        let mut transaction = SliceTransaction {
+            raw: None,
+            input: Some(self),
+            ledger: Some(ledger),
+            _work: public_work,
+        };
+        work.flush()?;
+        let input = transaction.input.as_ref().expect("unpublished slice input");
+        transaction.raw = Some(input.slice_typed_observed::<ExecutionFailure, _>(
+            offset,
+            length,
+            construction.storage_lifetime(),
+            |step| {
+                work.step()?;
+                construction.observe(0, &[], step)?;
+                work.flush()?;
+                Ok(())
+            },
+        )?);
+        work.flush()?;
+        let delta = record_batch_additional_bytes_observed(
+            transaction.raw.as_ref().expect("raw slice").record_batch(),
+            input.record_batch(),
+            || work.step(),
+        )?;
+        transaction
+            .ledger
+            .as_ref()
+            .expect("unpublished slice ledger")
+            .initialize(delta)?;
+        let output = adopt_ordered_output(
+            FilteredBatchBacking {
+                raw: transaction.raw.take().expect("raw slice"),
+                // slice_typed_observed already admitted this exact raw Vec
+                // through the original typed construction owner.
+                _raw_columns: (),
+                _input: transaction.input.take().expect("unpublished slice input"),
+                _ledger: transaction.ledger.take().expect("unpublished slice ledger"),
+            },
+            Arc::clone(&host),
+            &authority,
+            &mut work,
+            control,
+            construction,
+        )?;
+        work.finish()?;
+        Ok(output)
+    }
+
     /// Only the closed direct-scan route calls this creator. The supplied
     /// construction owner is the same actual task's explicit typed author.
     /// NULL is not TRUE, exactly as in the existing synchronous filter body.
@@ -224,17 +394,7 @@ impl Chunk {
             RecordBatch::try_new_with_options(schema, columns, &options)
                 .map_err(|error| ExecutionFailure::from(format!("compiled Filter: {error}")))?,
         );
-        let schema = transaction
-            .input
-            .as_ref()
-            .expect("unpublished input")
-            .chunk_schema_ref();
-        let ledger = transaction
-            .ledger
-            .as_ref()
-            .expect("unpublished ledger")
-            .clone();
-        let backing = SourceBackingOwner::try_from_owned_direct(
+        let output = adopt_ordered_output(
             FilteredBatchBacking {
                 raw: transaction.raw.take().expect("filtered raw output"),
                 _raw_columns: transaction.raw_columns.take().expect("raw column capacity"),
@@ -242,51 +402,11 @@ impl Chunk {
                 _ledger: transaction.ledger.take().expect("unpublished ledger"),
             },
             Arc::clone(&host),
+            &authority,
             &mut work,
-        )?;
-        let metadata = OutputColumnMetadata::try_new(
-            backing.borrowed().raw.num_columns(),
-            Arc::clone(&host),
             control,
-        )?;
-        // This local guard destroys partially wrapped columns before their
-        // already admitted container keeper on every return path.
-        struct WrappedColumns {
-            columns: Vec<ArrayRef>,
-            metadata: OutputColumnMetadata,
-        }
-        let mut wrapped = WrappedColumns {
-            columns: Vec::new(),
-            metadata,
-        };
-        wrapped
-            .columns
-            .try_reserve_exact(backing.borrowed().raw.num_columns())
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
-        if wrapped.columns.capacity() != backing.borrowed().raw.num_columns() {
-            return Err(invalid(
-                "ordered scan wrapped column capacity differs from its admitted request",
-            )
-            .into());
-        }
-        for original in backing.borrowed().raw.columns() {
-            let prepared = PreparedSourceCustody::prepare(original, &mut work)?;
-            let mut reservation =
-                authority.reserve_operation(prepared.request_facts().global_peak_upper())?;
-            wrapped
-                .columns
-                .push(prepared.retain(&backing, &mut reservation, &mut work)?);
-        }
-        let batch =
-            RecordBatch::try_new_with_options(schema.arrow_schema_ref(), wrapped.columns, &options)
-                .map_err(|error| ExecutionFailure::from(format!("compiled Filter: {error}")))?;
-        let mut output = Self::try_new_with_output_column_metadata(
-            batch,
-            schema,
-            wrapped.metadata,
             construction,
         )?;
-        output.attach_additional_buffers(ledger)?;
         work.finish()?;
         Ok(Some(output))
     }
@@ -295,3 +415,7 @@ impl Chunk {
 #[cfg(test)]
 #[path = "filtered_output_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ordered_slice_tests.rs"]
+mod ordered_slice_tests;
