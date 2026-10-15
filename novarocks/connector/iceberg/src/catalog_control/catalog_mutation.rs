@@ -2290,12 +2290,13 @@ fn execute_application_document_update(
     };
     let operation_marker =
         crate::document_storage::publication::operation_marker(request.operation_id);
+    let expected_manifest_digest = crate::document_storage::publication::manifest_digest(manifest);
     let target = IcebergMutationEvidenceTarget::ApplicationDocuments {
         namespace: table.namespace.to_string(),
         table: table.table.to_string(),
         table_uuid: loaded.table.metadata().uuid().to_string(),
         operation_marker: operation_marker.clone(),
-        manifest_digest: crate::document_storage::publication::manifest_digest(manifest),
+        manifest_digest: expected_manifest_digest,
         managed_kind: desired_marker.kind().to_string(),
         managed_owner: desired_marker.owner().to_string(),
         managed_incarnation: desired_marker.incarnation().to_string(),
@@ -2400,6 +2401,14 @@ fn execute_application_document_update(
                 .map_err(|error| {
                     internal(format!("read committed Iceberg document update: {error}"))
                 })
+        })
+        .and_then(|refreshed| {
+            if refreshed.table.metadata().uuid() != expected_uuid
+                || !application_document_update_matches(refreshed.table.metadata(), &operation_marker,
+                    expected_manifest_digest, desired_marker.kind(), desired_marker.owner(), desired_marker.incarnation()) {
+                return Err(corrupt("Post-publication document metadata no longer belongs to this operation; retain its Applied proof without a refreshed version"));
+            }
+            Ok(refreshed)
         });
     let (committed_version, post_finalization) = match refreshed {
         Ok(refreshed) => {
