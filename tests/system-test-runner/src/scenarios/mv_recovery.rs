@@ -8,12 +8,11 @@ use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use ::mysql::prelude::{FromRow, Queryable};
 use ::mysql::{Conn, Row};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use control_plan::FeLaunchIntent;
 use novarocks_cluster_harness::ServerHandle;
 use novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan;
 use reqwest::blocking::Client;
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -816,8 +815,25 @@ impl Scenario for MvRefreshConfigurationInterleaving {
         }
         require_refresh_paused(context, &mut conn, "orders_mv", true)?;
         require_refresh_paused(context, &mut conn, "parallel_mv", true)?;
-        require_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 2)?;
-        require_rest_snapshot_count(context, &rest_uri, "ns", "parallel_mv", 0)?;
+        require_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 3)?;
+        require_rest_snapshot_count(context, &rest_uri, "ns", "parallel_mv", 1)?;
+        let metadata =
+            super::mv_uea7_documents::load_metadata(context, &rest_uri, "ns", "orders_mv")?;
+        let graph = super::mv_uea7_documents::wire::Graph::from_metadata(&metadata)?;
+        let last = graph
+            .snapshots
+            .last()
+            .context("configuration slot snapshot missing")?;
+        let previous = graph
+            .snapshots
+            .iter()
+            .rev()
+            .nth(1)
+            .context("publication before slot change missing")?;
+        ensure!(
+            last.1 == previous.1,
+            "configuration slot change did not carry P bytes"
+        );
         let final_configuration =
             rest_configuration_revision(context, &rest_uri, "ns", "orders_mv")?;
         if final_configuration == initial_configuration {
@@ -916,25 +932,8 @@ fn rest_configuration_revision(
         .send()?
         .error_for_status()?
         .json()?;
-    let encoded = loaded["metadata"]["properties"]["novarocks.documents.v1"]
-        .as_str()
-        .context("REST MV metadata lacks document manifest")?;
-    let manifest: serde_json::Value = serde_json::from_str(encoded)?;
-    let documents = manifest["documents"]
-        .as_array()
-        .context("REST MV document manifest lacks documents")?;
-    let configuration = documents
-        .iter()
-        .find(|document| document["owner"] == "novarocks.mv" && document["name"] == "configuration")
-        .context("REST MV document manifest lacks C")?;
-    let revision: Vec<u8> = serde_json::from_value(configuration["revision"].clone())?;
-    if revision.len() != 32 {
-        bail!(
-            "REST MV C revision has {} bytes instead of 32",
-            revision.len()
-        );
-    }
-    Ok(revision)
+    let graph = super::mv_uea7_documents::wire::Graph::from_metadata(&loaded["metadata"])?;
+    graph.slots[super::mv_uea7_documents::wire::CONFIG].content_revision()
 }
 
 impl Scenario for MvCurrentDependencyRecheck {
@@ -1035,12 +1034,18 @@ impl Scenario for MvCurrentDependencyRecheck {
             "NOVAROCKS_MV_RECOVERY_PHASE phase=data-prepared token=before-current-dependency-recheck",
             "wait for BE computation before Current recheck",
         )?;
+        let before_injection =
+            super::mv_uea7_documents::load_metadata(context, &rest_uri, "ns", "orders_mv")?;
+        let graph = super::mv_uea7_documents::wire::Graph::from_metadata(&before_injection)?;
+        let missing_key = format!("novarocks.doc.v2.rev.{}", graph.definition);
         let snapshot_id =
             externally_remove_current_definition_document(context, &rest_uri, "ns", "orders_mv")?;
         prepared.remove()?;
         context.action("verify an externally changed D stops the old refresh before commit");
         match held_refresh.recv_timeout(context.remaining("receive stale MV refresh")?) {
-            Ok(Err(error)) if error.contains("reobserve Current MV publication documents") => {}
+            Ok(Err(error))
+                if error.to_ascii_lowercase().contains("corrupt")
+                    && error.contains(&missing_key) => {}
             Ok(Err(error)) => bail!("stale MV refresh failed for another reason: {error}"),
             Ok(Ok(())) => bail!("stale MV refresh published after D changed"),
             Err(error) => bail!("stale MV refresh did not finish: {error}"),
@@ -1982,44 +1987,25 @@ fn externally_remove_current_definition_document(
     let metadata = loaded
         .get("metadata")
         .context("REST table load has no metadata")?;
-    let table_uuid = metadata
-        .get("table-uuid")
-        .and_then(serde_json::Value::as_str)
-        .context("REST table load has no UUID")?;
     let snapshot_id = metadata
         .get("current-snapshot-id")
         .and_then(serde_json::Value::as_i64)
         .context("REST table load has no current MV snapshot")?;
-    let encoded = metadata
-        .get("properties")
-        .and_then(|properties| properties.get("novarocks.documents.v1"))
-        .and_then(serde_json::Value::as_str)
-        .context("REST table load has no MV document manifest")?;
-    let mut manifest: serde_json::Value = serde_json::from_str(encoded)?;
-    let documents = manifest
-        .get_mut("documents")
-        .and_then(serde_json::Value::as_array_mut)
-        .context("MV document manifest has no document array")?;
-    let before = documents.len();
-    documents.retain(|document| {
-        document.get("owner").and_then(serde_json::Value::as_str) != Some("novarocks.mv")
-            || document.get("name").and_then(serde_json::Value::as_str) != Some("definition")
-    });
-    if documents.len() + 1 != before {
-        bail!("external D mutation did not remove exactly one definition document");
-    }
-    context.action("commit external table-metadata D removal without changing main");
-    let update = serde_json::json!({
-        "requirements": [
-            {"type": "assert-table-uuid", "uuid": table_uuid},
-            {"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": snapshot_id}
-        ],
-        "updates": [{
-            "action": "set-properties",
-            "updates": {"novarocks.documents.v1": manifest.to_string()}
-        }]
-    });
-    client.post(&url).json(&update).send()?.error_for_status()?;
+    use super::mv_uea7_documents::{commit_updates, wire::Graph};
+    let graph = Graph::from_metadata(metadata)?;
+    let key = format!("novarocks.doc.v2.rev.{}", graph.definition);
+    context.action(format!(
+        "remove current definition version {key} without changing main"
+    ));
+    commit_updates(
+        context,
+        rest_uri,
+        namespace,
+        table,
+        metadata,
+        vec![serde_json::json!({"action":"remove-properties","removals":[key]})],
+        "remove-current-definition",
+    )?;
     assert_rest_snapshot_unchanged(context, rest_uri, namespace, table, snapshot_id)?;
     Ok(snapshot_id)
 }
@@ -2082,24 +2068,13 @@ fn externally_persist_old_endian_interpretation(
         bail!("old-format L fixture requires two target fields to reorder");
     }
     fields.reverse();
-    let encoded = metadata["properties"]["novarocks.documents.v1"]
-        .as_str()
-        .context("REST MV metadata has no table document manifest")?;
-    let mut manifest: serde_json::Value = serde_json::from_str(encoded)?;
-    let documents = manifest["documents"]
-        .as_array_mut()
-        .context("REST MV document manifest has no documents")?;
-    let interpretation = documents
-        .iter_mut()
-        .find(|document| {
-            document["owner"] == "novarocks.mv" && document["name"] == "interpretation"
-        })
-        .context("REST MV manifest has no L")?;
-    if interpretation["carrier"]["kind"] != "available" {
-        bail!("old-format L fixture requires an inline interpretation document");
-    }
-    let mut content: Vec<u8> =
-        serde_json::from_value(interpretation["carrier"]["content"].clone())?;
+    use super::mv_uea7_documents::wire::{Graph, ROOT, Reference, Version};
+    let graph = Graph::from_metadata(metadata)?;
+    let interpretation = graph
+        .versions
+        .get(&graph.interpretation)
+        .context("MV lacks current L")?;
+    let mut content = interpretation.bytes()?;
     let target = protobuf_bytes_field(&content, 9)?;
     let schema = protobuf_bytes_field(&content[target.clone()], 2)?;
     if schema.len() != 4 {
@@ -2111,21 +2086,43 @@ fn externally_persist_old_endian_interpretation(
         bail!("old-format L fixture schema version does not match the exact physical target");
     }
     content[schema].copy_from_slice(&(next_schema_id as i32).to_be_bytes());
-    interpretation["carrier"]["content"] = serde_json::to_value(&content)?;
-    interpretation["revision"] =
-        serde_json::to_value(Vec::from(Sha256::digest(&content).as_slice()))?;
+    let new_l = Version::new(
+        &interpretation.owner,
+        &interpretation.name,
+        interpretation.format.clone(),
+        interpretation.refs.clone(),
+        &content,
+    )?;
+    let binding = &graph.versions[&graph.binding];
+    let new_b = Version::new(
+        &binding.owner,
+        &binding.name,
+        binding.format.clone(),
+        vec![
+            Reference {
+                rel: "definition".into(),
+                id: graph.definition.clone(),
+            },
+            Reference {
+                rel: "interpretation".into(),
+                id: new_l.id.clone(),
+            },
+        ],
+        &binding.bytes()?,
+    )?;
     context
         .action("persist an exact nonzero physical schema with the former big-endian L encoding");
     let update = serde_json::json!({
         "requirements": [
             {"type": "assert-table-uuid", "uuid": table_uuid},
+            {"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": null},
             {"type": "assert-current-schema-id", "current-schema-id": current_schema_id},
             {"type": "assert-last-assigned-field-id", "last-assigned-field-id": last_column_id}
         ],
         "updates": [
             {"action": "add-schema", "schema": new_schema, "last-column-id": last_column_id},
             {"action": "set-current-schema", "schema-id": -1},
-            {"action": "set-properties", "updates": {"novarocks.documents.v1": manifest.to_string()}}
+            {"action": "set-properties", "updates": {(new_l.key()):new_l.encoded()?,(new_b.key()):new_b.encoded()?,(ROOT):new_b.id}}
         ]
     });
     let response = client.post(&url).json(&update).send()?;
@@ -2140,20 +2137,8 @@ fn externally_persist_old_endian_interpretation(
     if observed["metadata"]["current-schema-id"].as_i64() != Some(next_schema_id) {
         bail!("old-format L REST mutation did not advance the physical schema ID");
     }
-    let persisted = observed["metadata"]["properties"]["novarocks.documents.v1"]
-        .as_str()
-        .context("old-format L REST mutation lost the document manifest")?;
-    let persisted: serde_json::Value = serde_json::from_str(persisted)?;
-    let persisted_l = persisted["documents"]
-        .as_array()
-        .context("old-format L REST mutation lost the document list")?
-        .iter()
-        .find(|document| {
-            document["owner"] == "novarocks.mv" && document["name"] == "interpretation"
-        })
-        .context("old-format L REST mutation lost L")?;
-    let persisted_content: Vec<u8> =
-        serde_json::from_value(persisted_l["carrier"]["content"].clone())?;
+    let persisted_graph = Graph::from_metadata(&observed["metadata"])?;
+    let persisted_content = persisted_graph.versions[&persisted_graph.interpretation].bytes()?;
     let target = protobuf_bytes_field(&persisted_content, 9)?;
     let schema = protobuf_bytes_field(&persisted_content[target.clone()], 2)?;
     let persisted_schema = target.start + schema.start..target.start + schema.end;

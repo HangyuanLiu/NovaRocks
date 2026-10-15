@@ -25,9 +25,7 @@ use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::ServerHandle;
 use novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan;
-use reqwest::blocking::Client;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -37,7 +35,6 @@ use std::time::{Duration, Instant};
 const CATALOG: &str = "uea7_mv_storage";
 const NAMESPACE: &str = "ns";
 const VIEW: &str = "orders_mv";
-const DOCUMENT_MANIFEST_KEY: &str = "novarocks.documents.v1";
 
 #[derive(Default)]
 pub(super) struct MvStorageContract {
@@ -275,14 +272,15 @@ impl Scenario for MvStorageContract {
             "read the second publication directly",
         )?;
         context.action("verify FULL produced a new exact P and an Iceberg overwrite");
-        let second = load_graph(context, &rest_uri, 2)?;
+        let second = load_graph(context, &rest_uri, 3)?;
         ensure!(
             second.definition == first.definition && second.interpretation == first.interpretation,
             "FULL refresh changed the stable D/L revisions"
         );
         ensure!(
             second.publications[0] == first.publications[0]
-                && second.publications[1] != first.publications[0],
+                && second.publications.last().map(|(_, revision)| revision)
+                    != first.publications.last().map(|(_, revision)| revision),
             "FULL refresh did not retain the original exact P and add a distinct P"
         );
         ensure!(
@@ -394,167 +392,55 @@ struct DocumentGraph {
 }
 
 fn load_graph(context: &ScenarioContext, rest_uri: &str, expected: usize) -> Result<DocumentGraph> {
-    let url = format!(
-        "{}/v1/namespaces/{NAMESPACE}/tables/{VIEW}",
-        rest_uri.trim_end_matches('/')
-    );
-    let client = Client::builder()
-        .no_proxy()
-        .timeout(
-            context
-                .remaining("load exact MV REST metadata")?
-                .min(Duration::from_secs(30)),
-        )
-        .build()
-        .context("build isolated REST client")?;
-    let response = client
-        .get(&url)
-        .send()
-        .with_context(|| format!("load exact MV REST metadata at {url}"))?
-        .error_for_status()
-        .with_context(|| format!("REST did not return MV metadata at {url}"))?;
-    let table: Value = response.json().context("decode exact MV REST metadata")?;
-    let metadata = table
-        .get("metadata")
-        .context("REST response lacks metadata")?;
-    let table_manifest = manifest(&metadata["properties"], "table metadata")?;
-    let mut table_documents = HashMap::new();
-    for document in documents(&table_manifest, "table metadata")? {
-        let name = document["name"]
-            .as_str()
-            .context("table document lacks name")?;
-        ensure!(
-            document["attachment"]["kind"] == "table-metadata",
-            "{name} is not a table-level document"
-        );
-        ensure!(
-            table_documents.insert(name, document).is_none(),
-            "duplicate table-level document {name}"
-        );
-    }
-    for name in ["definition", "interpretation", "configuration"] {
-        ensure!(
-            table_documents.contains_key(name),
-            "MV REST metadata lacks table-level {name}"
-        );
-    }
+    use super::mv_uea7_documents::{load_metadata, wire::Graph};
+    use sha2::{Digest, Sha256};
+    let metadata = load_metadata(context, rest_uri, NAMESPACE, VIEW)?;
+    let graph = Graph::from_metadata(&metadata)?;
     ensure!(
-        !table_documents.contains_key("publication"),
-        "MV REST metadata has a table-level P"
-    );
-    let definition = table_documents["definition"]["revision"].clone();
-    let interpretation = table_documents["interpretation"]["revision"].clone();
-    ensure!(
-        !definition.is_null() && !interpretation.is_null(),
-        "D/L revisions are missing from canonical table metadata"
-    );
-    let snapshots = metadata["snapshots"]
-        .as_array()
-        .context("MV REST metadata lacks snapshots")?;
-    ensure!(
-        snapshots.len() == expected,
+        graph.snapshots.len() == expected,
         "expected {expected} MV snapshots, observed {}",
-        snapshots.len()
+        graph.snapshots.len()
     );
-    if expected == 0 {
-        ensure!(
-            metadata["current-snapshot-id"].is_null(),
-            "unpublished MV already has a current snapshot"
-        );
-    }
-
-    let mut publications = Vec::with_capacity(expected);
-    let mut last_operation = None;
-    for snapshot in snapshots {
-        let snapshot_id = snapshot["snapshot-id"]
-            .as_i64()
-            .context("MV snapshot lacks an exact ID")?;
-        let snapshot_manifest = manifest(&snapshot["summary"], "snapshot summary")?;
-        let snapshot_documents = documents(&snapshot_manifest, "snapshot summary")?;
-        ensure!(
-            snapshot_documents.len() == 1,
-            "snapshot {snapshot_id} has {} documents instead of one P",
-            snapshot_documents.len()
-        );
-        let publication = &snapshot_documents[0];
-        ensure!(
-            publication["name"] == "publication"
-                && publication["attachment"]["kind"] == "exact-output"
-                && publication["attachment"]["snapshot_id"].as_i64() == Some(snapshot_id),
-            "P does not bind exact output {snapshot_id}"
-        );
-        let references = publication["references"]
-            .as_array()
-            .context("P lacks D/L references")?;
-        ensure!(
-            references.len() == 2,
-            "P on snapshot {snapshot_id} does not have exactly two D/L references"
-        );
-        let mut seen = HashMap::new();
-        for reference in references {
-            let name = reference["name"]
-                .as_str()
-                .context("P reference lacks name")?;
-            ensure!(
-                seen.insert(name, ()).is_none(),
-                "P on snapshot {snapshot_id} repeats {name}"
-            );
-            let table_document = table_documents
-                .get(name)
-                .with_context(|| format!("P references absent table-level document {name}"))?;
-            ensure!(
-                reference["revision"] == table_document["revision"],
-                "P on snapshot {snapshot_id} does not reference exact {name} revision"
-            );
-        }
-        ensure!(
-            seen.contains_key("definition") && seen.contains_key("interpretation"),
-            "P on snapshot {snapshot_id} does not reference D and L"
-        );
-        let revision = publication["revision"].clone();
-        ensure!(
-            !revision.is_null(),
-            "P on snapshot {snapshot_id} has no revision"
-        );
-        ensure!(
-            publications
+    ensure!(
+        graph.diagnostics.is_empty(),
+        "MV storage contract history is not interpretable: {:?}",
+        graph.diagnostics
+    );
+    let publications = graph
+        .snapshots
+        .iter()
+        .map(|(id, p)| {
+            let p = p
+                .as_ref()
+                .with_context(|| format!("snapshot {id} has no publication record"))?;
+            let revision: String = Sha256::digest(p.frame.as_bytes())
                 .iter()
-                .all(|(id, prior_revision)| *id != snapshot_id && prior_revision != &revision),
-            "duplicate snapshot identity or P revision at snapshot {snapshot_id}"
-        );
-        publications.push((snapshot_id, revision));
-        last_operation = snapshot["summary"]["operation"].as_str().map(str::to_owned);
-    }
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            Ok((*id, Value::String(revision)))
+        })
+        .collect::<Result<Vec<_>>>()?;
     if expected > 0 {
         ensure!(
-            metadata["current-snapshot-id"].as_i64() == publications.last().map(|(id, _)| *id),
-            "current MV snapshot does not carry the last exact P"
+            graph.current == publications.last().map(|(id, _)| *id),
+            "current snapshot does not carry the latest P record"
         );
     }
+    let last_operation = metadata["snapshots"]
+        .as_array()
+        .and_then(|snapshots| {
+            snapshots
+                .iter()
+                .find(|s| s["snapshot-id"].as_i64() == graph.current)
+        })
+        .and_then(|s| s["summary"]["operation"].as_str())
+        .map(str::to_owned);
     Ok(DocumentGraph {
-        definition,
-        interpretation,
+        definition: Value::String(graph.definition),
+        interpretation: Value::String(graph.interpretation),
         publications,
         last_operation,
     })
-}
-
-fn manifest(properties: &Value, owner: &str) -> Result<Value> {
-    let encoded = properties[DOCUMENT_MANIFEST_KEY]
-        .as_str()
-        .with_context(|| format!("{owner} lacks {DOCUMENT_MANIFEST_KEY}"))?;
-    serde_json::from_str(encoded).with_context(|| format!("decode {owner} document manifest"))
-}
-
-fn documents<'a>(manifest: &'a Value, owner: &str) -> Result<&'a [Value]> {
-    ensure!(
-        manifest["version"].as_u64() == Some(1),
-        "{owner} has an unsupported document manifest version"
-    );
-    manifest["documents"]
-        .as_array()
-        .map(Vec::as_slice)
-        .with_context(|| format!("{owner} manifest lacks documents"))
 }
 
 fn connect(context: &mut ScenarioContext) -> Result<crate::actors::mysql::DeadlineConnection> {

@@ -32,7 +32,7 @@ const CATALOG: &str = "uea7_mv_incarnation";
 const NAMESPACE: &str = "ns";
 const VIEW: &str = "orders_mv";
 const COMPETING_INCARNATION: &str = "0197a0b5-0000-7001-8000-000000000001";
-const MARKER_PROPERTY: &str = "novarocks.managed.incarnation";
+const MARKER_PROPERTY: &str = super::mv_uea7_documents::wire::MANAGEMENT;
 
 /// A controlled external marker commit stands in for a second process that
 /// accidentally uses the same deployment identity. The scenario never starts
@@ -255,10 +255,9 @@ fn load_rest_table(context: &ScenarioContext, rest_uri: &str) -> Result<Value> {
     serde_json::from_str(&body).context("decode isolated REST table response")
 }
 
-fn marker(table: &Value) -> Result<&str> {
-    table["metadata"]["properties"][MARKER_PROPERTY]
-        .as_str()
-        .context("isolated REST table has no managed incarnation property")
+fn marker(table: &Value) -> Result<String> {
+    let graph = super::mv_uea7_documents::wire::Graph::from_metadata(&table["metadata"])?;
+    Ok(super::mv_uea7_documents::wire::management(&graph.slots[MARKER_PROPERTY])?[2].clone())
 }
 
 fn change_remote_incarnation(
@@ -271,30 +270,27 @@ fn change_remote_incarnation(
         marker(&current)? == original_incarnation,
         "isolated REST marker did not match this FE's admitted incarnation"
     );
-    let uuid = current["metadata"]["table-uuid"]
-        .as_str()
-        .context("isolated REST table has no UUID")?;
-    let body = json!({
-        "requirements": [{ "type": "assert-table-uuid", "uuid": uuid }],
-        "updates": [{
-            "action": "set-properties",
-            "updates": { (MARKER_PROPERTY): COMPETING_INCARNATION }
-        }]
-    });
-    let response = rest_client(context)?
-        .post(table_url(rest_uri))
-        .json(&body)
-        .send()
-        .context("commit competing incarnation into isolated REST catalog")?;
-    let status = response.status();
-    let response_body = response
-        .text()
-        .context("read competing incarnation commit response")?;
-    ensure!(
-        status.is_success(),
-        "isolated REST incarnation update returned HTTP {status}: {}",
-        response_body.chars().take(1024).collect::<String>()
-    );
+    use super::mv_uea7_documents::{
+        commit_updates,
+        wire::{Graph, management, management_content},
+    };
+    let graph = Graph::from_metadata(&current["metadata"])?;
+    let mut slot = graph.slots[MARKER_PROPERTY].clone();
+    let fields = management(&slot)?;
+    slot.replace_content(&management_content(
+        &fields[0],
+        &fields[1],
+        COMPETING_INCARNATION,
+    ))?;
+    commit_updates(
+        context,
+        rest_uri,
+        NAMESPACE,
+        VIEW,
+        &current["metadata"],
+        vec![json!({"action":"set-properties","updates":{(MARKER_PROPERTY):slot.encoded()?}})],
+        "competing-management-slot",
+    )?;
     let current = load_rest_table(context, rest_uri)?;
     ensure!(
         marker(&current)? == COMPETING_INCARNATION,

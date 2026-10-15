@@ -26,6 +26,7 @@ mod mv_uea7;
 mod mv_uea7_handover;
 mod mv_uea7_incarnation;
 mod mv_uea7_storage;
+mod mv_uea7_documents;
 mod native_compatibility;
 mod native_creation;
 mod native_direct_controls;
@@ -85,6 +86,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(catalog_state::scenarios());
     scenarios.extend(mv_recovery::scenarios());
     scenarios.extend(mv_uea7::scenarios());
+    scenarios.extend(mv_uea7_documents::scenarios());
     scenarios.push(Box::new(mv_uea7_handover::MvOwnerHandover::default()));
     scenarios.push(Box::new(
         mv_uea7_incarnation::MvIncarnationMismatch::default(),
