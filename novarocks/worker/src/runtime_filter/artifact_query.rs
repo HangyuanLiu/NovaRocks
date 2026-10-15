@@ -111,7 +111,7 @@ impl BackendRuntimeFilterArtifactQuery {
 
     pub fn ordered(
         bundle: &ArtifactBundle,
-        contract: Arc<RuntimeOrderContract>,
+        contract: &RuntimeOrderContract,
     ) -> Result<Self, RuntimeFilterArtifactQueryError> {
         if contract.keys().len() != 1 {
             return Err(RuntimeFilterArtifactQueryError::Unsupported);
@@ -131,7 +131,7 @@ impl BackendRuntimeFilterArtifactQuery {
             || artifact.kind() != ArtifactKind::Range
             || artifact.version() != bundle.version()
             || artifact.schema_digest().bytes() != contract.digest()
-            || range.contract.as_ref() != contract.as_ref()
+            || range.contract.as_ref() != contract
             || range.contract.compare(&range.bound, &range.bound).is_err()
         {
             return Err(RuntimeFilterArtifactQueryError::ContractViolation);

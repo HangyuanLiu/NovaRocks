@@ -2677,8 +2677,8 @@ mod tests {
 
     #[test]
     fn execution_contract_retains_ordered_key_semantics() {
-        let contract = execution::RuntimeFilterExecutionContract::Ordered(Arc::new(
-            execution::contribution::RuntimeOrderContract::from_frozen(
+        let contract = execution::RuntimeFilterExecutionContract::Ordered(
+            Arc::new(execution::contribution::RuntimeOrderContract::from_frozen(
                 [execution::contribution::RuntimeOrderKey::with_order(
                     DataType::Int64,
                     execution::contribution::RuntimeOrderSortDirection::Descending,
@@ -2686,8 +2686,9 @@ mod tests {
                 )],
                 [3; 32],
                 [4; 32],
-            ),
-        ));
+            ))
+            .into(),
+        );
 
         let execution::RuntimeFilterExecutionContract::Ordered(order) = contract else {
             panic!("ordered decoded contract must remain ordered")

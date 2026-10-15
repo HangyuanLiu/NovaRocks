@@ -287,7 +287,7 @@ impl KernelEvaluationControl for LegacyBoundaryControl {
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct AggregateTopNBoundaryCore<S: TopNBoundaryStorage> {
     limit: usize,
-    contract: Arc<RuntimeOrderContract>,
+    contract: crate::runtime_filter::RuntimeOrderContractRef,
     best: S,
     observed_group_count: usize,
     last_emitted_bound: Option<S::Key>,
@@ -310,7 +310,7 @@ pub(crate) type OwnedAggregateTopNBoundaryState =
     AggregateTopNBoundaryCore<OwnedTopNBoundaryStorage>;
 
 impl<S: TopNBoundaryStorage> AggregateTopNBoundaryCore<S> {
-    pub(crate) fn contract(&self) -> &Arc<RuntimeOrderContract> {
+    pub(crate) fn contract(&self) -> &crate::runtime_filter::RuntimeOrderContractRef {
         &self.contract
     }
 
@@ -424,8 +424,9 @@ impl<S: TopNBoundaryStorage> AggregateTopNBoundaryCore<S> {
 impl AggregateTopNBoundaryState {
     pub(crate) fn try_new(
         limit: NonZeroU32,
-        contract: Arc<RuntimeOrderContract>,
+        contract: impl Into<crate::runtime_filter::RuntimeOrderContractRef>,
     ) -> Result<Self, AggregateTopNBoundaryError> {
+        let contract = contract.into();
         validate_topn_boundary_contract(&contract)?;
         Ok(Self {
             limit: limit.get() as usize,
@@ -465,7 +466,7 @@ impl AggregateTopNBoundaryState {
 impl OwnedAggregateTopNBoundaryState {
     pub(crate) fn try_new_owned(
         limit: NonZeroU32,
-        contract: Arc<RuntimeOrderContract>,
+        contract: crate::runtime_filter::RuntimeOrderContractRef,
         host: &OrderedTopNAllocationHost,
     ) -> Result<Self, OwnedTopNBoundaryError> {
         validate_topn_boundary_contract(&contract)?;
@@ -515,7 +516,7 @@ impl AggregateTopNBoundaryBinding {
     pub(crate) fn try_new(
         group_key_ordinal: usize,
         limit: NonZeroU32,
-        contract: Arc<RuntimeOrderContract>,
+        contract: impl Into<crate::runtime_filter::RuntimeOrderContractRef>,
     ) -> Result<Self, AggregateTopNBoundaryError> {
         Ok(Self {
             group_key_ordinal,
@@ -529,7 +530,7 @@ impl AggregateTopNBoundaryBinding {
         let RuntimeFilterExecutionContract::Ordered(contract) = spec.contract().contract() else {
             return Err(AggregateTopNBoundaryError::NonOrderedContract);
         };
-        Self::try_new(spec.group_key_ordinal, spec.limit, Arc::clone(contract))
+        Self::try_new(spec.group_key_ordinal, spec.limit, contract.clone())
     }
 
     pub(crate) const fn state(&self) -> &AggregateTopNBoundaryState {
@@ -808,7 +809,7 @@ mod tests {
     fn execution_ordered_contract_for_test(
         contract: &RuntimeOrderContract,
     ) -> RuntimeFilterExecutionContract {
-        RuntimeFilterExecutionContract::Ordered(Arc::new(contract.clone()))
+        RuntimeFilterExecutionContract::Ordered(Arc::new(contract.clone()).into())
     }
 
     fn tuple(contract: &RuntimeOrderContract, value: Option<OrderedScalar>) -> OrderedTuple {

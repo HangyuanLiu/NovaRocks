@@ -41,9 +41,11 @@ pub(crate) use compiled::family_fixture::{
 #[cfg(test)]
 pub(crate) use compiled::{compiled_statistics_finish_fixture, compiled_statistics_writer_fixture};
 mod local;
+#[cfg(test)]
 pub(crate) use compiled::build_compiled_pipeline_graph;
 #[cfg(any(test, feature = "test-support"))]
 pub use compiled::build_compiled_pipeline_graph_for_test;
+pub(crate) use compiled::{CompiledOrderedFilterContext, build_compiled_pipeline_graph_typed};
 pub(crate) use local::build_native_pipeline_graph_for_local_program_with_runtime_settings;
 
 use crate::runtime_filter as execution;

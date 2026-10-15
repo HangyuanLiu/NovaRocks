@@ -36,7 +36,8 @@ pub(super) fn build_table_writer(
     input: ProgramNodeId,
     ctx: &mut PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
-) -> Result<PipelineBuildResult, String> {
+    ordered: Option<&CompiledOrderedFilterContext>,
+) -> ExecutionResult<PipelineBuildResult> {
     // The factory copies the Task capability it needs, so a refused binding
     // builds no driver.
     let binding = ctx.compiled_writers.writer(id).ok_or_else(|| {
@@ -46,7 +47,7 @@ pub(super) fn build_table_writer(
         )
     })?;
     let factory = compiled_table_writer_factory(program, id, node_id, binding, error)?;
-    let mut build = build_node(program, input, ctx, error)?;
+    let mut build = build_node(program, input, ctx, error, ordered)?;
     if matches!(
         program.graph().nodes()[input.index()].kind(),
         ProgramNodeKind::ExchangeSource { .. }
@@ -80,7 +81,8 @@ pub(super) fn build_table_finish(
     inputs: &[ProgramNodeId],
     ctx: &mut PipelineBuildContext,
     error: &Arc<RuntimeErrorState>,
-) -> Result<PipelineBuildResult, String> {
+    ordered: Option<&CompiledOrderedFilterContext>,
+) -> ExecutionResult<PipelineBuildResult> {
     let binding = ctx.compiled_writers.finisher(id).ok_or_else(|| {
         format!(
             "missing Task finish binding for compiled table finish at local node {}",
@@ -92,9 +94,10 @@ pub(super) fn build_table_finish(
         return Err(format!(
             "compiled table finish at local node {} reads more than one writer input",
             id.index()
-        ));
+        )
+        .into());
     };
-    let build = build_node(program, *input, ctx, error)?;
+    let build = build_node(program, *input, ctx, error, ordered)?;
     let mut build = gather_to_one(build, ctx, node_id);
     build.pipeline.factories.push(Box::new(factory));
     build.stream = StreamDesc::single();

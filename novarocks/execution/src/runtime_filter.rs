@@ -31,7 +31,9 @@ pub mod contribution;
 pub mod evaluator;
 mod failure;
 pub mod feedback_domain;
+mod order_contract;
 mod owned;
+pub use order_contract::RuntimeOrderContractRef;
 pub mod row_group_domain;
 pub use crate::exec::operators::AggregateTopNBoundaryError;
 pub use failure::RuntimeFilterFailure;
@@ -133,7 +135,7 @@ impl LogicalVersion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeFilterExecutionContract {
     Membership(RuntimeFilterMembershipSchema),
-    Ordered(Arc<contribution::RuntimeOrderContract>),
+    Ordered(RuntimeOrderContractRef),
 }
 
 impl RuntimeFilterExecutionContract {

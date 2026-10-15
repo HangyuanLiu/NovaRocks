@@ -175,7 +175,7 @@ pub fn dispatch_delivery_frame(
                     )
                 }
                 RuntimeFilterExecutionContract::Ordered(order) => {
-                    BackendRuntimeFilterArtifactQuery::ordered(&bundle, Arc::clone(order))
+                    BackendRuntimeFilterArtifactQuery::ordered(&bundle, order)
                 }
             };
             let Ok(query) = query else {

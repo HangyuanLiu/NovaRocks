@@ -184,6 +184,34 @@ impl OrderedTopNAllocationHost {
         self.allocator.clone()
     }
 
+    /// Retain a complete cold entity on the same host as its paid children.
+    /// The prefix covers construction only; the returned owner retains the
+    /// actual block until its final alias is destroyed.
+    pub(crate) fn retain_shared<T: Send + Sync + 'static>(
+        &self,
+        value: T,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<SourceBackingOwner<T>, KernelFailure> {
+        let _prefix = self.reserve_prefix()?;
+        let mut work = EvaluationCheckpoints::new(control);
+        work.flush()?;
+        let owner =
+            SourceBackingOwner::try_from_owned_direct(value, Arc::clone(&self.host), &mut work)?;
+        work.finish()?;
+        Ok(owner)
+    }
+
+    /// Retain the complete validated order, not only its shared key inventory.
+    pub(crate) fn utf8_shared_order_contract(
+        &self,
+        contract: &novarocks_local_program::StaticFilterContract,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<super::RuntimeOrderContractRef> {
+        let order = self.utf8_order_contract(contract, control)?;
+        let owner = self.retain_shared(order, control)?;
+        Ok(super::RuntimeOrderContractRef::from_owned(owner))
+    }
+
     /// Reconstruct the already frozen, first installed static order once on
     /// the actual creating host. No driver deep-copies these inner key slots.
     pub(crate) fn utf8_order_contract(

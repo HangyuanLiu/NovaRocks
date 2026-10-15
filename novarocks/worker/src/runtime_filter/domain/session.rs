@@ -768,7 +768,7 @@ impl BackendRuntimeFilterSession {
                 ) {
                     Ok(bundle) => match worker_runtime_filter::artifact_query::BackendRuntimeFilterArtifactQuery::ordered(
                         &bundle,
-                        Arc::clone(order),
+                        order,
                     ) {
                         Ok(query) => SnapshotAcquireOutcome::Published(Arc::new(
                             RuntimeFilterSnapshot::new(

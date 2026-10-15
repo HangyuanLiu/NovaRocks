@@ -359,7 +359,7 @@ fn runtime_filter_contract(
             )
             .map_err(|error| error.to_string())?;
             Ok(execution::RuntimeFilterExecutionContract::Ordered(
-                Arc::new(order),
+                Arc::new(order).into(),
             ))
         }
     }

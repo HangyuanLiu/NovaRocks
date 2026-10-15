@@ -351,7 +351,7 @@ mod tests {
             RuntimeFilterBindingId::new(7),
             RuntimeFilterChannelId::new(11),
             k,
-            RuntimeFilterExecutionContract::Ordered(Arc::clone(&order)),
+            RuntimeFilterExecutionContract::Ordered(Arc::clone(&order).into()),
         )
         .expect("TopK producer contract is valid");
         let policy = BackendInstallPolicy::new(

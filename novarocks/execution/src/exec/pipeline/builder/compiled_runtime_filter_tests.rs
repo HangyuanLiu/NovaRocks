@@ -742,7 +742,7 @@ fn frozen_filters_keep_complete_installed_types_and_owned_canonical_storage() {
             execution::RuntimeFilterBindingId::new(12),
             execution::RuntimeFilterChannelId::new(12),
             execution::RuntimeFilterLateApplyGranularity::Batch,
-            execution::RuntimeFilterExecutionContract::Ordered(Arc::new(order)),
+            execution::RuntimeFilterExecutionContract::Ordered(Arc::new(order).into()),
         )
         .unwrap();
         let frozen = freeze_installed_consumer(&declared, &installed);

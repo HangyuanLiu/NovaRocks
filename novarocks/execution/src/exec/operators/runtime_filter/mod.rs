@@ -1648,7 +1648,7 @@ mod tests {
             RuntimeFilterBindingId::new(1),
             RuntimeFilterChannelId::new(2),
             ConsumerActivation::BlockingSnapshot,
-            RuntimeFilterExecutionContract::Ordered(order),
+            RuntimeFilterExecutionContract::Ordered(order.into()),
         );
         let error = match NativeOrderedLiveConsumerSet::from_plan(
             &[RuntimeFilterConsumerBinding::new(expr_id, contract)],

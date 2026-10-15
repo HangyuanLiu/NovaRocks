@@ -58,6 +58,7 @@ pub(crate) mod runtime_scalar_memory_test_support;
 /// Kernel control backed by the fragment's runtime error state: a recorded
 /// failure or cancellation refuses the next checkpoint, and waits are
 /// interruptible by the same state.
+#[derive(Clone)]
 pub(crate) struct RuntimeKernelControl {
     error: Arc<RuntimeErrorState>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,

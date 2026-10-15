@@ -48,7 +48,7 @@ fn key_value(key: &OwnedUtf8OrderKey) -> Option<&str> {
 fn contract(
     direction: RuntimeOrderSortDirection,
     nulls: RuntimeOrderNullOrder,
-) -> Arc<RuntimeOrderContract> {
+) -> crate::runtime_filter::RuntimeOrderContractRef {
     Arc::new(RuntimeOrderContract::from_frozen(
         [RuntimeOrderKey::with_order(
             DataType::Utf8,
@@ -58,6 +58,7 @@ fn contract(
         [2; 32],
         [3; 32],
     ))
+    .into()
 }
 fn oracle_cmp(
     a: Option<&str>,
