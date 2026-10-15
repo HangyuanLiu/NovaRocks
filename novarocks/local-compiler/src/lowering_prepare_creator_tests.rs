@@ -1038,3 +1038,156 @@ fn original_request_header_gates_and_pending_control_precede_lazy_scope_creation
     drop(empty);
     assert_eq!(factory.observations.held.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn actual_runtime_filter_canonical_keeps_complete_type_creator_and_first_h() {
+    use crate::runtime_filter_lowering_tests::{Rf, broadcast};
+    use novarocks_local_program::{ProgramNodeKind, StaticFilterContract};
+
+    // Reuse this module's actual finite factory and the original RF source;
+    // provider validation remains the original pure provider author.
+    fn compile_rf(
+        source: Arc<FragmentPackage>,
+        functions: &PureEngineFunctionCatalog,
+        factory: &Factory,
+        stop: Option<usize>,
+    ) -> Result<LocalProgram, FragmentCreationError<FirstH>> {
+        let validated = validate_fragment_providers(
+            source,
+            &crate::scan_lowering_tests::providers(),
+            &FixtureControl,
+        )
+        .unwrap();
+        let main = RefCell::new(
+            factory
+                .begin_scope()
+                .map_err(FragmentCreationError::Creator)?,
+        );
+        let mut temporary = factory
+            .begin_scope()
+            .map_err(FragmentCreationError::Creator)?;
+        let mut request = |layout| main.borrow_mut().request_layout(layout);
+        let mut opaque = |bytes| main.borrow_mut().observe_opaque_upper_bound(bytes);
+        let mut creation =
+            ValueSchemaCreation::new(main.borrow().storage_lifetime(), &mut request, &mut opaque);
+        factory.observations.start();
+        *factory.observations.request_stop.lock().unwrap() = stop;
+        compile_fragment_with_creation(
+            validated,
+            functions,
+            crate::scan_lowering_tests::options(None),
+            &mut creation,
+            &mut temporary,
+            factory,
+            factory.observations.as_ref(),
+        )
+    }
+
+    let source = broadcast(Rf::blocking());
+    let novarocks_physical_plan::RuntimeFilterDomain::Membership {
+        ty: original_type,
+        null_semantics: original_null,
+    } = &source.cuts().runtime_filters[0].domain
+    else {
+        panic!("the original source is a membership filter")
+    };
+    let original_type = original_type.clone();
+    assert_eq!(
+        *original_null,
+        novarocks_physical_plan::RuntimeFilterNullSemantics::NeverMatches,
+    );
+    let functions = crate::scan_lowering_tests::functions();
+    let factory = Factory::new();
+    let observations = factory.observations.clone();
+    let program = compile_rf(source.clone(), &functions, &factory, None).unwrap();
+    let trace = observations.events();
+    let canonical_scope = trace
+        .iter()
+        .find_map(|event| match event {
+            // Main and temporary holders were created before trace start;
+            // the first new entity is the original membership canonical.
+            Event::Holder(scope, _) => Some(*scope),
+            _ => None,
+        })
+        .expect("actual canonical construction opens its independent scope");
+    let first_canonical_request = trace
+        .iter()
+        .position(|event| matches!(event, Event::Exact(scope, _, _) if *scope == canonical_scope))
+        .expect("actual canonical construction has a before-allocation quote");
+    let canonical = program
+        .graph()
+        .nodes()
+        .iter()
+        .find_map(|node| match node.kind() {
+            ProgramNodeKind::Join {
+                runtime_filters, ..
+            } => {
+                let [producer] = runtime_filters.as_slice() else {
+                    panic!("the original join has one membership producer")
+                };
+                let StaticFilterContract::Membership {
+                    canonical,
+                    value_type,
+                } = producer.producer.contract()
+                else {
+                    panic!("the producer retains its original membership contract")
+                };
+                assert_eq!(value_type, &original_type);
+                assert_eq!(
+                    canonical.null_semantics(),
+                    novarocks_local_program::FilterNullSemantics::NeverMatches,
+                );
+                Some(canonical.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let expected = novarocks_local_program::FilterMembershipSchema::try_new(
+        original_type.data_type(),
+        novarocks_local_program::FilterNullSemantics::NeverMatches,
+    )
+    .unwrap();
+    assert_eq!(
+        canonical, expected,
+        "the original canonical bytes and digest survive"
+    );
+    let peak = observations.held.load(Ordering::SeqCst);
+    assert!(peak > 0);
+    drop(program);
+    drop(source);
+    drop(functions);
+    drop(factory);
+    assert_eq!(observations.factory_exits.load(Ordering::SeqCst), 1);
+    let remaining = observations.held.load(Ordering::SeqCst);
+    assert!(
+        remaining > 0 && remaining < peak,
+        "only the finite canonical entity survives"
+    );
+    assert_eq!(canonical, expected);
+    drop(canonical);
+    assert_eq!(observations.held.load(Ordering::SeqCst), 0);
+
+    let rejected = Factory::new();
+    let failed_observations = rejected.observations.clone();
+    let token = rejected.token.clone();
+    let result = compile_rf(
+        broadcast(Rf::blocking()),
+        &crate::scan_lowering_tests::functions(),
+        &rejected,
+        Some(first_canonical_request),
+    );
+    match result {
+        Err(FragmentCreationError::Creator(FirstH(actual))) => {
+            assert!(Arc::ptr_eq(&actual, &token));
+        }
+        Err(other) => panic!("the original canonical request must keep its H: {other:?}"),
+        Ok(_) => panic!("the actual canonical request must refuse"),
+    }
+    assert_eq!(
+        failed_observations.events(),
+        trace[..=first_canonical_request],
+        "neither a later control callback nor a footer follows the primary H",
+    );
+    drop(rejected);
+    assert_eq!(failed_observations.held.load(Ordering::SeqCst), 0);
+}

@@ -447,14 +447,14 @@ enum Consumer {
 }
 
 #[derive(Clone, Copy)]
-struct Rf {
+pub(super) struct Rf {
     null_safe: bool,
     consumer: Consumer,
     /// An ordered-hull domain instead of a membership domain.
     ordered: bool,
 }
 impl Rf {
-    const fn blocking() -> Self {
+    pub(super) const fn blocking() -> Self {
         Self {
             null_safe: false,
             consumer: Consumer::BlockingScan,
@@ -658,7 +658,7 @@ fn dynamic_filter() -> StaticScanDynamicFilter {
 /// `SELECT v0, v1 FROM t JOIN broadcast(VALUES (7), (8), (20)) ON v0 = c0`
 /// in one fragment that streams to a gather. The join produces the filter
 /// and, unless `rf` names another consumer, its probe scan consumes it.
-fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
+pub(super) fn broadcast(rf: Rf) -> Arc<FragmentPackage> {
     let mut builder = FragmentBuilder::new(PROBE);
     let scan = add_scan(&mut builder, Distribution::Unconstrained);
     let (build, build_column) = build_fragment(BUILD_EDGE, rf.null_safe);
