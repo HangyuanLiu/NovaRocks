@@ -181,20 +181,18 @@ impl Preparer for SlotChangePreparer {
         for key in &removals {
             after.remove(key);
         }
-        // Only available ref heads are loaded here. Complete historical
-        // retained-byte diagnostics are collected by the caller on rejection.
-        let retained_bytes = rewrites
-            .iter()
-            .filter(|(key, _)| key.starts_with("novarocks.doc.v2.rev."))
-            .map(|(key, value)| key.len() + value.len())
-            .sum();
-        limits::check_private_properties(&after, retained_bytes, KeyedDocumentLimits::default())
+        limits::check_private_properties(&after, None, KeyedDocumentLimits::default())
             .map_err(document_error)?;
         let operation = if parent.is_some() {
             Operation::Replace
         } else {
             Operation::Append
         };
+        let carried_record_bytes = carry
+            .summary
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum();
         let mut change = super::overwrite::prepare_snapshot_change(
             view,
             intent,
@@ -213,6 +211,14 @@ impl Preparer for SlotChangePreparer {
                 .updates
                 .push(TableUpdate::RemoveProperties { removals });
         }
+        for name in self.change.slots.keys() {
+            tracing::info!(slot = %keys::slot_key(name), preselected_snapshot_id = snapshot_id, "Prepared ordered document slot change");
+        }
+        crate::document_storage::keyed::write::trace_updates(
+            metadata.properties(),
+            &change.updates,
+            carried_record_bytes,
+        );
         Ok(change)
     }
 }

@@ -368,6 +368,21 @@ async fn run_rewrite_manifests_with_table(
             });
         }
     }
+    let record_bytes = updates
+        .iter()
+        .filter_map(|update| match update {
+            TableUpdate::AddSnapshot { snapshot } => Some(snapshot),
+            _ => None,
+        })
+        .flat_map(|snapshot| snapshot.summary().additional_properties.iter())
+        .filter(|(key, _)| key.starts_with(crate::document_storage::keyed::keys::RECORD_PREFIX))
+        .map(|(key, value)| key.len() + value.len())
+        .sum();
+    crate::document_storage::keyed::write::trace_updates(
+        metadata.properties(),
+        &updates,
+        record_bytes,
+    );
     let requirements = vec![
         TableRequirement::CurrentSchemaIdMatch {
             current_schema_id: metadata.current_schema_id(),

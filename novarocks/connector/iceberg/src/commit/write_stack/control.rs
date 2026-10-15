@@ -1187,6 +1187,26 @@ impl IcebergWriteSessionControl {
             document_publication,
             context,
         );
+        if document_publication
+            .and_then(FinishDocumentPublication::keyed)
+            .is_some()
+            && let Ok(ExternalMutationOutcome::KnownUncommitted {
+                failure: rejection, ..
+            }) = &mut outcome
+            && rejection.kind() == ConnectorMutationFailureKind::InvalidRequest
+        {
+            let error = crate::document_storage::keyed::write::refusal_with_retained_bytes(
+                &self.runtime,
+                handle.table().namespace(),
+                handle.table().table_name(),
+                context,
+                invalid(rejection.message()),
+            );
+            *rejection = failure(
+                ConnectorMutationFailureKind::InvalidRequest,
+                error.to_string(),
+            );
+        }
         #[cfg(feature = "test-controls")]
         emit_iceberg_write_phase_marker(
             self.observation_slot.as_ref(),

@@ -89,7 +89,14 @@ pub(crate) fn create_properties(
     for (owner, id) in &documents.roots {
         properties.insert(keys::root_key(owner), id.to_hex());
     }
-    limits::check_private_properties(&properties, 0, KeyedDocumentLimits::default())?;
+    limits::check_private_properties(&properties, Some(0), KeyedDocumentLimits::default())?;
+    trace_updates(
+        &HashMap::new(),
+        &[TableUpdate::SetProperties {
+            updates: properties.clone(),
+        }],
+        0,
+    );
     Ok(properties)
 }
 
@@ -107,23 +114,15 @@ pub(crate) fn marker_properties(
         .collect::<Result<HashMap<_, _>, ConnectorError>>()?;
     let mut after = metadata.properties().clone();
     after.extend(properties.clone());
-    limits::check_private_properties(
-        &after,
-        retained_version_bytes(metadata),
-        KeyedDocumentLimits::default(),
-    )?;
+    limits::check_private_properties(&after, None, KeyedDocumentLimits::default())?;
+    trace_updates(
+        metadata.properties(),
+        &[TableUpdate::SetProperties {
+            updates: properties.clone(),
+        }],
+        0,
+    );
     Ok(properties)
-}
-
-/// This count is a visible-version diagnostic. Complete retained-snapshot
-/// attribution is computed from an All observation only on a budget refusal.
-pub(crate) fn retained_version_bytes(metadata: &TableMetadata) -> usize {
-    metadata
-        .properties()
-        .iter()
-        .filter(|(key, _)| key.starts_with("novarocks.doc.v2.rev."))
-        .map(|(key, value)| key.len().saturating_add(value.len()))
-        .sum()
 }
 
 #[derive(Debug)]
@@ -211,11 +210,7 @@ pub(crate) fn publication_updates(
         for key in &removals {
             after.remove(key);
         }
-        limits::check_private_properties(
-            &after,
-            retained_version_bytes(metadata),
-            KeyedDocumentLimits::default(),
-        )?;
+        limits::check_private_properties(&after, None, KeyedDocumentLimits::default())?;
     }
     let mut updates = Vec::new();
     if !properties.is_empty() {
@@ -226,6 +221,14 @@ pub(crate) fn publication_updates(
     if !removals.is_empty() {
         updates.push(TableUpdate::RemoveProperties { removals });
     }
+    trace_updates(
+        metadata.properties(),
+        &updates,
+        summary
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum(),
+    );
     Ok(PublicationUpdates { summary, updates })
 }
 
@@ -237,4 +240,86 @@ pub(crate) fn reject_reserved_property(key: &str) -> Result<(), ConnectorError> 
         ));
     }
     Ok(())
+}
+
+/// Refusal diagnostics may read history; successful ordinary refresh never does.
+/// Classification remains the original known-undispatched error even if the
+/// separate diagnostic observation is unavailable.
+pub(crate) fn refusal_with_retained_bytes(
+    runtime: &crate::metadata_context::IcebergMetadataContext,
+    namespace: &str,
+    table: &str,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    error: ConnectorError,
+) -> ConnectorError {
+    if error.kind() != ConnectorErrorKind::InvalidRequest {
+        return error;
+    }
+    let diagnostic = runtime
+        .observe_table_classified_for_request_with_snapshots(
+            namespace,
+            table,
+            context,
+            crate::catalog::SnapshotLoading::All,
+        )
+        .map_err(|(kind, message)| ConnectorError::new(kind, message))
+        .and_then(|physical| {
+            super::retention::snapshot_referenced_bytes(physical.table.metadata())
+        });
+    let detail = match diagnostic {
+        Ok(bytes) => format!("retained snapshot references occupy {bytes} bytes"),
+        Err(error) => format!("retained snapshot byte diagnostic unavailable: {error}"),
+    };
+    ConnectorError::new(error.kind(), format!("{}; {detail}", error.message()))
+}
+
+pub(crate) fn trace_updates(
+    before: &HashMap<String, String>,
+    updates: &[TableUpdate],
+    record_bytes: usize,
+) {
+    let mut after = before.clone();
+    let mut written = 0usize;
+    let mut rewritten = 0usize;
+    let mut removed = 0usize;
+    let mut snapshots_removed = 0usize;
+    let mut document_versions_deleted = 0usize;
+    for update in updates {
+        match update {
+            TableUpdate::SetProperties { updates } => {
+                for (key, value) in updates {
+                    if key.starts_with(keys::PREFIX) {
+                        if before.get(key) == Some(value) {
+                            rewritten += 1;
+                        } else {
+                            written += 1;
+                        }
+                    }
+                    after.insert(key.clone(), value.clone());
+                }
+            }
+            TableUpdate::RemoveProperties { removals } => {
+                for key in removals {
+                    removed += usize::from(key.starts_with(keys::PREFIX));
+                    document_versions_deleted +=
+                        usize::from(key.starts_with("novarocks.doc.v2.rev."));
+                    after.remove(key);
+                }
+            }
+            TableUpdate::RemoveSnapshots { snapshot_ids } => {
+                snapshots_removed += snapshot_ids.len()
+            }
+            _ => {}
+        }
+    }
+    tracing::info!(
+        private_keys_written = written,
+        private_keys_rewritten = rewritten,
+        private_keys_deleted = removed,
+        private_property_bytes = limits::private_property_bytes(&after),
+        snapshot_record_bytes = record_bytes,
+        snapshots_removed,
+        document_versions_deleted,
+        "Prepared keyed document updates"
+    );
 }

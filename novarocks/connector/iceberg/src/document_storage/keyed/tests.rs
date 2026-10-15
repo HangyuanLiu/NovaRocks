@@ -475,9 +475,9 @@ fn limits_are_encoded_bytes_and_boundaries_are_inclusive() {
     let size = "novarocks.doc.v2.root.a".len() + 64;
     assert_eq!(private_property_bytes(&props), size);
     limits.private_property_bytes = size;
-    check_private_properties(&props, 0, limits).unwrap();
+    check_private_properties(&props, Some(0), limits).unwrap();
     limits.private_property_bytes -= 1;
-    let error = check_private_properties(&props, 77, limits).unwrap_err();
+    let error = check_private_properties(&props, Some(77), limits).unwrap_err();
     assert!(error.message().contains("77"));
     let r = record(Some(v.identity()));
     let size = record_bytes(&r).unwrap();
@@ -494,9 +494,9 @@ fn default_budgets_cover_real_boundary_sizes() {
     let limits = KeyedDocumentLimits::default();
     let key = root_key("owner");
     let mut props = HashMap::from([(key.clone(), "x".repeat(256 * 1024 - key.len()))]);
-    check_private_properties(&props, 0, limits).unwrap();
+    check_private_properties(&props, Some(0), limits).unwrap();
     props.get_mut(&key).unwrap().push('x');
-    assert!(check_private_properties(&props, 0, limits).is_err());
+    assert!(check_private_properties(&props, Some(0), limits).is_err());
     let overhead = encode_version(&version()).unwrap().len() - 4;
     let largest_content = (64 * 1024 - overhead) / 4 * 3;
     let make = |count| {

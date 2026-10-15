@@ -231,41 +231,6 @@ pub(super) fn execute(
             )
             .map_err(document_error)?;
             preflight_journal.record(evidence, receipt, frozen)?;
-            let mut written = 0usize;
-            let mut deleted = 0usize;
-            let mut record_bytes = 0usize;
-            for update in frozen.updates() {
-                match update {
-                    TableUpdate::SetProperties { updates } => {
-                        written += updates
-                            .keys()
-                            .filter(|key| key.starts_with(keyed::keys::PREFIX))
-                            .count()
-                    }
-                    TableUpdate::RemoveProperties { removals } => {
-                        deleted += removals
-                            .iter()
-                            .filter(|key| key.starts_with(keyed::keys::PREFIX))
-                            .count()
-                    }
-                    TableUpdate::AddSnapshot { snapshot } => {
-                        record_bytes += snapshot
-                            .summary()
-                            .additional_properties
-                            .iter()
-                            .filter(|(key, _)| key.starts_with(keyed::keys::RECORD_PREFIX))
-                            .map(|(key, value)| key.len() + value.len())
-                            .sum::<usize>();
-                    }
-                    _ => {}
-                }
-            }
-            tracing::info!(
-                private_keys_written = written,
-                private_keys_deleted = deleted,
-                snapshot_record_bytes = record_bytes,
-                "Prepared keyed document mutation"
-            );
             Ok(())
         },
     );
@@ -334,6 +299,28 @@ pub(super) fn execute(
             }
         }
     };
+    if shape != RequestShape::DocumentExpiry
+        && let ExternalMutationOutcome::KnownUncommitted {
+            failure: rejection, ..
+        } = &mut outcome
+    {
+        if rejection.kind() == ConnectorMutationFailureKind::InvalidRequest {
+            let error = keyed::write::refusal_with_retained_bytes(
+                provider.runtime(),
+                &target.namespace,
+                &target.table,
+                &request.context,
+                invalid(rejection.message()),
+            );
+            *rejection = failure(&error);
+        }
+    }
+    if matches!(outcome, ExternalMutationOutcome::KnownCommitted { .. }) {
+        provider
+            .runtime()
+            .control_state()
+            .invalidate_table_cache(&target.namespace, &target.table);
+    }
     if shape != RequestShape::DocumentExpiry
         && let ExternalMutationOutcome::KnownCommitted {
             receipt,

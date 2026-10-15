@@ -6197,4 +6197,181 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn keyed_expiry_dispatches_version_deletion_without_snapshot_removal() {
+        use novarocks_spi::connector::{
+            ConnectorDocumentVersion, KeyedDocumentObservationRequest, KeyedExpiry, KeyedMutation,
+        };
+        let (_executor, _warehouse, provider) = document_provider();
+        let table = guarded_table(&provider);
+        let loaded = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        let orphan = ConnectorDocumentVersion::try_new(
+            "novarocks.test",
+            "orphan",
+            ConnectorDocumentFormat::try_new("novarocks.test", "fact", 1).unwrap(),
+            vec![],
+            Bytes::from_static(b"unreferenced"),
+        )
+        .unwrap();
+        let key = crate::document_storage::keyed::keys::version_key(orphan.identity());
+        // Fixture setup installs an unreachable historical version. The tested
+        // expiry is the only operation allowed to remove that private key.
+        let setup = crate::commit::existing_commit::existing_table_commit(
+            table_ident(&table).unwrap(),
+            loaded.table.metadata(),
+            vec![],
+            vec![TableUpdate::SetProperties {
+                updates: HashMap::from([(
+                    key.clone(),
+                    crate::document_storage::keyed::envelope::encode_version(&orphan).unwrap(),
+                )]),
+            }],
+        )
+        .unwrap();
+        update_table(provider.runtime(), setup, "seed unreachable version").unwrap();
+        provider
+            .runtime()
+            .control_state()
+            .invalidate_table_cache(&table.namespace, &table.table);
+        let lease = document_storage_lease(&provider);
+        let full = lease
+            .observe_full_keyed_documents(KeyedDocumentObservationRequest {
+                owner: ConnectorProviderBindingKey {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    incarnation: provider.incarnation(),
+                },
+                catalog_handle: lease.catalog_handle().clone(),
+                target: table.clone(),
+                object_id: crate::document_storage::observation::table_object_id(
+                    loaded.table.metadata(),
+                )
+                .unwrap(),
+                context: context(),
+            })
+            .unwrap();
+        assert!(full.snapshots.is_empty());
+        let request = keyed_channel_request(
+            &provider,
+            &table,
+            KeyedMutation::Expiry(KeyedExpiry {
+                observation: full.token,
+                remove_snapshots: Default::default(),
+            }),
+        );
+        assert!(matches!(
+            provider.execute(request).unwrap(),
+            ExternalMutationOutcome::KnownCommitted { .. }
+        ));
+        let loaded = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        assert!(!loaded.table.metadata().properties().contains_key(&key));
+        assert_eq!(loaded.table.metadata().snapshots().len(), 0);
+    }
+
+    #[test]
+    fn keyed_slot_evidence_is_bound_to_table_operation_and_valid_slot_names() {
+        use novarocks_spi::connector::{KeyedDocumentObservationRequest, UnknownCommitIdentity};
+        let (_executor, _warehouse, provider) = document_provider();
+        let table = guarded_table(&provider);
+        let loaded = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        let lease = document_storage_lease(&provider);
+        let request = KeyedDocumentObservationRequest {
+            owner: ConnectorProviderBindingKey {
+                instance_id: provider.descriptor().instance_id.clone(),
+                incarnation: provider.incarnation(),
+            },
+            catalog_handle: lease.catalog_handle().clone(),
+            target: table.clone(),
+            object_id: crate::document_storage::observation::table_object_id(
+                loaded.table.metadata(),
+            )
+            .unwrap(),
+            context: context(),
+        };
+        let operation = ConnectorMutationOperationId::new();
+        let make = |uuid: String, op: [u8; 16], slots: Vec<(String, String)>| {
+            evidence(
+                &provider,
+                operation,
+                "keyed-documents",
+                IcebergMutationEvidenceTarget::KeyedSlotChange {
+                    namespace: table.namespace.to_string(),
+                    table: table.table.to_string(),
+                    table_uuid: uuid,
+                    operation_id: op,
+                    asserted_parent: None,
+                    preselected_snapshot: 42,
+                    slots,
+                },
+            )
+            .unwrap()
+        };
+        let slots = vec![("novarocks.mv".into(), "configuration".into())];
+        let decoded = lease
+            .decode_keyed_slot_change_evidence(
+                request.clone(),
+                make(
+                    loaded.table.metadata().uuid().to_string(),
+                    operation.to_bytes(),
+                    slots.clone(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(decoded.preselected_snapshot, 42);
+        assert!(
+            matches!(decoded.identity,UnknownCommitIdentity::SlotWriter {slot} if slot.name=="configuration")
+        );
+        assert!(
+            lease
+                .decode_keyed_slot_change_evidence(
+                    request.clone(),
+                    make("replaced".into(), operation.to_bytes(), slots.clone())
+                )
+                .is_err()
+        );
+        assert!(
+            lease
+                .decode_keyed_slot_change_evidence(
+                    request.clone(),
+                    make(
+                        loaded.table.metadata().uuid().to_string(),
+                        [0; 16],
+                        slots.clone()
+                    )
+                )
+                .is_err()
+        );
+        assert!(
+            lease
+                .decode_keyed_slot_change_evidence(
+                    request.clone(),
+                    make(
+                        loaded.table.metadata().uuid().to_string(),
+                        operation.to_bytes(),
+                        vec![("novarocks.mv".into(), "bad~name".into())]
+                    )
+                )
+                .is_err()
+        );
+        assert!(
+            lease
+                .decode_keyed_slot_change_evidence(
+                    request,
+                    make(
+                        loaded.table.metadata().uuid().to_string(),
+                        operation.to_bytes(),
+                        vec![slots[0].clone(), slots[0].clone()]
+                    )
+                )
+                .is_err()
+        );
+    }
 }

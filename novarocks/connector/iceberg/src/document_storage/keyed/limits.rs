@@ -70,7 +70,7 @@ pub(crate) fn check_version(
 /// of an existing binding must not acquire a history-dependent admission gate.
 pub(crate) fn check_private_properties(
     properties: &HashMap<String, String>,
-    retained_bytes: usize,
+    retained_bytes: Option<usize>,
     limits: KeyedDocumentLimits,
 ) -> Result<(), ConnectorError> {
     check(
@@ -78,7 +78,7 @@ pub(crate) fn check_private_properties(
         "table",
         private_property_bytes(properties),
         limits.private_property_bytes,
-        Some(retained_bytes),
+        retained_bytes,
     )
 }
 pub(crate) fn record_bytes(record: &ConnectorSnapshotRecord) -> Result<usize, ConnectorError> {

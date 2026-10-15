@@ -96,3 +96,41 @@ pub(crate) fn deletable_versions(
 #[cfg(test)]
 #[path = "retention_tests.rs"]
 mod tests;
+
+/// Unique encoded property bytes referenced by retained snapshots in one All
+/// observation. Roots alone do not count as snapshot retention responsibility.
+pub(crate) fn snapshot_referenced_bytes(
+    metadata: &crate::iceberg::spec::TableMetadata,
+) -> Result<usize, ConnectorError> {
+    let properties = super::view::parse_properties(metadata.properties())
+        .map_err(super::super::observation::keyed_read_error)?;
+    let mut pending = Vec::new();
+    for snapshot in metadata.snapshots() {
+        pending.extend(
+            super::view::parse_snapshot_records(
+                &snapshot.summary().additional_properties,
+                Some(snapshot.snapshot_id()) == metadata.current_snapshot_id(),
+            )
+            .map_err(super::super::observation::keyed_read_error)?
+            .into_iter()
+            .filter_map(|record| record.binding),
+        );
+    }
+    let mut live = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if live.contains(&id) {
+            continue;
+        }
+        if let Some(version) = properties.versions.get(&id) {
+            live.insert(id);
+            pending.extend(version.references().values().copied());
+        }
+    }
+    Ok(live
+        .into_iter()
+        .map(|id| {
+            let key = super::keys::version_key(id);
+            key.len() + metadata.properties()[&key].len()
+        })
+        .sum())
+}

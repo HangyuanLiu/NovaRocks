@@ -54,6 +54,7 @@ struct WriteRecipe {
     summary: BTreeMap<String, String>,
     prefix: PreparedChange,
     output_facts: crate::write_codec::IcebergWrittenOutputFacts,
+    keyed_documents: Option<novarocks_spi::connector::KeyedPublication>,
 }
 
 impl WriteRecipe {
@@ -127,18 +128,15 @@ impl WriteRecipe {
             rows,
             documents.and_then(FinishDocumentPublication::legacy),
         )?;
-        let keyed_updates = documents
+        let keyed_documents = documents
             .and_then(FinishDocumentPublication::keyed)
-            .map(|intent| {
-                crate::document_storage::keyed::write::publication_updates(
-                    &source,
-                    &intent.documents,
-                )
-            })
-            .transpose()?;
-        if let Some(keyed) = &keyed_updates {
-            for (key, value) in &keyed.summary {
-                if summary.insert(key.clone(), value.clone()).is_some() {
+            .map(|intent| intent.documents.clone());
+        if let Some(keyed) = &keyed_documents {
+            for record in &keyed.records {
+                let key =
+                    crate::document_storage::keyed::keys::record_key(&record.owner, &record.name);
+                let value = crate::document_storage::keyed::record::encode_record(record)?;
+                if summary.insert(key, value).is_some() {
                     return Err(invalid(
                         "keyed record conflicts with a provider summary field",
                     ));
@@ -167,9 +165,6 @@ impl WriteRecipe {
         )? {
             // Repartition's declarative updates are canonicalized by StagingEngine.
             prefix.updates = updates;
-        }
-        if let Some(keyed) = keyed_updates {
-            prefix.updates.extend(keyed.updates);
         }
         // The writer schema and spec are exact admission facts, independent of the
         // ref dependency. A concurrent schema/spec change never reinterprets files.
@@ -205,6 +200,7 @@ impl WriteRecipe {
             summary,
             prefix,
             output_facts,
+            keyed_documents,
         })
     }
 
@@ -415,6 +411,34 @@ fn cow_output_row_ids(
     Ok(markers)
 }
 
+struct KeyedPublicationPreparer(novarocks_spi::connector::KeyedPublication);
+#[async_trait]
+impl Preparer for KeyedPublicationPreparer {
+    async fn prepare(
+        &self,
+        view: &StagedView<'_>,
+        intent: &OperationIntent,
+    ) -> crate::iceberg::Result<PreparedChange> {
+        // Recompute closure and budget on this attempt's actual refs base.
+        // A concurrent metadata-only marker write may increase its byte size
+        // without advancing main; the admitted source is not that base.
+        let prepared =
+            crate::document_storage::keyed::write::publication_updates(view.metadata(), &self.0)
+                .map_err(format_error)?;
+        for (key, value) in &prepared.summary {
+            if intent.summary().get(key) != Some(value) {
+                return Err(format_error(invalid(
+                    "keyed publication record differs from its frozen intent",
+                )));
+            }
+        }
+        Ok(PreparedChange {
+            requirements: vec![],
+            updates: prepared.updates,
+        })
+    }
+}
+
 struct WriteStatisticsPreparer {
     op_kind: CommitOpKind,
     drafts: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
@@ -575,7 +599,23 @@ impl IcebergWriteSessionControl {
         let recipe = WriteRecipe::freeze(handle, validated, documents);
         let recipe = match recipe {
             Ok(recipe) => recipe,
-            Err(error) => return Ok(self.reject_operation(&operation, error)),
+            Err(error) => {
+                let error = if documents
+                    .and_then(FinishDocumentPublication::keyed)
+                    .is_some()
+                {
+                    crate::document_storage::keyed::write::refusal_with_retained_bytes(
+                        &self.runtime,
+                        handle.table().namespace(),
+                        handle.table().table_name(),
+                        context,
+                        error,
+                    )
+                } else {
+                    error
+                };
+                return Ok(self.reject_operation(&operation, error));
+            }
         };
         let data = match recipe.preparer() {
             Ok(data) => data,
@@ -662,11 +702,17 @@ impl IcebergWriteSessionControl {
                         .await;
                     }
                 };
+                let keyed = recipe.keyed_documents.map(KeyedPublicationPreparer);
+                let mut preparers: Vec<&dyn Preparer> = Vec::new();
+                if let Some(keyed) = &keyed {
+                    preparers.push(keyed);
+                }
+                preparers.extend([data.as_ref(), &stats as &dyn Preparer]);
                 attempt::run(
                     &run_operation,
                     &intent,
                     &recipe.prefix,
-                    &[data.as_ref(), &stats],
+                    &preparers,
                     &publisher,
                     policy,
                 )
@@ -1600,5 +1646,176 @@ mod recovery_tests {
         nested["artifacts"][0]["unknown"] = serde_json::json!(true);
         let nested = super::super::recovery_codec::encode(&nested).unwrap();
         assert!(super::super::recovery_codec::decode::<RecoveryPayload>(&nested).is_err());
+    }
+}
+
+#[cfg(test)]
+mod keyed_preparation_tests {
+    use super::*;
+    use crate::commit::overwrite::preparer_tests::Fixture;
+    use crate::iceberg::TableUpdate;
+    use crate::iceberg::spec::FormatVersion;
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        ConnectorDocumentFormat, ConnectorDocumentVersion, ConnectorSnapshotRecord,
+        KeyedPublication,
+    };
+    use std::collections::HashMap;
+
+    fn document(name: &str, bytes: usize) -> ConnectorDocumentVersion {
+        ConnectorDocumentVersion::try_new(
+            "novarocks.test",
+            name,
+            ConnectorDocumentFormat::try_new("novarocks.test", "fact", 1).unwrap(),
+            vec![],
+            Bytes::from(vec![b'x'; bytes]),
+        )
+        .unwrap()
+    }
+    fn publication(version: ConnectorDocumentVersion) -> KeyedPublication {
+        KeyedPublication {
+            records: vec![ConnectorSnapshotRecord {
+                owner: "novarocks.test".into(),
+                name: "publication".into(),
+                binding: Some(version.identity()),
+                payload: Bytes::from_static(b"result"),
+            }],
+            roots: BTreeMap::from([("novarocks.test".into(), version.identity())]),
+            versions: vec![version],
+            ..Default::default()
+        }
+    }
+    fn intent(
+        fixture: &Fixture,
+        metadata: &TableMetadata,
+        documents: &KeyedPublication,
+    ) -> OperationIntent {
+        OperationIntent::new(OperationIntentParts {
+            target: TableTarget {
+                ident: crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
+                uuid: Some(metadata.uuid()),
+            },
+            target_ref: "main".into(),
+            start: None,
+            changes: FileChanges::default(),
+            dependencies: vec![crate::commit::model::Dependency::RefUnchanged],
+            isolation: IsolationLevel::Snapshot,
+            shape: RequestShape::SnapshotProducing,
+            summary: documents
+                .records
+                .iter()
+                .map(|record| {
+                    (
+                        crate::document_storage::keyed::keys::record_key(
+                            &record.owner,
+                            &record.name,
+                        ),
+                        crate::document_storage::keyed::record::encode_record(record).unwrap(),
+                    )
+                })
+                .collect(),
+            token: fixture.operation.token(),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn keyed_publication_uses_actual_attempt_properties_before_writing_any_manifest() {
+        use crate::commit::staging::StagingEngine;
+        let fixture = Fixture::new();
+        let mut base = fixture.metadata(FormatVersion::V2);
+        let properties: HashMap<_, _> = (0..8)
+            .map(|index| {
+                let version = document(&format!("history-{index}"), 30_000);
+                (
+                    crate::document_storage::keyed::keys::version_key(version.identity()),
+                    crate::document_storage::keyed::envelope::encode_version(&version).unwrap(),
+                )
+            })
+            .collect();
+        base = base
+            .into_builder(None)
+            .set_properties(properties)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let documents = publication(document("new-binding", 1));
+        let intent = intent(&fixture, &base, &documents);
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let mut engine = StagingEngine::begin(
+            StagingBase::Existing {
+                metadata: base,
+                metadata_location: "file://base.metadata.json".into(),
+            },
+            &intent,
+            &attempt,
+        )
+        .unwrap();
+        let error = engine
+            .stage(&KeyedPublicationPreparer(documents))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            attempt::before_dispatch_failure(&error).kind(),
+            ConnectorMutationFailureKind::InvalidRequest
+        );
+        assert!(error.to_string().contains("private properties"));
+        assert!(fixture.operation.artifacts().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn keyed_publication_stages_records_directly_and_reasserts_the_current_binding() {
+        use crate::commit::staging::StagingEngine;
+        let fixture = Fixture::new();
+        let base = fixture.metadata(FormatVersion::V2);
+        let documents = publication(document("binding", 1));
+        let intent = intent(&fixture, &base, &documents);
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let mut engine = StagingEngine::begin(
+            StagingBase::Existing {
+                metadata: base,
+                metadata_location: "file://base.metadata.json".into(),
+            },
+            &intent,
+            &attempt,
+        )
+        .unwrap();
+        engine
+            .stage(&KeyedPublicationPreparer(documents.clone()))
+            .await
+            .unwrap();
+        engine
+            .stage(&crate::commit::fast_append::FastAppendPreparer)
+            .await
+            .unwrap();
+        let snapshot = engine.metadata().current_snapshot().unwrap();
+        assert_eq!(
+            snapshot.summary().operation,
+            crate::iceberg::spec::Operation::Append
+        );
+        assert_eq!(
+            snapshot.summary().additional_properties["novarocks.doc.v2.record.novarocks.test~publication"],
+            format!("2.{}.cmVzdWx0", documents.versions[0].identity().to_hex())
+        );
+        assert!(
+            !snapshot
+                .summary()
+                .additional_properties
+                .keys()
+                .any(|key| crate::document_storage::keyed::keys::is_legacy_key(key))
+        );
+        let frozen = engine.freeze(&[]).unwrap();
+        assert_eq!(frozen.artifacts().attempt_owned().len(), 1);
+        let writes: Vec<_> = frozen
+            .updates()
+            .iter()
+            .filter_map(|update| match update {
+                TableUpdate::SetProperties { updates } => Some(updates),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].len(), 2); // one immutable version and this owner's root
     }
 }

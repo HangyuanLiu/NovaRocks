@@ -46,6 +46,7 @@ pub(crate) fn prepare(
             removals: deletable.into_iter().map(keys::version_key).collect(),
         });
     }
+    super::write::trace_updates(metadata.properties(), &updates, 0);
     Ok((
         metadata,
         PreparedChange {
