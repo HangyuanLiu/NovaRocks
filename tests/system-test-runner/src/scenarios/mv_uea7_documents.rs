@@ -6,6 +6,7 @@
 //! Explicit native acceptance scenarios with independent REST/wire side effects.
 pub(super) mod wire;
 use super::mv_recovery::control_plan::{self, FeLaunchIntent};
+use super::mv_recovery::protobuf_bytes_field;
 use super::mv_uea7::{
     ManagedMvRestFixture, assert_rows, execute, require_three_backends,
     select_catalog_and_namespace,
@@ -26,7 +27,7 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use wire::{Graph, Marker, RECORD, ROOT, Record};
+use wire::{Graph, Marker, RECORD, ROOT, Record, Reference, Version};
 
 const NS: &str = "ns";
 #[derive(Clone, Copy)]
@@ -237,10 +238,17 @@ pub(super) fn commit_updates(
     updates: Vec<Value>,
     label: &str,
 ) -> Result<Value> {
-    let requirements = vec![
+    let mut requirements = vec![
         json!({"type":"assert-table-uuid","uuid":base["table-uuid"]}),
         json!({"type":"assert-ref-snapshot-id","ref":"main","snapshot-id":base["current-snapshot-id"].as_i64().filter(|id|*id!=-1)}),
     ];
+    if updates
+        .iter()
+        .any(|update| update["action"].as_str() == Some("add-schema"))
+    {
+        requirements.push(json!({"type":"assert-current-schema-id","current-schema-id":base["current-schema-id"]}));
+        requirements.push(json!({"type":"assert-last-assigned-field-id","last-assigned-field-id":base["last-column-id"]}));
+    }
     let request = json!({"requirements":requirements,"updates":updates});
     let evidence = artifact(context, label)?;
     fs::write(
@@ -427,9 +435,20 @@ fn append_zero(
         .context("snapshot ID overflow")?;
     let timestamp = snapshots
         .iter()
-        .filter_map(|s| s["timestamp-ms"].as_u64())
+        .map(|s| {
+            s["timestamp-ms"]
+                .as_u64()
+                .context("snapshot timestamp missing")
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
         .max()
-        .unwrap_or(0)
+        .context("no snapshot timestamp")?
+        .max(
+            base["last-updated-ms"]
+                .as_u64()
+                .context("table timestamp missing")?,
+        )
         .checked_add(1)
         .context("timestamp overflow")?;
     let mut summary = serde_json::Map::from_iter([
@@ -450,7 +469,40 @@ fn append_zero(
         wire::record(frame)?;
         summary.insert(RECORD.into(), json!(frame));
     }
-    let snapshot = json!({"snapshot-id":id,"parent-snapshot-id":parent,"sequence-number":base["last-sequence-number"].as_i64().unwrap_or(0)+1,"timestamp-ms":timestamp,"manifest-list":old["manifest-list"],"summary":summary,"schema-id":base["current-schema-id"]});
+    let sequence = base["last-sequence-number"]
+        .as_i64()
+        .context("table sequence number missing")?
+        .checked_add(1)
+        .context("sequence number overflow")?;
+    let schema_updates: Vec<_> = extra
+        .iter()
+        .filter(|update| update["action"].as_str() == Some("set-current-schema"))
+        .collect();
+    ensure!(
+        schema_updates.len() <= 1,
+        "ambiguous snapshot schema update"
+    );
+    let schema_id = schema_updates
+        .first()
+        .map_or(&base["current-schema-id"], |update| &update["schema-id"])
+        .as_i64()
+        .filter(|id| *id >= 0)
+        .context("zero-file snapshot needs an exact schema ID")?;
+    let mut snapshot = json!({"snapshot-id":id,"parent-snapshot-id":parent,"sequence-number":sequence,"timestamp-ms":timestamp,"manifest-list":old["manifest-list"],"summary":summary,"schema-id":schema_id});
+    match base["format-version"]
+        .as_u64()
+        .context("table format version missing")?
+    {
+        2 => {}
+        3 => {
+            let first_row_id = base["next-row-id"]
+                .as_u64()
+                .context("v3 table next row ID missing")?;
+            snapshot["first-row-id"] = json!(first_row_id);
+            snapshot["added-rows"] = json!(0);
+        }
+        version => bail!("unsupported external zero-file snapshot format: {version}"),
+    }
     let mut updates = extra;
     if !properties.is_empty() {
         updates.push(json!({"action":"set-properties","updates":properties}));
@@ -469,6 +521,127 @@ fn append_zero(
         "external-zero-file-publication",
     )
 }
+
+fn publish_reordered_schema(
+    context: &ScenarioContext,
+    rest: &str,
+    table: &str,
+    base: &Value,
+) -> Result<Value> {
+    let current_schema_id = base["current-schema-id"]
+        .as_i64()
+        .context("current schema ID missing")?;
+    let schemas = base["schemas"]
+        .as_array()
+        .context("table schemas missing")?;
+    let next_schema_id = schemas
+        .iter()
+        .map(|schema| schema["schema-id"].as_i64().context("schema ID missing"))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .context("no table schema")?
+        .checked_add(1)
+        .context("schema ID overflow")?;
+    let next_version = i32::try_from(next_schema_id).context("schema version exceeds i32")?;
+    let mut schema = schemas
+        .iter()
+        .find(|schema| schema["schema-id"].as_i64() == Some(current_schema_id))
+        .cloned()
+        .context("current schema missing")?;
+    schema["schema-id"] = json!(next_schema_id);
+    let fields = schema["fields"]
+        .as_array_mut()
+        .context("schema fields missing")?;
+    ensure!(fields.len() >= 2, "schema reorder needs two fields");
+    fields.reverse();
+
+    let graph = Graph::from_metadata(base)?;
+    let interpretation = &graph.versions[&graph.interpretation];
+    let mut content = interpretation.bytes()?;
+    let target = protobuf_bytes_field(&content, 9)?;
+    let schema_version = protobuf_bytes_field(&content[target.clone()], 2)?;
+    ensure!(
+        schema_version.len() == 4,
+        "schema version is not four bytes"
+    );
+    let range = target.start + schema_version.start..target.start + schema_version.end;
+    let observed_version = i32::from_le_bytes(content[range.clone()].try_into()?);
+    ensure!(
+        i64::from(observed_version) == current_schema_id,
+        "L schema version differs from observed physical schema"
+    );
+    content[range].copy_from_slice(&next_version.to_le_bytes());
+    let new_l = Version::new(
+        &interpretation.owner,
+        &interpretation.name,
+        interpretation.format.clone(),
+        interpretation.refs.clone(),
+        &content,
+    )?;
+    let binding = &graph.versions[&graph.binding];
+    let new_b = Version::new(
+        &binding.owner,
+        &binding.name,
+        binding.format.clone(),
+        vec![
+            Reference {
+                rel: "definition".into(),
+                id: graph.definition.clone(),
+            },
+            Reference {
+                rel: "interpretation".into(),
+                id: new_l.id.clone(),
+            },
+        ],
+        &binding.bytes()?,
+    )?;
+    let p = current_record(base)?;
+    let frame = wire::record_frame(&new_b.id, &p.payload);
+    let properties = BTreeMap::from([
+        (new_l.key(), new_l.encoded()?),
+        (new_b.key(), new_b.encoded()?),
+        (ROOT.into(), new_b.id.clone()),
+    ]);
+    let last_column_id = base["last-column-id"]
+        .as_i64()
+        .context("last column ID missing")?;
+    let published = append_zero(
+        context,
+        rest,
+        table,
+        base,
+        Some(&frame),
+        properties,
+        vec![
+            json!({"action":"add-schema","schema":schema.clone(),"last-column-id":last_column_id}),
+            json!({"action":"set-current-schema","schema-id":next_schema_id}),
+        ],
+    )?;
+    let actual = Graph::from_metadata(&published)?;
+    let published_schema = published["schemas"]
+        .as_array()
+        .context("published schemas missing")?
+        .iter()
+        .find(|schema| schema["schema-id"].as_i64() == Some(next_schema_id))
+        .context("published schema missing")?;
+    ensure!(
+        published["current-schema-id"].as_i64() == Some(next_schema_id)
+            && published_schema["fields"] == schema["fields"]
+            && published["last-column-id"] == base["last-column-id"]
+            && published["partition-specs"] == base["partition-specs"]
+            && published["default-spec-id"] == base["default-spec-id"]
+            && published["next-row-id"] == base["next-row-id"]
+            && actual.interpretation == new_l.id
+            && actual.binding == new_b.id
+            && actual.definition == graph.definition
+            && new_l.id != graph.interpretation
+            && new_b.id != graph.binding,
+        "external schema publication did not install the exact distinct L/B closure"
+    );
+    Ok(published)
+}
+
 fn simulate_old_layout(
     context: &ScenarioContext,
     rest: &str,
@@ -482,9 +655,14 @@ fn simulate_old_layout(
     let frame = wire::record_frame(&graph.binding, &p.payload);
     let mut extra = Vec::new();
     if restore_default_spec {
-        if let Some(id) = old["default-spec-id"].as_i64() {
-            extra.push(json!({"action":"set-default-spec","spec-id":id}));
-        }
+        let id = old["default-spec-id"]
+            .as_i64()
+            .context("old partition spec missing")?;
+        extra.push(json!({"action":"set-default-spec","spec-id":id}));
+        let schema = old["current-schema-id"]
+            .as_i64()
+            .context("old schema missing")?;
+        extra.push(json!({"action":"set-current-schema","schema-id":schema}));
     }
     append_zero(
         context,
@@ -650,8 +828,17 @@ fn run_expiry(
     let a1 = load_metadata(context, rest, NS, "a")?;
     repartition(context, conn, "a", 2)?;
     let a2 = load_metadata(context, rest, NS, "a")?;
-    repartition(context, conn, "a", 4)?;
-    let a3 = load_metadata(context, rest, NS, "a")?;
+    // A second native repartition requires unsupported multi-spec overwrite.
+    // An external schema reorder preserves field identities and publishes a
+    // third distinct L/B closure without changing the writer's support contract.
+    let a3 = publish_reordered_schema(context, rest, "a", &a2)?;
+    assert_rows(
+        context,
+        conn,
+        "SELECT k1,v2 FROM a ORDER BY k1",
+        &[(1, 10), (2, 20)],
+        "read exact externally published third interpretation",
+    )?;
     let before = save_graph(context, "a-before-expiry", &a3)?;
     let first_graph = Graph::from_metadata(&a1)?;
     expire(context, conn, catalog, "a", "a-initial", 2)?;
@@ -722,12 +909,24 @@ fn run_expiry(
     );
     let restored = simulate_old_layout(context, rest, "a", &orphan_pruned, &a1, true)?;
     let restored_graph = save_graph(context, "a-old-layout-reintroduced", &restored)?;
+    ensure!(
+        restored["current-schema-id"] == a1["current-schema-id"]
+            && restored["default-spec-id"] == a1["default-spec-id"],
+        "old layout publication did not restore its exact schema and partition spec"
+    );
     for (key, value) in reintroduce_closure(&first_graph) {
         ensure!(
             restored_graph.properties.get(&key) == Some(&value),
             "reintroduced version differs from exact prior bytes: {key}"
         );
     }
+    assert_rows(
+        context,
+        conn,
+        "SELECT k1,v2 FROM a ORDER BY k1",
+        &[(1, 10), (2, 20)],
+        "read exact reintroduced old layout",
+    )?;
     // b: advancing main, moving a tag and deleting a tag all race the frozen plan.
     for (table, token, action) in [
         ("b_main", "b-main", "main"),
@@ -738,7 +937,42 @@ fn run_expiry(
         refresh(context, conn, table)?;
         let first = load_metadata(context, rest, NS, table)?;
         repartition(context, conn, table, 2)?;
+        let middle = load_metadata(context, rest, NS, table)?;
+        let middle_head = middle["current-snapshot-id"]
+            .as_i64()
+            .context("ref-race middle snapshot missing")?;
+        execute(
+            context,
+            conn,
+            "create a real unreferenced expiry candidate",
+            &format!("ALTER MATERIALIZED VIEW {table} RESUME REFRESH"),
+        )?;
         let mut before = load_metadata(context, rest, NS, table)?;
+        let head = before["current-snapshot-id"]
+            .as_i64()
+            .context("ref-race current snapshot missing")?;
+        let carrier = before["snapshots"]
+            .as_array()
+            .context("ref-race snapshots missing")?
+            .iter()
+            .find(|snapshot| snapshot["snapshot-id"].as_i64() == Some(head))
+            .context("ref-race carrier missing")?;
+        let middle_graph = Graph::from_metadata(&middle)?;
+        let before_graph = Graph::from_metadata(&before)?;
+        ensure!(
+            snapshot_ids(&before)?.len() == 3
+                && head != middle_head
+                && carrier["parent-snapshot-id"].as_i64() == Some(middle_head)
+                && before_graph.versions == middle_graph.versions
+                && before_graph.roots == middle_graph.roots
+                && current_record(&before)?.frame == current_record(&middle)?.frame
+                && before_graph.slots[wire::CONFIG].content
+                    == middle_graph.slots[wire::CONFIG].content
+                && before_graph.slots[wire::CONFIG].format
+                    == middle_graph.slots[wire::CONFIG].format
+                && before_graph.slots[wire::CONFIG].writer == Some(head),
+            "ref-race setup did not create a same-value carried-record slot snapshot"
+        );
         if action != "main" {
             before = commit_updates(
                 context,
@@ -752,6 +986,14 @@ fn run_expiry(
                 "create-observed-tag",
             )?;
         }
+        ensure!(
+            before["refs"]
+                .as_object()
+                .context("ref-race refs missing")?
+                .values()
+                .all(|reference| reference["snapshot-id"].as_i64() != Some(middle_head)),
+            "ref-race middle snapshot is protected, so expiry would have no effect"
+        );
         let mut held = HeldExpiry::start(context, catalog, table, token)?;
         let raced = match action {
             "main" => append_zero(

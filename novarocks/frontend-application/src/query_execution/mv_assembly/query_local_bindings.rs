@@ -141,6 +141,12 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
         full: target_read.clone(),
         affected_partitions: affected_read,
         target_table_uuid: target_table_uuid.clone(),
+        target_object_id: rewrite
+            .mv_definition
+            .facts
+            .source_revision()
+            .target_object_id
+            .clone(),
         frozen_snapshot_id,
     };
     let key = QueryTableBindingKey::mv_target(

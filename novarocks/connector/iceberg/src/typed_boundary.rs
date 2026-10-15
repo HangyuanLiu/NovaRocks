@@ -61,8 +61,8 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorOperationControl,
-    ConnectorPinnedFileSet, ConnectorRequestContext, MvExactPartitionTransform,
-    ProviderBindingEpoch, REWRITE_POSITION_DELETES_KIND,
+    ConnectorPinnedFileSet, ConnectorRequestContext, ConnectorTableObjectId,
+    MvExactPartitionTransform, ProviderBindingEpoch, REWRITE_POSITION_DELETES_KIND,
 };
 
 use crate::file_pruning::file_may_satisfy_physical_predicates;
@@ -449,6 +449,50 @@ impl IcebergTypedBoundary {
                 "unbound Iceberg typed control unexpectedly retained a request-pinned table cache",
             )),
         }
+    }
+
+    /// MV target reads use a fresh refs observation, retained by this request
+    /// for column binding, split planning and access sealing. Never publish a
+    /// partial observation into the complete-metadata planning cache.
+    fn load_mv_target_relation(
+        &self,
+        name: &SchemaTableName,
+    ) -> Result<Option<IcebergPhysicalTable>, ConnectorError> {
+        let (Some(context), Some(tables)) =
+            (&self.request_context, &self.request_pinned_physical_tables)
+        else {
+            return Err(invalid(
+                "frozen MV target reads require a request-bound table cache",
+            ));
+        };
+        self.check_request_active()?;
+        if let Some(table) = tables
+            .lock()
+            .expect("request-pinned Iceberg table cache lock")
+            .get(name)
+            .cloned()
+        {
+            return Ok(Some(table));
+        }
+        let table = match self
+            .runtime
+            .observe_table_classified_for_request_with_snapshots(
+                name.schema_name(),
+                name.table_name(),
+                context,
+                crate::catalog::SnapshotLoading::Refs,
+            ) {
+            Ok(table) => table,
+            Err((ConnectorErrorKind::NotFound, _)) => return Ok(None),
+            Err((kind, message)) => return Err(ConnectorError::new(kind, message)),
+        };
+        let table = tables
+            .lock()
+            .expect("request-pinned Iceberg table cache lock")
+            .entry(name.clone())
+            .or_insert(table)
+            .clone();
+        Ok(Some(table))
     }
 
     /// The visible files of one change-window endpoint.
@@ -1060,6 +1104,30 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         )))
     }
 
+    fn get_mv_target_handle(
+        &self,
+        _session: &ConnectorSession,
+        name: &SchemaTableName,
+        object_id: &ConnectorTableObjectId,
+        snapshot_id: Option<i64>,
+    ) -> Result<Option<crate::typed_read::IcebergRuntimeRelation>, ConnectorError> {
+        if system_relation_of(name.table_name()).is_some() {
+            return Ok(None);
+        }
+        let Some(physical) = self.load_mv_target_relation(name)? else {
+            return Ok(None);
+        };
+        let metadata = physical.table.metadata();
+        validate_mv_target_pin(metadata, object_id, snapshot_id)?;
+        let version = snapshot_id.map_or(
+            ConnectorReadRelationVersion::Current,
+            ConnectorReadRelationVersion::SnapshotId,
+        );
+        Ok(Some(crate::typed_read::IcebergRuntimeRelation::Table(
+            table_handle_for_version(name, metadata, version, None)?,
+        )))
+    }
+
     fn get_mv_target_partition_handle(
         &self,
         _session: &ConnectorSession,
@@ -1069,7 +1137,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         if system_relation_of(name.table_name()).is_some() {
             return Ok(None);
         }
-        let Some(physical) = self.load_relation(name)? else {
+        let Some(physical) = self.load_mv_target_relation(name)? else {
             return Ok(None);
         };
         let metadata = physical.table.metadata();
@@ -1954,17 +2022,11 @@ fn validate_mv_target_partition_selection(
     metadata: &TableMetadata,
     selection: &ConnectorMvTargetPartitionSelection,
 ) -> Result<(), ConnectorError> {
-    if selection.object_id().as_bytes().as_ref() != metadata.uuid().to_string().as_bytes() {
-        return Err(invalid(
-            "MV target selection names a different Iceberg table object",
-        ));
-    }
-    if metadata.snapshot_by_id(selection.snapshot_id()).is_none() {
-        return Err(not_found(format!(
-            "MV target selection snapshot {} no longer exists",
-            selection.snapshot_id()
-        )));
-    }
+    validate_mv_target_pin(
+        metadata,
+        selection.object_id(),
+        Some(selection.snapshot_id()),
+    )?;
     let spec_id = metadata.default_partition_spec_id();
     if selection.partition_spec_version().as_ref()
         != crate::storage_inspector::exact_partition_spec_version(spec_id).as_ref()
@@ -1994,6 +2056,29 @@ fn validate_mv_target_partition_selection(
         }
     }
     Ok(())
+}
+
+fn validate_mv_target_pin(
+    metadata: &TableMetadata,
+    object_id: &ConnectorTableObjectId,
+    snapshot_id: Option<i64>,
+) -> Result<(), ConnectorError> {
+    if object_id.as_bytes().as_ref() != metadata.uuid().to_string().as_bytes() {
+        return Err(invalid(
+            "MV target read names a different Iceberg table object",
+        ));
+    }
+    match snapshot_id {
+        Some(snapshot_id) if metadata.snapshot_by_id(snapshot_id).is_none() => {
+            Err(not_found(format!(
+                "frozen MV target snapshot {snapshot_id} is not present in this refs observation"
+            )))
+        }
+        None if metadata.current_snapshot_id().is_some() => {
+            Err(invalid("empty frozen MV target now has a snapshot"))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn mv_target_transform_matches(expected: &MvExactPartitionTransform, actual: &Transform) -> bool {
@@ -3373,6 +3458,50 @@ mod mv_target_selection_tests {
     }
 
     #[test]
+    fn frozen_target_requires_exact_object_snapshot_and_empty_state() {
+        let (metadata, selection, _) = fixture();
+        assert_eq!(metadata.current_snapshot_id(), None);
+        validate_mv_target_pin(&metadata, selection.object_id(), None).unwrap();
+        validate_mv_target_pin(&metadata, selection.object_id(), Some(41)).unwrap();
+        let missing =
+            validate_mv_target_pin(&metadata, selection.object_id(), Some(42)).unwrap_err();
+        assert_eq!(missing.kind(), ConnectorErrorKind::NotFound);
+        assert!(
+            missing
+                .to_string()
+                .contains("not present in this refs observation")
+        );
+        let other = ConnectorTableObjectId::try_new(Bytes::from_static(b"other-object")).unwrap();
+        assert_eq!(
+            validate_mv_target_pin(&metadata, &other, Some(41))
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        let metadata = metadata
+            .into_builder(None)
+            .set_ref(
+                "main",
+                crate::iceberg::spec::SnapshotReference::new(
+                    41,
+                    crate::iceberg::spec::SnapshotRetention::branch(None, None, None),
+                ),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert_eq!(metadata.current_snapshot_id(), Some(41));
+        assert_eq!(
+            validate_mv_target_pin(&metadata, selection.object_id(), None)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        validate_mv_target_pin(&metadata, selection.object_id(), Some(41)).unwrap();
+    }
+
+    #[test]
     fn target_partition_selection_rejects_different_object_spec_or_field() {
         let (metadata, selection, _) = fixture();
         let make = |object_id, spec_version, fields| {
@@ -3837,6 +3966,155 @@ mod attempt_access_tests {
             .build()
             .expect("table");
         IcebergPhysicalTable::new(table)
+    }
+
+    #[test]
+    fn mv_target_refs_observation_stays_request_local_and_historical_reads_use_all() {
+        use novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata;
+        let executor = tokio::runtime::Runtime::new().unwrap();
+        let warehouse = tempfile::tempdir().unwrap();
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .unwrap();
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
+        );
+        let original = IcebergMetadataContext::try_new(
+            crate::catalog_control::IcebergCatalogControlState::new(configuration),
+            crate::resources::IcebergMetadataResources::new(binding, executor.handle().clone()),
+        )
+        .unwrap();
+        let catalog = original.novarocks_catalog().vendored_client();
+        let table = executor.block_on(async {
+            let namespace = crate::iceberg::NamespaceIdent::new("db".to_string());
+            catalog
+                .create_namespace(&namespace, HashMap::new())
+                .await
+                .unwrap();
+            catalog
+                .create_table(
+                    &namespace,
+                    crate::iceberg::TableCreation::builder()
+                        .name("t".to_string())
+                        .schema(
+                            Schema::builder()
+                                .with_fields(vec![Arc::new(NestedField::required(
+                                    1,
+                                    "id",
+                                    Type::Primitive(PrimitiveType::Long),
+                                ))])
+                                .build()
+                                .unwrap(),
+                        )
+                        .format_version(FormatVersion::V2)
+                        .build(),
+                )
+                .await
+                .unwrap()
+        });
+        let loads = Arc::new(Mutex::new(Vec::new()));
+        let owner = crate::catalog::admission_test_support::all_admitted_with_snapshot_trace(
+            original.novarocks_catalog().clone(),
+            loads.clone(),
+        );
+        let context = Arc::new(IcebergMetadataContext::with_catalog_for_test(
+            original.control_state().clone(),
+            original.resources().clone(),
+            owner,
+        ));
+        let catalog_id = ConnectorInstanceId::parse("ice").unwrap();
+        let template = IcebergTypedBoundary::new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                instance_id: catalog_id.clone(),
+            },
+            ProviderBindingEpoch::new(),
+            CatalogHandle::new(catalog_id, CatalogVersion::from_bytes([1; 32])),
+            HiveTransactionHandle::new(true, [2; 16]),
+            context.clone(),
+        );
+        let name = SchemaTableName::try_new("db", "t").unwrap();
+        let object = ConnectorTableObjectId::try_new(bytes::Bytes::from(
+            table.metadata().uuid().to_string(),
+        ))
+        .unwrap();
+        let session =
+            ConnectorSession::try_new("q", "u", "UTC", "en_US", std::time::SystemTime::UNIX_EPOCH)
+                .unwrap();
+        let resources = TrackedAttemptResources::new();
+        let boundary = template.for_request(request_context(&resources));
+        let relation = boundary
+            .get_mv_target_handle(&session, &name, &object, None)
+            .unwrap()
+            .unwrap();
+        let crate::typed_read::IcebergRuntimeRelation::Table(handle) = &relation else {
+            panic!("table")
+        };
+        assert_eq!(handle.snapshot_id(), None);
+        assert_eq!(
+            handle.parse_table_schema().unwrap(),
+            *table.metadata().current_schema().as_ref()
+        );
+        boundary.get_column_bindings(&session, &relation).unwrap();
+        let pinned = boundary.load_pinned_relation(&name).unwrap();
+        let sealed = boundary.pinned_table_for_attempt(&name).unwrap();
+        assert_eq!(pinned.table.metadata().uuid(), table.metadata().uuid());
+        assert_eq!(sealed.table.metadata_location(), table.metadata_location());
+        assert_eq!(
+            *loads.lock().unwrap(),
+            vec![crate::catalog::SnapshotLoading::Refs]
+        );
+        assert!(
+            context
+                .control_state()
+                .physical_table_cache()
+                .get(&"db", &"t")
+                .unwrap()
+                .is_none()
+        );
+        let wrong =
+            ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"replacement")).unwrap();
+        assert_eq!(
+            boundary
+                .get_mv_target_handle(&session, &name, &wrong, None)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            boundary
+                .get_mv_target_handle(&session, &name, &object, Some(41))
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::NotFound
+        );
+        let historical_resources = TrackedAttemptResources::new();
+        let historical = template.for_request(request_context(&historical_resources));
+        assert!(
+            historical
+                .get_table_handle(
+                    &session,
+                    &name,
+                    ConnectorReadRelationVersion::SnapshotId(41),
+                    None
+                )
+                .is_err()
+        );
+        assert_eq!(
+            *loads.lock().unwrap(),
+            vec![
+                crate::catalog::SnapshotLoading::Refs,
+                crate::catalog::SnapshotLoading::All
+            ]
+        );
     }
 
     #[test]

@@ -2148,7 +2148,10 @@ fn externally_persist_old_endian_interpretation(
     Ok(())
 }
 
-fn protobuf_bytes_field(input: &[u8], expected_field: u64) -> Result<std::ops::Range<usize>> {
+pub(super) fn protobuf_bytes_field(
+    input: &[u8],
+    expected_field: u64,
+) -> Result<std::ops::Range<usize>> {
     let mut offset = 0;
     let mut selected = None;
     while offset < input.len() {

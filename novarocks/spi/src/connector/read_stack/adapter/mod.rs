@@ -229,6 +229,19 @@ pub trait ProviderReadMetadata: ProviderReadRuntime {
         reference: Option<&str>,
     ) -> Result<Option<Self::Table>, ConnectorError>;
 
+    fn get_mv_target_handle(
+        &self,
+        _session: &ConnectorSession,
+        _name: &SchemaTableName,
+        _object_id: &crate::connector::ConnectorTableObjectId,
+        _snapshot_id: Option<i64>,
+    ) -> Result<Option<Self::Table>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "provider read generation does not support frozen MV target reads",
+        ))
+    }
+
     fn get_pinned_file_set_handle(
         &self,
         session: &ConnectorSession,
@@ -813,6 +826,18 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
         self.provider
             .adopt_frozen_source(session, source.owner(), typed)
             .map(|table| self.wrap_table(table))
+    }
+
+    fn get_mv_target_handle(
+        &self,
+        session: &ConnectorSession,
+        name: &SchemaTableName,
+        object_id: &crate::connector::ConnectorTableObjectId,
+        snapshot_id: Option<i64>,
+    ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError> {
+        self.provider
+            .get_mv_target_handle(session, name, object_id, snapshot_id)
+            .map(|value| value.map(|table| self.wrap_table(table)))
     }
 
     fn get_pinned_file_set_handle(
@@ -1960,6 +1985,48 @@ mod tests {
     fn session() -> ConnectorSession {
         ConnectorSession::try_new("q", "u", "UTC", "en_US", SystemTime::UNIX_EPOCH)
             .expect("session")
+    }
+
+    #[test]
+    fn frozen_mv_target_requires_provider_support_without_generic_fallback() {
+        let provider = Arc::new(Probe::new());
+        let name = SchemaTableName::try_new("db", "orders").unwrap();
+        let object = crate::connector::ConnectorTableObjectId::try_new(bytes::Bytes::from_static(
+            b"opaque-target-object",
+        ))
+        .unwrap();
+        let direct = ProviderReadMetadata::get_mv_target_handle(
+            provider.as_ref(),
+            &session(),
+            &name,
+            &object,
+            Some(41),
+        )
+        .unwrap_err();
+        assert_eq!(direct.kind(), ConnectorErrorKind::Unsupported);
+        let adapter = ReadRuntimeAdapter::new(provider);
+        for snapshot in [Some(41), None] {
+            let erased = ConnectorReadMetadata::get_mv_target_handle(
+                &adapter,
+                &session(),
+                &name,
+                &object,
+                snapshot,
+            )
+            .unwrap_err();
+            assert_eq!(erased.kind(), ConnectorErrorKind::Unsupported);
+        }
+        assert!(
+            ConnectorReadMetadata::get_table_handle(
+                &adapter,
+                &session(),
+                &name,
+                ConnectorReadRelationVersion::SnapshotId(41),
+                None,
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 
     fn adapter_and_filter() -> (

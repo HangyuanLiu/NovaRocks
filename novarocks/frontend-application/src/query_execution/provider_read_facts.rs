@@ -239,6 +239,10 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
 /// thing a name and a version would select is a different read.
 enum AdmittedRead {
     Relation(crate::catalog_application::query_bindings::QueryScanMaterialization),
+    MvTarget {
+        materialization: crate::catalog_application::query_bindings::QueryScanMaterialization,
+        object_id: novarocks_spi::connector::ConnectorTableObjectId,
+    },
     Cohort(crate::catalog_application::query_bindings::QueryFrozenCohortRead),
 }
 
@@ -247,7 +251,10 @@ impl AdmittedRead {
     /// be frozen through.
     fn planning_lease(&self) -> &ConnectorControlPlanningLease {
         match self {
-            Self::Relation(materialization) => &materialization.planning_lease,
+            Self::Relation(materialization)
+            | Self::MvTarget {
+                materialization, ..
+            } => &materialization.planning_lease,
             Self::Cohort(cohort) => cohort.planning_lease(),
         }
     }
@@ -266,7 +273,7 @@ impl AdmittedRead {
         use crate::catalog_application::query_bindings::QueryFrozenCohortRead;
 
         let (namespace, table) = match self {
-            Self::Relation(_) => {
+            Self::Relation(_) | Self::MvTarget { .. } => {
                 let identity = relation_identity(relation);
                 (
                     identity.namespace.clone(),
@@ -326,11 +333,14 @@ pub(crate) fn freeze_one_read(
                 "provider read of {name} names a different MV target UUID or snapshot than its frozen binding"
             ));
         }
-        AdmittedRead::Relation(if *use_affected_partitions {
-            target.affected_partitions.clone()
-        } else {
-            target.full.clone()
-        })
+        AdmittedRead::MvTarget {
+            materialization: if *use_affected_partitions {
+                target.affected_partitions.clone()
+            } else {
+                target.full.clone()
+            },
+            object_id: target.target_object_id.clone(),
+        }
     } else {
         let input = frozen_input(relation)?;
         match input {
@@ -732,23 +742,28 @@ fn open_relation(
         ProviderReadRelationNeed::MvTarget {
             target_snapshot_id, ..
         } => {
-            let selection = match admitted {
-                AdmittedRead::Relation(read) => read.mv_partition_selection.as_ref(),
-                AdmittedRead::Cohort(_) => None,
+            let AdmittedRead::MvTarget {
+                materialization,
+                object_id,
+            } = admitted
+            else {
+                return Err(format!(
+                    "provider read of {name} lacks its exact MV target admission"
+                ));
             };
+            let selection = materialization.mv_partition_selection.as_ref();
             let opened = match selection {
                 Some(selection) => {
+                    if selection.object_id() != object_id {
+                        return Err(format!(
+                            "provider read of {name} has a different MV target selection object"
+                        ));
+                    }
                     metadata.get_mv_target_partition_handle(session, table, selection)
                 }
-                None => metadata.get_table_handle(
-                    session,
-                    table,
-                    target_snapshot_id.map_or(
-                        ConnectorReadRelationVersion::Current,
-                        ConnectorReadRelationVersion::SnapshotId,
-                    ),
-                    None,
-                ),
+                None => {
+                    metadata.get_mv_target_handle(session, table, object_id, *target_snapshot_id)
+                }
             };
             opened
                 .map_err(|error| {
