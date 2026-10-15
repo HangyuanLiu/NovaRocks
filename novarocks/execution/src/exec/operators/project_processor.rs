@@ -1183,6 +1183,64 @@ impl ProjectProcessorOperator {
         } else {
             self.arena.eval(expr_id, chunk)?
         };
+        let array = if matches!(
+            self.arena.node(expr_id),
+            Some(ExprNode::FunctionCall {
+                kind: crate::exec::expr::function::FunctionKind::HourFromUnixtime,
+                ..
+            })
+        ) {
+            let target = self.arena.value_type(expr_id).ok_or_else(|| {
+                ConstructionFailure::InvalidSource(
+                    "HOUR public result lacks its complete expression declaration".into(),
+                )
+            })?;
+            let mut request = |layout| owner.request(layout);
+            let mut opaque = |bytes| owner.observe_opaque_upper_bound(bytes);
+            let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
+                owner.storage_lifetime(),
+                &mut request,
+                &mut opaque,
+            );
+            novarocks_functions::builtin::calendar_unixtime::realize_legacy_hour_public_result(
+                &array,
+                target,
+                &mut creation,
+                &mut |_| {
+                    owner.observe(
+                        0,
+                        &[],
+                        crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
+                            units: 1,
+                        },
+                    )
+                },
+            )
+            .map_err(|error| -> crate::runtime::fragment::ExecutionFailure {
+                use novarocks_functions::selected_copy::{CopyConstructionError, CopyError};
+                match error {
+                    CopyConstructionError::Creator(cause) => cause.into(),
+                    CopyConstructionError::Resource(cause) => {
+                        ConstructionFailure::Resource(cause).into()
+                    }
+                    CopyConstructionError::Copy(CopyError::Control(cause)) => cause.into(),
+                    CopyConstructionError::Copy(CopyError::Extent) => {
+                        novarocks_functions::KernelFailure::ResourceExhausted.into()
+                    }
+                    CopyConstructionError::Copy(CopyError::Invalid(message)) => {
+                        ConstructionFailure::InvalidSource(message.into()).into()
+                    }
+                    CopyConstructionError::Copy(CopyError::Unsupported(ty)) => {
+                        ConstructionFailure::InvalidSource(format!(
+                            "HOUR public result does not support {ty:?}"
+                        ))
+                        .into()
+                    }
+                }
+            })?
+        } else {
+            array
+        };
         Ok((array, None, storage))
     }
 
@@ -3304,6 +3362,250 @@ mod owned_project_tests {
         .unwrap();
         (factory, input)
     }
+    fn frozen_hour_project_fixture() -> (ProjectProcessorFactory, Chunk, Vec<Option<i32>>) {
+        use crate::exec::expr::function::{FUNCTION_REGISTRY, FunctionKind};
+        use novarocks_local_program::{
+            ProjectExpressionSlot, ProjectExpressionSlots, StaticExprKind, StaticFunctionKind,
+            StaticLayout,
+        };
+        let source = FunctionValueType::new(DataType::Int64, true);
+        let result = FunctionValueType::new(DataType::Int32, true);
+        let field = Arc::new(Field::new("hour", DataType::Int32, true));
+        let output = StaticLayout::try_new_typed_for_compile(
+            Arc::new(arrow::datatypes::Schema::new(vec![field.clone()])),
+            Arc::from([SlotId::new(10)]),
+            vec![(result.typed_binding().clone(), None)],
+            ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+            &CompileControl,
+        )
+        .unwrap();
+        let purposes = ProjectExpressionSlots::try_from_boxed_observed::<
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+        >(
+            [9, 10]
+                .into_iter()
+                .map(|id| ProjectExpressionSlot {
+                    slot_id: SlotId::new(id),
+                    field: field.clone(),
+                    binding: result.typed_binding().clone(),
+                    storage: ValueTypeStorageLifetime::pure(),
+                    unique_id: None,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let input_schema = Arc::new(
+            ChunkSchema::try_new_typed(
+                vec![
+                    ChunkSlotSchema::try_new_typed(
+                        SlotId::new(7),
+                        Arc::new(Field::new("epoch", DataType::Int64, true)),
+                        source.typed_binding().clone(),
+                        None,
+                        ValueTypeStorageLifetime::pure(),
+                    )
+                    .unwrap(),
+                ],
+                ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+        );
+        let input = Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+            input_schema,
+            vec![Arc::new(arrow::array::Int64Array::from(vec![
+                Some(-1),
+                None,
+                Some(0),
+                Some(3600),
+            ]))],
+            4,
+            ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let mut arena = ExprArena::default();
+        let child = arena.push_value_typed(ExprNode::SlotId(SlotId::new(7)), source);
+        let kind = *FUNCTION_REGISTRY.get("hour_from_unixtime").unwrap();
+        assert_eq!(kind, FunctionKind::HourFromUnixtime);
+        let hour = arena.push_value_typed(
+            ExprNode::FunctionCall {
+                kind,
+                args: vec![child],
+            },
+            result.clone(),
+        );
+        let cse = arena.push_value_typed(ExprNode::SlotId(SlotId::new(9)), result);
+        // Preserve the pre-existing Local contract and original internal Int64
+        // oracle; this test changes only the fixed public realization.
+        let internal = arena.eval(hour, &input).unwrap();
+        assert_eq!(internal.data_type(), &DataType::Int64);
+        let expected = internal
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .iter()
+            .map(|value| value.map(|hour| i32::try_from(hour).unwrap()))
+            .collect();
+        let frozen = arena.into_immutable().unwrap();
+        assert!(matches!(
+            frozen.nodes()[hour.0].kind(),
+            StaticExprKind::FunctionCall {
+                kind: StaticFunctionKind::HourFromUnixtime,
+                ..
+            }
+        ));
+        let arena = ExprArena::from_immutable(&frozen).unwrap();
+        let factory = ProjectProcessorFactory::new(
+            41,
+            false,
+            Arc::new(arena),
+            vec![hour, cse],
+            vec![SlotId::new(9), SlotId::new(10)],
+            Some(purposes),
+            Some(vec![1]),
+            output,
+        );
+        (factory, input, expected)
+    }
+
+    #[test]
+    fn project_hour_public_int32_realization_precedes_cse_and_retains_last_output() {
+        let (factory, input, expected) = frozen_hour_project_fixture();
+        let tracker =
+            crate::runtime::mem_tracker::MemTracker::new_root("Project HOUR public result");
+        let creation = real_project_creator(tracker.clone());
+        let mut operator = factory.create_operator();
+        operator.set_construction_factory(creation.clone());
+        operator.prepare().unwrap();
+        operator
+            .bind_runtime_state(&RuntimeState::default())
+            .unwrap();
+        operator
+            .push_chunk(&RuntimeState::default(), input)
+            .unwrap();
+        let output = operator
+            .pull_chunk(&RuntimeState::default())
+            .unwrap()
+            .unwrap();
+        let values = output.columns()[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), expected);
+        assert_eq!(&expected[..2], &[None, None]);
+        assert_eq!(
+            output.chunk_schema().slots()[0].data_type(),
+            &DataType::Int32
+        );
+        let projection = output.into_batch_projection();
+        drop(operator);
+        drop(factory);
+        drop(creation);
+        assert!(tracker.current() > 0);
+        assert_eq!(projection.record_batch().num_rows(), 4);
+        drop(projection);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn project_hour_public_realization_retains_original_creator_refusal_and_control() {
+        use crate::exec::chunk::ArrayNormalizationStep;
+        use novarocks_functions::selected_copy::CopyConstructionError;
+        for cancelled in [false, true] {
+            let (factory, input, _) = frozen_hour_project_fixture();
+            let tracker = crate::runtime::mem_tracker::MemTracker::new_root("Project HOUR refusal");
+            let errors = Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default());
+            let creation = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                tracker.clone(), errors.clone(),
+            ).unwrap();
+            let mut operator = factory.create_operator();
+            operator.set_construction_factory(creation.clone());
+            operator.prepare().unwrap();
+            operator
+                .bind_runtime_state(&RuntimeState::default())
+                .unwrap();
+            let owner = operator
+                .control
+                .as_ref()
+                .unwrap()
+                .construction_owner(operator.prepared_output().unwrap())
+                .unwrap();
+            let source = Arc::new(arrow::array::Int64Array::from(vec![
+                Some(0),
+                None,
+                Some(23),
+            ])) as ArrayRef;
+            let stop = crate::runtime::fragment::ExecutionFailure::from(
+                novarocks_functions::KernelFailure::Cancelled,
+            );
+            if cancelled {
+                errors.set_error(stop.clone());
+            } else {
+                tracker.install_limit_once(tracker.current()).unwrap();
+            }
+            let allocated = tracker.allocated();
+            let retained = tracker.current();
+            let mut request = |layout| owner.request(layout);
+            let mut opaque = |bytes| owner.observe_opaque_upper_bound(bytes);
+            let mut scope = novarocks_type_contract::ValueSchemaCreation::new(
+                owner.storage_lifetime(),
+                &mut request,
+                &mut opaque,
+            );
+            let error =
+                novarocks_functions::builtin::calendar_unixtime::realize_legacy_hour_public_result(
+                    &source,
+                    &FunctionValueType::new(DataType::Int32, true),
+                    &mut scope,
+                    &mut |_| {
+                        owner.observe(
+                            0,
+                            &[],
+                            ArrayNormalizationStep::InspectConstructionWork { units: 1 },
+                        )
+                    },
+                )
+                .unwrap_err();
+            match error {
+                CopyConstructionError::Creator(cause) if cancelled => {
+                    assert_eq!(
+                        crate::runtime::fragment::ExecutionFailure::from(cause),
+                        stop
+                    )
+                }
+                CopyConstructionError::Creator(ConstructionFailure::Memory(_)) if !cancelled => {}
+                other => panic!("unexpected original HOUR creation failure: {other:?}"),
+            }
+            if cancelled {
+                assert_eq!(
+                    tracker.allocated(),
+                    allocated,
+                    "control stops before a request"
+                );
+            }
+            // The tracker counts attempted requests too. A rejected request
+            // must refund current responsibility, not erase its attempt.
+            assert_eq!(
+                tracker.current(),
+                retained,
+                "refusal retains no new storage"
+            );
+            drop(scope);
+            drop(owner);
+            drop(operator);
+            drop(creation);
+            drop(factory);
+            drop(input);
+            drop(errors);
+            assert_eq!(tracker.current(), 0);
+        }
+    }
+
     fn real_project_creator(
         tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
     ) -> Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory> {

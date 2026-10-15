@@ -63,9 +63,10 @@ impl InputConstructionRequestHost for TrackedInputConstructionHost {
     }
 }
 
-/// Only the independently retained cancellation/error signal is borrowed.
-pub struct RuntimeInputConstructionControl {
-    error: Arc<RuntimeErrorState>,
+/// The default control borrows the original kernel signal. A receiver control
+/// instead owns its independent signal inline in this same tracked Arc.
+pub struct RuntimeInputConstructionControl<S = Arc<RuntimeErrorState>> {
+    error: S,
     _creation: Option<TrackedArcCharge>,
 }
 impl RuntimeInputConstructionControl {
@@ -74,6 +75,37 @@ impl RuntimeInputConstructionControl {
             error,
             _creation: None,
         }
+    }
+}
+
+trait ConstructionErrorSignal: Send + Sync {
+    fn state(&self) -> &RuntimeErrorState;
+}
+impl ConstructionErrorSignal for Arc<RuntimeErrorState> {
+    fn state(&self) -> &RuntimeErrorState {
+        self.as_ref()
+    }
+}
+impl ConstructionErrorSignal for RuntimeErrorState {
+    fn state(&self) -> &RuntimeErrorState {
+        self
+    }
+}
+
+/// The unique producer-side stop responsibility, moved with the receiver
+/// registration. Factory and scope aliases retain only this same control;
+/// neither a naked signal Arc nor a Task/runtime capability escapes.
+pub struct ReceiverInputConstructionStopOwner {
+    control: Arc<RuntimeInputConstructionControl<RuntimeErrorState>>,
+}
+impl ReceiverInputConstructionStopOwner {
+    pub fn stop(&self, cause: crate::runtime::fragment::ExecutionFailure) {
+        self.control.error.set_error(cause);
+    }
+}
+impl Drop for ReceiverInputConstructionStopOwner {
+    fn drop(&mut self) {
+        self.stop(novarocks_functions::KernelFailure::Cancelled.into());
     }
 }
 
@@ -133,26 +165,75 @@ pub fn try_runtime_input_construction_factory(
     if let Some(error) = error.error() {
         return Err(ConstructionFailure::Caller(Box::new(error)));
     }
+    build_tracked_input_construction_factory(profile, tracker, error, |_| ())
+        .map(|(factory, ())| factory)
+}
+
+/// Construct a receiver's independently stopped control on the SAME actual
+/// tracker/profile/Arrow model. Existing kernel failure still refuses creation
+/// before any metadata request, but later normal kernel stop is not its owner.
+pub fn try_receiver_input_construction_factory(
+    profile: super::InputConstructionProfile,
+    tracker: Arc<MemTracker>,
+    kernel_error: Arc<RuntimeErrorState>,
+) -> Result<
+    (
+        Arc<dyn super::InputConstructionFactory>,
+        ReceiverInputConstructionStopOwner,
+    ),
+    ConstructionFailure,
+> {
+    if let Some(error) = kernel_error.error() {
+        return Err(ConstructionFailure::Caller(Box::new(error)));
+    }
+    build_tracked_input_construction_factory(
+        profile,
+        tracker,
+        RuntimeErrorState::default(),
+        |control| ReceiverInputConstructionStopOwner {
+            control: Arc::clone(control),
+        },
+    )
+}
+
+fn build_tracked_input_construction_factory<S, G>(
+    profile: super::InputConstructionProfile,
+    tracker: Arc<MemTracker>,
+    error: S,
+    stop_owner: impl FnOnce(&Arc<RuntimeInputConstructionControl<S>>) -> G,
+) -> Result<(Arc<dyn super::InputConstructionFactory>, G), ConstructionFailure>
+where
+    S: ConstructionErrorSignal + 'static,
+{
     let host_charge = metadata_request::<TrackedInputConstructionHost>(&tracker)?;
     let host = Arc::new(TrackedInputConstructionHost {
         tracker: tracker.clone(),
         _creation: Some(host_charge),
     });
-    let control_charge = metadata_request::<RuntimeInputConstructionControl>(&tracker)?;
+    let control_charge = metadata_request::<RuntimeInputConstructionControl<S>>(&tracker)?;
     let control = Arc::new(RuntimeInputConstructionControl {
         error,
         _creation: Some(control_charge),
     });
+    // Establish the local guard as soon as the actual control exists, before
+    // any subsequent model/factory request can refuse or unwind.
+    let stop_owner = stop_owner(&control);
     let model_charge = metadata_request::<TrackedArrowModel>(&tracker)?;
     let model = Arc::new(TrackedArrowModel {
         _creation: model_charge,
     });
-    super::ObservedInputConstructionFactory::try_new(profile, host, control, model)
-        .map(|factory| factory as Arc<dyn super::InputConstructionFactory>)
+    super::ObservedInputConstructionFactory::try_new(profile, host, control, model).map(|factory| {
+        (
+            factory as Arc<dyn super::InputConstructionFactory>,
+            stop_owner,
+        )
+    })
 }
-impl InputConstructionWorkControl for RuntimeInputConstructionControl {
+impl<S: ConstructionErrorSignal> InputConstructionWorkControl
+    for RuntimeInputConstructionControl<S>
+{
     fn checkpoint(&self, _: usize) -> Result<(), ConstructionFailure> {
-        match self.error.error() {
+        match self.error.state().error() {
             Some(error) => Err(ConstructionFailure::Caller(Box::new(error))),
             None => Ok(()),
         }
@@ -228,5 +309,157 @@ mod tests {
             control.checkpoint(0).unwrap_err(),
             ConstructionFailure::Caller(Box::new(original))
         );
+    }
+
+    // Receiver lifetime differs from kernel lifetime, not capacity or Arrow
+    // semantics. These owner-local tests use the real finite tracker and the
+    // original typed causes as independent oracles; no service/controller or
+    // timing assumptions are involved. Keep them with the shared factory.
+    #[test]
+    fn receiver_factory_existing_kernel_failure_precedes_all_metadata_requests() {
+        let tracker = MemTracker::new_root("receiver construction metadata");
+        tracker.install_limit_once(1).unwrap();
+        let kernel = Arc::new(RuntimeErrorState::default());
+        let original: crate::runtime::fragment::ExecutionFailure =
+            novarocks_functions::KernelFailure::DeadlineExceeded.into();
+        kernel.set_error(original.clone());
+        let before = tracker.allocated();
+        let result = try_receiver_input_construction_factory(profile(), tracker.clone(), kernel);
+        assert!(matches!(result, Err(ConstructionFailure::Caller(cause)) if *cause == original));
+        assert_eq!(tracker.allocated(), before);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn receiver_factory_keeps_kernel_stop_separate_and_forwards_original_receiver_cause() {
+        let tracker = MemTracker::new_root("receiver construction metadata");
+        tracker.install_limit_once(1024 * 1024).unwrap();
+        let kernel = Arc::new(RuntimeErrorState::default());
+        let weak_kernel = Arc::downgrade(&kernel);
+        let (factory, owner) =
+            try_receiver_input_construction_factory(profile(), tracker.clone(), kernel.clone())
+                .unwrap();
+        kernel.set_error(novarocks_functions::KernelFailure::Cancelled);
+        let scope = factory.begin_input_construction(&source()).unwrap();
+        scope.request(Layout::new::<u64>()).unwrap();
+        drop(kernel);
+        assert!(
+            weak_kernel.upgrade().is_none(),
+            "receiver control never retains the kernel"
+        );
+        let original: crate::runtime::fragment::ExecutionFailure =
+            novarocks_functions::KernelFailure::ResourceExhausted.into();
+        owner.stop(original.clone());
+        owner.stop(novarocks_functions::KernelFailure::DeadlineExceeded.into());
+        assert_eq!(
+            scope.request(Layout::new::<u64>()).unwrap_err(),
+            ConstructionFailure::Caller(Box::new(original.clone())),
+        );
+        assert_eq!(
+            factory.observe_input_work(1).unwrap_err(),
+            ConstructionFailure::Caller(Box::new(original)),
+        );
+        drop(scope);
+        drop(factory);
+        assert!(
+            tracker.current() > 0,
+            "the unique stop owner still retains the original control block"
+        );
+        drop(owner);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn receiver_factory_metadata_refusal_releases_initial_and_owned_control_prefixes() {
+        // Derive the later refusal point from the SAME original metadata
+        // request author, not from guessed private bytes or platform sizes.
+        let measured = MemTracker::new_root("receiver metadata request geometry");
+        let host = metadata_request::<TrackedInputConstructionHost>(&measured).unwrap();
+        let control =
+            metadata_request::<RuntimeInputConstructionControl<RuntimeErrorState>>(&measured)
+                .unwrap();
+        let owned_control_prefix = measured.current();
+        drop(control);
+        drop(host);
+        assert_eq!(measured.current(), 0);
+        for limit in [1, owned_control_prefix] {
+            let tracker = MemTracker::new_root("receiver metadata refusal");
+            tracker.install_limit_once(limit).unwrap();
+            let result = try_receiver_input_construction_factory(
+                profile(),
+                tracker.clone(),
+                Arc::new(RuntimeErrorState::default()),
+            );
+            assert!(matches!(result, Err(ConstructionFailure::Memory(_))));
+            assert_eq!(
+                tracker.current(),
+                0,
+                "failed factory releases every constructed prefix"
+            );
+        }
+        // The same production builder's owner constructor is the observation
+        // seam: keep a private control alias to inspect the local guard after
+        // the real next metadata request refuses. No public signal escapes.
+        let tracker = MemTracker::new_root("receiver stopped construction prefix");
+        tracker.install_limit_once(owned_control_prefix).unwrap();
+        let mut observed_control = None;
+        let result = build_tracked_input_construction_factory(
+            profile(),
+            tracker.clone(),
+            RuntimeErrorState::default(),
+            |control| {
+                observed_control = Some(Arc::clone(control));
+                ReceiverInputConstructionStopOwner {
+                    control: Arc::clone(control),
+                }
+            },
+        );
+        assert!(matches!(result, Err(ConstructionFailure::Memory(_))));
+        let control =
+            observed_control.expect("the actual owned control was created before refusal");
+        assert_eq!(
+            control.checkpoint(0).unwrap_err(),
+            ConstructionFailure::Caller(Box::new(
+                novarocks_functions::KernelFailure::Cancelled.into()
+            )),
+        );
+        drop(control);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn receiver_stop_owner_drop_stops_live_scopes_and_last_storage_release_balances() {
+        let tracker = MemTracker::new_root("receiver construction aliases");
+        tracker.install_limit_once(1024 * 1024).unwrap();
+        let (factory, owner) = try_receiver_input_construction_factory(
+            profile(),
+            tracker.clone(),
+            Arc::new(RuntimeErrorState::default()),
+        )
+        .unwrap();
+        let control_weak = Arc::downgrade(&owner.control);
+        let scope = factory.begin_input_construction(&source()).unwrap();
+        let storage = scope.storage_lifetime();
+        drop(factory);
+        drop(owner);
+        let cancelled: crate::runtime::fragment::ExecutionFailure =
+            novarocks_functions::KernelFailure::Cancelled.into();
+        assert_eq!(
+            scope.request(Layout::new::<u64>()).unwrap_err(),
+            ConstructionFailure::Caller(Box::new(cancelled)),
+        );
+        assert!(
+            control_weak.upgrade().is_some(),
+            "the live scope retains the stopped signal"
+        );
+        drop(scope);
+        assert!(control_weak.upgrade().is_none());
+        drop(control_weak);
+        assert!(
+            tracker.current() > 0,
+            "independent constructed storage still holds its original creator"
+        );
+        drop(storage);
+        assert_eq!(tracker.current(), 0);
     }
 }

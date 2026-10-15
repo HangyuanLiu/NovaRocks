@@ -1252,7 +1252,26 @@ impl AggregateProcessorOperator {
         if self.group_states.is_empty() {
             if self.group_by.is_empty() {
                 self.ensure_scalar_group().map_err(|e| e.to_string())?;
-            } else if !self.output_chunk_schema.is_typed() {
+            } else if self.output_chunk_schema.is_typed() {
+                let kernels = self
+                    .kernels
+                    .as_ref()
+                    .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
+                let factory = self
+                    .construction
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+                let chunk = AggregateOutputCreation::begin(
+                    &self.output_chunk_schema,
+                    &self.arena,
+                    &self.group_by,
+                    &kernels.entries,
+                    self.output_intermediate,
+                    factory.as_ref(),
+                )?
+                .finish_empty()?;
+                return Ok(Some(chunk));
+            } else {
                 let schema = self
                     .output_schema
                     .clone()
@@ -1951,6 +1970,205 @@ fn aggregate_topn_test_operator(
         fail_output_construction: false,
     }
     .create(1, 0)
+}
+
+#[cfg(test)]
+pub(super) mod typed_empty_tests {
+    use super::*;
+    use crate::exec::chunk::typed_fixture;
+    use crate::exec::node::aggregate::AggTypeSignature;
+    use crate::exec::pipeline::operator::InputConstructionFactory;
+    use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    use arrow::array::{Int64Array, StringArray};
+    use novarocks_functions::{FunctionResultType, FunctionValueType};
+
+    pub(super) const KEY_SLOT: SlotId = SlotId::new(701);
+    pub(super) const INPUT_SLOT: SlotId = SlotId::new(702);
+    pub(super) const RESULT_SLOT: SlotId = SlotId::new(703);
+
+    pub(super) struct Declaration {
+        pub(super) arena: Arc<ExprArena>,
+        pub(super) groups: Vec<ExprId>,
+        pub(super) functions: Vec<AggFunction>,
+        pub(super) function_set: Arc<agg::SealedExecutionFunctionSet>,
+        pub(super) resolved: Vec<ResolvedAggregateSignature>,
+        pub(super) schema: ChunkSchemaRef,
+        pub(super) construction: Arc<dyn InputConstructionFactory>,
+        pub(super) tracker: Arc<MemTracker>,
+    }
+
+    pub(super) fn declaration(grouped: bool) -> Declaration {
+        let tracker = MemTracker::new_root("typed empty aggregate recipient");
+        tracker.install_limit_once(16 * 1024 * 1024).unwrap();
+        let construction = try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker.clone(),
+            Arc::new(RuntimeErrorState::default()),
+        )
+        .unwrap();
+        let group_type = FunctionValueType::new(DataType::Utf8, true);
+        let input_type = FunctionValueType::new(DataType::Int64, true);
+        let mut arena = ExprArena::default();
+        let group = arena.push_value_typed(ExprNode::SlotId(KEY_SLOT), group_type.clone());
+        let input = arena.push_value_typed(ExprNode::SlotId(INPUT_SLOT), input_type.clone());
+        let function_set = agg::test_builtin_execution_function_set();
+        let frozen = typed_fixture::frozen_aggregate(
+            function_set.catalog(),
+            "multi_distinct_sum",
+            &[input_type],
+        );
+        let FunctionResultType::Scalar(result) = &frozen.selected().result_type else {
+            panic!("DISTINCT SUM has a scalar result");
+        };
+        let result = result.clone();
+        let intermediate = frozen
+            .selected()
+            .aggregate
+            .as_ref()
+            .unwrap()
+            .intermediate_type
+            .data_type()
+            .clone();
+        let resolved = function_set
+            .catalog()
+            .resolve_aggregate_trusted("multi_distinct_sum", &[DataType::Int64])
+            .unwrap();
+        let function = AggFunction {
+            frozen: Some(frozen),
+            name: "multi_distinct_sum".into(),
+            inputs: vec![input],
+            input_is_intermediate: false,
+            types: Some(AggTypeSignature {
+                intermediate_type: Some(intermediate),
+                output_type: Some(result.data_type().clone()),
+                input_arg_type: Some(DataType::Int64),
+            }),
+            order: Default::default(),
+        };
+        let mut types = Vec::new();
+        let mut fields = Vec::new();
+        let mut slots = Vec::new();
+        if grouped {
+            fields.push(Field::new(
+                "key",
+                group_type.data_type().clone(),
+                group_type.nullable(),
+            ));
+            slots.push(KEY_SLOT);
+            types.push(group_type);
+        }
+        fields.push(Field::new(
+            "sum",
+            result.data_type().clone(),
+            result.nullable(),
+        ));
+        slots.push(RESULT_SLOT);
+        types.push(result);
+        let layout = typed_fixture::layout(Arc::new(Schema::new(fields)), &slots, &types);
+        let schema = construction.create_compiled_chunk_schema(&layout).unwrap();
+        Declaration {
+            arena: Arc::new(arena),
+            groups: if grouped { vec![group] } else { vec![] },
+            functions: vec![function],
+            function_set,
+            resolved: vec![resolved],
+            schema,
+            construction,
+            tracker,
+        }
+    }
+
+    pub(super) fn all_null_group() -> Chunk {
+        typed_fixture::columns(
+            &["key", "value"],
+            &[KEY_SLOT, INPUT_SLOT],
+            &[
+                FunctionValueType::new(DataType::Utf8, true),
+                FunctionValueType::new(DataType::Int64, true),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec![Some("all-null"), Some("all-null")])),
+                Arc::new(Int64Array::from(vec![None::<i64>, None])),
+            ],
+            2,
+        )
+    }
+
+    // Protect the actual prepared hash-aggregate recipient, not the former
+    // untyped empty RecordBatch branch. Original selected SUM declarations,
+    // zero groups, one scalar-empty group and one real all-NULL group provide
+    // independent row/type/NULL oracles. This owner-local test has no services;
+    // the paired streaming recipient reuses only its explicit declarations.
+    #[test]
+    fn typed_grouped_empty_processor_preserves_scalar_null_group_and_finish_lifecycle() {
+        for (grouped, populated) in [(true, false), (false, false), (true, true)] {
+            let declaration = declaration(grouped);
+            let tracker = declaration.tracker.clone();
+            {
+                let factory = AggregateProcessorFactory::new_native(
+                    701,
+                    declaration.arena,
+                    declaration.groups,
+                    declaration.functions,
+                    declaration.function_set,
+                    declaration.resolved,
+                    false,
+                    false,
+                    declaration.schema.clone(),
+                    vec![],
+                    None,
+                    1,
+                    None,
+                )
+                .unwrap();
+                let mut operator = factory.create(1, 0);
+                operator.set_mem_tracker(tracker.clone());
+                operator.set_construction_factory(declaration.construction);
+                operator.prepare().unwrap();
+                let processor = operator.as_processor_mut().unwrap();
+                let state = RuntimeState::default();
+                if populated {
+                    processor.push_chunk(&state, all_null_group()).unwrap();
+                }
+                processor.set_finishing(&state).unwrap();
+                processor.set_finishing(&state).unwrap();
+                let output = processor.pull_chunk(&state).unwrap().unwrap();
+                let rows = usize::from(!grouped || populated);
+                assert_eq!(output.len(), rows);
+                for (actual, declared) in output
+                    .chunk_schema()
+                    .slots()
+                    .iter()
+                    .zip(declaration.schema.slots())
+                {
+                    assert_eq!(actual.typed_binding(), declared.typed_binding());
+                }
+                if rows == 0 {
+                    assert_eq!(
+                        output.columns()[0]
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .value_offsets(),
+                        &[0]
+                    );
+                } else {
+                    assert!(output.columns().last().unwrap().is_null(0));
+                }
+                assert!(processor.is_finished());
+                processor.set_finishing(&state).unwrap();
+                assert!(processor.pull_chunk(&state).unwrap().is_none());
+                drop(output);
+            }
+            drop(declaration.schema);
+            assert_eq!(
+                tracker.current(),
+                0,
+                "the actual recipient and its result have exited"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

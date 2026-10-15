@@ -48,6 +48,7 @@ pub use conditional::eval_nullif;
 pub use conditional::{eval_is_not_null, eval_is_null};
 pub use date::common::{parse_date as parse_date_value, parse_datetime as parse_datetime_value};
 pub use date::eval_date_function;
+pub(super) use date::eval_hour_from_unixtime;
 pub use date::eval_year;
 pub use encryption::eval_encryption_function;
 pub use iceberg::{
@@ -84,6 +85,8 @@ pub enum FunctionKind {
 
     // Date/Time functions
     Year,
+    /// Original HOUR computation with its fixed public result realization.
+    HourFromUnixtime,
 
     // Conditional functions
     AssertTrue,
@@ -363,6 +366,12 @@ pub fn function_metadata(kind: FunctionKind) -> FunctionMetadata {
             name: "round",
             min_args: 1,
             max_args: 2,
+            kind,
+        },
+        FunctionKind::HourFromUnixtime => FunctionMetadata {
+            name: "hour_from_unixtime",
+            min_args: 1,
+            max_args: 1,
             kind,
         },
         FunctionKind::Date(name) => {

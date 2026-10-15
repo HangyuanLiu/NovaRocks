@@ -49,6 +49,7 @@ use crate::runtime::fragment::sink::materialize_fragment_sink_with_result;
 use crate::runtime::fragment::submission::FragmentSubmission;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
+use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_types::QueryId;
 
@@ -70,6 +71,7 @@ pub struct FragmentPrepareContext {
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     commit_port: Arc<dyn FragmentCommitPort>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
+    receiver_construction_lifetime: ReceiverConstructionLifetime,
     /// The per-edge send permission this task's push sinks are bound by.
     ///
     /// Absent means the caller runs no closed-edge barrier, which is how
@@ -85,6 +87,17 @@ pub struct FragmentPrepareContext {
     #[cfg(test)]
     start_failure: Option<StartFailurePoint>,
 }
+
+#[derive(Clone, Copy)]
+enum ReceiverConstructionLifetime {
+    KernelBound,
+    RegistrationOwned,
+}
+
+type ReceiverConstruction = (
+    Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    Option<crate::exec::pipeline::operator::input_construction::ReceiverInputConstructionStopOwner>,
+);
 
 #[cfg(test)]
 mod owner_tests {
@@ -110,7 +123,9 @@ mod owner_tests {
         FragmentRuntimeOptions, FragmentSinkAssignment, ScanAssignments,
     };
     use crate::runtime::fragment::io::{
-        FragmentIoError, FragmentResultSession, FragmentResultWriter, ResultAbort, ResultWriteSpec,
+        ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverPort,
+        ExchangeReceiverRegistration, ExecutionRuntimeExchangeReceiverPort, FragmentIoError,
+        FragmentResultSession, FragmentResultWriter, ResultAbort, ResultWriteSpec,
     };
     use crate::runtime::fragment::submission::FragmentSubmission;
     use crate::runtime::query_options::QueryOptions;
@@ -120,6 +135,80 @@ mod owner_tests {
         FragmentCancelReason, FragmentOutcome, FragmentPrepareContext, RunningFragmentHandle,
         prepare_fragment,
     };
+
+    /// Loan the actual registration to the two preparation rollback fixtures;
+    /// all registration, decoding and cleanup stay on the original port.
+    pub(in crate::runtime::fragment::handle) struct ReceiverConstructionPort {
+        delegate: ExecutionRuntimeExchangeReceiverPort,
+        pub(in crate::runtime::fragment::handle) registrations:
+            Mutex<Vec<ExchangeReceiverRegistration>>,
+    }
+
+    impl ReceiverConstructionPort {
+        pub(in crate::runtime::fragment::handle) fn new(
+            runtime: Arc<crate::runtime::execution_runtime::ExecutionRuntime>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                delegate: ExecutionRuntimeExchangeReceiverPort::new(runtime),
+                registrations: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl ExchangeReceiverPort for ReceiverConstructionPort {
+        fn register(&self, registration: ExchangeReceiverRegistration) -> Result<(), String> {
+            self.delegate.register(registration.clone())?;
+            self.registrations.lock().unwrap().push(registration);
+            Ok(())
+        }
+        fn push(
+            &self,
+            key: ExchangeReceiverKey,
+            frame: ExchangeReceiverFrame,
+        ) -> Result<(), crate::runtime::exchange::ExchangeReceiveFailure> {
+            self.delegate.push(key, frame)
+        }
+        fn cancel(&self, key: ExchangeReceiverKey) {
+            self.delegate.cancel(key);
+        }
+        fn remove(&self, key: ExchangeReceiverKey) {
+            self.delegate.remove(key);
+        }
+        fn cancel_fragment(&self, fragment_instance_id: UniqueId) {
+            self.delegate.cancel_fragment(fragment_instance_id);
+        }
+        fn receiver_handle(
+            &self,
+            key: ExchangeReceiverKey,
+            expected_senders: usize,
+        ) -> Result<crate::runtime::exchange::ExchangeReceiverHandle, String> {
+            self.delegate.receiver_handle(key, expected_senders)
+        }
+        fn ensure_mem_tracker(
+            &self,
+            key: ExchangeReceiverKey,
+            root: &Arc<crate::runtime::mem_tracker::MemTracker>,
+        ) -> Result<Arc<crate::runtime::mem_tracker::MemTracker>, String> {
+            self.delegate.ensure_mem_tracker(key, root)
+        }
+        fn push_local(
+            &self,
+            key: ExchangeReceiverKey,
+            sender_id: i32,
+            backend_number: i32,
+            chunks: Vec<Chunk>,
+            eos: bool,
+        ) {
+            self.delegate
+                .push_local(key, sender_id, backend_number, chunks, eos);
+        }
+        fn snapshot(
+            &self,
+            key: ExchangeReceiverKey,
+        ) -> Option<crate::runtime::exchange::ExchangeReceiverSnapshot> {
+            self.delegate.snapshot(key)
+        }
+    }
 
     fn noop_submission(finst_id: UniqueId) -> FragmentSubmission {
         submission(
@@ -532,6 +621,215 @@ mod owner_tests {
         .start()
     }
 
+    /// Reuse the original registration and real receiver port while keeping
+    /// the pipeline itself minimal: these tests isolate its cleanup owner.
+    fn noop_with_receiver(
+        id: UniqueId,
+    ) -> (
+        super::DormantFragmentHandle,
+        Arc<dyn crate::runtime::fragment::io::ExchangeReceiverPort>,
+        crate::runtime::fragment::io::ExchangeReceiverKey,
+    ) {
+        let context = FragmentPrepareContext::default();
+        let port = Arc::clone(&context.exchange_receiver_port);
+        let mut dormant = prepare_fragment(noop_submission(id), context).unwrap();
+        let tracker =
+            crate::runtime::mem_tracker::MemTracker::new_root("receiver retirement fixture");
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker,
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        ).unwrap();
+        let declaration =
+            crate::exec::chunk::typed_fixture::layout(Arc::new(Schema::empty()), &[], &[]);
+        let schema = factory.create_compiled_chunk_schema(&declaration).unwrap();
+        let key = crate::runtime::fragment::io::ExchangeReceiverKey {
+            fragment_instance_id: id,
+            node_id: 71,
+        };
+        dormant
+            .resources
+            .acquire_compiled_exchange(
+                vec![crate::runtime::fragment::io::ExchangeReceiverRegistration {
+                    key,
+                    expected_senders: 1,
+                    expected_chunk_schema: schema,
+                    column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
+                    creation_factory: factory,
+                }],
+                None,
+            )
+            .unwrap();
+        (dormant, port, key)
+    }
+
+    #[test]
+    fn direct_execution_keeps_original_receiver_terminal_cleanup_without_transfer() {
+        for (ordinal, failed) in [false, true].into_iter().enumerate() {
+            let (dormant, port, key) = noop_with_receiver(UniqueId::new(84_100, ordinal as i64));
+            assert!(port.snapshot(key).is_some());
+            let running = if failed {
+                dormant.start_failed("original execution failure")
+            } else {
+                dormant.start()
+            };
+            let fact = running.join();
+            assert_eq!(matches!(fact.outcome(), FragmentOutcome::Failed(_)), failed);
+            assert!(port.snapshot(key).is_none());
+        }
+    }
+
+    #[test]
+    fn plan_tree_receiver_prepare_rollback_preserves_primary_and_cleanup_diagnostics() {
+        use crate::exec::fragment::program::{ExchangeInputContract, FragmentNodeId};
+        use crate::exec::node::exchange_source::ExchangeSourceNode;
+        use crate::runtime::fragment::instance::ExchangeInputAssignment;
+        use crate::runtime::fragment::resources::ResourceKind;
+
+        let id = UniqueId::new(84_500, 1);
+        let node = FragmentNodeId::new(71);
+        let schema = crate::exec::chunk::typed_fixture::columns(&[], &[], &[], Vec::new(), 0)
+            .chunk_schema_ref();
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::ExchangeSource(ExchangeSourceNode::new(
+                    node.get(),
+                    Duration::from_secs(1),
+                    schema.clone(),
+                )),
+            },
+        };
+        let profile = crate::exec::chunk::typed_fixture::profile(&plan, NonZeroUsize::MIN, None);
+        let (local, bindings) = crate::exec::chunk::typed_fixture::lower(
+            plan,
+            profile,
+            Vec::new(),
+            novarocks_local_program::StaticSinkProgram::Noop,
+        );
+        let program = Arc::new(
+            FragmentProgram::try_new(
+                Arc::new(local),
+                FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
+                BTreeMap::new(),
+                BTreeMap::from([(node, ExchangeInputContract::new(schema))]),
+                RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
+            )
+            .unwrap(),
+        );
+        let instance = FragmentInstanceSpec::new_native(
+            FragmentContractVersion::CURRENT,
+            QueryId::new(84_498, 1),
+            FragmentInstanceId::new(id),
+            ScanAssignments::default(),
+            ExchangeInputAssignments::new(BTreeMap::from([(
+                node,
+                ExchangeInputAssignment::new(NonZeroUsize::MIN),
+            )])),
+            FragmentSinkAssignment::None,
+            FragmentRuntimeOptions::new(QueryOptions::default(), false),
+            NonZeroUsize::MIN,
+            BackendNum::try_new(1).unwrap(),
+        );
+        let submission = FragmentSubmission::try_new(program, bindings, instance).unwrap();
+        let runtime = crate::runtime::execution_runtime::test_execution_runtime();
+        let port = ReceiverConstructionPort::new(runtime.clone());
+        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("receiver rollback");
+        tracker.install_limit_once(1024 * 1024).unwrap();
+        let mut context = FragmentPrepareContext::default()
+            .with_execution_runtime(runtime)
+            .with_exchange_receiver_port(port.clone())
+            .with_registration_owned_exchange_receivers()
+            .with_prepare_failure(super::PrepareFailurePoint::AfterExchange)
+            .with_cleanup_failure(ResourceKind::Exchange);
+        context.mem_tracker = Some(tracker.clone());
+        let error = match prepare_fragment(submission, context) {
+            Err(error) => error,
+            Ok(_) => panic!("the original AfterExchange failure must refuse preparation"),
+        };
+        assert_eq!(error.stage(), super::FragmentLaunchStage::Register);
+        assert_eq!(
+            error.kind(),
+            super::FragmentLaunchErrorKind::ResourceUnavailable
+        );
+        assert_eq!(
+            error.detail(),
+            super::PrepareFailurePoint::AfterExchange.detail()
+        );
+        assert_eq!(
+            error.cleanup_diagnostics(),
+            &["injected exchange registration cleanup failure"]
+        );
+        let loans = port.registrations.lock().unwrap();
+        assert_eq!(
+            loans.len(),
+            1,
+            "the actual receiver was installed before failure"
+        );
+        let loan = &loans[0];
+        assert_eq!(
+            loan.key,
+            ExchangeReceiverKey {
+                fragment_instance_id: id,
+                node_id: node.get()
+            }
+        );
+        assert!(port.snapshot(loan.key).is_none());
+        assert_eq!(
+            loan.creation_factory.observe_input_work(1).unwrap_err(),
+            crate::exec::pipeline::operator::ConstructionFailure::Caller(Box::new(
+                novarocks_functions::KernelFailure::Cancelled.into(),
+            )),
+        );
+        assert!(
+            tracker.current() > 0,
+            "the independent factory loan is still live"
+        );
+        drop(loans);
+        port.registrations.lock().unwrap().clear();
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn transferred_receiver_survives_raw_terminal_until_explicit_retirement() {
+        for (ordinal, failed) in [false, true].into_iter().enumerate() {
+            let (mut dormant, port, key) =
+                noop_with_receiver(UniqueId::new(84_101, ordinal as i64));
+            let mut retirement = dormant
+                .take_exchange_retirement()
+                .expect("unique original receiver owner");
+            assert!(dormant.take_exchange_retirement().is_none());
+            let running = if failed {
+                dormant.start_failed("original execution failure")
+            } else {
+                dormant.start()
+            };
+            let fact = running.join();
+            assert_eq!(matches!(fact.outcome(), FragmentOutcome::Failed(_)), failed);
+            assert!(port.snapshot(key).is_some());
+            retirement.record_terminal(&fact);
+            assert!(
+                port.snapshot(key).is_some(),
+                "recording a fact cannot close physical ingress"
+            );
+            retirement.retire();
+            assert!(port.snapshot(key).is_none());
+        }
+    }
+
+    #[test]
+    fn transferred_dormant_receiver_rolls_back_once_without_a_terminal_fact() {
+        let (mut dormant, port, key) = noop_with_receiver(UniqueId::new(84_102, 1));
+        let retirement = dormant.take_exchange_retirement().unwrap();
+        drop(dormant);
+        assert!(
+            port.snapshot(key).is_some(),
+            "dormant rollback no longer owns transferred ingress"
+        );
+        drop(retirement);
+        assert!(port.snapshot(key).is_none());
+    }
+
     #[test]
     fn execution_owner_prepares_starts_and_freezes_a_noop_fragment() {
         let handle = prepare_fragment(
@@ -845,6 +1143,7 @@ impl Default for FragmentPrepareContext {
             commit_port: Arc::new(TestFragmentCommitPort),
             exchange_receiver_port:
                 crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port(),
+            receiver_construction_lifetime: ReceiverConstructionLifetime::KernelBound,
             #[cfg(test)]
             prepare_failure: None,
             #[cfg(test)]
@@ -887,6 +1186,7 @@ impl FragmentPrepareContext {
             query_memory: None,
             commit_port: Arc::new(UnavailableFragmentCommitPort),
             exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
+            receiver_construction_lifetime: ReceiverConstructionLifetime::KernelBound,
             #[cfg(test)]
             prepare_failure: None,
             #[cfg(test)]
@@ -916,6 +1216,43 @@ impl FragmentPrepareContext {
     pub fn with_execution_runtime(mut self, runtime: Arc<ExecutionRuntime>) -> Self {
         self.execution_runtime = Some(runtime);
         self
+    }
+
+    /// Native tasks keep authorized ingress alive until their inbound gate
+    /// retires the registration, independently of local kernel quiescence.
+    pub fn with_registration_owned_exchange_receivers(mut self) -> Self {
+        self.receiver_construction_lifetime = ReceiverConstructionLifetime::RegistrationOwned;
+        self
+    }
+
+    pub(super) fn receiver_construction(
+        &self,
+        runtime_state: &RuntimeState,
+    ) -> Result<ReceiverConstruction, crate::exec::pipeline::operator::ConstructionFailure> {
+        use crate::exec::pipeline::operator::input_construction::{
+            ConstructionFailure, try_receiver_input_construction_factory,
+            try_runtime_input_construction_factory,
+        };
+        let tracker = runtime_state
+            .mem_tracker()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let profile = crate::exec::pipeline::pipeline::representation_construction_profile()?;
+        match self.receiver_construction_lifetime {
+            ReceiverConstructionLifetime::KernelBound => try_runtime_input_construction_factory(
+                profile,
+                tracker,
+                runtime_state.error_state(),
+            )
+            .map(|factory| (factory, None)),
+            ReceiverConstructionLifetime::RegistrationOwned => {
+                try_receiver_input_construction_factory(
+                    profile,
+                    tracker,
+                    runtime_state.error_state(),
+                )
+                .map(|(factory, stop)| (factory, Some(stop)))
+            }
+        }
     }
 
     /// Binds this fragment's push sinks to the per-edge send permission its
@@ -1012,6 +1349,7 @@ impl FragmentPrepareContext {
             query_memory: None,
             commit_port: Arc::new(UnavailableFragmentCommitPort),
             exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
+            receiver_construction_lifetime: ReceiverConstructionLifetime::KernelBound,
             #[cfg(test)]
             prepare_failure: None,
             #[cfg(test)]
@@ -1141,6 +1479,15 @@ pub struct DormantFragmentHandle {
 }
 
 impl DormantFragmentHandle {
+    /// Transfer the same physical registrations to the task's inbound-close
+    /// owner before installation. Without this explicit transfer the fragment
+    /// retains its original terminal cleanup and preparation rollback.
+    pub fn take_exchange_retirement(
+        &mut self,
+    ) -> Option<super::resources::ExchangeReceiverRetirement> {
+        self.resources.take_exchange_retirement()
+    }
+
     pub const fn submitted_driver_count(&self) -> usize {
         self.prepared.submitted_driver_count()
     }
@@ -1492,28 +1839,28 @@ pub fn prepare_fragment(
                 error,
             )
         })?;
-        let receiver_creation = if program.exchange_inputs().is_empty() {
-            None
-        } else {
-            let construction_error =
-                |cause: crate::exec::pipeline::operator::ConstructionFailure| {
-                    FragmentLaunchError::from_failure(
-                        FragmentLaunchStage::Register,
-                        FragmentLaunchErrorKind::ResourceUnavailable,
-                        cause.into(),
-                    )
-                };
-            let tracker = runtime_state.mem_tracker().ok_or_else(|| {
-                construction_error(
-                    crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
-                )
-            })?;
-            let profile = crate::exec::pipeline::pipeline::representation_construction_profile()
-                .map_err(crate::exec::pipeline::operator::ConstructionFailure::from)
-                .map_err(construction_error)?;
-            Some(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(profile, tracker, runtime_state.error_state()).map_err(construction_error)?)
-        };
-        resources.acquire_exchange(program, instance, receiver_creation)?;
+        let (receiver_creation, receiver_construction_stop) =
+            if program.exchange_inputs().is_empty() {
+                (None, None)
+            } else {
+                let (factory, stop) =
+                    context
+                        .receiver_construction(&runtime_state)
+                        .map_err(|cause| {
+                            FragmentLaunchError::from_failure(
+                                FragmentLaunchStage::Register,
+                                FragmentLaunchErrorKind::ResourceUnavailable,
+                                cause.into(),
+                            )
+                        })?;
+                (Some(factory), stop)
+            };
+        resources.acquire_exchange(
+            program,
+            instance,
+            receiver_creation,
+            receiver_construction_stop,
+        )?;
         context.fail_if_injected(PrepareFailurePoint::AfterExchange)?;
 
         let materialized_sink = materialize_fragment_sink_with_result(

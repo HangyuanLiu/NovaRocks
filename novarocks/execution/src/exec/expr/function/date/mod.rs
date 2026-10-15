@@ -38,6 +38,7 @@ mod datediff;
 mod from_days;
 mod from_unixtime;
 mod hour_from_unixtime;
+pub(in crate::exec::expr) use hour_from_unixtime::eval_hour_from_unixtime;
 mod last_day;
 mod makedate;
 mod next_day;

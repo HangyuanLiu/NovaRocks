@@ -34,7 +34,10 @@ pub mod runtime;
 #[path = "input_construction/scoped.rs"]
 pub mod scoped;
 pub use arrow_model::LockedArrowInputConstructionModel;
-pub use runtime::try_runtime_input_construction_factory;
+pub use runtime::{
+    ReceiverInputConstructionStopOwner, try_receiver_input_construction_factory,
+    try_runtime_input_construction_factory,
+};
 pub use scoped::{
     InputConstructionOperationModel, InputConstructionProfile, InputConstructionRequestHost,
     InputConstructionWorkControl, ObservedInputConstructionFactory, OpaqueConstructionBound,

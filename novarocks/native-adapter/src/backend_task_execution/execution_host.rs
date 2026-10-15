@@ -34,9 +34,10 @@
 //! is not a step the fragment kernel exposes on its own: it happens inside
 //! `prepare_fragment`, which also builds the pipeline and hands back a
 //! [`DormantFragmentHandle`]. So `install_receiver` prepares the whole
-//! fragment and parks the handle; `remove_receiver` drops it, and the
-//! `FragmentResources` it owns roll every registration back. The Worker's
-//! Live commit starts the prepared execution through the runnable.
+//! fragment and parks the handle, transferring its physical receivers into
+//! the task's retirement owner. `remove_receiver` synchronously retires those
+//! receivers under the Worker's inbound gate, including when another task
+//! handle still exists. The Worker's Live commit starts the prepared execution.
 //!
 //! This host reads nothing from the fragment-based lifecycle registry. Every
 //! query-scoped fact it needs arrives through [`TaskQueryContextFacts`], which
@@ -44,7 +45,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use novarocks_execution::connector::{
@@ -60,10 +61,11 @@ use novarocks_execution::runtime::fragment::io::{
 };
 use novarocks_execution::runtime::fragment::scan::compiled_scan_nodes;
 use novarocks_execution::runtime::fragment::{
-    CompiledFragmentSubmission, DormantFragmentHandle, ExecutionFailureCause, FragmentCancelReason,
-    FragmentExecutionError, FragmentInstanceSpec, FragmentLaunchError, FragmentOutcome,
-    FragmentRuntimeOptions, FragmentTerminalFact, RunningFragmentHandle, ScanAssignments,
-    compiled_sink_kind, prepare_compiled_fragment, prepare_fragment,
+    CompiledFragmentSubmission, DormantFragmentHandle, ExchangeReceiverRetirement,
+    ExecutionFailure, ExecutionFailureCause, FragmentCancelReason, FragmentExecutionError,
+    FragmentInstanceSpec, FragmentLaunchError, FragmentOutcome, FragmentRuntimeOptions,
+    FragmentTerminalFact, RunningFragmentHandle, ScanAssignments, compiled_sink_kind,
+    prepare_compiled_fragment, prepare_fragment,
 };
 use novarocks_execution::runtime::operator_statistics::project_operator_statistics;
 use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragment_root_profiler};
@@ -274,6 +276,9 @@ struct TaskRuntime {
     /// fragment is prepared but not started, and dropping it rolls every
     /// acquired resource back.
     dormant: Mutex<Option<DormantFragmentHandle>>,
+    /// Physical ingress survives actual driver stop until the original
+    /// capability owner closes its route. Taken synchronously on retirement.
+    exchange_retirement: Mutex<Option<ExchangeReceiverRetirement>>,
     edges: Arc<ExchangeEdgeGates>,
     splits: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
     read_context: Arc<TypedReadAttemptContext>,
@@ -850,6 +855,7 @@ impl NativeTaskExecutionHost {
             )
             .with_fragment_commit_port(Arc::clone(&self.commit_port))
             .with_exchange_receiver_port(Arc::clone(&self.exchange_receiver_port))
+            .with_registration_owned_exchange_receivers()
             .with_execution_runtime(Arc::clone(&self.execution_runtime))
             .with_result_identity(identity)
             .with_edge_gates(Arc::clone(&edges));
@@ -886,7 +892,9 @@ impl NativeTaskExecutionHost {
             None => prepare_compiled_fragment(submission, context),
         };
         tracing::debug!(resource_scope = "project-prepare-metadata", receipt = ?project_journal, "Project preparation resource receipt");
-        let dormant = prepared.map_err(|error| preparation_failure_to_host(identity, &error))?;
+        let mut dormant =
+            prepared.map_err(|error| preparation_failure_to_host(identity, &error))?;
+        let exchange_retirement = dormant.take_exchange_retirement();
 
         #[cfg(feature = "test-controls")]
         crate::task_execution_observation::emit_prepared_task_dop(
@@ -914,6 +922,7 @@ impl NativeTaskExecutionHost {
                 stop: task_stop,
                 sink_kind,
                 dormant: Mutex::new(Some(dormant)),
+                exchange_retirement: Mutex::new(exchange_retirement),
                 edges,
                 splits,
                 read_context,
@@ -1426,6 +1435,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             )
             .with_fragment_commit_port(Arc::clone(&self.commit_port))
             .with_exchange_receiver_port(Arc::clone(&self.exchange_receiver_port))
+            .with_registration_owned_exchange_receivers()
             .with_execution_runtime(Arc::clone(&self.execution_runtime))
             .with_result_identity(identity)
             // Binding the gates here is what makes the closed-edge barrier
@@ -1452,8 +1462,9 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         // This is the receiver install. It registers every inbound exchange
         // receiver and builds the pipeline in one step, and its rollback is
         // dropping the handle it returns.
-        let dormant = prepare_fragment(submission, context)
+        let mut dormant = prepare_fragment(submission, context)
             .map_err(|error| preparation_failure_to_host(identity, &error))?;
+        let exchange_retirement = dormant.take_exchange_retirement();
 
         #[cfg(feature = "test-controls")]
         crate::task_execution_observation::emit_prepared_task_dop(
@@ -1484,6 +1495,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 sink_kind,
                 root_channel,
                 dormant: Mutex::new(Some(dormant)),
+                exchange_retirement: Mutex::new(exchange_retirement),
                 edges,
                 splits,
                 read_context,
@@ -1501,8 +1513,8 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
     /// Idempotent, because the owner calls it both to roll a creation back and
     /// to retire a task that already ran. In the first case the dormant handle
     /// is still parked and its drop rolls the registrations back; in the
-    /// second it was taken by `submit_runnable` and the running fragment
-    /// already finished them.
+    /// second it was taken by `submit_runnable`. Physical ingress is retired
+    /// here in both cases, without waiting for the last TaskRuntime alias.
     fn remove_receiver(&self, descriptor: &TaskDescriptor) {
         let removed = self
             .tasks
@@ -1514,6 +1526,16 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             // Closing the queues wakes any scan still blocked on a split that
             // will now never arrive.
             self.split_queues.close_attempt(runtime.attempt);
+            // The caller has already closed the capability or holds its
+            // normal-close writer gate. Do not defer this to Arc::drop.
+            if let Some(retirement) = runtime
+                .exchange_retirement
+                .lock()
+                .expect(DORMANT_LOCK)
+                .take()
+            {
+                retirement.retire();
+            }
             drop(runtime);
         }
     }
@@ -1605,6 +1627,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             identity,
             kernel_key,
             runtime.stop.clone(),
+            Arc::downgrade(&runtime),
         ));
         let completion_worker = Arc::clone(&task);
         let queries = self.queries.clone();
@@ -1614,12 +1637,24 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         let root_channel = runtime.root_channel.clone();
         let operator_statistics = Arc::clone(&runtime.operator_statistics);
         let completion_reporter = reporter.clone();
+        let completion_runtime = Arc::clone(&runtime);
         let completion = self
             .completion_supervisor
             .reserve(
                 identity,
                 kernel_key,
                 Box::new(move |fact| {
+                    // Preserve the kernel's original removal/cancellation
+                    // disposition before any fact can make the task retire.
+                    // Only the inbound-close owner performs physical cleanup.
+                    if let Some(retirement) = completion_runtime
+                        .exchange_retirement
+                        .lock()
+                        .expect(DORMANT_LOCK)
+                        .as_mut()
+                    {
+                        retirement.record_terminal(&fact);
+                    }
                     // The stopped observer is the positive local evidence
                     // that pipeline work ended. A terminal status, abort
                     // acknowledgement, or timeout cannot manufacture it.
@@ -1861,6 +1896,7 @@ pub struct NativeRunnableTask {
     identity: TaskIdentity,
     fragment_instance_id: UniqueId,
     stop: ConnectorStopOwner,
+    receiver_runtime: Option<Weak<TaskRuntime>>,
     state: Mutex<RunnableState>,
     completion: OnceLock<TaskCompletionSignal>,
 }
@@ -1884,10 +1920,31 @@ const RUNNABLE_LOCK: &str = "native runnable task lock";
 impl NativeRunnableTask {
     #[cfg(test)]
     fn new(identity: TaskIdentity, fragment_instance_id: UniqueId) -> Self {
-        Self::new_with_stop(identity, fragment_instance_id, ConnectorStopOwner::new())
+        Self::new_without_receiver_with_stop(
+            identity,
+            fragment_instance_id,
+            ConnectorStopOwner::new(),
+        )
     }
 
     fn new_with_stop(
+        identity: TaskIdentity,
+        fragment_instance_id: UniqueId,
+        stop: ConnectorStopOwner,
+        receiver_runtime: Weak<TaskRuntime>,
+    ) -> Self {
+        Self {
+            identity,
+            fragment_instance_id,
+            stop,
+            receiver_runtime: Some(receiver_runtime),
+            state: Mutex::new(RunnableState::default()),
+            completion: OnceLock::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_without_receiver_with_stop(
         identity: TaskIdentity,
         fragment_instance_id: UniqueId,
         stop: ConnectorStopOwner,
@@ -1896,6 +1953,7 @@ impl NativeRunnableTask {
             identity,
             fragment_instance_id,
             stop,
+            receiver_runtime: None,
             state: Mutex::new(RunnableState::default()),
             completion: OnceLock::new(),
         }
@@ -2071,6 +2129,22 @@ impl RunnableTask for NativeRunnableTask {
     }
 
     fn abort(&self, cause: AbortCause) {
+        // Receiver construction follows the registration's lifetime, not the
+        // first kernel stand-down. A later true abort must still stop it.
+        if let Some(runtime) = self.receiver_runtime.as_ref().and_then(Weak::upgrade) {
+            if let Some(retirement) = runtime
+                .exchange_retirement
+                .lock()
+                .expect(DORMANT_LOCK)
+                .as_ref()
+            {
+                retirement.stop_construction(ExecutionFailure::from(
+                    StandDown::Abort(cause).reason().detail().to_owned(),
+                ));
+            }
+        }
+        // Release the retirement lock before reaching the original latch or
+        // kernel cancellation, which may run completion callbacks.
         self.request(StandDown::Abort(cause));
     }
 }
@@ -4281,7 +4355,7 @@ pub(super) mod tests {
     #[test]
     fn a_stand_down_before_the_fragment_starts_is_replayed_when_it_attaches() {
         let stop = ConnectorStopOwner::new();
-        let task = NativeRunnableTask::new_with_stop(
+        let task = NativeRunnableTask::new_without_receiver_with_stop(
             identity(14, 1, 1),
             UniqueId::new(81, 82),
             stop.clone(),
@@ -4330,7 +4404,7 @@ pub(super) mod tests {
     #[test]
     fn a_stand_down_after_the_fragment_started_reaches_it_directly() {
         let stop = ConnectorStopOwner::new();
-        let task = NativeRunnableTask::new_with_stop(
+        let task = NativeRunnableTask::new_without_receiver_with_stop(
             identity(16, 1, 1),
             UniqueId::new(101, 102),
             stop.clone(),
@@ -6002,6 +6076,539 @@ pub(super) mod tests {
             novarocks_worker::result_buffer::retire_task_result(task_id),
             novarocks_worker::result_buffer::ResultPublication::Removed,
         );
+    }
+
+    /// Only observes the original port's lifecycle; every registration and
+    /// delivery still reaches the real execution-runtime registry.
+    struct RetirementPort {
+        inner: Arc<dyn novarocks_execution::runtime::fragment::io::ExchangeReceiverPort>,
+        removed: AtomicUsize,
+        cancelled: AtomicUsize,
+        expected_schema: Mutex<Option<novarocks_execution::exec::chunk::ChunkSchemaRef>>,
+    }
+
+    impl novarocks_execution::runtime::fragment::io::ExchangeReceiverPort for RetirementPort {
+        fn register(
+            &self,
+            registration: novarocks_execution::runtime::fragment::io::ExchangeReceiverRegistration,
+        ) -> Result<(), String> {
+            let schema = registration.expected_chunk_schema.clone();
+            self.inner.register(registration)?;
+            *self.expected_schema.lock().unwrap() = Some(schema);
+            Ok(())
+        }
+        fn push(
+            &self,
+            key: novarocks_execution::runtime::fragment::io::ExchangeReceiverKey,
+            frame: novarocks_execution::runtime::fragment::io::ExchangeReceiverFrame,
+        ) -> Result<(), novarocks_execution::runtime::exchange::ExchangeReceiveFailure> {
+            self.inner.push(key, frame)
+        }
+        fn cancel(&self, key: novarocks_execution::runtime::fragment::io::ExchangeReceiverKey) {
+            self.cancelled.fetch_add(1, Ordering::SeqCst);
+            self.inner.cancel(key);
+        }
+        fn remove(&self, key: novarocks_execution::runtime::fragment::io::ExchangeReceiverKey) {
+            self.removed.fetch_add(1, Ordering::SeqCst);
+            self.inner.remove(key);
+        }
+        fn cancel_fragment(&self, id: UniqueId) {
+            self.inner.cancel_fragment(id);
+        }
+        fn receiver_handle(
+            &self,
+            key: novarocks_execution::runtime::fragment::io::ExchangeReceiverKey,
+            expected: usize,
+        ) -> Result<novarocks_execution::runtime::exchange::ExchangeReceiverHandle, String>
+        {
+            self.inner.receiver_handle(key, expected)
+        }
+        fn ensure_mem_tracker(
+            &self,
+            key: novarocks_execution::runtime::fragment::io::ExchangeReceiverKey,
+            root: &Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
+        ) -> Result<Arc<novarocks_execution::runtime::mem_tracker::MemTracker>, String> {
+            self.inner.ensure_mem_tracker(key, root)
+        }
+        fn push_local(
+            &self,
+            key: novarocks_execution::runtime::fragment::io::ExchangeReceiverKey,
+            sender: i32,
+            backend: i32,
+            chunks: Vec<novarocks_execution::exec::chunk::Chunk>,
+            eos: bool,
+        ) {
+            self.inner.push_local(key, sender, backend, chunks, eos);
+        }
+        fn snapshot(
+            &self,
+            key: novarocks_execution::runtime::fragment::io::ExchangeReceiverKey,
+        ) -> Option<novarocks_execution::runtime::exchange::ExchangeReceiverSnapshot> {
+            self.inner.snapshot(key)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReceiverStop {
+        Success,
+        Quiesce,
+        QuiesceThenAbort,
+        BeforeStart,
+        Abort,
+        Rollback,
+    }
+
+    fn receiver_data_payload(port: &RetirementPort) -> Vec<u8> {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::DataType;
+        use novarocks_execution::exec::chunk::Chunk;
+        use novarocks_type_contract::ValueKind;
+        let schema = port
+            .expected_schema
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("actual registered declaration");
+        assert_eq!(
+            schema.slots().len(),
+            1,
+            "the original single-column receiver declaration"
+        );
+        let binding = schema.slots()[0].typed_binding();
+        assert_eq!(
+            binding.value_type().kind(),
+            &ValueKind::Scalar(DataType::Int64)
+        );
+        assert_eq!(binding.layout().data_type(), &DataType::Int64);
+        // These are declared Int64 rows, not inferred execution types.
+        // The same original frozen schema validates the actual source chunk.
+        let chunk =
+            Chunk::try_new_with_columns(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+        assert_eq!(chunk.len(), 1);
+        let payload =
+            novarocks_execution::runtime::exchange::encode_chunks(&[chunk], true).unwrap();
+        assert!(
+            !payload.is_empty(),
+            "DATA must enter the original IPC decoder"
+        );
+        payload
+    }
+
+    fn receiver_retirement_case(
+        mut host: NativeTaskExecutionHost,
+        descriptor: TaskDescriptor,
+        input: TaskCreationInput,
+        stop: ReceiverStop,
+        nonempty_data: bool,
+    ) {
+        use novarocks_execution::runtime::fragment::io::{
+            ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverPort,
+        };
+        let port = Arc::new(RetirementPort {
+            inner: Arc::new(novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort::new(Arc::clone(&host.execution_runtime))),
+            removed: AtomicUsize::new(0),
+            cancelled: AtomicUsize::new(0),
+            expected_schema: Mutex::new(None),
+        });
+        host.exchange_receiver_port = port.clone();
+        let inbound = &descriptor.topology().inbound()[0];
+        let source = inbound.sources()[0];
+        let key = ExchangeReceiverKey {
+            fragment_instance_id: descriptor.fragment_instance_id(),
+            node_id: inbound.node_id().get(),
+        };
+        establish_fixture_context(&host, descriptor.identity());
+        host.install_receiver(
+            &descriptor,
+            input,
+            novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+        )
+        .expect("real receiver preparation");
+        let runtime_alias = host.task_runtime(descriptor.identity()).unwrap();
+        assert!(runtime_alias.exchange_retirement.lock().unwrap().is_some());
+        assert!(port.snapshot(key).is_some());
+        if matches!(stop, ReceiverStop::Rollback) {
+            host.remove_receiver(&descriptor);
+            host.remove_receiver(&descriptor);
+            assert!(port.snapshot(key).is_none());
+            assert_eq!(port.cancelled.load(Ordering::SeqCst), 1);
+            assert_eq!(port.removed.load(Ordering::SeqCst), 0);
+            assert!(runtime_alias.exchange_retirement.lock().unwrap().is_none());
+            return;
+        }
+        host.reserve_inbound_close_capacity(&descriptor).unwrap();
+        host.install_inbound_capability(&descriptor).unwrap();
+        let status = Arc::new(TaskStatusSource::new());
+        let owner = Arc::new(TaskStatusOwner::new(
+            descriptor.identity(),
+            status.clone(),
+            Arc::new(ProcessMonotonicClock::new()),
+            METRIC_PUBLISH_MIN_INTERVAL,
+        ));
+        owner.release_to_observers();
+        owner.note_installed();
+        let context = QueryContextRef::new(
+            descriptor.identity().query_execution_id(),
+            FrontendProcessId::new_v7(),
+            descriptor.identity().backend_process_id(),
+        );
+        let observed = status
+            .begin_covered_subscription(context, 1, &[], &[], None, &[descriptor.identity()], 1)
+            .unwrap();
+        let data_payload = nonempty_data.then(|| receiver_data_payload(&port));
+        let reporter = TaskStatusReporter::new(owner.clone());
+        let runnable = host.submit_runnable(&descriptor, reporter).unwrap();
+        if matches!(stop, ReceiverStop::BeforeStart) {
+            runnable.quiesce();
+        }
+        runnable.commit_creation();
+        let frame = || ExchangeReceiverFrame {
+            source_fragment_instance_id: source.fragment_instance_id(),
+            sender_ordinal: source.sender_ordinal(),
+            sender_count: 1,
+            sender_id: 0,
+            backend_number: 0,
+            sequence: 0,
+            eos: true,
+            payload: Vec::new(),
+        };
+        if matches!(stop, ReceiverStop::Success) {
+            if let Some(payload) = &data_payload {
+                let mut data = frame();
+                data.payload = payload.clone();
+                data.eos = false;
+                let delivery = host.capabilities.deliver_frame_with_receiver_error(
+                    key.fragment_instance_id,
+                    inbound.node_id(),
+                    source.fragment_instance_id(),
+                    source.sender_ordinal(),
+                    1,
+                    || port.push(key, data),
+                );
+                assert!(
+                    matches!(
+                        &delivery,
+                        novarocks_worker::InboundFrameDelivery::Claim(
+                            InboundFrameClaim::Authorized
+                        )
+                    ),
+                    "the original DATA declaration is accepted before stop: {delivery:?}"
+                );
+            }
+            port.push(key, frame()).expect("original exact sender EOS");
+        } else if matches!(stop, ReceiverStop::Quiesce | ReceiverStop::QuiesceThenAbort) {
+            runnable.quiesce();
+        } else if matches!(stop, ReceiverStop::Abort) {
+            runnable.abort(AbortCause::QueryFailed);
+        }
+        // Observe the original covered source's actual-stop publication.
+        // Its concrete subscription stays inferred behind the Worker's port.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let cut = observed.source_cut();
+                        if owner.convergence().actual_stopped() {
+                            break;
+                        }
+                        observed.wait_for_change(cut).await;
+                    }
+                })
+                .await
+                .expect("the actual receiver drivers stop");
+            });
+        assert_eq!(port.removed.load(Ordering::SeqCst), 0);
+        assert_eq!(port.cancelled.load(Ordering::SeqCst), 0);
+        assert!(
+            port.snapshot(key).is_some(),
+            "actual-stop is not ingress retirement"
+        );
+        if matches!(stop, ReceiverStop::QuiesceThenAbort) {
+            // The kernel has already quiesced and published actual-stop.
+            // Its original first-wins latch must not suppress this abort.
+            runnable.abort(AbortCause::QueryFailed);
+        }
+        if matches!(stop, ReceiverStop::Abort | ReceiverStop::QuiesceThenAbort)
+            && let Some(payload) = &data_payload
+        {
+            use novarocks_execution::exec::pipeline::operator::ConstructionFailure;
+            use novarocks_execution::runtime::exchange::ExchangeReceiveFailure;
+            // No DATA or EOS was sent before stop in either abort scenario.
+            // The original capability still authorizes delivery; construction
+            // must preserve the true abort's original typed cause instead.
+            let mut data = frame();
+            data.payload = payload.clone();
+            data.eos = false;
+            let delivery = host.capabilities.deliver_frame_with_receiver_error(
+                key.fragment_instance_id,
+                inbound.node_id(),
+                source.fragment_instance_id(),
+                source.sender_ordinal(),
+                1,
+                || port.push(key, data),
+            );
+            let abort_preserved = matches!(
+                &delivery,
+                novarocks_worker::InboundFrameDelivery::Receiver(
+                    ExchangeReceiveFailure::Construction(ConstructionFailure::Caller(error))
+                ) if matches!(error.cause(), novarocks_execution::runtime::fragment::ExecutionFailureCause::Pipeline(detail)
+                    if detail == AbortCause::QueryFailed.as_str())
+            );
+            if !abort_preserved {
+                host.remove_inbound_capability(&descriptor);
+                host.remove_receiver(&descriptor);
+            }
+            assert!(
+                abort_preserved,
+                "true abort must stop DATA creation with its original typed cause: {delivery:?}"
+            );
+        }
+        if matches!(stop, ReceiverStop::Quiesce)
+            && let Some(payload) = &data_payload
+        {
+            // No DATA or EOS entered this lane before quiesce. The sender is
+            // still open: this is legal in-flight DATA, not data after EOS.
+            let mut data = frame();
+            data.payload = payload.clone();
+            data.eos = false;
+            let delivery = host.capabilities.deliver_frame_with_receiver_error(
+                key.fragment_instance_id,
+                inbound.node_id(),
+                source.fragment_instance_id(),
+                source.sender_ordinal(),
+                1,
+                || port.push(key, data),
+            );
+            if !matches!(
+                &delivery,
+                novarocks_worker::InboundFrameDelivery::Claim(InboundFrameClaim::Authorized)
+            ) {
+                // Preserve the original typed delivery cause through teardown.
+                // A failed normative assertion must not leave ingress installed.
+                host.remove_inbound_capability(&descriptor);
+                host.remove_receiver(&descriptor);
+            }
+            assert!(
+                matches!(
+                    &delivery,
+                    novarocks_worker::InboundFrameDelivery::Claim(InboundFrameClaim::Authorized)
+                ),
+                "normal quiesce must retain original DATA creation until the inbound gate closes: {delivery:?}"
+            );
+        }
+        assert_eq!(
+            host.capabilities.deliver_frame(
+                key.fragment_instance_id,
+                inbound.node_id(),
+                source.fragment_instance_id(),
+                source.sender_ordinal(),
+                1,
+                || port.push(key, frame()).map_err(|error| error.to_string())
+            ),
+            InboundFrameClaim::Authorized
+        );
+        if matches!(stop, ReceiverStop::Abort | ReceiverStop::QuiesceThenAbort) {
+            host.remove_inbound_capability(&descriptor);
+            host.remove_receiver(&descriptor);
+        } else {
+            host.retire_receiver_normally(&descriptor);
+        }
+        assert!(
+            port.snapshot(key).is_none(),
+            "physical retirement cannot wait for TaskRuntime's last Arc"
+        );
+        assert!(runtime_alias.exchange_retirement.lock().unwrap().is_none());
+        let success = matches!(stop, ReceiverStop::Success);
+        assert_eq!(port.removed.load(Ordering::SeqCst), usize::from(success));
+        assert_eq!(port.cancelled.load(Ordering::SeqCst), usize::from(!success));
+        let final_claim = host.capabilities.claim_frame(
+            key.fragment_instance_id,
+            inbound.node_id(),
+            source.fragment_instance_id(),
+            source.sender_ordinal(),
+            1,
+        );
+        if matches!(stop, ReceiverStop::Abort | ReceiverStop::QuiesceThenAbort) {
+            assert_eq!(final_claim, InboundFrameClaim::NotHeld);
+        } else {
+            assert!(matches!(final_claim, InboundFrameClaim::NormallyClosed(_)));
+        }
+        if !matches!(stop, ReceiverStop::Abort | ReceiverStop::QuiesceThenAbort) {
+            assert!(matches!(
+                host.capabilities.claim_frame(
+                    key.fragment_instance_id,
+                    inbound.node_id(),
+                    UniqueId::new(-1, -1),
+                    0,
+                    1
+                ),
+                InboundFrameClaim::Refused(_)
+            ));
+        }
+        host.remove_receiver(&descriptor);
+        assert_eq!(
+            port.removed.load(Ordering::SeqCst) + port.cancelled.load(Ordering::SeqCst),
+            1
+        );
+        drop(runtime_alias);
+    }
+
+    #[test]
+    fn plan_tree_receiver_retirement_waits_for_the_original_inbound_gate() {
+        for (ordinal, stop) in [
+            ReceiverStop::Success,
+            ReceiverStop::Quiesce,
+            ReceiverStop::BeforeStart,
+            ReceiverStop::Abort,
+            ReceiverStop::Rollback,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let facts = Arc::new(StubContextFacts::default());
+            let host = host(facts);
+            let query = 83_100 + ordinal as i64;
+            let descriptor = descriptor_with(
+                identity(query, 1, 1),
+                UniqueId::new(query, 1),
+                1,
+                inbound_topology(
+                    FragmentNodeId::new(10),
+                    vec![ExchangeSource::new(
+                        identity(query, 2, 1),
+                        UniqueId::new(query, 2),
+                        0,
+                    )],
+                ),
+            );
+            let mut body = Body::values(1);
+            body.frozen
+                .plan
+                .as_mut()
+                .unwrap()
+                .root
+                .as_mut()
+                .unwrap()
+                .payload = Some(plan::distributed_node::Payload::Exchange(
+                plan::ExchangeReceiver {
+                    partition_type: plan::PartitionType::Unpartitioned as i32,
+                    source_fragment_id: 8,
+                    flavor: Some(plan::ExchangeFlavor {
+                        kind: Some(plan::exchange_flavor::Kind::Distribution(true)),
+                    }),
+                    ..Default::default()
+                },
+            ));
+            let input = body.input(&descriptor);
+            receiver_retirement_case(host, descriptor, input, stop, false);
+        }
+    }
+
+    #[test]
+    fn plan_tree_receiver_nonempty_data_remains_authorized_after_normal_quiesce() {
+        for (ordinal, stop) in [ReceiverStop::Success, ReceiverStop::Quiesce]
+            .into_iter()
+            .enumerate()
+        {
+            let host = host(Arc::new(StubContextFacts::default()));
+            let query = 83_400 + ordinal as i64;
+            let descriptor = descriptor_with(
+                identity(query, 1, 1),
+                UniqueId::new(query, 1),
+                1,
+                inbound_topology(
+                    FragmentNodeId::new(10),
+                    vec![ExchangeSource::new(
+                        identity(query, 2, 1),
+                        UniqueId::new(query, 2),
+                        0,
+                    )],
+                ),
+            );
+            let mut body = Body::values(1);
+            let ty = novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            );
+            let column = novarocks_proto_models::common::OutputColumn {
+                column_id: 10,
+                name: "v".into(),
+                r#type: Some(fixture_type_reference(0)),
+                nullable: false,
+                is_internal: false,
+            };
+            let fragment = body.frozen.plan.as_mut().unwrap();
+            fragment.execution_types = Some(encode_fixture_type_table(&[(0, &ty)]));
+            fragment.output_columns = vec![column.clone()];
+            fragment.root.as_mut().unwrap().payload = Some(
+                plan::distributed_node::Payload::Exchange(plan::ExchangeReceiver {
+                    partition_type: plan::PartitionType::Unpartitioned as i32,
+                    source_fragment_id: 8,
+                    output_columns: vec![column],
+                    flavor: Some(plan::ExchangeFlavor {
+                        kind: Some(plan::exchange_flavor::Kind::Distribution(true)),
+                    }),
+                    ..Default::default()
+                }),
+            );
+            let input = body.input(&descriptor);
+            receiver_retirement_case(host, descriptor, input, stop, true);
+        }
+    }
+
+    #[test]
+    fn plan_tree_receiver_nonempty_data_stops_on_true_abort() {
+        for (ordinal, stop) in [ReceiverStop::Abort, ReceiverStop::QuiesceThenAbort]
+            .into_iter()
+            .enumerate()
+        {
+            let host = host(Arc::new(StubContextFacts::default()));
+            let query = 83_500 + ordinal as i64;
+            let descriptor = descriptor_with(
+                identity(query, 1, 1),
+                UniqueId::new(query, 1),
+                1,
+                inbound_topology(
+                    FragmentNodeId::new(10),
+                    vec![ExchangeSource::new(
+                        identity(query, 2, 1),
+                        UniqueId::new(query, 2),
+                        0,
+                    )],
+                ),
+            );
+            let mut body = Body::values(1);
+            let ty = novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            );
+            let column = novarocks_proto_models::common::OutputColumn {
+                column_id: 10,
+                name: "v".into(),
+                r#type: Some(fixture_type_reference(0)),
+                nullable: false,
+                is_internal: false,
+            };
+            let fragment = body.frozen.plan.as_mut().unwrap();
+            fragment.execution_types = Some(encode_fixture_type_table(&[(0, &ty)]));
+            fragment.output_columns = vec![column.clone()];
+            fragment.root.as_mut().unwrap().payload = Some(
+                plan::distributed_node::Payload::Exchange(plan::ExchangeReceiver {
+                    partition_type: plan::PartitionType::Unpartitioned as i32,
+                    source_fragment_id: 8,
+                    output_columns: vec![column],
+                    flavor: Some(plan::ExchangeFlavor {
+                        kind: Some(plan::exchange_flavor::Kind::Distribution(true)),
+                    }),
+                    ..Default::default()
+                }),
+            );
+            let input = body.input(&descriptor);
+            receiver_retirement_case(host, descriptor, input, stop, true);
+        }
     }
 
     #[test]
@@ -8038,6 +8645,10 @@ pub(super) mod tests {
         }
 
         fn sql_producer(sql: &str, window: bool) -> (Vec<u8>, u32) {
+            sql_fragment(sql, window, false)
+        }
+
+        fn sql_fragment(sql: &str, window: bool, receive: bool) -> (Vec<u8>, u32) {
             let control = SqlCompileControl::unbounded();
             let request = SqlFinalPlanCompileRequest::new(
                 PlanVersionId::try_new([9; 16]).expect("plan version"),
@@ -8113,7 +8724,12 @@ pub(super) mod tests {
                 .fragments()
                 .iter()
                 .find(|(_, fragment)| {
-                    if window {
+                    if receive {
+                        fragment
+                            .nodes()
+                            .values()
+                            .any(|node| matches!(node.kind, NodeKind::ExchangeSource { .. }))
+                    } else if window {
                         fragment
                             .nodes()
                             .values()
@@ -8222,6 +8838,132 @@ pub(super) mod tests {
             )
             .expect("a structurally legal assignment");
             TaskCreationInput::new(carrier, Box::new(assignment))
+        }
+
+        // Normative regression: a normal stop does not revoke a sender's
+        // already-authorized DATA path. The old empty-EOS coverage remains.
+        #[test]
+        fn compiled_receiver_nonempty_data_remains_authorized_after_normal_quiesce() {
+            let (package, receiver) = sql_fragment("SELECT 1", false, true);
+            for (ordinal, stop) in [ReceiverStop::Success, ReceiverStop::Quiesce]
+                .into_iter()
+                .enumerate()
+            {
+                let host = compiled_host(Arc::new(StubContextFacts::default()));
+                let query = 83_300 + ordinal as i64;
+                let descriptor = TaskDescriptor::try_new(
+                    identity(query, 1, 1),
+                    UniqueId::new(query, 1),
+                    NonZeroUsize::new(1).unwrap(),
+                    vec![],
+                    inbound_topology(
+                        FragmentNodeId::new(receiver as i32),
+                        vec![ExchangeSource::new(
+                            identity(query, 2, 1),
+                            UniqueId::new(query, 2),
+                            0,
+                        )],
+                    ),
+                )
+                .unwrap();
+                let assignment = decode_task_assignment(
+                    proto::TaskAssignment {
+                        instance_ordinal: 0,
+                        initial_scan_ranges: vec![],
+                        sink_edge_ids: vec![],
+                    },
+                    &descriptor,
+                    FieldPath::root("assignment"),
+                )
+                .unwrap();
+                let input = TaskCreationInput::new(package_carrier(&package), Box::new(assignment));
+                receiver_retirement_case(host, descriptor, input, stop, true);
+            }
+        }
+
+        #[test]
+        fn compiled_receiver_nonempty_data_stops_on_true_abort() {
+            let (package, receiver) = sql_fragment("SELECT 1", false, true);
+            for (ordinal, stop) in [ReceiverStop::Abort, ReceiverStop::QuiesceThenAbort]
+                .into_iter()
+                .enumerate()
+            {
+                let host = compiled_host(Arc::new(StubContextFacts::default()));
+                let query = 83_600 + ordinal as i64;
+                let descriptor = TaskDescriptor::try_new(
+                    identity(query, 1, 1),
+                    UniqueId::new(query, 1),
+                    NonZeroUsize::new(1).unwrap(),
+                    vec![],
+                    inbound_topology(
+                        FragmentNodeId::new(receiver as i32),
+                        vec![ExchangeSource::new(
+                            identity(query, 2, 1),
+                            UniqueId::new(query, 2),
+                            0,
+                        )],
+                    ),
+                )
+                .unwrap();
+                let assignment = decode_task_assignment(
+                    proto::TaskAssignment {
+                        instance_ordinal: 0,
+                        initial_scan_ranges: vec![],
+                        sink_edge_ids: vec![],
+                    },
+                    &descriptor,
+                    FieldPath::root("assignment"),
+                )
+                .unwrap();
+                let input = TaskCreationInput::new(package_carrier(&package), Box::new(assignment));
+                receiver_retirement_case(host, descriptor, input, stop, true);
+            }
+        }
+
+        #[test]
+        fn compiled_receiver_retirement_waits_for_the_original_inbound_gate() {
+            for (ordinal, stop) in [
+                ReceiverStop::Success,
+                ReceiverStop::Quiesce,
+                ReceiverStop::BeforeStart,
+                ReceiverStop::Abort,
+                ReceiverStop::Rollback,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (package, receiver) = sql_fragment("SELECT 1", false, true);
+                let facts = Arc::new(StubContextFacts::default());
+                let host = compiled_host(facts);
+                let query = 83_200 + ordinal as i64;
+                let descriptor = TaskDescriptor::try_new(
+                    identity(query, 1, 1),
+                    UniqueId::new(query, 1),
+                    NonZeroUsize::new(1).unwrap(),
+                    vec![],
+                    inbound_topology(
+                        FragmentNodeId::new(receiver as i32),
+                        vec![ExchangeSource::new(
+                            identity(query, 2, 1),
+                            UniqueId::new(query, 2),
+                            0,
+                        )],
+                    ),
+                )
+                .unwrap();
+                let assignment = decode_task_assignment(
+                    proto::TaskAssignment {
+                        instance_ordinal: 0,
+                        initial_scan_ranges: vec![],
+                        sink_edge_ids: vec![],
+                    },
+                    &descriptor,
+                    FieldPath::root("assignment"),
+                )
+                .unwrap();
+                let input = TaskCreationInput::new(package_carrier(&package), Box::new(assignment));
+                receiver_retirement_case(host, descriptor, input, stop, false);
+            }
         }
 
         // The FE's own producer package is received, compiled and prepared

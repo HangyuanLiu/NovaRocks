@@ -1691,6 +1691,68 @@ impl AggregateOutputCreation {
         })
     }
 
+    /// No group exists to finalize. The original frozen declarations, rather
+    /// than a missing KeyTable or a kernel's empty-state behavior, author all
+    /// zero-row arrays and their complete construction responsibility.
+    pub(crate) fn finish_empty(
+        self,
+    ) -> crate::runtime::fragment::ExecutionResult<crate::exec::chunk::Chunk> {
+        use crate::exec::chunk::ArrayNormalizationStep;
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        use novarocks_functions::selected_copy::{CopyConstructionError, CopyError};
+        let mut arrays = Vec::with_capacity(self.schema.slots().len());
+        {
+            let mut request = |layout| self.owner.request(layout);
+            let mut opaque = |bytes| self.owner.observe_opaque_upper_bound(bytes);
+            let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
+                self.owner.storage_lifetime(),
+                &mut request,
+                &mut opaque,
+            );
+            let mut observe = |_| {
+                self.owner.observe(
+                    0,
+                    &[],
+                    ArrayNormalizationStep::InspectConstructionWork { units: 1 },
+                )
+            };
+            for slot in self.schema.slots() {
+                novarocks_functions::selected_copy::preflight_empty_construction_observed(
+                    slot.typed_binding().layout(),
+                    &mut creation,
+                    &mut observe,
+                )
+                .map_err(
+                    |error| -> crate::runtime::fragment::ExecutionFailure {
+                        match error {
+                            CopyConstructionError::Creator(cause) => cause.into(),
+                            CopyConstructionError::Resource(cause) => {
+                                ConstructionFailure::Resource(cause).into()
+                            }
+                            CopyConstructionError::Copy(CopyError::Control(cause)) => cause.into(),
+                            CopyConstructionError::Copy(CopyError::Extent) => {
+                                novarocks_functions::KernelFailure::ResourceExhausted.into()
+                            }
+                            CopyConstructionError::Copy(CopyError::Invalid(message)) => {
+                                ConstructionFailure::InvalidSource(message.into()).into()
+                            }
+                            CopyConstructionError::Copy(CopyError::Unsupported(ty)) => {
+                                ConstructionFailure::InvalidSource(format!(
+                                    "aggregate empty output does not support {ty:?}"
+                                ))
+                                .into()
+                            }
+                        }
+                    },
+                )?;
+                observe(true)?;
+                arrays.push(arrow::array::new_empty_array(slot.data_type()));
+                observe(true)?;
+            }
+        }
+        self.finish(arrays, 0)
+    }
+
     pub(crate) fn finish(
         self,
         arrays: Vec<arrow::array::ArrayRef>,
@@ -2021,6 +2083,96 @@ mod typed_output_owner_tests {
         drop(projection);
         assert_eq!(tracker.current(), 0);
     }
+    // A zero-group aggregate has no values to finalize, but its nested
+    // representation still owns Arrow offsets and the original type loan.
+    // This real finite creator fixture verifies the original independent batch-projection exit;
+    // the original declared layout and Arrow offsets supply the oracle.
+    #[test]
+    fn aggregate_typed_output_empty_keeps_offsets_and_last_batch_projection_owner() {
+        let (tracker, errors, factory, schema, arena, expression) = fixture();
+        let created = AggregateOutputCreation::begin(
+            &schema,
+            &arena,
+            &[expression],
+            &[],
+            false,
+            factory.as_ref(),
+        )
+        .unwrap();
+        let output = created.finish_empty().unwrap();
+        assert_eq!(output.len(), 0);
+        assert_eq!(
+            output.chunk_schema().slots()[0].typed_binding(),
+            schema.slots()[0].typed_binding()
+        );
+        let projection = output.into_batch_projection();
+        let list = projection.columns()[0]
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(list.value_offsets(), &[0]);
+        assert_eq!(
+            list.values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value_offsets(),
+            &[0]
+        );
+        drop(schema);
+        drop(arena);
+        drop(factory);
+        drop(errors);
+        assert!(
+            tracker.current() > 0,
+            "the independent empty batch projection retains its real creator"
+        );
+        drop(projection);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn aggregate_typed_output_empty_refusal_and_control_keep_original_causes() {
+        for stopped in [false, true] {
+            let (tracker, errors, factory, schema, arena, expression) = fixture();
+            let created = AggregateOutputCreation::begin(
+                &schema,
+                &arena,
+                &[expression],
+                &[],
+                false,
+                factory.as_ref(),
+            )
+            .unwrap();
+            let stop = ExecutionFailure::from(ConstructionFailure::from(
+                novarocks_type_contract::CompileControlError::Cancelled,
+            ));
+            if stopped {
+                errors.set_error(stop.clone());
+            } else {
+                tracker.install_limit_once(tracker.current()).unwrap();
+            }
+            let error = created.finish_empty().unwrap_err();
+            if stopped {
+                assert_eq!(error, stop);
+            } else {
+                assert!(matches!(
+                    error.cause(),
+                    ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
+                ));
+            }
+            drop(schema);
+            drop(arena);
+            drop(factory);
+            drop(errors);
+            assert_eq!(
+                tracker.current(),
+                0,
+                "unpublished empty arrays and loans are released"
+            );
+        }
+    }
+
     #[test]
     fn aggregate_typed_output_refuses_same_carrier_wrong_domain_before_new_scope() {
         let (tracker, errors, factory, schema, _, _) = fixture();
