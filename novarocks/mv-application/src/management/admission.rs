@@ -275,6 +275,8 @@ pub enum MvManagementPhase {
     Stopping,
     /// A fresh Current observation found a different process incarnation.
     IncarnationMismatch,
+    /// A fresh Current observation transferred this target to another deployment.
+    OwnerMismatch,
 }
 
 impl MvManagementPhase {
@@ -294,6 +296,7 @@ impl MvManagementPhase {
             Self::AwaitingCreateBinding => "AWAITING_CREATE_BINDING",
             Self::Stopping => "STOPPING",
             Self::IncarnationMismatch => "INCARNATION_MISMATCH",
+            Self::OwnerMismatch => "OWNER_MISMATCH",
         }
     }
 }
@@ -324,6 +327,7 @@ struct TargetAdmissionState {
     installed_observation: Option<ManagementObservationLiveness>,
     ready: bool,
     incarnation_mismatch: bool,
+    owner_mismatch: bool,
 }
 
 impl ManagementEntrance {
@@ -496,7 +500,7 @@ impl ManagementEntrance {
         }
         let mut state = lock(&self.inner.state);
         if let Some(current) = state.get(observation.target().table()) {
-            if current.incarnation_mismatch {
+            if current.incarnation_mismatch || current.owner_mismatch {
                 return Err(ManagementAdmissionError::ReadmissionIncomplete);
             }
             let current_effects = current
@@ -554,6 +558,7 @@ impl ManagementEntrance {
                 installed_observation: Some(observation.liveness().clone()),
                 ready: true,
                 incarnation_mismatch: false,
+                owner_mismatch: false,
             },
         );
         Ok(admission)
@@ -689,6 +694,7 @@ impl ManagementEntrance {
                 installed_observation: None,
                 ready: false,
                 incarnation_mismatch: false,
+                owner_mismatch: false,
             },
         );
         ManagementObservationState::try_new(
@@ -814,6 +820,9 @@ impl ManagementEntrance {
         let Some(current) = state.get(table) else {
             return MvManagementPhase::NotObserved;
         };
+        if current.owner_mismatch {
+            return MvManagementPhase::OwnerMismatch;
+        }
         if current.incarnation_mismatch {
             return MvManagementPhase::IncarnationMismatch;
         }
@@ -838,10 +847,10 @@ impl ManagementEntrance {
     }
 
     /// Close this process's admission when a provider Current observation of
-    /// the exact installed target names another incarnation. An already
+    /// the exact installed target names another owner or incarnation. An already
     /// dispatched effect is not revoked; this only stops future admissions.
     /// Historical observations must never be passed to this method.
-    pub fn close_on_keyed_current_incarnation_mismatch(
+    pub fn close_on_keyed_current_management_mismatch(
         &self,
         lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
@@ -871,13 +880,13 @@ impl ManagementEntrance {
         };
         if current.target.catalog() != &catalog
             || current.target.object_id() != &view.object_id
-            || owner != self.inner.owner
-            || incarnation == self.inner.incarnation
+            || (owner == self.inner.owner && incarnation == self.inner.incarnation)
         {
             return Ok(false);
         }
         current.ready = false;
-        current.incarnation_mismatch = true;
+        current.owner_mismatch = owner != self.inner.owner;
+        current.incarnation_mismatch = incarnation != self.inner.incarnation;
         if let Some(installed) = &current.installed_observation {
             installed.close();
         }
@@ -1391,6 +1400,7 @@ fn record_committed(
         installed_observation: None,
         ready: false,
         incarnation_mismatch: false,
+        owner_mismatch: false,
     });
     if target.target != *responsibility.target()
         || !target.unsettled.is_empty()
@@ -1578,6 +1588,7 @@ fn record_unsettled(
         installed_observation: None,
         ready: false,
         incarnation_mismatch: false,
+        owner_mismatch: false,
     });
     if target.target != *responsibility.target()
         || target.pending_committed_effect.is_some()
