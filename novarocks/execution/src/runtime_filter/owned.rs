@@ -29,11 +29,12 @@ use novarocks_functions::{
 
 use super::contribution::{
     ControlledContributionCodecError, OrderedScalarRef, OrderedTupleRef, RuntimeOrderContract,
-    RuntimeOrderKey, RuntimeOrderNullOrder, RuntimeOrderSortDirection,
-    borrowed_ordered_bound_encoded_len, visit_borrowed_ordered_bound,
+    RuntimeOrderContractValidationFailure, RuntimeOrderKey, RuntimeOrderNullOrder,
+    RuntimeOrderSortDirection, borrowed_ordered_bound_encoded_len, visit_borrowed_ordered_bound,
 };
 use crate::exec::expr::agg::{AggregateAllocator, AggregateVec};
 use crate::exec::operators::compiled_aggregate::expression_allocation_host;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 
 struct ByteBacking {
@@ -189,7 +190,7 @@ impl OrderedTopNAllocationHost {
         &self,
         contract: &novarocks_local_program::StaticFilterContract,
         control: &dyn KernelEvaluationControl,
-    ) -> Result<RuntimeOrderContract, KernelFailure> {
+    ) -> ExecutionResult<RuntimeOrderContract> {
         use novarocks_local_program::{FilterNullOrder, FilterSortDirection, StaticFilterContract};
         let StaticFilterContract::Ordered {
             keys,
@@ -199,19 +200,21 @@ impl OrderedTopNAllocationHost {
         else {
             return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
                 "pure Aggregate TopN runtime filter requires an ordered contract",
-            )));
+            ))
+            .into());
         };
         let [key] = keys.as_ref() else {
             return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
                 "pure Aggregate TopN runtime filter requires one complete order key",
-            )));
+            ))
+            .into());
         };
         if key.value_type.data_type() != &arrow::datatypes::DataType::Utf8
             || key.value_type.logical_type() != novarocks_functions::ValueLogicalType::Physical
         {
             return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
                 "pure Aggregate TopN runtime filter order key type other than Utf8 is not installed",
-            )));
+            )).into());
         }
         let _prefix = self.reserve_prefix()?;
         let mut work = EvaluationCheckpoints::new(control);
@@ -233,6 +236,26 @@ impl OrderedTopNAllocationHost {
                 FilterNullOrder::Last => RuntimeOrderNullOrder::Last,
             },
         ));
+        // Reuse the original strict canonical author on these same paid
+        // slots before a holder can escape or a producer can bind them.
+        RuntimeOrderContract::validate_fragment_keys_observed(
+            &slots,
+            *comparator_digest,
+            *contract_digest,
+            |units| {
+                if units == 0 {
+                    return work.flush();
+                }
+                for _ in 0..units {
+                    work.step()?;
+                }
+                Ok(())
+            },
+        )
+        .map_err(|failure| match failure {
+            RuntimeOrderContractValidationFailure::Contract(cause) => ExecutionFailure::from(cause),
+            RuntimeOrderContractValidationFailure::Work(cause) => ExecutionFailure::from(cause),
+        })?;
         let owner = SourceBackingOwner::try_from_owned_direct(
             OrderKeyBacking { keys: slots },
             Arc::clone(&self.host),

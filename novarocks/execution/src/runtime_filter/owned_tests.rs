@@ -313,14 +313,38 @@ fn static_utf8_order(
     direction: novarocks_local_program::FilterSortDirection,
     null_order: novarocks_local_program::FilterNullOrder,
 ) -> novarocks_local_program::StaticFilterContract {
+    use novarocks_local_program::{FilterNullOrder, FilterSortDirection};
+    // Frozen v1 canonical bytes: count1, Utf8 tag9, direction/null position;
+    // SHA256 domain/version, inclusive1 and comparator digest. The original
+    // strict fragment-contract author verifies each literal below.
+    let (comparator, order) = match (direction, null_order) {
+        (FilterSortDirection::Ascending, FilterNullOrder::First) => (
+            "77782fddf467caee0ce29343ed593a1acb8cf89a46ef1f6765730c4bdbabc51d",
+            "5137b9bc01ebb44e0f02e78917ef2e76a655d5320b360f7ec68ff2566970ca62",
+        ),
+        (FilterSortDirection::Ascending, FilterNullOrder::Last) => (
+            "c712d2a8677a0968f10c6e39490fcd77ab08fcd3ee9de29bb1df944a16223bae",
+            "a26b9e26239e0842aa3fd6016bcaf0d41d0f69d17b6a078ea57633f17e1eba26",
+        ),
+        (FilterSortDirection::Descending, FilterNullOrder::First) => (
+            "e75b9b677a5a21c827d830a9a56dc38d389f51314de51dc18cb6ce7dd186911f",
+            "63fd0c611009b809d3e952d66ce73e4a9b966b7f68b395eae784f35ca8331627",
+        ),
+        (FilterSortDirection::Descending, FilterNullOrder::Last) => (
+            "ea4e538a3a740e5c6813c79021f0b816aacd03a060a9741902504e4034bdcaae",
+            "2efde53cbc305da924d5b722ff253591fa2d9dfe6c137f319531b0108af51d6f",
+        ),
+    };
+    let comparator_digest: [u8; 32] = hex::decode(comparator).unwrap().try_into().unwrap();
+    let contract_digest: [u8; 32] = hex::decode(order).unwrap().try_into().unwrap();
     novarocks_local_program::StaticFilterContract::Ordered {
         keys: Arc::from([novarocks_local_program::FilterOrderKey {
             value_type: novarocks_functions::FunctionValueType::new(DataType::Utf8, true),
             direction,
             null_order,
         }]),
-        comparator_digest: [17; 32],
-        contract_digest: [23; 32],
+        comparator_digest,
+        contract_digest,
     }
 }
 
@@ -344,17 +368,25 @@ fn ordered_topn_owned_frozen_key_slots_share_last_owner_and_preserve_legacy_cont
         ] {
             let tracker = MemTracker::new_root("ordered-frozen-keys-last-alias");
             let host = OrderedTopNAllocationHost::new(tracker.clone());
-            let contract = host
-                .utf8_order_contract(&static_utf8_order(direction, nulls), &Control::pass())
-                .unwrap();
+            let frozen = static_utf8_order(direction, nulls);
+            let novarocks_local_program::StaticFilterContract::Ordered {
+                comparator_digest,
+                contract_digest,
+                ..
+            } = &frozen
+            else {
+                unreachable!()
+            };
+            let (comparator_digest, contract_digest) = (*comparator_digest, *contract_digest);
+            let contract = host.utf8_order_contract(&frozen, &Control::pass()).unwrap();
             let expected = RuntimeOrderContract::from_frozen(
                 [RuntimeOrderKey::with_value_type(
                     novarocks_functions::FunctionValueType::new(DataType::Utf8, true),
                     expected_direction,
                     expected_nulls,
                 )],
-                [17; 32],
-                [23; 32],
+                comparator_digest,
+                contract_digest,
             );
             assert_eq!(contract, expected);
             assert_eq!(format!("{contract:?}"), format!("{expected:?}"));
@@ -366,7 +398,8 @@ fn ordered_topn_owned_frozen_key_slots_share_last_owner_and_preserve_legacy_cont
             let legacy_copy = expected.clone();
             assert_ne!(expected.keys().as_ptr(), legacy_copy.keys().as_ptr());
             let tuple = OrderedTuple::new([Some(OrderedScalar::Utf8("\u{6d77}\0".into()))]);
-            let bound = CodecContribution::ordered_bound(OrderedBoundUpdate::new([23; 32], tuple));
+            let bound =
+                CodecContribution::ordered_bound(OrderedBoundUpdate::new(contract_digest, tuple));
             let legacy_bytes = encode_contribution(
                 &bound,
                 ContributionCodecExpectation::OrderedBound(&expected),
@@ -385,8 +418,8 @@ fn ordered_topn_owned_frozen_key_slots_share_last_owner_and_preserve_legacy_cont
             assert_eq!(tracker.current(), held);
             std::thread::spawn(move || {
                 assert_eq!(last, expected);
-                assert_eq!(last.comparator_digest(), [17; 32]);
-                assert_eq!(last.digest(), [23; 32]);
+                assert_eq!(last.comparator_digest(), comparator_digest);
+                assert_eq!(last.digest(), contract_digest);
                 drop(last);
             })
             .join()
@@ -435,7 +468,7 @@ fn ordered_topn_owned_frozen_key_slots_refuse_real_prefix_vector_and_holder_limi
         let control = Control::pass();
         assert!(matches!(
             host.utf8_order_contract(&contract, &control),
-            Err(KernelFailure::ResourceExhausted)
+            Err(e) if e.cause() == &crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted)
         ));
         assert_eq!(tracker.current(), 0);
         if limit == 1 {
@@ -469,7 +502,9 @@ fn ordered_topn_owned_frozen_key_slots_preserve_control_causes_and_named_uninsta
                 cause: cause.clone(),
                 ..Control::pass()
             };
-            assert!(matches!(host.utf8_order_contract(&contract, &refusal), Err(e) if e == cause));
+            assert!(
+                matches!(host.utf8_order_contract(&contract, &refusal), Err(e) if e.cause() == &crate::runtime::fragment::ExecutionFailureCause::Kernel(cause.clone()))
+            );
             assert_eq!(
                 tracker.current(),
                 0,
@@ -514,9 +549,88 @@ fn ordered_topn_owned_frozen_key_slots_preserve_control_causes_and_named_uninsta
     ] {
         let control = Control::pass();
         assert!(
-            matches!(host.utf8_order_contract(&shape, &control), Err(KernelFailure::InvalidProgram(d)) if d.message() == detail)
+            matches!(host.utf8_order_contract(&shape, &control), Err(e) if matches!(e.cause(), crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::InvalidProgram(d)) if d.message() == detail))
         );
         assert_eq!(control.calls.load(Ordering::SeqCst), 0);
         assert_eq!(tracker.current(), 0);
+    }
+}
+
+// Original strict constructor and literal wire contract are independent of
+// the new paid-slot entry. Corrupting either digest must never publish slots.
+#[test]
+fn ordered_topn_owned_frozen_contract_rejects_changed_digests_with_original_typed_cause() {
+    use crate::runtime::fragment::{ExecutionFailure, ExecutionFailureCause};
+    use crate::runtime_filter::RuntimeFilterFailure;
+    use novarocks_local_program::{FilterNullOrder, FilterSortDirection, StaticFilterContract};
+    for direction in [
+        FilterSortDirection::Ascending,
+        FilterSortDirection::Descending,
+    ] {
+        for nulls in [FilterNullOrder::First, FilterNullOrder::Last] {
+            let frozen = static_utf8_order(direction, nulls);
+            let StaticFilterContract::Ordered {
+                keys,
+                comparator_digest,
+                contract_digest,
+            } = &frozen
+            else {
+                unreachable!()
+            };
+            let original_keys = [RuntimeOrderKey::with_value_type(
+                keys[0].value_type.clone(),
+                match direction {
+                    FilterSortDirection::Ascending => RuntimeOrderSortDirection::Ascending,
+                    FilterSortDirection::Descending => RuntimeOrderSortDirection::Descending,
+                },
+                match nulls {
+                    FilterNullOrder::First => RuntimeOrderNullOrder::First,
+                    FilterNullOrder::Last => RuntimeOrderNullOrder::Last,
+                },
+            )];
+            RuntimeOrderContract::from_fragment_contract(
+                original_keys.clone(),
+                *comparator_digest,
+                *contract_digest,
+            )
+            .unwrap();
+            for comparator in [true, false] {
+                let mut changed = frozen.clone();
+                let StaticFilterContract::Ordered {
+                    comparator_digest,
+                    contract_digest,
+                    ..
+                } = &mut changed
+                else {
+                    unreachable!()
+                };
+                if comparator {
+                    comparator_digest[0] ^= 1;
+                } else {
+                    contract_digest[0] ^= 1;
+                }
+                let expected = RuntimeOrderContract::from_fragment_contract(
+                    original_keys.clone(),
+                    *comparator_digest,
+                    *contract_digest,
+                )
+                .unwrap_err();
+                let tracker = MemTracker::new_root("ordered-frozen-digest-refusal");
+                let host = OrderedTopNAllocationHost::new(tracker.clone());
+                let actual = ExecutionFailure::from(
+                    host.utf8_order_contract(&changed, &Control::pass())
+                        .unwrap_err(),
+                );
+                assert_eq!(
+                    actual.cause(),
+                    &ExecutionFailureCause::RuntimeFilter(RuntimeFilterFailure::Contract(
+                        expected.clone()
+                    ))
+                );
+                assert_eq!(actual.to_string(), expected.to_string());
+                assert_eq!(actual.context(), None);
+                assert_eq!(tracker.current(), 0);
+            }
+        }
     }
 }
