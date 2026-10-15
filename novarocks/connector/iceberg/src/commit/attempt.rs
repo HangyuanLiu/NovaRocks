@@ -1532,4 +1532,97 @@ mod tests {
                 .any(|identity| identity.object().path() == file)
         );
     }
+
+    #[tokio::test]
+    async fn slot_conflict_deletes_its_one_new_list_without_reprepare_or_source_cleanup() {
+        use crate::commit::model::StartSnapshot;
+        use crate::commit::slot_change::SlotChangePreparer;
+        use bytes::Bytes;
+        use novarocks_spi::connector::{
+            ConnectorDocumentFormat, ConnectorSlotName, ConnectorSlotValue, KeyedSlotChange,
+        };
+
+        // Source and writer must have separate operations: the writer never owns
+        // the parent's existing manifests and must not clean them on rejection.
+        let source = Fixture::new();
+        let metadata = source.metadata_with_data_and_delete_manifests().await;
+        let source_objects = source.operation.artifacts().unwrap();
+        assert_eq!(source_objects.len(), 3); // data manifest + delete manifest + list
+        let fixture = Fixture::new();
+        let intent = OperationIntent::new(OperationIntentParts {
+            target: TableTarget {
+                ident: crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
+                uuid: Some(metadata.uuid()),
+            },
+            target_ref: "main".into(),
+            start: metadata.current_snapshot().map(|snapshot| StartSnapshot {
+                snapshot_id: snapshot.snapshot_id(),
+                sequence_number: snapshot.sequence_number(),
+            }),
+            changes: FileChanges::default(),
+            dependencies: vec![Dependency::RefUnchanged],
+            isolation: IsolationLevel::Snapshot,
+            shape: RequestShape::SnapshotProducing,
+            summary: Default::default(),
+            token: fixture.operation.token(),
+        })
+        .unwrap();
+        let preparer = SlotChangePreparer {
+            change: KeyedSlotChange {
+                slots: std::collections::BTreeMap::from([(
+                    ConnectorSlotName::try_new("novarocks.mv", "configuration").unwrap(),
+                    ConnectorSlotValue {
+                        format: ConnectorDocumentFormat::try_new(
+                            "novarocks.mv",
+                            "configuration",
+                            1,
+                        )
+                        .unwrap(),
+                        content: Bytes::from_static(b"paused"),
+                    },
+                )]),
+                markers_remove: Default::default(),
+            },
+        };
+        // Deliberately retain the same main in the injected catalog conflict. A
+        // mistaken retry would otherwise pass RefUnchanged and commit attempt 2.
+        let publisher =
+            ControlledPublisher::new(&fixture, metadata.clone(), Dispatch::ConflictThen(metadata));
+        let report = run(
+            &fixture.operation,
+            &intent,
+            &PreparedChange::default(),
+            &[&preparer],
+            &publisher,
+            policy(),
+        )
+        .await;
+        let PublicationOutcome::KnownUncommitted(failure) = report.publication else {
+            panic!("slot conflict must terminate the operation");
+        };
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Conflict);
+        assert_eq!(
+            report.cleanup,
+            IcebergCleanupReport::Complete { deleted: 1 }
+        );
+        assert_eq!(publisher.loads.load(Ordering::SeqCst), 1);
+        let requests = publisher.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let list = requests[0]["updates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|update| update["action"] == "add-snapshot")
+            .unwrap()["snapshot"]["manifest-list"]
+            .as_str()
+            .unwrap();
+        assert!(!std::path::Path::new(list.strip_prefix("file://").unwrap()).exists());
+        assert!(fixture.operation.artifacts().unwrap().is_empty());
+        for original in source_objects {
+            assert!(
+                std::path::Path::new(original.object.path().strip_prefix("file://").unwrap())
+                    .exists()
+            );
+        }
+    }
 }

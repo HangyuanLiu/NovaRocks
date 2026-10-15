@@ -111,16 +111,23 @@ pub(crate) mod test_support {
     use crate::iceberg::transaction::{ApplyTransactionAction, Transaction};
     use crate::iceberg::{
         Catalog, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent,
-        TableRequirement,
+        TableRequirement, TableUpdate,
     };
 
     #[derive(Debug)]
     pub(crate) struct RecordingCatalog {
         inner: Arc<dyn Catalog>,
         commits: Mutex<Vec<Vec<TableRequirement>>>,
+        updates: Mutex<Vec<Vec<TableUpdate>>>,
     }
 
     impl RecordingCatalog {
+        pub(crate) fn take_single_commit_updates(&self) -> Vec<TableUpdate> {
+            let mut updates = self.updates.lock().expect("recording catalog updates lock");
+            assert_eq!(updates.len(), 1, "expected exactly one dispatched commit");
+            updates.pop().unwrap()
+        }
+
         pub(crate) fn commits(&self) -> Vec<Vec<TableRequirement>> {
             self.commits.lock().expect("recording catalog lock").clone()
         }
@@ -232,6 +239,11 @@ pub(crate) mod test_support {
 
         async fn update_table(&self, mut commit: TableCommit) -> crate::iceberg::Result<Table> {
             let requirements = commit.take_requirements();
+            let updates = commit.take_updates();
+            self.updates
+                .lock()
+                .expect("recording catalog updates lock")
+                .push(updates.clone());
             self.commits
                 .lock()
                 .expect("recording catalog lock")
@@ -239,7 +251,7 @@ pub(crate) mod test_support {
             let forwarded = TableCommit::builder()
                 .ident(commit.identifier().clone())
                 .requirements(requirements)
-                .updates(commit.take_updates())
+                .updates(updates)
                 .build();
             self.inner.update_table(forwarded).await
         }
@@ -340,6 +352,7 @@ pub(crate) mod test_support {
             catalog: Arc::new(RecordingCatalog {
                 inner,
                 commits: Mutex::new(Vec::new()),
+                updates: Mutex::new(Vec::new()),
             }),
             ident: TableIdent::new(namespace, "t".to_string()),
             _warehouse: warehouse,

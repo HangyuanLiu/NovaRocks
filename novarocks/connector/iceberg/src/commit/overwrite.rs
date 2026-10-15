@@ -1745,4 +1745,21 @@ pub(crate) mod preparer_tests {
         assert_eq!(error.kind(), crate::iceberg::ErrorKind::DataInvalid);
         assert!(engine.updates().is_empty());
     }
+
+    impl Fixture {
+        pub(crate) async fn metadata_with_data_and_delete_manifests(&self) -> TableMetadata {
+            let base = self.metadata(FormatVersion::V3);
+            let seed = vec![
+                AddedContent::new_logical_data(data("s3://b/data.parquet", 3, Struct::empty()), 0)
+                    .unwrap(),
+                AddedContent::new_logical_data(
+                    dv("s3://b/deletes.puffin", "s3://b/data.parquet", 4, 7),
+                    0,
+                )
+                .unwrap(),
+            ];
+            let intent = self.intent(&base, "main", Vec::new());
+            self.stage(base, &intent, &Seed(seed)).await.0
+        }
+    }
 }

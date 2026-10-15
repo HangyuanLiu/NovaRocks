@@ -415,4 +415,60 @@ mod tests {
             envelope::encode_version(&version).unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn slot_change_reuses_nonempty_data_and_delete_manifests_with_one_new_list() {
+        use crate::commit::model::ArtifactWriter;
+        use crate::iceberg::spec::ManifestContentType;
+
+        let fixture = Fixture::new();
+        let base = fixture.metadata_with_data_and_delete_manifests().await;
+        let reader = fixture.operation.begin_attempt().unwrap();
+        let parent = base.current_snapshot().unwrap();
+        let before = crate::manifest::load_manifest_list(parent, reader.file_io(), &base)
+            .await
+            .unwrap();
+        assert_eq!(before.entries().len(), 2);
+        assert!(
+            before
+                .entries()
+                .iter()
+                .any(|m| m.content == ManifestContentType::Data)
+        );
+        assert!(
+            before
+                .entries()
+                .iter()
+                .any(|m| m.content == ManifestContentType::Deletes)
+        );
+
+        let (after, request) = fixture
+            .stage(base.clone(), &intent(&fixture, &base), &change())
+            .await;
+        let current = after.current_snapshot().unwrap();
+        let carried = crate::manifest::load_manifest_list(current, reader.file_io(), &after)
+            .await
+            .unwrap();
+        // ManifestFile equality includes path, content, file/row counters, sequence,
+        // original added snapshot and first-row-ID fields. No manifest is rewritten.
+        assert_eq!(carried.entries(), before.entries());
+        assert_eq!(current.summary().operation, Operation::Replace);
+        assert_eq!(current.parent_snapshot_id(), Some(parent.snapshot_id()));
+        assert_eq!(current.row_range(), Some((base.next_row_id(), 0)));
+        assert_ne!(current.manifest_list(), parent.manifest_list());
+        assert_eq!(request.artifacts().attempt_owned().len(), 1);
+        assert_eq!(
+            request.artifacts().attempt_owned()[0].path(),
+            current.manifest_list()
+        );
+        assert!(
+            std::path::Path::new(current.manifest_list().strip_prefix("file://").unwrap()).exists()
+        );
+        for field in ["total-data-files", "total-delete-files", "total-records"] {
+            assert_eq!(
+                current.summary().additional_properties[field],
+                parent.summary().additional_properties[field]
+            );
+        }
+    }
 }

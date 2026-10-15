@@ -743,6 +743,171 @@ mod existing_table_commit_tests {
             vec![loaded.metadata().uuid()]
         );
     }
+    #[tokio::test]
+    async fn keyed_rewrite_carries_all_records_and_reasserts_exact_closure() {
+        use crate::document_storage::keyed::{envelope, keys, record};
+        use crate::iceberg::spec::Snapshot;
+        use bytes::Bytes;
+        use novarocks_spi::connector::{
+            ConnectorDocumentFormat, ConnectorDocumentVersion, ConnectorSnapshotRecord,
+            DocumentIdentity,
+        };
+
+        let fixture = local_table().await;
+        fixture.append("first").await;
+        fixture.append("second").await;
+        let loaded = fixture.load().await;
+        let metadata = loaded.metadata();
+        let previous = metadata.current_snapshot().unwrap();
+        let definition = ConnectorDocumentVersion::try_new(
+            "novarocks.mv",
+            "definition",
+            ConnectorDocumentFormat::try_new("novarocks.mv", "definition", 1).unwrap(),
+            vec![],
+            Bytes::from_static(b"definition-fact"),
+        )
+        .unwrap();
+        let binding = ConnectorDocumentVersion::try_new(
+            "novarocks.mv",
+            "binding",
+            ConnectorDocumentFormat::try_new("novarocks.mv", "binding", 1).unwrap(),
+            vec![("definition".into(), definition.identity())],
+            Bytes::from_static(b"binding-fact"),
+        )
+        .unwrap();
+        let publication = ConnectorSnapshotRecord {
+            owner: "novarocks.mv".into(),
+            name: "publication".into(),
+            binding: Some(binding.identity()),
+            payload: Bytes::from_static(b"publication-fact"),
+        };
+        let annotation = ConnectorSnapshotRecord {
+            owner: "novarocks.test".into(),
+            name: "annotation".into(),
+            binding: None,
+            payload: Bytes::from_static(b"annotation-fact"),
+        };
+        let expected_records = HashMap::from([
+            (
+                keys::record_key(&publication.owner, &publication.name),
+                record::encode_record(&publication).unwrap(),
+            ),
+            (
+                keys::record_key(&annotation.owner, &annotation.name),
+                record::encode_record(&annotation).unwrap(),
+            ),
+        ]);
+        let definition_key = keys::version_key(definition.identity());
+        let binding_key = keys::version_key(binding.identity());
+        let root_key = keys::root_key("novarocks.mv");
+        let definition_value = envelope::encode_version(&definition).unwrap();
+        let binding_value = envelope::encode_version(&binding).unwrap();
+        let stale_root = DocumentIdentity::from_bytes([9; 32]).to_hex();
+        let setup_properties = HashMap::from([
+            (definition_key.clone(), definition_value.clone()),
+            (binding_key.clone(), binding_value.clone()),
+            (root_key.clone(), stale_root),
+        ]);
+        let mut parent_properties = previous.summary().additional_properties.clone();
+        parent_properties.extend(expected_records.clone());
+        // Publish the synthetic application facts through the existing local catalog.
+        // Reusing the old list is fixture setup, not the slot/maintenance mechanism.
+        let parent_id = crate::commit::staging::new_snapshot_id(metadata);
+        let parent = Snapshot::builder()
+            .with_snapshot_id(parent_id)
+            .with_parent_snapshot_id(Some(previous.snapshot_id()))
+            .with_sequence_number(metadata.next_sequence_number())
+            .with_timestamp_ms(now_ms().max(metadata.last_updated_ms()))
+            .with_manifest_list(previous.manifest_list().to_string())
+            .with_schema_id(metadata.current_schema_id())
+            .with_summary(Summary {
+                operation: Operation::Replace,
+                additional_properties: parent_properties,
+            })
+            .build();
+        let mut reference = metadata.refs()["main"].clone();
+        reference.snapshot_id = parent_id;
+        let setup = existing_table_commit(
+            fixture.ident.clone(),
+            metadata,
+            vec![TableRequirement::RefSnapshotIdMatch {
+                r#ref: "main".into(),
+                snapshot_id: Some(previous.snapshot_id()),
+            }],
+            vec![
+                TableUpdate::AddSnapshot { snapshot: parent },
+                TableUpdate::SetSnapshotRef {
+                    ref_name: "main".into(),
+                    reference,
+                },
+                TableUpdate::SetProperties {
+                    updates: setup_properties,
+                },
+            ],
+        )
+        .unwrap();
+        fixture.catalog.update_table(setup).await.unwrap();
+        assert_eq!(
+            fixture.catalog.take_single_commit_uuids(),
+            vec![metadata.uuid()]
+        );
+        let _ = fixture.catalog.take_single_commit_updates();
+
+        let before = fixture.load().await;
+        let io = before.file_io().clone();
+        let outcome = run_rewrite_manifests_once_with_marker(
+            fixture.catalog.clone(),
+            before.clone(),
+            io,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.rewritten_manifests_count, 2);
+        let updates = fixture.catalog.take_single_commit_updates();
+        let expected_parent_cas = TableRequirement::RefSnapshotIdMatch {
+            r#ref: "main".into(),
+            snapshot_id: Some(parent_id),
+        };
+        let requirements = fixture.catalog.commits();
+        assert_eq!(requirements.len(), 1);
+        assert!(requirements[0].contains(&expected_parent_cas));
+        assert!(expected_parent_cas.check(Some(before.metadata())).is_ok());
+        let requirements_uuids = fixture.catalog.take_single_commit_uuids();
+        assert_eq!(requirements_uuids, vec![before.metadata().uuid()]);
+        let closure_writes = updates
+            .iter()
+            .find_map(|update| match update {
+                TableUpdate::SetProperties { updates } => Some(updates),
+                _ => None,
+            })
+            .expect("rewrite must reassert its document closure in the actual commit");
+        assert_eq!(
+            closure_writes,
+            &HashMap::from([
+                (definition_key, definition_value),
+                (binding_key, binding_value),
+                (root_key.clone(), binding.identity().to_hex()),
+            ])
+        );
+        let after = fixture.load().await;
+        let current = after.metadata().current_snapshot().unwrap();
+        assert!(expected_parent_cas.check(Some(after.metadata())).is_err());
+        assert_eq!(current.summary().operation, Operation::Replace);
+        assert_eq!(current.parent_snapshot_id(), Some(parent_id));
+        let carried_records: HashMap<_, _> = current
+            .summary()
+            .additional_properties
+            .iter()
+            .filter(|(key, _)| key.starts_with(keys::RECORD_PREFIX))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        assert_eq!(carried_records, expected_records);
+        assert_eq!(
+            after.metadata().properties()[&root_key],
+            binding.identity().to_hex()
+        );
+    }
 }
 
 #[cfg(test)]
