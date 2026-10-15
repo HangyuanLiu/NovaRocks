@@ -23,12 +23,15 @@
 
 use super::*;
 use crate::exec::chunk::root_schema_backing::RootSchemaInspection;
-use crate::exec::chunk::{Chunk, ChunkSchema};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::operators::compiled_aggregate::expression_allocation_host;
 use crate::runtime::mem_tracker::MemTracker;
 use arrow::array::{Int64Array, RecordBatch};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field};
 use novarocks_functions::opaque_memory::OpaqueAllocationHost;
+use novarocks_type_contract::{
+    TypedValueBinding, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+};
 use novarocks_types::SlotId;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -62,11 +65,21 @@ impl KernelEvaluationControl for Control {
 }
 
 fn schema() -> crate::exec::chunk::ChunkSchemaRef {
-    ChunkSchema::try_ref_from_schema_and_slot_ids(
-        &Schema::new(vec![Field::new("key", DataType::Int64, true)]),
-        &[SlotId::new(1)],
+    let storage = ValueTypeStorageLifetime::pure();
+    let binding = TypedValueBinding::try_new(
+        ValueTypeRef::try_new(ValueKind::Scalar(DataType::Int64), true, storage.clone()).unwrap(),
+        ValueLayout::try_new(&DataType::Int64, storage.clone()).unwrap(),
     )
-    .unwrap()
+    .unwrap();
+    let slot = ChunkSlotSchema::try_new_typed(
+        SlotId::new(1),
+        Arc::new(Field::new("key", DataType::Int64, true)),
+        binding,
+        None,
+        storage.clone(),
+    )
+    .unwrap();
+    Arc::new(ChunkSchema::try_new_typed(vec![slot], storage).unwrap())
 }
 fn construction_owner(
     schema: &ChunkSchema,
@@ -108,7 +121,15 @@ fn original_column_charge_is_shared_until_the_last_chunk_alias_exits() {
         "original Vec request and real cold holders are separately paid"
     );
     let clone = chunk.clone();
-    let slice = chunk.slice(1, 1);
+    let slice_owner = construction_owner(chunk.chunk_schema());
+    let slice = chunk
+        .slice_typed_observed::<crate::runtime::fragment::ExecutionFailure, _>(
+            1,
+            1,
+            slice_owner.storage_lifetime(),
+            |step| Ok(slice_owner.observe(0, &[], step)?),
+        )
+        .unwrap();
     let like = Chunk::try_new_like(chunk.record_batch().slice(0, 1), &chunk).unwrap();
     assert_eq!(tracker.current(), charged, "sharing creates no new grant");
     drop(chunk);
@@ -134,6 +155,75 @@ fn column_admission_refuses_overflow_and_the_real_host_limit_before_allocation()
         Err(KernelFailure::ResourceExhausted)
     ));
     assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn raw_column_capacity_is_paid_without_changing_the_logical_arity() {
+    // The declared arrays are test inputs. This case qualifies the raw column
+    // container only, not its Arrow payload or a new source authority.
+    struct RawBatch {
+        batch: RecordBatch,
+        _columns: OpaqueRetainedCharge,
+    }
+    let tracker = MemTracker::new_root("raw-column-capacity");
+    let host = Arc::new(DropOrderHost {
+        original: expression_allocation_host(tracker.clone()),
+        weak: Mutex::new(None),
+        armed: AtomicBool::new(false),
+        observed: AtomicBool::new(false),
+        column_bytes: AtomicUsize::new(0),
+    });
+    let mut columns = Vec::new();
+    columns.try_reserve_exact(7).unwrap();
+    let array = Arc::new(Int64Array::from(vec![Some(7), None]));
+    *host.weak.lock().unwrap() = Some(Arc::downgrade(&array));
+    columns.push(array as ArrayRef);
+    let capacity = columns.capacity();
+    let batch = RecordBatch::try_new(schema().arrow_schema_ref(), columns).unwrap();
+    let (arrow_schema, columns, rows) = batch.into_parts();
+    assert_eq!(
+        columns.capacity(),
+        capacity,
+        "the actual moved Vec is retained"
+    );
+    let charge = retain_column_capacity(columns.capacity(), host.clone()).unwrap();
+    assert_eq!(
+        charge.bytes(),
+        Layout::array::<ArrayRef>(capacity).unwrap().size()
+    );
+    host.column_bytes.store(charge.bytes(), Ordering::SeqCst);
+    host.armed.store(true, Ordering::SeqCst);
+    let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(rows));
+    let batch = RecordBatch::try_new_with_options(arrow_schema, columns, &options).unwrap();
+    // Sharing here belongs only to the test; production uses the one paid
+    // FilteredBatchBacking, whose raw batch likewise precedes this charge.
+    let raw = Arc::new(RawBatch {
+        batch,
+        _columns: charge,
+    });
+    assert_eq!(raw.batch.num_columns(), 1);
+    let charged = tracker.current();
+    let last = raw.clone();
+    drop(raw);
+    assert_eq!(tracker.current(), charged);
+    std::thread::spawn(move || drop(last)).join().unwrap();
+    assert!(host.observed.load(Ordering::SeqCst));
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn raw_column_capacity_rejects_overflow_and_preserves_actual_empty_capacity() {
+    let tracker = MemTracker::new_root("raw-column-invalid-capacity");
+    let host = expression_allocation_host(tracker.clone());
+    assert!(matches!(
+        retain_column_capacity(usize::MAX, host.clone()),
+        Err(KernelFailure::ResourceExhausted)
+    ));
+    let empty = Vec::<ArrayRef>::new();
+    let zero = retain_column_capacity(empty.capacity(), host).unwrap();
+    assert_eq!(zero.bytes(), 0);
+    assert_eq!(tracker.current(), 0);
+    drop(zero);
 }
 
 #[test]
@@ -303,7 +393,15 @@ fn fixed_root_inspection_counts_known_holders_without_granting_payload_authority
     chunk
         .inspect_root_holder_scaffolds(&mut inspection)
         .unwrap();
-    assert_eq!(inspection.bytes(), std::mem::size_of::<Chunk>() + holder);
+    // The original inspector also counts the actual shared RecordBatch
+    // holder. This fixture previously failed before reaching this assertion
+    // because its schema lacked explicit value bindings.
+    let mut batch_holder = RootSchemaInspection::new(1 << 20, 32, 8);
+    batch_holder.charge_arc(chunk.record_batch()).unwrap();
+    assert_eq!(
+        inspection.bytes(),
+        std::mem::size_of::<Chunk>() + batch_holder.bytes() + holder
+    );
     assert!(!chunk.source_authority().is_attached());
     drop(chunk);
     assert_eq!(tracker.current(), 0);

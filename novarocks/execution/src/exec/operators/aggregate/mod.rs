@@ -137,6 +137,8 @@ impl AnalyticAggregateRetainedMemory {
 
 pub(super) const ENABLE_GROUP_KEY_OPTIMIZATIONS: bool = true;
 
+pub(crate) const AGGREGATE_TOPN_PUBLISH_ROWS: usize = 4096;
+
 #[cfg(test)]
 pub(super) fn empty_execution_function_set() -> Arc<agg::SealedExecutionFunctionSet> {
     agg::test_builtin_execution_function_set()

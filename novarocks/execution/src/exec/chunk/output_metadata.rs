@@ -61,17 +61,14 @@ impl OutputColumnMetadata {
         host: Arc<dyn AggregateStateAllocator>,
         control: &dyn KernelEvaluationControl,
     ) -> Result<Self, KernelFailure> {
-        let layout =
-            Layout::array::<ArrayRef>(columns).map_err(|_| KernelFailure::ResourceExhausted)?;
+        let layout = column_capacity_layout(columns)?;
         let mut charge = OpaqueRetainedCharge::try_new(Arc::clone(&host))?;
         let _prefix = charge.reserve_operation(source_custody_prefix_facts().requests().bytes())?;
         let mut work = EvaluationCheckpoints::new(control);
         work.flush()?;
         let _facts = SourceBackingOwner::<ColumnMetadataCharge>::owned_request_facts()
             .map_err(model_failure)?;
-        let mut reservation = charge.reserve_operation(layout.size())?;
-        charge.reconcile_under_reservation(layout.size(), &mut reservation)?;
-        drop(reservation);
+        retain_capacity_under_reservation(&mut charge, layout)?;
         let owner = SourceBackingOwner::try_from_owned_direct(
             ColumnMetadataCharge {
                 columns,
@@ -97,6 +94,32 @@ impl OutputColumnMetadata {
                 .bytes(),
         )
     }
+}
+
+fn column_capacity_layout(capacity: usize) -> Result<Layout, KernelFailure> {
+    Layout::array::<ArrayRef>(capacity).map_err(|_| KernelFailure::ResourceExhausted)
+}
+
+fn retain_capacity_under_reservation(
+    charge: &mut OpaqueRetainedCharge,
+    layout: Layout,
+) -> Result<(), KernelFailure> {
+    let mut reservation = charge.reserve_operation(layout.size())?;
+    charge.reconcile_under_reservation(layout.size(), &mut reservation)
+}
+
+/// Retain the actual moved Vec capacity of a public Arrow result. The caller
+/// keeps its public work budget through this admission and all failure cleanup,
+/// then moves this inline charge AFTER the raw batch in its one backing owner.
+/// No cold keeper or late callback may refund the charge ahead of that batch.
+pub(crate) fn retain_column_capacity(
+    capacity: usize,
+    host: Arc<dyn AggregateStateAllocator>,
+) -> Result<OpaqueRetainedCharge, KernelFailure> {
+    let layout = column_capacity_layout(capacity)?;
+    let mut charge = OpaqueRetainedCharge::try_new(host)?;
+    retain_capacity_under_reservation(&mut charge, layout)?;
+    Ok(charge)
 }
 
 impl fmt::Debug for OutputColumnMetadata {

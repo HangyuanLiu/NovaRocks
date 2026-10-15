@@ -777,6 +777,13 @@ impl AggregateTopNProducerStream {
         reason: execution::RuntimeFilterProducerFailure,
     ) -> Result<(), SessionFailure> {
         self.terminal = true;
+        // An owned driver can be destroyed after construction but before bind.
+        // It has no service handle with which to settle a bound sibling, so it
+        // must leave that sibling's once-fail right intact. Legacy keeps its
+        // original coordinator transition, including the unbound case.
+        if matches!(self.binding.coordinator, Coordinator::Owned(_)) && self.producer.is_none() {
+            return Ok(());
+        }
         if self
             .binding
             .coordinator
@@ -1773,6 +1780,41 @@ mod tests {
                     partition: 0,
                     sequence: 0
                 },
+            ]
+        );
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn aggregate_topn_runtime_filter_owned_unbound_drop_preserves_bound_sibling_fail_right() {
+        let (tracker, host) = owned_host();
+        let control = OwnedControl::pass();
+        let state = Arc::new(RecordingState::with_open_actions([]));
+        let factory = AggregateTopNProducerSessionFactory::try_from_compiled(
+            &[compiled_spec(38)],
+            recording_session(state.clone()),
+            2,
+            &host,
+            &control,
+        )
+        .unwrap();
+        let mut bound = factory.create_for_driver_owned(2, 0, &control).unwrap();
+        bound.bind_owned(&control).unwrap();
+        // This models a later driver's schema preparation refusing before bind.
+        let unbound = factory.create_for_driver_owned(2, 1, &control).unwrap();
+        drop(unbound);
+        bound
+            .fail_owned(execution::RuntimeFilterProducerFailure::ExecutionFailed)
+            .unwrap();
+        drop((bound, factory));
+        assert_eq!(
+            state.events(),
+            vec![
+                Event::Open {
+                    binding_id: 38,
+                    local_partition_count: 2,
+                },
+                Event::Fail(execution::RuntimeFilterProducerFailure::ExecutionFailed),
             ]
         );
         assert_eq!(tracker.current(), 0);

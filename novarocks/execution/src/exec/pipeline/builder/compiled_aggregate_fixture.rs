@@ -776,6 +776,18 @@ pub(super) fn packages(
     plan: &PhysicalPlan,
     catalog: &PureEngineFunctionCatalog,
 ) -> BTreeMap<FragmentId, FragmentPackage> {
+    packages_with_reads(plan, catalog, &BTreeMap::new())
+}
+
+/// The same aggregate root/call author with explicitly frozen provider reads.
+pub(super) fn packages_with_reads(
+    plan: &PhysicalPlan,
+    catalog: &PureEngineFunctionCatalog,
+    reads: &BTreeMap<
+        novarocks_physical_plan::ProviderReadOccurrenceId,
+        novarocks_connector_contract::FrozenConnectorRead,
+    >,
+) -> BTreeMap<FragmentId, FragmentPackage> {
     let mut uses = BTreeMap::new();
     let mut calls = BTreeMap::new();
     for (id, fragment) in plan.fragments() {
@@ -800,7 +812,7 @@ pub(super) fn packages(
         .collect::<BTreeMap<_, _>>();
     extract_fragment_packages(
         plan,
-        &BTreeMap::new(),
+        reads,
         &BTreeMap::new(),
         &uses,
         &calls,
@@ -820,8 +832,18 @@ pub(super) fn try_compile(
     let providers =
         PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &FixtureControl)
             .unwrap();
-    let validated =
-        validate_fragment_providers(Arc::new(package), &providers, &FixtureControl).unwrap();
+    try_compile_with_providers(package, catalog, pipeline_dop, result, &providers)
+}
+
+fn try_compile_with_providers<E: std::error::Error + 'static>(
+    package: FragmentPackage,
+    catalog: &PureEngineFunctionCatalog,
+    pipeline_dop: usize,
+    result: bool,
+    providers: &PureProviderProgramCatalog<E>,
+) -> Result<Arc<LocalProgram>, String> {
+    let validated = validate_fragment_providers(Arc::new(package), providers, &FixtureControl)
+        .map_err(|error| error.to_string())?;
     let options = LocalCompileOptions {
         pipeline_dop: NonZeroUsize::new(pipeline_dop).unwrap(),
         // Only a Result root has a frozen placement; a stream sink has none.
@@ -843,6 +865,19 @@ pub(super) fn compile(
 ) -> Arc<LocalProgram> {
     try_compile(package, catalog, pipeline_dop, result)
         .unwrap_or_else(|error| panic!("aggregate fragment compiles: {error}"))
+}
+
+/// Preserve the original compile/options author while admitting the fixture's
+/// actual frozen Scan through its existing pure provider catalogue.
+pub(super) fn compile_with_providers<E: std::error::Error + 'static>(
+    package: FragmentPackage,
+    catalog: &PureEngineFunctionCatalog,
+    pipeline_dop: usize,
+    result: bool,
+    providers: &PureProviderProgramCatalog<E>,
+) -> Arc<LocalProgram> {
+    try_compile_with_providers(package, catalog, pipeline_dop, result, providers)
+        .unwrap_or_else(|error| panic!("aggregate scan fragment compiles: {error}"))
 }
 
 /// Delivers every encoded frame to the receiver port, as the native data

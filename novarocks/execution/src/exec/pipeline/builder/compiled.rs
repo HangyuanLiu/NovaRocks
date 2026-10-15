@@ -751,17 +751,39 @@ fn build_node(
             build.stream = StreamDesc::single();
             Ok(build)
         }
-        ProgramNodeKind::Aggregate { input, .. } => {
+        ProgramNodeKind::Aggregate { input, topn_filters, .. } => {
             // Preserve the original driver-local Partial -> exchange -> Final
             // chronology. Grouped states hash actual emitted key slots; a
             // group-less state uses the original Single exchange.
-            let factory = CompiledAggregateProcessorFactory::try_new(
-                Arc::clone(program),
-                id,
-                Arc::clone(error),
-            )?;
+            let mut ordered_input = None;
+            let factory = if let Some(ordered) = ordered.filter(|_| !topn_filters.is_empty()) {
+                // Only the installed ordered lane needs its actual child width
+                // before creating producer partitions. The reader's width is
+                // not the downstream Partial aggregate's width.
+                let build = build_node(program, *input, ctx, error, Some(ordered))?;
+                let session = ctx.runtime_filter_execution.session.as_ref().ok_or_else(|| {
+                    novarocks_functions::KernelFailure::InvalidProgram(
+                        novarocks_functions::KernelDiagnostic::new(
+                            "compiled ordered Aggregate TopN has no Task runtime-filter session",
+                        ),
+                    )
+                })?;
+                let factory = CompiledAggregateProcessorFactory::try_new_ordered(
+                    Arc::clone(program), id, Arc::clone(error), Arc::clone(session),
+                    build.pipeline.dop, &ordered.host, &ordered.control,
+                )?;
+                ordered_input = Some(build);
+                factory
+            } else {
+                CompiledAggregateProcessorFactory::try_new(
+                    Arc::clone(program), id, Arc::clone(error),
+                )?
+            };
             let complete = factory.completes_groups();
-            let mut build = build_node(program, *input, ctx, error, ordered)?;
+            let mut build = match ordered_input {
+                Some(build) => build,
+                None => build_node(program, *input, ctx, error, ordered)?,
+            };
             if factory.requires_local_update_stages() && build.pipeline.dop > 1 {
                 let partition_slots = factory.local_group_partition_slots();
                 let (partial, final_stage) = factory.into_local_update_stages()?;

@@ -42,15 +42,52 @@ pub fn record_batch_bytes(batch: &RecordBatch) -> usize {
 /// retained by `owner`. This is used when a zero-copy projection transfers the
 /// owner's accounting lease together with the projected batch.
 pub(crate) fn record_batch_additional_bytes(batch: &RecordBatch, owner: &RecordBatch) -> usize {
+    infallible(additional_bytes_with(
+        batch,
+        owner,
+        || Ok(()),
+        |total, bytes| Ok(total.saturating_add(bytes)),
+    ))
+}
+
+/// Observe the original buffer-identity traversal under the caller's public
+/// operation lease. Identity measures actual new stock; it grants no source
+/// authority. The controlled caller refuses overflow instead of undercharging.
+pub(crate) fn record_batch_additional_bytes_observed(
+    batch: &RecordBatch,
+    owner: &RecordBatch,
+    observe: impl FnMut() -> Result<(), novarocks_functions::KernelFailure>,
+) -> Result<usize, novarocks_functions::KernelFailure> {
+    additional_bytes_with(batch, owner, observe, |total, bytes| {
+        total
+            .checked_add(bytes)
+            .ok_or(novarocks_functions::KernelFailure::ResourceExhausted)
+    })
+}
+
+fn additional_bytes_with<E>(
+    batch: &RecordBatch,
+    owner: &RecordBatch,
+    mut observe: impl FnMut() -> Result<(), E>,
+    mut add: impl FnMut(usize, usize) -> Result<usize, E>,
+) -> Result<usize, E> {
     let mut seen = HashSet::new();
     for column in owner.columns() {
-        collect_array_buffers(&column.to_data(), &mut seen);
+        observe()?;
+        visit_array_buffers(&column.to_data(), &mut observe, &mut |buffer| {
+            seen.insert(buffer.data_ptr().as_ptr() as usize);
+            Ok(())
+        })?;
     }
     let mut total = 0usize;
     for column in batch.columns() {
-        total = total.saturating_add(array_data_bytes(&column.to_data(), &mut seen));
+        observe()?;
+        visit_array_buffers(&column.to_data(), &mut observe, &mut |buffer| {
+            total = add(total, buffer_bytes(buffer, &mut seen))?;
+            Ok(())
+        })?;
     }
-    total
+    Ok(total)
 }
 
 /// Returns the unique Arrow buffer capacity in `owner` that remains reachable
@@ -311,30 +348,50 @@ pub(super) fn chunk_bytes_i64(batch: &RecordBatch) -> i64 {
     i64::try_from(record_batch_bytes(batch)).unwrap_or(i64::MAX)
 }
 
-fn array_data_bytes(data: &ArrayData, seen: &mut HashSet<usize>) -> usize {
-    let mut total = 0usize;
+fn infallible<T>(result: Result<T, std::convert::Infallible>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(never) => match never {},
+    }
+}
+
+/// One structural visitor for original inventory, sharing and controlled delta
+/// callers. The observer runs before traversing each array, buffer and child.
+fn visit_array_buffers<E>(
+    data: &ArrayData,
+    observe: &mut impl FnMut() -> Result<(), E>,
+    visit: &mut impl FnMut(&Buffer) -> Result<(), E>,
+) -> Result<(), E> {
+    observe()?;
     for buffer in data.buffers() {
-        total = total.saturating_add(buffer_bytes(buffer, seen));
+        observe()?;
+        visit(buffer)?;
     }
     if let Some(nulls) = data.nulls() {
-        total = total.saturating_add(buffer_bytes(nulls.buffer(), seen));
+        observe()?;
+        visit(nulls.buffer())?;
     }
     for child in data.child_data() {
-        total = total.saturating_add(array_data_bytes(child, seen));
+        observe()?;
+        visit_array_buffers(child, observe, visit)?;
     }
+    Ok(())
+}
+
+fn array_data_bytes(data: &ArrayData, seen: &mut HashSet<usize>) -> usize {
+    let mut total = 0usize;
+    infallible(visit_array_buffers(data, &mut || Ok(()), &mut |buffer| {
+        total = total.saturating_add(buffer_bytes(buffer, seen));
+        Ok(())
+    }));
     total
 }
 
 fn collect_array_buffers(data: &ArrayData, seen: &mut HashSet<usize>) {
-    for buffer in data.buffers() {
+    infallible(visit_array_buffers(data, &mut || Ok(()), &mut |buffer| {
         seen.insert(buffer.data_ptr().as_ptr() as usize);
-    }
-    if let Some(nulls) = data.nulls() {
-        seen.insert(nulls.buffer().data_ptr().as_ptr() as usize);
-    }
-    for child in data.child_data() {
-        collect_array_buffers(child, seen);
-    }
+        Ok(())
+    }));
 }
 
 fn array_data_shared_bytes(
@@ -343,19 +400,12 @@ fn array_data_shared_bytes(
     counted: &mut HashSet<usize>,
 ) -> usize {
     let mut total = 0usize;
-    for buffer in data.buffers() {
+    infallible(visit_array_buffers(data, &mut || Ok(()), &mut |buffer| {
         if retained.contains(&(buffer.data_ptr().as_ptr() as usize)) {
             total = total.saturating_add(buffer_bytes(buffer, counted));
         }
-    }
-    if let Some(nulls) = data.nulls()
-        && retained.contains(&(nulls.buffer().data_ptr().as_ptr() as usize))
-    {
-        total = total.saturating_add(buffer_bytes(nulls.buffer(), counted));
-    }
-    for child in data.child_data() {
-        total = total.saturating_add(array_data_shared_bytes(child, retained, counted));
-    }
+        Ok(())
+    }));
     total
 }
 
@@ -371,6 +421,78 @@ fn buffer_bytes(buffer: &Buffer, seen: &mut HashSet<usize>) -> usize {
 mod tests {
     use super::*;
     use arrow::array::{Int32Array, Int64Array};
+
+    #[test]
+    fn observed_delta_uses_original_allocation_identity_and_deduplicates_new_aliases() {
+        let original = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])) as Arc<dyn Array>;
+        let owner = RecordBatch::try_from_iter(vec![("old", original.clone())]).unwrap();
+        let shared = RecordBatch::try_from_iter(vec![("slice", original.slice(1, 2))]).unwrap();
+        assert_eq!(
+            record_batch_additional_bytes_observed(&shared, &owner, || Ok(())).unwrap(),
+            0
+        );
+
+        let new = Arc::new(Int32Array::from(vec![7, 8])) as Arc<dyn Array>;
+        let data = new.to_data();
+        let values = &data.buffers()[0];
+        let expected = values.capacity().max(values.len());
+        let batch = RecordBatch::try_from_iter(vec![
+            ("slice", original.slice(1, 2)),
+            ("new", new.clone()),
+            ("alias", new),
+        ])
+        .unwrap();
+        assert_eq!(
+            record_batch_additional_bytes_observed(&batch, &owner, || Ok(())).unwrap(),
+            expected
+        );
+        assert_eq!(record_batch_additional_bytes(&batch, &owner), expected);
+    }
+
+    #[test]
+    fn observed_delta_stops_at_the_original_callback_first_cause() {
+        use novarocks_functions::KernelFailure;
+        let owner = RecordBatch::try_from_iter(vec![(
+            "old",
+            Arc::new(Int64Array::from(vec![Some(1), None])) as Arc<dyn Array>,
+        )])
+        .unwrap();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "new",
+            Arc::new(Int64Array::from(vec![Some(3), None])) as Arc<dyn Array>,
+        )])
+        .unwrap();
+        let mut total = 0usize;
+        record_batch_additional_bytes_observed(&batch, &owner, || {
+            total += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(total > 1);
+        for cause in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+        ] {
+            for stop in [1, total] {
+                let mut calls = 0usize;
+                let error = record_batch_additional_bytes_observed(&batch, &owner, || {
+                    calls += 1;
+                    if calls == stop {
+                        Err(cause.clone())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+                assert_eq!(error, cause);
+                assert_eq!(
+                    calls, stop,
+                    "no traversal continues after the first refusal"
+                );
+            }
+        }
+    }
 
     #[test]
     fn additional_bytes_excludes_zero_copy_projection_buffers() {

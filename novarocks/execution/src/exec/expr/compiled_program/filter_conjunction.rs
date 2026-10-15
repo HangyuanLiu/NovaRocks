@@ -17,6 +17,7 @@
 //! One ordered Filter/Scan conjunct consumer over the actual original root sites.
 //! The expression evaluator and BooleanRows remain their sole existing authors.
 use super::boolean_region::BooleanRows;
+use super::input_source::CompiledInputLoan;
 use super::*;
 use crate::runtime::fragment::{ExecutionResult, RequiredExpressionRowError};
 use novarocks_local_program::{ProgramNodeExpressionRole, ProgramNodeKind};
@@ -179,7 +180,7 @@ impl CompiledFilterConjunctionInstance {
     }
     fn evaluate_once<'a, E: scalar_invocation::FrameFailure>(
         &mut self,
-        input: &RecordBatch,
+        input: CompiledInputLoan<'_>,
         selection: Selection<'a>,
         work: &mut Work<'_, '_>,
     ) -> Result<(SelectedValues<'a>, Box<[ProgramExpressionRootSite]>), E> {
@@ -204,7 +205,7 @@ impl CompiledFilterConjunctionInstance {
                 if selection.is_empty() {
                     // A zero-row invocation validates the entire original port,
                     // but the existing Frame enters no child/kernel constructor.
-                    let output = root.evaluate_controlled::<E>(
+                    let output = root.evaluate_input_controlled::<E>(
                         input,
                         selection,
                         novarocks_functions::ScalarInvocationActivation::ValidateOnly,
@@ -229,7 +230,7 @@ impl CompiledFilterConjunctionInstance {
             }
             let actual_selection =
                 Selection::try_sparse_observed(input.num_rows(), &batch_rows, || work.step())?;
-            let output = root.evaluate_controlled::<E>(
+            let output = root.evaluate_input_controlled::<E>(
                 input,
                 actual_selection,
                 novarocks_functions::ScalarInvocationActivation::Activated,
@@ -288,12 +289,31 @@ impl CompiledFilterConjunctionInstance {
         control: &dyn KernelEvaluationControl,
     ) -> ExecutionResult<ArrayRef> {
         self.evaluate_required_controlled::<novarocks_functions::ScalarInvocationFailure>(
-            input, selection, control, None,
+            CompiledInputLoan::RecordBatch(input),
+            selection,
+            control,
+            None,
         )
     }
     pub(crate) fn evaluate_required_runtime(
         &mut self,
         input: &RecordBatch,
+        selection: Selection<'_>,
+        control: &dyn KernelEvaluationControl,
+        scope: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
+    ) -> ExecutionResult<ArrayRef> {
+        self.evaluate_required_input_runtime(
+            CompiledInputLoan::RecordBatch(input),
+            selection,
+            control,
+            scope,
+        )
+    }
+    /// Preserve the original structural input through every predicate's same
+    /// evaluator. A Chunk loan keeps its actual attached source pairing.
+    pub(crate) fn evaluate_required_input_runtime(
+        &mut self,
+        input: CompiledInputLoan<'_>,
         selection: Selection<'_>,
         control: &dyn KernelEvaluationControl,
         scope: &mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope,
@@ -304,7 +324,7 @@ impl CompiledFilterConjunctionInstance {
         E: scalar_invocation::FrameFailure + Into<crate::runtime::fragment::ExecutionFailure>,
     >(
         &mut self,
-        input: &RecordBatch,
+        input: CompiledInputLoan<'_>,
         selection: Selection<'_>,
         control: &dyn KernelEvaluationControl,
         scope: Option<&mut dyn crate::runtime::scalar_memory::RuntimeScalarOperationScope>,

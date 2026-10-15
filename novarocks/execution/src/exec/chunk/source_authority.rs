@@ -83,3 +83,9 @@ pub(crate) struct ChunkSourceAuthority {
     _native: Option<Arc<ChunkAccounting>>,
     _provider: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
 }
+
+impl ChunkSourceAuthority {
+    pub(super) fn borrowed(&self) -> ChunkSourceAuthorityRef<'_> {
+        ChunkSourceAuthorityRef::from_attached(self._native.as_ref(), self._provider.as_ref())
+    }
+}
