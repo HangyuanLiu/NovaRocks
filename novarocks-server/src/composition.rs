@@ -27,9 +27,7 @@ use crate::state_store_limits::resolve_state_store_limits;
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::resources::IcebergExecutionResources;
 use novarocks_connector_iceberg::storage_inspector::{
-    IcebergStorageInspector, IcebergStorageLakePublication,
-    IcebergStorageLakeTargetSnapshotObservation, IcebergStoragePartitionTransform,
-    IcebergStorageRefreshTechnique,
+    IcebergStorageInspector, IcebergStoragePartitionTransform,
 };
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntimeConfig;
 use novarocks_frontend_application::{
@@ -54,13 +52,11 @@ use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
     ConnectorTableMetadata, MvCreateSourceObservation, MvCreatedTargetObservation,
-    MvLakeDescriptorProjection, MvLakePackageObservation, MvLakePublicationObservation,
-    MvLakeTargetSnapshotObservation, MvMaintenanceMetadataObservation, MvObservedField,
-    MvObservedMaintenancePolicy, MvObservedPartitionField, MvObservedPartitionSpec,
-    MvObservedPartitionTransform, MvObservedRefreshMarker, MvObservedSnapshot,
-    MvObservedSourceField, MvPublishedBaseObservation, MvPublishedRefreshObservation,
-    MvPublishedRefreshTechnique, MvRefreshBaseObservation, MvRefreshTargetObservation,
-    MvSchemaValidationObservation, MvStorageObservationPort, WriteCommitEvidenceLimits,
+    MvMaintenanceMetadataObservation, MvObservedField, MvObservedMaintenancePolicy,
+    MvObservedPartitionField, MvObservedPartitionSpec, MvObservedPartitionTransform,
+    MvObservedRefreshMarker, MvObservedSnapshot, MvObservedSourceField, MvRefreshBaseObservation,
+    MvRefreshTargetObservation, MvSchemaValidationObservation, MvStorageObservationPort,
+    WriteCommitEvidenceLimits,
 };
 use novarocks_state_store_api::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
 use novarocks_state_store_runtime::{
@@ -151,19 +147,6 @@ fn mv_partition_observation(
             })
             .collect(),
     )
-}
-
-/// Preserve the exact snapshot identity carried by the provider package
-/// observation. Publication consistency is frontend policy; this adapter only
-/// translates the sealed provider value without loading metadata again.
-fn mv_lake_target_snapshot_observation(
-    observed: Option<IcebergStorageLakeTargetSnapshotObservation>,
-) -> Result<Option<MvLakeTargetSnapshotObservation>, ConnectorError> {
-    observed
-        .map(|snapshot| {
-            MvLakeTargetSnapshotObservation::try_new(snapshot.snapshot_id, snapshot.timestamp_ms)
-        })
-        .transpose()
 }
 
 impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
@@ -271,96 +254,6 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
             observed.partition_fields,
             &context,
         )
-    }
-
-    fn observe_lake_package(
-        &self,
-        exact_lease: &ConnectorControlPlanningLease,
-        metadata: &ConnectorTableMetadata,
-        context: ConnectorRequestContext,
-    ) -> Result<Option<MvLakePackageObservation>, ConnectorError> {
-        let Some(observed) =
-            self.inspector
-                .observe_lake_package(exact_lease, metadata, context.clone())?
-        else {
-            return Ok(None);
-        };
-        let package_id = observed
-            .descriptor_properties
-            .get("novarocks.mv.descriptor.package-id")
-            .cloned()
-            .ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "Iceberg MV package is missing its descriptor package ID",
-                )
-            })?;
-        let inline_descriptor = observed
-            .descriptor_properties
-            .get("novarocks.mv.descriptor.inline")
-            .cloned()
-            .ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "Iceberg MV package is missing its inline descriptor property",
-                )
-            })?;
-        let descriptor = MvLakeDescriptorProjection::try_new(
-            package_id,
-            inline_descriptor,
-            observed
-                .descriptor_properties
-                .get("novarocks.mv.descriptor.hash")
-                .cloned(),
-            &context,
-        )?;
-        let current_target_snapshot =
-            mv_lake_target_snapshot_observation(observed.current_target_snapshot)?;
-        let publication = match observed.publication {
-            IcebergStorageLakePublication::NeverPublished => {
-                MvLakePublicationObservation::NeverPublished
-            }
-            IcebergStorageLakePublication::Published(facts) => {
-                let technique = match facts.technique {
-                    IcebergStorageRefreshTechnique::Incremental => {
-                        MvPublishedRefreshTechnique::Incremental
-                    }
-                    IcebergStorageRefreshTechnique::Full => MvPublishedRefreshTechnique::Full,
-                    IcebergStorageRefreshTechnique::MetadataOnly => {
-                        MvPublishedRefreshTechnique::MetadataOnly
-                    }
-                };
-                let bases = facts
-                    .bases
-                    .into_iter()
-                    .map(|base| MvPublishedBaseObservation {
-                        table_fqn: base.table_fqn,
-                        object_id: base.object_id,
-                        from_snapshot: base.from_snapshot,
-                        to_snapshot: base.to_snapshot,
-                    })
-                    .collect();
-                MvLakePublicationObservation::Published(MvPublishedRefreshObservation::try_new(
-                    facts.target_snapshot_id,
-                    facts.publication_id,
-                    technique,
-                    bases,
-                    facts.definition_fingerprint,
-                    facts.rows,
-                    facts.provenance_hash,
-                    facts.waterline_hash,
-                    &context,
-                )?)
-            }
-        };
-        MvLakePackageObservation::try_new(
-            metadata.identity.clone(),
-            observed.target_object_id,
-            descriptor,
-            current_target_snapshot,
-            publication,
-        )
-        .map(Some)
     }
 
     fn observe_refresh_base(
@@ -1258,10 +1151,7 @@ pub fn state_store_provider_registry(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        IcebergStorageLakeTargetSnapshotObservation, compose_frontend_workload_runtime,
-        compose_task_execution_budgets, mv_lake_target_snapshot_observation,
-    };
+    use super::{compose_frontend_workload_runtime, compose_task_execution_budgets};
     use novarocks_execution_contract::{MaxWait, OperationKind};
     use novarocks_native_adapter::FrontendTaskTransportBudget;
     use novarocks_query_application::coordination::DispatchBudget;
@@ -1327,21 +1217,6 @@ mod tests {
             std::path::Path::new("/var/lib/novarocks/mv-startup-isolation.toml")
         );
         assert_eq!(source.launch_nonce().as_str(), "launch-7f3c");
-    }
-
-    #[test]
-    fn lake_target_snapshot_adapter_preserves_provider_metadata() {
-        let observed = mv_lake_target_snapshot_observation(Some(
-            IcebergStorageLakeTargetSnapshotObservation {
-                snapshot_id: 42,
-                timestamp_ms: 1_700_000_042_000,
-            },
-        ))
-        .expect("SPI snapshot observation")
-        .expect("snapshot");
-
-        assert_eq!(observed.snapshot_id(), 42);
-        assert_eq!(observed.timestamp_ms(), 1_700_000_042_000);
     }
 
     #[test]

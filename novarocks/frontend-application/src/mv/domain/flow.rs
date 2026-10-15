@@ -277,7 +277,7 @@ pub fn alter_mv_with_ports(
             },
             connector_context.clone(),
         )?;
-        crate::mv::domain::iceberg_refresh::reobserve_and_project_iceberg_mv_with_ports(
+        crate::mv::domain::iceberg_refresh::reobserve_configured_iceberg_mv_with_ports(
             ports,
             &target,
             connector_context.clone(),

@@ -68,8 +68,8 @@ pub mod write_stack;
 
 pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
 pub use mv_provenance::{
-    MV_PUBLICATION_PROVENANCE_PROP, MV_PUBLICATION_PROVENANCE_VERSION, MV_REFRESH_ROW_COUNT_PROP,
-    MvPublicationProvenanceV2, ProvenanceBase, RefreshTechnique, waterline_hash_for,
+    MV_PUBLICATION_PROVENANCE_PROP, MV_PUBLICATION_PROVENANCE_VERSION, MvPublicationProvenanceV2,
+    ProvenanceBase, RefreshTechnique,
 };
 pub use mv_refresh_ref::{
     MV_PUBLICATION_ID_PROP, MV_PUBLICATION_STAGING_REF_PREFIX, MvPublicationSnapshotMarker,

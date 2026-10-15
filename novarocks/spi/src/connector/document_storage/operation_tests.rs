@@ -410,3 +410,199 @@ fn discovery_continuation_requires_a_sealed_page_and_a_shared_reduced_item_budge
         ConnectorErrorKind::ResourceExhausted
     );
 }
+
+fn publication_declaration(
+    publication_id: LakePublicationId,
+    technique: crate::connector::ConnectorManagedPublicationTechnique,
+    empty_input: crate::connector::ConnectorManagedPublicationEmptyInputDisposition,
+    replacement: Option<crate::connector::ConnectorManagedPartitionSpecReplacement>,
+    preview: Option<crate::connector::ConnectorCommittedPartitioning>,
+) -> Result<ConnectorDocumentPublicationDeclaration, ConnectorError> {
+    let lease = lease_with(
+        None,
+        Some(Arc::new(Management {
+            descriptor: descriptor(),
+            incarnation: request().owner.incarnation,
+            calls: Default::default(),
+        })),
+        Default::default(),
+    );
+    let target = request();
+    let admission =
+        lease.admit_management(ConnectorDocumentManagementAdmissionRequest::try_new(
+            target.owner,
+            target.catalog_handle,
+            ConnectorMutationOperationId::from_bytes(publication_id.to_bytes()),
+            target.target,
+            Some(target.object_id.clone()),
+            ConnectorDocumentManagementOperation::Publication,
+            target.context,
+        )?)?;
+    ConnectorDocumentPublicationDeclaration::try_new(
+        publication_id,
+        admission,
+        target.object_id,
+        ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"exact-write-base"))?,
+        technique,
+        empty_input,
+        replacement,
+        preview,
+    )
+}
+
+fn publication_partition_replacement(
+    publication_id: LakePublicationId,
+) -> crate::connector::ConnectorManagedPartitionSpecReplacement {
+    use crate::connector::{
+        ConnectorManagedPartitionField, ConnectorManagedPartitionSpecObservation,
+        ConnectorManagedPartitionSpecReplacement, ConnectorManagedPartitionTransform,
+    };
+    ConnectorManagedPartitionSpecReplacement::try_new(
+        publication_id.into(),
+        ConnectorManagedPartitionSpecObservation::try_from_fields(0, &[]).unwrap(),
+        vec![
+            ConnectorManagedPartitionField::try_new(
+                1,
+                0,
+                ConnectorManagedPartitionTransform::Identity,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
+}
+
+fn publication_partition_preview() -> crate::connector::ConnectorCommittedPartitioning {
+    use crate::connector::{
+        ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,
+        ConnectorManagedPartitionTransform,
+    };
+    ConnectorCommittedPartitioning::try_new(
+        1,
+        vec![
+            ConnectorCommittedPartitionField::try_new(
+                1000,
+                "id",
+                1,
+                "id",
+                0,
+                ConnectorManagedPartitionTransform::Identity,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn document_publication_preserves_the_exact_atomic_partition_replacement() {
+    use crate::connector::{
+        ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+        ConnectorManagedPublicationTechnique::Full,
+    };
+    let publication_id = LakePublicationId::new_v7();
+    let replacement = publication_partition_replacement(publication_id);
+    let preview = publication_partition_preview();
+    let declaration = publication_declaration(
+        publication_id,
+        Full,
+        CommitEmptyWrite,
+        Some(replacement.clone()),
+        Some(preview.clone()),
+    )
+    .unwrap();
+    assert_eq!(declaration.publication_id(), publication_id);
+    assert_eq!(declaration.partition_spec_replacement(), Some(&replacement));
+    assert_eq!(
+        declaration.expected_committed_partitioning(),
+        Some(&preview)
+    );
+    declaration
+        .validate_for_write(Some(declaration.expected_base()))
+        .unwrap();
+    assert!(
+        declaration
+            .validate_for_write(Some(
+                &ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"another-base")).unwrap()
+            ))
+            .is_err()
+    );
+}
+
+#[test]
+fn document_partition_replacement_requires_full_publication_and_committed_empty_input() {
+    use crate::connector::{
+        ConnectorManagedPublicationEmptyInputDisposition::{
+            AbortWithoutExternalCommit, CommitEmptyWrite,
+        },
+        ConnectorManagedPublicationTechnique::{Full, Incremental, MetadataOnly},
+    };
+    for technique in [Full, Incremental, MetadataOnly] {
+        for empty_input in [CommitEmptyWrite, AbortWithoutExternalCommit] {
+            if technique == Full && empty_input == CommitEmptyWrite {
+                continue;
+            }
+            let publication_id = LakePublicationId::new_v7();
+            let error = publication_declaration(
+                publication_id,
+                technique,
+                empty_input,
+                Some(publication_partition_replacement(publication_id)),
+                Some(publication_partition_preview()),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            assert!(error.message().contains("requires a full publication"));
+        }
+    }
+}
+
+#[test]
+fn document_partition_replacement_and_exact_preview_must_be_paired() {
+    use crate::connector::{
+        ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+        ConnectorManagedPublicationTechnique::Full,
+    };
+    let publication_id = LakePublicationId::new_v7();
+    for (replacement, preview) in [
+        (
+            Some(publication_partition_replacement(publication_id)),
+            None,
+        ),
+        (None, Some(publication_partition_preview())),
+    ] {
+        let error =
+            publication_declaration(publication_id, Full, CommitEmptyWrite, replacement, preview)
+                .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(error.message().contains("replacement is incomplete"));
+    }
+    let declaration =
+        publication_declaration(publication_id, Full, CommitEmptyWrite, None, None).unwrap();
+    assert!(declaration.partition_spec_replacement().is_none());
+    assert!(declaration.expected_committed_partitioning().is_none());
+}
+
+#[test]
+fn document_partition_replacement_is_bound_to_its_publication_operation() {
+    use crate::connector::{
+        ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+        ConnectorManagedPublicationTechnique::Full,
+    };
+    let error = publication_declaration(
+        LakePublicationId::new_v7(),
+        Full,
+        CommitEmptyWrite,
+        Some(publication_partition_replacement(
+            LakePublicationId::new_v7(),
+        )),
+        Some(publication_partition_preview()),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    assert!(
+        error
+            .message()
+            .contains("does not match the write operation")
+    );
+}

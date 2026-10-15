@@ -65,10 +65,9 @@ pub use control::{
 pub use domain::{
     IcebergArtifactMetrics, IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment,
     IcebergCommitHandle, IcebergContentRange, IcebergDataBranchRecipe, IcebergDataFileArtifact,
-    IcebergDeletionVectorArtifact, IcebergEmptyWriteDecision, IcebergManagedPublicationFacts,
-    IcebergPositionDeleteFileArtifact, IcebergSealedWriteTarget, IcebergWriteBranch,
-    IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts,
-    IcebergWriterHandle, IcebergWriterOutput,
+    IcebergDeletionVectorArtifact, IcebergEmptyWriteDecision, IcebergPositionDeleteFileArtifact,
+    IcebergSealedWriteTarget, IcebergWriteBranch, IcebergWriteFlavor, IcebergWriteSessionId,
+    IcebergWriteSessionState, IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput,
 };
 pub use execution::{IcebergWriteStackExecution, IcebergWriteStackExecutionFactory};
 pub use old_delete::{

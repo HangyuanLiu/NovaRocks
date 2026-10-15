@@ -17,9 +17,9 @@
 
 -- @sequential=true
 -- @tags=mv,iceberg,rest,minio,storage-contract,configuration
--- Each configuration statement commits exactly one C replacement. The
--- runner reads the real REST graph and counts target mutations at each step;
--- the single published P must keep its exact D/L references and snapshot.
+-- Configuration statements commit main-conditioned C slot changes. The
+-- runner checks the actual REST graph and exact publication references;
+-- ordinary table properties must also reobserve keyed Current successfully.
 
 -- query 1
 -- @skip_result_check=true
@@ -127,6 +127,28 @@ REFRESH MATERIALIZED VIEW mv_config WITH SYNC MODE;
 SHOW MATERIALIZED VIEWS;
 
 -- query 17
+-- A metadata-only user property update must not require a legacy package.
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=2,slot-changes=4,table-commits=8
+ALTER MATERIALIZED VIEW mv_config SET TBLPROPERTIES ("read.split.target-size" = "16777216");
+
+-- query 18
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=3,slot-changes=4,table-commits=9
+REFRESH MATERIALIZED VIEW mv_config WITH SYNC MODE;
+
+-- query 19
+-- @result_contains=east
+-- @result_contains=10
+SELECT k, v FROM mv_config ORDER BY k, v;
+
+-- query 20
+-- @result_contains=mv_config
+-- @result_contains=MANUAL
+-- @result_contains=false
+SHOW MATERIALIZED VIEWS;
+
+-- query 21
 -- @cleanup=true
 -- @skip_result_check=true
 SET CATALOG mvcfg_${uuid0};

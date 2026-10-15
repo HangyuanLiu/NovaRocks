@@ -116,14 +116,7 @@ impl WriteRecipe {
             .flat_map(|entry| entry.fragment.merged_old_references().iter().cloned())
             .collect();
         let output_facts = crate::write_codec::written_output_facts(&files).map_err(invalid)?;
-        let rows = files
-            .iter()
-            .filter(|file| file.content == DataContentType::Data)
-            .try_fold(0u64, |sum, file| {
-                sum.checked_add(file.record_count)
-                    .ok_or_else(|| corrupt("Staged Iceberg row count overflow"))
-            })?;
-        let mut summary = session_snapshot_properties_for_commit(handle, rows)?;
+        let mut summary = session_snapshot_properties_for_commit(handle)?;
         let keyed_documents = documents.map(|intent| intent.documents.clone());
         if let Some(keyed) = &keyed_documents {
             for record in &keyed.records {

@@ -22,7 +22,6 @@ pub mod codec;
 pub mod create_documents;
 pub mod definition;
 pub mod dependency;
-pub mod descriptor;
 pub mod documents;
 pub mod exact_revision;
 pub mod identity;

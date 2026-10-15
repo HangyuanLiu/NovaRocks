@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Publication-ID MV provenance carried in an Iceberg snapshot summary.
+//! Read-only historical MV provenance used to prove owned staging-ref cleanup.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 
 use crate::iceberg::spec::Snapshot;
@@ -26,11 +27,11 @@ use sha2::{Digest, Sha256};
 
 use novarocks_spi::connector::LakePublicationId;
 
+#[cfg(test)]
 use crate::commit::MV_PUBLICATION_ID_PROP;
 
 pub const MV_PUBLICATION_PROVENANCE_PROP: &str = "novarocks.mv.publication.v2";
 pub const MV_PUBLICATION_PROVENANCE_VERSION: u16 = 2;
-pub const MV_REFRESH_ROW_COUNT_PROP: &str = "novarocks.mv.refresh.row_count";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -66,18 +67,8 @@ pub struct MvPublicationProvenanceV2 {
     pub rows: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct WaterlineBase {
-    /// Part of the hashed watermark, not decoration: two mentions of one table
-    /// read at different points are two different watermarks, and without this
-    /// they would digest to the same value.
-    occurrence_id: u32,
-    table_fqn: String,
-    uuid: String,
-    to_snapshot: i64,
-}
-
 impl MvPublicationProvenanceV2 {
+    #[cfg(test)]
     pub fn to_summary_properties(&self) -> Result<BTreeMap<String, String>, String> {
         let mut props = BTreeMap::new();
         props.insert(
@@ -106,19 +97,6 @@ impl MvPublicationProvenanceV2 {
         Ok(hex_encode(&Sha256::digest(
             self.to_canonical_json()?.as_bytes(),
         )))
-    }
-
-    pub fn with_rows(&self, rows: i64) -> Result<Self, String> {
-        if rows < 0 {
-            return Err("MV provenance row count cannot be negative".to_string());
-        }
-        let mut updated = self.clone();
-        updated.rows = rows;
-        Ok(updated)
-    }
-
-    pub fn waterline_hash(&self) -> Result<String, String> {
-        waterline_hash_for(&self.bases)
     }
 
     pub fn to_canonical_json(&self) -> Result<String, String> {
@@ -151,35 +129,6 @@ impl MvPublicationProvenanceV2 {
         }
         Ok(record)
     }
-}
-
-pub fn waterline_hash_for(bases: &[ProvenanceBase]) -> Result<String, String> {
-    let mut waterline_bases: Vec<WaterlineBase> = bases
-        .iter()
-        .map(|base| WaterlineBase {
-            occurrence_id: base.occurrence_id,
-            table_fqn: base.table_fqn.clone(),
-            uuid: base.uuid.clone(),
-            to_snapshot: base.to_snapshot,
-        })
-        .collect();
-    waterline_bases.sort_by(|left, right| {
-        (
-            left.occurrence_id,
-            left.table_fqn.as_str(),
-            left.uuid.as_str(),
-        )
-            .cmp(&(
-                right.occurrence_id,
-                right.table_fqn.as_str(),
-                right.uuid.as_str(),
-            ))
-    });
-    let value = serde_json::to_value(&waterline_bases)
-        .map_err(|err| format!("failed to serialize MV provenance waterline: {err}"))?;
-    let canonical_json = serde_json::to_string(&sort_json_value(value))
-        .map_err(|err| format!("failed to render canonical MV provenance waterline JSON: {err}"))?;
-    Ok(hex_encode(&Sha256::digest(canonical_json.as_bytes())))
 }
 
 pub(crate) fn sort_json_value(value: Value) -> Value {

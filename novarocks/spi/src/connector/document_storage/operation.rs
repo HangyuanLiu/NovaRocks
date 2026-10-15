@@ -251,6 +251,17 @@ impl ConnectorDocumentPublicationDeclaration {
                 "document publication partition replacement is incomplete",
             ));
         }
+        if let Some(replacement) = &partition_spec_replacement {
+            if technique != crate::connector::ConnectorManagedPublicationTechnique::Full
+                || empty_input
+                    != crate::connector::ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite
+            {
+                return Err(invalid(
+                    "document partition replacement requires a full publication that commits empty input",
+                ));
+            }
+            replacement.validate_for_operation(publication_id.into())?;
+        }
         if let Some(partitioning) = &expected_committed_partitioning {
             partitioning.validate()?;
         }

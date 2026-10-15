@@ -1816,7 +1816,7 @@ pub(crate) fn configuration_effect_disposition(
 /// projection from those authoritative facts.  This is intentionally a
 /// post-commit operation: no caller may manufacture desired state from its
 /// statement inputs after the provider has accepted a mutation.
-pub fn reobserve_and_project_iceberg_mv_with_ports(
+pub fn reobserve_configured_iceberg_mv_with_ports(
     ports: &IcebergMvCorePorts,
     target: &IcebergMvTarget,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -1824,39 +1824,28 @@ pub fn reobserve_and_project_iceberg_mv_with_ports(
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| error.to_string())?;
     let lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
-        ports.connector_control.as_ref(),
+        ports.connector_control(),
         &instance_id,
     )
     .map_err(|error| error.to_string())?;
-    let table = novarocks_spi::connector::ConnectorTableIdentity {
-        instance_id,
-        namespace: Arc::from(target.namespace.as_str()),
-        table: Arc::from(target.table.as_str()),
-    };
-    let metadata = lease
+    let catalog = lease
         .binding()
-        .metadata()
-        .load_frontend_table(novarocks_spi::connector::ConnectorTableRequest {
-            table,
-            resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-            context: connector_context.clone(),
-        })
-        .map_err(|error| error.to_string())?;
-    let package = crate::mv::domain::storage_observation::observe_lake_package(
-        ports.storage_observation.as_ref(),
-        &lease,
-        &metadata,
-        connector_context,
+        .catalog_handle()
+        .map_err(|error| error.to_string())?
+        .clone();
+    crate::mv::domain::staged_create::install_configured_current_projection(
+        ports.management_entrance()?.as_ref(),
+        ports.readiness().as_ref(),
+        ports.connector_control(),
+        catalog,
+        novarocks_mv_application::product::MvTarget::from_parts(
+            Some(target.catalog.as_str()),
+            &target.namespace,
+            &target.table,
+        ),
+        uuid::Uuid::now_v7(),
+        connector_context.after_external_effect(),
     )
-    .map_err(|error| error.to_string())?
-    .ok_or_else(|| "Iceberg MV target is missing its lake descriptor after mutation".to_string())?;
-    // The readiness port is the one place that adapts the async projection
-    // store for this synchronous statement thread, and it is also what marks
-    // the target consumable again once the post-commit observation lands.
-    ports
-        .readiness
-        .project_observed(uuid::Uuid::now_v7(), &package)
-        .map_err(|error| error.to_string())
 }
 
 /// Peel any top-level `BranchScoped` wrapper, returning the per-row inner

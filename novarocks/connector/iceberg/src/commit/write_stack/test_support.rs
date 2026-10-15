@@ -31,8 +31,8 @@ use novarocks_spi::connector::{
 
 use crate::commit::write_stack::domain::{
     IcebergArtifactMetrics, IcebergArtifactPartition, IcebergContentRange, IcebergDataBranchRecipe,
-    IcebergDeletionVectorArtifact, IcebergEqualityDeleteColumnFacts, IcebergEqualityDeleteRecipe,
-    IcebergManagedPublicationFacts, IcebergManagedPublicationProvenance, IcebergWriteBranch,
+    IcebergDeletionVectorArtifact, IcebergDocumentPublicationFacts,
+    IcebergEqualityDeleteColumnFacts, IcebergEqualityDeleteRecipe, IcebergWriteBranch,
     IcebergWriteTableFacts, IcebergWriterOutput,
 };
 use crate::commit::write_stack::flavor::IcebergSessionMaterial;
@@ -89,101 +89,167 @@ pub(crate) fn staged_table_metadata() -> std::sync::Arc<crate::iceberg::spec::Ta
     std::sync::Arc::new(metadata)
 }
 
-/// The durable publication a managed session publishes under.
-///
-/// It is one fixed id so a test can assert that exactly this id reaches the
-/// committed snapshot's summary, which is where the publication fence looks
-/// for it.
-pub(crate) fn publication_id() -> novarocks_spi::connector::LakePublicationId {
+/// A stable test publication identity, bound by a real native admission.
+fn document_publication_id() -> novarocks_spi::connector::LakePublicationId {
     novarocks_spi::connector::LakePublicationId::try_from_uuid(
         uuid::Uuid::parse_str("019200aa-0000-7000-8000-0000000000ab").expect("publication uuid"),
     )
     .expect("publication id")
 }
 
-pub(crate) fn publication_provenance() -> IcebergManagedPublicationProvenance {
-    IcebergManagedPublicationProvenance::try_new(
-        publication_id(),
-        vec![crate::commit::ProvenanceBase {
-            occurrence_id: 0,
-            table_fqn: "db.base".to_string(),
-            uuid: "6f7c3a0e-0000-4000-8000-000000000002".to_string(),
-            from_snapshot: Some(11),
-            to_snapshot: 12,
-        }],
-        "fingerprint".to_string(),
-        "ZGlnZXN0".to_string(),
-    )
-    .expect("publication provenance")
-}
-
-/// A publication that republishes rows wholesale: the shape every existing
-/// publication test means unless it says otherwise.
-pub(crate) fn publication_facts(
+/// Ask the actual document provider for admission, under the same explicitly
+/// admitted catalog fixture used by document_publication_for_refusal.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn admitted_document_publication_declaration(
+    runtime: &std::sync::Arc<crate::metadata_context::IcebergMetadataContext>,
+    incarnation: ProviderBindingEpoch,
+    catalog_handle: novarocks_spi::connector::CatalogHandle,
+    target: novarocks_spi::connector::ConnectorTableIdentity,
+    object_id: novarocks_spi::connector::ConnectorTableObjectId,
+    base: ConnectorWriteBaseVersion,
     technique: novarocks_spi::connector::ConnectorManagedPublicationTechnique,
     empty_input: novarocks_spi::connector::ConnectorManagedPublicationEmptyInputDisposition,
-) -> IcebergManagedPublicationFacts {
-    publication_facts_with_shape(
+) -> novarocks_spi::connector::ConnectorDocumentPublicationDeclaration {
+    use novarocks_spi::connector::*;
+    use std::sync::Arc;
+    let descriptor = ConnectorInstanceDescriptor {
+        provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+        instance_id: catalog_handle.catalog_name().clone(),
+    };
+    let admitted_runtime = Arc::new(
+        crate::metadata_context::IcebergMetadataContext::with_catalog_for_test(
+            runtime.control_state().clone(),
+            runtime.resources().clone(),
+            crate::catalog::admission_test_support::all_admitted(Arc::clone(
+                runtime.novarocks_catalog(),
+            )),
+        ),
+    );
+    let provider = Arc::new(crate::metadata::IcebergMetadata::new(
+        descriptor.clone(),
+        incarnation,
+        Arc::clone(&admitted_runtime),
+    ));
+    let storage = Arc::new(crate::document_storage::IcebergDocumentStorage::new(
+        descriptor.clone(),
+        incarnation,
+        admitted_runtime,
+    ));
+    let documents = ConnectorDocumentStorageBinding::try_new(
+        descriptor.clone(),
+        incarnation,
+        Some(storage.clone()),
+        Some(storage),
+    )
+    .expect("document binding");
+    let binding = ConnectorControlBinding::try_new(
+        descriptor.clone(),
+        incarnation,
+        provider.clone(),
+        provider.clone(),
+        Arc::new(crate::provider_binding::IcebergInstanceDistribution::new(
+            descriptor.clone(),
+            incarnation,
+        )),
+        Some(provider),
+    )
+    .and_then(|binding| {
+        binding.with_catalog_properties(
+            CatalogProperties::new(
+                catalog_handle.clone(),
+                descriptor.provider_id,
+                1,
+                vec![],
+                vec![],
+            )
+            .expect("properties"),
+        )
+    })
+    .and_then(|binding| binding.try_with_document_storage(Some(documents)))
+    .expect("control binding");
+    let lease = ConnectorControlPlanningLease::new(Arc::new(binding), || {})
+        .derive_document_storage_lease()
+        .expect("document lease");
+    let publication_id = document_publication_id();
+    let admission = lease
+        .admit_management(
+            ConnectorDocumentManagementAdmissionRequest::try_new(
+                lease.owner().clone(),
+                catalog_handle,
+                ConnectorMutationOperationId::from_bytes(publication_id.to_bytes()),
+                target,
+                Some(object_id.clone()),
+                ConnectorDocumentManagementOperation::Publication,
+                super::tests::request_context(),
+            )
+            .expect("admission request"),
+        )
+        .expect("actual provider admission");
+    ConnectorDocumentPublicationDeclaration::try_new(
+        publication_id,
+        admission,
+        object_id,
+        base,
+        technique,
+        empty_input,
+        None,
+        None,
+    )
+    .expect("document publication declaration")
+}
+
+pub(crate) fn document_publication_facts(
+    technique: novarocks_spi::connector::ConnectorManagedPublicationTechnique,
+    empty_input: novarocks_spi::connector::ConnectorManagedPublicationEmptyInputDisposition,
+) -> IcebergDocumentPublicationFacts {
+    document_publication_facts_with_shape(
         technique,
         empty_input,
         novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
     )
 }
 
-pub(crate) fn publication_facts_with_shape(
+pub(crate) fn document_publication_facts_with_shape(
     technique: novarocks_spi::connector::ConnectorManagedPublicationTechnique,
     empty_input: novarocks_spi::connector::ConnectorManagedPublicationEmptyInputDisposition,
     shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape,
-) -> IcebergManagedPublicationFacts {
-    IcebergManagedPublicationFacts::new(technique, empty_input, shape, publication_provenance())
-}
-
-/// The neutral publication intent a frontend hands to `begin_write`.
-///
-/// Built here so a test can exercise the admission path that reads it, rather
-/// than the provider-side facts it is converted into.
-pub(crate) fn publication_intent(
-    technique: novarocks_spi::connector::ConnectorManagedPublicationTechnique,
-) -> novarocks_spi::connector::ConnectorManagedPublicationIntent {
-    novarocks_spi::connector::ConnectorManagedPublicationIntent::try_new(
-        publication_id(),
-        novarocks_spi::connector::ConnectorManagedPublicationTarget::try_new(
-            novarocks_spi::connector::ConnectorTableObjectId::try_new(
-                bytes::Bytes::from_static(b"6f7c3a0e-0000-4000-8000-000000000001"),
-            )
-            .expect("target object id"),
-            Some(77),
-        )
-        .expect("publication target"),
+) -> IcebergDocumentPublicationFacts {
+    use novarocks_spi::connector::*;
+    // No network request is made by provider admission: the catalog explicitly
+    // admits it, while ordinary I/O against this REST endpoint still refuses.
+    let (_executor, runtime) = super::tests::unreachable_rest_runtime();
+    let table = table_facts();
+    let declaration = admitted_document_publication_declaration(
+        &runtime,
+        ProviderBindingEpoch::from_bytes([7; 16]),
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").unwrap(),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+        ConnectorTableIdentity {
+            instance_id: ConnectorInstanceId::parse("unit").unwrap(),
+            namespace: table.namespace().into(),
+            table: table.table_name().into(),
+        },
+        ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(
+            table.table_uuid().as_bytes(),
+        ))
+        .unwrap(),
+        ConnectorWriteBaseVersion::try_new(bytes::Bytes::from_static(b"base")).unwrap(),
         technique,
-        vec![novarocks_spi::connector::ConnectorStagedPublicationBaseFact {
-            occurrence_id: 0,
-            table: std::sync::Arc::from("db.base"),
-            object_id: novarocks_spi::connector::ConnectorTableObjectId::try_new(
-                bytes::Bytes::from_static(b"6f7c3a0e-0000-4000-8000-000000000002"),
-            )
-            .expect("base object id"),
-            from_version: Some(11),
-            to_version: 12,
-        }],
-        "fingerprint",
-        novarocks_spi::connector::ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
-        novarocks_spi::connector::ConnectorManagedDescriptorProperties::try_new(vec![(
-            std::sync::Arc::from("novarocks.mv.definition"),
-            std::sync::Arc::from("select 1"),
-        )])
-        .expect("descriptor properties"),
-    )
-    .expect("publication intent")
+        empty_input,
+    );
+    IcebergDocumentPublicationFacts::new(declaration, shape)
 }
 
-/// The neutral session flavor a managed publication is admitted under.
-pub(crate) fn publication_flavor(
+pub(crate) fn document_publication_flavor(
     technique: novarocks_spi::connector::ConnectorManagedPublicationTechnique,
     shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape,
 ) -> novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor {
-    novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ManagedPublication {
-        intent: publication_intent(technique),
+    let facts = document_publication_facts_with_shape(technique,
+        novarocks_spi::connector::ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite, shape);
+    novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+        declaration: facts.declaration().clone(),
         shape,
     }
 }

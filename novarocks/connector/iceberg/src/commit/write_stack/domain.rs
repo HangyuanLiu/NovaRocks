@@ -306,33 +306,9 @@ impl IcebergWriteFlavor {
     }
 }
 
-/// The publication facts one managed write session keeps.
-///
-/// The boundary here is about *where* a publication identity may travel, not
-/// about whether the provider may hold it. The `LakePublicationId` must not
-/// reach a writer recipe, a commit fragment, or a backend — nothing that
-/// executes needs it, and putting it there would make a durable frontend
-/// identity part of the execution contract.
-///
-/// It does legitimately reach one place: the snapshot this session's own commit
-/// creates. The publication fence adjudicates a staged refresh by reading
-/// `MV_PUBLICATION_ID_PROP` off that snapshot's summary
-/// (`commit::snapshot_matches_publication_marker`), so a session that dropped
-/// the id would publish a snapshot no publication could ever claim. Holding it
-/// on the frontend-only session, and writing it only into the snapshot summary,
-/// is what keeps both halves true.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IcebergManagedPublicationFacts {
-    technique: ConnectorManagedPublicationTechnique,
-    empty_input: ConnectorManagedPublicationEmptyInputDisposition,
-    shape: ConnectorManagedPublicationShape,
-    provenance: IcebergManagedPublicationProvenance,
-}
-
 /// The application-document publication declaration frozen by `begin_write`.
 ///
-/// Unlike the legacy managed-publication facts this contains no provider
-/// provenance projection. The application documents are the durable truth and
+/// The application documents are the durable truth and
 /// are supplied only to `finish_write`, while this declaration keeps the
 /// admission-time target, base, technique, shape, and repartition decision
 /// available for exact validation.
@@ -366,158 +342,16 @@ impl IcebergDocumentPublicationFacts {
         self.declaration.empty_input()
     }
 
-    pub const fn commit_op_kind(&self, delete_branch: Option<IcebergWriteBranch>) -> CommitOpKind {
-        publication_commit_op_kind(self.technique(), delete_branch)
-    }
-}
-
-/// The durable publication facts the single commit stamps onto its snapshot.
-///
-/// Every field is already in its Iceberg form: the session converts the neutral
-/// intent once, at admission, so a conversion failure is refused before any
-/// external effect rather than after a writer has staged.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IcebergManagedPublicationProvenance {
-    publication_id: novarocks_spi::connector::LakePublicationId,
-    bases: Vec<crate::commit::ProvenanceBase>,
-    definition_fingerprint: String,
-    descriptor_properties_digest_base64: String,
-}
-
-impl IcebergManagedPublicationProvenance {
-    pub fn try_new(
-        publication_id: novarocks_spi::connector::LakePublicationId,
-        bases: Vec<crate::commit::ProvenanceBase>,
-        definition_fingerprint: String,
-        descriptor_properties_digest_base64: String,
-    ) -> Result<Self, ConnectorError> {
-        if bases.is_empty() {
-            return Err(invalid(
-                "Iceberg managed publication requires at least one provenance base",
-            ));
-        }
-        if definition_fingerprint.is_empty() {
-            return Err(invalid(
-                "Iceberg managed publication requires a definition fingerprint",
-            ));
-        }
-        Ok(Self {
-            publication_id,
-            bases,
-            definition_fingerprint,
-            descriptor_properties_digest_base64,
-        })
-    }
-
-    pub const fn publication_id(&self) -> novarocks_spi::connector::LakePublicationId {
-        self.publication_id
-    }
-
-    /// The snapshot summary properties this publication's commit must carry.
-    ///
-    /// `rows` is the count of rows this write staged. The commit action
-    /// overwrites it with the committed snapshot's real `total-records` once
-    /// the manifest is written, so it is a lower bound here, not a claim.
-    pub fn to_summary_properties(
-        &self,
-        technique: ConnectorManagedPublicationTechnique,
-        rows: u64,
-    ) -> Result<BTreeMap<String, String>, ConnectorError> {
-        let rows = i64::try_from(rows)
-            .map_err(|_| invalid("Iceberg managed publication row count exceeds i64"))?;
-        crate::commit::MvPublicationProvenanceV2 {
-            provenance_version: crate::commit::MV_PUBLICATION_PROVENANCE_VERSION,
-            publication_id: self.publication_id,
-            technique: match technique {
-                ConnectorManagedPublicationTechnique::Full => crate::commit::RefreshTechnique::Full,
-                ConnectorManagedPublicationTechnique::Incremental => {
-                    crate::commit::RefreshTechnique::Incremental
-                }
-                ConnectorManagedPublicationTechnique::MetadataOnly => {
-                    crate::commit::RefreshTechnique::MetadataOnly
-                }
-            },
-            bases: self.bases.clone(),
-            definition_fingerprint: self.definition_fingerprint.clone(),
-            descriptor_properties_digest_base64: Some(
-                self.descriptor_properties_digest_base64.clone(),
-            ),
-            rows,
-        }
-        .to_summary_properties()
-        .map_err(invalid)
-    }
-}
-
-impl IcebergManagedPublicationFacts {
-    pub const fn new(
-        technique: ConnectorManagedPublicationTechnique,
-        empty_input: ConnectorManagedPublicationEmptyInputDisposition,
-        shape: ConnectorManagedPublicationShape,
-        provenance: IcebergManagedPublicationProvenance,
-    ) -> Self {
-        Self {
-            technique,
-            empty_input,
-            shape,
-            provenance,
-        }
-    }
-
-    /// How this publication's rows reach it, as its caller declared.
-    ///
-    /// It decides the branch structure the session seals, and therefore the
-    /// delta form its commit takes. It is a sealed session fact rather than
-    /// something re-derived at each use, because the input shape it would have
-    /// to be derived from cannot tell a publication's change stream from
-    /// ordinary DML.
-    pub const fn shape(&self) -> ConnectorManagedPublicationShape {
-        self.shape
-    }
-
-    pub const fn technique(&self) -> ConnectorManagedPublicationTechnique {
-        self.technique
-    }
-
-    pub const fn empty_input(&self) -> ConnectorManagedPublicationEmptyInputDisposition {
-        self.empty_input
-    }
-
-    pub const fn provenance(&self) -> &IcebergManagedPublicationProvenance {
-        &self.provenance
-    }
-
-    /// The single external commit op this publication performs, given the
-    /// delete branch its session sealed.
-    ///
-    /// The technique alone stopped being enough once a publication could apply
-    /// a change stream. A full refresh republishes the whole target, so it
-    /// replaces what the ref already holds, and committing it as an append
-    /// would leave the superseded rows live. An incremental refresh adds to
-    /// what is live — but one that also seals a delete branch publishes a
-    /// *delta*, and committing that as a plain append would add every
-    /// after-image while silently dropping the delete artifact that retires the
-    /// before-image, leaving both versions of the row live.
-    ///
-    /// So the sealed delete branch decides the delta form, and it decides it
-    /// through the exact mapping ordinary DML already commits a row mutation
-    /// under rather than a second one written out here.
-    pub const fn commit_op_kind(&self, delete_branch: Option<IcebergWriteBranch>) -> CommitOpKind {
-        publication_commit_op_kind(self.technique, delete_branch)
-    }
-
-    /// The neutral write intent a publication of this technique is admitted
-    /// as.
     pub const fn connector_intent(&self) -> ConnectorWriteIntent {
-        match self.technique {
+        match self.technique() {
             ConnectorManagedPublicationTechnique::Full => ConnectorWriteIntent::Overwrite,
-            // Append, and it appends nothing. The new version has to carry the
-            // rows the old one carried, and an append that adds no files is
-            // exactly that; an overwrite of nothing would publish an empty
-            // view of a view whose inputs never changed.
             ConnectorManagedPublicationTechnique::Incremental
             | ConnectorManagedPublicationTechnique::MetadataOnly => ConnectorWriteIntent::Append,
         }
+    }
+
+    pub const fn commit_op_kind(&self, delete_branch: Option<IcebergWriteBranch>) -> CommitOpKind {
+        publication_commit_op_kind(self.technique(), delete_branch)
     }
 }
 
@@ -527,7 +361,7 @@ const fn publication_commit_op_kind(
 ) -> CommitOpKind {
     match (technique, delete_branch) {
         // A full refresh never seals a delete branch:
-        // `plan_managed_publication_branches` refuses a full refresh with a
+        // `plan_document_publication_branches` refuses a full refresh with a
         // change-stream shape, because a commit that replaces every live
         // row has no prior row for a change event to supersede.
         (ConnectorManagedPublicationTechnique::Full, _) => CommitOpKind::Overwrite,
@@ -1925,7 +1759,6 @@ pub struct IcebergCommitHandle {
     flavor: IcebergWriteFlavor,
     purpose: ConnectorWriteAdmissionPurpose,
     base_version_digest: Option<[u8; 32]>,
-    publication: Option<IcebergManagedPublicationFacts>,
     document_publication: Option<IcebergDocumentPublicationFacts>,
     targets: Vec<IcebergSealedWriteTarget>,
     delete_owner: BTreeMap<String, WriteTargetOrdinal>,
@@ -1978,8 +1811,6 @@ pub struct IcebergCommitHandle {
 pub struct IcebergSessionFacts {
     pub purpose: ConnectorWriteAdmissionPurpose,
     pub base_version_digest: Option<[u8; 32]>,
-    /// Present exactly on the managed-publication flavor.
-    pub publication: Option<IcebergManagedPublicationFacts>,
     /// Present exactly on an application-document publication flavor.
     pub document_publication: Option<IcebergDocumentPublicationFacts>,
     /// Present exactly on the staged-create flavor.
@@ -2006,7 +1837,6 @@ impl IcebergSessionFacts {
         Self {
             purpose,
             base_version_digest,
-            publication: None,
             document_publication: None,
             staged_metadata: None,
             rewrite_inputs: Vec::new(),
@@ -2084,29 +1914,17 @@ impl IcebergCommitHandle {
         let IcebergSessionFacts {
             purpose,
             base_version_digest,
-            publication,
             document_publication,
             staged_metadata,
             rewrite_inputs,
             copy_on_write,
             repartition,
         } = facts;
-        if publication.is_some() && flavor != IcebergWriteFlavor::ManagedPublication {
-            return Err(invalid(format!(
-                "Iceberg {} write session cannot carry managed publication facts",
-                flavor.as_str()
-            )));
-        }
         if document_publication.is_some() && flavor != IcebergWriteFlavor::ManagedPublication {
             return Err(invalid(format!(
                 "Iceberg {} write session cannot carry application-document publication facts",
                 flavor.as_str()
             )));
-        }
-        if publication.is_some() && document_publication.is_some() {
-            return Err(invalid(
-                "Iceberg write session cannot carry both legacy and application-document publication facts",
-            ));
         }
         // The two directions are both errors, and for the same reason: a staged
         // session with no frozen metadata has nothing to interpret its
@@ -2178,14 +1996,9 @@ impl IcebergCommitHandle {
                 ));
             }
         }
-        let publication_shape = publication
+        let publication_shape = document_publication
             .as_ref()
-            .map(IcebergManagedPublicationFacts::shape)
-            .or_else(|| {
-                document_publication
-                    .as_ref()
-                    .map(IcebergDocumentPublicationFacts::shape)
-            });
+            .map(IcebergDocumentPublicationFacts::shape);
         let allowed = allowed_session_branches(flavor, publication_shape)
             .iter()
             .copied()
@@ -2203,7 +2016,6 @@ impl IcebergCommitHandle {
             flavor,
             purpose,
             base_version_digest,
-            publication,
             document_publication,
             targets,
             delete_owner,
@@ -2313,10 +2125,6 @@ impl IcebergCommitHandle {
     pub const fn base_version_digest(&self) -> Option<[u8; 32]> {
         self.base_version_digest
     }
-    /// The managed publication facts, present exactly on a publication session.
-    pub const fn publication(&self) -> Option<&IcebergManagedPublicationFacts> {
-        self.publication.as_ref()
-    }
     pub const fn document_publication(&self) -> Option<&IcebergDocumentPublicationFacts> {
         self.document_publication.as_ref()
     }
@@ -2408,12 +2216,9 @@ impl IcebergCommitHandle {
     /// replaces, an incremental one appends — and every other session decides
     /// it from its flavor alone.
     pub fn commit_op_kind(&self) -> CommitOpKind {
-        match &self.publication {
+        match &self.document_publication {
             Some(publication) => publication.commit_op_kind(self.sealed_delete_branch()),
-            None => match &self.document_publication {
-                Some(publication) => publication.commit_op_kind(self.sealed_delete_branch()),
-                None => self.flavor.commit_op_kind(),
-            },
+            None => self.flavor.commit_op_kind(),
         }
     }
 
@@ -2452,14 +2257,9 @@ impl IcebergCommitHandle {
             return IcebergEmptyWriteDecision::SkipExternalCommit;
         }
         let disposition = self
-            .publication
+            .document_publication
             .as_ref()
-            .map(IcebergManagedPublicationFacts::empty_input)
-            .or_else(|| {
-                self.document_publication
-                    .as_ref()
-                    .map(IcebergDocumentPublicationFacts::empty_input)
-            });
+            .map(IcebergDocumentPublicationFacts::empty_input);
         match disposition {
             Some(ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit) => {
                 IcebergEmptyWriteDecision::SkipExternalCommit

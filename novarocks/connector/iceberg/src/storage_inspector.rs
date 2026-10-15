@@ -34,18 +34,15 @@ use novarocks_spi::connector::{
     MvExactPartitionField, MvExactPartitionTransform,
 };
 
-use crate::commit::{MV_PUBLICATION_ID_PROP, MvPublicationProvenanceV2, RefreshTechnique};
+use crate::commit::MV_PUBLICATION_ID_PROP;
 use crate::iceberg::spec::{FormatVersion, TableMetadata, Transform};
 use crate::scan_model::IcebergTableInfo;
 
 pub(crate) const MV_DESCRIPTOR_PACKAGE_ID_PROP: &str = "novarocks.mv.descriptor.package-id";
-const MV_DESCRIPTOR_HASH_PROP: &str = "novarocks.mv.descriptor.hash";
-const MV_DESCRIPTOR_INLINE_PROP: &str = "novarocks.mv.descriptor.inline";
 const MAX_TARGET_FIELDS: usize = 4_096;
 const MAX_PARTITION_FIELDS: usize = 4_096;
 const MAX_TARGET_REFS: usize = 1_024;
 const MAX_MAIN_ANCESTORS: usize = 100_000;
-const MAX_PROVENANCE_BASES: usize = 16_384;
 const MAX_MAINTENANCE_SNAPSHOTS: usize = 100_000;
 /// Two `i64` values per projected snapshot, charged against the request budget.
 const MAINTENANCE_SNAPSHOT_BYTES: usize = 16;
@@ -180,57 +177,6 @@ pub struct IcebergStorageRefreshMarker {
     pub publication_id: LakePublicationId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IcebergStorageLakePackageObservation {
-    pub target_object_id: ConnectorTableObjectId,
-    pub descriptor_properties: BTreeMap<String, String>,
-    /// The exact current target snapshot from the same decoded metadata value
-    /// as the descriptor and publication facts. This is intentionally distinct
-    /// from publication provenance: an unrefreshed target snapshot is still
-    /// an exact target revision, but not a refresh watermark.
-    pub current_target_snapshot: Option<IcebergStorageLakeTargetSnapshotObservation>,
-    pub publication: IcebergStorageLakePublication,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IcebergStorageLakeTargetSnapshotObservation {
-    pub snapshot_id: i64,
-    pub timestamp_ms: i64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum IcebergStorageLakePublication {
-    NeverPublished,
-    Published(IcebergStoragePublishedFacts),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IcebergStoragePublishedFacts {
-    pub target_snapshot_id: i64,
-    pub publication_id: LakePublicationId,
-    pub technique: IcebergStorageRefreshTechnique,
-    pub bases: Vec<IcebergStoragePublishedBaseFact>,
-    pub definition_fingerprint: String,
-    pub rows: i64,
-    pub provenance_hash: String,
-    pub waterline_hash: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IcebergStoragePublishedBaseFact {
-    pub table_fqn: String,
-    pub object_id: ConnectorTableObjectId,
-    pub from_snapshot: Option<i64>,
-    pub to_snapshot: i64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IcebergStorageRefreshTechnique {
-    Incremental,
-    Full,
-    MetadataOnly,
-}
-
 /// Pure `TableMetadata` projection of the facts MV maintenance policy needs.
 ///
 /// Every value comes from the already-loaded metadata document. Facts that
@@ -322,16 +268,6 @@ impl IcebergStorageInspector {
     ) -> Result<IcebergStorageTargetObservation, ConnectorError> {
         let table = decoded_table(exact_lease, metadata, &context)?;
         target_observation(&table, &context)
-    }
-
-    pub fn observe_lake_package(
-        &self,
-        exact_lease: &ConnectorControlPlanningLease,
-        metadata: &ConnectorTableMetadata,
-        context: ConnectorRequestContext,
-    ) -> Result<Option<IcebergStorageLakePackageObservation>, ConnectorError> {
-        let table = decoded_table(exact_lease, metadata, &context)?;
-        lake_package_observation(&table, &context)
     }
 
     pub fn observe_refresh_base(
@@ -781,61 +717,6 @@ pub(crate) fn exact_partition_spec_version(spec_id: i32) -> Bytes {
     Bytes::copy_from_slice(&spec_id.to_le_bytes())
 }
 
-fn lake_package_observation(
-    table: &TableMetadata,
-    context: &ConnectorRequestContext,
-) -> Result<Option<IcebergStorageLakePackageObservation>, ConnectorError> {
-    let properties = table.properties();
-    if !properties.contains_key(MV_DESCRIPTOR_PACKAGE_ID_PROP) {
-        return Ok(None);
-    }
-    let mut budget = 0_usize;
-    let mut descriptor_properties = BTreeMap::new();
-    for key in [
-        MV_DESCRIPTOR_PACKAGE_ID_PROP,
-        MV_DESCRIPTOR_HASH_PROP,
-        MV_DESCRIPTOR_INLINE_PROP,
-    ] {
-        if let Some(value) = properties.get(key) {
-            reserve(context, &mut budget, key)?;
-            reserve(context, &mut budget, value)?;
-            descriptor_properties.insert(key.to_string(), value.clone());
-        }
-    }
-    if !descriptor_properties.contains_key(MV_DESCRIPTOR_INLINE_PROP) {
-        return Err(corrupt(
-            "Iceberg MV package is missing its inline descriptor property",
-        ));
-    }
-    let current_snapshot = table.current_snapshot();
-    let current_target_snapshot =
-        current_snapshot.map(|snapshot| IcebergStorageLakeTargetSnapshotObservation {
-            snapshot_id: snapshot.snapshot_id(),
-            timestamp_ms: snapshot.timestamp_ms(),
-        });
-    let publication = match current_snapshot {
-        None => IcebergStorageLakePublication::NeverPublished,
-        Some(snapshot) => {
-            match MvPublicationProvenanceV2::from_snapshot_summary(snapshot).map_err(corrupt)? {
-                None => IcebergStorageLakePublication::NeverPublished,
-                Some(provenance) => IcebergStorageLakePublication::Published(published_facts(
-                    snapshot.snapshot_id(),
-                    provenance,
-                    context,
-                    &mut budget,
-                )?),
-            }
-        }
-    };
-    validate_context(context)?;
-    Ok(Some(IcebergStorageLakePackageObservation {
-        target_object_id: iceberg_object_id_from_uuid(table.uuid().to_string())?,
-        descriptor_properties,
-        current_target_snapshot,
-        publication,
-    }))
-}
-
 #[derive(Deserialize)]
 struct TableHandlePayload {
     namespace: String,
@@ -900,52 +781,6 @@ fn decoded_table_generation(
         ))
     })?;
     Ok((table, payload.metadata_location))
-}
-
-fn published_facts(
-    target_snapshot_id: i64,
-    provenance: MvPublicationProvenanceV2,
-    context: &ConnectorRequestContext,
-    budget: &mut usize,
-) -> Result<IcebergStoragePublishedFacts, ConnectorError> {
-    if provenance.bases.len() > MAX_PROVENANCE_BASES {
-        return Err(exhausted(
-            "Iceberg MV provenance exceeds the inspection base limit",
-        ));
-    }
-    reserve(context, budget, &provenance.definition_fingerprint)?;
-    let provenance_hash = provenance.content_hash().map_err(corrupt)?;
-    let waterline_hash = provenance.waterline_hash().map_err(corrupt)?;
-    reserve(context, budget, &provenance_hash)?;
-    reserve(context, budget, &waterline_hash)?;
-    let bases = provenance
-        .bases
-        .iter()
-        .map(|base| {
-            reserve(context, budget, &base.table_fqn)?;
-            reserve(context, budget, &base.uuid)?;
-            Ok(IcebergStoragePublishedBaseFact {
-                table_fqn: base.table_fqn.clone(),
-                object_id: iceberg_object_id_from_uuid(base.uuid.clone())?,
-                from_snapshot: base.from_snapshot,
-                to_snapshot: base.to_snapshot,
-            })
-        })
-        .collect::<Result<Vec<_>, ConnectorError>>()?;
-    Ok(IcebergStoragePublishedFacts {
-        target_snapshot_id,
-        publication_id: provenance.publication_id,
-        technique: match provenance.technique {
-            RefreshTechnique::Incremental => IcebergStorageRefreshTechnique::Incremental,
-            RefreshTechnique::Full => IcebergStorageRefreshTechnique::Full,
-            RefreshTechnique::MetadataOnly => IcebergStorageRefreshTechnique::MetadataOnly,
-        },
-        bases,
-        definition_fingerprint: provenance.definition_fingerprint,
-        rows: provenance.rows,
-        provenance_hash,
-        waterline_hash,
-    })
 }
 
 fn partition_transform(
@@ -1244,80 +1079,6 @@ mod tests {
         )
         .expect("explicit row lineage observation");
         assert!(explicit.explicit_row_lineage_enabled);
-    }
-
-    #[test]
-    fn lake_projection_is_absent_for_ordinary_table() {
-        assert_eq!(
-            lake_package_observation(&metadata(HashMap::new()), &context(4096))
-                .expect("lake observation"),
-            None
-        );
-    }
-
-    #[test]
-    fn lake_projection_requires_inline_descriptor() {
-        let error = lake_package_observation(
-            &metadata(HashMap::from([(
-                MV_DESCRIPTOR_PACKAGE_ID_PROP.to_string(),
-                "analytics.mv_orders".to_string(),
-            )])),
-            &context(4096),
-        )
-        .expect_err("missing inline descriptor");
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-    }
-
-    #[test]
-    fn lake_projection_is_bounded_by_request_context() {
-        let error = lake_package_observation(
-            &metadata(HashMap::from([
-                (
-                    MV_DESCRIPTOR_PACKAGE_ID_PROP.to_string(),
-                    "analytics.mv_orders".to_string(),
-                ),
-                (MV_DESCRIPTOR_INLINE_PROP.to_string(), "x".repeat(1024)),
-            ])),
-            &context(64),
-        )
-        .expect_err("payload limit");
-        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
-    }
-
-    #[test]
-    fn lake_projection_preserves_current_target_snapshot_from_one_metadata_value() {
-        let table = maintenance_metadata(
-            vec![SnapshotFixture::new(42, 1_700_000_042_000).on_main()],
-            HashMap::from([
-                (
-                    MV_DESCRIPTOR_PACKAGE_ID_PROP.to_string(),
-                    "analytics.mv_orders".to_string(),
-                ),
-                (
-                    MV_DESCRIPTOR_INLINE_PROP.to_string(),
-                    "descriptor".to_string(),
-                ),
-            ]),
-        );
-
-        let package = lake_package_observation(&table, &context(4096))
-            .expect("lake package observation")
-            .expect("MV package");
-        assert_eq!(
-            package.target_object_id.as_bytes().as_ref(),
-            table.uuid().to_string().as_bytes()
-        );
-        assert_eq!(
-            package.current_target_snapshot,
-            Some(IcebergStorageLakeTargetSnapshotObservation {
-                snapshot_id: 42,
-                timestamp_ms: 1_700_000_042_000,
-            })
-        );
-        assert_eq!(
-            package.publication,
-            IcebergStorageLakePublication::NeverPublished
-        );
     }
 
     #[test]

@@ -15,19 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Canonical MV desired semantics shared by lake descriptor writers and
-//! rebuilders. Runtime identities and scheduler bookkeeping intentionally do
-//! not enter this value.
+//! Validated MV desired semantics and refresh configuration.
+//! Document codecs own persistence; runtime identities and scheduler bookkeeping
+//! do not enter these values.
 
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::definition::MvDesiredRefreshPolicy;
-use crate::persistence::descriptor::DescriptorDependency;
 use crate::persistence::schema::MvSchemaContract;
 use novarocks_query_application::persisted_query_definition::PersistedQueryDefinition;
 use novarocks_types::naming::normalize_identifier;
+
+/// Maximum retained SQL source accepted by the MV semantic constructor.
+pub const RAW_QUERY_SOURCE_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescriptorDependency {
+    pub catalog: String,
+    pub namespace: String,
+    pub name: String,
+    pub object_type: String,
+    pub storage_engine: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -137,12 +148,10 @@ impl MvDesiredSemantics {
         query_definition
             .validate()
             .map_err(|error| format!("invalid MV descriptor query definition: {error}"))?;
-        if query_definition.raw_query_source.len()
-            > super::descriptor::MV_DESCRIPTOR_RAW_QUERY_SOURCE_MAX_BYTES
-        {
+        if query_definition.raw_query_source.len() > RAW_QUERY_SOURCE_MAX_BYTES {
             return Err(format!(
                 "MV descriptor raw query source exceeds 64KiB cap of {} bytes",
-                super::descriptor::MV_DESCRIPTOR_RAW_QUERY_SOURCE_MAX_BYTES
+                RAW_QUERY_SOURCE_MAX_BYTES
             ));
         }
         if visible_columns.is_empty() {
@@ -309,3 +318,7 @@ mod tests {
         assert_eq!(columns, vec!["second", "first"]);
     }
 }
+
+#[cfg(test)]
+#[path = "semantic_tests.rs"]
+mod semantic_tests;

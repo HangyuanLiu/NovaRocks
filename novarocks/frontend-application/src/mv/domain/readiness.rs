@@ -21,7 +21,6 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::mv::activity::canonical_mv_target;
-use crate::mv::domain::storage_observation::MvLakePackageObservation;
 use novarocks_mv_application::dependency::MvDependencyObjectIdentity;
 use novarocks_mv_application::persistence::dependency::StoredMvDependency;
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
@@ -181,19 +180,6 @@ impl MvReadinessPort {
             Ok(_) => tokio::task::block_in_place(|| self.handle.block_on(future)),
             Err(_) => self.handle.block_on(future),
         }
-    }
-
-    pub(crate) fn project_observed(
-        &self,
-        _operation_id: Uuid,
-        _package: &MvLakePackageObservation,
-    ) -> Result<(), MvRepositoryError> {
-        Err(
-            novarocks_mv_application::repository::MvRepositoryError::new(
-                novarocks_mv_application::repository::MvRepositoryErrorKind::Corruption,
-                "legacy MV lake package cannot install a canonical D/L/P/C projection",
-            ),
-        )
     }
 
     pub(crate) fn observe_current_and_install(
@@ -506,14 +492,6 @@ impl MvCandidateReader {
         }
         Ok(observed)
     }
-}
-
-fn canonical_target(package: &MvLakePackageObservation) -> CanonicalMvTarget {
-    CanonicalMvTarget::from_parts(
-        Some(package.table.instance_id.as_str()),
-        &package.table.namespace,
-        &package.table.table,
-    )
 }
 
 #[cfg(all(test, unix, feature = "test-controls"))]

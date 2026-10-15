@@ -43,7 +43,6 @@ use crate::commit::model::EntryIdentity;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use base64::Engine;
 use bytes::Bytes;
 use novarocks_spi::connector::write_stack::session::{
     ConnectorWriteBeginRequest, ConnectorWriteFinishRequest, ConnectorWriteSessionAbortRequest,
@@ -56,14 +55,14 @@ use novarocks_spi::connector::write_stack::{
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorDistributedRewriteShape, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceDescriptor, ConnectorManagedPublicationIntent, ConnectorMutationFailure,
-    ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorProviderBindingKey,
-    ConnectorRequestContext, ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose,
-    ConnectorWriteBaseVersion, ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
-    ConnectorWriteFieldToken, ConnectorWriteInputRequest, ConnectorWriteInputShape,
-    ConnectorWriteReceipt, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, ProviderBindingEpoch,
-    StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
+    ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorMutationOperationId, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion,
+    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
+    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteReceipt,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome, ProviderBindingEpoch, StatisticsArtifactIdentity,
+    StatisticsRequiredAggregation, StatisticsScanColumn,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -74,15 +73,13 @@ use crate::catalog::transaction::{TransactionIdentity, TransactionRequest};
 use crate::commit::write_stack::domain::{
     IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment, IcebergCommitHandle,
     IcebergContentRange, IcebergDataBranchRecipe, IcebergDocumentPublicationFacts,
-    IcebergEmptyWriteDecision, IcebergManagedPublicationFacts, IcebergManagedPublicationProvenance,
-    IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts,
-    IcebergWriterOutput, corrupt, invalid,
+    IcebergEmptyWriteDecision, IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState,
+    IcebergWriteTableFacts, IcebergWriterOutput, corrupt, invalid,
 };
 use crate::commit::write_stack::flavor::{
     IcebergFrozenRewriteBranch, IcebergSessionFlavorPlan, IcebergSessionMaterial,
     plan_copy_on_write_branches, plan_distributed_rewrite_branches,
-    plan_document_publication_branches, plan_managed_publication_branches, plan_ordinary_branches,
-    plan_row_mutation_branches,
+    plan_document_publication_branches, plan_ordinary_branches, plan_row_mutation_branches,
 };
 use crate::commit::write_stack::old_delete::{
     IcebergOldDeleteArtifactRef, IcebergOldDeleteMergeTarget, IcebergStorageRoute,
@@ -829,50 +826,23 @@ fn permits_fresh_eager_attempt(
     )
 }
 
-/// The summary properties the single external commit stamps onto its snapshot.
-///
-/// Two things are recorded, and each exists because something later reads it
-/// back off the snapshot rather than out of memory:
-///
-/// * the write-session marker, which is the only proof available to
-///   reconciliation after an unknown outcome;
-/// * a managed publication's durable provenance, whose publication id is what
-///   the publication fence matches when it fast-forwards a staged refresh
-///   (`commit::snapshot_matches_publication_marker`). A publication that
-///   committed without it would strand its own snapshot.
-///
-/// `staged_data_rows` seeds the provenance row count. The commit action
-/// replaces it with the committed snapshot's real `total-records`, so it is a
-/// starting value rather than a claim.
+/// The write-session marker proves the session's commit during reconciliation.
+/// Application document records are bound separately to the exact commit.
 #[cfg(test)]
 pub(crate) fn session_snapshot_properties(
     handle: &IcebergCommitHandle,
-    staged_data_rows: u64,
 ) -> Result<BTreeMap<String, String>, ConnectorError> {
-    session_snapshot_properties_for_commit(handle, staged_data_rows)
+    session_snapshot_properties_for_commit(handle)
 }
 
 fn session_snapshot_properties_for_commit(
     handle: &IcebergCommitHandle,
-    staged_data_rows: u64,
 ) -> Result<BTreeMap<String, String>, ConnectorError> {
     let mut properties = BTreeMap::new();
     properties.insert(
         ICEBERG_WRITE_SESSION_MARKER_PROPERTY.to_string(),
         handle.session_id().to_string(),
     );
-    if let Some(publication) = handle.publication() {
-        for (key, value) in publication
-            .provenance()
-            .to_summary_properties(publication.technique(), staged_data_rows)?
-        {
-            if properties.insert(key, value).is_some() {
-                return Err(internal(
-                    "Iceberg write session marker conflicts with managed snapshot properties",
-                ));
-            }
-        }
-    }
     Ok(properties)
 }
 
@@ -1306,7 +1276,7 @@ impl IcebergWriteSessionControl {
         snapshot_id: i64,
         context: &ConnectorRequestContext,
     ) -> Result<Option<u64>, ConnectorError> {
-        if handle.publication().is_none() && handle.document_publication().is_none() {
+        if handle.document_publication().is_none() {
             return Ok(None);
         }
         let facts = handle.table();
@@ -1322,11 +1292,7 @@ impl IcebergWriteSessionControl {
                     .clone()
                     .without_vended_credential_lease_sink()
                     .after_external_effect(),
-                if handle.document_publication().is_some() {
-                    crate::catalog::SnapshotLoading::Refs
-                } else {
-                    crate::catalog::SnapshotLoading::All
-                },
+                crate::catalog::SnapshotLoading::Refs,
             )
             .map_err(|error| internal(error.to_string()))?
             .into_table();
@@ -1383,7 +1349,7 @@ fn publication_row_count_from_metadata(
     metadata: &TableMetadata,
     snapshot_id: i64,
 ) -> Result<Option<u64>, ConnectorError> {
-    if handle.publication().is_none() && handle.document_publication().is_none() {
+    if handle.document_publication().is_none() {
         return Ok(None);
     }
     let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
@@ -2056,8 +2022,7 @@ impl IcebergWriteSessionControl {
             ConnectorWriteSessionFlavor::StagedCreate(_) => CatalogOperation::CreateTable(
                 crate::catalog::CatalogCreateIntent::CreateTableAsSelect,
             ),
-            ConnectorWriteSessionFlavor::ManagedPublication { .. }
-            | ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. } => {
+            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. } => {
                 CatalogOperation::PublishDocuments
             }
             ConnectorWriteSessionFlavor::RowMutation => CatalogOperation::RowMutation,
@@ -2285,7 +2250,7 @@ impl IcebergWriteSessionControl {
             }
             _ => None,
         };
-        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } =
+        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, .. } =
             &request.flavor
         {
             // A publication's base comes from the publication's own write
@@ -2334,34 +2299,6 @@ impl IcebergWriteSessionControl {
         // the spec the table still has would stage files partitioned against a
         // spec the same commit retires.
         let repartition = match &request.flavor {
-            ConnectorWriteSessionFlavor::ManagedPublication { intent, .. } => intent
-                .partition_spec_replacement()
-                .map(|replacement| {
-                    let prepared = crate::commit::write_stack::repartition::
-                        prepare_managed_repartition(
-                            &metadata,
-                            replacement,
-                            intent.descriptor_properties(),
-                        )?;
-                    // The caller signed the provider's own earlier preview into
-                    // the intent. Re-deriving it here and requiring equality is
-                    // the optimistic-concurrency check: a table whose spec moved
-                    // between preview and admission produces a different result
-                    // and is refused rather than silently repartitioned another
-                    // way.
-                    let expected = intent.expected_committed_partitioning().ok_or_else(|| {
-                        invalid(
-                            "Iceberg managed partition replacement is missing its exact preview partitioning",
-                        )
-                    })?;
-                    if prepared.committed() != expected {
-                        return Err(invalid(
-                            "Iceberg managed partition replacement no longer matches its exact preview partitioning",
-                        ));
-                    }
-                    Ok(prepared)
-                })
-                .transpose()?,
             ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
                 declaration,
                 ..
@@ -2480,9 +2417,6 @@ impl IcebergWriteSessionControl {
             | ConnectorWriteSessionFlavor::StagedCreate(_) => {
                 plan_ordinary_branches(flavor_for(request)?, &material)?
             }
-            ConnectorWriteSessionFlavor::ManagedPublication { intent, shape } => {
-                plan_managed_publication_branches(&material, publication_facts(intent, *shape)?)?
-            }
             ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } => {
                 plan_document_publication_branches(
                     &material,
@@ -2547,7 +2481,6 @@ impl IcebergWriteSessionControl {
         };
         let IcebergSessionFlavorPlan {
             flavor,
-            publication,
             document_publication,
             rewrite_inputs,
             copy_on_write,
@@ -2560,7 +2493,6 @@ impl IcebergWriteSessionControl {
                 purpose: request.purpose,
                 table: material.table,
                 base_version_digest: request.base.as_ref().map(|base| base.digest()),
-                publication,
                 document_publication,
                 staged_metadata: staged.map(|staged| Arc::new(staged.metadata)),
                 rewrite_inputs,
@@ -2959,70 +2891,6 @@ fn format_version_number(metadata: &TableMetadata) -> u8 {
     }
 }
 
-/// What a publication needs the session to know.
-///
-/// The boundary the publication id must respect is a *destination* boundary,
-/// not a "the provider never holds it" one. The session's writer recipes, its
-/// commit fragments, and every backend that executes them have no use for the
-/// id, and it reaches none of them.
-///
-/// It does reach exactly one thing, and must: the summary of the snapshot this
-/// session's own commit creates. The publication fence adjudicates a staged
-/// refresh by reading `MV_PUBLICATION_ID_PROP` back off that snapshot
-/// (`catalog_control::catalog_mutation` -> `snapshot_matches_publication_marker`),
-/// so a commit that omitted it would publish a snapshot no publication could
-/// ever claim — and would do so silently, because nothing before the fence
-/// looks for the property. Converting the intent's durable facts once, here, is
-/// what keeps the id off the execution path while still putting it where the
-/// fence looks.
-pub(crate) fn publication_facts(
-    intent: &ConnectorManagedPublicationIntent,
-    shape: ConnectorManagedPublicationShape,
-) -> Result<IcebergManagedPublicationFacts, ConnectorError> {
-    let bases = intent
-        .bases()
-        .iter()
-        .map(provenance_base_from_staged_fact)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(invalid)?;
-    Ok(IcebergManagedPublicationFacts::new(
-        intent.technique(),
-        intent.empty_input(),
-        shape,
-        IcebergManagedPublicationProvenance::try_new(
-            intent.publication_id(),
-            bases,
-            intent.definition_fingerprint().to_string(),
-            base64::engine::general_purpose::STANDARD
-                .encode(intent.descriptor_properties().digest()),
-        )?,
-    ))
-}
-
-/// One publication base, in the Iceberg provenance form the snapshot records.
-///
-/// The neutral base object identity stays opaque to everything but this
-/// conversion, which is the only place that is allowed to know it is a
-/// canonical Iceberg table UUID (ADR-0097).
-fn provenance_base_from_staged_fact(
-    base: &novarocks_spi::connector::ConnectorStagedPublicationBaseFact,
-) -> Result<crate::commit::ProvenanceBase, String> {
-    let uuid = std::str::from_utf8(base.object_id.as_bytes())
-        .map_err(|error| format!("Iceberg base object ID is not UTF-8: {error}"))?;
-    let parsed = uuid::Uuid::parse_str(uuid)
-        .map_err(|error| format!("Iceberg base object ID is not a UUID: {error}"))?;
-    if parsed.to_string() != uuid {
-        return Err("Iceberg base object ID is not a canonical UUID".to_string());
-    }
-    Ok(crate::commit::ProvenanceBase {
-        occurrence_id: base.occurrence_id,
-        table_fqn: base.table.to_string(),
-        uuid: uuid.to_string(),
-        from_snapshot: base.from_version,
-        to_snapshot: base.to_version,
-    })
-}
-
 /// Whether this session will seal a delete branch, and therefore has to freeze
 /// the old delete artifacts that branch must supersede.
 pub(crate) fn session_freezes_old_deletes(
@@ -3043,8 +2911,7 @@ pub(crate) fn session_freezes_old_deletes(
         // branch a DML row mutation does, so it must supersede the same old
         // artifacts. One that republishes rows wholesale seals no delete branch
         // at all and has nothing to freeze.
-        ConnectorWriteSessionFlavor::ManagedPublication { shape, .. }
-        | ConnectorWriteSessionFlavor::ApplicationDocumentPublication { shape, .. } => {
+        ConnectorWriteSessionFlavor::ApplicationDocumentPublication { shape, .. } => {
             *shape == ConnectorManagedPublicationShape::RowMutation
                 && !matches!(
                     signed,

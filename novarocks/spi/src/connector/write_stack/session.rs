@@ -44,11 +44,10 @@ use crate::connector::write_stack::runtime::{
 };
 use crate::connector::write_stack::target::{WriteTargetOrdinal, validate_dense_target_ordinals};
 use crate::connector::{
-    ConnectorDocumentPublicationDeclaration, ConnectorManagedPublicationIntent,
-    ConnectorRowMutationEffect, ConnectorTableHandle, ConnectorWriteAbortOutcome,
-    ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion, ConnectorWriteInputRequest,
-    ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWriteReceipt, ConnectorWriteRouteId,
-    ConnectorWriteTargetRef,
+    ConnectorDocumentPublicationDeclaration, ConnectorRowMutationEffect, ConnectorTableHandle,
+    ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion,
+    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
+    ConnectorWriteReceipt, ConnectorWriteRouteId, ConnectorWriteTargetRef,
 };
 use crate::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorProviderBindingKey, ConnectorRequestContext,
@@ -209,22 +208,11 @@ pub enum ConnectorWriteSessionFlavor {
     /// this is the same provider-owned table value the staged-create capability
     /// vends, and it names no publication, operation, or attempt.
     StagedCreate(ConnectorTableHandle),
-    /// A durable publication whose identity belongs to the upper layer that
-    /// owns it. The publication id never reaches a writer recipe, a commit
-    /// fragment, or a backend -- but it does reach the snapshot the commit
-    /// writes, because the publication fence reads it back off that summary.
-    ///
-    /// `shape` is declared by the caller and cannot be inferred: an incremental
-    /// merge-on-read refresh arrives as a `RowLineage` input with `_file` /
-    /// `_pos` identity, which is indistinguishable from an ordinary DML row
-    /// mutation by input alone -- and the difference decides whether the commit
-    /// is a publication or DML.
-    ManagedPublication {
-        intent: ConnectorManagedPublicationIntent,
-        shape: ConnectorManagedPublicationShape,
-    },
     /// A publication whose application-owned durable facts are attached by
     /// the same existing write-session commit that publishes its data.
+    /// The caller declares `shape`: an incremental `_file` / `_pos` change
+    /// stream shares its physical input with a row mutation, while this
+    /// declaration binds the session to its publication contract.
     ApplicationDocumentPublication {
         declaration: ConnectorDocumentPublicationDeclaration,
         shape: ConnectorManagedPublicationShape,
