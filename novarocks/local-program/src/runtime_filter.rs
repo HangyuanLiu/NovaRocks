@@ -33,6 +33,9 @@ use sha2::{Digest, Sha256};
 #[path = "runtime_filter/order_keys.rs"]
 mod order_keys;
 pub use order_keys::FilterOrderKeys;
+#[path = "runtime_filter/sites.rs"]
+mod sites;
+pub use sites::{AggregateTopNFilters, ScanFilterConsumers};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FilterNullSemantics {

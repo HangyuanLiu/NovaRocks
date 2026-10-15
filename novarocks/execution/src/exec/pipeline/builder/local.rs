@@ -2496,7 +2496,7 @@ mod tests {
                 7,
                 lp::ProgramNodeKind::Scan {
                     source: recipe.into(),
-                    runtime_filters: vec![],
+                    runtime_filters: vec![].into(),
                     residuals: Vec::new(),
                     limit: None,
                 },
@@ -2541,7 +2541,7 @@ mod tests {
                 vec![lp::DiagnosticSourceNodeId::new(u32::MAX)],
                 lp::ProgramNodeKind::ExchangeSource {
                     timeout: Duration::from_secs(1),
-                    runtime_filters: vec![],
+                    runtime_filters: vec![].into(),
                     hash_partition_exprs: vec![],
                 },
                 layout.clone(),
@@ -2594,7 +2594,7 @@ mod tests {
                     10,
                     lp::ProgramNodeKind::ExchangeSource {
                         timeout: Duration::from_secs(1),
-                        runtime_filters: Vec::new(),
+                        runtime_filters: Vec::new().into(),
                         hash_partition_exprs: Vec::new(),
                     },
                     layout.clone(),

@@ -76,6 +76,7 @@ pub(crate) fn lower_aggregate_with_creation<H>(
     input: ProgramNodeId,
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     slots: &[SlotId],
+    topn_filters: novarocks_local_program::AggregateTopNFilters,
     control: &dyn PureCompileControl,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
 ) -> Result<LoweredAggregate, crate::FragmentCreationError<H>> {
@@ -86,6 +87,7 @@ pub(crate) fn lower_aggregate_with_creation<H>(
         input,
         expressions,
         slots,
+        topn_filters,
         &mut work,
         creation,
     );
@@ -98,6 +100,7 @@ fn lower_core_with_creation<H>(
     input: ProgramNodeId,
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     slots: &[SlotId],
+    topn_filters: novarocks_local_program::AggregateTopNFilters,
     work: &mut CompileCheckpoints<'_>,
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
 ) -> Result<LoweredAggregate, crate::FragmentCreationError<H>> {
@@ -206,9 +209,8 @@ fn lower_core_with_creation<H>(
             functions,
             need_finalize,
             input_is_intermediate: !calls.is_empty() && merging,
-            // Runtime-filter graphs are refused before lowering; streaming
-            // pre-aggregation is a local freedom this compiler does not take.
-            topn_filters: Vec::new(),
+            topn_filters,
+            // Streaming pre-aggregation remains outside this installed route.
             streaming_preaggregation_mode: None,
         },
         layout,

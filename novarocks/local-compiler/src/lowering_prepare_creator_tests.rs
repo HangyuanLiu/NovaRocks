@@ -209,6 +209,15 @@ fn compile_created(
     functions: &PureEngineFunctionCatalog,
     factory: &Factory,
 ) -> Result<LocalProgram, FragmentCreationError<FirstH>> {
+    compile_created_validated(providers(source), functions, factory, options(1))
+}
+
+fn compile_created_validated(
+    source: crate::ProviderValidatedFragment,
+    functions: &PureEngineFunctionCatalog,
+    factory: &Factory,
+    compile_options: LocalCompileOptions,
+) -> Result<LocalProgram, FragmentCreationError<FirstH>> {
     let main = RefCell::new(
         factory
             .begin_scope()
@@ -224,9 +233,9 @@ fn compile_created(
     let mut opaque = |bytes| main.borrow_mut().observe_opaque_upper_bound(bytes);
     let mut creation = ValueSchemaCreation::new(storage, &mut request, &mut opaque);
     compile_fragment_with_creation(
-        providers(source),
+        source,
         functions,
-        options(1),
+        compile_options,
         &mut creation,
         &mut temporary,
         factory,
@@ -1190,4 +1199,129 @@ fn actual_runtime_filter_canonical_keeps_complete_type_creator_and_first_h() {
     );
     drop(rejected);
     assert_eq!(failed_observations.held.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn ordered_topn_compiler_actual_creator_keeps_both_site_collections_after_program_exit() {
+    let (source, functions) = crate::runtime_filter_lowering_tests::ordered_scan_package(
+        true,
+        novarocks_physical_plan::SortDirection::Descending,
+        novarocks_physical_plan::NullOrdering::First,
+    );
+    let validated = validate_fragment_providers(
+        source.clone(),
+        &crate::scan_lowering_tests::providers(),
+        &crate::scan_lowering_tests::FixtureControl,
+    )
+    .unwrap();
+    let factory = Factory::new();
+    let observations = factory.observations.clone();
+    let program = compile_created_validated(
+        validated,
+        &functions,
+        &factory,
+        crate::scan_lowering_tests::options(None),
+    )
+    .unwrap();
+    let mut aggregate = None;
+    let mut scan = None;
+    for node in program.graph().nodes() {
+        match node.kind() {
+            novarocks_local_program::ProgramNodeKind::Aggregate { topn_filters, .. }
+                if !topn_filters.is_empty() =>
+            {
+                aggregate = Some(topn_filters.clone())
+            }
+            novarocks_local_program::ProgramNodeKind::Scan {
+                runtime_filters, ..
+            } => scan = Some(runtime_filters.clone()),
+            _ => {}
+        }
+    }
+    let aggregate = aggregate.unwrap();
+    let scan = scan.unwrap();
+    assert_eq!(aggregate.len(), 1);
+    assert_eq!(scan.len(), 1);
+    assert_eq!(
+        aggregate[0].producer.contract(),
+        scan[0].consumer.contract()
+    );
+    let peak = observations.held.load(Ordering::SeqCst);
+    assert!(peak > 0);
+    drop(program);
+    drop(source);
+    drop(functions);
+    drop(factory);
+    assert_eq!(observations.factory_exits.load(Ordering::SeqCst), 1);
+    let both = observations.held.load(Ordering::SeqCst);
+    assert!(both > 0 && both < peak);
+    drop(aggregate);
+    let scan_only = observations.held.load(Ordering::SeqCst);
+    assert!(scan_only > 0 && scan_only < both);
+    std::thread::spawn(move || drop(scan)).join().unwrap();
+    assert_eq!(observations.held.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn ordered_topn_compiler_actual_creator_preserves_every_refusal_prefix() {
+    let (source, functions) = crate::runtime_filter_lowering_tests::ordered_scan_package(
+        false,
+        novarocks_physical_plan::SortDirection::Ascending,
+        novarocks_physical_plan::NullOrdering::Last,
+    );
+    let run = |factory: &Factory| {
+        let validated = validate_fragment_providers(
+            source.clone(),
+            &crate::scan_lowering_tests::providers(),
+            &crate::scan_lowering_tests::FixtureControl,
+        )
+        .unwrap();
+        compile_created_validated(
+            validated,
+            &functions,
+            factory,
+            crate::scan_lowering_tests::options(None),
+        )
+    };
+    let baseline = Factory::new();
+    drop(run(&baseline).unwrap());
+    let trace = baseline.observations.events();
+    assert_eq!(baseline.observations.held.load(Ordering::SeqCst), 0);
+    assert!(
+        trace
+            .iter()
+            .any(|event| matches!(event, Event::Opaque(1, _)))
+    );
+    for (at, event) in trace.iter().enumerate() {
+        match event {
+            Event::Holder(..) | Event::Exact(..) | Event::Opaque(..) => {
+                let factory = Factory::new();
+                *factory.observations.request_stop.lock().unwrap() = Some(at);
+                match run(&factory) {
+                    Err(FragmentCreationError::Creator(FirstH(actual))) => {
+                        assert!(Arc::ptr_eq(&actual, &factory.token))
+                    }
+                    Err(other) => panic!("original ordered creation H: {other:?}"),
+                    Ok(_) => panic!("ordered request must refuse"),
+                }
+                assert_eq!(factory.observations.events(), trace[..=at]);
+                assert_eq!(factory.observations.held.load(Ordering::SeqCst), 0);
+            }
+            Event::Control(..) => {
+                for cause in [
+                    CompileControlError::Cancelled,
+                    CompileControlError::DeadlineExceeded,
+                    CompileControlError::ResourceExhausted,
+                ] {
+                    let factory = Factory::new();
+                    *factory.observations.control_stop.lock().unwrap() = Some((at, cause));
+                    assert!(
+                        matches!(run(&factory), Err(FragmentCreationError::Control(actual)) if actual == cause)
+                    );
+                    assert_eq!(factory.observations.events(), trace[..=at]);
+                    assert_eq!(factory.observations.held.load(Ordering::SeqCst), 0);
+                }
+            }
+        }
+    }
 }

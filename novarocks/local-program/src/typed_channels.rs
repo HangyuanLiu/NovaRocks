@@ -921,6 +921,69 @@ impl ProgramTypedChannels {
                 }
                 _ => {}
             }
+            // Ordered sites reuse exactly the existing evaluated group/scan
+            // key. Complete metadata and root nullability remain mandatory.
+            match node.kind() {
+                ProgramNodeKind::Aggregate {
+                    group_by,
+                    topn_filters,
+                    ..
+                } => {
+                    for filter in topn_filters {
+                        work.step()?;
+                        let crate::StaticFilterContract::Ordered { keys, .. } =
+                            filter.producer.contract()
+                        else {
+                            return Err(ProgramChannelTypeError::WrongKind);
+                        };
+                        let [key] = keys.as_slice() else {
+                            continue;
+                        };
+                        // Other ordered shapes retain their existing named
+                        // unsupported gate; this is the installed Utf8 lane.
+                        if !matches!(key.value_type.data_type(), arrow_schema::DataType::Utf8)
+                            || !crate::is_ordered_filter_flat_payload_type(&key.value_type)
+                        {
+                            continue;
+                        }
+                        if group_by.get(filter.group_key_ordinal) != Some(&filter.group_key_expr) {
+                            return Err(ProgramChannelTypeError::WrongShape);
+                        }
+                        same_value(
+                            self.definition(ProgramExpressionArena::Main, filter.group_key_expr)?,
+                            &key.value_type,
+                            false,
+                            work,
+                        )?;
+                    }
+                }
+                ProgramNodeKind::Scan {
+                    runtime_filters, ..
+                } => {
+                    for filter in runtime_filters {
+                        work.step()?;
+                        if let crate::StaticFilterContract::Ordered { keys, .. } =
+                            filter.consumer.contract()
+                        {
+                            let [key] = keys.as_slice() else {
+                                continue;
+                            };
+                            if !matches!(key.value_type.data_type(), arrow_schema::DataType::Utf8)
+                                || !crate::is_ordered_filter_flat_payload_type(&key.value_type)
+                            {
+                                continue;
+                            }
+                            same_value(
+                                self.definition(ProgramExpressionArena::Main, filter.expr_id)?,
+                                &key.value_type,
+                                false,
+                                work,
+                            )?;
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
         Ok(())
     }

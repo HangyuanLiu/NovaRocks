@@ -23,21 +23,11 @@
 //! channel identity of every site is its physical runtime filter, which is
 //! also the `filter_id` a scan's frozen dynamic filter names.
 //!
-//! This milestone lowers exactly two endpoint shapes of a complete-once
-//! membership (SetUnion) filter:
-//!
-//! - a hash join's build-key producer, which becomes a `Join` runtime-filter
-//!   producer over its own `build_keys[k]`. The local build input is the
-//!   physical build side, so the producer key is the existing `JoinBuildKey`
-//!   root and gets no root of its own;
-//! - a blocking scan-source consumer of a scan field, which becomes a `Scan`
-//!   runtime-filter consumer keyed by a compiler-authored slot read of the
-//!   scan's own output occurrence, rooted at `RuntimeFilter { binding }`
-//!   where `binding` is the consumer's index among that scan's sites.
-//!
-//! Each site has exactly one `RuntimeFilter` binding requirement. Every other
-//! domain, lifecycle, reduction, producer target, consumer target, apply point
-//! and activation is refused by name, before any channel or expression exists.
+//! Complete-once membership sites reuse existing hash-join build/probe keys
+//! and blocking scan consumers. The first monotonic ordered route reuses an
+//! original Partial Aggregate group key and its direct Scan's live Batch key.
+//! Every endpoint retains its one original binding requirement. Shapes outside
+//! these installed declarations are refused by name before expressions lower.
 
 use crate::{
     channels::{NodeChannels, ResolvedInput, UnionChannelSource},
@@ -65,6 +55,9 @@ use novarocks_type_contract::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+#[path = "runtime_filter/ordered.rs"]
+mod ordered;
+
 /// One admitted hash-join build-key membership producer.
 struct PlannedProducer {
     requirement: i32,
@@ -72,13 +65,29 @@ struct PlannedProducer {
     producer: StaticFilterProducer,
 }
 
-/// One admitted blocking scan-source membership consumer of the scan output
-/// occurrence `ordinal`, typed exactly as its membership key.
+/// One admitted scan-source consumer of output occurrence `ordinal`, with
+/// the exact declared key and separately checked membership/ordered contract.
 struct PlannedConsumer {
     requirement: i32,
     ordinal: usize,
     ty: ValueType,
     consumer: StaticFilterConsumer,
+}
+
+fn has_ordered_consumer(
+    consumers: &[PlannedConsumer],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, CompileControlError> {
+    for site in consumers {
+        work.step()?;
+        if matches!(
+            site.consumer.contract(),
+            StaticFilterContract::Ordered { .. }
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 struct PlannedJoinConsumer {
@@ -94,13 +103,15 @@ struct PlannedJoinConsumer {
 /// each node's sites exactly once.
 pub(crate) struct PlannedRuntimeFilters {
     producers: BTreeMap<NodeId, Vec<PlannedProducer>>,
+    aggregate_producers: BTreeMap<NodeId, Vec<ordered::PlannedAggregateProducer>>,
     join_consumers: BTreeMap<NodeId, Vec<PlannedJoinConsumer>>,
     consumers: BTreeMap<NodeId, Vec<PlannedConsumer>>,
 }
 
 /// The sites one lowered scan owns.
 pub(crate) struct ScanFilterSites {
-    pub filters: Vec<FilterConsumerAtExpr>,
+    pub ordered: bool,
+    pub filters: novarocks_local_program::ScanFilterConsumers,
     pub requirements: Vec<BindingRequirement>,
     pub roots: Vec<RuntimeFilterKeyRoot>,
 }
@@ -235,12 +246,24 @@ pub(crate) fn plan_runtime_filters<H, F: ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     reads: &BTreeMap<NodeId, ConnectorReadProgramRecipe>,
     factory: Option<&F>,
+    mut temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PlannedRuntimeFilters, FragmentCreationError<H>> {
     let fragment = package.fragment();
     let cuts = package.cuts();
     let mut filters = BTreeMap::new();
     for filter in cuts.runtime_filters.iter() {
+        if matches!(filter.domain, RuntimeFilterDomain::Ordered { .. }) {
+            crate::creation::before_tree_insert::<
+                novarocks_physical_plan::RuntimeFilterId,
+                &RuntimeFilter,
+                H,
+            >(
+                filters.len(),
+                crate::creation::borrow_scope(&mut temporary),
+                work,
+            )?;
+        }
         filters.insert(filter.id, filter);
         work.step()?;
     }
@@ -256,6 +279,7 @@ pub(crate) fn plan_runtime_filters<H, F: ValueSchemaCreationFactory<H>>(
     }
     let mut planned = PlannedRuntimeFilters {
         producers: BTreeMap::new(),
+        aggregate_producers: BTreeMap::new(),
         join_consumers: BTreeMap::new(),
         consumers: BTreeMap::new(),
     };
@@ -267,6 +291,15 @@ pub(crate) fn plan_runtime_filters<H, F: ValueSchemaCreationFactory<H>>(
             .ok_or(FragmentCompileError::Invalid(
                 "runtime-filter binding names no supplied runtime filter",
             ))?;
+        if matches!(filter.domain, RuntimeFilterDomain::Ordered { .. })
+            && !bound.contains(&binding.binding_id)
+        {
+            crate::creation::before_tree_insert::<u32, (), H>(
+                bound.len(),
+                crate::creation::borrow_scope(&mut temporary),
+                work,
+            )?;
+        }
         if !bound.insert(binding.binding_id) {
             return Err(FragmentCompileError::Invalid(
                 "runtime-filter binding identity is not unique",
@@ -274,12 +307,26 @@ pub(crate) fn plan_runtime_filters<H, F: ValueSchemaCreationFactory<H>>(
             .into());
         }
         match binding.role {
-            RuntimeFilterBindingRole::Producer(index) => {
-                plan_producer(package, filter, binding, index, &mut planned, factory, work)?
-            }
-            RuntimeFilterBindingRole::Consumer(index) => {
-                plan_consumer(package, filter, binding, index, &mut planned, factory, work)?
-            }
+            RuntimeFilterBindingRole::Producer(index) => plan_producer(
+                package,
+                filter,
+                binding,
+                index,
+                &mut planned,
+                factory,
+                crate::creation::borrow_scope(&mut temporary),
+                work,
+            )?,
+            RuntimeFilterBindingRole::Consumer(index) => plan_consumer(
+                package,
+                filter,
+                binding,
+                index,
+                &mut planned,
+                factory,
+                crate::creation::borrow_scope(&mut temporary),
+                work,
+            )?,
         }
     }
     // A scan's frozen dynamic filters name exactly the filters its admitted
@@ -304,9 +351,17 @@ pub(crate) fn plan_runtime_filters<H, F: ValueSchemaCreationFactory<H>>(
         if consumers.is_empty() && scan.dynamic_filters().is_empty() {
             continue;
         }
+        let ordered = has_ordered_consumer(&consumers, work)?;
         let mut expected = BTreeMap::new();
         for consumer in consumers {
             let value = node.output.columns[consumer.ordinal];
+            if ordered && !expected.contains_key(&consumer.consumer.channel_id()) {
+                crate::creation::before_tree_insert::<u32, novarocks_physical_plan::ValueId, H>(
+                    expected.len(),
+                    crate::creation::borrow_scope(&mut temporary),
+                    work,
+                )?;
+            }
             if expected
                 .insert(consumer.consumer.channel_id(), value)
                 .is_some_and(|other| other != value)
@@ -321,6 +376,13 @@ pub(crate) fn plan_runtime_filters<H, F: ValueSchemaCreationFactory<H>>(
         // Assignment `i` names provider output `i`.
         let mut assigned = BTreeMap::new();
         for (ordinal, assignment) in scan.assignments().iter().enumerate() {
+            if ordered && !assigned.contains_key(assignment.variable()) {
+                crate::creation::before_tree_insert::<&str, usize, H>(
+                    assigned.len(),
+                    crate::creation::borrow_scope(&mut temporary),
+                    work,
+                )?;
+            }
             assigned.entry(assignment.variable()).or_insert(ordinal);
             work.step()?;
         }
@@ -336,6 +398,13 @@ pub(crate) fn plan_runtime_filters<H, F: ValueSchemaCreationFactory<H>>(
                     "scan dynamic filter binds no admitted runtime-filter consumer column",
                 )
                 .into());
+            }
+            if ordered && !actual.contains(&dynamic.filter_id()) {
+                crate::creation::before_tree_insert::<u32, (), H>(
+                    actual.len(),
+                    crate::creation::borrow_scope(&mut temporary),
+                    work,
+                )?;
             }
             actual.insert(dynamic.filter_id());
         }
@@ -368,6 +437,7 @@ fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
     index: usize,
     planned: &mut PlannedRuntimeFilters,
     factory: Option<&F>,
+    mut temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), FragmentCreationError<H>> {
     let fragment = package.fragment();
@@ -385,7 +455,16 @@ fn plan_producer<H, F: ValueSchemaCreationFactory<H>>(
         .into());
     }
     let RuntimeFilterProducerTarget::JoinBuildKey { equality } = producer.target else {
-        return Err(unsupported(node, "Aggregate TopN runtime-filter producer").into());
+        return ordered::plan_producer(
+            package,
+            filter,
+            binding,
+            index,
+            planned,
+            factory,
+            crate::creation::borrow_scope(&mut temporary),
+            work,
+        );
     };
     let (contract, null_semantics) = membership_contract(filter, node, factory, work)?;
     // A fenced final domain is published by a separate completion owner; only
@@ -520,6 +599,7 @@ fn plan_consumer<H, F: ValueSchemaCreationFactory<H>>(
     index: usize,
     planned: &mut PlannedRuntimeFilters,
     factory: Option<&F>,
+    mut temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), FragmentCreationError<H>> {
     let fragment = package.fragment();
@@ -542,7 +622,16 @@ fn plan_consumer<H, F: ValueSchemaCreationFactory<H>>(
             return plan_join_consumer(package, filter, binding, index, planned, factory, work);
         }
         RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => {
-            return Err(unsupported(node, "Aggregate TopN runtime-filter consumer").into());
+            return ordered::plan_consumer(
+                package,
+                filter,
+                binding,
+                index,
+                planned,
+                factory,
+                crate::creation::borrow_scope(&mut temporary),
+                work,
+            );
         }
     }
     let (contract, _) = membership_contract(filter, node, factory, work)?;
@@ -817,18 +906,34 @@ impl PlannedRuntimeFilters {
 
     /// Every scan consumer's key read: the planned slot and channel of the
     /// scan output occurrence it keys, typed exactly as that occurrence.
-    pub(crate) fn consumer_keys(
+    pub(crate) fn consumer_keys<H>(
         &self,
         nodes: &BTreeMap<NodeId, NodeChannels>,
+        mut temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<BTreeMap<NodeId, Vec<UnionChannelSource>>, FragmentCompileError> {
+    ) -> Result<BTreeMap<NodeId, Vec<UnionChannelSource>>, FragmentCreationError<H>> {
         let mut keys = BTreeMap::new();
         for (&scan, consumers) in &self.consumers {
             let planned = nodes.get(&scan).ok_or(FragmentCompileError::Invalid(
                 "runtime-filter consumer scan has no planned channels",
             ))?;
             let mut reads = Vec::new();
-            crate::assert_rows::reserve_vec(&mut reads, consumers.len(), work)?;
+            let ordered = has_ordered_consumer(&consumers, work)?;
+            if ordered {
+                crate::creation::reserve_vec(
+                    &mut reads,
+                    consumers.len(),
+                    crate::creation::borrow_scope(&mut temporary),
+                    work,
+                )?;
+                crate::creation::before_tree_insert::<NodeId, Vec<UnionChannelSource>, H>(
+                    keys.len(),
+                    crate::creation::borrow_scope(&mut temporary),
+                    work,
+                )?;
+            } else {
+                crate::assert_rows::reserve_vec(&mut reads, consumers.len(), work)?;
+            }
             for consumer in consumers {
                 let slot =
                     *planned
@@ -858,31 +963,66 @@ impl PlannedRuntimeFilters {
 
     /// Take one lowered scan's consumer sites. `definitions` are its key
     /// reads, as expression lowering authored them in binding order.
-    pub(crate) fn take_scan(
+    pub(crate) fn take_scan<H, F: ValueSchemaCreationFactory<H>>(
         &mut self,
         scan: NodeId,
         local: ProgramNodeId,
         definitions: Option<&Vec<ProgramExprId>>,
+        factory: Option<&F>,
+        mut temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<ScanFilterSites, FragmentCompileError> {
+    ) -> Result<ScanFilterSites, FragmentCreationError<H>> {
         let consumers = self.consumers.remove(&scan).unwrap_or_default();
         let definitions = definitions.map(Vec::as_slice).unwrap_or_default();
         if definitions.len() != consumers.len() {
             return Err(FragmentCompileError::Invalid(
                 "runtime-filter consumer keys differ from their scan's consumers",
-            ));
+            )
+            .into());
         }
-        let mut sites = ScanFilterSites {
-            filters: Vec::new(),
-            requirements: Vec::new(),
-            roots: Vec::new(),
+        let ordered = has_ordered_consumer(&consumers, work)?;
+        let mut scope = match factory {
+            Some(factory) if ordered => {
+                work.flush()?;
+                Some(
+                    factory
+                        .begin_scope()
+                        .map_err(FragmentCreationError::Creator)?,
+                )
+            }
+            _ => None,
         };
-        crate::assert_rows::reserve_vec(&mut sites.filters, consumers.len(), work)?;
-        crate::assert_rows::reserve_vec(&mut sites.requirements, consumers.len(), work)?;
-        crate::assert_rows::reserve_vec(&mut sites.roots, consumers.len(), work)?;
+        let mut filters = Vec::new();
+        let mut requirements = Vec::new();
+        let mut roots = Vec::new();
+        crate::creation::reserve_vec(
+            &mut filters,
+            consumers.len(),
+            scope
+                .as_mut()
+                .map(|scope| scope as &mut dyn ValueSchemaCreationScope<H>),
+            work,
+        )?;
+        if ordered {
+            crate::creation::reserve_vec(
+                &mut requirements,
+                consumers.len(),
+                crate::creation::borrow_scope(&mut temporary),
+                work,
+            )?;
+            crate::creation::reserve_vec(
+                &mut roots,
+                consumers.len(),
+                crate::creation::borrow_scope(&mut temporary),
+                work,
+            )?;
+        } else {
+            crate::assert_rows::reserve_vec(&mut requirements, consumers.len(), work)?;
+            crate::assert_rows::reserve_vec(&mut roots, consumers.len(), work)?;
+        }
         for (binding, (consumer, &definition)) in consumers.into_iter().zip(definitions).enumerate()
         {
-            sites.roots.push(RuntimeFilterKeyRoot {
+            roots.push(RuntimeFilterKeyRoot {
                 node: local,
                 binding: u32::try_from(binding)
                     .map_err(|_| CompileControlError::ResourceExhausted)?,
@@ -894,16 +1034,29 @@ impl PlannedRuntimeFilters {
                         .map_err(|_| CompileControlError::ResourceExhausted)?,
                 },
             });
-            sites.requirements.push(BindingRequirement::RuntimeFilter {
+            requirements.push(BindingRequirement::RuntimeFilter {
                 binding_id: consumer.requirement,
             });
-            sites.filters.push(FilterConsumerAtExpr {
+            filters.push(FilterConsumerAtExpr {
                 expr_id: definition,
                 consumer: consumer.consumer,
             });
             work.step()?;
         }
-        Ok(sites)
+        let filters = match scope.as_mut() {
+            Some(scope) => novarocks_local_program::ScanFilterConsumers::try_from_vec_observed(
+                filters,
+                scope.storage_lifetime(),
+                |layout| crate::creation::request(layout, scope, work),
+            )?,
+            None => filters.into(),
+        };
+        Ok(ScanFilterSites {
+            ordered,
+            filters,
+            requirements,
+            roots,
+        })
     }
 
     /// Take one lowered hash join's producer sites.
@@ -978,7 +1131,8 @@ impl PlannedRuntimeFilters {
 
     /// Every admitted endpoint was taken by exactly its lowered owner.
     pub(crate) fn finish(&self) -> Result<(), FragmentCompileError> {
-        if !self.producers.is_empty()
+        if !self.aggregate_producers.is_empty()
+            || !self.producers.is_empty()
             || !self.consumers.is_empty()
             || !self.join_consumers.is_empty()
         {

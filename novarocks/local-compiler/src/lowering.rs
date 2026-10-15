@@ -390,8 +390,13 @@ fn lower_with_creation<
     // Provider reads and writes are admitted per scan and writer below; each
     // local runtime-filter endpoint is admitted here and later lowered by its
     // own scan or join.
-    let mut runtime_filters =
-        crate::runtime_filter::plan_runtime_filters(package, &reads, factory, work)?;
+    let mut runtime_filters = crate::runtime_filter::plan_runtime_filters(
+        package,
+        &reads,
+        factory,
+        crate::creation::borrow_scope(&mut temporary),
+        work,
+    )?;
     // The result port exists exactly for a Result sink; a stream producer
     // has no result labels and never borrows another fragment's port.
     let result = package.result();
@@ -897,7 +902,11 @@ fn lower_with_creation<
     work.flush()?;
     let channels_plan =
         resolve_tree_channels_with_creation(package, &order, work.control(), creation)?;
-    let runtime_filter_keys = runtime_filters.consumer_keys(&channels_plan.nodes, work)?;
+    let runtime_filter_keys = runtime_filters.consumer_keys(
+        &channels_plan.nodes,
+        crate::creation::borrow_scope(&mut temporary),
+        work,
+    )?;
     work.flush()?;
     let expressions = match factory {
         Some(f) => {
@@ -1239,6 +1248,8 @@ fn lower_with_creation<
                     source,
                     id,
                     expressions.runtime_filter_key_ids.get(&source),
+                    factory,
+                    crate::creation::borrow_scope(&mut temporary),
                     work,
                 )?;
                 work.flush()?;
@@ -1252,6 +1263,25 @@ fn lower_with_creation<
                     work.control(),
                     creation,
                 )?;
+                if filters.ordered {
+                    let count = filters
+                        .requirements
+                        .len()
+                        .checked_add(1)
+                        .ok_or(CompileControlError::ResourceExhausted)?;
+                    crate::creation::reserve_vec(
+                        &mut source_requirements,
+                        count,
+                        crate::creation::borrow_scope(&mut temporary),
+                        work,
+                    )?;
+                    crate::creation::reserve_vec(
+                        &mut filter_roots,
+                        filters.roots.len(),
+                        crate::creation::borrow_scope(&mut temporary),
+                        work,
+                    )?;
+                }
                 source_requirements.push(lowered.requirement);
                 source_requirements.extend(filters.requirements);
                 filter_roots.extend(filters.roots);
@@ -1299,6 +1329,22 @@ fn lower_with_creation<
                         .ok_or(FragmentCompileError::Invalid(
                             "missing lowered aggregate child",
                         ))?;
+                let filters = runtime_filters.take_aggregate(
+                    source,
+                    &expressions.ids,
+                    factory,
+                    crate::creation::borrow_scope(&mut temporary),
+                    work,
+                )?;
+                if !filters.filters.is_empty() {
+                    crate::creation::reserve_vec(
+                        &mut source_requirements,
+                        filters.requirements.len(),
+                        crate::creation::borrow_scope(&mut temporary),
+                        work,
+                    )?;
+                }
+                source_requirements.extend(filters.requirements);
                 work.flush()?;
                 let lowered = lower_aggregate_with_creation(
                     package,
@@ -1306,6 +1352,7 @@ fn lower_with_creation<
                     child,
                     &expressions.ids,
                     &planned.slots,
+                    filters.filters,
                     work.control(),
                     creation,
                 )?;

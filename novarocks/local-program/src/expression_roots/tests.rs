@@ -197,7 +197,8 @@ fn metadata_source_program(
                     group_key_ordinal: 0,
                     limit: NonZeroU32::new(3).unwrap(),
                     producer,
-                }],
+                }]
+                .into(),
                 streaming_preaggregation_mode: None,
             },
             layout.clone(),

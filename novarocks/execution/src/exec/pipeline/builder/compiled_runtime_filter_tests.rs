@@ -846,7 +846,7 @@ fn scan_with_consumers(
     }
     let kind = ProgramNodeKind::Scan {
         source: source.clone(),
-        runtime_filters,
+        runtime_filters: runtime_filters.into(),
         residuals: residuals.clone(),
         limit: *limit,
     };
@@ -1659,7 +1659,8 @@ fn compiled_runtime_filter_bindings_must_match_the_requirements_and_a_session() 
                 runtime_filters: vec![FilterConsumerAtExpr {
                     expr_id: definition,
                     consumer: blocking_consumer(7),
-                }],
+                }]
+                .into(),
                 residuals: Vec::new(),
                 limit: None,
             },
@@ -2650,7 +2651,8 @@ fn runtime_scalar_memory_actual_scan_driver_bind_funds_original_shift_key() {
                 runtime_filters: vec![FilterConsumerAtExpr {
                     expr_id: definition,
                     consumer: consumer.clone(),
-                }],
+                }]
+                .into(),
             },
         ),
         Additions {

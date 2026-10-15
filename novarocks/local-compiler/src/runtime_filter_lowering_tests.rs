@@ -146,13 +146,22 @@ fn add_scan_columns(
     distribution: Distribution,
     width: usize,
 ) -> Vec<ValueId> {
-    let columns = columns(width);
+    add_scan_typed(builder, distribution, &vec![int64(); width])
+}
+
+fn add_scan_typed(
+    builder: &mut FragmentBuilder,
+    distribution: Distribution,
+    types: &[ValueType],
+) -> Vec<ValueId> {
+    let columns = columns(types.len());
     let provider = columns
         .iter()
-        .map(|column| {
+        .zip(types)
+        .map(|(column, ty)| {
             builder
                 .add_value(
-                    int64(),
+                    ty.clone(),
                     ValueOrigin::ProviderField {
                         scan_node: SCAN,
                         field: column.clone(),
@@ -176,9 +185,10 @@ fn add_scan_columns(
                     selection_digest: [7; 32],
                     schema: columns
                         .iter()
-                        .map(|column| RelationField {
+                        .zip(types)
+                        .map(|(column, ty)| RelationField {
                             column: column.clone(),
-                            ty: int64(),
+                            ty: ty.clone(),
                         })
                         .collect(),
                     predicate_guarantees: Box::default(),
@@ -213,6 +223,22 @@ fn frozen_read_columns(
     width: usize,
     dynamic_filters: Vec<StaticScanDynamicFilter>,
 ) -> FrozenConnectorRead {
+    let schema = public_schema();
+    frozen_read_typed(
+        singleton,
+        &vec![ConnectorValueType::BigInt; width],
+        arrow_schema::Schema::new(schema.fields()[..width].to_vec()),
+        dynamic_filters,
+    )
+}
+
+fn frozen_read_typed(
+    singleton: bool,
+    types: &[ConnectorValueType],
+    schema: arrow_schema::Schema,
+    dynamic_filters: Vec<StaticScanDynamicFilter>,
+) -> FrozenConnectorRead {
+    let width = types.len();
     let draft = ConnectorReadRelationRecipeDraft::try_new(
         binding(),
         relation_payload(),
@@ -226,7 +252,8 @@ fn frozen_read_columns(
         draft,
         ["v0", "v1"][..width]
             .iter()
-            .map(|name| StaticScanAssignment::new(Arc::from(*name), ConnectorValueType::BigInt))
+            .zip(types)
+            .map(|(name, ty)| StaticScanAssignment::new(Arc::from(*name), ty.clone()))
             .collect(),
         TupleDomain::all(),
         TupleDomain::all(),
@@ -253,12 +280,7 @@ fn frozen_read_columns(
         vec![],
     )
     .unwrap();
-    let schema = public_schema();
-    let public = crate::scan_lowering_tests::typed_public_schema(
-        source,
-        None,
-        arrow_schema::Schema::new(schema.fields()[..width].to_vec()),
-    );
+    let public = crate::scan_lowering_tests::typed_public_schema(source, None, schema);
     FrozenConnectorRead::try_new(scan, public).unwrap()
 }
 
@@ -1275,6 +1297,97 @@ fn runtime_filter_shapes_outside_m1_are_refused_by_name() {
 
 /// `SELECT v0 FROM t GROUP BY v0 ORDER BY v0 LIMIT 5` whose aggregate
 /// produces an ordered bound its scan consumes.
+fn ordered_filter(
+    fragment: FragmentId,
+    aggregate: NodeId,
+    scan: NodeId,
+    topn: NodeId,
+    phase: TopNPhase,
+    value: ValueId,
+    ty: ValueType,
+    direction: SortDirection,
+    null_ordering: NullOrdering,
+    limit: u64,
+) -> RuntimeFilter {
+    let bound = RuntimeFilterCoverage {
+        nodes: Box::from([
+            RuntimeFilterCoverageNode::Witness(WITNESS),
+            RuntimeFilterCoverageNode::AllOf {
+                children: Box::from([0]),
+            },
+        ]),
+        root: 1,
+    };
+    RuntimeFilter {
+        id: FILTER,
+        kind: RuntimeFilterKind::MinMax,
+        domain: RuntimeFilterDomain::Ordered {
+            key: RuntimeFilterOrderKey {
+                ty,
+                direction,
+                null_ordering,
+            },
+            inclusive: true,
+            comparator: novarocks_type_contract::OrderedComparisonAlgorithm::NativeScalarOrderV1,
+        },
+        lifecycle: RuntimeFilterLifecycle::MonotonicUpdates,
+        reduction: RuntimeFilterReduction::TightenOrderedBound,
+        availability_coverage: bound.clone(),
+        terminal_coverage: bound,
+        equality_witnesses: Box::default(),
+        producers: Box::from([RuntimeFilterProducer {
+            witness: WITNESS,
+            endpoint: RuntimeFilterEndpoint {
+                fragment,
+                node: aggregate,
+                values: Box::from([value]),
+            },
+            apply_point: RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 },
+            contribution_kinds: Box::from([
+                RuntimeFilterContributionKind::OrderedBoundUpdate,
+                RuntimeFilterContributionKind::ProducerClosed,
+            ]),
+            completion: RuntimeFilterCompletion::ProducerClosed,
+            progress: RuntimeFilterProducerProgress {
+                build_edges: Box::default(),
+                non_build_edges: Box::default(),
+            },
+            target: RuntimeFilterProducerTarget::AggregateTopNKey {
+                group_key_ordinal: 0,
+                topn,
+                phase,
+                order_key_ordinal: 0,
+                limit,
+                offset: 0,
+                direction,
+                null_ordering,
+            },
+        }]),
+        consumers: Box::from([RuntimeFilterConsumer {
+            endpoint: RuntimeFilterEndpoint {
+                fragment,
+                node: scan,
+                values: Box::from([value]),
+            },
+            apply_point: RuntimeFilterApplyPoint::ScanSource,
+            capabilities: Box::from([RuntimeFilterArtifactCapability::OrderedRange]),
+            activation: RuntimeFilterConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            },
+            target: RuntimeFilterConsumerTarget::AggregateTopNScanField {
+                producer: WITNESS,
+                lineage: Box::default(),
+            },
+        }]),
+        policy: RuntimeFilterPolicy {
+            max_contribution_bytes: 1024,
+            max_artifact_bytes: 1024,
+            deadline_ms: 100,
+            max_retries: 1,
+        },
+    }
+}
+
 fn aggregate_topn() -> Arc<FragmentPackage> {
     let mut builder = FragmentBuilder::new(PROBE);
     let scan = add_scan(&mut builder, Distribution::Singleton);
@@ -1322,83 +1435,18 @@ fn aggregate_topn() -> Arc<FragmentPackage> {
     plan.add_fragment(fragment).unwrap();
     plan.set_result_port(result_port(PROBE, TOPN, &[grouped]))
         .unwrap();
-    let bound = RuntimeFilterCoverage {
-        nodes: Box::from([
-            RuntimeFilterCoverageNode::Witness(WITNESS),
-            RuntimeFilterCoverageNode::AllOf {
-                children: Box::from([0]),
-            },
-        ]),
-        root: 1,
-    };
-    plan.add_runtime_filter(RuntimeFilter {
-        id: FILTER,
-        kind: RuntimeFilterKind::MinMax,
-        domain: RuntimeFilterDomain::Ordered {
-            key: RuntimeFilterOrderKey {
-                ty: int64(),
-                direction: SortDirection::Ascending,
-                null_ordering: NullOrdering::Last,
-            },
-            inclusive: true,
-            comparator: novarocks_type_contract::OrderedComparisonAlgorithm::NativeScalarOrderV1,
-        },
-        lifecycle: RuntimeFilterLifecycle::MonotonicUpdates,
-        reduction: RuntimeFilterReduction::TightenOrderedBound,
-        availability_coverage: bound.clone(),
-        terminal_coverage: bound,
-        equality_witnesses: Box::default(),
-        producers: Box::from([RuntimeFilterProducer {
-            witness: WITNESS,
-            endpoint: RuntimeFilterEndpoint {
-                fragment: PROBE,
-                node: AGGREGATE,
-                values: Box::from([scan[0]]),
-            },
-            apply_point: RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 },
-            contribution_kinds: Box::from([
-                RuntimeFilterContributionKind::OrderedBoundUpdate,
-                RuntimeFilterContributionKind::ProducerClosed,
-            ]),
-            completion: RuntimeFilterCompletion::ProducerClosed,
-            progress: RuntimeFilterProducerProgress {
-                build_edges: Box::default(),
-                non_build_edges: Box::default(),
-            },
-            target: RuntimeFilterProducerTarget::AggregateTopNKey {
-                group_key_ordinal: 0,
-                topn: TOPN,
-                phase: TopNPhase::Single,
-                order_key_ordinal: 0,
-                limit: 5,
-                offset: 0,
-                direction: SortDirection::Ascending,
-                null_ordering: NullOrdering::Last,
-            },
-        }]),
-        consumers: Box::from([RuntimeFilterConsumer {
-            endpoint: RuntimeFilterEndpoint {
-                fragment: PROBE,
-                node: SCAN,
-                values: Box::from([scan[0]]),
-            },
-            apply_point: RuntimeFilterApplyPoint::ScanSource,
-            capabilities: Box::from([RuntimeFilterArtifactCapability::OrderedRange]),
-            activation: RuntimeFilterConsumerActivation::NonBlockingLive {
-                late_apply: LateApplyGranularity::Batch,
-            },
-            target: RuntimeFilterConsumerTarget::AggregateTopNScanField {
-                producer: WITNESS,
-                lineage: Box::default(),
-            },
-        }]),
-        policy: RuntimeFilterPolicy {
-            max_contribution_bytes: 1024,
-            max_artifact_bytes: 1024,
-            deadline_ms: 100,
-            max_retries: 1,
-        },
-    })
+    plan.add_runtime_filter(ordered_filter(
+        PROBE,
+        AGGREGATE,
+        SCAN,
+        TOPN,
+        TopNPhase::Single,
+        scan[0],
+        int64(),
+        SortDirection::Ascending,
+        NullOrdering::Last,
+        5,
+    ))
     .unwrap();
     let plan = plan
         .finish()
@@ -2012,3 +2060,5 @@ fn a_runtime_filter_key_root_never_reuses_a_relational_call_use() {
 
 #[path = "grouped_topn_lowering_tests.rs"]
 mod grouped_topn_lowering_tests;
+
+pub(super) use grouped_topn_lowering_tests::ordered_scan_package;
