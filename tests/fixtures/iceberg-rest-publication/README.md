@@ -130,3 +130,43 @@ sixteen successes, three real JDBC conflicts, and zero unclassified failures.
 In the two old-first cases the later frozen request is rejected by its main
 requirement before delegation; both new-first cases retry only after the real
 JDBC conflict and then reject the original requirement.
+
+## Publication lifecycle observations
+
+`tests/cluster-harness/src/publication.rs` owns the private Java REST service,
+transparent proxy, their cancellation, and actual joins for native system
+scenarios. SQL suites consume the same `publication_catalog` and
+`publication_service` owners; the original MV conflict oracle still requires
+its original six ordered events, exact base/updated identity, one competitor,
+and no second stale delegation.
+
+The service accepts `POST /arm?table=namespace.table&stage=...`:
+
+- `before-persistent-commit` is the existing requirements-passed hold.
+- `after-persistent-commit` holds after the real delegate succeeds and before
+  `TableOperations.commit` returns to the REST handler's metadata reload.
+
+A post-commit arm is claimed by exactly one request before persistence. Its
+trace records `delegate-commit-success`,
+`persistent-commit-before-handler-reload`, and `hold-reached`. Releasing it
+allows the handler to load a successor committed by a competitor. Every held
+request separately records `commit-method-exited`. `Control::wait_for_original_exit`
+returns the actual original success/conflict/failure; it does not prescribe a
+conflict. A release ACK alone is not exit evidence. Owner cleanup may pass
+`cancel=true` to disarm an unused hold; ordinary release before the boundary
+continues to return 409.
+
+The shared proxy's `stream-response` fault forwards the real request once,
+then streams each byte of the real successful body every 50 ms. Each interval
+is below the ordinary read idle timeout. The proxy records stream start,
+chunks, and actual body drop. A client deadline, explicit release, or fixture
+shutdown ends the stream. Bodyless success statuses retain their decisive
+status. This fault never invents catalog state or a successful mutation.
+
+These facilities are test-only. Quick proxy/control tests belong to the normal
+cluster-harness publication unit filter; Java/native cases are explicit and
+run when publication or maintenance semantics change and at final acceptance.
+The image uses local pinned inputs and `--pull=false`. Missing input is a
+fixture precondition failure. Keep raw failed attempts, trace, image identity,
+container logs, SQL error/result, release result and actual-exit evidence;
+retries use a fresh artifact directory and preserve the original failure.

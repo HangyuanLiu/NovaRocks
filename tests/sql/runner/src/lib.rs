@@ -1774,11 +1774,14 @@ fn execute_target_query_with_inflight_publication_service_shell(
         "    @publication_catalog_concurrent_shell completed before release"
     );
     if let Err(error) = hold.release() {
-        drop(query_thread);
+        let retry = hold.release();
+        let actual_exit = query_thread.join().is_ok();
         return (
             false,
             None,
-            format!("FAIL (runner service hold release): {error:#}"),
+            format!(
+                "FAIL (runner service hold release): {error:#}; release_retry={retry:?}; query_actor_joined={actual_exit}"
+            ),
         );
     }
     let result = match query_thread.join() {
@@ -1858,11 +1861,14 @@ fn execute_target_query_while_publication_service_holds_shell(
         ),
     };
     if let Err(error) = hold.release() {
-        drop(shell_thread);
+        let retry = hold.release();
+        let actual_exit = shell_thread.join().is_ok();
         return (
             false,
             None,
-            format!("FAIL (runner service hold release): {error:#}"),
+            format!(
+                "FAIL (runner service hold release): {error:#}; release_retry={retry:?}; shell_actor_joined={actual_exit}"
+            ),
         );
     }
     let (shell_ok, _, shell_error) = match shell_thread.join() {
@@ -1966,9 +1972,8 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
     let (companion_ok, _, companion_error) =
         shell::execute_shell_step_until(&format!("shell: {shell}"), Some(deadline));
     if !companion_ok {
-        if fault_guard.release().is_ok() {
-            let _ = query_thread.join();
-        }
+        let _ = fault_guard.release();
+        let _ = query_thread.join();
         return (
             false,
             None,
@@ -1980,14 +1985,16 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
         "    @publication_catalog_concurrent_shell completed before release"
     );
     if let Err(error) = fault_guard.release() {
-        // A failed control request may leave the primary REST call held. Do
-        // not join that thread; step cleanup drops the guard and retries the
-        // release before cluster teardown.
-        drop(query_thread);
+        // The query socket retains its original deadline. Keep ownership and
+        // join its actual exit even if the control acknowledgement was lost.
+        let retry = fault_guard.release();
+        let actual_exit = query_thread.join().is_ok();
         return (
             false,
             None,
-            format!("FAIL (runner publication hold): release before-dispatch hold: {error:#}"),
+            format!(
+                "FAIL (runner publication hold): release before-dispatch hold: {error:#}; release_retry={retry:?}; query_actor_joined={actual_exit}"
+            ),
         );
     }
     match query_thread.join() {
