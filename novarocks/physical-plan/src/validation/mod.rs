@@ -660,7 +660,9 @@ pub(crate) fn _assert_required_contract_is_copy(_: RequiredContracts) {}
 #[allow(dead_code)]
 pub(crate) fn _assert_maps_are_deterministic(_: BTreeMap<FragmentId, Fragment>) {}
 
-pub use aggregate::aggregate_bindings_match_observed;
+pub use aggregate::{
+    aggregate_bindings_match_observed, aggregate_topn_grouped_parent_matches_observed,
+};
 
 /// Frozen executable transport/projection identity, with root NULL admission
 /// delegated to the association owner. Semantic overload identity is separate.

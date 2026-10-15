@@ -1054,6 +1054,7 @@ pub(crate) fn validate_fragment_runtime_filter_cuts(
     path: &str,
     errors: &mut ValidationContext,
 ) {
+    let mut parent_proof_work = SemanticTraceWorkBudget::new(errors.limits());
     let inbound = cuts
         .inbound
         .iter()
@@ -1135,6 +1136,7 @@ pub(crate) fn validate_fragment_runtime_filter_cuts(
                     filter.reduction,
                     path,
                     errors,
+                    &mut parent_proof_work,
                 );
                 validate_runtime_filter_join_coverage(fragment, filter, producer, path, errors);
                 validate_runtime_filter_producer_progress(

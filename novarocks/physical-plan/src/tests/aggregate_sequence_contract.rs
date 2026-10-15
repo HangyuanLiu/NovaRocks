@@ -905,6 +905,7 @@ fn aggregate_call_identity_is_unique_across_a_fragment() {
 #[derive(Clone, Copy, Debug)]
 enum GroupedReductionFixture {
     Valid,
+    Utf8Key(bool),
     MissingState,
     WrongSequence,
     ReusedState,
@@ -936,6 +937,7 @@ fn grouped_reduction_plan(fixture: GroupedReductionFixture) -> Result<PhysicalPl
     let mut b = FragmentBuilder::new(FragmentId::new(811));
     let singleton = properties(Distribution::Singleton);
     let key_type = match fixture {
+        GroupedReductionFixture::Utf8Key(nullable) => ty(DataType::Utf8, nullable),
         GroupedReductionFixture::FloatKey => ty(DataType::Float64, false),
         GroupedReductionFixture::BinaryCarrier => ty(DataType::FixedSizeBinary(16), false),
         GroupedReductionFixture::LargeIntKey => ValueType::try_with_logical_type(
@@ -1338,4 +1340,11 @@ fn grouped_topn_rejects_missing_contributions_row_budgets_and_binding_drift() {
             assert!(error.contains("TopN partial paths"), "{fixture:?}: {error}");
         }
     }
+}
+
+/// Reuse the original complete, authenticated Partial -> Intermediate -> Final
+/// sequence. RF tests add only their own exact producer/consumer witness.
+pub(super) fn runtime_filter_grouped_utf8_fragment(nullable: bool) -> Fragment {
+    let plan = grouped_reduction_plan(GroupedReductionFixture::Utf8Key(nullable)).unwrap();
+    plan.fragments().values().next().unwrap().clone()
 }

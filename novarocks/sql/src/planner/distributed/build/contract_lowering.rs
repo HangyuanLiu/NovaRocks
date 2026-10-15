@@ -987,6 +987,7 @@ fn materialize_runtime_filter(
     probes: &[PendingRuntimeFilterProbe],
     fragments: &BTreeMap<FragmentId, Fragment>,
     edges: &BTreeMap<EdgeId, Edge>,
+    work: &mut CompileCheckpoints<'_>,
 ) -> Result<RuntimeFilter, ContractLoweringError> {
     let id = runtime_filter_id(legacy_id)?;
     let placement = runtime_filter_placement(legacy_id, build, probes)?;
@@ -1166,32 +1167,47 @@ fn materialize_runtime_filter(
             eprintln!(
                 "C28_DIAGNOSTIC_PRODUCER fragment={fragment:?} aggregate={node:?} key_ordinal={group_key_ordinal} input={input_value:?} group_output={group_output:?} limit={limit} direction={direction:?} null_ordering={null_ordering:?}: {producer_fragment:#?}"
             );
-            let matching_topn = producer_fragment
-                .nodes()
-                .values()
-                .filter_map(|candidate| {
-                    let NodeKind::TopN {
-                        order_by,
-                        limit: frozen_limit,
-                        offset,
-                        phase,
-                        reduction: novarocks_physical_plan::TopNReduction::Rows,
-                    } = &candidate.kind
-                    else {
-                        return None;
-                    };
-                    (candidate.inputs.as_ref() == [*node]
-                        && matches!(phase, ContractTopNPhase::Partial { .. })
-                        && order_by.len() == 1
-                        && direct_expression_value(producer_fragment, order_by[0].expr)
-                            == Some(group_output)
-                        && *frozen_limit == u64::from(*limit)
-                        && *offset == 0
-                        && order_by[0].direction == *direction
-                        && order_by[0].null_ordering == *null_ordering)
-                        .then_some((candidate.id, *phase))
-                })
-                .collect::<Vec<_>>();
+            let mut matching_topn = Vec::new();
+            for candidate in producer_fragment.nodes().values() {
+                work.step()?;
+                let NodeKind::TopN {
+                    order_by,
+                    limit: frozen_limit,
+                    offset,
+                    phase,
+                    reduction,
+                } = &candidate.kind
+                else {
+                    continue;
+                };
+                if candidate.inputs.as_ref() != [*node]
+                    || !matches!(phase, ContractTopNPhase::Partial { .. })
+                    || order_by.len() != 1
+                    || direct_expression_value(producer_fragment, order_by[0].expr)
+                        != Some(group_output)
+                    || *frozen_limit != u64::from(*limit)
+                    || *offset != 0
+                    || order_by[0].direction != *direction
+                    || order_by[0].null_ordering != *null_ordering
+                {
+                    continue;
+                }
+                let parent_matches = match reduction {
+                    novarocks_physical_plan::TopNReduction::Rows => true,
+                    novarocks_physical_plan::TopNReduction::GroupedStates { .. } => {
+                        novarocks_physical_plan::aggregate_topn_grouped_parent_matches_observed(
+                            producer_fragment,
+                            aggregate,
+                            candidate,
+                            work,
+                        )?
+                    }
+                };
+                if parent_matches {
+                    matching_topn.push((candidate.id, *phase));
+                }
+            }
+            work.flush()?;
             let [(topn, phase)] = matching_topn.as_slice() else {
                 return Err(invalid(
                     "Aggregate TopN producer lacks one exact partial TopN parent".to_string(),
@@ -2209,7 +2225,7 @@ impl<'a> ContractLoweringVisitor<'a> {
     }
 
     fn materialize_runtime_filters(
-        &self,
+        &mut self,
         fragments: &BTreeMap<FragmentId, Fragment>,
     ) -> Result<Vec<RuntimeFilter>, ContractLoweringError> {
         for id in self.runtime_filter_probes.keys() {
@@ -2230,7 +2246,14 @@ impl<'a> ContractLoweringVisitor<'a> {
                         detail: "producer has no static consumer witness".to_string(),
                     }
                 })?;
-                materialize_runtime_filter(*legacy_id, build, probes, fragments, &self.edges)
+                materialize_runtime_filter(
+                    *legacy_id,
+                    build,
+                    probes,
+                    fragments,
+                    &self.edges,
+                    &mut self.work,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         resolve_runtime_filter_activations(&mut filters, fragments, &self.edges);

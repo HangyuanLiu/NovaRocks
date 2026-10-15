@@ -3778,3 +3778,278 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
         ))
     );
 }
+
+// RF owner-local proof regressions: reuse the original complete aggregate
+// sequence and validate both real publication boundaries. These tests own no
+// service/input fixture and run with the existing short RF owner lane.
+fn grouped_runtime_filter_parent_fixture(nullable: bool) -> (Fragment, RuntimeFilter) {
+    let fragment =
+        super::aggregate_sequence_contract::runtime_filter_grouped_utf8_fragment(nullable);
+    let grouped = fragment
+        .nodes()
+        .values()
+        .find(|n| {
+            matches!(
+                n.kind,
+                NodeKind::TopN {
+                    reduction: TopNReduction::GroupedStates { .. },
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let aggregate = &fragment.nodes()[&grouped.inputs[0]];
+    let scan = &fragment.nodes()[&aggregate.inputs[0]];
+    assert!(matches!(scan.kind, NodeKind::Scan { .. }));
+    let NodeKind::Aggregate {
+        group_by,
+        calls,
+        grouping: AggregateGrouping::Partial,
+    } = &aggregate.kind
+    else {
+        panic!("original partial aggregate required")
+    };
+    let input = crate::expression_value(fragment.expressions(), group_by[0].0).unwrap();
+    let NodeKind::TopN {
+        order_by,
+        limit,
+        offset,
+        phase,
+        reduction:
+            TopNReduction::GroupedStates {
+                calls: merged_calls,
+                ..
+            },
+    } = &grouped.kind
+    else {
+        unreachable!()
+    };
+    let AggregatePhase::Partial { sequence } = calls[0].binding.phase else {
+        unreachable!()
+    };
+    assert_eq!(
+        merged_calls[0].binding.phase,
+        AggregatePhase::Intermediate { sequence }
+    );
+    assert_ne!(merged_calls[0].output, calls[0].output);
+    let TopNPhase::Partial {
+        sequence: topn_sequence,
+    } = phase
+    else {
+        unreachable!()
+    };
+    assert_ne!(
+        sequence.get(),
+        topn_sequence.get(),
+        "separate identity domains"
+    );
+    let (_, mut filter) = aggregate_topn_filter();
+    let RuntimeFilterDomain::Ordered { key, .. } = &mut filter.domain else {
+        unreachable!()
+    };
+    key.ty = fragment.values()[&input].ty.clone();
+    key.direction = order_by[0].direction;
+    key.null_ordering = order_by[0].null_ordering;
+    filter.producers[0].endpoint = RuntimeFilterEndpoint {
+        fragment: fragment.id(),
+        node: aggregate.id,
+        values: Box::from([input]),
+    };
+    filter.producers[0].target = RuntimeFilterProducerTarget::AggregateTopNKey {
+        group_key_ordinal: 0,
+        topn: grouped.id,
+        phase: *phase,
+        order_key_ordinal: 0,
+        limit: *limit,
+        offset: *offset,
+        direction: order_by[0].direction,
+        null_ordering: order_by[0].null_ordering,
+    };
+    filter.consumers[0].endpoint = RuntimeFilterEndpoint {
+        fragment: fragment.id(),
+        node: scan.id,
+        values: Box::from([input]),
+    };
+    let mut parts = fragment.into_parts();
+    parts.runtime_filters = Box::from([filter.id]);
+    (parts.into(), filter)
+}
+
+#[test]
+fn runtime_filter_grouped_parent_accepts_exact_sequence_at_both_boundaries() {
+    for nullable in [false, true] {
+        let (fragment, filter) = grouped_runtime_filter_parent_fixture(nullable);
+        let cuts = local_runtime_filter_cuts(&fragment, &filter);
+        validate_fragment(&fragment, &cuts).unwrap();
+        let mut builder = PlanBuilder::new(version());
+        builder.add_fragment(fragment).unwrap();
+        builder.add_runtime_filter(filter).unwrap();
+        builder.finish_observed(&GroupedConstantControl).unwrap();
+    }
+}
+
+#[test]
+fn runtime_filter_grouped_parent_preserves_the_exact_frozen_witness_at_both_boundaries() {
+    let (fragment, filter) = grouped_runtime_filter_parent_fixture(true);
+    let mut wrong = filter.clone();
+    let RuntimeFilterProducerTarget::AggregateTopNKey { phase, .. } =
+        &mut wrong.producers[0].target
+    else {
+        unreachable!()
+    };
+    *phase = TopNPhase::Single;
+    let mut reversed = filter;
+    let RuntimeFilterProducerTarget::AggregateTopNKey { direction, .. } =
+        &mut reversed.producers[0].target
+    else {
+        unreachable!()
+    };
+    *direction = SortDirection::Descending;
+    for invalid in [wrong, reversed] {
+        let cuts = local_runtime_filter_cuts(&fragment, &invalid);
+        let cut_error = validate_fragment(&fragment, &cuts).unwrap_err();
+        let mut builder = PlanBuilder::new(version());
+        builder.add_fragment(fragment.clone()).unwrap();
+        builder.add_runtime_filter(invalid).unwrap();
+        let plan_error = builder
+            .finish_observed(&GroupedConstantControl)
+            .unwrap_err();
+        for error in [cut_error.to_string(), plan_error.to_string()] {
+            assert!(error.contains("runtime filter Aggregate TopN producer target does not match its exact group key"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn runtime_filter_grouped_parent_reuses_complete_type_state_and_work_proofs() {
+    use crate::validation::{SemanticTraceWorkBudget, aggregate_topn_grouped_parent_matches};
+    let (fragment, filter) = grouped_runtime_filter_parent_fixture(true);
+    let aggregate = &fragment.nodes()[&filter.producers[0].endpoint.node];
+    let RuntimeFilterProducerTarget::AggregateTopNKey { topn, .. } = filter.producers[0].target
+    else {
+        unreachable!()
+    };
+    let grouped = &fragment.nodes()[&topn];
+    let mut budget = SemanticTraceWorkBudget::new(&PlanLimits::FROZEN);
+    let initial = budget.remaining;
+    assert!(aggregate_topn_grouped_parent_matches(
+        &fragment,
+        aggregate,
+        grouped,
+        &mut budget
+    ));
+    let used = initial - budget.remaining;
+    assert!(used > 0);
+    let mut exact = SemanticTraceWorkBudget { remaining: used };
+    assert!(aggregate_topn_grouped_parent_matches(
+        &fragment, aggregate, grouped, &mut exact
+    ));
+    assert_eq!(exact.remaining, 0);
+    assert!(
+        !aggregate_topn_grouped_parent_matches(&fragment, aggregate, grouped, &mut exact),
+        "same caller budget cannot reset for another producer"
+    );
+    let mut short = SemanticTraceWorkBudget {
+        remaining: used - 1,
+    };
+    assert!(!aggregate_topn_grouped_parent_matches(
+        &fragment, aggregate, grouped, &mut short
+    ));
+    let mut wrong_state = grouped.clone();
+    let NodeKind::TopN {
+        reduction: TopNReduction::GroupedStates { calls, .. },
+        ..
+    } = &mut wrong_state.kind
+    else {
+        unreachable!()
+    };
+    calls[0].binding.phase = AggregatePhase::Intermediate {
+        sequence: AggregateSequenceId::new(999),
+    };
+    let mut wrong_parent = grouped.clone();
+    wrong_parent.inputs = aggregate.inputs.clone();
+    for invalid in [wrong_state, wrong_parent] {
+        let mut budget = SemanticTraceWorkBudget::new(&PlanLimits::FROZEN);
+        assert!(!aggregate_topn_grouped_parent_matches(
+            &fragment,
+            aggregate,
+            &invalid,
+            &mut budget
+        ));
+    }
+    let NodeKind::Aggregate { group_by, .. } = &aggregate.kind else {
+        unreachable!()
+    };
+    let mut parts = fragment.clone().into_parts();
+    let definition = parts.values.get_mut(&group_by[0].1).unwrap();
+    definition.ty = definition.ty.with_nullable(false).unwrap();
+    let changed: Fragment = parts.into();
+    let mut budget = SemanticTraceWorkBudget::new(&PlanLimits::FROZEN);
+    assert!(
+        !aggregate_topn_grouped_parent_matches(&changed, aggregate, grouped, &mut budget),
+        "exact key nullability is not a physical layout guess"
+    );
+}
+
+#[test]
+fn runtime_filter_grouped_parent_observed_control_retains_every_first_refusal() {
+    use novarocks_type_contract::{
+        CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+    };
+    use std::sync::Mutex;
+    struct Control {
+        trace: Mutex<Vec<u32>>,
+        refusal: Option<(usize, CompileControlError)>,
+    }
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert_eq!(phase, CompilePhase::Validate);
+            assert!(units <= novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK);
+            let mut trace = self.trace.lock().unwrap();
+            let at = trace.len();
+            trace.push(units);
+            if let Some((refuse_at, cause)) = self.refusal {
+                if at == refuse_at {
+                    return Err(cause);
+                }
+            }
+            Ok(())
+        }
+    }
+    let (fragment, filter) = grouped_runtime_filter_parent_fixture(false);
+    let aggregate = &fragment.nodes()[&filter.producers[0].endpoint.node];
+    let RuntimeFilterProducerTarget::AggregateTopNKey { topn, .. } = filter.producers[0].target
+    else {
+        unreachable!()
+    };
+    let grouped = &fragment.nodes()[&topn];
+    let evaluate = |control: &Control| {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        let valid = crate::aggregate_topn_grouped_parent_matches_observed(
+            &fragment, aggregate, grouped, &mut work,
+        )?;
+        work.finish()?;
+        Ok::<_, CompileControlError>(valid)
+    };
+    let control = Control {
+        trace: Mutex::default(),
+        refusal: None,
+    };
+    assert_eq!(evaluate(&control), Ok(true));
+    let trace = control.trace.into_inner().unwrap();
+    assert!(trace.iter().any(|units| *units > 0));
+    for at in 0..trace.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Control {
+                trace: Mutex::default(),
+                refusal: Some((at, cause)),
+            };
+            assert_eq!(evaluate(&control), Err(cause));
+            assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+        }
+    }
+}
