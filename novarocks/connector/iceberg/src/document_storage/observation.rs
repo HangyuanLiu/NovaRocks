@@ -251,6 +251,54 @@ pub(crate) fn validate_expected_object(
 }
 
 impl ConnectorDocumentStorageObservation for super::create::IcebergDocumentStorage {
+    fn observe_keyed_documents(
+        &self,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<
+        novarocks_spi::connector::KeyedDocumentView,
+        novarocks_spi::connector::KeyedDocumentReadError,
+    > {
+        let table = load_keyed_table(self, &request, crate::catalog::SnapshotLoading::Refs)?;
+        super::keyed::project_view(table.metadata(), &request, committed_version(&table)?)
+    }
+
+    fn observe_full_keyed_documents(
+        &self,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<
+        novarocks_spi::connector::FullKeyedDocumentView,
+        novarocks_spi::connector::KeyedDocumentReadError,
+    > {
+        let table = load_keyed_table(self, &request, crate::catalog::SnapshotLoading::All)?;
+        super::keyed::project_full_view(table.metadata(), &request, committed_version(&table)?)
+    }
+
+    fn resolve_keyed_commit(
+        &self,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+        evidence: novarocks_spi::connector::UnknownCommitEvidence,
+    ) -> Result<novarocks_spi::connector::CommitConclusion, ConnectorError> {
+        use super::keyed::resolution::{self, Resolution};
+        let refs = self
+            .observe_keyed_documents(request.clone())
+            .map_err(keyed_read_error)?;
+        match resolution::resolve(&refs, None, &evidence)? {
+            Resolution::Conclusion(conclusion) => Ok(conclusion),
+            Resolution::NeedFull => {
+                let full = self
+                    .observe_full_keyed_documents(request)
+                    .map_err(keyed_read_error)?;
+                match resolution::resolve(&refs, Some(&full), &evidence)? {
+                    Resolution::Conclusion(conclusion) => Ok(conclusion),
+                    Resolution::NeedFull => Err(ConnectorError::new(
+                        ConnectorErrorKind::Internal,
+                        "complete keyed commit observation requested another full load",
+                    )),
+                }
+            }
+        }
+    }
+
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         self.descriptor()
     }
@@ -514,6 +562,48 @@ fn decode_committed_version_with_limits(
         ));
     }
     Ok(payload)
+}
+
+pub(crate) fn keyed_read_error(
+    error: novarocks_spi::connector::KeyedDocumentReadError,
+) -> ConnectorError {
+    match error {
+        novarocks_spi::connector::KeyedDocumentReadError::Invalid(error) => error,
+        legacy @ novarocks_spi::connector::KeyedDocumentReadError::LegacyFormat { .. } => {
+            ConnectorError::new(ConnectorErrorKind::Unsupported, legacy.to_string())
+        }
+    }
+}
+
+fn load_keyed_table(
+    storage: &super::create::IcebergDocumentStorage,
+    request: &novarocks_spi::connector::KeyedDocumentObservationRequest,
+    mode: crate::catalog::SnapshotLoading,
+) -> Result<crate::iceberg::table::Table, ConnectorError> {
+    request.validate()?;
+    if request.owner.instance_id != storage.descriptor().instance_id
+        || request.owner.incarnation != storage.incarnation()
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "keyed observation belongs to a different provider generation",
+        ));
+    }
+    super::io::check_context(&request.context)?;
+    // Both scopes are fresh observations. A cached All load cannot adjudicate
+    // an unknown commit, and a partial load must never enter that cache.
+    let table = storage
+        .runtime()
+        .observe_table_for_request_with_snapshots(
+            &request.target.namespace,
+            &request.target.table,
+            &request.context,
+            mode,
+        )
+        .map_err(|message| ConnectorError::new(ConnectorErrorKind::Unavailable, message))?
+        .into_table();
+    validate_expected_object(&request.object_id, table.metadata())?;
+    Ok(table)
 }
 
 fn load_exact_table(
