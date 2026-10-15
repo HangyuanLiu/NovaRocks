@@ -918,6 +918,22 @@ impl ConnectorDocumentStorageLease {
         view.token.seal();
         Ok(view)
     }
+    pub fn decode_keyed_slot_change_evidence(
+        &self,
+        request: super::KeyedDocumentObservationRequest,
+        evidence: crate::connector::ExternalMutationEvidence,
+    ) -> Result<super::UnknownCommitEvidence, ConnectorError> {
+        self.validate_keyed_request(&request)?;
+        if evidence.descriptor() != self.binding.descriptor()
+            || evidence.incarnation() != self.owner.incarnation
+        {
+            return Err(invalid(
+                "slot-change evidence does not match its retained control generation",
+            ));
+        }
+        self.observation()?
+            .decode_keyed_slot_change_evidence(request, evidence)
+    }
     pub fn resolve_keyed_commit(
         &self,
         request: super::KeyedDocumentObservationRequest,

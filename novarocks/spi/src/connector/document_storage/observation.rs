@@ -1076,6 +1076,16 @@ pub trait ConnectorDocumentStorageObservation: Send + Sync {
         )
         .into())
     }
+    fn decode_keyed_slot_change_evidence(
+        &self,
+        _request: super::KeyedDocumentObservationRequest,
+        _evidence: crate::connector::ExternalMutationEvidence,
+    ) -> Result<super::UnknownCommitEvidence, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "keyed slot-change evidence projection is not installed",
+        ))
+    }
     fn resolve_keyed_commit(
         &self,
         _request: super::KeyedDocumentObservationRequest,
