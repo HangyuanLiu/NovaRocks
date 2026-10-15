@@ -325,7 +325,9 @@ fn original_type_host_preserves_a_qualified_shared_shortage_without_running_body
     let binding = binding(2 << 20);
     // A known real Rust request holds capacity independently of the pending
     // metadata operation. Its own tag is published exactly once by GLOBAL.
-    const PAYLOAD: usize = 1_400_000;
+    // Leave enough room for the small execution namespace, while the source
+    // request still exceeds remaining elastic capacity after its rollback.
+    const PAYLOAD: usize = 1_450_000;
     let ready = match novarocks_execution::runtime::kernel_memory::request_complete_operation(
         Some(&binding),
         PAYLOAD + 8,
