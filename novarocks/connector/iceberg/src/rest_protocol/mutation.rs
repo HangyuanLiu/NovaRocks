@@ -369,7 +369,9 @@ impl RestEndpoints {
             .send_once(
                 request,
                 expect.endpoint().success_statuses(),
-                &RequestContext::default(),
+                // The legacy migration path retains a finite request phase.
+                // Prepared publication consumes the journal's evidence grant.
+                &RequestContext::for_read(),
             )
             .await;
         let (read, document) = match (expect.endpoint().response_shape(), body) {

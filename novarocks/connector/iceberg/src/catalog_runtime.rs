@@ -99,7 +99,8 @@ pub fn build_hadoop_catalog(
 pub(crate) const REST_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) const REST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Read the fixed parameters used by catalog admission and the REST client.
+/// Read catalog listing admission, connection setup, and ordinary read-phase
+/// bounds. The third value is not a shared-client or publication read timeout.
 /// This projection grants no capacity and does not make them configurable.
 pub const fn frozen_sdk_listing_parameters() -> (usize, std::time::Duration, std::time::Duration) {
     (

@@ -51,20 +51,14 @@ impl fmt::Debug for RestHttpClient {
 }
 
 impl RestHttpClient {
-    /// Builds the production client: today's timeouts (connect 5 s, read
-    /// 30 s, no total deadline) plus the three L3 settings.
+    /// The caller's finite phase context bounds headers and body together.
+    /// No pool-wide read timer may preempt a longer evidence grant.
     pub(crate) fn new() -> Result<Self, String> {
-        Self::with_timeouts(REST_CONNECT_TIMEOUT, REST_READ_TIMEOUT)
+        Self::build(REST_CONNECT_TIMEOUT, None)
     }
 
-    /// Builds a client with explicit timeouts and otherwise the production
-    /// settings. Production always uses [`Self::new`].
-    ///
-    /// reqwest counts the read timeout from the start of the request,
-    /// connection setup included, while the connect timeout covers DNS, TCP,
-    /// TLS and proxy tunnel. Only a connect timeout shorter than the read
-    /// timeout guarantees that a stalled connection setup is reported as a
-    /// connect error (not written) rather than a read timeout.
+    /// Explicit transport timeouts are only for independent fault oracles.
+    #[cfg(test)]
     pub(crate) fn with_timeouts(
         connect_timeout: Duration,
         read_timeout: Duration,
@@ -72,9 +66,16 @@ impl RestHttpClient {
         if connect_timeout >= read_timeout {
             return Err("REST connect timeout must be shorter than the read timeout".to_string());
         }
-        reqwest::Client::builder()
-            .connect_timeout(connect_timeout)
-            .read_timeout(read_timeout)
+        Self::build(connect_timeout, Some(read_timeout))
+    }
+
+    fn build(connect_timeout: Duration, read_timeout: Option<Duration>) -> Result<Self, String> {
+        let builder = reqwest::Client::builder().connect_timeout(connect_timeout);
+        let builder = match read_timeout {
+            Some(timeout) => builder.read_timeout(timeout),
+            None => builder,
+        };
+        builder
             // Routing is decided by the session binding only; a redirect
             // would let the server reroute outside it and could resend a
             // client secret to a new address (L4).
@@ -272,7 +273,8 @@ impl RestRequest {
 }
 
 /// The caller's bounds on one request. Cancellation is dropping the future.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct RequestContext {
     deadline: Option<Instant>,
 }
@@ -619,6 +621,36 @@ mod tests {
         }
         assert!(chunks.len() >= 2, "{chunks:?}");
         assert_eq!(chunks.concat(), b"{\"a\":1}");
+    }
+
+    #[tokio::test]
+    async fn production_client_does_not_preempt_a_grant_with_the_old_read_cap() {
+        let server = TestServer::start(
+            Script::new().on(
+                "GET",
+                "/long-evidence",
+                Reply::json(200, &serde_json::json!({"complete":true}))
+                    .with_delay(Duration::from_secs(31)),
+            ),
+        );
+        let context = RequestContext::with_deadline(Instant::now() + Duration::from_secs(45));
+        let (stage, body) = RestHttpClient::new()
+            .unwrap()
+            .send_once(
+                get(format!("{}/long-evidence", server.url())),
+                &[200],
+                &context,
+            )
+            .await;
+        assert!(
+            matches!(stage, DispatchStage::Status { code: 200, .. }),
+            "{stage:?}"
+        );
+        assert_eq!(
+            body.unwrap().read_to_end().await.unwrap(),
+            br#"{"complete":true}"#
+        );
+        assert_eq!(server.requests_to("GET", "/long-evidence").len(), 1);
     }
 
     #[tokio::test]
