@@ -472,6 +472,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         _generation: novarocks_spi::connector::ProviderBindingEpoch,
         _preparation: novarocks_spi::connector::ConnectorRequestContext,
         _document: catalog_request::CatalogResponseDocument,
+        _read_binding: crate::access_binding::IcebergReadBinding,
     ) -> publication_dispatch::PreparationResult<publication_dispatch::PreparedPublication> {
         Err(publication_dispatch::PreparationFailure(
             ConnectorMutationFailure::new(

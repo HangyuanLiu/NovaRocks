@@ -33,6 +33,20 @@ use novarocks_spi::connector::{
 };
 
 impl HadoopFileSystemCatalog {
+    pub(crate) fn prepare_namespace_publication(
+        self: Arc<Self>,
+        namespace: &NamespaceIdent,
+        create: bool,
+    ) -> PreparedPublication {
+        PreparedPublication::Mutation {
+            binding: None,
+            dispatch: Box::new(HadoopPreparedNamespace {
+                marker: self.namespace_marker_location(namespace),
+                file_io: self.file_io.clone(),
+                create,
+            }),
+        }
+    }
     pub(crate) async fn prepare_frozen_update(
         self: Arc<Self>,
         request: FrozenRequest,
@@ -58,6 +72,40 @@ impl HadoopFileSystemCatalog {
                 request,
             }),
         })
+    }
+}
+
+struct HadoopPreparedNamespace {
+    marker: String,
+    file_io: FileIO,
+    create: bool,
+}
+#[async_trait]
+impl PreparedCatalogDispatch for HadoopPreparedNamespace {
+    async fn dispatch_once(self: Box<Self>, evidence: EvidenceContext) -> DispatchCompletion {
+        if let Err(error) = HadoopFileSystemCatalog::check_publication_budget(Some(evidence)) {
+            return not_dispatched(error);
+        }
+        let result = if self.create {
+            let output = match self.file_io.new_output(&self.marker) {
+                Ok(output) => output,
+                Err(error) => return not_dispatched(error),
+            };
+            // Preserve the existing marker protocol and await the started PUT
+            // to actual exit. No namespace object is materialized for proof.
+            output.write(Bytes::new()).await
+        } else {
+            self.file_io.delete(&self.marker).await
+        };
+        match result {
+            Ok(()) => DispatchCompletion::evidence(DispatchEvidence::Applied {
+                proof: CommitProof::applied(None),
+            }),
+            Err(_) => unknown(
+                "namespace-marker",
+                "Hadoop namespace mutation has no decisive acknowledgement",
+            ),
+        }
     }
 }
 

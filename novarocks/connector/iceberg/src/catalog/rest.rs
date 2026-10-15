@@ -240,6 +240,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         generation: novarocks_spi::connector::ProviderBindingEpoch,
         preparation: novarocks_spi::connector::ConnectorRequestContext,
         document: super::catalog_request::CatalogResponseDocument,
+        _read_binding: crate::access_binding::IcebergReadBinding,
     ) -> super::publication_dispatch::PreparationResult<
         super::publication_dispatch::PreparedPublication,
     > {
@@ -256,6 +257,26 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                     ),
                 )
             })?;
+        if matches!(
+            request.operation,
+            CatalogOperation::CreateNamespace | CatalogOperation::DropNamespace
+        ) {
+            let CatalogAdmissionTarget::Namespace(namespace) = &request.target else {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Namespace publication requires a namespace target",
+                )
+                .into());
+            };
+            let exists = self
+                .delegate
+                .listing
+                .run(&preparation, self.namespace_exists(namespace.clone()))
+                .await?;
+            if request.namespace_no_op(exists)? {
+                return Ok(super::publication_dispatch::PreparedPublication::NoOp);
+            }
+        }
         if request.stage_create {
             let CatalogAdmissionTarget::Table(table) = &request.target else {
                 return Err(ConnectorError::new(
@@ -615,6 +636,23 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     ) -> Result<bool, ConnectorError> {
         let ident = super::delegate::namespace_ident(&namespace)?;
         self.endpoints.namespace_exists(&ident).await
+    }
+
+    async fn namespace_exists_for_read(
+        &self,
+        namespace: CatalogNamespaceName,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<bool, ConnectorError> {
+        let context = binding.request_context().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Namespace existence requires an admitted request context",
+            )
+        })?;
+        self.delegate
+            .listing
+            .run(context, self.namespace_exists(namespace))
+            .await
     }
 
     /// Request bounded REST pages, checking every response before retention

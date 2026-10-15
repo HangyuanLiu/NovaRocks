@@ -293,6 +293,7 @@ pub(crate) fn prepare_rest_staged_table(
     let staging_owner = Arc::clone(&owner);
     let policy = stage.policy;
     let preparation = original.clone();
+    let read_binding = runtime.resources().planning_binding().clone();
     let dispatched = runtime.resources().catalog_runtime().block_on(async move {
         journal
             .publish_once(
@@ -301,7 +302,12 @@ pub(crate) fn prepare_rest_staged_table(
                 move |descriptor, generation, original| async move {
                     staging_owner
                         .prepare_catalog_publication(
-                            frozen, descriptor, generation, original, response,
+                            frozen,
+                            descriptor,
+                            generation,
+                            original,
+                            response,
+                            read_binding,
                         )
                         .await
                 },

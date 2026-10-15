@@ -31,8 +31,12 @@ pub(crate) enum CatalogPublicationRequest {
     CreateNamespace {
         namespace: CatalogNamespaceName,
         properties: HashMap<String, String>,
+        no_op_if_exists: bool,
     },
-    DropNamespace(CatalogNamespaceName),
+    DropNamespace {
+        namespace: CatalogNamespaceName,
+        no_op_if_missing: bool,
+    },
     CreateTable {
         namespace: CatalogNamespaceName,
         creation: TableCreation,
@@ -75,21 +79,76 @@ pub(crate) struct FrozenCatalogPublication {
     pub(super) route: MutationRoute,
     pub(super) expectation: AttributionExpectation,
     pub(super) stage_create: bool,
+    namespace_no_op: Option<bool>,
+    pub(super) namespace_has_properties: bool,
     request: Vec<u8>,
     attribution: AttributionPlan,
 }
 impl FrozenCatalogPublication {
     pub(crate) fn targets(&self) -> Vec<String> {
-        vec![match &self.target {
-            CatalogAdmissionTarget::Namespace(namespace) => namespace.to_string(),
-            CatalogAdmissionTarget::Table(table) => table.to_string(),
-        }]
+        // Bind the actual operation, structured name and local policy even
+        // when two endpoints use identical empty HTTP bodies. Display names
+        // are ambiguous (namespace "db.t" versus table {db, t}).
+        let target = match &self.target {
+            CatalogAdmissionTarget::Namespace(namespace) => serde_json::json!({
+                "kind": "namespace", "namespace": namespace.namespace.as_ref(),
+            }),
+            CatalogAdmissionTarget::Table(table) => serde_json::json!({
+                "kind": "table", "namespace": table.namespace.as_ref(), "name": table.name.as_ref(),
+            }),
+        };
+        vec![
+            serde_json::json!({
+                "catalog-request-scope-version": 1,
+                "operation": self.operation.name(), "target": target,
+                "namespace-no-op": self.namespace_no_op,
+            })
+            .to_string(),
+        ]
     }
     pub(crate) fn request_bytes(&self) -> &[u8] {
         &self.request
     }
     pub(crate) fn attribution(&self) -> &AttributionPlan {
         &self.attribution
+    }
+    pub(super) fn namespace_no_op(
+        &self,
+        exists: bool,
+    ) -> super::publication_dispatch::PreparationResult<bool> {
+        use novarocks_spi::connector::{ConnectorMutationFailure, ConnectorMutationFailureKind};
+        let satisfied = match self.operation {
+            CatalogOperation::CreateNamespace => exists,
+            CatalogOperation::DropNamespace => !exists,
+            _ => {
+                return Err(super::publication_dispatch::PreparationFailure(
+                    ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::InvalidRequest,
+                        "Namespace precondition requires an actual namespace operation",
+                    ),
+                ));
+            }
+        };
+        if !satisfied {
+            return Ok(false);
+        }
+        if self.namespace_no_op == Some(true) {
+            return Ok(true);
+        }
+        Err(super::publication_dispatch::PreparationFailure(
+            ConnectorMutationFailure::new(
+                if exists {
+                    ConnectorMutationFailureKind::AlreadyExists
+                } else {
+                    ConnectorMutationFailureKind::NotFound
+                },
+                if exists {
+                    "Iceberg namespace already exists"
+                } else {
+                    "Iceberg namespace does not exist"
+                },
+            ),
+        ))
     }
     pub(crate) fn validate_descriptor(&self, descriptor: &PublicationDescriptor) -> Result<()> {
         descriptor.validate_catalog(
@@ -107,11 +166,16 @@ impl CatalogPublicationRequest {
         use crate::rest_protocol::wire::{CreateNamespaceRequest, CreateTableRequest};
         let mut attribution = AttributionPlan::ObserveOnly;
         let mut stage_create = false;
+        let mut namespace_no_op = None;
+        let mut namespace_has_properties = false;
         let (operation, target, route, expectation, request) = match self {
             Self::CreateNamespace {
                 namespace,
                 properties,
+                no_op_if_exists,
             } => {
+                namespace_no_op = Some(no_op_if_exists);
+                namespace_has_properties = !properties.is_empty();
                 let ident = super::delegate::namespace_ident(&namespace).map_err(invalid_target)?;
                 let body = CreateNamespaceRequest {
                     namespace: ident.clone(),
@@ -125,7 +189,11 @@ impl CatalogPublicationRequest {
                     encode(&body)?,
                 )
             }
-            Self::DropNamespace(namespace) => {
+            Self::DropNamespace {
+                namespace,
+                no_op_if_missing,
+            } => {
+                namespace_no_op = Some(no_op_if_missing);
                 let ident = super::delegate::namespace_ident(&namespace).map_err(invalid_target)?;
                 (
                     CatalogOperation::DropNamespace,
@@ -251,6 +319,8 @@ impl CatalogPublicationRequest {
             route,
             expectation,
             stage_create,
+            namespace_no_op,
+            namespace_has_properties,
             request,
             attribution,
         })
@@ -269,4 +339,59 @@ fn encode<T: serde::Serialize>(body: &T) -> Result<Vec<u8>> {
 
 fn invalid_target(error: novarocks_spi::connector::ConnectorError) -> Error {
     Error::new(ErrorKind::DataInvalid, "Invalid catalog publication target").with_source(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_binds_actual_endpoint_structured_target_and_local_policy() {
+        let id = [9; 16];
+        let table = CatalogTableName::new("db", "t");
+        let source = CatalogPublicationRequest::DropTable(table.clone())
+            .freeze(id)
+            .unwrap();
+        let descriptor = PublicationDescriptor::catalog(
+            id,
+            source.targets(),
+            source.request_bytes().to_vec(),
+            source.attribution().clone(),
+        )
+        .unwrap();
+        source.validate_descriptor(&descriptor).unwrap();
+        for other in [
+            CatalogPublicationRequest::DropView(table),
+            CatalogPublicationRequest::DropNamespace {
+                namespace: CatalogNamespaceName::new("db.t"),
+                no_op_if_missing: false,
+            },
+            CatalogPublicationRequest::DropTable(CatalogTableName::new("db.t", "")),
+        ] {
+            let other = other.freeze(id);
+            if let Ok(other) = other {
+                assert!(other.validate_descriptor(&descriptor).is_err());
+            }
+        }
+        let strict = CatalogPublicationRequest::DropNamespace {
+            namespace: CatalogNamespaceName::new("db"),
+            no_op_if_missing: false,
+        }
+        .freeze(id)
+        .unwrap();
+        let descriptor = PublicationDescriptor::catalog(
+            id,
+            strict.targets(),
+            strict.request_bytes().to_vec(),
+            strict.attribution().clone(),
+        )
+        .unwrap();
+        let conditional = CatalogPublicationRequest::DropNamespace {
+            namespace: CatalogNamespaceName::new("db"),
+            no_op_if_missing: true,
+        }
+        .freeze(id)
+        .unwrap();
+        assert!(conditional.validate_descriptor(&descriptor).is_err());
+    }
 }

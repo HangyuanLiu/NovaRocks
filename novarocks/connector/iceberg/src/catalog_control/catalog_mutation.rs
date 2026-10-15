@@ -100,6 +100,13 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         {
             return execute_application_document_update(self, &request, intent);
         }
+        if matches!(
+            &request.operation,
+            ConnectorCatalogMutationOperation::CreateNamespace { .. }
+                | ConnectorCatalogMutationOperation::DropNamespace { .. }
+        ) {
+            return execute_namespace_publication(self, &request);
+        }
         // Every catalog creates through the create-table transaction. Which
         // receipt shape comes back is decided by what the publication proof
         // actually carries, not by asking which kind of catalog this is.
@@ -409,56 +416,10 @@ fn execute_operation(
             "Iceberg CREATE TABLE is published through the create-table transaction, \
              so it must not reach the effect-only mutation path",
         )),
-        ConnectorCatalogMutationOperation::CreateNamespace { namespace, policy } => {
-            ensure_owner(provider, &namespace.instance_id)?;
-            let exists = provider
-                .runtime()
-                .namespace_exists_for_request(&namespace.namespace, context)
-                .map_err(unavailable)?;
-            if exists {
-                return if *policy == CreatePolicy::NoOpIfExists {
-                    Ok(ExternalMutationEffect::NoOp)
-                } else {
-                    Err(already_exists("Iceberg namespace already exists"))
-                };
-            }
-            let namespace = crate::catalog::CatalogNamespaceName::new(
-                normalize_identifier(&namespace.namespace).map_err(invalid)?,
-            );
-            let owner = Arc::clone(provider.runtime().novarocks_catalog());
-            let outcome = provider
-                .runtime()
-                .resources()
-                .catalog_runtime()
-                .block_on(async move { owner.create_namespace(namespace).await })
-                .map_err(unavailable)?;
-            catalog_effect(outcome)
-        }
-        ConnectorCatalogMutationOperation::DropNamespace { namespace, policy } => {
-            ensure_owner(provider, &namespace.instance_id)?;
-            let exists = provider
-                .runtime()
-                .namespace_exists_for_request(&namespace.namespace, context)
-                .map_err(unavailable)?;
-            if !exists {
-                return if *policy == DropPolicy::NoOpIfMissing {
-                    Ok(ExternalMutationEffect::NoOp)
-                } else {
-                    Err(not_found("Iceberg namespace does not exist"))
-                };
-            }
-            let namespace = crate::catalog::CatalogNamespaceName::new(
-                normalize_identifier(&namespace.namespace).map_err(invalid)?,
-            );
-            let owner = Arc::clone(provider.runtime().novarocks_catalog());
-            let outcome = provider
-                .runtime()
-                .resources()
-                .catalog_runtime()
-                .block_on(async move { owner.drop_namespace(namespace).await })
-                .map_err(unavailable)?;
-            catalog_effect(outcome)
-        }
+        ConnectorCatalogMutationOperation::CreateNamespace { .. }
+        | ConnectorCatalogMutationOperation::DropNamespace { .. } => Err(internal(
+            "Namespace mutation must use its prepared publication journal",
+        )),
         ConnectorCatalogMutationOperation::DropTable {
             table,
             policy,
@@ -2220,6 +2181,117 @@ fn update_table(
         .map_err(|error| map_iceberg_message(action, error))
 }
 
+fn execute_namespace_publication(
+    provider: &IcebergMetadata,
+    request: &ConnectorCatalogMutationRequest,
+) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+    use crate::catalog::catalog_request::{CatalogPublicationRequest, CatalogResponseDocument};
+    let namespace = match &request.operation {
+        ConnectorCatalogMutationOperation::CreateNamespace { namespace, .. }
+        | ConnectorCatalogMutationOperation::DropNamespace { namespace, .. } => namespace,
+        _ => {
+            return Err(internal(
+                "Namespace publication requires a namespace mutation",
+            ));
+        }
+    };
+    if let Err(error) = ensure_owner(provider, &namespace.instance_id) {
+        return Ok(known_uncommitted(error));
+    }
+    // Local setup has proven no publication dispatch. Preserve that fact at
+    // the SPI boundary instead of returning an unqualified provider error.
+    let setup = (|| {
+        let frozen = match &request.operation {
+            ConnectorCatalogMutationOperation::CreateNamespace { namespace, policy } => {
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: CatalogNamespaceName::new(
+                        normalize_identifier(&namespace.namespace).map_err(invalid)?,
+                    ),
+                    properties: HashMap::new(),
+                    no_op_if_exists: *policy == CreatePolicy::NoOpIfExists,
+                }
+            }
+            ConnectorCatalogMutationOperation::DropNamespace { namespace, policy } => {
+                CatalogPublicationRequest::DropNamespace {
+                    namespace: CatalogNamespaceName::new(
+                        normalize_identifier(&namespace.namespace).map_err(invalid)?,
+                    ),
+                    no_op_if_missing: *policy == DropPolicy::NoOpIfMissing,
+                }
+            }
+            _ => {
+                return Err(internal(
+                    "Namespace publication requires a namespace mutation",
+                ));
+            }
+        }
+        .freeze(request.operation_id.to_bytes())
+        .map_err(|error| invalid(error.to_string()))?;
+        let evidence = mutation_evidence(
+            provider,
+            request.operation_id,
+            &request.operation,
+            &request.context,
+        )?;
+        let seed = receipt(provider, request.operation_id, request.operation.kind())?;
+        Ok::<_, ConnectorError>((frozen, evidence, seed))
+    })();
+    let (frozen, evidence, seed) = match setup {
+        Ok(prepared) => prepared,
+        Err(error) => return Ok(known_uncommitted(error)),
+    };
+    let journal = crate::commit::attempt::observation::PublicationJournal::new(
+        crate::commit::model::OperationToken::from_mutation(request.operation_id),
+    );
+    if let Err(error) = journal.prepare_catalog(
+        evidence,
+        seed,
+        frozen.targets(),
+        frozen.request_bytes().to_vec(),
+        frozen.attribution().clone(),
+        request.context.clone(),
+    ) {
+        return Ok(known_uncommitted(invalid(error.to_string())));
+    }
+    let catalog = Arc::clone(provider.runtime().novarocks_catalog());
+    let policy = catalog.evidence_policy();
+    let read_binding = provider.runtime().resources().planning_binding().clone();
+    let publication = journal.clone();
+    let preparation = request.context.clone();
+    let result = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .block_on(async move {
+            publication
+                .publish_once(
+                    preparation,
+                    policy,
+                    move |descriptor, generation, original| async move {
+                        catalog
+                            .prepare_catalog_publication(
+                                frozen,
+                                descriptor,
+                                generation,
+                                original,
+                                CatalogResponseDocument::default(),
+                                read_binding,
+                            )
+                            .await
+                    },
+                )
+                .await
+        });
+    Ok(match result {
+        Ok(Ok(entry)) => journal.catalog_entry_outcome(entry),
+        Ok(Err(error)) => journal
+            .catalog_bridge_failure(format!("Namespace publication invocation failed: {error}")),
+        Err(error) => {
+            journal.catalog_bridge_failure(format!("Namespace publication bridge failed: {error}"))
+        }
+    })
+}
+
 fn execute_application_document_update(
     provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
@@ -2944,19 +3016,10 @@ fn reconcile_evidence(
         })
     };
     match target {
-        IcebergMutationEvidenceTarget::Namespace {
-            namespace,
-            should_exist,
-        } => {
-            let exists = provider
-                .runtime()
-                .namespace_exists_for_request(&namespace, context)
-                .map_err(unavailable)?;
-            if exists == should_exist {
-                ambiguous("Iceberg namespace postcondition matches but cannot be attributed")
-            } else {
-                uncommitted("Iceberg namespace mutation postcondition is absent")
-            }
+        IcebergMutationEvidenceTarget::Namespace { .. } => {
+            // Presence and absence are not attributable to this operation.
+            // ObserveOnly has no positive probe; never turn Unknown negative.
+            ambiguous("Iceberg namespace mutation has no attributable positive proof")
         }
         IcebergMutationEvidenceTarget::Table {
             namespace,
@@ -4032,6 +4095,466 @@ mod tests {
                 if failure.kind() == ConnectorMutationFailureKind::Unsupported
         ));
         assert_eq!(std::fs::read_dir(warehouse.path()).unwrap().count(), before);
+    }
+
+    fn namespace_request(
+        provider: &IcebergMetadata,
+        create: bool,
+        conditional: bool,
+    ) -> ConnectorCatalogMutationRequest {
+        let namespace = novarocks_spi::connector::ConnectorNamespaceIdentity {
+            instance_id: provider.descriptor().instance_id.clone(),
+            namespace: "db".into(),
+        };
+        ConnectorCatalogMutationRequest {
+            operation_id: ConnectorMutationOperationId::new(),
+            target: ConnectorProviderBindingKey {
+                instance_id: provider.descriptor().instance_id.clone(),
+                incarnation: provider.incarnation(),
+            },
+            operation: if create {
+                ConnectorCatalogMutationOperation::CreateNamespace {
+                    namespace,
+                    policy: if conditional {
+                        CreatePolicy::NoOpIfExists
+                    } else {
+                        CreatePolicy::FailIfExists
+                    },
+                }
+            } else {
+                ConnectorCatalogMutationOperation::DropNamespace {
+                    namespace,
+                    policy: if conditional {
+                        DropPolicy::NoOpIfMissing
+                    } else {
+                        DropPolicy::FailIfMissing
+                    },
+                }
+            },
+            context: context(),
+        }
+    }
+
+    #[test]
+    fn namespace_hadoop_journal_preserves_applied_no_op_and_typed_refusals() {
+        let (_executor, warehouse, provider) = provider();
+        let marker = warehouse.path().join("db/.novarocks_namespace");
+        for (create, conditional, expected) in [
+            (true, false, "applied"),
+            (true, true, "noop"),
+            (true, false, "exists"),
+            (false, false, "applied"),
+            (false, true, "noop"),
+            (false, false, "missing"),
+        ] {
+            let before = marker.exists();
+            let outcome = provider
+                .execute(namespace_request(&provider, create, conditional))
+                .unwrap();
+            match (expected, outcome) {
+                (
+                    "applied",
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::Applied,
+                        ..
+                    },
+                ) => assert_eq!(marker.exists(), create),
+                (
+                    "noop",
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::NoOp,
+                        ..
+                    },
+                ) => assert_eq!(marker.exists(), before),
+                ("exists", ExternalMutationOutcome::KnownUncommitted { failure, .. }) => {
+                    assert_eq!(failure.kind(), ConnectorMutationFailureKind::AlreadyExists)
+                }
+                ("missing", ExternalMutationOutcome::KnownUncommitted { failure, .. }) => {
+                    assert_eq!(failure.kind(), ConnectorMutationFailureKind::NotFound)
+                }
+                (_, other) => panic!("Unexpected {expected} namespace outcome: {other:?}"),
+            }
+        }
+        let mut request = namespace_request(&provider, true, false);
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        stop.request_stop();
+        request.context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(10),
+            stop.view(),
+            65536,
+            262144,
+        )
+        .unwrap();
+        assert!(
+            matches!(provider.execute(request).unwrap(), ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == ConnectorMutationFailureKind::Cancelled)
+        );
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn namespace_hadoop_properties_are_refused_before_filesystem_discovery() {
+        use crate::catalog::catalog_request::{CatalogPublicationRequest, CatalogResponseDocument};
+        let (_executor, warehouse, provider) = provider();
+        let frozen = CatalogPublicationRequest::CreateNamespace {
+            namespace: CatalogNamespaceName::new("db"),
+            properties: HashMap::from([("owner".into(), "user".into())]),
+            no_op_if_exists: false,
+        }
+        .freeze([8; 16])
+        .unwrap();
+        let descriptor = crate::commit::publication_descriptor::PublicationDescriptor::catalog(
+            [8; 16],
+            frozen.targets(),
+            frozen.request_bytes().to_vec(),
+            frozen.attribution().clone(),
+        )
+        .unwrap();
+        let catalog = Arc::clone(provider.runtime().novarocks_catalog());
+        let generation = provider.incarnation();
+        let read_binding = provider.runtime().resources().planning_binding().clone();
+        let result = provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move {
+                catalog
+                    .prepare_catalog_publication(
+                        frozen,
+                        descriptor,
+                        generation,
+                        context(),
+                        CatalogResponseDocument::default(),
+                        read_binding,
+                    )
+                    .await
+            })
+            .unwrap();
+        assert!(
+            matches!(result, Err(crate::catalog::publication_dispatch::PreparationFailure(failure)) if failure.kind() == ConnectorMutationFailureKind::Unsupported)
+        );
+        assert_eq!(std::fs::read_dir(warehouse.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn namespace_rest_journal_preserves_protocol_evidence_and_never_retries() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for create in [true, false] {
+            for (code, expected) in [
+                (200, "applied"),
+                (204, "applied"),
+                (409, "rejected"),
+                (401, "rejected"),
+                (403, "rejected"),
+                (419, "rejected"),
+                (404, "unknown"),
+                (503, "unknown"),
+            ] {
+                if (create && code == 204) || (!create && code == 200) {
+                    continue;
+                }
+                let method = if create { "POST" } else { "DELETE" };
+                let path = if create {
+                    "/v1/namespaces"
+                } else {
+                    "/v1/namespaces/db"
+                };
+                let reply = if create && code == 200 {
+                    Reply::json(
+                        code,
+                        &serde_json::json!({"namespace": ["db"], "properties": {}}),
+                    )
+                } else {
+                    Reply::status(code)
+                };
+                let server = TestServer::start(
+                    Script::new()
+                        .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                        .on(
+                            "GET",
+                            "/v1/namespaces/db",
+                            if create {
+                                Reply::status(404)
+                            } else {
+                                Reply::json(
+                                    200,
+                                    &serde_json::json!({"namespace": ["db"], "properties": {}}),
+                                )
+                            },
+                        )
+                        .on(method, path, reply),
+                );
+                let (_executor, provider) = variant_definition_provider(&server.url());
+                let outcome = provider
+                    .execute(namespace_request(&provider, create, false))
+                    .unwrap();
+                match (expected, outcome) {
+                    (
+                        "applied",
+                        ExternalMutationOutcome::KnownCommitted {
+                            effect: ExternalMutationEffect::Applied,
+                            ..
+                        },
+                    ) => (),
+                    ("rejected", ExternalMutationOutcome::KnownUncommitted { failure, .. }) => {
+                        assert_eq!(
+                            failure.kind(),
+                            match code {
+                                409 if create => ConnectorMutationFailureKind::AlreadyExists,
+                                409 => ConnectorMutationFailureKind::Conflict,
+                                401 | 419 => ConnectorMutationFailureKind::Unauthenticated,
+                                403 => ConnectorMutationFailureKind::PermissionDenied,
+                                _ => unreachable!(),
+                            }
+                        );
+                    }
+                    ("unknown", ExternalMutationOutcome::CommitUnknown { evidence, .. }) => {
+                        let outcome = provider
+                            .reconcile(ConnectorCatalogMutationReconcileRequest {
+                                evidence,
+                                context: context(),
+                            })
+                            .unwrap();
+                        assert!(matches!(
+                            outcome,
+                            ExternalMutationOutcome::CommitUnknown { .. }
+                        ));
+                        assert_eq!(
+                            server.requests_to("GET", "/v1/namespaces/db").len(),
+                            1,
+                            "ObserveOnly performs no state-based adjudication"
+                        );
+                    }
+                    (_, other) => panic!("Unexpected {method} {code} outcome: {other:?}"),
+                }
+                assert_eq!(server.requests_to(method, path).len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_rest_preparation_stop_prevents_send_but_dispatch_stop_keeps_evidence() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for during_probe in [true, false] {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db",
+                        Reply::status(404).with_delay(if during_probe {
+                            Duration::from_millis(250)
+                        } else {
+                            Duration::ZERO
+                        }),
+                    )
+                    .on(
+                        "POST",
+                        "/v1/namespaces",
+                        Reply::json(
+                            200,
+                            &serde_json::json!({"namespace": ["db"], "properties": {}}),
+                        )
+                        .with_delay(Duration::from_millis(250)),
+                    ),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            let mut request = namespace_request(&provider, true, false);
+            let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+            request.context = ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(30),
+                stop.view(),
+                65536,
+                262144,
+            )
+            .unwrap();
+            let outcome = std::thread::scope(|scope| {
+                let worker = scope.spawn(|| provider.execute(request));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let (method, path) = if during_probe {
+                    ("GET", "/v1/namespaces/db")
+                } else {
+                    ("POST", "/v1/namespaces")
+                };
+                while server.requests_to(method, path).is_empty() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "Namespace request did not reach the controlled phase"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                stop.request_stop();
+                worker.join().unwrap().unwrap()
+            });
+            if during_probe {
+                assert!(
+                    matches!(outcome, ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == ConnectorMutationFailureKind::Cancelled)
+                );
+                assert!(server.requests_to("POST", "/v1/namespaces").is_empty());
+            } else {
+                assert!(matches!(
+                    outcome,
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::Applied,
+                        ..
+                    }
+                ));
+                assert_eq!(server.requests_to("POST", "/v1/namespaces").len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_local_setup_refusal_keeps_zero_dispatch_evidence() {
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        let server = TestServer::start(Script::new());
+        let (_executor, provider) = variant_definition_provider(&server.url());
+        for create in [true, false] {
+            for (name, expected) in [
+                (
+                    "bad/name".to_string(),
+                    ConnectorMutationFailureKind::InvalidRequest,
+                ),
+                (
+                    "n".repeat(65537),
+                    ConnectorMutationFailureKind::ResourceExhausted,
+                ),
+            ] {
+                let mut request = namespace_request(&provider, create, false);
+                let (ConnectorCatalogMutationOperation::CreateNamespace { namespace, .. }
+                | ConnectorCatalogMutationOperation::DropNamespace { namespace, .. }) =
+                    &mut request.operation
+                else {
+                    unreachable!()
+                };
+                namespace.namespace = name.into();
+                assert!(
+                    matches!(provider.execute(request).unwrap(), ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == expected)
+                );
+            }
+        }
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn namespace_target_instance_mismatch_is_refused_before_session_io() {
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        let server = TestServer::start(Script::new());
+        let (_executor, provider) = variant_definition_provider(&server.url());
+        for create in [true, false] {
+            let mut request = namespace_request(&provider, create, false);
+            let (ConnectorCatalogMutationOperation::CreateNamespace { namespace, .. }
+            | ConnectorCatalogMutationOperation::DropNamespace { namespace, .. }) =
+                &mut request.operation
+            else {
+                unreachable!()
+            };
+            namespace.instance_id =
+                novarocks_spi::connector::ConnectorInstanceId::parse("foreign").unwrap();
+            assert!(
+                matches!(provider.execute(request).unwrap(), ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == ConnectorMutationFailureKind::InvalidRequest)
+            );
+        }
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn namespace_rest_owner_rejects_cross_endpoint_descriptor_before_session_io() {
+        use crate::catalog::catalog_request::{CatalogPublicationRequest, CatalogResponseDocument};
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        let server = TestServer::start(Script::new());
+        let (_executor, provider) = variant_definition_provider(&server.url());
+        let table = CatalogTableName::new("db", "t");
+        let original = CatalogPublicationRequest::DropTable(table.clone())
+            .freeze([9; 16])
+            .unwrap();
+        let descriptor = crate::commit::publication_descriptor::PublicationDescriptor::catalog(
+            [9; 16],
+            original.targets(),
+            original.request_bytes().to_vec(),
+            original.attribution().clone(),
+        )
+        .unwrap();
+        let other = CatalogPublicationRequest::DropView(table)
+            .freeze([9; 16])
+            .unwrap();
+        let catalog = Arc::clone(provider.runtime().novarocks_catalog());
+        let generation = provider.incarnation();
+        let read_binding = provider.runtime().resources().planning_binding().clone();
+        let result = provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move {
+                catalog
+                    .prepare_catalog_publication(
+                        other,
+                        descriptor,
+                        generation,
+                        context(),
+                        CatalogResponseDocument::default(),
+                        read_binding,
+                    )
+                    .await
+            })
+            .unwrap();
+        assert!(
+            matches!(result, Err(crate::catalog::publication_dispatch::PreparationFailure(failure)) if failure.kind() == ConnectorMutationFailureKind::InvalidRequest)
+        );
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn namespace_rest_conditional_no_op_and_preparation_failure_send_no_mutation() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        for (create, exists, conditional, code, expected) in [
+            (true, true, true, 200, "noop"),
+            (true, true, false, 200, "exists"),
+            (false, false, true, 404, "noop"),
+            (false, false, false, 404, "missing"),
+            (true, false, false, 503, "unavailable"),
+        ] {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db",
+                        if exists {
+                            Reply::json(
+                                200,
+                                &serde_json::json!({"namespace": ["db"], "properties": {}}),
+                            )
+                        } else {
+                            Reply::status(code)
+                        },
+                    ),
+            );
+            let (_executor, provider) = variant_definition_provider(&server.url());
+            match (
+                expected,
+                provider
+                    .execute(namespace_request(&provider, create, conditional))
+                    .unwrap(),
+            ) {
+                (
+                    "noop",
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::NoOp,
+                        ..
+                    },
+                ) => (),
+                (kind, ExternalMutationOutcome::KnownUncommitted { failure, .. }) => assert_eq!(
+                    failure.kind(),
+                    match kind {
+                        "exists" => ConnectorMutationFailureKind::AlreadyExists,
+                        "missing" => ConnectorMutationFailureKind::NotFound,
+                        _ => ConnectorMutationFailureKind::Unavailable,
+                    }
+                ),
+                (_, other) => panic!("Unexpected namespace preparation outcome: {other:?}"),
+            }
+            assert!(server.requests().iter().all(|r| r.method == "GET"));
+        }
     }
 
     fn document_storage_lease(

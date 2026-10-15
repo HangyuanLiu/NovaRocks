@@ -130,6 +130,80 @@ fn map_bounded_read_error(error: &crate::iceberg::Error) -> ConnectorError {
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksHadoopCatalog {
+    async fn prepare_catalog_publication(
+        &self,
+        request: super::catalog_request::FrozenCatalogPublication,
+        descriptor: crate::commit::publication_descriptor::PublicationDescriptor,
+        generation: novarocks_spi::connector::ProviderBindingEpoch,
+        preparation: novarocks_spi::connector::ConnectorRequestContext,
+        _document: super::catalog_request::CatalogResponseDocument,
+        read_binding: crate::access_binding::IcebergReadBinding,
+    ) -> super::publication_dispatch::PreparationResult<
+        super::publication_dispatch::PreparedPublication,
+    > {
+        use novarocks_spi::connector::ConnectorOperationControl;
+        preparation.check_active()?;
+        self.delegate.publication_generation.require(generation)?;
+        request.validate_descriptor(&descriptor)?;
+        self.admit_operation(&request.operation, &request.target)
+            .map_err(|error| {
+                super::publication_dispatch::PreparationFailure(
+                    novarocks_spi::connector::ConnectorMutationFailure::new(
+                        novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                        error.message(),
+                    ),
+                )
+            })?;
+        if !matches!(
+            request.operation,
+            CatalogOperation::CreateNamespace | CatalogOperation::DropNamespace
+        ) {
+            return Err(super::publication_dispatch::PreparationFailure(
+                novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                    "Hadoop catalog request has no prepared mechanism for this operation",
+                ),
+            ));
+        }
+        if request.namespace_has_properties {
+            return Err(super::publication_dispatch::PreparationFailure(
+                novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                    "Hadoop namespace marker does not persist namespace properties",
+                ),
+            ));
+        }
+        let CatalogAdmissionTarget::Namespace(namespace) = &request.target else {
+            return Err(ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "Namespace publication requires a namespace target",
+            )
+            .into());
+        };
+        let ident = super::delegate::namespace_ident(namespace)?;
+        let exists = self
+            .delegate
+            .listing
+            .run_wait_for_exit(&preparation, async {
+                self.client
+                    .namespace_exists_for_read(
+                        &ident,
+                        read_binding.for_request(preparation.clone()),
+                    )
+                    .await
+                    .map_err(|error| map_bounded_read_error(&error))
+            })
+            .await?;
+        if request.namespace_no_op(exists)? {
+            return Ok(super::publication_dispatch::PreparedPublication::NoOp);
+        }
+        preparation.check_active()?;
+        Ok(Arc::clone(&self.client).prepare_namespace_publication(
+            &ident,
+            request.operation == CatalogOperation::CreateNamespace,
+        ))
+    }
+
     fn bind_publication_generation(
         &self,
         generation: novarocks_spi::connector::ProviderBindingEpoch,

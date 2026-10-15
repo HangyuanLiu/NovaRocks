@@ -81,10 +81,18 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
         generation: novarocks_spi::connector::ProviderBindingEpoch,
         preparation: novarocks_spi::connector::ConnectorRequestContext,
         document: crate::catalog::catalog_request::CatalogResponseDocument,
+        read_binding: crate::access_binding::IcebergReadBinding,
     ) -> crate::catalog::publication_dispatch::PreparationResult<
         crate::catalog::publication_dispatch::PreparedPublication,
     > {
-        let _ = (request, descriptor, generation, preparation, document);
+        let _ = (
+            request,
+            descriptor,
+            generation,
+            preparation,
+            document,
+            read_binding,
+        );
         self.mutation()
     }
     async fn prepare_frozen_publication(
