@@ -131,10 +131,10 @@ struct Fixture {
     constant_policy: ConstantPolicy,
 }
 fn input_literal(ty: &FunctionValueType, floating_bits: Option<u64>) -> LiteralValue {
-    if ty.nullable {
+    if ty.nullable() {
         return LiteralValue::Null;
     }
-    match ty.data_type {
+    match ty.data_type() {
         DataType::Boolean => LiteralValue::Boolean(true),
         DataType::Int64 => LiteralValue::Int64(7),
         DataType::Float64 => LiteralValue::Float64Bits(floating_bits.unwrap_or(1f64.to_bits())),
@@ -203,7 +203,7 @@ fn fixture(
         Shape::Binary(op) => {
             let ty = match output {
                 OutputClaim::Accurate => {
-                    FunctionValueType::new(DataType::Boolean, left.nullable || right.nullable)
+                    FunctionValueType::new(DataType::Boolean, left.nullable() || right.nullable())
                 }
                 OutputClaim::NonBoolean => FunctionValueType::new(DataType::Int64, true),
                 OutputClaim::Narrow => FunctionValueType::new(DataType::Boolean, false),
@@ -546,6 +546,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
             )
             .unwrap();
         frozen.push(FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
@@ -931,11 +932,12 @@ fn original_physical_authors_reject_foreign_domains_bad_results_and_nullable_nar
                 Ok(_) => false,
             });
         }
-        let uuid = FunctionValueType {
-            data_type: DataType::FixedSizeBinary(16),
-            nullable: true,
-            logical_type: ValueLogicalType::Uuid,
-        };
+        let uuid = FunctionValueType::try_from_legacy_declared_projection(
+            DataType::FixedSizeBinary(16),
+            true,
+            ValueLogicalType::Uuid,
+        )
+        .expect("valid temporary legacy value projection");
         let opaque = FunctionValueType::new(DataType::FixedSizeBinary(16), true);
         assert!(match fixture(
             &functions,

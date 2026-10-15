@@ -181,7 +181,9 @@ fn caller_owned_publication_retains_dead_type_only_none_and_original_typed_null(
 #[test]
 fn caller_owned_complete_binding_and_sparse_coverage_keep_first_control_refusal() {
     let lambda = FunctionArgument::Lambda {
-        parameter_types: Box::from([nested(false, false, "original")]),
+        parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+            nested(false, false, "original"),
+        ])),
         result_type: integer(true),
     };
     let source = fragment(
@@ -189,7 +191,9 @@ fn caller_owned_complete_binding_and_sparse_coverage_keep_first_control_refusal(
         vec![expression(
             u32::MAX,
             vec![FunctionArgumentType::Lambda {
-                parameter_types: Box::from([nested(false, false, "original")]),
+                parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    Box::from([nested(false, false, "original")]),
+                ),
                 result_type: integer(true),
             }],
             vec![],
@@ -214,11 +218,15 @@ fn caller_owned_complete_binding_and_sparse_coverage_keep_first_control_refusal(
         request(vec![]),
         request(vec![value(integer(true))]),
         request(vec![FunctionArgument::Lambda {
-            parameter_types: Box::from([nested(false, false, "foreign")]),
+            parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                nested(false, false, "foreign"),
+            ])),
             result_type: integer(true),
         }]),
         request(vec![FunctionArgument::Lambda {
-            parameter_types: Box::from([nested(false, false, "original")]),
+            parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                nested(false, false, "original"),
+            ])),
             result_type: integer(false),
         }]),
     ] {

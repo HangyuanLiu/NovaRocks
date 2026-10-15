@@ -47,16 +47,19 @@ fn percentile_union_actual_original_required_sql_binding_and_state_source() {
                     assert_eq!(call.binding.logical_argument_count, 1);
                     assert_eq!(call.binding.function.argument_types.len(), 1);
                     assert_eq!(
-                        call.binding.function.result_type.data_type,
+                        call.binding.function.result_type.data_type().clone(),
                         DataType::Binary
                     );
-                    assert_eq!(call.binding.intermediate_type.data_type, DataType::Binary);
+                    assert_eq!(
+                        call.binding.intermediate_type.data_type().clone(),
+                        DataType::Binary
+                    );
                     let FunctionArgumentType::Value(selected) =
                         &call.binding.function.argument_types[0]
                     else {
                         panic!("actual value")
                     };
-                    assert_eq!(selected.data_type, DataType::Binary);
+                    assert_eq!(selected.data_type().clone(), DataType::Binary);
                     eprintln!(
                         "PERCENTILE_UNION actual phase={:?} fullbinding={:?} originalrequest={:?} expressions={:?}",
                         call.binding.phase, call.binding, request, call.arguments

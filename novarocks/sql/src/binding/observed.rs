@@ -134,13 +134,13 @@ impl SqlFunctionBinding {
                     }
                     BindingField::ValueType(ty) => {
                         hash.write_u8(2);
-                        hash.write_u8(ty.logical_type as u8);
-                        hash.write_u8(u8::from(ty.nullable));
+                        hash.write_u8(ty.logical_type() as u8);
+                        hash.write_u8(u8::from(ty.nullable()));
                         work.step()?;
                         let carrier =
                             novarocks_type_contract::arrow_data_type_fingerprint_observed::<
                                 ConstantError,
-                            >(&ty.data_type, &mut || {
+                            >(&ty.data_type(), &mut || {
                                 work.step().map_err(Into::into)
                             })
                             .map_err(SqlCompileError::from)?;

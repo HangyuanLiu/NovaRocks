@@ -39,8 +39,8 @@ use crate::commit::validation::{
     ensure_overwrite_single_partition_spec_from_metadata,
 };
 use crate::commit::write_shared::{
-    exact_requested_write_fields, invalid_write_activation, snapshot_token,
-    write_target_snapshot_id,
+    exact_metadata_write_fields, exact_requested_write_fields, invalid_write_activation,
+    snapshot_token, write_target_snapshot_id,
 };
 use crate::file_reader::execution_payload::decode_payload;
 use crate::iceberg::spec::{FormatVersion, TableMetadata};
@@ -286,27 +286,16 @@ fn bind_write_input(
     owner: &ConnectorProviderBindingKey,
     metadata: &TableMetadata,
 ) -> Result<ConnectorWriteInputShape, ConnectorError> {
-    Ok(match &request.input {
+    let authored = freeze_write_input_request(metadata, &request.input, &request.context)?;
+    Ok(match &authored {
         ConnectorWriteInputRequest::Data { fields } => ConnectorWriteInputShape::Data {
-            fields: bind_write_fields(
-                &exact_data_write_fields(metadata, fields)?,
-                owner,
-                &request.table,
-                request.intent,
-                1,
-            )?,
+            fields: bind_write_fields(fields, owner, &request.table, request.intent, 1)?,
         },
         ConnectorWriteInputRequest::RowLineage {
             data_fields,
             row_identity_fields,
         } => ConnectorWriteInputShape::RowLineage {
-            data_fields: bind_write_fields(
-                &exact_row_lineage_data_write_fields(metadata, data_fields)?,
-                owner,
-                &request.table,
-                request.intent,
-                2,
-            )?,
+            data_fields: bind_write_fields(data_fields, owner, &request.table, request.intent, 2)?,
             row_identity_fields: bind_write_fields(
                 row_identity_fields,
                 owner,
@@ -318,65 +307,302 @@ fn bind_write_input(
         ConnectorWriteInputRequest::PositionDelete {
             identity_fields,
             partition_source_fields,
-        } => {
-            let partition_source_fields = if partition_source_fields.is_empty() {
-                position_delete_partition_field_requests(metadata)?
-            } else {
-                partition_source_fields.clone()
-            };
-            ConnectorWriteInputShape::PositionDelete {
-                identity_fields: bind_write_fields(
-                    identity_fields,
-                    owner,
-                    &request.table,
-                    request.intent,
-                    4,
-                )?,
-                partition_source_fields: bind_write_fields(
-                    &partition_source_fields,
-                    owner,
-                    &request.table,
-                    request.intent,
-                    5,
-                )?,
-            }
-        }
+        } => ConnectorWriteInputShape::PositionDelete {
+            identity_fields: bind_write_fields(
+                identity_fields,
+                owner,
+                &request.table,
+                request.intent,
+                4,
+            )?,
+            partition_source_fields: bind_write_fields(
+                partition_source_fields,
+                owner,
+                &request.table,
+                request.intent,
+                5,
+            )?,
+        },
         ConnectorWriteInputRequest::DeletionVector {
             identity_fields,
             partition_source_fields,
-        } => {
-            let partition_source_fields = if partition_source_fields.is_empty() {
-                position_delete_partition_field_requests(metadata)?
-            } else {
-                partition_source_fields.clone()
-            };
-            ConnectorWriteInputShape::DeletionVector {
-                identity_fields: bind_write_fields(
-                    identity_fields,
-                    owner,
-                    &request.table,
-                    request.intent,
-                    6,
-                )?,
-                partition_source_fields: bind_write_fields(
-                    &partition_source_fields,
-                    owner,
-                    &request.table,
-                    request.intent,
-                    7,
-                )?,
-            }
-        }
+        } => ConnectorWriteInputShape::DeletionVector {
+            identity_fields: bind_write_fields(
+                identity_fields,
+                owner,
+                &request.table,
+                request.intent,
+                6,
+            )?,
+            partition_source_fields: bind_write_fields(
+                partition_source_fields,
+                owner,
+                &request.table,
+                request.intent,
+                7,
+            )?,
+        },
         ConnectorWriteInputRequest::EqualityDelete { equality_fields } => {
             ConnectorWriteInputShape::EqualityDelete {
                 equality_fields: bind_write_fields(
-                    &exact_requested_write_fields(metadata, equality_fields)?,
+                    equality_fields,
                     owner,
                     &request.table,
                     request.intent,
                     8,
                 )?,
             }
+        }
+    })
+}
+
+/// Freeze complete provider declarations before either session-signing entry.
+/// The loaded schema and exact metadata roles author execution semantics;
+/// caller Field attributes remain source facts and supply no type authority.
+pub(crate) fn freeze_write_input_request(
+    metadata: &TableMetadata,
+    input: &ConnectorWriteInputRequest,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<ConnectorWriteInputRequest, ConnectorError> {
+    crate::metadata::with_pure_schema_creation(context, |creation| {
+        Ok(match input {
+            ConnectorWriteInputRequest::Data { fields } => ConnectorWriteInputRequest::Data {
+                fields: exact_data_write_fields(metadata, fields, creation)?,
+            },
+            ConnectorWriteInputRequest::RowLineage {
+                data_fields,
+                row_identity_fields,
+            } => ConnectorWriteInputRequest::RowLineage {
+                data_fields: exact_row_lineage_data_write_fields(metadata, data_fields, creation)?,
+                row_identity_fields: exact_metadata_write_fields(
+                    metadata,
+                    row_identity_fields,
+                    creation,
+                )?,
+            },
+            ConnectorWriteInputRequest::PositionDelete {
+                identity_fields,
+                partition_source_fields,
+            } => ConnectorWriteInputRequest::PositionDelete {
+                identity_fields: exact_metadata_write_fields(metadata, identity_fields, creation)?,
+                partition_source_fields: exact_partition_source_write_fields(
+                    metadata,
+                    partition_source_fields,
+                    creation,
+                )?,
+            },
+            ConnectorWriteInputRequest::DeletionVector {
+                identity_fields,
+                partition_source_fields,
+            } => ConnectorWriteInputRequest::DeletionVector {
+                identity_fields: exact_metadata_write_fields(metadata, identity_fields, creation)?,
+                partition_source_fields: exact_partition_source_write_fields(
+                    metadata,
+                    partition_source_fields,
+                    creation,
+                )?,
+            },
+            ConnectorWriteInputRequest::EqualityDelete { equality_fields } => {
+                ConnectorWriteInputRequest::EqualityDelete {
+                    equality_fields: exact_requested_write_fields(
+                        metadata,
+                        equality_fields,
+                        creation,
+                    )?,
+                }
+            }
+        })
+    })
+}
+
+/// Check the caller's complete declaration against the independently frozen
+/// provider input before the session signs it. Preparation may rebuild target
+/// facts, but that must never silently repair a caller's execution contract.
+pub(crate) fn validate_session_write_input_request(
+    proposed: &ConnectorWriteInputRequest,
+    authored: &ConnectorWriteInputRequest,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), ConnectorError> {
+    crate::metadata::with_pure_schema_creation(context, |creation| {
+        let mut fields = |proposed: &[ConnectorWriteFieldRequest],
+                          authored: &[ConnectorWriteFieldRequest]|
+         -> Result<(), ConnectorError> {
+            if proposed.is_empty() {
+                return Ok(());
+            }
+            let resource = || {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "Iceberg session role name index extent is unrepresentable",
+                )
+            };
+            let table = novarocks_type_contract::owned_resources::hashmap::fresh_table_layout::<
+                String,
+                &ConnectorWriteFieldRequest,
+            >(authored.len())
+            .map_err(|_| resource())?;
+            let mut max_key_bytes = 0;
+            for field in authored {
+                creation
+                    .work(field.field().name().len())
+                    .map_err(crate::metadata::metadata_creation_error)?;
+                max_key_bytes = max_key_bytes.max(field.field().name().len());
+            }
+            // Only this role's borrowed declarations are indexed. ASCII folding
+            // retains eq_ignore_ascii_case semantics, including non-ASCII names.
+            creation
+                .work(1)
+                .map_err(crate::metadata::metadata_creation_error)?;
+            let mut by_name = std::collections::HashMap::new();
+            if let Some(layout) = table.layout {
+                creation
+                    .request(layout)
+                    .map_err(crate::metadata::metadata_creation_error)?;
+                creation
+                    .work(layout.size())
+                    .map_err(crate::metadata::metadata_creation_error)?;
+            }
+            by_name
+                .try_reserve(authored.len())
+                .map_err(|_| resource())?;
+            for field in authored {
+                let mut name = creation
+                    .text(field.field().name())
+                    .map_err(crate::metadata::metadata_creation_error)?;
+                creation
+                    .work(name.len())
+                    .map_err(crate::metadata::metadata_creation_error)?;
+                name.make_ascii_lowercase();
+                creation
+                    .work(
+                        novarocks_type_contract::owned_resources::hashmap::string_operations_work_upper_bound(
+                            table.buckets, 1, name.len(), max_key_bytes,
+                        )
+                        .map_err(|_| resource())?,
+                    )
+                    .map_err(crate::metadata::metadata_creation_error)?;
+                // Preserve the original scan's first match if an authoritative
+                // role contains duplicate names; this validator adds no gate.
+                by_name.entry(name).or_insert(field);
+            }
+            for source in proposed {
+                creation
+                    .work(1)
+                    .map_err(crate::metadata::metadata_creation_error)?;
+                let mut name = creation
+                    .text(source.field().name())
+                    .map_err(crate::metadata::metadata_creation_error)?;
+                creation
+                    .work(name.len())
+                    .map_err(crate::metadata::metadata_creation_error)?;
+                name.make_ascii_lowercase();
+                creation
+                    .work(
+                        novarocks_type_contract::owned_resources::hashmap::string_operations_work_upper_bound(
+                            table.buckets, 1, name.len(), max_key_bytes.max(name.len()),
+                        )
+                        .map_err(|_| resource())?,
+                    )
+                    .map_err(crate::metadata::metadata_creation_error)?;
+                let target = by_name.get(name.as_str()).copied().ok_or_else(|| {
+                    invalid_write_activation(
+                        "Iceberg session source field is absent from its authoritative input role",
+                    )
+                })?;
+                let actual = source.execution_type().ok_or_else(|| {
+                    invalid_write_activation(
+                        "Iceberg session source field has no complete execution declaration",
+                    )
+                })?;
+                let expected = target.execution_type().ok_or_else(|| {
+                    invalid_write_activation(
+                        "Iceberg session target field has no authoritative complete declaration",
+                    )
+                })?;
+                if actual.nullable() && !expected.nullable() {
+                    return Err(invalid_write_activation(
+                        "Iceberg session nullable source cannot satisfy a required target field",
+                    ));
+                }
+                if !actual.same_physical_binding_ignoring_root_nullability_observed(
+                    expected,
+                    || {
+                        creation
+                            .work(1)
+                            .map_err(crate::metadata::metadata_creation_error)
+                    },
+                )? {
+                    // Retain the established narrow-integer refusal detail while
+                    // comparing its real complete provider declaration.
+                    let narrow = matches!(
+                        expected.value_type().kind(),
+                        novarocks_type_contract::ValueKind::Scalar(
+                            DataType::Int8 | DataType::Int16
+                        )
+                    );
+                    return Err(invalid_write_activation(
+                        if narrow && actual.data_type() != expected.data_type() {
+                            "Iceberg write input differs from the authoritative scalar integer declaration"
+                        } else {
+                            "Iceberg session source differs from its authoritative complete execution declaration"
+                        },
+                    ));
+                }
+            }
+            Ok(())
+        };
+        match (proposed, authored) {
+            (
+                ConnectorWriteInputRequest::Data { fields: source },
+                ConnectorWriteInputRequest::Data { fields: target },
+            ) => fields(source, target),
+            (
+                ConnectorWriteInputRequest::RowLineage {
+                    data_fields: source,
+                    row_identity_fields: source_identity,
+                },
+                ConnectorWriteInputRequest::RowLineage {
+                    data_fields: target,
+                    row_identity_fields: target_identity,
+                },
+            ) => {
+                fields(source, target)?;
+                fields(source_identity, target_identity)
+            }
+            (
+                ConnectorWriteInputRequest::PositionDelete {
+                    identity_fields: source,
+                    partition_source_fields: source_partition,
+                },
+                ConnectorWriteInputRequest::PositionDelete {
+                    identity_fields: target,
+                    partition_source_fields: target_partition,
+                },
+            )
+            | (
+                ConnectorWriteInputRequest::DeletionVector {
+                    identity_fields: source,
+                    partition_source_fields: source_partition,
+                },
+                ConnectorWriteInputRequest::DeletionVector {
+                    identity_fields: target,
+                    partition_source_fields: target_partition,
+                },
+            ) => {
+                fields(source, target)?;
+                fields(source_partition, target_partition)
+            }
+            (
+                ConnectorWriteInputRequest::EqualityDelete {
+                    equality_fields: source,
+                },
+                ConnectorWriteInputRequest::EqualityDelete {
+                    equality_fields: target,
+                },
+            ) => fields(source, target),
+            _ => Err(invalid_write_activation(
+                "Iceberg session source and authoritative input roles differ",
+            )),
         }
     })
 }
@@ -388,6 +614,7 @@ fn bind_write_input(
 fn exact_data_write_fields(
     metadata: &TableMetadata,
     requested: &[ConnectorWriteFieldRequest],
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
     for request in requested {
         if metadata
@@ -416,7 +643,7 @@ fn exact_data_write_fields(
             ))
         })
         .collect::<Vec<_>>();
-    exact_requested_write_fields(metadata, &requested_all)
+    exact_requested_write_fields(metadata, &requested_all, creation)
 }
 
 /// Rebuild a row-lineage after-image's data fields from the frozen schema.
@@ -431,6 +658,7 @@ fn exact_data_write_fields(
 fn exact_row_lineage_data_write_fields(
     metadata: &TableMetadata,
     requested: &[ConnectorWriteFieldRequest],
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
     let is_lineage = |request: &ConnectorWriteFieldRequest| {
         is_iceberg_row_id(request.field().name())
@@ -441,14 +669,50 @@ fn exact_row_lineage_data_write_fields(
         .filter(|request| !is_lineage(request))
         .cloned()
         .collect::<Vec<_>>();
-    let mut fields = exact_data_write_fields(metadata, &target)?;
-    fields.extend(
-        requested
-            .iter()
-            .filter(|request| is_lineage(request))
-            .cloned(),
-    );
+    let mut fields = exact_data_write_fields(metadata, &target, creation)?;
+    let lineage = requested
+        .iter()
+        .filter(|request| is_lineage(request))
+        .cloned()
+        .collect::<Vec<_>>();
+    fields.extend(exact_metadata_write_fields(metadata, &lineage, creation)?);
     Ok(fields)
+}
+
+fn exact_partition_source_write_fields(
+    metadata: &TableMetadata,
+    requested: &[ConnectorWriteFieldRequest],
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
+    let authored = position_delete_partition_field_requests(metadata, creation)?;
+    if requested.is_empty() {
+        return Ok(authored);
+    }
+    requested
+        .iter()
+        .map(|requested| {
+            let original = authored
+                .iter()
+                .find(|field| {
+                    field
+                        .field()
+                        .name()
+                        .eq_ignore_ascii_case(requested.field().name())
+                })
+                .ok_or_else(|| {
+                    invalid_write_activation(
+                        "partition source field is absent from the frozen spec",
+                    )
+                })?;
+            ConnectorWriteFieldRequest::try_new_typed(
+                requested.field().clone(),
+                original
+                    .execution_type()
+                    .expect("provider partition declaration")
+                    .clone(),
+            )
+        })
+        .collect()
 }
 
 /// Position-delete and deletion-vector SQL only name the fixed row identity.
@@ -456,6 +720,7 @@ fn exact_row_lineage_data_write_fields(
 /// the frozen Iceberg metadata is still available.
 fn position_delete_partition_field_requests(
     metadata: &TableMetadata,
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
     let declarations = crate::scalar_integer_domain::of_schema(
         metadata.current_schema(),
@@ -475,18 +740,21 @@ fn position_delete_partition_field_requests(
                         partition.source_id
                     ))
                 })?;
-            let data_type =
-                crate::metadata_batch_reader::iceberg_type_to_arrow_type(source.field_type.as_ref())
+            if matches!(source.field_type.as_ref(), crate::iceberg::spec::Type::Variant(_)) {
+                return Err(ConnectorError::new(ConnectorErrorKind::Unsupported,
+                    "partition descriptor does not support variant payload"));
+            }
+            let data_type = crate::metadata_batch_reader::iceberg_type_to_arrow_type(source.field_type.as_ref())
                 .map_err(invalid_write_activation)?;
             let data_type = match declarations.get(&source.id) {
-                Some(domain) => domain.data_type(),
-                None => data_type,
+                Some(domain) => domain.data_type(), None => data_type,
             };
-            Ok(ConnectorWriteFieldRequest::new(Field::new(
-                &source.name,
-                data_type,
-                !source.required,
-            )))
+            let binding = crate::metadata_batch_reader::metadata_alias_value_type(
+                &data_type, !source.required, creation,
+            ).map_err(crate::metadata::metadata_creation_error)?;
+            ConnectorWriteFieldRequest::try_new_typed(
+                Field::new(&source.name, data_type, !source.required), binding,
+            )
         })
         .collect()
 }
@@ -511,10 +779,16 @@ fn bind_write_fields(
             hasher.update([domain]);
             hasher.update((ordinal as u64).to_be_bytes());
             hasher.update(format!("{:?}", request.field()).as_bytes());
-            Ok(ConnectorWriteFieldBinding::new(
+            let value = request.execution_type().ok_or_else(|| {
+                invalid_write_activation(
+                    "Iceberg writer field has no complete provider declaration",
+                )
+            })?;
+            ConnectorWriteFieldBinding::try_new_typed(
                 ConnectorWriteFieldToken::from_bytes(hasher.finalize().into()),
                 request.field().clone(),
-            ))
+                value.clone(),
+            )
         })
         .collect()
 }
@@ -1559,5 +1833,247 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Field::new("region", DataType::Int16, false)]
         );
+    }
+    fn partition_domain_metadata(
+        field_type: crate::iceberg::spec::Type,
+        transform: crate::iceberg::spec::Transform,
+        partition_name: &str,
+    ) -> TableMetadata {
+        let schema = Schema::builder()
+            .with_fields(vec![NestedField::optional(7, "u", field_type).into()])
+            .build()
+            .unwrap();
+        let spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_partition_field("u", partition_name, transform)
+            .unwrap()
+            .build()
+            .unwrap();
+        TableMetadataBuilder::new(
+            schema,
+            spec.into_unbound(),
+            SortOrder::unsorted_order(),
+            "memory://routing_alias".into(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata
+    }
+
+    #[test]
+    fn table_uuid_and_routing_alias_keep_separate_complete_declarations() {
+        let metadata = partition_domain_metadata(
+            crate::iceberg::spec::Type::Primitive(crate::iceberg::spec::PrimitiveType::Uuid),
+            crate::iceberg::spec::Transform::Identity,
+            "u",
+        );
+        let requested = [ConnectorWriteFieldRequest::new(Field::new(
+            "u",
+            DataType::Null,
+            true,
+        ))];
+        let data = crate::metadata::with_pure_schema_creation(&context(), |creation| {
+            exact_requested_write_fields(&metadata, &requested, creation)
+        })
+        .unwrap();
+        let aliases = crate::metadata::with_pure_schema_creation(&context(), |creation| {
+            position_delete_partition_field_requests(&metadata, creation)
+        })
+        .unwrap();
+        let data_type = data[0].execution_type().unwrap();
+        let alias = aliases[0].execution_type().unwrap();
+        assert_eq!(
+            data_type.logical_type(),
+            novarocks_type_contract::ValueLogicalType::Uuid
+        );
+        assert_eq!(data_type.data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(
+            alias.logical_type(),
+            novarocks_type_contract::ValueLogicalType::Physical
+        );
+        assert_eq!(alias.data_type(), &DataType::Utf8);
+        assert!(data_type.nullable());
+        assert!(alias.nullable());
+        assert_eq!(aliases[0].field(), &Field::new("u", DataType::Utf8, true));
+        assert!(aliases[0].field().metadata().is_empty());
+    }
+
+    #[test]
+    fn variant_partition_keeps_the_original_descriptor_refusal() {
+        let metadata = partition_domain_metadata(
+            crate::iceberg::spec::Type::Variant(crate::iceberg::spec::VariantType),
+            // SDK0.11 rejects Variant Identity before our descriptor boundary.
+            // Void is a legal frozen source and must still hit the same refusal.
+            crate::iceberg::spec::Transform::Void,
+            "u_void",
+        );
+        let error = crate::metadata::with_pure_schema_creation(&context(), |creation| {
+            position_delete_partition_field_requests(&metadata, creation)
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(
+            error.message(),
+            "partition descriptor does not support variant payload"
+        );
+    }
+    fn declared_session_field(
+        value: novarocks_type_contract::FunctionValueType,
+    ) -> ConnectorWriteFieldRequest {
+        ConnectorWriteFieldRequest::try_new_typed(
+            Field::new("v", value.data_type().clone(), value.nullable()),
+            value,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn session_complete_input_allows_only_root_null_widening_and_exact_role() {
+        use novarocks_type_contract::FunctionValueType;
+        let source = ConnectorWriteInputRequest::Data {
+            fields: vec![declared_session_field(FunctionValueType::new(
+                DataType::Int64,
+                false,
+            ))],
+        };
+        let target = ConnectorWriteInputRequest::Data {
+            fields: vec![declared_session_field(FunctionValueType::new(
+                DataType::Int64,
+                true,
+            ))],
+        };
+        validate_session_write_input_request(&source, &target, &context()).unwrap();
+        assert_eq!(
+            validate_session_write_input_request(&target, &source, &context())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        let wrong_role = ConnectorWriteInputRequest::EqualityDelete {
+            equality_fields: match &target {
+                ConnectorWriteInputRequest::Data { fields } => fields.clone(),
+                _ => unreachable!(),
+            },
+        };
+        assert_eq!(
+            validate_session_write_input_request(&source, &wrong_role, &context())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        let absent = ConnectorWriteInputRequest::Data {
+            fields: vec![ConnectorWriteFieldRequest::new(Field::new(
+                "v",
+                DataType::Int64,
+                false,
+            ))],
+        };
+        assert_eq!(
+            validate_session_write_input_request(&absent, &target, &context())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn session_role_index_preserves_reordering_subsets_ascii_first_match_and_empty_partition() {
+        use novarocks_type_contract::FunctionValueType;
+        let field = |name: &str, data_type: DataType| {
+            ConnectorWriteFieldRequest::try_new_typed(
+                Field::new(name, data_type.clone(), false),
+                FunctionValueType::new(data_type, false),
+            )
+            .unwrap()
+        };
+        let authored = ConnectorWriteInputRequest::Data {
+            fields: vec![
+                field("a", DataType::Int64),
+                field("b", DataType::Int64),
+                field("A", DataType::Utf8),
+                field("Ä", DataType::Int64),
+            ],
+        };
+        let proposed = ConnectorWriteInputRequest::Data {
+            // Independent declarations: reordered, a subset, and ASCII aliases.
+            fields: vec![field("B", DataType::Int64), field("A", DataType::Int64)],
+        };
+        validate_session_write_input_request(&proposed, &authored, &context()).unwrap();
+        let exact_non_ascii = ConnectorWriteInputRequest::Data {
+            fields: vec![field("Ä", DataType::Int64)],
+        };
+        validate_session_write_input_request(&exact_non_ascii, &authored, &context()).unwrap();
+        let unicode_case_alias = ConnectorWriteInputRequest::Data {
+            fields: vec![field("ä", DataType::Int64)],
+        };
+        let error =
+            validate_session_write_input_request(&unicode_case_alias, &authored, &context())
+                .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message(),
+            "Iceberg session source field is absent from its authoritative input role"
+        );
+        let proposed = ConnectorWriteInputRequest::PositionDelete {
+            identity_fields: vec![field("_pos", DataType::Int64)],
+            partition_source_fields: vec![],
+        };
+        let authored = ConnectorWriteInputRequest::PositionDelete {
+            identity_fields: vec![field("_pos", DataType::Int64)],
+            partition_source_fields: vec![field("provider_partition", DataType::Int64)],
+        };
+        validate_session_write_input_request(&proposed, &authored, &context()).unwrap();
+    }
+
+    #[test]
+    fn session_complete_input_rejects_same_carrier_nominal_and_child_null_drift() {
+        use novarocks_type_contract::{
+            FunctionValueType, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+            ValueTypeStorageLifetime,
+        };
+        let list = |domain, child_nullable| {
+            let storage = ValueTypeStorageLifetime::pure();
+            let child =
+                FunctionValueType::try_with_logical_type(DataType::Utf8, child_nullable, domain)
+                    .unwrap();
+            let semantic = ValueTypeRef::try_new(
+                ValueKind::List(child.value_type().clone()),
+                false,
+                storage.clone(),
+            )
+            .unwrap();
+            let layout = ValueLayout::try_new(
+                &DataType::List(std::sync::Arc::new(Field::new(
+                    "item",
+                    DataType::Utf8,
+                    child_nullable,
+                ))),
+                storage,
+            )
+            .unwrap();
+            FunctionValueType::try_from_value(semantic, layout).unwrap()
+        };
+        let target_value = list(ValueLogicalType::Json, false);
+        let target = ConnectorWriteInputRequest::Data {
+            fields: vec![declared_session_field(target_value.clone())],
+        };
+        validate_session_write_input_request(&target, &target, &context()).unwrap();
+        for wrong in [
+            list(ValueLogicalType::Physical, false),
+            list(ValueLogicalType::Json, true),
+        ] {
+            let source = ConnectorWriteInputRequest::Data {
+                fields: vec![declared_session_field(wrong)],
+            };
+            assert_eq!(
+                validate_session_write_input_request(&source, &target, &context())
+                    .unwrap_err()
+                    .kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
+        }
     }
 }

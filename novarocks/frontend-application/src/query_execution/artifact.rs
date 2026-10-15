@@ -1774,17 +1774,12 @@ impl ExpectedOutputSchema {
             columns: self
                 .output_columns
                 .into_iter()
-                .map(|column| {
-                    let logical_type = column.logical_type().map_err(contract_error)?;
-                    Ok(QueryResultColumn::new(
-                        column.name,
-                        column.data_type,
-                        column.nullable,
-                        logical_type,
-                    ))
-                })
+                .map(|column| Ok(QueryResultColumn::new(column.name, column.ty)))
                 .collect::<Result<Vec<_>, DistributedQueryError>>()?,
-            batches: chunks.into_iter().map(|chunk| chunk.batch).collect(),
+            batches: chunks
+                .into_iter()
+                .map(|chunk| chunk.record_batch().clone())
+                .collect(),
         })
     }
 }
@@ -1847,9 +1842,6 @@ fn native_submission_encoding_view<'a>(
 
 fn validate_root_output_columns(outputs: &[PlanOutputColumn]) -> Result<(), DistributedQueryError> {
     u32::try_from(outputs.len()).map_err(|_| contract_error("too many root output columns"))?;
-    for output in outputs {
-        output.validate_domain().map_err(contract_error)?;
-    }
     Ok(())
 }
 
@@ -1869,17 +1861,27 @@ fn build_expected_output_schema(
                 let slot = u32::try_from(index + 1)
                     .map(SlotId::new)
                     .map_err(|_| contract_error("too many root output columns"))?;
-                Ok(ChunkSlotSchema::new_with_field(
+                ChunkSlotSchema::try_new_typed(
                     slot,
-                    output
-                        .canonical_field(output.nullable)
-                        .map_err(contract_error)?,
+                    Arc::new(arrow::datatypes::Field::new(
+                        &output.name,
+                        output.data_type().clone(),
+                        output.nullable(),
+                    )),
+                    output.ty.typed_binding().clone(),
                     None,
-                    None,
-                ))
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                )
+                .map_err(contract_error)
             })
             .collect::<Result<Vec<_>, DistributedQueryError>>()?;
-        Arc::new(ChunkSchema::try_new(slots).map_err(contract_error)?)
+        Arc::new(
+            ChunkSchema::try_new_typed(
+                slots,
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            )
+            .map_err(contract_error)?,
+        )
     };
     Ok(ExpectedOutputSchema {
         output_columns,
@@ -1889,6 +1891,38 @@ fn build_expected_output_schema(
 
 #[cfg(test)]
 mod tests {
+    // Exercise the installed BE receive boundary with the fixture's complete
+    // frozen declaration. Returned chunks retain finite creation responsibility.
+    fn test_receive_root_chunks(
+        payload: &[u8],
+        schema: &novarocks_execution::exec::chunk::ChunkSchemaRef,
+    ) -> Result<Vec<novarocks_execution::exec::chunk::Chunk>, String> {
+        use novarocks_execution::runtime::exchange::{
+            ExchangeColumnBinding, ExchangeKey, ExchangeSenderIdentity, ExecutionExchangeRegistry,
+        };
+        let registry = ExecutionExchangeRegistry::default();
+        let key = ExchangeKey {
+            finst_id_hi: 47,
+            finst_id_lo: 83,
+            node_id: 1,
+        };
+        let factory = novarocks_execution::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            novarocks_execution::exec::pipeline::pipeline::representation_construction_profile().map_err(|e|e.to_string())?,
+            novarocks_execution::runtime::mem_tracker::MemTracker::new_root("root consumer fixture"),
+            std::sync::Arc::new(novarocks_execution::runtime::runtime_state::RuntimeErrorState::default()),
+        ).map_err(|e|e.to_string())?;
+        registry.try_register_expected_chunk_schema_with_binding(
+            key,
+            1,
+            schema.clone(),
+            ExchangeColumnBinding::Positional,
+            factory,
+        )?;
+        registry
+            .decode_chunks_for_sender(key, ExchangeSenderIdentity::local(1, 1), payload)
+            .map_err(|e| e.to_string())
+    }
+
     /// These tiny one-column fixtures exercise the production bounded encoder
     /// after IPC projection, with the exact domain supplied by the test plan.
     fn render_test_cells(
@@ -1966,10 +2000,9 @@ mod tests {
 
     fn test_decode_root_chunk(
         payload: &[u8],
-        schema: Option<&novarocks_execution::exec::chunk::ChunkSchemaRef>,
+        schema: &novarocks_execution::exec::chunk::ChunkSchemaRef,
     ) -> Result<novarocks_execution::exec::chunk::Chunk, String> {
-        let mut chunks =
-            novarocks_execution::runtime::exchange::decode_root_result_chunks(payload, schema)?;
+        let mut chunks = test_receive_root_chunks(payload, schema)?;
         if chunks.len() != 1 {
             return Err("test payload must contain exactly one chunk".into());
         }
@@ -2178,165 +2211,101 @@ mod tests {
         assert!(!attachment.matches(RuntimeFilterArtifactId(18), first_attempt));
     }
 
-    #[test]
-    fn m07_exact_result_domains_survive_nonempty_ipc_alignment_cache_and_mysql_render() {
-        use arrow::array::{ArrayRef, BinaryArray, LargeBinaryArray, StringArray};
-        use arrow::datatypes::{DataType, Field, Schema};
+    fn typed_result_chunk(
+        array: arrow::array::ArrayRef,
+        ty: &novarocks_type_contract::FunctionValueType,
+    ) -> novarocks_execution::exec::chunk::Chunk {
+        use arrow::datatypes::{Field, Schema};
         use arrow::record_batch::RecordBatch;
-        use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
+        use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+        use novarocks_type_contract::ValueTypeStorageLifetime as S;
+        let field = Arc::new(Field::new("wire", array.data_type().clone(), ty.nullable()));
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![field.clone()])), vec![array]).unwrap();
+        let slot = ChunkSlotSchema::try_new_typed(
+            novarocks_types::SlotId::new(73),
+            field,
+            ty.typed_binding().clone(),
+            None,
+            S::pure(),
+        )
+        .unwrap();
+        Chunk::try_new_with_chunk_schema(batch, Arc::new(ChunkSchema::try_new(vec![slot]).unwrap()))
+            .unwrap()
+    }
+
+    fn assert_shared_payload(before: &arrow::array::ArrayData, after: &arrow::array::ArrayData) {
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.buffers().len(), after.buffers().len());
+        for (before, after) in before.buffers().iter().zip(after.buffers()) {
+            assert!(before.ptr_eq(after));
+        }
+        if let (Some(before), Some(after)) = (before.nulls(), after.nulls()) {
+            assert!(before.buffer().ptr_eq(after.buffer()));
+        }
+        assert_eq!(before.child_data().len(), after.child_data().len());
+        for (before, after) in before.child_data().iter().zip(after.child_data()) {
+            assert_shared_payload(before, after);
+        }
+    }
+
+    #[test]
+    fn completed_scalar_bindings_survive_ipc_alias_and_client_metadata_projection() {
+        use crate::query_execution::attempt_plan_facts::{PlanOutputColumn, declared_test_value};
+        use arrow::array::{ArrayRef, BinaryArray, LargeBinaryArray, StringArray};
+        use arrow::datatypes::DataType;
         use novarocks_physical_plan::ResultValueDomain as D;
-        use novarocks_types::logical::{
-            LogicalType as L, field_with_logical_type, logical_type_of_field,
-        };
-        use novarocks_types::schema::SqlType as T;
-        let cases = [
-            (D::Hll, DataType::Binary, Some(L::Hll), Some(T::Hll), true),
-            (
-                D::Bitmap,
-                DataType::Binary,
-                Some(L::Bitmap),
-                Some(T::Bitmap),
-                true,
-            ),
-            (
-                D::Object,
-                DataType::Binary,
-                Some(L::Object),
-                Some(T::Object),
-                true,
-            ),
-            (
-                D::Percentile,
-                DataType::Binary,
-                Some(L::Percentile),
-                Some(T::Percentile),
-                true,
-            ),
-            (
-                D::Variant,
-                DataType::LargeBinary,
-                None,
-                Some(T::Variant),
-                false,
-            ),
-            (D::Json, DataType::Utf8, Some(L::Json), Some(T::Json), false),
-            (D::Plain, DataType::Binary, None, None, false),
-            (D::Plain, DataType::Utf8, None, None, false),
-        ];
-        for (domain, data_type, marker, logical, opaque) in cases {
-            let wire_modes = if marker.is_some() {
-                vec![None, marker]
+        for (domain, carrier) in [
+            (D::Hll, DataType::Binary),
+            (D::Bitmap, DataType::Binary),
+            (D::Object, DataType::Binary),
+            (D::Percentile, DataType::Binary),
+            (D::Variant, DataType::LargeBinary),
+            (D::Json, DataType::Utf8),
+            (D::Plain, DataType::Binary),
+            (D::Plain, DataType::Utf8),
+        ] {
+            // JSON presentation validates JSON bytes; the frozen domain does
+            // not turn an arbitrary UTF8 fixture into a valid JSON document.
+            let bytes: &[u8] = if domain == D::Json {
+                b"\"nonempty\""
             } else {
-                vec![None]
+                b"nonempty"
             };
-            for wire_marker in wire_modes {
-                let raw = if data_type == DataType::Utf8 {
-                    b"{\"k\":1}".as_slice()
-                } else {
-                    b"nonempty-original-value".as_slice()
-                };
-                let array: ArrayRef = match &data_type {
-                    DataType::Binary => Arc::new(BinaryArray::from(vec![raw])),
-                    DataType::LargeBinary => Arc::new(LargeBinaryArray::from(vec![raw])),
-                    DataType::Utf8 => {
-                        Arc::new(StringArray::from(vec![std::str::from_utf8(raw).unwrap()]))
-                    }
-                    _ => unreachable!(),
-                };
-                // A missing source marker may acquire the exact frozen domain;
-                // an already known source must agree with it independently.
-                let wire_field = Field::new("wire_name", data_type.clone(), false);
-                let wire_field = match wire_marker {
-                    Some(marker) => field_with_logical_type(wire_field, marker),
-                    None => wire_field,
-                };
-                let schema = Arc::new(Schema::new(vec![wire_field]));
-                let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
-                let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-                    schema.as_ref(),
-                    &[novarocks_types::SlotId::new(73)],
-                )
-                .unwrap();
-                let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
-                let payload =
-                    novarocks_execution::runtime::exchange::encode_chunks(&[chunk], true).unwrap();
-                let outputs = [
-                    crate::query_execution::attempt_plan_facts::PlanOutputColumn {
-                        name: "declared_value".into(),
-                        data_type: data_type.clone(),
-                        nullable: false,
-                        domain,
-                    },
-                ];
-                let expected = super::build_expected_output_schema(&outputs).unwrap();
-                assert_eq!(
-                    expected.chunk_schema.slots()[0]
-                        .field_schema()
-                        .logical_type(),
-                    marker
-                );
-                let decoded =
-                    test_decode_root_chunk(&payload, Some(&expected.chunk_schema)).unwrap();
-                let aligned =
-                    crate::query_execution::assembly::align_fetch_chunks_to_output_columns(
-                        vec![decoded],
-                        &outputs,
-                    )
-                    .unwrap();
-                assert_eq!(
-                    logical_type_of_field(aligned[0].batch.schema().field(0)),
-                    marker
-                );
-                assert_eq!(
-                    aligned[0].chunk_schema().slots()[0]
-                        .field_schema()
-                        .logical_type(),
-                    marker
-                );
-                assert_eq!(
-                    aligned[0].chunk_schema().slots()[0].slot_id(),
-                    novarocks_types::SlotId::new(1)
-                );
-                // An independently wire-derived cache may be empty. The exact
-                // output domain supplies the missing fact without trusting a name.
-                let wire_cached = test_decode_root_chunk(&payload, None).unwrap();
-                let rebuilt =
-                    crate::query_execution::assembly::align_fetch_chunks_to_output_columns(
-                        vec![wire_cached],
-                        &outputs,
-                    )
-                    .unwrap();
-                assert_eq!(
-                    rebuilt[0].chunk_schema().slots()[0]
-                        .field_schema()
-                        .logical_type(),
-                    marker
-                );
-                let decoded =
-                    test_decode_root_chunk(&payload, Some(&expected.chunk_schema)).unwrap();
-                let result = expected.into_query_result(vec![decoded]).unwrap();
-                assert_eq!(result.columns[0].logical_type(), logical.as_ref());
-                assert_eq!(result.batches[0].schema().field(0).name(), "declared_value");
-                assert_eq!(
-                    logical_type_of_field(result.batches[0].schema().field(0)),
-                    marker
-                );
-                let rows = render_test_cells(&result, domain);
-                match &rows[0] {
-                    None if opaque => {}
-                    Some(bytes) if !opaque => assert_eq!(bytes, raw),
-                    other => panic!("unexpected rendered value for {domain:?}: {other:?}"),
+            let array: ArrayRef = match carrier {
+                DataType::Binary => Arc::new(BinaryArray::from(vec![bytes])),
+                DataType::LargeBinary => Arc::new(LargeBinaryArray::from(vec![bytes])),
+                DataType::Utf8 => {
+                    Arc::new(StringArray::from(vec![std::str::from_utf8(bytes).unwrap()]))
                 }
+                _ => unreachable!(),
+            };
+            let ty = declared_test_value(carrier, false, domain).unwrap();
+            let chunk = typed_result_chunk(array, &ty);
+            let payload =
+                novarocks_execution::runtime::exchange::encode_chunks(&[chunk], true).unwrap();
+            let output = PlanOutputColumn {
+                name: "declared_value".into(),
+                ty: ty.clone(),
+            };
+            let expected = super::build_expected_output_schema(&[output]).unwrap();
+            let decoded = test_decode_root_chunk(&payload, &expected.chunk_schema).unwrap();
+            let result = expected.into_query_result(vec![decoded]).unwrap();
+            assert_eq!(result.columns[0].value_type(), &ty);
+            assert_eq!(result.columns[0].name(), "declared_value");
+            assert!(result.batches[0].schema().field(0).metadata().is_empty());
+            let rows = render_test_cells(&result, domain);
+            if matches!(domain, D::Hll | D::Bitmap | D::Object | D::Percentile) {
+                assert_eq!(rows[0], None);
+            } else {
+                assert_eq!(rows[0].as_deref(), Some(bytes));
             }
         }
     }
 
     #[test]
-    fn m07_exact_result_domain_rejects_incompatible_carriers_without_wire_guessing() {
-        use arrow::array::Int32Array;
-        use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
-        use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
+    fn completed_nominal_author_refuses_an_incompatible_carrier() {
+        use arrow::datatypes::DataType;
         use novarocks_physical_plan::ResultValueDomain as D;
         for domain in [
             D::Json,
@@ -2346,509 +2315,214 @@ mod tests {
             D::Object,
             D::Percentile,
         ] {
-            let output = crate::query_execution::attempt_plan_facts::PlanOutputColumn {
-                name: "value".into(),
-                data_type: DataType::Int32,
-                nullable: false,
-                domain,
-            };
-            let error = super::build_expected_output_schema(std::slice::from_ref(&output))
-                .err()
-                .expect("incompatible expected domain must fail");
-            assert!(error.message().contains("does not match output carrier"));
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                "wire",
-                DataType::Int32,
-                false,
-            )]));
-            let batch =
-                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
-                    .unwrap();
-            let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-                schema.as_ref(),
-                &[novarocks_types::SlotId::new(1)],
-            )
-            .unwrap();
-            let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
-            let error = crate::query_execution::assembly::align_fetch_chunks_to_output_columns(
-                vec![chunk],
-                &[output],
-            )
-            .unwrap_err();
-            assert!(error.contains("does not match output carrier"));
-        }
-    }
-
-    #[test]
-    fn m07_string_dictionary_ipc_keeps_buffers_domains_keys_nulls_and_mysql_cells() {
-        use arrow::array::{
-            ArrayData, ArrayRef, DictionaryArray, Int32Array, LargeStringArray, StringArray,
-        };
-        use arrow::datatypes::{DataType, Field, Int32Type, Schema};
-        use arrow::record_batch::RecordBatch;
-        use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
-        use novarocks_physical_plan::ResultValueDomain as D;
-        use novarocks_types::logical::{LogicalType, logical_type_of_field};
-        fn shared_buffers(before: &ArrayData, after: &ArrayData) {
-            assert_eq!(before.data_type(), after.data_type());
-            assert_eq!(before.len(), after.len());
-            assert_eq!(before.buffers().len(), after.buffers().len());
-            for (left, right) in before.buffers().iter().zip(after.buffers()) {
-                assert!(
-                    left.ptr_eq(right),
-                    "alignment must retain the actual backing"
-                );
-            }
-            match (before.nulls(), after.nulls()) {
-                (Some(left), Some(right)) => assert!(left.buffer().ptr_eq(right.buffer())),
-                (None, None) => {}
-                _ => panic!("null bitmap changed"),
-            }
-            assert_eq!(before.child_data().len(), after.child_data().len());
-            for (left, right) in before.child_data().iter().zip(after.child_data()) {
-                shared_buffers(left, right);
-            }
-        }
-        for large in [false, true] {
-            for domain in [D::Plain, D::Json] {
-                let values: ArrayRef = if large {
-                    Arc::new(LargeStringArray::from(vec![r#"{"a":0}"#, r#"{"b":1}"#]))
-                } else {
-                    Arc::new(StringArray::from(vec![r#"{"a":0}"#, r#"{"b":1}"#]))
-                };
-                let array: ArrayRef = Arc::new(
-                    DictionaryArray::<Int32Type>::try_new(
-                        Int32Array::from(vec![Some(1), None, Some(0), Some(1)]),
-                        values,
-                    )
-                    .unwrap(),
-                );
-                let schema = Arc::new(Schema::new(vec![Field::new(
-                    "wire",
-                    array.data_type().clone(),
-                    true,
-                )]));
-                let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
-                let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-                    schema.as_ref(),
-                    &[novarocks_types::SlotId::new(81)],
+            assert!(
+                crate::query_execution::attempt_plan_facts::declared_test_value(
+                    DataType::Int32,
+                    false,
+                    domain
                 )
-                .unwrap();
-                let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
-                let payload =
-                    novarocks_execution::runtime::exchange::encode_chunks(&[chunk], true).unwrap();
-                let outputs = [
-                    crate::query_execution::attempt_plan_facts::PlanOutputColumn {
-                        name: "declared".into(),
-                        data_type: DataType::Utf8,
-                        nullable: true,
-                        domain,
-                    },
-                ];
-                let expected = super::build_expected_output_schema(&outputs).unwrap();
-                let fetched =
-                    test_decode_root_chunk(&payload, Some(&expected.chunk_schema)).unwrap();
-                let chunk = fetched;
-                let original = Arc::clone(chunk.batch.column(0));
-                let backing = original.to_data();
-                let aligned =
-                    crate::query_execution::assembly::align_fetch_chunks_to_output_columns(
-                        vec![chunk],
-                        &outputs,
-                    )
-                    .unwrap()
-                    .remove(0);
-                assert!(Arc::ptr_eq(&original, aligned.batch.column(0)));
-                shared_buffers(&backing, &aligned.batch.column(0).to_data());
-                let marker = (domain == D::Json).then_some(LogicalType::Json);
-                assert_eq!(
-                    aligned.batch.schema().field(0).data_type(),
-                    original.data_type()
-                );
-                assert_eq!(
-                    logical_type_of_field(aligned.batch.schema().field(0)),
-                    marker
-                );
-                assert_eq!(
-                    aligned.chunk_schema().slots()[0]
-                        .field_schema()
-                        .logical_type(),
-                    marker
-                );
-                let result = expected.into_query_result(vec![aligned]).unwrap();
-                assert_eq!(result.columns[0].data_type(), &DataType::Utf8);
-                assert_eq!(
-                    result.columns[0].logical_type(),
-                    if domain == D::Json {
-                        Some(&novarocks_types::schema::SqlType::Json)
-                    } else {
-                        None
-                    }
-                );
-                shared_buffers(&backing, &result.batches[0].column(0).to_data());
-                let dictionary = result.batches[0]
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<DictionaryArray<Int32Type>>()
-                    .unwrap();
-                assert_eq!(
-                    dictionary.keys(),
-                    &Int32Array::from(vec![Some(1), None, Some(0), Some(1)])
-                );
-                for (row, literal) in [
-                    Some(b"{\"b\":1}".as_slice()),
-                    None,
-                    Some(b"{\"a\":0}".as_slice()),
-                    Some(b"{\"b\":1}".as_slice()),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let cell = render_test_cells(&result, domain)[row].clone();
-                    match (cell, literal) {
-                        (None, None) => {}
-                        (Some(actual), Some(expected)) => {
-                            assert_eq!(actual, expected)
-                        }
-                        other => panic!("unexpected dictionary cell: {other:?}"),
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn m07_result_string_alignment_refuses_numeric_and_non_int32_dictionaries() {
-        use arrow::array::{
-            ArrayRef, DictionaryArray, Int8Array, Int32Array, Int64Array, StringArray,
-        };
-        use arrow::datatypes::{DataType, Field, Int8Type, Int32Type, Schema};
-        use arrow::record_batch::RecordBatch;
-        use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
-        use novarocks_physical_plan::ResultValueDomain;
-        let arrays: [ArrayRef; 2] = [
-            Arc::new(
-                DictionaryArray::<Int8Type>::try_new(
-                    Int8Array::from(vec![0]),
-                    Arc::new(StringArray::from(vec!["value"])) as ArrayRef,
-                )
-                .unwrap(),
-            ),
-            Arc::new(
-                DictionaryArray::<Int32Type>::try_new(
-                    Int32Array::from(vec![0]),
-                    Arc::new(Int64Array::from(vec![42])) as ArrayRef,
-                )
-                .unwrap(),
-            ),
-        ];
-        for array in arrays {
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                "wire",
-                array.data_type().clone(),
-                false,
-            )]));
-            let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
-            let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-                schema.as_ref(),
-                &[novarocks_types::SlotId::new(1)],
-            )
-            .unwrap();
-            let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
-            let output = crate::query_execution::attempt_plan_facts::PlanOutputColumn {
-                name: "declared".into(),
-                data_type: DataType::Utf8,
-                nullable: false,
-                domain: ResultValueDomain::Plain,
-            };
-            let error = crate::query_execution::assembly::align_fetch_chunks_to_output_columns(
-                vec![chunk],
-                &[output],
-            )
-            .unwrap_err();
-            assert_eq!(
-                error,
-                "typed root result string dictionary carrier is unsupported"
+                .is_err()
             );
         }
     }
 
-    mod m07_nested_result_domains {
-        use std::sync::Arc;
+    #[test]
+    fn string_dictionary_ipc_preserves_selected_nulls_payload_and_full_binding() {
+        use crate::query_execution::attempt_plan_facts::{PlanOutputColumn, declared_test_value};
+        use arrow::array::{ArrayRef, DictionaryArray, Int32Array, LargeStringArray, StringArray};
+        use arrow::datatypes::{DataType, Int32Type};
+        use novarocks_physical_plan::ResultValueDomain as D;
+        for large in [false, true] {
+            for domain in [D::Plain, D::Json] {
+                // JSON's installed declaration is UTF8; a LargeUTF8 source has
+                // its own exact layout rather than borrowing that declaration.
+                if large && domain == D::Json {
+                    continue;
+                }
+                let (a, b) = if domain == D::Json {
+                    ("{}", "[]")
+                } else {
+                    ("a", "b")
+                };
+                let values: ArrayRef = if large {
+                    Arc::new(LargeStringArray::from(vec![Some(a), None, Some(b)]))
+                } else {
+                    Arc::new(StringArray::from(vec![Some(a), None, Some(b)]))
+                };
+                let array: ArrayRef = Arc::new(
+                    DictionaryArray::<Int32Type>::try_new(
+                        Int32Array::from(vec![Some(2), None, Some(1), Some(0)]),
+                        values,
+                    )
+                    .unwrap(),
+                );
+                let ty = declared_test_value(
+                    if large {
+                        DataType::LargeUtf8
+                    } else {
+                        DataType::Utf8
+                    },
+                    true,
+                    domain,
+                )
+                .unwrap();
+                let chunk = typed_result_chunk(array, &ty);
+                let payload =
+                    novarocks_execution::runtime::exchange::encode_chunks(&[chunk], true).unwrap();
+                let expected = super::build_expected_output_schema(&[PlanOutputColumn {
+                    name: "declared".into(),
+                    ty: ty.clone(),
+                }])
+                .unwrap();
+                let decoded = test_decode_root_chunk(&payload, &expected.chunk_schema).unwrap();
+                let original = decoded.record_batch().column(0).clone();
+                let result = expected.into_query_result(vec![decoded]).unwrap();
+                assert_eq!(result.columns[0].value_type(), &ty);
+                assert_shared_payload(&original.to_data(), &result.batches[0].column(0).to_data());
+                assert_eq!(
+                    render_test_cells(&result, domain),
+                    vec![
+                        Some(b.as_bytes().to_vec()),
+                        None,
+                        None,
+                        Some(a.as_bytes().to_vec())
+                    ]
+                );
+            }
+        }
+    }
 
+    mod complete_nested_outputs {
+        use super::*;
+        use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
         use arrow::array::{
-            Array, ArrayData, ArrayRef, BinaryArray, ListArray, MapArray, StringArray, StructArray,
+            Array, ArrayRef, BinaryArray, ListArray, MapArray, StringArray, StructArray,
         };
         use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-        use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
-        use novarocks_execution::exec::chunk::{
-            Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema,
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_type_contract::{
+            FunctionValueType, ValueField, ValueKind, ValueLayout, ValueLogicalType as L,
+            ValueTypeRef, ValueTypeStorageLifetime as S,
         };
-        use novarocks_physical_plan::ResultValueDomain;
-        use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY, logical_type_of_field};
-        use novarocks_types::slot_id::SlotId;
-
-        use crate::query_execution::assembly::align_fetch_chunks_to_output_columns;
-        use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
-
-        fn marked(field: Field, marker: Option<&str>) -> Field {
-            match marker {
-                Some(marker) => {
-                    field.with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into())
-                }
-                None => field,
-            }
-        }
-
-        fn array(shape: usize, marker: Option<&str>, entries_marker: Option<&str>) -> ArrayRef {
-            let child = Arc::new(marked(Field::new("value", DataType::Binary, false), marker));
-            let values: ArrayRef = Arc::new(BinaryArray::from(vec![
-                b"first".as_slice(),
-                b"second".as_slice(),
-            ]));
-            match shape {
-                0 => Arc::new(StructArray::new(vec![child].into(), vec![values], None)),
-                1 => Arc::new(ListArray::new(
-                    child,
-                    OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2])),
-                    values,
-                    None,
-                )),
-                2 => {
-                    let key = Arc::new(Field::new("key", DataType::Utf8, false));
-                    let entries = StructArray::new(
-                        vec![key, child].into(),
-                        vec![Arc::new(StringArray::from(vec!["a", "b"])), values],
-                        None,
-                    );
-                    let field = Arc::new(marked(
-                        Field::new("entries", entries.data_type().clone(), false),
-                        entries_marker,
-                    ));
-                    Arc::new(MapArray::new(
-                        field,
-                        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2])),
-                        entries,
-                        None,
-                        false,
-                    ))
-                }
-                _ => unreachable!(),
-            }
-        }
 
         fn source(
             shape: usize,
-            batch_marker: Option<&str>,
-            slot_marker: Option<&str>,
-            cache_marker: Option<&str>,
-            batch_entries: Option<&str>,
-            slot_entries: Option<&str>,
-        ) -> Chunk {
-            let values = array(shape, batch_marker, batch_entries);
-            let batch = RecordBatch::try_new(
-                Arc::new(Schema::new(vec![Field::new(
-                    "wire",
-                    values.data_type().clone(),
-                    false,
-                )])),
-                vec![values],
-            )
-            .unwrap();
-            let slot_type = array(shape, slot_marker, slot_entries).data_type().clone();
-            let cache_type = array(shape, cache_marker, None).data_type().clone();
-            let cache =
-                ChunkFieldSchema::from_field(&Field::new("wire", cache_type, false)).unwrap();
-            let slot = ChunkSlotSchema::try_new_with_field(
-                SlotId::new(91),
-                Field::new("wire", slot_type, false),
-                Some(cache),
-                None,
-            )
-            .unwrap();
-            let mut chunk = Chunk::try_new_with_chunk_schema(
-                batch.clone(),
-                Arc::new(ChunkSchema::try_new(vec![slot]).unwrap()),
-            )
-            .unwrap();
-            // Preserve independent actual public Field/cache facts. Normal
-            // Chunk construction reconciles the batch against its slot Field.
-            chunk.batch = batch;
-            chunk
-        }
-
-        fn output(shape: usize, marker: Option<&str>) -> PlanOutputColumn {
-            PlanOutputColumn {
-                name: "declared".into(),
-                data_type: array(shape, marker, None).data_type().clone(),
-                nullable: false,
-                domain: ResultValueDomain::Plain,
+            semantic: L,
+            child_nullable: bool,
+            attribute: Option<&str>,
+        ) -> (ArrayRef, FunctionValueType) {
+            let child = if semantic == L::Physical {
+                ValueKind::Binary
+            } else {
+                ValueKind::Nominal(semantic)
+            };
+            let child = ValueTypeRef::try_new(child, child_nullable, S::pure()).unwrap();
+            let mut field = Field::new("value", DataType::Binary, child_nullable);
+            if let Some(attribute) = attribute {
+                field = field.with_metadata([("nr_logical_type".into(), attribute.into())].into());
             }
-        }
-
-        fn shared_buffers(before: &ArrayData, after: &ArrayData) {
-            assert_eq!(before.len(), after.len());
-            assert_eq!(before.buffers().len(), after.buffers().len());
-            for (before, after) in before.buffers().iter().zip(after.buffers()) {
-                assert!(
-                    before.ptr_eq(after),
-                    "nested domain completion copied a payload buffer"
-                );
-            }
-            assert_eq!(before.child_data().len(), after.child_data().len());
-            for (before, after) in before.child_data().iter().zip(after.child_data()) {
-                shared_buffers(before, after);
-            }
-        }
-
-        #[test]
-        fn m07_nested_result_fields_and_cache_refuse_conflicting_domains_before_rebuild() {
-            for shape in 0..3 {
-                for (batch, slot, cache) in [
-                    (Some("HLL"), Some("BITMAP"), Some("BITMAP")),
-                    (Some("BITMAP"), Some("HLL"), Some("BITMAP")),
-                    (Some("BITMAP"), Some("BITMAP"), Some("HLL")),
-                    (Some("unknown"), Some("BITMAP"), Some("BITMAP")),
-                    (Some("BITMAP"), Some("unknown"), Some("BITMAP")),
-                    (Some(""), Some("BITMAP"), Some("BITMAP")),
-                ] {
-                    let error = align_fetch_chunks_to_output_columns(
-                        vec![source(shape, batch, slot, cache, None, None)],
-                        &[output(shape, Some("BITMAP"))],
-                    )
-                    .unwrap_err();
-                    assert!(
-                        error.contains("logical domain differs")
-                            || error.contains("unknown logical domain"),
-                        "{error}"
+            let field = Arc::new(field);
+            let values: ArrayRef =
+                Arc::new(BinaryArray::from(vec![b"a".as_slice(), b"b".as_slice()]));
+            let (array, kind): (ArrayRef, ValueKind) = match shape {
+                0 => (
+                    Arc::new(StructArray::new(vec![field].into(), vec![values], None)),
+                    ValueKind::Struct(
+                        vec![ValueField::new("value", child, S::pure())].into_boxed_slice(),
+                    ),
+                ),
+                1 => (
+                    Arc::new(ListArray::new(
+                        field,
+                        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2])),
+                        values,
+                        None,
+                    )),
+                    ValueKind::List(child),
+                ),
+                2 => {
+                    let key = ValueTypeRef::try_new(ValueKind::String, false, S::pure()).unwrap();
+                    let entries = StructArray::new(
+                        vec![Arc::new(Field::new("key", DataType::Utf8, false)), field].into(),
+                        vec![Arc::new(StringArray::from(vec!["k1", "k2"])), values],
+                        None,
                     );
-                }
-                // Arrow permits an explicitly metadata-insensitive batch.
-                // The actual nested Array Field must remain an independent
-                // source fact even when both enclosing Fields are canonical.
-                let declared = output(shape, Some("BITMAP"));
-                let canonical = declared.canonical_field(false).unwrap();
-                let schema = Arc::new(Schema::new(vec![canonical.clone()]));
-                let batch = RecordBatch::try_new_with_options(
-                    schema,
-                    vec![array(shape, Some("HLL"), None)],
-                    &arrow::array::RecordBatchOptions::new().with_match_field_names(false),
-                )
-                .unwrap();
-                let slot =
-                    ChunkSlotSchema::try_new_with_field(SlotId::new(91), canonical, None, None)
-                        .unwrap();
-                let chunk = Chunk::try_new_with_chunk_schema(
-                    batch,
-                    Arc::new(ChunkSchema::try_new(vec![slot]).unwrap()),
-                )
-                .unwrap();
-                assert!(
-                    align_fetch_chunks_to_output_columns(vec![chunk], &[declared])
-                        .unwrap_err()
-                        .contains("logical domain differs")
-                );
-                // Existing nested semantics cannot be cleared to ordinary
-                // Binary, even when both physical child types are identical.
-                assert!(
-                    align_fetch_chunks_to_output_columns(
-                        vec![source(
-                            shape,
-                            Some("BITMAP"),
-                            Some("BITMAP"),
-                            Some("BITMAP"),
+                    let entries_field = Arc::new(
+                        Field::new("entries", entries.data_type().clone(), false).with_metadata(
+                            [(
+                                "nr_logical_type".into(),
+                                "uninterpreted-map-source-attribute".into(),
+                            )]
+                            .into(),
+                        ),
+                    );
+                    (
+                        Arc::new(MapArray::new(
+                            entries_field,
+                            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2])),
+                            entries,
                             None,
-                            None
-                        )],
-                        &[output(shape, None)]
+                            false,
+                        )),
+                        ValueKind::Map { key, value: child },
                     )
-                    .unwrap_err()
-                    .contains("logical domain differs")
-                );
-            }
+                }
+                _ => unreachable!(),
+            };
+            let layout = ValueLayout::try_new(array.data_type(), S::pure()).unwrap();
+            let ty = FunctionValueType::try_from_value(
+                ValueTypeRef::try_new(kind, false, S::pure()).unwrap(),
+                layout,
+            )
+            .unwrap();
+            (array, ty)
         }
 
         #[test]
-        fn m07_nested_result_map_entries_markers_are_checked_independently() {
-            for marker in ["HLL", "unknown", ""] {
-                for (batch, slot) in [(Some(marker), None), (None, Some(marker))] {
-                    let error = align_fetch_chunks_to_output_columns(
-                        vec![source(
-                            2,
-                            Some("BITMAP"),
-                            Some("BITMAP"),
-                            Some("BITMAP"),
-                            batch,
-                            slot,
-                        )],
-                        &[output(2, Some("BITMAP"))],
-                    )
-                    .unwrap_err();
-                    assert!(
-                        error.contains("logical domain differs")
-                            || error.contains("unknown logical domain"),
-                        "{error}"
-                    );
+        fn same_layout_nested_domains_and_child_nullability_remain_distinct() {
+            for shape in 0..3 {
+                let (array, ty) = source(shape, L::Bitmap, false, None);
+                let chunk = typed_result_chunk(array, &ty);
+                for (domain, nullable) in [(L::Hll, false), (L::Physical, false), (L::Bitmap, true)]
+                {
+                    let (_, other) = source(shape, domain, nullable, None);
+                    let error =
+                        crate::query_execution::assembly::align_fetch_chunks_to_output_columns(
+                            vec![chunk.clone()],
+                            &[PlanOutputColumn {
+                                name: "renamed".into(),
+                                ty: other,
+                            }],
+                        )
+                        .unwrap_err();
+                    assert!(error.contains("complete value type differs"));
                 }
             }
         }
 
         #[test]
-        fn m07_nested_result_missing_domains_complete_without_copying_payload_buffers() {
+        fn unknown_nested_attributes_do_not_author_domains_or_copy_payload() {
             for shape in 0..3 {
-                for marker in [None, Some("BITMAP")] {
-                    let chunk = source(shape, marker, marker, marker, None, None);
-                    let original = chunk.batch.column(0).clone();
-                    let before = original.to_data();
-                    let aligned = align_fetch_chunks_to_output_columns(
+                let (array, ty) = source(shape, L::Bitmap, false, Some("unknown"));
+                let before = array.to_data();
+                let chunk = typed_result_chunk(array, &ty);
+                let aligned =
+                    crate::query_execution::assembly::align_fetch_chunks_to_output_columns(
                         vec![chunk],
-                        &[output(shape, Some("BITMAP"))],
+                        &[PlanOutputColumn {
+                            name: "renamed".into(),
+                            ty: ty.clone(),
+                        }],
                     )
                     .unwrap()
                     .remove(0);
-                    shared_buffers(&before, &aligned.batch.column(0).to_data());
-                    assert_eq!(aligned.batch.num_rows(), original.len());
-                    assert_eq!(
-                        aligned.batch.column(0).data_type(),
-                        &output(shape, Some("BITMAP")).data_type
-                    );
-                    let (field, cache) = match aligned.batch.column(0).data_type() {
-                        DataType::Struct(fields) => (
-                            &fields[0],
-                            aligned.chunk_schema().slots()[0]
-                                .field_schema()
-                                .struct_child(0)
-                                .unwrap(),
-                        ),
-                        DataType::List(field) => (
-                            field,
-                            aligned.chunk_schema().slots()[0]
-                                .field_schema()
-                                .list_item()
-                                .unwrap(),
-                        ),
-                        DataType::Map(entries, _) => {
-                            let DataType::Struct(fields) = entries.data_type() else {
-                                unreachable!()
-                            };
-                            assert_eq!(logical_type_of_field(entries), None);
-                            (
-                                &fields[1],
-                                aligned.chunk_schema().slots()[0]
-                                    .field_schema()
-                                    .map_value()
-                                    .unwrap(),
-                            )
-                        }
-                        _ => unreachable!(),
-                    };
-                    assert_eq!(logical_type_of_field(field), Some(LogicalType::Bitmap));
-                    assert_eq!(cache.logical_type(), Some(LogicalType::Bitmap));
-                    if marker.is_some() {
-                        assert!(Arc::ptr_eq(&original, aligned.batch.column(0)));
-                    }
-                }
+                assert_shared_payload(&before, &aligned.record_batch().column(0).to_data());
+                assert_eq!(
+                    aligned.chunk_schema().slots()[0].typed_binding(),
+                    ty.typed_binding()
+                );
+                assert_eq!(aligned.record_batch().schema().field(0).name(), "renamed");
+                assert_eq!(aligned.record_batch().column(0).data_type(), ty.data_type());
             }
         }
     }

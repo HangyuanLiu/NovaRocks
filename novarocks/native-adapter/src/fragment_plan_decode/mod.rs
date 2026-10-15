@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 
 use crate::fragment_decode_context::NativePlanDecodeContext;
 use crate::fragment_error::NativeFragmentDecodeError;
-use crate::fragment_expression::decode_expr_for_slot_layout;
+use crate::fragment_expression::decode_expr_for_slot_layout_with_types;
 use crate::fragment_plan_node::{
     NativeLoweredPlanNode, apply_distributed_limit, lower_assert_one_row_node,
     lower_change_event_expand_node, lower_filter_node, lower_generate_series_node,
@@ -75,11 +75,25 @@ use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
 pub(crate) type DecodedNode = NativeLoweredPlanNode;
+/// Explicit inline expansion helper; task ingress requires the strong table.
 #[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn decode_node(
     node: &plan::DistributedNode,
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+        decode_node_with_types(node, arena, ctx, decoder)
+    })
+}
+#[allow(dead_code)]
+pub(crate) fn decode_node_with_types(
+    node: &plan::DistributedNode,
+    arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     decode_node_inner(
         node,
@@ -87,6 +101,7 @@ pub(crate) fn decode_node(
         arena,
         ctx,
         None,
+        type_decoder,
     )
 }
 
@@ -95,6 +110,8 @@ pub(crate) fn decode_node_with_runtime_filters(
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
     ledger: &mut NativeRuntimeFilterDecodeLedger,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     decode_node_inner(
         node,
@@ -102,6 +119,7 @@ pub(crate) fn decode_node_with_runtime_filters(
         arena,
         ctx,
         Some(ledger),
+        type_decoder,
     )
 }
 
@@ -111,6 +129,8 @@ fn decode_node_inner(
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
     mut ledger: Option<&mut NativeRuntimeFilterDecodeLedger>,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     validate_distributed_node_children(node, path.clone())?;
     let mut children = Vec::with_capacity(node.children.len());
@@ -121,6 +141,7 @@ fn decode_node_inner(
             arena,
             ctx,
             ledger.as_deref_mut(),
+            type_decoder,
         )?);
     }
 
@@ -150,6 +171,7 @@ fn decode_node_inner(
             &mut children,
             arena,
             path.clone().field("runtime_filter_binding_ids"),
+            type_decoder,
         )?;
     }
 
@@ -168,6 +190,7 @@ fn decode_node_inner(
             children,
             arena,
             ctx,
+            type_decoder,
         ),
         plan::distributed_node::Payload::Exchange(exchange) => {
             crate::fragment_exchange_receiver::lower_exchange_receiver(
@@ -177,6 +200,7 @@ fn decode_node_inner(
                 children,
                 arena,
                 ctx,
+                type_decoder,
             )
         }
         // The write dataflow nodes reach their exact query-leased write role
@@ -189,6 +213,7 @@ fn decode_node_inner(
                 path.clone().field("payload").field("table_writer"),
                 children,
                 ctx,
+                type_decoder,
             )
         }
         plan::distributed_node::Payload::TableFinish(finish) => {
@@ -199,11 +224,19 @@ fn decode_node_inner(
                 children,
                 arena,
                 ctx,
+                type_decoder,
             )
         }
     }?;
     if children_are_absent(node) && !consumer_bindings.is_empty() {
-        attach_leaf_consumers(node, &consumer_bindings, &mut lowered, arena, path.clone())?;
+        attach_leaf_consumers(
+            node,
+            &consumer_bindings,
+            &mut lowered,
+            arena,
+            path.clone(),
+            type_decoder,
+        )?;
     }
     let mut lowered = apply_distributed_limit(node, lowered, path.clone())?;
     if !producer_bindings.is_empty() {
@@ -214,6 +247,7 @@ fn decode_node_inner(
             &mut lowered,
             arena,
             path.clone(),
+            type_decoder,
         )?;
     }
     if let Some(ledger) = ledger {
@@ -234,6 +268,8 @@ fn attach_direct_input_consumers(
     children: &mut [DecodedNode],
     arena: &mut ExprArena,
     path: FieldPath,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<(), NativeFragmentDecodeError> {
     let mut grouped = BTreeMap::<usize, Vec<RuntimeFilterConsumerBinding>>::new();
     for binding in bindings {
@@ -268,8 +304,13 @@ fn attach_direct_input_consumers(
                 ),
             )
         })?;
-        let expr_id =
-            lower_binding_expression(binding, &child.layout, &child.output_schema, arena)?;
+        let expr_id = lower_binding_expression(
+            binding,
+            &child.layout,
+            &child.output_schema,
+            arena,
+            type_decoder,
+        )?;
         grouped
             .entry(*index)
             .or_default()
@@ -298,6 +339,8 @@ fn attach_leaf_consumers(
     lowered: &mut DecodedNode,
     arena: &mut ExprArena,
     path: FieldPath,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<(), NativeFragmentDecodeError> {
     for binding in bindings {
         let DecodedBindingRole::Consumer { target, .. } = &binding.role else {
@@ -322,8 +365,13 @@ fn attach_leaf_consumers(
     let specs = bindings
         .iter()
         .map(|binding| {
-            let expr_id =
-                lower_binding_expression(binding, &lowered.layout, &lowered.output_schema, arena)?;
+            let expr_id = lower_binding_expression(
+                binding,
+                &lowered.layout,
+                &lowered.output_schema,
+                arena,
+                type_decoder,
+            )?;
             consumer_spec(binding, expr_id).map_err(|error| {
                 NativeFragmentDecodeError::inconsistent(
                     path.clone().field("runtime_filter_binding_ids"),
@@ -467,6 +515,7 @@ fn attach_producers(
     lowered: &mut DecodedNode,
     arena: &mut ExprArena,
     path: FieldPath,
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<(), NativeFragmentDecodeError> {
     let payload = wire_node.payload.as_ref().ok_or_else(|| {
         NativeFragmentDecodeError::missing(
@@ -487,9 +536,15 @@ fn attach_producers(
         ));
     };
     match physical.kind.as_ref() {
-        Some(plan::plan_node::Kind::HashJoin(wire_join)) => {
-            attach_hash_join_producers(wire_node, wire_join, bindings, direct_inputs, lowered, path)
-        }
+        Some(plan::plan_node::Kind::HashJoin(wire_join)) => attach_hash_join_producers(
+            wire_node,
+            wire_join,
+            bindings,
+            direct_inputs,
+            lowered,
+            path,
+            type_decoder,
+        ),
         Some(plan::plan_node::Kind::HashAggregate(wire_aggregate)) => {
             attach_hash_aggregate_producers(
                 wire_node,
@@ -499,6 +554,7 @@ fn attach_producers(
                 lowered,
                 arena,
                 path,
+                type_decoder,
             )
         }
         kind => Err(NativeFragmentDecodeError::inconsistent(
@@ -511,6 +567,65 @@ fn attach_producers(
     }
 }
 
+/// A planner RF endpoint is a materialized slot read, not a second invocation
+/// of the expression that supplied that slot. Its complete type references are
+/// fragment-local roots and need not have the same numeric binding ID.
+fn runtime_filter_materialized_key_matches(
+    key: &novarocks_proto_models::expr::Expr,
+    endpoint: &novarocks_proto_models::expr::Expr,
+    path: FieldPath,
+    decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
+) -> Result<bool, NativeFragmentDecodeError> {
+    use novarocks_proto_models::expr::expr::Kind;
+    let (Some(Kind::ColumnRef(key_column)), Some(Kind::ColumnRef(endpoint_column))) =
+        (key.kind.as_ref(), endpoint.kind.as_ref())
+    else {
+        // Preserve the pre-existing exact comparison for every other shape.
+        // In particular, invocation definition IDs are never erased here.
+        return Ok(key == endpoint);
+    };
+    if key_column != endpoint_column
+        || key.nullable != endpoint.nullable
+        || (endpoint.original_definition_id.is_some()
+            && key.original_definition_id != endpoint.original_definition_id)
+    {
+        return Ok(false);
+    }
+    let key_reference = key.r#type.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("type"),
+            "runtime-filter key requires a complete type reference",
+        )
+    })?;
+    let endpoint_reference = endpoint.r#type.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("type"),
+            "runtime-filter endpoint requires a complete type reference",
+        )
+    })?;
+    let key_type = decoder
+        .value_type(key_reference, path.clone().field("type"))?
+        .ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone().field("type"),
+                "runtime-filter key complete binding is absent",
+            )
+        })?;
+    let endpoint_type = decoder
+        .value_type(endpoint_reference, path.clone().field("type"))?
+        .ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.field("type"),
+                "runtime-filter endpoint complete binding is absent",
+            )
+        })?;
+    decoder.bindings_match(
+        key_type.typed_binding(),
+        endpoint_type.typed_binding(),
+        false,
+    )
+}
+
 fn attach_hash_join_producers(
     wire_node: &plan::DistributedNode,
     wire_join: &plan::HashJoinNode,
@@ -518,6 +633,7 @@ fn attach_hash_join_producers(
     direct_inputs: &[(Layout, ChunkSchemaRef)],
     lowered: &mut DecodedNode,
     path: FieldPath,
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<(), NativeFragmentDecodeError> {
     let binding_path = path.clone().field("runtime_filter_binding_ids");
     let join = find_hash_join_mut(&mut lowered.node, wire_node.node_id).ok_or_else(|| {
@@ -609,7 +725,12 @@ fn attach_hash_join_producers(
                 ),
             )
         })?;
-        if raw_build != &binding.expression {
+        if !runtime_filter_materialized_key_matches(
+            raw_build,
+            binding.expression,
+            raw_build_path.clone(),
+            type_decoder,
+        )? {
             return Err(NativeFragmentDecodeError::inconsistent(
                 raw_build_path.clone(),
                 format!(
@@ -624,6 +745,7 @@ fn attach_hash_join_producers(
             build_layout,
             build_schema,
             raw_build_path,
+            type_decoder,
         )?;
         let build_expr_id = *join.build_keys.get(build_key_index).ok_or_else(|| {
             NativeFragmentDecodeError::inconsistent(
@@ -692,6 +814,7 @@ fn attach_hash_aggregate_producers(
     lowered: &mut DecodedNode,
     arena: &ExprArena,
     path: FieldPath,
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<(), NativeFragmentDecodeError> {
     let binding_path = path.clone().field("runtime_filter_binding_ids");
     let [(input_layout, input_schema)] = direct_inputs else {
@@ -770,7 +893,12 @@ fn attach_hash_aggregate_producers(
                     ),
                 )
             })?;
-        if raw_group_key != &binding.expression {
+        if !runtime_filter_materialized_key_matches(
+            raw_group_key,
+            binding.expression,
+            group_key_path.clone(),
+            type_decoder,
+        )? {
             return Err(NativeFragmentDecodeError::inconsistent(
                 group_key_path.clone(),
                 format!(
@@ -785,6 +913,7 @@ fn attach_hash_aggregate_producers(
             input_layout,
             input_schema,
             group_key_path.clone(),
+            type_decoder,
         )?;
         let group_key_expr_id =
             *aggregate
@@ -899,6 +1028,8 @@ fn lower_binding_expression(
     layout: &Layout,
     schema: &ChunkSchemaRef,
     arena: &mut ExprArena,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<novarocks_execution::exec::expr::ExprId, NativeFragmentDecodeError> {
     let expression_path = binding.expression_path.clone();
     validate_column_refs_exact(
@@ -907,8 +1038,15 @@ fn lower_binding_expression(
         layout,
         schema,
         expression_path.clone(),
+        type_decoder,
     )?;
-    decode_expr_for_slot_layout(&binding.expression, expression_path, arena, layout)
+    decode_expr_for_slot_layout_with_types(
+        &binding.expression,
+        expression_path,
+        arena,
+        layout,
+        type_decoder,
+    )
 }
 
 fn validate_column_refs_exact(
@@ -917,6 +1055,7 @@ fn validate_column_refs_exact(
     layout: &Layout,
     schema: &ChunkSchemaRef,
     path: FieldPath,
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<(), NativeFragmentDecodeError> {
     use novarocks_proto_models::expr::expr::Kind;
 
@@ -939,7 +1078,7 @@ fn validate_column_refs_exact(
                     ),
                 )
             })?;
-        let expected = schema.field_by_slot(slot_id).ok_or_else(|| {
+        schema.field_by_slot(slot_id).ok_or_else(|| {
             NativeFragmentDecodeError::inconsistent(
                 column_path.clone().field("column_id"),
                 format!(
@@ -957,50 +1096,35 @@ fn validate_column_refs_exact(
                 ),
             )
         })?;
-        let actual = novarocks_plan_codec::native_type::decode_field_type(
-            "_runtime_filter_column",
-            expression.nullable,
-            type_desc,
-        )
-        .map_err(|error| {
-            NativeFragmentDecodeError::invalid_value(
-                path.clone().field("type"),
-                format!(
-                    "native runtime-filter binding_id={binding_id} ColumnRef column_id={} type: {error}",
-                    column.column_id
-                ),
-            )
-        })?;
-        let expected_schema = novarocks_execution::exec::chunk::ChunkFieldSchema::from_field(
-            expected,
-        )
-        .map_err(|error| NativeFragmentDecodeError::inconsistent(column_path.clone(), error))?;
-        let actual_schema = novarocks_execution::exec::chunk::ChunkFieldSchema::from_field(&actual)
-            .map_err(|error| {
-                NativeFragmentDecodeError::invalid_value(path.clone().field("type"), error)
-            })?;
-        if expected.data_type() != actual.data_type()
-            || expected.is_nullable() != actual.is_nullable()
-            || expected_schema != actual_schema
-        {
-            return Err(NativeFragmentDecodeError::inconsistent(
-                column_path,
-                format!(
-                    "native runtime-filter binding_id={binding_id} ColumnRef column_id={} type/nullability does not exactly match direct input",
-                    column.column_id
-                ),
-            ));
+        if let Some(actual) = type_decoder.value_type(type_desc, path.clone().field("type"))? {
+            let expected_slot = schema.slot(slot_id).expect("checked direct input field");
+            if !expected_slot.is_typed()
+                || expression.nullable != actual.nullable()
+                || !type_decoder.bindings_match(
+                    expected_slot.typed_binding(),
+                    actual.typed_binding(),
+                    false,
+                )?
+            {
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    column_path,
+                    "runtime filter ColumnRef differs from its exact complete direct input binding",
+                ));
+            }
         }
     }
 
-    let visit = |child: &novarocks_proto_models::expr::Expr, child_path: FieldPath| {
-        validate_column_refs_exact(binding_id, child, layout, schema, child_path)
+    let mut visit = |child: &novarocks_proto_models::expr::Expr, child_path: FieldPath| {
+        validate_column_refs_exact(binding_id, child, layout, schema, child_path, type_decoder)
     };
     let missing = |child_path: FieldPath, detail: &'static str| {
         NativeFragmentDecodeError::missing(child_path, detail)
     };
     match kind {
-        Kind::ColumnRef(_) | Kind::Literal(_) | Kind::LambdaParamRef(_) => Ok(()),
+        Kind::ColumnRef(_)
+        | Kind::Literal(_)
+        | Kind::ConstantReference(_)
+        | Kind::LambdaParamRef(_) => Ok(()),
         Kind::BinaryOp(binary) => {
             let binary_path = path.field("binary_op");
             let left_path = binary_path.clone().field("left");
@@ -1235,6 +1359,8 @@ fn lower_physical_node(
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let physical_output_path = path.clone().field("output_columns");
     let kind = physical.kind.as_ref().ok_or_else(|| {
@@ -1252,6 +1378,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            type_decoder,
         ),
         plan::plan_node::Kind::Project(project) => lower_project_node(
             node,
@@ -1259,6 +1386,7 @@ fn lower_physical_node(
             path.clone().field("project"),
             children,
             arena,
+            type_decoder,
         ),
         plan::plan_node::Kind::Unpivot(unpivot) => lower_unpivot_node(
             node,
@@ -1268,10 +1396,16 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            type_decoder,
         ),
-        plan::plan_node::Kind::Filter(filter) => {
-            lower_filter_node(node, filter, path.clone().field("filter"), children, arena)
-        }
+        plan::plan_node::Kind::Filter(filter) => lower_filter_node(
+            node,
+            filter,
+            path.clone().field("filter"),
+            children,
+            arena,
+            type_decoder,
+        ),
         plan::plan_node::Kind::Limit(limit) => lower_limit_node(
             node,
             limit,
@@ -1287,10 +1421,16 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            type_decoder,
         ),
-        plan::plan_node::Kind::Topn(topn) => {
-            lower_topn_node(node, topn, path.clone().field("topn"), children, arena)
-        }
+        plan::plan_node::Kind::Topn(topn) => lower_topn_node(
+            node,
+            topn,
+            path.clone().field("topn"),
+            children,
+            arena,
+            type_decoder,
+        ),
         plan::plan_node::Kind::SetOp(set_op) => lower_set_op_node(
             node,
             physical,
@@ -1299,6 +1439,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            type_decoder,
         ),
         plan::plan_node::Kind::AssertOneRow(assert) => {
             lower_assert_one_row_node(node, assert, path.clone().field("assert_one_row"), children)
@@ -1310,6 +1451,7 @@ fn lower_physical_node(
             path.clone().field("scan"),
             ctx,
             arena,
+            type_decoder,
         ),
         plan::plan_node::Kind::HashAggregate(aggregate) => {
             crate::fragment_aggregate::lower_hash_aggregate_node(
@@ -1321,6 +1463,7 @@ fn lower_physical_node(
                 children,
                 arena,
                 ctx,
+                type_decoder,
             )
         }
         plan::plan_node::Kind::HashJoin(join) => crate::fragment_hash_join::lower_hash_join_node(
@@ -1332,6 +1475,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            type_decoder,
         ),
         plan::plan_node::Kind::NestLoopJoin(join) => lower_nest_loop_join_node(
             node,
@@ -1342,6 +1486,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            type_decoder,
         ),
         plan::plan_node::Kind::Window(window) => crate::fragment_window::lower_window_node(
             node,
@@ -1352,6 +1497,7 @@ fn lower_physical_node(
             children,
             arena,
             ctx,
+            type_decoder,
         ),
         plan::plan_node::Kind::Repeat(repeat) => {
             lower_repeat_node(node, repeat, path.clone().field("repeat"), children)
@@ -1362,6 +1508,7 @@ fn lower_physical_node(
             path.clone().field("generate_series"),
             children,
             arena,
+            type_decoder,
         ),
         plan::plan_node::Kind::TableFunction(table_function) => lower_table_function_node(
             node,
@@ -1369,6 +1516,7 @@ fn lower_physical_node(
             path.clone().field("table_function"),
             children,
             arena,
+            type_decoder,
         ),
         plan::plan_node::Kind::Decode(_) => Err(NativeFragmentDecodeError::unsupported(
             path.clone().field("decode"),
@@ -1382,6 +1530,7 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
+            type_decoder,
         ),
         plan::plan_node::Kind::CteAnchor(_) => Err(NativeFragmentDecodeError::unsupported(
             path.clone().field("cte_anchor"),
@@ -1402,6 +1551,7 @@ fn lower_physical_node(
             physical_output_path,
             children,
             arena,
+            type_decoder,
         ),
     }
 }
@@ -1418,7 +1568,6 @@ mod tests {
     use novarocks_execution::exec::node::assert::{AssertNumRowsMode, Assertion};
     use novarocks_execution::exec::node::set_op::SetOpKind;
     use novarocks_execution::runtime_filter as execution;
-    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;
 
@@ -1429,53 +1578,248 @@ mod tests {
         )
     }
 
+    use crate::fragment_expression::fixture_aggregate_sources::{
+        AggregateSource, aggregate_definition,
+    };
+    use crate::fragment_expression::fixture_sources as sources;
+    use novarocks_proto_models::call_request;
+    #[derive(Clone, Debug)]
+    pub(super) struct FixturePlan {
+        wire: plan::DistributedNode,
+        original_requests: Vec<call_request::OriginalCallRequest>,
+    }
+    impl std::ops::Deref for FixturePlan {
+        type Target = plan::DistributedNode;
+        fn deref(&self) -> &Self::Target {
+            &self.wire
+        }
+    }
+    impl std::ops::DerefMut for FixturePlan {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.wire
+        }
+    }
+    impl FixturePlan {
+        pub(super) fn from_wire(wire: plan::DistributedNode, children: Vec<FixturePlan>) -> Self {
+            let original_requests = children
+                .iter()
+                .flat_map(|child| child.original_requests.iter().cloned())
+                .collect();
+            assert_eq!(wire.children.len(), children.len());
+            Self {
+                wire,
+                original_requests,
+            }
+        }
+        pub(super) fn raw(wire: plan::DistributedNode) -> Self {
+            assert!(wire.children.is_empty());
+            Self {
+                wire,
+                original_requests: Vec::new(),
+            }
+        }
+        pub(super) fn wire_clone(&self) -> plan::DistributedNode {
+            self.wire.clone()
+        }
+        pub(super) fn with_original_writer(
+            mut self,
+            partial: bool,
+            call: u32,
+            source: AggregateSource,
+        ) -> Self {
+            use novarocks_physical_plan::{NodeId, PhysicalCallSite};
+            use novarocks_proto_models::physical_semantics_v2 as semantics;
+            let node = self.wire.node_id;
+            let request_id = u32::try_from(node)
+                .unwrap()
+                .checked_mul(16)
+                .unwrap()
+                .checked_add(call)
+                .unwrap();
+            let site = if partial {
+                PhysicalCallSite::WriterPartial {
+                    node: NodeId::new(u32::try_from(node).unwrap()),
+                    call,
+                }
+            } else {
+                PhysicalCallSite::WriterFinal {
+                    node: NodeId::new(u32::try_from(node).unwrap()),
+                    call,
+                }
+            };
+            let signature = match self.wire.payload.as_mut().expect("original writer source") {
+                plan::distributed_node::Payload::TableWriter(writer) if partial => {
+                    writer.partial_aggregate_plan.as_mut().unwrap().calls[call as usize]
+                        .resolved_signature
+                        .as_mut()
+                }
+                plan::distributed_node::Payload::TableFinish(finish) if !partial => {
+                    finish.final_aggregate_plan.as_mut().unwrap().calls[call as usize]
+                        .resolved_signature
+                        .as_mut()
+                }
+                _ => panic!("original writer occurrence"),
+            };
+            if let Some(signature) = signature {
+                signature.original_request_id = Some(request_id);
+                signature.writer_preparation_call = Some(source.writer_call(
+                    site,
+                    if partial {
+                        novarocks_functions::AggregateKernelPhase::Partial
+                    } else {
+                        novarocks_functions::AggregateKernelPhase::Final
+                    },
+                    request_id,
+                ));
+            }
+            let position = semantics::NodeCallSite {
+                node_id: Some(u32::try_from(node).unwrap()),
+                call,
+            };
+            self.original_requests.push(source.request(
+                request_id,
+                call_request::CallRequestDefinition {
+                    kind: Some(call_request::call_request_definition::Kind::Relational(
+                        semantics::CallSite {
+                            kind: Some(if partial {
+                                semantics::call_site::Kind::WriterPartial(position)
+                            } else {
+                                semantics::call_site::Kind::WriterFinal(position)
+                            }),
+                        },
+                    )),
+                },
+            ));
+            self
+        }
+    }
+    impl FixturePlan {
+        pub(super) fn with_original_aggregate(
+            mut self,
+            call: u32,
+            source: AggregateSource,
+        ) -> Self {
+            let request_id = u32::try_from(self.wire.node_id)
+                .unwrap()
+                .checked_mul(16)
+                .unwrap()
+                .checked_add(call)
+                .unwrap();
+            let Some(plan::distributed_node::Payload::Physical(physical)) =
+                self.wire.payload.as_mut()
+            else {
+                panic!("original physical fixture author")
+            };
+            let Some(plan::plan_node::Kind::HashAggregate(aggregate)) = physical.kind.as_mut()
+            else {
+                panic!("original aggregate occurrence")
+            };
+            aggregate.aggregates[call as usize]
+                .resolved_signature
+                .as_mut()
+                .expect("original selected signature")
+                .original_request_id = Some(request_id);
+            self.original_requests
+                .push(source.request(request_id, aggregate_definition(self.wire.node_id, call)));
+            self
+        }
+    }
+    impl FixturePlan {
+        pub(super) fn with_original_window(
+            mut self,
+            call: u32,
+            definition: u32,
+            source: AggregateSource,
+        ) -> Self {
+            let request_id = u32::try_from(self.wire.node_id)
+                .unwrap()
+                .checked_mul(16)
+                .unwrap()
+                .checked_add(call)
+                .unwrap();
+            let Some(plan::distributed_node::Payload::Physical(physical)) =
+                self.wire.payload.as_mut()
+            else {
+                panic!("original physical fixture author")
+            };
+            let Some(plan::plan_node::Kind::Window(window)) = physical.kind.as_mut() else {
+                panic!("original Window occurrence")
+            };
+            let expression = &mut window.window_exprs[call as usize];
+            expression.original_expression_definition_id = Some(definition);
+            expression
+                .aggregate_binding
+                .as_mut()
+                .expect("original selected binding")
+                .original_request_id = Some(request_id);
+            self.original_requests.push(source.request(
+                request_id,
+                call_request::CallRequestDefinition {
+                    kind: Some(
+                        call_request::call_request_definition::Kind::ExpressionDefinitionId(
+                            definition,
+                        ),
+                    ),
+                },
+            ));
+            self
+        }
+    }
+    pub(super) fn aggregate_source(
+        name: &str,
+        logical: &[DataType],
+        update: &[DataType],
+    ) -> AggregateSource {
+        if matches!(name, "group_concat" | "string_agg") {
+            AggregateSource::with_literals(
+                name,
+                logical,
+                update,
+                &[(1, common::literal_value::Value::StringValue("|".into()))],
+            )
+        } else if name == "count_if" {
+            AggregateSource::with_literals(
+                name,
+                logical,
+                update,
+                &[(0, common::literal_value::Value::BoolValue(true))],
+            )
+        } else {
+            AggregateSource::new(name, logical, update)
+        }
+    }
     pub(super) fn resolved_aggregate_signature(
         name: &str,
-        argument_types: &[DataType],
+        arguments: &[DataType],
     ) -> Option<plan::ResolvedAggregateSignature> {
-        let selected = test_function_catalog()
-            .resolve_aggregate_trusted(name, argument_types)
-            .expect("resolved builtin aggregate");
-        Some(plan::ResolvedAggregateSignature {
-            overload_identity: selected.overload.as_str().to_string(),
-            argument_types: selected
-                .argument_types
-                .iter()
-                .map(|data_type| encode_type(data_type).expect("encoded argument type"))
-                .collect(),
-            intermediate_type: Some(
-                encode_type(&selected.intermediate_type).expect("encoded intermediate type"),
-            ),
-            output_type: Some(encode_type(&selected.output_type).expect("encoded output type")),
-            state_format_identity: selected.state_format.as_str().to_string(),
-        })
+        Some(aggregate_source(name, arguments, arguments).signature(0))
     }
-
     pub(super) fn resolved_aggregate_update_signature(
         name: &str,
-        logical_argument_types: &[DataType],
-        update_argument_types: &[DataType],
+        logical: &[DataType],
+        update: &[DataType],
     ) -> Option<plan::ResolvedAggregateSignature> {
-        let selected = test_function_catalog()
-            .resolve_aggregate_update_trusted(name, logical_argument_types, update_argument_types)
-            .expect("resolved builtin aggregate update signature");
-        Some(plan::ResolvedAggregateSignature {
-            overload_identity: selected.overload.as_str().to_string(),
-            argument_types: selected
-                .argument_types
-                .iter()
-                .map(|data_type| encode_type(data_type).expect("encoded argument type"))
-                .collect(),
-            intermediate_type: Some(
-                encode_type(&selected.intermediate_type).expect("encoded intermediate type"),
-            ),
-            output_type: Some(encode_type(&selected.output_type).expect("encoded output type")),
-            state_format_identity: selected.state_format.as_str().to_string(),
-        })
+        Some(aggregate_source(name, logical, update).signature(0))
     }
-
     pub(super) fn type_desc(data_type: &DataType) -> common::TypeDesc {
-        encode_type(data_type).expect("encode type")
+        sources::type_desc(data_type)
+    }
+    pub(super) fn decode_node(
+        node: &FixturePlan,
+        arena: &mut ExprArena,
+        context: &NativePlanDecodeContext,
+    ) -> Result<super::DecodedNode, NativeFragmentDecodeError> {
+        sources::with_fragment_owners(&node.original_requests, |decoder, original, parameters| {
+            super::decode_node_with_types(
+                &node.wire,
+                arena,
+                &context
+                    .clone()
+                    .with_original_requests(original.clone())
+                    .with_writer_parameters(Some(parameters.clone())),
+                decoder,
+            )
+        })
     }
 
     pub(super) fn output_column_with_nullable(
@@ -1487,7 +1831,7 @@ mod tests {
         common::OutputColumn {
             column_id,
             name: name.to_string(),
-            r#type: Some(type_desc(&data_type)),
+            r#type: Some(sources::type_desc_with_nullable(&data_type, nullable)),
             nullable,
             is_internal: false,
         }
@@ -1503,37 +1847,57 @@ mod tests {
 
     fn int_literal(value: i64) -> expr::Expr {
         expr::Expr {
-            r#type: Some(type_desc(&DataType::Int64)),
+            original_definition_id: None,
+            r#type: Some(sources::type_desc_with_nullable(&DataType::Int64, false)),
             nullable: false,
-            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-                value: Some(common::LiteralValue {
-                    value: Some(common::literal_value::Value::IntValue(value)),
-                }),
-            })),
+            kind: Some(expr::expr::Kind::ConstantReference(
+                sources::constant_reference(
+                    &DataType::Int64,
+                    &expr::LiteralExpr {
+                        value: Some(common::LiteralValue {
+                            value: Some(common::literal_value::Value::IntValue(value)),
+                        }),
+                    },
+                ),
+            )),
         }
     }
 
     pub(super) fn string_literal(value: &str) -> expr::Expr {
         expr::Expr {
-            r#type: Some(type_desc(&DataType::Utf8)),
+            original_definition_id: None,
+            r#type: Some(sources::type_desc_with_nullable(&DataType::Utf8, false)),
             nullable: false,
-            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-                value: Some(common::LiteralValue {
-                    value: Some(common::literal_value::Value::StringValue(value.to_string())),
-                }),
-            })),
+            kind: Some(expr::expr::Kind::ConstantReference(
+                sources::constant_reference(
+                    &DataType::Utf8,
+                    &expr::LiteralExpr {
+                        value: Some(common::LiteralValue {
+                            value: Some(common::literal_value::Value::StringValue(
+                                value.to_string(),
+                            )),
+                        }),
+                    },
+                ),
+            )),
         }
     }
 
     pub(super) fn bool_literal(value: bool) -> expr::Expr {
         expr::Expr {
-            r#type: Some(type_desc(&DataType::Boolean)),
+            original_definition_id: None,
+            r#type: Some(sources::type_desc_with_nullable(&DataType::Boolean, false)),
             nullable: false,
-            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-                value: Some(common::LiteralValue {
-                    value: Some(common::literal_value::Value::BoolValue(value)),
-                }),
-            })),
+            kind: Some(expr::expr::Kind::ConstantReference(
+                sources::constant_reference(
+                    &DataType::Boolean,
+                    &expr::LiteralExpr {
+                        value: Some(common::LiteralValue {
+                            value: Some(common::literal_value::Value::BoolValue(value)),
+                        }),
+                    },
+                ),
+            )),
         }
     }
 
@@ -1543,18 +1907,25 @@ mod tests {
     )]
     fn null_literal(data_type: DataType) -> expr::Expr {
         expr::Expr {
-            r#type: Some(type_desc(&data_type)),
+            original_definition_id: None,
+            r#type: Some(sources::type_desc_with_nullable(&data_type, true)),
             nullable: true,
-            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-                value: Some(common::LiteralValue {
-                    value: Some(common::literal_value::Value::NullValue(true)),
-                }),
-            })),
+            kind: Some(expr::expr::Kind::ConstantReference(
+                sources::constant_reference(
+                    &data_type,
+                    &expr::LiteralExpr {
+                        value: Some(common::LiteralValue {
+                            value: Some(common::literal_value::Value::NullValue(true)),
+                        }),
+                    },
+                ),
+            )),
         }
     }
 
     pub(super) fn column_ref(column_id: u32, data_type: DataType) -> expr::Expr {
         expr::Expr {
+            original_definition_id: None,
             r#type: Some(type_desc(&data_type)),
             nullable: true,
             kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
@@ -1577,24 +1948,31 @@ mod tests {
         node_id: i32,
         kind: plan::plan_node::Kind,
         output_columns: Vec<common::OutputColumn>,
-        children: Vec<plan::DistributedNode>,
-    ) -> plan::DistributedNode {
-        plan::DistributedNode {
-            node_id,
-            fragment_id: 1,
-            tuple_ids: Vec::new(),
-            nullable_tuple_ids: Vec::new(),
-            limit: -1,
-            runtime_filter_binding_ids: Vec::new(),
-            children,
-            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-                output_columns,
-                kind: Some(kind),
-            })),
+        children: Vec<FixturePlan>,
+    ) -> FixturePlan {
+        let original_requests = children
+            .iter()
+            .flat_map(|child| child.original_requests.iter().cloned())
+            .collect();
+        FixturePlan {
+            original_requests,
+            wire: plan::DistributedNode {
+                node_id,
+                fragment_id: 1,
+                tuple_ids: Vec::new(),
+                nullable_tuple_ids: Vec::new(),
+                limit: -1,
+                runtime_filter_binding_ids: Vec::new(),
+                children: children.into_iter().map(|child| child.wire).collect(),
+                payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                    output_columns,
+                    kind: Some(kind),
+                })),
+            },
         }
     }
 
-    pub(super) fn values_node(node_id: i32) -> plan::DistributedNode {
+    pub(super) fn values_node(node_id: i32) -> FixturePlan {
         let columns = vec![
             output_column(1, "id", DataType::Int64),
             output_column(2, "name", DataType::Utf8),
@@ -1617,7 +1995,7 @@ mod tests {
         )
     }
 
-    pub(super) fn one_col_values_node(node_id: i32) -> plan::DistributedNode {
+    pub(super) fn one_col_values_node(node_id: i32) -> FixturePlan {
         one_col_values_node_with(node_id, 1, "id", 10)
     }
 
@@ -1626,7 +2004,7 @@ mod tests {
         column_id: u32,
         name: &str,
         value: i64,
-    ) -> plan::DistributedNode {
+    ) -> FixturePlan {
         one_col_values_node_with_nullable(node_id, column_id, name, value, true)
     }
 
@@ -1636,7 +2014,7 @@ mod tests {
         name: &str,
         value: i64,
         nullable: bool,
-    ) -> plan::DistributedNode {
+    ) -> FixturePlan {
         let columns = vec![output_column_with_nullable(
             column_id,
             name,
@@ -1666,7 +2044,7 @@ mod tests {
         name: &str,
         value: i64,
         data_type: DataType,
-    ) -> plan::DistributedNode {
+    ) -> FixturePlan {
         let columns = vec![output_column(column_id, name, data_type)];
         physical_node(
             node_id,
@@ -1681,7 +2059,7 @@ mod tests {
         )
     }
 
-    pub(super) fn three_col_values_node(node_id: i32) -> plan::DistributedNode {
+    pub(super) fn three_col_values_node(node_id: i32) -> FixturePlan {
         let columns = vec![
             output_column(1, "a", DataType::Int64),
             output_column(2, "b", DataType::Int64),
@@ -1700,7 +2078,7 @@ mod tests {
         )
     }
 
-    pub(super) fn lower(node: &plan::DistributedNode) -> super::DecodedNode {
+    pub(super) fn lower(node: &FixturePlan) -> super::DecodedNode {
         let mut arena = ExprArena::default();
         decode_node(
             node,
@@ -1714,7 +2092,7 @@ mod tests {
         dead_code,
         reason = "Retained for target-specific native integration and regression coverage."
     )]
-    fn decode_error(node: &plan::DistributedNode) -> NativeFragmentDecodeError {
+    fn decode_error(node: &FixturePlan) -> NativeFragmentDecodeError {
         decode_node(
             node,
             &mut ExprArena::default(),
@@ -1727,7 +2105,7 @@ mod tests {
         dead_code,
         reason = "Retained for target-specific native integration and regression coverage."
     )]
-    fn assert_children_error(node: &plan::DistributedNode) {
+    fn assert_children_error(node: &FixturePlan) {
         let error = decode_error(node);
         let protocol = error.protocol().expect("protocol error");
         assert_eq!(protocol.path().to_string(), "plan_fragment.root.children");
@@ -1842,6 +2220,201 @@ mod tests {
         }
     }
 
+    fn with_materialized_key_types<R>(
+        values: &[novarocks_type_contract::FunctionValueType],
+        operation: impl FnOnce(&mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>) -> R,
+    ) -> R {
+        use novarocks_plan_codec::execution_type_table::{
+            ExecutionTypeRoot, ExecutionTypeTableBuilder, ExecutionTypeTableLimits,
+        };
+        use novarocks_type_contract::{
+            CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+        };
+        struct Control;
+        impl PureCompileControl for Control {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                assert!(units <= 256);
+                Ok(())
+            }
+        }
+        let roots = values
+            .iter()
+            .enumerate()
+            .map(|(id, value)| ExecutionTypeRoot {
+                id: id as u32,
+                value,
+            })
+            .collect::<Vec<_>>();
+        let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Encode).unwrap();
+        let table = ExecutionTypeTableBuilder::new(&roots)
+            .encode_observed::<std::convert::Infallible>(
+                ExecutionTypeTableLimits::for_validated_root_count(roots.len()).unwrap(),
+                &mut |_| Ok(()),
+                &mut work,
+            )
+            .unwrap()
+            .into_wire();
+        work.finish().unwrap();
+        let fragment = plan::PlanFragment {
+            execution_types: Some(table),
+            ..Default::default()
+        };
+        let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+            "RF materialized key fixture",
+        );
+        tracker.install_limit_once(1 << 20).unwrap();
+        let creation = crate::native_type_construction::NativeTypeConstruction::try_with_control(
+            tracker.clone(),
+            &Control,
+        )
+        .unwrap();
+        let mut resources =
+            crate::fragment_type_decode::NativeDecodeResources::try_new(&creation).unwrap();
+        let types =
+            crate::fragment_type_decode::decode_fragment_type_owner(&fragment, &mut resources)
+                .unwrap();
+        let result = operation(
+            &mut crate::fragment_type_decode::NativeTypeDecoder::Strong {
+                types: &types.execution,
+                original_requests: None,
+                resources: &mut resources,
+            },
+        );
+        resources.finish().unwrap();
+        drop(types);
+        drop(creation);
+        assert_eq!(tracker.current(), 0);
+        result
+    }
+    fn materialized_key(reference: u32, definition: Option<u32>) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(common::TypeDesc {
+                value_binding_id: Some(reference),
+            }),
+            nullable: true,
+            original_definition_id: definition,
+            kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
+                column_id: 7,
+                qualifier: None,
+                column: None,
+            })),
+        }
+    }
+    #[test]
+    fn runtime_filter_materialized_key_accepts_equal_independent_type_roots_and_synthetic_read() {
+        let first = novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true);
+        let second = novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true);
+        with_materialized_key_types(&[first, second], |decoder| {
+            let key = materialized_key(0, Some(19));
+            let endpoint = materialized_key(1, None);
+            assert_ne!(
+                key, endpoint,
+                "wire IDs and source-definition markers are distinct"
+            );
+            assert!(
+                super::runtime_filter_materialized_key_matches(
+                    &key,
+                    &endpoint,
+                    FieldPath::root("key"),
+                    decoder
+                )
+                .unwrap()
+            );
+        });
+    }
+    #[test]
+    fn runtime_filter_materialized_key_rejects_full_domain_layout_null_and_slot_drift() {
+        use novarocks_type_contract::{FunctionValueType as V, ValueLogicalType};
+        let nested_json = V::try_from_typed_binding(
+            novarocks_types::execution_value_type_from_declaration(
+                &novarocks_types::schema::SqlType::Array(Box::new(
+                    novarocks_types::schema::SqlType::Json,
+                )),
+                &DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    false,
+                ))),
+                true,
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let values = [
+            V::new(DataType::Utf8, true),
+            V::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap(),
+            V::new(DataType::LargeUtf8, true),
+            V::new(DataType::Utf8, false),
+            V::new(
+                DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    false,
+                ))),
+                true,
+            ),
+            V::new(
+                DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    true,
+                ))),
+                true,
+            ),
+            nested_json,
+        ];
+        with_materialized_key_types(&values, |decoder| {
+            for (left, right) in [(0, 1), (0, 2), (0, 3), (4, 5), (4, 6)] {
+                assert!(
+                    !super::runtime_filter_materialized_key_matches(
+                        &materialized_key(left, Some(19)),
+                        &materialized_key(right, None),
+                        FieldPath::root("key"),
+                        decoder
+                    )
+                    .unwrap()
+                );
+            }
+            let key = materialized_key(0, Some(19));
+            let mut endpoint = materialized_key(0, None);
+            let Some(expr::expr::Kind::ColumnRef(column)) = endpoint.kind.as_mut() else {
+                unreachable!()
+            };
+            column.column_id = 8;
+            assert!(
+                !super::runtime_filter_materialized_key_matches(
+                    &key,
+                    &endpoint,
+                    FieldPath::root("key"),
+                    decoder
+                )
+                .unwrap()
+            );
+            endpoint = materialized_key(0, Some(20));
+            assert!(
+                !super::runtime_filter_materialized_key_matches(
+                    &key,
+                    &endpoint,
+                    FieldPath::root("key"),
+                    decoder
+                )
+                .unwrap()
+            );
+            endpoint = materialized_key(0, None);
+            endpoint.nullable = false;
+            assert!(
+                !super::runtime_filter_materialized_key_matches(
+                    &key,
+                    &endpoint,
+                    FieldPath::root("key"),
+                    decoder
+                )
+                .unwrap()
+            );
+        });
+    }
+
     #[test]
     fn hash_join_producer_requires_exact_membership_null_semantics() {
         fn contract(
@@ -1936,7 +2509,7 @@ mod tests {
     fn lowers_hash_aggregate_and_join_shapes() {
         let output_columns = vec![
             output_column(1, "id", DataType::Int64),
-            output_column(2, "cnt", DataType::Int64),
+            output_column_with_nullable(2, "cnt", DataType::Int64, false),
         ];
         let aggregate = physical_node(
             20,
@@ -1947,7 +2520,10 @@ mod tests {
                     name: "count".to_string(),
                     args: Vec::new(),
                     distinct: false,
-                    result_type: Some(type_desc(&DataType::Int64)),
+                    result_type: Some(sources::type_desc_with_nullable(
+                        aggregate_source("count", &[], &[]).output(),
+                        false,
+                    )),
                     order_by: Vec::new(),
                     output_column_id: 2,
                     resolved_signature: resolved_aggregate_signature("count", &[]),
@@ -1961,7 +2537,8 @@ mod tests {
             }),
             output_columns,
             vec![one_col_values_node(10)],
-        );
+        )
+        .with_original_aggregate(0, aggregate_source("count", &[], &[]));
         let lowered = lower(&aggregate);
         let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
             panic!("expected Aggregate");

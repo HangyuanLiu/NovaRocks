@@ -86,7 +86,7 @@ pub(super) fn pooled_source(
             )) as ArrayRef
         };
     }
-    let array = match ty.data_type {
+    let array = match ty.data_type() {
         DataType::Int8 => ints!(arrow::array::Int8Array, i8),
         DataType::Int16 => ints!(arrow::array::Int16Array, i16),
         DataType::Int32 => ints!(arrow::array::Int32Array, i32),
@@ -192,6 +192,17 @@ fn original_dispatcher(
     )?
     .create(8, 0);
     let state = RuntimeState::default();
+    let tracker =
+        crate::runtime::mem_tracker::MemTracker::new_root("series original bounds creator");
+    source.set_mem_tracker(tracker.clone());
+    source.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker,
+        Arc::new(RuntimeErrorState::default()),
+    ));
+    source.prepare().map_err(|error| error.to_string())?;
+    source
+        .bind_runtime_state(&state)
+        .map_err(|error| error.to_string())?;
     let chunk = source
         .as_processor_mut()
         .unwrap()
@@ -222,7 +233,9 @@ fn original_dispatcher(
             .map(|field| field.data_type().clone())
             .collect(),
         vec![output.schema().field(0).data_type().clone()],
-        ChunkSchema::from_compiled_layout(output)?,
+        // This adapter compares the original array computation, not runtime
+        // typed-storage ownership. Its legacy slicing API needs a legacy schema.
+        ChunkSchema::try_ref_from_schema_and_slot_ids(output.schema().as_ref(), output.slots())?,
         vec![TableFunctionOutputSlot::Result { index: 0 }],
     );
     let mut operator = factory.create(8, 0);
@@ -261,7 +274,7 @@ fn assert_original(program: &Arc<LocalProgram>) {
                     arrow::compute::concat(
                         &chunks
                             .iter()
-                            .map(|chunk| chunk.batch.column(0).as_ref())
+                            .map(|chunk| chunk.record_batch().column(0).as_ref())
                             .collect::<Vec<_>>(),
                     )
                     .unwrap()
@@ -400,7 +413,7 @@ fn compiled_generate_series_source_pooled_complete_reader_domain_and_original_re
                     let out = run(&program);
                     let arrays = out
                         .iter()
-                        .map(|chunk| chunk.batch.column(0).as_ref())
+                        .map(|chunk| chunk.record_batch().column(0).as_ref())
                         .collect::<Vec<_>>();
                     let array = arrow::compute::concat(&arrays).unwrap();
                     for (row, expected) in [1, 3, 5].into_iter().enumerate() {
@@ -562,4 +575,111 @@ fn compiled_generate_series_compile_three_causes_return_at_original_callback_pre
             assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
         }
     }
+}
+
+#[test]
+fn compiled_series_schema_and_slice_use_actual_creator_without_retaining_program() {
+    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::operators::compiled_generate_series::CompiledGenerateSeriesProcessorFactory;
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::runtime::fragment::ExecutionFailureCause;
+    use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+    let program = compile(literal_source([Some(1), Some(3), Some(1)], true, false), 8);
+    let weak = Arc::downgrade(&program);
+    let factory = CompiledGenerateSeriesProcessorFactory::try_new(
+        Arc::clone(&program),
+        program.graph().root(),
+        Arc::new(RuntimeErrorState::default()),
+    )
+    .unwrap();
+    let mut missing = factory.create(1, 0);
+    assert!(matches!(
+        missing.prepare().unwrap_err().cause(),
+        ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
+    ));
+    drop(missing);
+    let tracker = MemTracker::new_root("series schema and slice creator");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    let mut operator = factory.create(1, 0);
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        Arc::new(RuntimeErrorState::default()),
+    ));
+    operator.prepare().unwrap();
+    let layout = program.graph().nodes()[0].output_layout();
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        layout.schema().clone(),
+        [1, 3, 1]
+            .into_iter()
+            .map(|value| Arc::new(Int64Array::from(vec![value])) as ArrayRef)
+            .collect(),
+    )
+    .unwrap();
+    let input =
+        Chunk::try_new_with_chunk_schema(batch, ChunkSchema::from_compiled_layout(layout).unwrap())
+            .unwrap();
+    drop(factory);
+    drop(program);
+    assert!(weak.upgrade().is_none());
+    let state = RuntimeState::default();
+    let processor = operator.as_processor_mut().unwrap();
+    processor.push_chunk(&state, input).unwrap();
+    let output = processor.pull_chunk(&state).unwrap().unwrap();
+    assert_eq!(
+        int64_rows(std::slice::from_ref(&output)),
+        vec![vec![Some(1)], vec![Some(2)], vec![Some(3)]]
+    );
+    let schema = output.chunk_schema_ref();
+    assert!(schema.is_typed());
+    assert_eq!(schema.slots()[0].field_ref().metadata().capacity(), 0);
+    drop(operator);
+    assert!(tracker.current() > 0);
+    drop(output);
+    assert!(tracker.current() > 0);
+    drop(schema);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn compiled_series_prepare_keeps_typed_first_memory_refusal_without_later_construction() {
+    use crate::exec::operators::compiled_generate_series::CompiledGenerateSeriesProcessorFactory;
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::runtime::fragment::ExecutionFailureCause;
+    use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    let program = compile(literal_source([Some(1), Some(3), Some(1)], true, false), 8);
+    let factory = CompiledGenerateSeriesProcessorFactory::try_new(
+        Arc::clone(&program),
+        program.graph().root(),
+        Arc::new(RuntimeErrorState::default()),
+    )
+    .unwrap();
+    let tracker = MemTracker::new_root("series first schema refusal");
+    let mut operator = factory.create(1, 0);
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        Arc::new(RuntimeErrorState::default()),
+    ));
+    // Install the real factory first. One byte of remaining headroom rejects
+    // preparation's first allocation, rather than failing fixture setup.
+    let installed_bytes = tracker.current();
+    assert!(installed_bytes > 0);
+    tracker.install_limit_once(installed_bytes + 1).unwrap();
+    let error = operator.prepare().unwrap_err();
+    assert!(matches!(
+        error.cause(),
+        ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
+    ));
+    assert_eq!(tracker.current(), installed_bytes);
+    assert!(matches!(
+        operator.prepare().unwrap_err().cause(),
+        ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::InstanceFailed)
+    ));
+    assert!(operator.is_finished());
+    assert_eq!(tracker.current(), installed_bytes);
+    drop(operator);
+    assert_eq!(tracker.current(), 0);
 }

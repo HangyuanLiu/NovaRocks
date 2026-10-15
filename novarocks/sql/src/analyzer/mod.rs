@@ -162,6 +162,35 @@ pub(crate) fn analyze_with_function_catalog_and_sql_semantics(
     ),
     AnalyzeError,
 > {
+    analyze_with_materialized_values_and_sql_semantics(
+        query,
+        catalog,
+        current_database,
+        function_catalog,
+        sql_semantics,
+        constant_policy,
+        control,
+        None,
+    )
+}
+
+pub(crate) fn analyze_with_materialized_values_and_sql_semantics(
+    query: &ast::Query,
+    catalog: &dyn PlannerTableProvider,
+    current_database: &str,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
+    materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
+) -> Result<
+    (
+        ResolvedQuery,
+        crate::analysis::cte::CTERegistry,
+        crate::column_id::ColumnRefFactory,
+    ),
+    AnalyzeError,
+> {
     analyze_with_factory_and_function_catalog_inner(
         query,
         catalog,
@@ -171,6 +200,7 @@ pub(crate) fn analyze_with_function_catalog_and_sql_semantics(
         sql_semantics,
         constant_policy,
         control,
+        materialized,
     )
 }
 
@@ -236,6 +266,7 @@ pub(crate) fn analyze_with_factory_and_function_catalog(
         &crate::sql_mode::SqlSemanticSettings::default(),
         constant_policy,
         control,
+        None,
     )
 }
 
@@ -248,6 +279,7 @@ fn analyze_with_factory_and_function_catalog_inner(
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
+    materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
 ) -> Result<
     (
         ResolvedQuery,
@@ -264,12 +296,29 @@ fn analyze_with_factory_and_function_catalog_inner(
     .map_err(AnalyzeError::control)?;
     let query = crate::sql_mode::normalize_concat_query(query.clone(), sql_semantics)?;
     let query = query_prepass::preanalyze(query)?;
+    let materialized_source = materialized
+        .map(|source| source.loan(&query, control))
+        .transpose()
+        .map_err(|error| match error {
+            crate::compiler::SqlCompileError::Cancelled => {
+                AnalyzeError::control(novarocks_type_contract::CompileControlError::Cancelled)
+            }
+            crate::compiler::SqlCompileError::DeadlineExceeded => AnalyzeError::control(
+                novarocks_type_contract::CompileControlError::DeadlineExceeded,
+            ),
+            crate::compiler::SqlCompileError::ResourceExhausted => AnalyzeError::control(
+                novarocks_type_contract::CompileControlError::ResourceExhausted,
+            ),
+            other => AnalyzeError::internal(other.to_string()),
+        })?;
+    let materialized_values = materialized_source.as_ref().map(|source| source.view());
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
     let ctx = AnalyzerContext {
         catalog,
         current_database,
         function_catalog,
         constant_policy,
+        materialized_values,
         control,
         sql_semantics: sql_semantics.clone(),
         factory: factory.clone(),
@@ -296,6 +345,7 @@ fn analyze_with_factory_and_function_catalog_inner(
 pub(super) struct AnalyzerContext<'a> {
     pub(super) control: &'a crate::compiler::SqlCompileControl,
     pub(super) constant_policy: novarocks_functions::ConstantPolicy,
+    materialized_values: Option<crate::compiler::materialized_values::MaterializedValuesLoan<'a>>,
     pub(super) catalog: &'a dyn PlannerTableProvider,
     pub(super) current_database: &'a str,
     pub(super) function_catalog: &'a dyn crate::compiler::SqlFunctionCatalog,
@@ -340,6 +390,7 @@ impl<'a> AnalyzerContext<'a> {
         let child = AnalyzerContext {
             control: self.control,
             constant_policy: self.constant_policy,
+            materialized_values: self.materialized_values,
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
@@ -415,6 +466,7 @@ impl<'a> AnalyzerContext<'a> {
         let mut child_ctx = AnalyzerContext {
             control: self.control,
             constant_policy: self.constant_policy,
+            materialized_values: self.materialized_values,
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
@@ -675,14 +727,29 @@ impl<'a> AnalyzerContext<'a> {
         values: &ast::Values,
     ) -> Result<(ResolvedValues, Vec<OutputColumn>), AnalyzeError> {
         let scope = self.new_scope(); // VALUES has no table scope
-        let mut resolved_rows = Vec::with_capacity(values.rows.len());
+        let materialized = self
+            .materialized_values
+            .and_then(|source| source.rows_at(values));
+        let row_count = materialized.map_or(values.rows.len(), |rows| rows.len());
+        let mut resolved_rows = Vec::with_capacity(row_count);
         let mut column_types: Vec<novarocks_type_contract::FunctionValueType> = Vec::new();
-
-        for row in &values.rows {
+        for row_idx in 0..row_count {
             self.check_control()?;
-            let mut resolved_row = Vec::with_capacity(row.len());
-            for (col_idx, expr) in row.iter().enumerate() {
-                let typed = self.analyze_expr(expr, &scope)?;
+            let width =
+                materialized.map_or_else(|| values.rows[row_idx].len(), |rows| rows[row_idx].len());
+            let mut resolved_row = Vec::with_capacity(width);
+            for col_idx in 0..width {
+                let typed = match materialized {
+                    Some(rows) => {
+                        self.check_control()?;
+                        let value = &rows[row_idx][col_idx];
+                        TypedExpr {
+                            kind: ExprKind::Constant(value.clone()),
+                            value_type: value.value_type().clone(),
+                        }
+                    }
+                    None => self.analyze_expr(&values.rows[row_idx][col_idx], &scope)?,
+                };
                 if col_idx < column_types.len() {
                     column_types[col_idx] = helpers::assignment_common_value_type(
                         &column_types[col_idx],
@@ -1622,7 +1689,10 @@ impl<'a> AnalyzerContext<'a> {
                 if let ExprKind::ColumnRef { column_id, .. } = &key.kind
                     && nulled_keys.contains(column_id)
                 {
-                    key.value_type.nullable = true;
+                    key.value_type = key
+                        .value_type
+                        .with_nullable(true)
+                        .expect("validated root NULL contract");
                 }
             }
             let mut nulled_outputs = std::collections::HashSet::new();
@@ -1630,13 +1700,20 @@ impl<'a> AnalyzerContext<'a> {
                 if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind
                     && nulled_keys.contains(column_id)
                 {
-                    item.expr.value_type.nullable = true;
+                    item.expr.value_type = item
+                        .expr
+                        .value_type
+                        .with_nullable(true)
+                        .expect("validated root NULL contract");
                     nulled_outputs.insert(item.output_column_id);
                 }
             }
             for column in &mut cols {
                 if nulled_outputs.contains(&column.column_id) {
-                    column.value_type.nullable = true;
+                    column.value_type = column
+                        .value_type
+                        .with_nullable(true)
+                        .expect("validated root NULL contract");
                 }
             }
         }
@@ -1699,7 +1776,7 @@ impl<'a> AnalyzerContext<'a> {
                         || matches!(expr, ast::Expr::Cast(_))
                     {
                         let logical =
-                            self.logical_output_type(Some(expr), &typed, &effective_scope);
+                            self.logical_output_type(Some(expr), &typed, &effective_scope)?;
                         self.factory
                             .borrow_mut()
                             .set_logical_type(column_id, logical);
@@ -1739,7 +1816,7 @@ impl<'a> AnalyzerContext<'a> {
                         || matches!(expr, ast::Expr::Cast(_))
                     {
                         let logical =
-                            self.logical_output_type(Some(expr), &typed, &effective_scope);
+                            self.logical_output_type(Some(expr), &typed, &effective_scope)?;
                         self.factory
                             .borrow_mut()
                             .set_logical_type(column_id, logical);
@@ -4060,14 +4137,14 @@ mod tests {
                 .expect("wide decimal literal should analyze");
 
         assert_eq!(
-            resolved.output_columns[0].value_type.data_type,
+            resolved.output_columns[0].value_type.data_type().clone(),
             DataType::Decimal256(39, 9)
         );
         let QueryBody::Select(select) = &resolved.body else {
             panic!("expected select body");
         };
         assert_eq!(
-            select.projection[0].expr.value_type.data_type,
+            select.projection[0].expr.value_type.data_type().clone(),
             DataType::Decimal256(39, 9)
         );
     }
@@ -4098,14 +4175,17 @@ mod tests {
             DataType::Decimal256(39, 9),
             true,
         )));
-        assert_eq!(resolved.output_columns[0].value_type.data_type, expected);
+        assert_eq!(
+            resolved.output_columns[0].value_type.data_type().clone(),
+            expected
+        );
     }
 
     #[test]
     fn hex_string_literal_analyzes_as_binary() {
         let resolved = parse_raw_and_analyze("SELECT X'AB01'").expect("analysis should succeed");
         assert_eq!(
-            resolved.output_columns[0].value_type.data_type,
+            resolved.output_columns[0].value_type.data_type().clone(),
             DataType::Binary
         );
         let QueryBody::Select(select) = &resolved.body else {
@@ -4353,7 +4433,7 @@ mod tests {
         let spec = only_predicate_spec(sel);
         assert!(matches!(spec.kind, SubqueryKind::Exists { negated: false }));
         assert!(
-            apply_inner_filter(&spec.inner).value_type.data_type
+            *apply_inner_filter(&spec.inner).value_type.data_type()
                 == arrow::datatypes::DataType::Boolean,
             "inner EXISTS filter should retain correlation and residual predicates"
         );
@@ -4415,7 +4495,7 @@ mod tests {
         assert!(
             spec.in_lhs
                 .as_ref()
-                .is_some_and(|lhs| lhs.value_type.nullable)
+                .is_some_and(|lhs| lhs.value_type.nullable())
         );
     }
 
@@ -4943,7 +5023,7 @@ mod tests {
             parse_and_analyze(sql).expect("CASE with scalar subqueries in projection should work");
         assert!(!resolved.output_columns.is_empty());
         assert_eq!(
-            resolved.output_columns[0].value_type.data_type,
+            resolved.output_columns[0].value_type.data_type().clone(),
             arrow::datatypes::DataType::Float64,
             "rewritten CASE scalar-subquery projection should expose the final branch type"
         );
@@ -4951,7 +5031,7 @@ mod tests {
         if let QueryBody::Select(sel) = &resolved.body {
             for item in &sel.projection {
                 assert_eq!(
-                    item.expr.value_type.data_type,
+                    item.expr.value_type.data_type().clone(),
                     arrow::datatypes::DataType::Float64,
                     "projection expression type should be recomputed after placeholder replacement"
                 );
@@ -4972,7 +5052,7 @@ mod tests {
         .expect("analysis should succeed");
         assert_eq!(resolved.output_columns.len(), 1);
         assert!(matches!(
-            resolved.output_columns[0].value_type.data_type,
+            resolved.output_columns[0].value_type.data_type(),
             arrow::datatypes::DataType::List(_)
         ));
     }
@@ -5071,7 +5151,7 @@ mod tests {
         )
         .expect("array_map lambda parameter should resolve in lambda scope");
         assert_eq!(resolved.output_columns.len(), 1);
-        match &resolved.output_columns[0].value_type.data_type {
+        match &resolved.output_columns[0].value_type.data_type() {
             arrow::datatypes::DataType::List(item) => {
                 assert!(matches!(item.data_type(), arrow::datatypes::DataType::Utf8));
             }
@@ -5084,7 +5164,7 @@ mod tests {
         let resolved = parse_raw_and_analyze("SELECT array_map((x, y) -> x + y, [1,2], [3,4])")
             .expect("array_map should analyze multi-parameter lambda");
         assert_eq!(resolved.output_columns.len(), 1);
-        match &resolved.output_columns[0].value_type.data_type {
+        match &resolved.output_columns[0].value_type.data_type() {
             arrow::datatypes::DataType::List(item) => {
                 // StarRocks narrows array literal element types to the
                 // smallest signed integer width (TINYINT for `[1, 2]`),
@@ -5143,7 +5223,7 @@ mod tests {
             .expect("any_match should analyze lambda predicate");
         assert_eq!(resolved.output_columns.len(), 1);
         assert!(matches!(
-            resolved.output_columns[0].value_type.data_type,
+            resolved.output_columns[0].value_type.data_type(),
             arrow::datatypes::DataType::Boolean
         ));
     }
@@ -5976,7 +6056,7 @@ mod tests {
         };
         let expr = &sel.projection[0].expr;
         assert_eq!(
-            expr.value_type.data_type,
+            expr.value_type.data_type().clone(),
             arrow::datatypes::DataType::Boolean
         );
         let ExprKind::WindowCall { name, args, .. } = &expr.kind else {
@@ -5992,7 +6072,7 @@ mod tests {
         };
         assert_eq!(target, &arrow::datatypes::DataType::Boolean);
         assert_eq!(
-            args[0].value_type.data_type,
+            args[0].value_type.data_type().clone(),
             arrow::datatypes::DataType::Boolean
         );
     }
@@ -6008,7 +6088,7 @@ mod tests {
 
         for expr in [&sel.projection[0].expr, &sel.projection[1].expr] {
             assert_eq!(
-                expr.value_type.data_type,
+                expr.value_type.data_type().clone(),
                 arrow::datatypes::DataType::Float64
             );
             let ExprKind::AggregateCall { name, args, .. } = &expr.kind else {
@@ -6026,10 +6106,13 @@ mod tests {
             };
             assert_eq!(target, &arrow::datatypes::DataType::Float64);
             assert_eq!(
-                args[0].value_type.data_type,
+                args[0].value_type.data_type().clone(),
                 arrow::datatypes::DataType::Float64
             );
-            assert_eq!(inner.value_type.data_type, arrow::datatypes::DataType::Utf8);
+            assert_eq!(
+                inner.value_type.data_type().clone(),
+                arrow::datatypes::DataType::Utf8
+            );
         }
     }
 
@@ -6052,10 +6135,13 @@ mod tests {
         };
         assert_eq!(target, &arrow::datatypes::DataType::Utf8);
         assert_eq!(
-            args[0].value_type.data_type,
+            args[0].value_type.data_type().clone(),
             arrow::datatypes::DataType::Utf8
         );
-        assert_eq!(expr.value_type.data_type, arrow::datatypes::DataType::Int64);
+        assert_eq!(
+            expr.value_type.data_type().clone(),
+            arrow::datatypes::DataType::Int64
+        );
     }
 
     #[test]
@@ -6077,11 +6163,11 @@ mod tests {
         };
         assert_eq!(target, &arrow::datatypes::DataType::Utf8);
         assert_eq!(
-            expr.value_type.data_type,
+            expr.value_type.data_type().clone(),
             arrow::datatypes::DataType::Float64
         );
         assert_eq!(
-            args[1].value_type.data_type,
+            args[1].value_type.data_type().clone(),
             arrow::datatypes::DataType::Int64
         );
     }
@@ -6096,11 +6182,11 @@ mod tests {
             panic!("expected Select body");
         };
         assert_eq!(
-            sel.projection[0].expr.value_type.data_type,
+            sel.projection[0].expr.value_type.data_type().clone(),
             arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
         );
         assert_eq!(
-            sel.projection[1].expr.value_type.data_type,
+            sel.projection[1].expr.value_type.data_type().clone(),
             arrow::datatypes::DataType::Date32
         );
     }
@@ -6128,7 +6214,10 @@ mod tests {
             target,
             &arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
         );
-        assert_eq!(expr.value_type.data_type, arrow::datatypes::DataType::Int64);
+        assert_eq!(
+            expr.value_type.data_type().clone(),
+            arrow::datatypes::DataType::Int64
+        );
     }
 
     #[test]
@@ -6138,7 +6227,7 @@ mod tests {
         let QueryBody::Select(sel) = &resolved.body else {
             panic!("expected Select body");
         };
-        let arrow::datatypes::DataType::List(item) = &sel.projection[0].expr.value_type.data_type
+        let arrow::datatypes::DataType::List(item) = &sel.projection[0].expr.value_type.data_type()
         else {
             panic!("expected ARRAY return type");
         };
@@ -6152,11 +6241,11 @@ mod tests {
         assert!(matches!(args[0].kind, ExprKind::Cast { .. }));
         assert!(matches!(args[1].kind, ExprKind::Cast { .. }));
         assert_eq!(
-            args[0].value_type.data_type,
+            args[0].value_type.data_type().clone(),
             arrow::datatypes::DataType::Utf8
         );
         assert_eq!(
-            args[1].value_type.data_type,
+            args[1].value_type.data_type().clone(),
             arrow::datatypes::DataType::Utf8
         );
     }
@@ -6420,8 +6509,11 @@ mod tests {
         assert_eq!(resolved.output_columns.len(), 1);
         let col = &resolved.output_columns[0];
         assert_eq!(col.name, "snapshot_id");
-        assert_eq!(col.value_type.data_type, arrow::datatypes::DataType::Int64);
-        assert!(!col.value_type.nullable);
+        assert_eq!(
+            col.value_type.data_type().clone(),
+            arrow::datatypes::DataType::Int64
+        );
+        assert!(!col.value_type.nullable());
     }
 
     #[test]
@@ -6544,7 +6636,7 @@ mod tests {
         assert_eq!(resolved.output_columns.len(), 1);
         assert_eq!(resolved.output_columns[0].name, "_row_id");
         assert_eq!(
-            resolved.output_columns[0].value_type.data_type,
+            resolved.output_columns[0].value_type.data_type().clone(),
             arrow::datatypes::DataType::Int64
         );
     }
@@ -6883,7 +6975,7 @@ mod tests {
         assert_eq!(select.apply_specs.len(), 1);
         let spec = &select.apply_specs[0];
         assert_eq!(
-            spec.output_column.value_type.data_type,
+            spec.output_column.value_type.data_type().clone(),
             DataType::Float64,
             "AVG scalar subquery output must remain Float64"
         );
@@ -6900,12 +6992,12 @@ mod tests {
         };
 
         assert_eq!(
-            left.value_type.data_type,
+            left.value_type.data_type().clone(),
             DataType::Float64,
             "left INT operand should be widened to Float64 for AVG comparison"
         );
         assert_eq!(
-            right.value_type.data_type,
+            right.value_type.data_type().clone(),
             DataType::Float64,
             "scalar subquery RHS should stay Float64, not cast back to INT"
         );
@@ -7124,7 +7216,7 @@ mod tests {
                     if alias.starts_with("__sq_null_") || alias.starts_with("__sq_any_") {
                         for column in output_columns {
                             if column.name.starts_with("__has_") {
-                                out.push((column.name.clone(), column.value_type.nullable));
+                                out.push((column.name.clone(), column.value_type.nullable()));
                             }
                         }
                     }

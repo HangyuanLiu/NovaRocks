@@ -30,7 +30,9 @@ pub(crate) use lowered_draft::{
 mod expression_occurrences;
 mod source_support;
 pub use source_support::check_pure_call_definitions_observed;
+mod native_writer_preparation;
 mod package_semantics;
+pub use native_writer_preparation::{NativeWriterPreparation, author_native_writer_preparation};
 mod physical_aggregate_occurrences;
 mod physical_aggregate_requests;
 mod physical_call_arguments;

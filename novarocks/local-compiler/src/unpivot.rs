@@ -19,7 +19,6 @@
 //! Input representatives are supplied by the sole channel author. No runtime
 //! capability, constant re-admission, or formal allocation grant is created.
 
-use arrow_schema::Schema;
 use novarocks_functions::ConstantError;
 use novarocks_local_program::{
     LayoutCompileError, ProgramExprId, ProgramNodeId, ProgramNodeKind, StaticLayout,
@@ -263,54 +262,69 @@ pub(crate) fn plan_unpivot_channels(
     })
 }
 
-pub(crate) fn lower_unpivot(
+pub(crate) fn lower_unpivot_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     local: ProgramNodeId,
     input: UnpivotLoweringInput<'_>,
     planned_slots: &[SlotId],
     control: &dyn PureCompileControl,
-) -> Result<(ProgramNodeKind, StaticLayout), UnpivotLoweringError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(package, node, local, input, planned_slots, &mut work);
-    if matches!(&result, Err(UnpivotLoweringError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    let result = lower_core_with_creation(
+        package,
+        node,
+        local,
+        input,
+        planned_slots,
+        &mut work,
+        creation,
+    );
+    crate::creation::finish_attempt(result, work)
 }
 
-fn lower_core(
+fn lower_core_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     local: ProgramNodeId,
     input: UnpivotLoweringInput<'_>,
     planned_slots: &[SlotId],
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(ProgramNodeKind, StaticLayout), UnpivotLoweringError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
     let fragment = package.fragment();
     let NodeKind::Unpivot { spec } = &node.kind else {
-        return Err(UnpivotLoweringError::Invalid("Unpivot source kind differs"));
+        return Err((UnpivotLoweringError::Invalid("Unpivot source kind differs")).into());
     };
     if node.inputs.len() != 1
         || spec.mappings.is_empty()
         || planned_slots.len() != node.output.columns.len()
     {
-        return Err(UnpivotLoweringError::Invalid(
-            "Unpivot materialized shape differs",
-        ));
+        return Err((UnpivotLoweringError::Invalid("Unpivot materialized shape differs")).into());
     }
     let child = &fragment.nodes()[&node.inputs[0]];
     if child.output.columns.len() != input.layout.slots().len() {
-        return Err(UnpivotLoweringError::Invalid(
-            "Unpivot child layout width differs",
-        ));
+        return Err((UnpivotLoweringError::Invalid("Unpivot child layout width differs")).into());
     }
     for (ordinal, &value) in child.output.columns.iter().enumerate() {
         work.flush()?;
-        let actual = FunctionValueType::try_from_field(input.layout.schema().field(ordinal))?;
+        let actual =
+            input
+                .layout
+                .value_binding_at(ordinal)
+                .ok_or(UnpivotLoweringError::Invalid(
+                    "Unpivot child has no complete value binding",
+                ))?;
+        if !actual.exactly_equals_observed::<UnpivotLoweringError>(
+            value_type(fragment, value)?.typed_binding(),
+            || work.step().map_err(Into::into),
+        )? {
+            return Err(
+                (UnpivotLoweringError::Invalid("Unpivot complete value types differ")).into(),
+            );
+        }
         work.flush()?;
-        exact_type(&actual, value_type(fragment, value)?, work)?;
         work.step()?;
     }
     let mut outputs = BTreeMap::new();
@@ -318,9 +332,9 @@ fn lower_core(
         let old = outputs.insert(value, ordinal);
         work.step()?;
         if old.is_some() {
-            return Err(UnpivotLoweringError::Invalid(
-                "duplicate Unpivot output occurrence",
-            ));
+            return Err(
+                (UnpivotLoweringError::Invalid("duplicate Unpivot output occurrence")).into(),
+            );
         }
     }
     let output_slot = |value| {
@@ -370,24 +384,29 @@ fn lower_core(
     for mapping in &spec.mappings {
         let input_value_slot_id = source_slot(input.sources, mapping.input, work)?;
         if mapping.constants.len() != spec.literal_outputs.len() {
-            return Err(UnpivotLoweringError::Invalid(
-                "Unpivot constant width differs",
-            ));
+            return Err((UnpivotLoweringError::Invalid("Unpivot constant width differs")).into());
         }
         // Nullability is authored as an OR across mappings, so each source
         // keeps its complete domain and may only widen to that output root.
         work.flush()?;
         let source_type = value_type(fragment, mapping.input)?;
         let output_type = value_type(fragment, spec.value_output)?;
-        if source_type.nullable && !output_type.nullable {
-            return Err(UnpivotLoweringError::Invalid(
+        if source_type.nullable() && !output_type.nullable() {
+            return Err((UnpivotLoweringError::Invalid(
                 "Unpivot mapping narrows source nullability",
-            ));
+            ))
+            .into());
         }
-        let mut source = source_type.clone();
-        source.nullable = output_type.nullable;
+        if !source_type
+            .same_physical_binding_ignoring_root_nullability_observed(output_type, || {
+                work.step().map_err(UnpivotLoweringError::from)
+            })?
+        {
+            return Err(
+                (UnpivotLoweringError::Invalid("Unpivot complete value types differ")).into(),
+            );
+        }
         work.flush()?;
-        exact_type(&source, value_type(fragment, spec.value_output)?, work)?;
         let mut constants = Vec::new();
         for (constant, &output) in mapping.constants.iter().zip(&spec.literal_outputs) {
             let lowered = match constant {
@@ -406,26 +425,37 @@ fn lower_core(
                     let expr_id = input.expressions.get(id).copied();
                     work.step()?;
                     if !valid {
-                        return Err(UnpivotLoweringError::Invalid(
+                        return Err((UnpivotLoweringError::Invalid(
                             "Unpivot scalar source is not a static constant",
-                        ));
+                        ))
+                        .into());
                     }
                     work.flush()?;
                     let output_type = value_type(fragment, output)?;
-                    if definition.ty.nullable && !output_type.nullable {
-                        return Err(UnpivotLoweringError::Invalid(
+                    if definition.ty.nullable() && !output_type.nullable() {
+                        return Err((UnpivotLoweringError::Invalid(
                             "Unpivot constant narrows source nullability",
-                        ));
+                        ))
+                        .into());
                     }
-                    let mut expected = definition.ty.clone();
-                    expected.nullable = output_type.nullable;
+                    if !definition
+                        .ty
+                        .same_physical_binding_ignoring_root_nullability_observed(
+                            output_type,
+                            || work.step().map_err(UnpivotLoweringError::from),
+                        )?
+                    {
+                        return Err((UnpivotLoweringError::Invalid(
+                            "Unpivot constant complete value types differ",
+                        ))
+                        .into());
+                    }
                     work.flush()?;
-                    exact_type(&expected, value_type(fragment, output)?, work)?;
                     UnpivotConstant::Scalar {
                         expr_id: expr_id.ok_or(UnpivotLoweringError::Invalid(
                             "missing lowered Unpivot constant",
                         ))?,
-                        nullable: definition.ty.nullable,
+                        nullable: definition.ty.nullable(),
                     }
                 }
                 SourceConstant::Int32List(reference) => {
@@ -500,43 +530,28 @@ fn lower_core(
             }
         }
     }
-    let mut fields = Vec::new();
-    let mut original_fields = input.layout.metadata_materializations().map(|_| Vec::new());
+    let mut typed_layout = crate::typed_layout::TypedLayoutBuilder::new_with_creation(
+        planned_slots.len(),
+        work,
+        creation,
+    )?;
     for (ordinal, &value) in node.output.columns.iter().enumerate() {
         let name = result_names
             .and_then(|r| r.fields.get(ordinal))
             .map(|f| f.alias.as_deref().unwrap_or(&f.name));
         work.flush()?;
-        if let Some(original_fields) = original_fields.as_mut() {
-            let field = if let Some(source) = source_fields.get(&value) {
-                let mut field = novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::clone_from_source(source, input.layout.metadata_materializations());
-                if let Some(name) = name {
-                    field = field.with_name_owned(name);
-                }
-                field
-            } else {
-                novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::Materialized(novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(
-                    value_type(fragment, value)?, name.map(str::to_owned).unwrap_or_else(|| format!("local_{}_{}", local.index(), ordinal)),
-                )?)
+        let name =
+            match name.or_else(|| source_fields.get(&value).map(|field| field.name().as_str())) {
+                Some(name) => crate::typed_layout::copy_name_with_creation(name, work, creation)?,
+                None => crate::typed_layout::local_name_with_creation(
+                    "local",
+                    local.index(),
+                    ordinal,
+                    work,
+                    creation,
+                )?,
             };
-            work.flush()?;
-            original_fields.push(field);
-        } else {
-            let field = if let Some(source) = source_fields.get(&value) {
-                let mut field = (***source).clone();
-                if let Some(name) = name {
-                    field = field.with_name(name);
-                }
-                field
-            } else {
-                value_type(fragment, value)?.try_to_field(
-                    name.map(str::to_owned)
-                        .unwrap_or_else(|| format!("local_{}_{}", local.index(), ordinal)),
-                )?
-            };
-            work.flush()?;
-            fields.push(field);
-        }
+        typed_layout.push_with_creation(value_type(fragment, value)?, name, work, creation)?;
         work.step()?;
     }
     let max_output_rows = usize::try_from(spec.max_output_rows)
@@ -544,32 +559,10 @@ fn lower_core(
     let max_output_bytes = usize::try_from(spec.max_output_bytes)
         .map_err(|_| UnpivotLoweringError::Invalid("Unpivot byte bound exceeds host range"))?;
     if max_output_rows == 0 || max_output_bytes == 0 {
-        return Err(UnpivotLoweringError::Invalid("Unpivot bounds are zero"));
+        return Err((UnpivotLoweringError::Invalid("Unpivot bounds are zero")).into());
     }
     work.flush()?;
-    let (schema, original_schema) = match (
-        original_fields,
-        input.layout.metadata_materializations(),
-    ) {
-        (Some(fields), Some(source)) => {
-            let inherited = source.field_namespace();
-            let namespace = match package.original_metadata_namespace() {
-                Some(package_source) => inherited.join_original_observed(package_source, work)?,
-                None => inherited,
-            };
-            let original = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::from_original_fields(fields, namespace).into_original_schema();
-            (original.schema_owner().schema().clone(), Some(original))
-        }
-        _ => (Arc::new(Schema::new(fields)), None),
-    };
-    let slots = Arc::from(planned_slots);
-    work.flush()?;
-    let layout = match original_schema {
-        Some(source) => {
-            StaticLayout::try_new_materialized_for_compile(source, slots, work.control())?
-        }
-        None => StaticLayout::try_new_for_compile(schema, slots, work.control())?,
-    };
+    let layout = typed_layout.finish_with_creation(planned_slots, work, creation)?;
     Ok((
         ProgramNodeKind::Unpivot {
             input: input.node,
@@ -591,7 +584,7 @@ fn special_source_domain(
     output: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), UnpivotLoweringError> {
-    let nonnullable = !source.nullable;
+    let nonnullable = !source.nullable();
     work.step()?;
     if !nonnullable {
         return Err(UnpivotLoweringError::Invalid(

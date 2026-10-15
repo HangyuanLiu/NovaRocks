@@ -30,8 +30,109 @@ fn list(values: ArrayRef, offsets: Vec<i32>, valid: Option<Vec<bool>>) -> ArrayR
         valid.map(NullBuffer::from),
     ))
 }
+
 #[test]
-fn pure_differential_array_match_both_real_overloads_all_primitive_castable_shapes() {
+fn pure_differential_array_match_both_real_overloads_encoded_and_fixed_singleton_items() {
+    let dictionary: ArrayRef = Arc::new(
+        DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![Some(1), None, Some(0), Some(1)]),
+            Arc::new(StringArray::from(vec!["false", "true"])),
+        )
+        .unwrap(),
+    );
+    let fixed: ArrayRef = Arc::new(
+        FixedSizeListArray::try_new(
+            Arc::new(Field::new("inner", DataType::Int64, true)),
+            1,
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(0), Some(1)])),
+            None,
+        )
+        .unwrap(),
+    );
+    for name in ["all_match", "any_match"] {
+        for values in [dictionary.clone(), fixed.clone()] {
+            assert_scalar_matches_v1(ScalarDiffSpec::new(name).column(list(
+                values,
+                vec![0, 2, 4],
+                None,
+            )));
+        }
+    }
+}
+
+#[test]
+fn pure_differential_array_match_both_real_overloads_run_and_union_projection() {
+    let run_values = Int64Array::from(vec![Some(1), None, Some(0)]);
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(
+            RunArray::<Int16Type>::try_new(&Int16Array::from(vec![1, 2, 4]), &run_values).unwrap(),
+        ),
+        Arc::new(
+            RunArray::<Int32Type>::try_new(&Int32Array::from(vec![1, 2, 4]), &run_values).unwrap(),
+        ),
+        Arc::new(
+            RunArray::<Int64Type>::try_new(&Int64Array::from(vec![1, 2, 4]), &run_values).unwrap(),
+        ),
+        // Arrow's original union cast resolves the exact BOOLEAN child and projects NULL for other ids.
+        Arc::new(
+            UnionArray::try_new(
+                UnionFields::try_new(
+                    [7, 3],
+                    [
+                        Arc::new(Field::new("boolean", DataType::Boolean, true)),
+                        Arc::new(Field::new("text", DataType::Utf8, true)),
+                    ],
+                )
+                .unwrap(),
+                vec![7i8, 3, 7, 7].into(),
+                Some(vec![0i32, 0, 1, 2].into()),
+                vec![
+                    Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
+                    Arc::new(StringArray::from(vec!["true"])),
+                ],
+            )
+            .unwrap(),
+        ),
+        Arc::new(
+            UnionArray::try_new(
+                UnionFields::try_new(
+                    [7, 3],
+                    [
+                        Arc::new(Field::new("boolean", DataType::Boolean, true)),
+                        Arc::new(Field::new("text", DataType::Utf8, true)),
+                    ],
+                )
+                .unwrap(),
+                vec![7i8, 3, 7, 7].into(),
+                None,
+                vec![
+                    Arc::new(BooleanArray::from(vec![
+                        Some(true),
+                        None,
+                        None,
+                        Some(false),
+                    ])),
+                    Arc::new(StringArray::from(vec!["false", "true", "false", "false"])),
+                ],
+            )
+            .unwrap(),
+        ),
+    ];
+    for name in ["all_match", "any_match"] {
+        for values in &arrays {
+            let a = list(values.clone(), vec![0, 2, 4], None);
+            for a in [a.clone(), a.slice(1, 1), a.slice(0, 0)] {
+                assert_scalar_matches_v1(ScalarDiffSpec::new(name).column(a));
+            }
+        }
+    }
+}
+
+// Raw owner/profile and prepared-source replacement passed before retirement
+// of the superseded engine-ingress mismatch witnesses.
+#[test]
+fn pure_differential_array_match_both_real_overloads_all_primitive_castable_shapes_prepared_plain_views()
+ {
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(BooleanArray::from(vec![
             Some(true),
@@ -134,111 +235,43 @@ fn pure_differential_array_match_both_real_overloads_all_primitive_castable_shap
         ])
         .unwrap(),
     ];
+    let declarations = [
+        DataType::Boolean,
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::UInt8,
+        DataType::UInt16,
+        DataType::UInt32,
+        DataType::UInt64,
+        DataType::Float16,
+        DataType::Float32,
+        DataType::Float64,
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Utf8View,
+        DataType::Null,
+        DataType::FixedSizeBinary(16),
+    ];
+    assert_eq!(declarations.len(), arrays.len());
     for name in ["all_match", "any_match"] {
-        for values in &arrays {
+        for (item_type, values) in declarations.iter().zip(&arrays) {
             let a = list(
                 values.clone(),
                 vec![0, 2, 2, 3, 4],
                 Some(vec![true, true, false, true]),
             );
             for a in [a.clone(), a.slice(1, 3), a.slice(0, 0)] {
-                assert_scalar_matches_v1(ScalarDiffSpec::new(name).column(a));
-            }
-        }
-    }
-}
-#[test]
-fn pure_differential_array_match_both_real_overloads_encoded_and_fixed_singleton_items() {
-    let dictionary: ArrayRef = Arc::new(
-        DictionaryArray::<Int8Type>::try_new(
-            Int8Array::from(vec![Some(1), None, Some(0), Some(1)]),
-            Arc::new(StringArray::from(vec!["false", "true"])),
-        )
-        .unwrap(),
-    );
-    let fixed: ArrayRef = Arc::new(
-        FixedSizeListArray::try_new(
-            Arc::new(Field::new("inner", DataType::Int64, true)),
-            1,
-            Arc::new(Int64Array::from(vec![Some(1), None, Some(0), Some(1)])),
-            None,
-        )
-        .unwrap(),
-    );
-    for name in ["all_match", "any_match"] {
-        for values in [dictionary.clone(), fixed.clone()] {
-            assert_scalar_matches_v1(ScalarDiffSpec::new(name).column(list(
-                values,
-                vec![0, 2, 4],
-                None,
-            )));
-        }
-    }
-}
-
-#[test]
-fn pure_differential_array_match_both_real_overloads_run_and_union_projection() {
-    let run_values = Int64Array::from(vec![Some(1), None, Some(0)]);
-    let arrays: Vec<ArrayRef> = vec![
-        Arc::new(
-            RunArray::<Int16Type>::try_new(&Int16Array::from(vec![1, 2, 4]), &run_values).unwrap(),
-        ),
-        Arc::new(
-            RunArray::<Int32Type>::try_new(&Int32Array::from(vec![1, 2, 4]), &run_values).unwrap(),
-        ),
-        Arc::new(
-            RunArray::<Int64Type>::try_new(&Int64Array::from(vec![1, 2, 4]), &run_values).unwrap(),
-        ),
-        // Arrow's original union cast resolves the exact BOOLEAN child and projects NULL for other ids.
-        Arc::new(
-            UnionArray::try_new(
-                UnionFields::try_new(
-                    [7, 3],
-                    [
-                        Arc::new(Field::new("boolean", DataType::Boolean, true)),
-                        Arc::new(Field::new("text", DataType::Utf8, true)),
-                    ],
-                )
-                .unwrap(),
-                vec![7i8, 3, 7, 7].into(),
-                Some(vec![0i32, 0, 1, 2].into()),
-                vec![
-                    Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
-                    Arc::new(StringArray::from(vec!["true"])),
-                ],
-            )
-            .unwrap(),
-        ),
-        Arc::new(
-            UnionArray::try_new(
-                UnionFields::try_new(
-                    [7, 3],
-                    [
-                        Arc::new(Field::new("boolean", DataType::Boolean, true)),
-                        Arc::new(Field::new("text", DataType::Utf8, true)),
-                    ],
-                )
-                .unwrap(),
-                vec![7i8, 3, 7, 7].into(),
-                None,
-                vec![
-                    Arc::new(BooleanArray::from(vec![
-                        Some(true),
-                        None,
-                        None,
-                        Some(false),
-                    ])),
-                    Arc::new(StringArray::from(vec!["false", "true", "false", "false"])),
-                ],
-            )
-            .unwrap(),
-        ),
-    ];
-    for name in ["all_match", "any_match"] {
-        for values in &arrays {
-            let a = list(values.clone(), vec![0, 2, 4], None);
-            for a in [a.clone(), a.slice(1, 1), a.slice(0, 0)] {
-                assert_scalar_matches_v1(ScalarDiffSpec::new(name).column(a));
+                super::assert_scalar_matches_v1_with_plain_views(
+                    ScalarDiffSpec::new(name).typed_column(
+                        FunctionValueType::new(
+                            DataType::List(Arc::new(Field::new("item", item_type.clone(), true))),
+                            true,
+                        ),
+                        a,
+                    ),
+                );
             }
         }
     }

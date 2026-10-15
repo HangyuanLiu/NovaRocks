@@ -110,10 +110,10 @@ fn check(sql: &str, group_concat: bool, mode: SqlPhysicalEmissionMode) {
                 else {
                     panic!("the real -k ORDER channel has no constant backing")
                 };
-                assert_eq!(value_type.data_type, DataType::Int8);
-                assert_eq!(
-                    value_type.nullable, exact,
-                    "own ORDER request {sql} site {site:?}"
+                assert_eq!(value_type.data_type().clone(), DataType::Int8);
+                assert!(
+                    value_type.nullable(),
+                    "both modes retain the checked -k NULL guarantee in their own ORDER request {sql} site {site:?}"
                 );
                 let FunctionArgumentType::Value(bound) =
                     &call.binding.function.argument_types[logical]

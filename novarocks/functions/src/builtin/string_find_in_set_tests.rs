@@ -713,7 +713,7 @@ fn string_find_in_set_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects
         for source in [
             FunctionValueType::new(DataType::LargeUtf8, true),
             FunctionValueType::new(DataType::Binary, true),
-            FunctionValueType::new(
+            FunctionValueType::from_legacy_declared_projection(
                 DataType::List(Arc::new(arrow_schema::Field::new(
                     "item",
                     DataType::Int64,
@@ -740,7 +740,7 @@ fn string_find_in_set_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects
 fn string_find_in_set_compile_success_and_ordinary_tail_preserve_all_callback_causes() {
     for ty in [source(true), FunctionValueType::new(DataType::Binary, true)] {
         let good = CompileControl::default();
-        let success = ty.data_type == DataType::Utf8;
+        let success = ty.data_type() == &DataType::Utf8;
         assert_eq!(
             prepared_for_test_with_control(
                 "find_in_set",

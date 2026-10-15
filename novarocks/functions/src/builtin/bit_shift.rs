@@ -57,18 +57,18 @@ pub(super) fn evaluate_shift<'a>(
         return Err(invalid("shift requires two evaluated arguments"));
     };
     let target = input.contract().result_type();
-    if count.logical_type != ValueLogicalType::Physical
-        || count.data_type != DataType::Int64
-        || target.logical_type != source.logical_type
-        || target.data_type != source.data_type
-        || !target.nullable
+    if count.logical_type() != ValueLogicalType::Physical
+        || count.data_type() != &DataType::Int64
+        || target.logical_type() != source.logical_type()
+        || target.data_type() != source.data_type()
+        || !target.nullable()
     {
         return Err(invalid(
             "shift types differ from their exact installed profile",
         ));
     }
-    if left.array().data_type() != &source.data_type
-        || right.array().data_type() != &count.data_type
+    if left.array().data_type() != source.data_type()
+        || right.array().data_type() != count.data_type()
     {
         return Err(internal("shift carrier differs from its checked argument"));
     }
@@ -84,7 +84,7 @@ pub(super) fn evaluate_shift<'a>(
         count,
         counts,
     };
-    let values = match (&source.logical_type, &source.data_type) {
+    let values = match (&source.logical_type(), source.data_type()) {
         (ValueLogicalType::Physical, DataType::Int8) => {
             primitive::<Int8Type>(operation, &input, arguments, control)?
         }
@@ -106,8 +106,13 @@ pub(super) fn evaluate_shift<'a>(
             ));
         }
     };
-    SelectedValues::try_new(input.selection(), &target.data_type, values, Box::default())
-        .map_err(|_| internal("shift compact output violates its selected contract"))
+    SelectedValues::try_new(
+        input.selection(),
+        target.data_type(),
+        values,
+        Box::default(),
+    )
+    .map_err(|_| internal("shift compact output violates its selected contract"))
 }
 
 /// Each side owns its mapping and SQL NULL contract. Check both addresses and
@@ -136,7 +141,7 @@ impl ShiftArguments<'_, '_> {
         }
         let left_null = self.left.array().is_null(left_row);
         let right_null = self.right.array().is_null(right_row);
-        if (left_null && !self.source.nullable) || (right_null && !self.count.nullable) {
+        if (left_null && !self.source.nullable()) || (right_null && !self.count.nullable()) {
             return Err(internal(
                 "shift non-null argument contains selected SQL NULL",
             ));
@@ -191,7 +196,7 @@ where
     )?;
     let values = crate::bit_array::finish_i64_observed(
         values,
-        Some(&input.contract().result_type().data_type),
+        Some(input.contract().result_type().data_type()),
         &mut observe,
     )?
     .map_err(|error| internal(&error.legacy_message("shift")))?;
@@ -241,7 +246,7 @@ fn largeint(
     )?;
     let values = crate::bit_array::cast_largeint_output_observed(
         &values,
-        Some(&input.contract().result_type().data_type),
+        Some(input.contract().result_type().data_type()),
         &mut observe,
     )?
     .map_err(|_| internal("shift LargeInt output has an incorrect byte width"))?;

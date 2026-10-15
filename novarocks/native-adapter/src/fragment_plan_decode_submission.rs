@@ -35,12 +35,14 @@ use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 use novarocks_spi::connector::ConnectorStopView;
 
-use crate::fragment_validation::{validate_fragment_expressions, validate_node_required_fields};
+use crate::fragment_validation::{
+    validate_fragment_expressions_with_types, validate_node_required_fields_with_types,
+};
 
 use crate::fragment_decode_context::NativePlanDecodeContext;
 use crate::fragment_error::NativeFragmentDecodeError;
 use crate::fragment_instance::{NativeFragmentInstanceInput, task_scan_ranges_path};
-use crate::fragment_layout::decode_exchange_contracts;
+
 use crate::fragment_plan_decode::decode_node_with_runtime_filters;
 use crate::fragment_runtime_filter::decode_runtime_filter_contract;
 use crate::fragment_runtime_filter_binding::NativeRuntimeFilterDecodeLedger;
@@ -81,10 +83,54 @@ pub(crate) fn decode_fragment_submission(
     #[cfg(feature = "test-controls")] observation_controls: Option<
         Arc<crate::test_observation_controls::NativeObservationControls>,
     >,
+    type_creation: &crate::native_type_construction::NativeTypeConstruction,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
+    let mut type_resources =
+        crate::fragment_type_decode::NativeDecodeResources::try_new(type_creation)?;
+    type_resources.bind_function_catalog(function_catalog.as_ref());
+    // Keep the original envelope error order after the creator's initial
+    // control observation, before building a type table for a missing root.
     let root_path = FieldPath::root("plan_fragment").field("root");
     let root = require_root(fragment).map_err(NativeFragmentDecodeError::from)?;
-    validate_node_required_fields(root, root_path.clone())
+    let source_types =
+        crate::fragment_type_decode::decode_fragment_type_owner(fragment, &mut type_resources)?;
+    let original_requests = crate::fragment_original_sources::decode_original_requests(
+        fragment,
+        &source_types,
+        &mut type_resources,
+    )?;
+    type_resources
+        .work
+        .step()
+        .map_err(crate::native_type_construction::NativeTypeConstructionError::Control)?;
+    let writer_parameters = if let Some(source) = fragment.writer_semantic_parameters.as_ref() {
+        let host = type_resources.creation;
+        let mut request = |layout| host.request_layout(layout);
+        let mut opaque = |bytes| host.request_opaque_upper_bound(bytes);
+        let mut creator = novarocks_type_contract::ValueSchemaCreation::new(
+            type_resources.storage(),
+            &mut request,
+            &mut opaque,
+        );
+        Some(novarocks_plan_codec::physical_semantics_v2::decode_writer_semantic_parameters_with_creator_in(
+            source, &mut creator, &mut type_resources.work,
+        ).map_err(|error| match error {
+            novarocks_plan_codec::host_projection_v2::ProjectionFailure::Host(cause) => NativeFragmentDecodeError::from(cause),
+            novarocks_plan_codec::host_projection_v2::ProjectionFailure::Codec(novarocks_plan_codec::physical_semantics_v2::SemanticsCodecError::Control(cause)) => crate::native_type_construction::NativeTypeConstructionError::Control(cause).into(),
+            novarocks_plan_codec::host_projection_v2::ProjectionFailure::Codec(cause) => NativeFragmentDecodeError::invalid_value(FieldPath::root("plan_fragment").field("writer_semantic_parameters"), cause),
+        })?)
+    } else {
+        None
+    };
+    let context_requests = original_requests.clone();
+    let execution_types = &source_types.execution;
+    let mut type_decoder = crate::fragment_type_decode::NativeTypeDecoder::Strong {
+        types: execution_types,
+        original_requests: Some(original_requests.as_ref()),
+        resources: &mut type_resources,
+    };
+
+    validate_node_required_fields_with_types(root, root_path.clone(), &mut type_decoder)
         .map_err(NativeFragmentDecodeError::from)?;
     let sink = require_sink(fragment).map_err(NativeFragmentDecodeError::from)?;
     if sink.kind.is_none() {
@@ -93,7 +139,8 @@ pub(crate) fn decode_fragment_submission(
             "native DataSink requires kind",
         ));
     }
-    validate_fragment_expressions(fragment).map_err(NativeFragmentDecodeError::from)?;
+    validate_fragment_expressions_with_types(fragment, &mut type_decoder)
+        .map_err(NativeFragmentDecodeError::from)?;
 
     let scan_sources = decode_scan_source_contracts(root, root_path.clone())
         .map_err(NativeFragmentDecodeError::from)?;
@@ -124,20 +171,30 @@ pub(crate) fn decode_fragment_submission(
     )
     .with_backend_process_id(instance.backend_process_id)
     .with_typed_scan_runtime(typed_scan_runtime)
-    .with_function_catalog(function_catalog);
+    .with_function_catalog(Arc::clone(&function_catalog))
+    .with_original_requests(context_requests)
+    .with_writer_parameters(writer_parameters);
     #[cfg(feature = "test-controls")]
     let context = context
         .with_test_controls(test_controls)
         .with_observation_controls(observation_controls);
-    let mut ledger = NativeRuntimeFilterDecodeLedger::decode(
+    let mut ledger = NativeRuntimeFilterDecodeLedger::decode_with_types(
         fragment.fragment_id,
         fragment.runtime_filter_bindings.as_ref(),
+        &mut type_decoder,
     )?;
-    let decoded_root = decode_node_with_runtime_filters(root, &mut arena, &context, &mut ledger)?;
+    let decoded_root = decode_node_with_runtime_filters(
+        root,
+        &mut arena,
+        &context,
+        &mut ledger,
+        &mut type_decoder,
+    )?;
     ledger.finish()?;
     let scan_assignments = ScanAssignments::try_new(context.take_captured_scan_ranges())
         .map_err(NativeFragmentDecodeError::Binding)?;
-    let sink_program = decode_fragment_sink_program(fragment, &decoded_root.layout)?;
+    let sink_program =
+        decode_fragment_sink_program(fragment, &decoded_root.layout, &mut type_decoder)?;
     let static_sink = sink_program.into_static().map_err(|error| {
         NativeFragmentDecodeError::invalid_value(
             FieldPath::root("plan_fragment").field("sink"),
@@ -167,6 +224,7 @@ pub(crate) fn decode_fragment_submission(
             &fragment.output_columns,
             &mut arena,
             root.node_id,
+            &mut type_decoder,
         )?
     } else {
         decoded_root
@@ -201,32 +259,42 @@ pub(crate) fn decode_fragment_submission(
                 "effective pipeline DOP must be positive",
             )
         })?;
+    let layout_temporary = type_creation.begin_scope()?;
+    let mut temporary_requests = |layout| layout_temporary.request_layout(layout);
+    let mut layout_requests = |layout| type_creation.request_layout(layout);
+    let mut layout_creation = novarocks_execution::exec::node::LocalLayoutCreation::new(
+        type_creation.storage_lifetime(),
+        &mut layout_requests,
+        &mut temporary_requests,
+        type_creation,
+    );
     let profile = plan
-        .local_compile_profile(effective_dop, None)
+        .local_compile_profile_with_creator(effective_dop, None, &mut layout_creation)
         .map_err(|error| {
-            NativeFragmentDecodeError::invalid_value(
-                FieldPath::root("plan_fragment").field("root"),
+            crate::fragment_type_decode::lowering_failure(
                 error,
+                FieldPath::root("plan_fragment").field("root"),
             )
         })?;
     let (local_program, runtime_bindings) = plan
-        .into_local_program_and_bindings(
+        .into_local_program_and_bindings_with_creator(
             profile,
             context.take_captured_static_scans(),
             sink_requirements,
             static_sink,
+            layout_creation,
         )
         .map_err(|error| {
-            NativeFragmentDecodeError::invalid_value(
-                FieldPath::root("plan_fragment").field("root"),
+            crate::fragment_type_decode::lowering_failure(
                 error,
+                FieldPath::root("plan_fragment").field("root"),
             )
         })?;
-    let program = FragmentProgram::try_new(
+    let program = FragmentProgram::try_new_with_exchange_inputs(
         Arc::new(local_program),
         FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
         scan_sources,
-        decode_exchange_contracts(root, root_path).map_err(NativeFragmentDecodeError::from)?,
+        type_decoder.exchange_contracts(root, root_path)?,
         decode_runtime_filter_contract(fragment).map_err(NativeFragmentDecodeError::from)?,
     )
     .map_err(NativeFragmentDecodeError::Binding)?;
@@ -245,6 +313,8 @@ pub(crate) fn decode_fragment_submission(
     let submission =
         FragmentSubmission::try_new(Arc::new(program), runtime_bindings, fragment_instance)
             .map_err(NativeFragmentDecodeError::Binding)?;
+    drop(type_decoder);
+    type_resources.finish()?;
     Ok(DecodedNativeFragment {
         submission,
         backend_num,
@@ -281,13 +351,59 @@ mod tests {
 
     use super::{DecodedNativeFragment, NativeFragmentDecodeError, decode_fragment_submission};
     use crate::fragment_instance::NativeFragmentInstanceInput;
-    use novarocks_plan_codec::encode_native_type as encode_type;
+    struct FixtureSourceControl;
+    impl novarocks_type_contract::PureCompileControl for FixtureSourceControl {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+    fn int32_reference() -> common::TypeDesc {
+        common::TypeDesc {
+            value_binding_id: Some(0),
+        }
+    }
+    fn fixture_execution_types() -> plan::ExecutionTypeTable {
+        use novarocks_plan_codec::execution_type_table::{
+            ExecutionTypeRoot, ExecutionTypeTableBuilder, ExecutionTypeTableLimits,
+        };
+        let source = novarocks_functions::FunctionValueType::new(DataType::Int32, false);
+        let predicate = novarocks_functions::FunctionValueType::new(DataType::Boolean, false);
+        let roots = [
+            ExecutionTypeRoot {
+                id: 0,
+                value: &source,
+            },
+            ExecutionTypeRoot {
+                id: 1,
+                value: &predicate,
+            },
+        ];
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            &FixtureSourceControl,
+            novarocks_type_contract::CompilePhase::Encode,
+        )
+        .unwrap();
+        let table = ExecutionTypeTableBuilder::new(&roots)
+            .encode_observed::<std::convert::Infallible>(
+                ExecutionTypeTableLimits::for_validated_root_count(roots.len()).unwrap(),
+                &mut |_| Ok(()),
+                &mut work,
+            )
+            .unwrap()
+            .into_wire();
+        work.finish().unwrap();
+        table
+    }
 
     fn output_column(column_id: u32) -> common::OutputColumn {
         common::OutputColumn {
             column_id,
             name: "value".to_string(),
-            r#type: Some(encode_type(&DataType::Int32).expect("encode type")),
+            r#type: Some(int32_reference()),
             nullable: false,
             is_internal: false,
         }
@@ -295,7 +411,8 @@ mod tests {
 
     fn column_ref(column_id: u32) -> expr::Expr {
         expr::Expr {
-            r#type: Some(encode_type(&DataType::Int32).expect("encode type")),
+            original_definition_id: None,
+            r#type: Some(int32_reference()),
             nullable: false,
             kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
                 column_id,
@@ -308,6 +425,15 @@ mod tests {
     fn values_noop_fragment() -> plan::PlanFragment {
         let columns = vec![output_column(1)];
         plan::PlanFragment {
+            execution_types: Some(fixture_execution_types()),
+            constant_source_fields: Some(
+                crate::fragment_expression::fixture_sources::empty_source_fields(),
+            ),
+            original_call_requests: Some(
+                novarocks_proto_models::call_request::FragmentCallRequests {
+                    entries: Vec::new(),
+                },
+            ),
             fragment_id: 7,
             root: Some(plan::DistributedNode {
                 node_id: 11,
@@ -367,11 +493,22 @@ mod tests {
         instance: NativeFragmentInstanceInput,
         topology: &ExchangeTopology,
     ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
+        let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+            "native fragment fixture",
+        );
+        tracker.install_limit_once(1024 * 1024).unwrap();
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let creator = crate::native_type_construction::NativeTypeConstruction::try_new(
+            tracker,
+            stop.view(),
+            novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+        )
+        .unwrap();
         decode_fragment_submission(
             fragment,
             instance,
             topology,
-            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            stop.view(),
             Duration::from_secs(1),
             None,
             Arc::new(
@@ -382,6 +519,7 @@ mod tests {
             None,
             #[cfg(feature = "test-controls")]
             None,
+            &creator,
         )
     }
 
@@ -562,9 +700,13 @@ mod tests {
         };
         values.rows.push(plan::ExprList {
             values: vec![expr::Expr {
-                r#type: Some(encode_type(&DataType::Boolean).expect("encode type")),
+                original_definition_id: None,
+                r#type: Some(common::TypeDesc {
+                    value_binding_id: Some(1),
+                }),
                 nullable: false,
                 kind: Some(expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                    allow_throw_exception: None,
                     decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                     op: expr::BinaryOp::Eq as i32,
                     left: None,

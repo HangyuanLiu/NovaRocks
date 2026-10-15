@@ -89,9 +89,12 @@ fn namespace_preserves_sparse_ids_original_fields_values_and_receiving_backing_c
     let max = &pools.entries()[&ConstantPoolId::new(u32::MAX)];
     assert!(Arc::ptr_eq(
         zero.field_ref(),
-        types.field(u32::MAX).unwrap()
+        types.source_field(u32::MAX).unwrap()
     ));
-    assert!(Arc::ptr_eq(max.field_ref(), types.field(u32::MAX).unwrap()));
+    assert!(Arc::ptr_eq(
+        max.field_ref(),
+        types.source_field(u32::MAX).unwrap()
+    ));
     assert_ne!(zero.backing_identity(), max.backing_identity());
     assert_eq!(zero.value(2).unwrap().try_i64().unwrap(), Some(-9));
     assert!(
@@ -131,7 +134,7 @@ fn namespace_mixed_roots_retain_geometry_once_and_materialize_same_type_table() 
         vec![Arc::new(Int32Array::from(vec![Some(3), None]))],
         None,
     )));
-    let encoded = encode_type_table_with_fields(
+    let types = types_many(
         &[
             (0, flat.value_type().clone()),
             (u32::MAX, nested.value_type().clone()),
@@ -140,16 +143,7 @@ fn namespace_mixed_roots_retain_geometry_once_and_materialize_same_type_table() 
             (0, Arc::clone(flat.field_ref())),
             (u32::MAX, Arc::clone(nested.field_ref())),
         ],
-        type_limits(),
-        &Control::good(CompilePhase::Encode),
-    )
-    .unwrap();
-    let types = decode_type_table(
-        &encoded,
-        type_limits(),
-        &Control::good(CompilePhase::Decode),
-    )
-    .unwrap();
+    );
     let records = [
         encode(&flat, u32::MAX, 0, 0),
         encode(&nested, 0, u32::MAX, u32::MAX),
@@ -167,7 +161,7 @@ fn namespace_mixed_roots_retain_geometry_once_and_materialize_same_type_table() 
         let result = &pools.entries()[&ConstantPoolId::new(id)];
         assert!(Arc::ptr_eq(
             result.field_ref(),
-            types.field(field_id).unwrap()
+            types.source_field(field_id).unwrap()
         ));
         for ordinal in 0..2 {
             assert!(
@@ -321,12 +315,7 @@ fn namespace_empty_zero_request_and_every_callback_keep_original_control() {
         max_cumulative_library_work: 0,
     };
     let control = Control::good(CompilePhase::Decode);
-    let empty_types = decode_type_table(
-        &novarocks_proto_models::physical_type_v2::TypeTable::default(),
-        type_limits(),
-        &Control::good(CompilePhase::Decode),
-    )
-    .unwrap();
+    let empty_types = types_many(&[], &[]);
     let prepared = prepare_constant_namespace(
         &[],
         &empty_types,

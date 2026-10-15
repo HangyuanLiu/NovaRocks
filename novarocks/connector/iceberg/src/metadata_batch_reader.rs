@@ -37,9 +37,23 @@ pub enum MetadataTableType {
 
 #[derive(Clone, Debug)]
 pub struct MetadataOutputColumn {
-    pub name: String,
-    pub data_type: DataType,
-    pub nullable: bool,
+    name: String,
+    binding: novarocks_type_contract::FunctionValueType,
+}
+
+impl MetadataOutputColumn {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn data_type(&self) -> &DataType {
+        self.binding.data_type()
+    }
+    pub fn nullable(&self) -> bool {
+        self.binding.nullable()
+    }
+    pub fn value_type(&self) -> &novarocks_type_contract::FunctionValueType {
+        &self.binding
+    }
 }
 
 /// Provider-owned schema for one Iceberg metadata-table alias.
@@ -49,11 +63,22 @@ pub struct MetadataOutputColumn {
 pub fn metadata_table_output_columns(
     metadata_table_type: MetadataTableType,
     metadata: &TableMetadata,
-) -> Result<Vec<MetadataOutputColumn>, String> {
-    let column = |name: &str, data_type: DataType, nullable: bool| MetadataOutputColumn {
-        name: name.to_string(),
-        data_type,
-        nullable,
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<
+    Vec<MetadataOutputColumn>,
+    novarocks_connector_contract::PureProviderCompileError<
+        novarocks_spi::connector::ConnectorError,
+    >,
+> {
+    let mut column = |name: &str, data_type: DataType, nullable: bool| {
+        let name = creation.text(name)?;
+        let binding = typed::value(&data_type, nullable, creation)?;
+        Ok::<
+            _,
+            novarocks_connector_contract::PureProviderCompileError<
+                novarocks_spi::connector::ConnectorError,
+            >,
+        >(MetadataOutputColumn { name, binding })
     };
     let map_int_to = |value: DataType| {
         let entries = DataType::Struct(
@@ -80,73 +105,97 @@ pub fn metadata_table_output_columns(
         );
         DataType::Map(Arc::new(Field::new("entries", entries, false)), false)
     };
-    let files = || -> Result<Vec<MetadataOutputColumn>, String> {
+    let files = |column: &mut dyn FnMut(
+        &str,
+        DataType,
+        bool,
+    ) -> Result<
+        MetadataOutputColumn,
+        novarocks_connector_contract::PureProviderCompileError<
+            novarocks_spi::connector::ConnectorError,
+        >,
+    >|
+     -> Result<
+        Vec<MetadataOutputColumn>,
+        novarocks_connector_contract::PureProviderCompileError<
+            novarocks_spi::connector::ConnectorError,
+        >,
+    > {
         Ok(vec![
-            column("content", DataType::Int32, false),
-            column("file_path", DataType::Utf8, false),
-            column("file_format", DataType::Utf8, false),
-            column("spec_id", DataType::Int32, false),
-            column("record_count", DataType::Int64, false),
-            column("file_size_in_bytes", DataType::Int64, false),
-            column("column_sizes", map_int_to(DataType::Int64), true),
-            column("value_counts", map_int_to(DataType::Int64), true),
-            column("null_value_counts", map_int_to(DataType::Int64), true),
-            column("nan_value_counts", map_int_to(DataType::Int64), true),
-            column("lower_bounds", map_int_to(DataType::Binary), true),
-            column("upper_bounds", map_int_to(DataType::Binary), true),
-            column("split_offsets", list_of(DataType::Int64), true),
-            column("equality_ids", list_of(DataType::Int32), true),
-            column("sort_order_id", DataType::Int32, true),
-            column("key_metadata", DataType::Binary, true),
-            column("first_row_id", DataType::Int64, true),
-            column("partition", partition_struct_type(metadata)?, true),
+            column("content", DataType::Int32, false)?,
+            column("file_path", DataType::Utf8, false)?,
+            column("file_format", DataType::Utf8, false)?,
+            column("spec_id", DataType::Int32, false)?,
+            column("record_count", DataType::Int64, false)?,
+            column("file_size_in_bytes", DataType::Int64, false)?,
+            column("column_sizes", map_int_to(DataType::Int64), true)?,
+            column("value_counts", map_int_to(DataType::Int64), true)?,
+            column("null_value_counts", map_int_to(DataType::Int64), true)?,
+            column("nan_value_counts", map_int_to(DataType::Int64), true)?,
+            column("lower_bounds", map_int_to(DataType::Binary), true)?,
+            column("upper_bounds", map_int_to(DataType::Binary), true)?,
+            column("split_offsets", list_of(DataType::Int64), true)?,
+            column("equality_ids", list_of(DataType::Int32), true)?,
+            column("sort_order_id", DataType::Int32, true)?,
+            column("key_metadata", DataType::Binary, true)?,
+            column("first_row_id", DataType::Int64, true)?,
+            column(
+                "partition",
+                partition_struct_type(metadata).map_err(|error| {
+                    novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                        error,
+                    )
+                })?,
+                true,
+            )?,
         ])
     };
     match metadata_table_type {
         MetadataTableType::Snapshots => Ok(vec![
-            column("committed_at", timestamp_tz(), false),
-            column("snapshot_id", DataType::Int64, false),
-            column("parent_id", DataType::Int64, true),
-            column("operation", DataType::Utf8, true),
-            column("manifest_list", DataType::Utf8, false),
+            column("committed_at", timestamp_tz(), false)?,
+            column("snapshot_id", DataType::Int64, false)?,
+            column("parent_id", DataType::Int64, true)?,
+            column("operation", DataType::Utf8, true)?,
+            column("manifest_list", DataType::Utf8, false)?,
             // A real map, not a rendered string: reading one value out of it
             // is the whole reason the column exists, and a string forces every
             // caller to parse the map back out.
-            column("summary", map_varchar_to_varchar(), true),
+            column("summary", map_varchar_to_varchar(), true)?,
         ]),
         MetadataTableType::History => Ok(vec![
-            column("made_current_at", timestamp_tz(), false),
-            column("snapshot_id", DataType::Int64, false),
-            column("parent_id", DataType::Int64, true),
-            column("is_current_ancestor", DataType::Boolean, false),
+            column("made_current_at", timestamp_tz(), false)?,
+            column("snapshot_id", DataType::Int64, false)?,
+            column("parent_id", DataType::Int64, true)?,
+            column("is_current_ancestor", DataType::Boolean, false)?,
         ]),
         MetadataTableType::Refs => Ok(vec![
-            column("name", DataType::Utf8, false),
-            column("type", DataType::Utf8, false),
-            column("snapshot_id", DataType::Int64, false),
-            column("max_reference_age_in_ms", DataType::Int64, true),
-            column("min_snapshots_to_keep", DataType::Int32, true),
-            column("max_snapshot_age_in_ms", DataType::Int64, true),
+            column("name", DataType::Utf8, false)?,
+            column("type", DataType::Utf8, false)?,
+            column("snapshot_id", DataType::Int64, false)?,
+            column("max_reference_age_in_ms", DataType::Int64, true)?,
+            column("min_snapshots_to_keep", DataType::Int32, true)?,
+            column("max_snapshot_age_in_ms", DataType::Int64, true)?,
         ]),
         MetadataTableType::Partitions => Ok(vec![
-            column("record_count", DataType::Int64, false),
-            column("file_count", DataType::Int64, false),
-            column("position_delete_file_count", DataType::Int64, true),
-            column("equality_delete_file_count", DataType::Int64, true),
+            column("record_count", DataType::Int64, false)?,
+            column("file_count", DataType::Int64, false)?,
+            column("position_delete_file_count", DataType::Int64, true)?,
+            column("equality_delete_file_count", DataType::Int64, true)?,
         ]),
-        MetadataTableType::Files => files(),
+        MetadataTableType::Files => files(&mut column),
         MetadataTableType::Manifests => Ok(vec![
-            column("content", DataType::Int32, false),
-            column("path", DataType::Utf8, false),
-            column("length", DataType::Int64, false),
-            column("partition_spec_id", DataType::Int32, false),
-            column("added_snapshot_id", DataType::Int64, true),
-            column("added_data_files_count", DataType::Int32, false),
-            column("existing_data_files_count", DataType::Int32, false),
-            column("deleted_data_files_count", DataType::Int32, false),
-            column("added_rows_count", DataType::Int64, false),
-            column("existing_rows_count", DataType::Int64, false),
-            column("deleted_rows_count", DataType::Int64, false),
+            column("content", DataType::Int32, false)?,
+            column("path", DataType::Utf8, false)?,
+            column("length", DataType::Int64, false)?,
+            column("partition_spec_id", DataType::Int32, false)?,
+            column("added_snapshot_id", DataType::Int64, true)?,
+            column("added_data_files_count", DataType::Int32, false)?,
+            column("existing_data_files_count", DataType::Int32, false)?,
+            column("deleted_data_files_count", DataType::Int32, false)?,
+            column("added_rows_count", DataType::Int64, false)?,
+            column("existing_rows_count", DataType::Int64, false)?,
+            column("deleted_rows_count", DataType::Int64, false)?,
             column(
                 "partition_summaries",
                 list_of(DataType::Struct(
@@ -159,16 +208,16 @@ pub fn metadata_table_output_columns(
                     .into(),
                 )),
                 true,
-            ),
+            )?,
         ]),
         MetadataTableType::LogicalIcebergMetadata => {
             let mut columns = vec![
-                column("status", DataType::Int32, false),
-                column("snapshot_id", DataType::Int64, true),
-                column("sequence_number", DataType::Int64, true),
-                column("file_sequence_number", DataType::Int64, true),
+                column("status", DataType::Int32, false)?,
+                column("snapshot_id", DataType::Int64, true)?,
+                column("sequence_number", DataType::Int64, true)?,
+                column("file_sequence_number", DataType::Int64, true)?,
             ];
-            columns.extend(files()?);
+            columns.extend(files(&mut column)?);
             Ok(columns)
         }
     }
@@ -287,9 +336,9 @@ pub fn metadata_output_schema(
         .iter()
         .map(|column| {
             Arc::new(Field::new(
-                &column.name,
-                normalize_metadata_output_type(&column.data_type),
-                column.nullable,
+                column.name(),
+                column.data_type().clone(),
+                column.nullable(),
             ))
         })
         .collect::<Vec<_>>();
@@ -352,9 +401,59 @@ fn normalize_metadata_output_field(field: &Field) -> Field {
         .with_data_type(normalize_metadata_output_type(field.data_type()))
 }
 
+mod typed;
+
+/// Complete physical declaration of an existing metadata/routing alias.
+/// The alias's advertised carrier is an explicit provider fact; it neither
+/// imports Arrow annotations nor declares the table value's nominal domain.
+pub(crate) fn metadata_alias_value_type(
+    ty: &DataType,
+    nullable: bool,
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<
+    novarocks_type_contract::FunctionValueType,
+    novarocks_connector_contract::PureProviderCompileError<
+        novarocks_spi::connector::ConnectorError,
+    >,
+> {
+    typed::value(ty, nullable, creation)
+}
+
+/// Complete paired execution declaration of this exact metadata alias author.
+/// The caller chooses explicit FE pure preparation or a real BE creation hold.
+pub fn metadata_output_execution_schema(
+    columns: &[MetadataOutputColumn],
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<
+    novarocks_connector_contract::ConnectorReadExecutionSchema,
+    novarocks_connector_contract::PureProviderCompileError<
+        novarocks_spi::connector::ConnectorError,
+    >,
+> {
+    typed::schema(columns, creation)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MetadataTableType, metadata_table_output_columns, normalize_metadata_output_type};
+    use super::{MetadataTableType, normalize_metadata_output_type};
+    fn metadata_table_output_columns(
+        kind: MetadataTableType,
+        metadata: &crate::iceberg::spec::TableMetadata,
+    ) -> Result<
+        Vec<super::MetadataOutputColumn>,
+        novarocks_connector_contract::PureProviderCompileError<
+            novarocks_spi::connector::ConnectorError,
+        >,
+    > {
+        let mut request = |_| Ok(());
+        let mut work = |_| Ok(());
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
+        super::metadata_table_output_columns(kind, metadata, &mut creation)
+    }
     use arrow::datatypes::{DataType, Field};
     use std::sync::Arc;
 
@@ -390,16 +489,10 @@ mod tests {
         let metadata = table_metadata();
         let files = metadata_table_output_columns(MetadataTableType::Files, &metadata)
             .expect("files columns");
-        assert_eq!(
-            files.first().map(|column| column.name.as_str()),
-            Some("content")
-        );
-        assert_eq!(
-            files.last().map(|column| column.name.as_str()),
-            Some("partition")
-        );
+        assert_eq!(files.first().map(|column| column.name()), Some("content"));
+        assert_eq!(files.last().map(|column| column.name()), Some("partition"));
         assert!(matches!(
-            files.last().map(|column| &column.data_type),
+            files.last().map(|column| column.data_type()),
             Some(DataType::Struct(fields)) if fields.is_empty()
         ));
         let snapshots = metadata_table_output_columns(MetadataTableType::Snapshots, &metadata)
@@ -407,7 +500,7 @@ mod tests {
         assert_eq!(
             snapshots
                 .iter()
-                .map(|column| column.name.as_str())
+                .map(|column| column.name())
                 .collect::<Vec<_>>(),
             vec![
                 "committed_at",

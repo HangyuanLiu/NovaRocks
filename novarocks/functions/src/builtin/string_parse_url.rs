@@ -72,8 +72,8 @@ pub(super) fn evaluate_string_parse_url<'a>(
             let FunctionArgumentType::Value(source) = ty else {
                 return Err(invalid("parse_url requires value arguments"));
             };
-            if source.logical_type != ValueLogicalType::Physical
-                || source.data_type != DataType::Utf8
+            if source.logical_type() != ValueLogicalType::Physical
+                || source.data_type() != &DataType::Utf8
             {
                 return Err(invalid(
                     "parse_url differs from its exact installed argument profile",
@@ -87,9 +87,9 @@ pub(super) fn evaluate_string_parse_url<'a>(
             );
         }
         let target = input.contract().result_type();
-        if target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
+        if target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Utf8
+            || !target.nullable()
         {
             return Err(invalid(
                 "parse_url differs from its exact installed result profile",
@@ -116,7 +116,7 @@ pub(super) fn evaluate_string_parse_url<'a>(
                     unreachable!()
                 };
                 if strings[i].is_null(row) {
-                    if !source.nullable {
+                    if !source.nullable() {
                         return Err(internal(
                             "parse_url non-null argument contains selected SQL NULL",
                         ));
@@ -183,7 +183,7 @@ pub(super) fn evaluate_string_parse_url<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

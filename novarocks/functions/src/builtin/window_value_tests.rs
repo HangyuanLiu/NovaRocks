@@ -206,7 +206,7 @@ fn ints(output: &SelectedValues<'_>) -> Vec<Option<i32>> {
         .collect()
 }
 fn ty(array: &ArrayRef, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(array.data_type().clone(), nullable)
+    FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), nullable)
 }
 fn policy() -> ConstantPolicy {
     // Explicit finite test invoice; not a production profile or a host MEM grant.
@@ -384,7 +384,7 @@ fn sliced_scalar_nonzero_constant_and_dense_compact_arguments_keep_original_addr
 }
 
 #[test]
-fn ignore_nulls_keeps_physical_dictionary_key_rule_without_reinterpreting_value_nulls() {
+fn ignore_nulls_follows_dictionary_selected_values_after_explicit_plain_ingress() {
     let dictionary: ArrayRef = Arc::new(
         DictionaryArray::<Int8Type>::try_new(
             Int8Array::from(vec![Some(0), Some(1), None]),
@@ -393,7 +393,9 @@ fn ignore_nulls_keeps_physical_dictionary_key_rule_without_reinterpreting_value_
         .unwrap(),
     );
     assert!(!dictionary.is_null(0));
-    let arguments = [EvaluatedArgument::Column(&dictionary)];
+    let plain = arrow_cast::cast(dictionary.as_ref(), &DataType::Utf8).unwrap();
+    assert!(plain.is_null(0));
+    let arguments = [EvaluatedArgument::Column(&plain)];
     let peers = [WindowRowRange { start: 0, end: 3 }];
     let frames = [WindowRowRange { start: 0, end: 3 }; 3];
     for name in NAMES {
@@ -417,18 +419,9 @@ fn ignore_nulls_keeps_physical_dictionary_key_rule_without_reinterpreting_value_
         let output = output
             .values()
             .as_any()
-            .downcast_ref::<DictionaryArray<Int8Type>>()
-            .unwrap();
-        let key = if name == "first_value" { 0 } else { 1 };
-        assert_eq!(output.keys().iter().collect::<Vec<_>>(), vec![Some(key); 3]);
-        let values = output
-            .values()
-            .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        assert!(values.is_null(0));
-        assert_eq!(values.value(1), "visible");
-        assert_eq!(output.null_count(), 0);
+        assert_eq!(output.iter().collect::<Vec<_>>(), vec![Some("visible"); 3]);
     }
 }
 
@@ -444,6 +437,7 @@ fn exact_nested_metadata_fresh_frozen_owner_and_empty_frames_preserve_full_sourc
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
         Some(NullBuffer::from(vec![true, false, true])),
     ));
+    let values = crate::test_value_ingress::array_for_binding(&values, &ty(&values, true)).unwrap();
     let arguments = [EvaluatedArgument::Column(&values)];
     let peers = [WindowRowRange { start: 0, end: 3 }];
     let frames = [
@@ -507,9 +501,9 @@ fn exact_nested_metadata_fresh_frozen_owner_and_empty_frames_preserve_full_sourc
             &fixture.selected
         ));
         assert_eq!(*frozen.contract().options(), options);
-        assert!(frozen.contract().result_type().nullable);
+        assert!(frozen.contract().result_type().nullable());
         assert!(novarocks_type_contract::arrow_data_types_exact(
-            &frozen.contract().result_type().data_type,
+            frozen.contract().result_type().data_type(),
             values.data_type()
         ));
         let mut part = frozen
@@ -535,7 +529,7 @@ fn exact_nested_metadata_fresh_frozen_owner_and_empty_frames_preserve_full_sourc
             actual.data_type(),
             values.data_type()
         ));
-        assert_eq!(actual.fields()[0].metadata(), field.metadata());
+        assert!(actual.fields()[0].metadata().is_empty());
         let actual_values = actual
             .column(0)
             .as_any()
@@ -547,7 +541,7 @@ fn exact_nested_metadata_fresh_frozen_owner_and_empty_frames_preserve_full_sourc
         );
         assert_eq!(actual_values.value(2), 3);
         // A stale selected source must not be repaired by generic Any matching.
-        let drift = FunctionValueType::new(
+        let drift = FunctionValueType::from_legacy_declared_projection(
             DataType::Struct(vec![Arc::new(Field::new("other", DataType::Int32, false))].into()),
             true,
         );
@@ -961,7 +955,7 @@ fn nonnull_float_bits_and_empty_partition_keep_original_options_and_nullable_res
             .prepare(options, &CompileControl::default())
             .unwrap();
         assert_eq!(*prepared.contract().options(), options);
-        assert!(prepared.contract().result_type().nullable);
+        assert!(prepared.contract().result_type().nullable());
         let mut part = WindowEvaluationPartition::begin(
             prepared.clone(),
             geometry(&prepared, &arguments, &peers, &frames),
@@ -1016,7 +1010,8 @@ fn wide_full_field_binding_observation_crosses_actual_compile_quantum_without_ty
         })
         .collect::<Vec<_>>()
         .into();
-    let source = FunctionValueType::new(DataType::Struct(fields), false);
+    let source =
+        FunctionValueType::from_legacy_declared_projection(DataType::Struct(fields), false);
     for name in NAMES {
         let fixture = Fixture::new(name, source.clone(), DecimalOverflowPolicy::ReportError);
         let baseline = CompileControl::default();

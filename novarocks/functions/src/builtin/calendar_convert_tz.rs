@@ -98,8 +98,8 @@ pub(super) fn evaluate_convert_tz<'a>(
         let types = [date_type, from_type, to_type];
         let args = [date_arg, from_arg, to_arg];
         for (ty, arg) in types.iter().zip(args) {
-            if ty.logical_type != ValueLogicalType::Physical
-                || &ty.data_type != arg.array().data_type()
+            if ty.logical_type() != ValueLogicalType::Physical
+                || ty.data_type() != arg.array().data_type()
             {
                 return Err(invalid(
                     "convert_tz input differs from its exact Physical profile",
@@ -107,13 +107,14 @@ pub(super) fn evaluate_convert_tz<'a>(
             }
             work.step()?;
         }
-        if input.target.logical_type != ValueLogicalType::Physical
-            || !input.target.nullable
-            || from_type.data_type != DataType::Utf8
-            || to_type.data_type != DataType::Utf8
+        if input.target.logical_type() != ValueLogicalType::Physical
+            || !input.target.nullable()
+            || from_type.data_type() != &DataType::Utf8
+            || to_type.data_type() != &DataType::Utf8
             || (!input.legacy
-                && (date_type.data_type != DataType::Timestamp(TimeUnit::Microsecond, None)
-                    || input.target.data_type != DataType::Timestamp(TimeUnit::Microsecond, None)))
+                && (date_type.data_type() != &DataType::Timestamp(TimeUnit::Microsecond, None)
+                    || input.target.data_type()
+                        != &DataType::Timestamp(TimeUnit::Microsecond, None)))
         {
             return Err(invalid(
                 "convert_tz differs from its exact declared profile",
@@ -149,7 +150,7 @@ pub(super) fn evaluate_convert_tz<'a>(
                     return Err(internal("convert_tz selected row is out of bounds"));
                 }
                 nulls[index] = args[index].array().is_null(rows[index]);
-                if nulls[index] && !types[index].nullable {
+                if nulls[index] && !types[index].nullable() {
                     return Err(internal("convert_tz non-null input contains SQL NULL"));
                 }
                 work.step()?;
@@ -178,7 +179,7 @@ pub(super) fn evaluate_convert_tz<'a>(
                 let result = match (date, from, to) {
                     (Some(date), Some(from), Some(to)) => convert_tz_with_zone(date, from, to)
                         .and_then(|date| {
-                            timestamp_value_for_type(date, &input.target.data_type).ok()
+                            timestamp_value_for_type(date, input.target.data_type()).ok()
                         }),
                     _ => None,
                 };

@@ -313,8 +313,10 @@ fn signed_and_frozen(
         .map(|field| ConnectorWriteFieldRequest::new(field.field().clone()))
         .collect::<Vec<_>>();
     let input = ConnectorWriteInputRequest::RowLineage {
-        data_fields: crate::commit::write_shared::exact_requested_write_fields(metadata, &fields)
-            .expect("original requested fields"),
+        data_fields: crate::metadata::with_pure_schema_creation(context, |creation| {
+            crate::commit::write_shared::exact_requested_write_fields(metadata, &fields, creation)
+        })
+        .expect("original requested fields"),
         row_identity_fields: vec![
             ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
                 "_row_id",
@@ -328,6 +330,9 @@ fn signed_and_frozen(
             )),
         ],
     };
+    let input =
+        crate::commit::write_preparation::freeze_write_input_request(metadata, &input, context)
+            .expect("original frozen stock declarations");
     let signed = sign_input_shape(&facts, &input).expect("original stock signer");
     let recipes = freeze_copy_on_write_branches(
         selection,

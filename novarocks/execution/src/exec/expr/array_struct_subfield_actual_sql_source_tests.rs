@@ -108,19 +108,25 @@ fn array_struct_subfield_actual_required_sql_full_binding_source() {
                 let FunctionArgumentType::Value(input) = &function.argument_types[0] else {
                     panic!("actual input");
                 };
-                let DataType::List(item) = &input.data_type else {
+                let DataType::List(item) = &input.data_type() else {
                     panic!("actual List");
                 };
                 let DataType::Struct(fields) = item.data_type() else {
                     panic!("actual Struct child");
                 };
                 let original = fields.iter().find(|field| field.name() == "item").unwrap();
-                let DataType::List(output) = &node.ty.data_type else {
+                let DataType::List(output) = &node.ty.data_type() else {
                     panic!("actual projected List");
                 };
                 assert_eq!(output.data_type(), original.data_type());
                 assert_eq!(
-                    fragment.expressions().get(args[1]).unwrap().ty.data_type,
+                    fragment
+                        .expressions()
+                        .get(args[1])
+                        .unwrap()
+                        .ty
+                        .data_type()
+                        .clone(),
                     DataType::Utf8
                 );
                 eprintln!(

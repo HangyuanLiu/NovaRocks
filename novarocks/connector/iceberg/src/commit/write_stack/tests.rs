@@ -1119,7 +1119,23 @@ fn cow_rewrite_source(
         arrow::datatypes::Field::new("_row_id", DataType::Int64, true),
         arrow::datatypes::Field::new("_last_updated_sequence_number", DataType::Int64, true),
     ]));
-    novarocks_spi::connector::write_stack::session::ConnectorWriteRewriteSource::new(
+    let bindings = (0..3)
+        .map(|_| novarocks_type_contract::FunctionValueType::new(DataType::Int64, true))
+        .collect::<Vec<_>>();
+    let execution = novarocks_connector_contract::ConnectorReadExecutionSchema::try_new(
+        schema.clone(),
+        bindings.into_boxed_slice(),
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+    )
+    .expect("declared COW execution schema");
+    let mut request = |_| Ok(());
+    let mut work = |_| Ok(());
+    let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        &mut request,
+        &mut work,
+    );
+    novarocks_spi::connector::write_stack::session::ConnectorWriteRewriteSource::try_new_typed(
         novarocks_spi::connector::ConnectorTableHandle::try_new(
             ConnectorInstanceId::parse("copy_on_write").expect("instance id"),
             bytes::Bytes::from_static(b"frozen-source"),
@@ -1129,6 +1145,7 @@ fn cow_rewrite_source(
             .expect("pinned source"),
         [5; 32],
         schema,
+        execution,
         vec![
             novarocks_spi::connector::ConnectorRowMutationScanBinding::new(
                 novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([1; 32]),
@@ -1145,7 +1162,9 @@ fn cow_rewrite_source(
         ],
         vec![novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([5; 32])],
         Some(novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([6; 32])),
+        &mut creation,
     )
+    .expect("typed frozen COW source")
 }
 
 /// A sealed copy-on-write session holding exactly these frozen branches.
@@ -2942,9 +2961,13 @@ fn staged_begin_request(
         intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
         purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
         input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
-            fields: vec![novarocks_spi::connector::ConnectorWriteFieldRequest::new(
-                Field::new("id", DataType::Int64, false),
-            )],
+            fields: vec![
+                novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                    Field::new("id", DataType::Int64, false),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                )
+                .expect("staged caller declares required Int64 id"),
+            ],
         },
         base: None,
         flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::StagedCreate(
@@ -3249,19 +3272,30 @@ fn scalar_integer_staged_target_handle(
 }
 
 fn scalar_integer_fields() -> Vec<novarocks_spi::connector::ConnectorWriteFieldRequest> {
+    use novarocks_type_contract::FunctionValueType;
     vec![
-        Field::new("id", DataType::Int8, false),
-        Field::new("small", DataType::Int16, true),
-        Field::new("plain", DataType::Int32, false),
+        (
+            Field::new("id", DataType::Int8, false),
+            FunctionValueType::new(DataType::Int8, false),
+        ),
+        (
+            Field::new("small", DataType::Int16, true),
+            FunctionValueType::new(DataType::Int16, true),
+        ),
+        (
+            Field::new("plain", DataType::Int32, false),
+            FunctionValueType::new(DataType::Int32, false),
+        ),
     ]
     .into_iter()
     .enumerate()
-    .map(|(ordinal, field)| {
-        // The actual table schema authors field IDs 1/2/3; preparation and
-        // begin must retain these same provider annotations with the carrier.
-        novarocks_spi::connector::ConnectorWriteFieldRequest::new(
+    .map(|(ordinal, (field, value))| {
+        // Independent SQL execution declarations accompany the provider's IDs.
+        novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
             field.with_metadata([("PARQUET:field_id".into(), (ordinal + 1).to_string())].into()),
+            value,
         )
+        .expect("complete scalar integer caller declaration")
     })
     .collect()
 }
@@ -3352,12 +3386,17 @@ fn real_begin_rejects_storage_i32_forgery_even_when_statistics_are_disabled() {
             let target =
                 scalar_integer_staged_target_handle(&runtime, incarnation, collect_statistics);
             let mut fields = scalar_integer_fields();
-            fields[forged_ordinal] = ConnectorWriteFieldRequest::new(
+            fields[forged_ordinal] = ConnectorWriteFieldRequest::try_new_typed(
                 fields[forged_ordinal]
                     .field()
                     .clone()
                     .with_data_type(DataType::Int32),
-            );
+                novarocks_type_contract::FunctionValueType::new(
+                    DataType::Int32,
+                    forged_ordinal == 1,
+                ),
+            )
+            .expect("explicit forged scalar declaration");
             let mut request = staged_begin_request(target.clone());
             request.input = ConnectorWriteInputRequest::Data { fields };
             let outcome = crate::commit::write_preparation::prepare_write(
@@ -3607,9 +3646,13 @@ fn all_write_admission_requests(
     .collect::<Vec<_>>();
     let mut equality_delete = ordinary(ConnectorWriteIntent::RowDelta);
     equality_delete.input = novarocks_spi::connector::ConnectorWriteInputRequest::EqualityDelete {
-        equality_fields: vec![novarocks_spi::connector::ConnectorWriteFieldRequest::new(
-            Field::new("id", DataType::Int64, false),
-        )],
+        equality_fields: vec![
+            novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                Field::new("id", DataType::Int64, false),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            )
+            .expect("equality caller declares required Int64 id"),
+        ],
     };
     requests.push(("equality delete".to_string(), equality_delete));
     for (name, flavor) in [
@@ -3869,6 +3912,13 @@ impl FrozenRewriteLake {
             ConnectorWriteOperationId,
         };
         let table = ConnectorTableHandle::try_new(self.control.binding_key().instance_id.clone(), bytes::Bytes::from_static(br#"{"namespace":"db","table":"t","metadata_location":null,"table_info":null,"metadata_columns":[],"metadata_table_type":null,"prepared_files":[],"explicit_files":null}"#)).unwrap();
+        let mut layout = |_| Ok(());
+        let mut work = |_| Ok(());
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut layout,
+            &mut work,
+        );
         self.rewrite
             .plan_rewrite(
                 ConnectorDistributedRewritePlanningRequest::try_new(
@@ -3889,6 +3939,7 @@ impl FrozenRewriteLake {
                     request_context(),
                 )
                 .unwrap(),
+                &mut creation,
             )
             .unwrap()
     }
@@ -3908,7 +3959,13 @@ impl FrozenRewriteLake {
                     .fields()
                     .iter()
                     .map(|b| {
-                        novarocks_spi::connector::ConnectorWriteFieldRequest::new(b.field().clone())
+                        novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                            b.field().clone(),
+                            b.execution_type()
+                                .expect("rewrite field declaration")
+                                .clone(),
+                        )
+                        .expect("frozen writer declaration")
                     })
                     .collect(),
             },
@@ -3935,9 +3992,13 @@ impl FrozenRewriteLake {
             intent,
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
             input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
-                fields: vec![novarocks_spi::connector::ConnectorWriteFieldRequest::new(
-                    Field::new("id", DataType::Int64, false),
-                )],
+                fields: vec![
+                    novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                        Field::new("id", DataType::Int64, false),
+                        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                    )
+                    .expect("fixture declares required Int64 id"),
+                ],
             },
             base: None,
             flavor: ConnectorWriteSessionFlavor::Ordinary,
@@ -4320,16 +4381,16 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
     for (index, file) in files.iter().enumerate() {
         let input = novarocks_spi::connector::ConnectorWriteInputRequest::DeletionVector {
             identity_fields: vec![
-                novarocks_spi::connector::ConnectorWriteFieldRequest::new(Field::new(
-                    "_file",
-                    DataType::Utf8,
-                    false,
-                )),
-                novarocks_spi::connector::ConnectorWriteFieldRequest::new(Field::new(
-                    "_pos",
-                    DataType::Int64,
-                    false,
-                )),
+                novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                    Field::new("_file", DataType::Utf8, false),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+                )
+                .expect("fixture declares required file path"),
+                novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                    Field::new("_pos", DataType::Int64, false),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                )
+                .expect("fixture declares required row position"),
             ],
             partition_source_fields: Vec::new(),
         };

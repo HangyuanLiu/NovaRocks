@@ -35,6 +35,9 @@ use novarocks_types::arrow_metadata_owner::{FieldMetadataOrigins, MetadataOwnedS
 /// conversion between independent construction receipts establishes identity.
 #[derive(Clone, Copy)]
 pub(crate) enum RootFieldSource<'a> {
+    /// Only the private immutable typed ChunkSchema can elect this source.
+    /// No retained metadata table exists; each actual Field is still checked.
+    CanonicalExecution,
     M07(&'a FieldMetadataOrigins),
     Original {
         index: &'a [MetadataFieldLoan],
@@ -48,6 +51,8 @@ impl RootFieldSource<'_> {
         observe: &mut impl FnMut() -> Result<(), RootSchemaBackingError>,
     ) -> Result<usize, RootSchemaBackingError> {
         match self {
+            Self::CanonicalExecution if field.metadata().capacity() == 0 => Ok(0),
+            Self::CanonicalExecution => Err(RootSchemaBackingError::UnknownFieldMetadataOwner),
             Self::M07(origins) => origins
                 .metadata_bytes_for(field)
                 .ok_or(RootSchemaBackingError::UnknownFieldMetadataOwner),
@@ -70,6 +75,7 @@ impl RootFieldSource<'_> {
     }
     fn same_index(self, other: Self) -> bool {
         match (self, other) {
+            (Self::CanonicalExecution, Self::CanonicalExecution) => true,
             (Self::M07(a), Self::M07(b)) => {
                 a.owners().as_ptr() == b.owners().as_ptr() && a.owners().len() == b.owners().len()
             }
@@ -101,6 +107,7 @@ impl RootFieldSource<'_> {
 
 #[derive(Clone, Copy)]
 pub(crate) enum RootSchemaSource<'a> {
+    CanonicalExecution,
     M07(&'a MetadataOwnedSchema),
     Original(&'a SharedMaterializedSchema),
 }
@@ -227,7 +234,12 @@ impl<'a> RootSchemaInspection<'a> {
         for owner in owners {
             self.enter_auxiliary_node(0)?;
             self.field_own_heap(owner.field(), RootFieldSource::M07(origins))?;
-            self.type_own_heap(owner.field().data_type(), RootFieldSource::M07(origins), 0)?;
+            self.type_own_heap(
+                owner.field().data_type(),
+                RootFieldSource::M07(origins),
+                0,
+                false,
+            )?;
         }
         self.inspected_origin_index = Some(RootFieldSource::M07(origins));
         Ok(())
@@ -265,7 +277,7 @@ impl<'a> RootSchemaInspection<'a> {
             self.enter_auxiliary_node(0)?;
             if let Some(field) = loan.borrow_original_field() {
                 self.field_own_heap(&field, source)?;
-                self.type_own_heap(field.data_type(), source, 0)?;
+                self.type_own_heap(field.data_type(), source, 0, false)?;
             } else {
                 // Weak pins the complete ArcInner allocation after payload
                 // destruction, but no destroyed String/map/type heap remains.
@@ -283,6 +295,10 @@ impl<'a> RootSchemaInspection<'a> {
         origins: RootFieldSource<'_>,
     ) -> Result<(), RootSchemaBackingError> {
         let metadata = match owner {
+            RootSchemaSource::CanonicalExecution if schema.metadata().capacity() == 0 => 0,
+            RootSchemaSource::CanonicalExecution => {
+                return Err(RootSchemaBackingError::UnknownSchemaMetadataOwner);
+            }
             RootSchemaSource::M07(owner) => owner
                 .backing_bytes_for(schema)
                 .ok_or(RootSchemaBackingError::UnknownSchemaMetadataOwner)?,
@@ -329,13 +345,14 @@ impl<'a> RootSchemaInspection<'a> {
         data_type: &DataType,
         origins: RootFieldSource<'_>,
     ) -> Result<(), RootSchemaBackingError> {
-        if !self
-            .inspected_origin_index
-            .is_some_and(|checked| checked.same_index(origins))
+        if !matches!(origins, RootFieldSource::CanonicalExecution)
+            && !self
+                .inspected_origin_index
+                .is_some_and(|checked| checked.same_index(origins))
         {
             return Err(RootSchemaBackingError::UninspectedOriginIndex);
         }
-        self.type_own_heap(data_type, origins, 0)
+        self.type_own_heap(data_type, origins, 0, true)
     }
 
     fn charge_arc_layout(&mut self, payload: Layout) -> Result<(), RootSchemaBackingError> {
@@ -367,7 +384,7 @@ impl<'a> RootSchemaInspection<'a> {
         self.enter_tree_node(depth)?;
         self.field_own_heap(field, origins)?;
         let data_type = field.data_type();
-        self.type_own_heap(data_type, origins, depth)?;
+        self.type_own_heap(data_type, origins, depth, false)?;
         match data_type {
             DataType::List(child) | DataType::LargeList(child) => {
                 self.inspect_field_at(child, origins, depth + 1)?;
@@ -402,6 +419,7 @@ impl<'a> RootSchemaInspection<'a> {
         data_type: &DataType,
         origins: RootFieldSource<'_>,
         depth: usize,
+        actual_array_type: bool,
     ) -> Result<(), RootSchemaBackingError> {
         self.enter_auxiliary_node(depth)?;
         match data_type {
@@ -434,13 +452,13 @@ impl<'a> RootSchemaInspection<'a> {
                 }
             }
             DataType::List(child) | DataType::LargeList(child) | DataType::Map(child, _) => {
-                self.require_child(child, origins, depth)?;
+                self.require_child(child, origins, depth, actual_array_type)?;
             }
             DataType::Struct(fields) => {
                 self.preflight_auxiliary(fields.len())?;
                 self.charge_arc(&fields[..])?;
                 for child in fields {
-                    self.require_child(child, origins, depth)?;
+                    self.require_child(child, origins, depth, actual_array_type)?;
                 }
             }
             DataType::Dictionary(key, value)
@@ -463,11 +481,25 @@ impl<'a> RootSchemaInspection<'a> {
         child: &FieldRef,
         origins: RootFieldSource<'_>,
         depth: usize,
+        actual_array_type: bool,
     ) -> Result<(), RootSchemaBackingError> {
         self.enter_auxiliary_node(depth)?;
         // Membership does not iterate or format unknown metadata. Exact
         // source lookup alone proves the child's independent construction.
         match origins {
+            RootFieldSource::CanonicalExecution => {
+                if child.metadata().capacity() != 0 {
+                    return Err(RootSchemaBackingError::UnknownFieldMetadataOwner);
+                }
+                if actual_array_type {
+                    // No closed origin index covers an actual array's child
+                    // Field. Equal fields may have independent name backing.
+                    // Charge only this direct Arc/name; that child's own array
+                    // callback covers its DataType heaps, without a subtree
+                    // walk per parent (which would make nesting quadratic).
+                    self.field_own_heap(child, origins)?;
+                }
+            }
             RootFieldSource::M07(origins) => {
                 if origins.metadata_bytes_for(child).is_none() {
                     return Err(RootSchemaBackingError::UnknownFieldMetadataOwner);
@@ -634,6 +666,71 @@ mod tests {
         assert_eq!(
             inspection().inspect_origin_index(&incomplete),
             Err(RootSchemaBackingError::UnknownFieldMetadataOwner)
+        );
+    }
+
+    #[test]
+    fn canonical_actual_type_counts_independent_child_name_backing_shallowly() {
+        let zone: Arc<str> = Arc::from("z".repeat(8192));
+        let mut name = String::with_capacity(16384);
+        name.push_str("item");
+        let child = Arc::new(Field::new(
+            name,
+            DataType::Timestamp(TimeUnit::Microsecond, Some(zone.clone())),
+            true,
+        ));
+        let actual = DataType::List(child.clone());
+        let mut state = inspection();
+        state
+            .inspect_data_type_source(&actual, RootFieldSource::CanonicalExecution)
+            .unwrap();
+        // A shallow parent callback covers its actual Field/name, even though
+        // an equal frozen layout could own a different small String/Field.
+        assert_eq!(
+            state.bytes(),
+            arc_bytes(child.as_ref()) + child.name().capacity()
+        );
+        let before = state.bytes();
+        state
+            .inspect_data_type_source(child.data_type(), RootFieldSource::CanonicalExecution)
+            .unwrap();
+        assert_eq!(state.bytes() - before, arc_bytes(zone.as_ref()));
+        let mut small = RootSchemaInspection::new(1024, 8192, 64);
+        assert_eq!(
+            small.inspect_data_type_source(&actual, RootFieldSource::CanonicalExecution),
+            Err(RootSchemaBackingError::CapacityExceeded)
+        );
+    }
+
+    #[test]
+    fn canonical_schema_and_actual_child_reject_even_empty_spare_metadata() {
+        let mut spare = HashMap::with_capacity(256);
+        spare.insert("discarded".to_owned(), "source attribute".to_owned());
+        spare.clear();
+        assert!(spare.is_empty() && spare.capacity() > 0);
+        let mut child_spare = HashMap::with_capacity(256);
+        child_spare.insert("discarded".to_owned(), "source attribute".to_owned());
+        child_spare.clear();
+        assert!(child_spare.is_empty() && child_spare.capacity() > 0);
+        let child = Arc::new(Field::new("item", DataType::Int32, true).with_metadata(child_spare));
+        let mut state = inspection();
+        assert_eq!(
+            state.inspect_data_type_source(
+                &DataType::List(child),
+                RootFieldSource::CanonicalExecution
+            ),
+            Err(RootSchemaBackingError::UnknownFieldMetadataOwner)
+        );
+        let schema = Arc::new(
+            Schema::new(vec![Field::new("value", DataType::Int32, true)]).with_metadata(spare),
+        );
+        assert_eq!(
+            state.inspect_schema_source(
+                &schema,
+                RootSchemaSource::CanonicalExecution,
+                RootFieldSource::CanonicalExecution
+            ),
+            Err(RootSchemaBackingError::UnknownSchemaMetadataOwner)
         );
     }
 

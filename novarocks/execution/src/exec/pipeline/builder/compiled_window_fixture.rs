@@ -272,7 +272,7 @@ fn typed_literal_values(
     let needs_cast = |literal: &LiteralValue, ty: &FunctionValueType| {
         matches!(literal, LiteralValue::Int64(_))
             && matches!(
-                ty.data_type,
+                ty.data_type(),
                 DataType::Int8 | DataType::Int16 | DataType::Int32
             )
     };
@@ -324,7 +324,7 @@ fn typed_literal_values(
                                 ty.clone(),
                                 ExprKind::Cast {
                                     expr: source,
-                                    target: ty.data_type.clone(),
+                                    target: ty.data_type().clone(),
                                     decimal_overflow_policy: POLICY,
                                     allow_throw_exception: allow_throw(),
                                 },
@@ -864,6 +864,7 @@ pub(super) fn package_typed(
         let call_context = context(use_id.get());
         if call.uninstalled {
             frozen.push(FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -939,6 +940,7 @@ pub(super) fn package_typed(
             )
             .unwrap_or_else(|error| panic!("fixture window call prepares: {error}"));
         frozen.push(FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,

@@ -96,7 +96,7 @@ fn scalar(
         FunctionId::try_new("fixture/exact").unwrap(),
         FunctionOverloadId::try_new("fixture/selected").unwrap(),
         kind,
-        args.into_boxed_slice(),
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(args.into_boxed_slice()),
         result,
     )
 }
@@ -169,7 +169,9 @@ fn workflow<H>(
     let aggregate = scalar(
         FunctionKind::Aggregate,
         vec![FunctionArgumentType::Lambda {
-            parameter_types: Box::from([v[0].1.clone(), v[2].1.clone()]),
+            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                Box::from([v[0].1.clone(), v[2].1.clone()]),
+            ),
             result_type: v[1].1.clone(),
         }],
         v[0].1.clone(),
@@ -178,8 +180,13 @@ fn workflow<H>(
     let table = BoundTableFunction::from_exact_signature(
         FunctionId::try_new("fixture/table").unwrap(),
         FunctionOverloadId::try_new("fixture/table-selected").unwrap(),
-        Box::from([FunctionArgumentType::Value(v[0].1.clone())]),
-        Box::from([v[0].1.clone(), v[1].1.clone()]),
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::from([
+            FunctionArgumentType::Value(v[0].1.clone()),
+        ])),
+        novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(Box::from([
+            v[0].1.clone(),
+            v[1].1.clone(),
+        ])),
     );
     let scalar_args = [ArgumentTypeIds::Value(u32::MAX)];
     let lambda_params = [0, u32::MAX];

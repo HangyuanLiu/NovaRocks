@@ -109,7 +109,8 @@ pub(crate) fn prepare_equality_delete_statement(
     if rows.is_empty() {
         return Err("ADD EQUALITY DELETE requires at least one row".to_string());
     }
-    let values_query = build_equality_delete_sink_query(&delete_columns, &rows)?;
+    let delete_fields = equality_delete_input_fields(&table_metadata, &delete_columns)?;
+    let values_query = build_equality_delete_sink_query(&delete_fields, &rows)?;
 
     // The durable operation journal records the snapshot this attempt is based
     // on. It is read through the same planning lease rather than a concrete
@@ -126,7 +127,7 @@ pub(crate) fn prepare_equality_delete_statement(
         state,
         &target,
         current_snapshot_id,
-        &delete_columns,
+        &delete_fields,
         values_query,
         execution,
         connector_context,
@@ -247,7 +248,7 @@ fn prepare_equality_delete_distributed_write(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
     current_snapshot_id: Option<i64>,
-    delete_columns: &[Field],
+    delete_columns: &[ConnectorWriteFieldRequest],
     values_query: Query,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -259,10 +260,7 @@ fn prepare_equality_delete_distributed_write(
         .derive_write_lease()
         .map_err(|error| format!("derive equality-delete write lease: {error}"))?;
     let input = ConnectorWriteInputRequest::EqualityDelete {
-        equality_fields: delete_columns
-            .iter()
-            .map(|column| ConnectorWriteFieldRequest::new(column.clone()))
-            .collect(),
+        equality_fields: delete_columns.to_vec(),
     };
     // One logical equality-delete branch on the generation that resolved the
     // target. ADD EQUALITY DELETE appends delete files rather than mutating
@@ -330,7 +328,7 @@ fn prepare_equality_delete_distributed_write(
 }
 
 fn build_equality_delete_sink_query(
-    delete_columns: &[Field],
+    delete_columns: &[ConnectorWriteFieldRequest],
     rows: &[Vec<Literal>],
 ) -> Result<Query, String> {
     if delete_columns.is_empty() {
@@ -349,7 +347,7 @@ fn build_equality_delete_sink_query(
         }
     }
 
-    let target_columns = equality_delete_target_columns(delete_columns);
+    let target_columns = equality_delete_target_columns(delete_columns)?;
     let alias = "__nr_eqdel";
     let rendered_rows = rows
         .iter()
@@ -396,15 +394,57 @@ fn build_equality_delete_sink_query(
     parse_generated_query(&sql, "ADD EQUALITY DELETE sink")
 }
 
-fn equality_delete_target_columns(delete_columns: &[Field]) -> Vec<ColumnDef> {
+/// Keep the admitted provider's complete binding beside the unchanged literal
+/// validation projection; a Field never re-authors its semantic domain.
+fn equality_delete_input_fields(
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+    columns: &[Field],
+) -> Result<Vec<ConnectorWriteFieldRequest>, String> {
+    columns
+        .iter()
+        .map(|column| {
+            let ordinal = metadata
+                .schema()
+                .fields()
+                .iter()
+                .position(|field| field.name().eq_ignore_ascii_case(column.name()))
+                .ok_or_else(|| {
+                    format!(
+                        "column `{}` not found in iceberg table schema",
+                        column.name()
+                    )
+                })?;
+            let value = metadata
+                .execution_schema()
+                .bindings()
+                .get(ordinal)
+                .ok_or_else(|| {
+                    "equality-delete key lacks its complete provider declaration".to_string()
+                })?;
+            ConnectorWriteFieldRequest::try_new_typed(column.clone(), value.clone())
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+fn equality_delete_target_columns(
+    delete_columns: &[ConnectorWriteFieldRequest],
+) -> Result<Vec<ColumnDef>, String> {
     delete_columns
         .iter()
-        .map(|column| ColumnDef {
-            name: column.name().clone(),
-            data_type: column.data_type().clone(),
-            nullable: column.is_nullable(),
-            write_default: None,
-            logical_type: None,
+        .map(|column| {
+            let value = column.execution_type().ok_or_else(|| {
+                "equality-delete source lacks its complete execution declaration".to_string()
+            })?;
+            let logical_type = novarocks_types::sql_type_from_value_type(value)
+                .map_err(|error| error.to_string())?;
+            Ok(ColumnDef {
+                name: column.field().name().clone(),
+                data_type: value.data_type().clone(),
+                nullable: value.nullable(),
+                write_default: None,
+                logical_type: Some(logical_type),
+            })
         })
         .collect()
 }
@@ -479,7 +519,7 @@ fn equality_delete_key_columns(
     let mut delete_columns = Vec::with_capacity(column_names.len());
     for column_name in column_names {
         let (ordinal, field) = table_metadata
-            .schema
+            .schema()
             .fields()
             .iter()
             .enumerate()
@@ -806,7 +846,27 @@ mod tests {
     /// reports one: the full physical Arrow schema plus per-column planning
     /// facts, where `write_target_type` carries the provider-signed DML write
     /// type for the columns whose write encoding differs from the read one.
-    fn loaded_table(fields: Vec<(Field, Option<DataType>)>) -> ConnectorTableMetadata {
+    fn loaded_table(
+        fields: Vec<(Field, Option<DataType>)>,
+        declarations: Vec<novarocks_types::schema::SqlType>,
+    ) -> ConnectorTableMetadata {
+        assert_eq!(fields.len(), declarations.len());
+        let bindings = fields
+            .iter()
+            .zip(&declarations)
+            .map(|((field, _), declaration)| {
+                novarocks_type_contract::FunctionValueType::try_from_typed_binding(
+                    novarocks_types::execution_value_type_from_declaration(
+                        declaration,
+                        field.data_type(),
+                        field.is_nullable(),
+                        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
         let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
         let schema = Arc::new(ArrowSchema::new(
             fields
@@ -836,29 +896,39 @@ mod tests {
             &request_context(),
         )
         .expect("planning facts");
-        ConnectorTableMetadata {
-            identity: ConnectorTableIdentity {
-                instance_id: instance_id.clone(),
-                namespace: Arc::from("db"),
-                table: Arc::from("t"),
+        crate::connector::schema_creation::declared_test_metadata(
+            novarocks_spi::connector::ConnectorTableMetadataHeader {
+                identity: ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from("db"),
+                    table: Arc::from("t"),
+                },
+                planning_facts,
+                definition_facts: ConnectorTableDefinitionFacts::empty(),
+                version: None,
+                statistics_data_version: None,
+                table: ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"table"))
+                    .expect("table handle"),
             },
             schema,
-            planning_facts,
-            definition_facts: ConnectorTableDefinitionFacts::empty(),
-            version: None,
-            statistics_data_version: None,
-            table: ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"table"))
-                .expect("table handle"),
-        }
+            bindings,
+        )
     }
 
     /// `id INT NOT NULL`, `category STRING NULL`, `amount BIGINT NULL`.
     fn plain_table() -> ConnectorTableMetadata {
-        loaded_table(vec![
-            (Field::new("id", DataType::Int32, false), None),
-            (Field::new("category", DataType::Utf8, true), None),
-            (Field::new("amount", DataType::Int64, true), None),
-        ])
+        loaded_table(
+            vec![
+                (Field::new("id", DataType::Int32, false), None),
+                (Field::new("category", DataType::Utf8, true), None),
+                (Field::new("amount", DataType::Int64, true), None),
+            ],
+            vec![
+                novarocks_types::schema::SqlType::Int,
+                novarocks_types::schema::SqlType::String,
+                novarocks_types::schema::SqlType::BigInt,
+            ],
+        )
     }
 
     #[test]
@@ -893,7 +963,12 @@ mod tests {
             (DataType::Int16, -32768, 32767, -32769, 32768),
         ] {
             let field = Field::new("n", data_type, true);
-            let table = loaded_table(vec![(field.clone(), None)]);
+            let declaration = if field.data_type() == &DataType::Int8 {
+                novarocks_types::schema::SqlType::TinyInt
+            } else {
+                novarocks_types::schema::SqlType::SmallInt
+            };
+            let table = loaded_table(vec![(field.clone(), None)], vec![declaration]);
             let names = vec!["n".to_string()];
             let rows = vec![
                 vec![Literal::Int(minimum)],
@@ -918,25 +993,21 @@ mod tests {
 
     #[test]
     fn equality_delete_key_columns_reject_a_variant_key_column() {
-        // A variant column reads as a two-leaf struct and writes as the
-        // engine's encoded `LargeBinary`; the provider signs the write type.
-        let table = loaded_table(vec![
-            (Field::new("id", DataType::Int32, false), None),
-            (
-                Field::new(
-                    "payload",
-                    DataType::Struct(
-                        vec![
-                            Field::new("metadata", DataType::Binary, false),
-                            Field::new("value", DataType::Binary, false),
-                        ]
-                        .into(),
-                    ),
-                    true,
+        // The formal read declaration is Variant; external shredding and the
+        // writer's storage representation are separate provider facts.
+        let table = loaded_table(
+            vec![
+                (Field::new("id", DataType::Int32, false), None),
+                (
+                    Field::new("payload", DataType::LargeBinary, true),
+                    Some(DataType::LargeBinary),
                 ),
-                Some(DataType::LargeBinary),
-            ),
-        ]);
+            ],
+            vec![
+                novarocks_types::schema::SqlType::Int,
+                novarocks_types::schema::SqlType::Variant,
+            ],
+        );
         let columns = vec!["payload".to_string()];
         let rows = vec![vec![Literal::Null]];
 
@@ -951,14 +1022,19 @@ mod tests {
 
     #[test]
     fn equality_delete_key_columns_reject_an_unsupported_key_type() {
-        let table = loaded_table(vec![(
-            Field::new(
-                "tags",
-                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                true,
-            ),
-            None,
-        )]);
+        let table = loaded_table(
+            vec![(
+                Field::new(
+                    "tags",
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                    true,
+                ),
+                None,
+            )],
+            vec![novarocks_types::schema::SqlType::Array(Box::new(
+                novarocks_types::schema::SqlType::String,
+            ))],
+        );
         let columns = vec!["tags".to_string()];
         let rows = vec![vec![Literal::Null]];
 
@@ -1048,14 +1124,17 @@ mod tests {
     /// to accept either spelling.
     #[test]
     fn equality_delete_key_columns_accept_a_zone_stamped_microsecond_timestamp() {
-        let table = loaded_table(vec![(
-            Field::new(
-                "event_at",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
-                true,
-            ),
-            None,
-        )]);
+        let table = loaded_table(
+            vec![(
+                Field::new(
+                    "event_at",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                    true,
+                ),
+                None,
+            )],
+            vec![novarocks_types::schema::SqlType::DateTime],
+        );
 
         let delete_columns = super::equality_delete_key_columns(
             &table,
@@ -1088,7 +1167,17 @@ mod tests {
         let delete_columns =
             super::equality_delete_key_columns(&table, &columns, &rows).expect("columns");
 
-        let query = super::build_equality_delete_sink_query(&delete_columns, &rows).expect("query");
+        let fields =
+            super::equality_delete_input_fields(&table, &delete_columns).expect("complete keys");
+        assert_eq!(
+            fields[0].execution_type(),
+            table.execution_schema().bindings().first()
+        );
+        assert_eq!(
+            fields[1].execution_type(),
+            table.execution_schema().bindings().get(1)
+        );
+        let query = super::build_equality_delete_sink_query(&fields, &rows).expect("query");
         let sql = novarocks_parser::printer::print_query(&query);
 
         assert!(sql.contains("VALUES"));

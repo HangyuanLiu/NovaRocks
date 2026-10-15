@@ -597,10 +597,10 @@ fn window_occurrences_lead_lag_checked_default_nonzero_ordinal_keeps_original_d_
             FunctionArgumentType::Value(integer.clone())
         );
         assert_eq!(
-            window_contract(&result).result_type().data_type,
+            window_contract(&result).result_type().data_type().clone(),
             DataType::Utf8
         );
-        assert!(window_contract(&result).result_type().nullable);
+        assert!(window_contract(&result).result_type().nullable());
     }
 }
 
@@ -680,8 +680,8 @@ fn window_occurrences_ntile_constant_valid_null_and_dynamic_are_distinct_owner_p
 }
 
 #[test]
-fn window_occurrences_count_over_keeps_single_signature_state_format_and_rejects_bare_null_encoded()
-{
+fn window_occurrences_count_over_keeps_single_signature_state_format_and_complete_null_encoded_sources()
+ {
     let catalog = build_builtin_engine_function_catalog().unwrap();
     let empty_pools = ConstantPools::empty();
     for value in [false, true] {
@@ -740,7 +740,7 @@ fn window_occurrences_count_over_keeps_single_signature_state_format_and_rejects
     .unwrap();
     let encoded = ty(dictionary.data_type().clone(), true);
     let pool = ConstantPool::try_new(
-        Arc::new(Field::new("encoded", encoded.data_type.clone(), true)),
+        Arc::new(Field::new("encoded", dictionary.data_type().clone(), true)),
         encoded.clone(),
         dictionary.to_data(),
         policy(),
@@ -789,21 +789,27 @@ fn window_occurrences_count_over_keeps_single_signature_state_format_and_rejects
         let req = request(source, &fragment, &pools, &Control::default()).unwrap();
         let children = pure_children(roots.flow());
         let params = SemanticParameters::try_new([]).unwrap();
-        assert!(matches!(
-            run(
-                input(
-                    source,
-                    &req,
-                    roots.flow(),
-                    root_use(&roots, root),
-                    &children,
-                    &params
-                ),
-                &catalog,
-                &Control::default()
+        // This validates pure selected preparation, not a runtime Dictionary capability.
+        let prepared = run(
+            input(
+                source,
+                &req,
+                roots.flow(),
+                root_use(&roots, root),
+                &children,
+                &params,
             ),
-            Err(PhysicalWindowOccurrenceError::Function(_))
-        ));
+            &catalog,
+            &Control::default(),
+        )
+        .unwrap();
+        let aggregate = window_contract(&prepared).aggregate().unwrap();
+        assert_eq!(aggregate.phase(), AggregateKernelPhase::Single);
+        assert_eq!(aggregate.call().logical_argument_count(), 1);
+        assert_eq!(
+            aggregate.call().selected().argument_types.as_ref(),
+            &[req.request().arguments[0].argument_type()]
+        );
     }
 }
 

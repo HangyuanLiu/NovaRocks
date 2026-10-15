@@ -30,6 +30,7 @@ use crate::optimizer::rewrite::phase::RewritePhase;
 use crate::optimizer::rewrite::result::RewriteResult;
 use crate::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::optimizer::scalar::ScalarNode;
+use novarocks_type_contract::PureCompileControl;
 
 pub(crate) struct PruneValuesColumns;
 
@@ -93,14 +94,26 @@ impl LogicalRewriteRule for PruneValuesColumns {
             .iter()
             .enumerate()
             .map(|(i, keep)| {
-                *keep
-                    && matches!(arena.node(node.rows[0][i]), ScalarNode::Literal(_))
-                    && arena.data_type(node.rows[0][i]) == &node.columns[i].value_type.data_type
-                    && arena.value_type(node.rows[0][i]).logical_type
-                        == node.columns[i].value_type.logical_type
-                    && node.rows.iter().all(|row| row[i] == node.rows[0][i])
+                Ok::<_, crate::compiler::SqlCompileError>(
+                    *keep
+                        && matches!(arena.node(node.rows[0][i]), ScalarNode::Literal(_))
+                        && arena
+                            .value_type(node.rows[0][i])
+                            .same_physical_binding_ignoring_root_nullability_observed(
+                                &node.columns[i].value_type,
+                                || {
+                                    ctx.control_view()
+                                        .checkpoint(
+                                            novarocks_type_contract::CompilePhase::Validate,
+                                            1,
+                                        )
+                                        .map_err(crate::compiler::SqlCompileError::from)
+                                },
+                            )?
+                        && node.rows.iter().all(|row| row[i] == node.rows[0][i]),
+                )
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         // Even an all-constant relation needs one cell per original row.
         if keep.iter().zip(&lifted).all(|(keep, lift)| !keep || *lift) {
             lifted[keep
@@ -310,7 +323,13 @@ mod tests {
         let Operator::LogicalValues(source) = &mut input.op else {
             unreachable!()
         };
-        source.columns[2].value_type.data_type = DataType::Int64;
+        source.columns[2].value_type =
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                DataType::Int64,
+                source.columns[2].value_type.nullable(),
+                source.columns[2].value_type.logical_type(),
+            )
+            .unwrap();
         let rewritten = rewrite(input, &mut ctx);
         let Operator::LogicalValues(source) = rewritten.op else {
             panic!("expected VALUES source")

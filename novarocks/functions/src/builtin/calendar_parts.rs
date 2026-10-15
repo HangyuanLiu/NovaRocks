@@ -46,19 +46,21 @@ enum CalendarInput<'a> {
 }
 impl<'a> CalendarInput<'a> {
     fn checked(source: &FunctionValueType, array: &'a dyn Array) -> Result<Self, KernelFailure> {
-        if array.data_type() != &source.data_type {
+        if array.data_type() != source.data_type() {
             return Err(internal(
                 "calendar selected carrier differs from its exact source",
             ));
         }
-        let physical = source.logical_type == ValueLogicalType::Physical;
-        match &source.data_type {
+        let physical = source.logical_type() == ValueLogicalType::Physical;
+        match source.data_type() {
             DataType::Timestamp(TimeUnit::Microsecond, None) if physical => {
                 array.as_any().downcast_ref().map(Self::Timestamp)
             }
             DataType::Date32 if physical => array.as_any().downcast_ref().map(Self::Date),
             DataType::Utf8 if physical => array.as_any().downcast_ref().map(Self::Text),
-            DataType::FixedSizeBinary(16) if source.logical_type == ValueLogicalType::LargeInt => {
+            DataType::FixedSizeBinary(16)
+                if source.logical_type() == ValueLogicalType::LargeInt =>
+            {
                 array.as_any().downcast_ref().map(Self::LargeInt)
             }
             _ => {
@@ -158,9 +160,9 @@ pub(super) fn evaluate_calendar_part<'a>(
             ));
         };
         let target = input.contract().result_type();
-        let exact = target.logical_type == ValueLogicalType::Physical
-            && target.data_type == DataType::Int32
-            && target.nullable;
+        let exact = target.logical_type() == ValueLogicalType::Physical
+            && target.data_type() == &DataType::Int32
+            && target.nullable();
         work.step()?;
         if !exact {
             return Err(invalid(
@@ -189,7 +191,7 @@ pub(super) fn evaluate_calendar_part<'a>(
             }
             let null = argument.array().is_null(row);
             work.step()?;
-            if null && !source.nullable {
+            if null && !source.nullable() {
                 return Err(internal(
                     "calendar non-null source contains selected SQL NULL",
                 ));
@@ -221,7 +223,7 @@ pub(super) fn evaluate_calendar_part<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

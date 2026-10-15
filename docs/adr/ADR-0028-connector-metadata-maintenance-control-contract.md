@@ -5,7 +5,7 @@ domain: [provider-spi, table-maintenance]
 status: active
 supersedes: []
 superseded-by: null
-partially-superseded-by: [ADR-0176]
+partially-superseded-by: [ADR-0177]
 date: 2026-08-02
 provenance:
   - "discussion: 2026-08-01 connector metadata maintenance control"

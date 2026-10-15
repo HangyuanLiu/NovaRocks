@@ -78,7 +78,7 @@ pub(super) fn definition(
 }
 
 pub(super) struct WindowOffsetOwner {
-    resolver: BuiltinScalarResolver,
+    resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
     operation: OffsetOperation,
@@ -120,7 +120,7 @@ impl WindowOffsetOwner {
             })
             .collect();
         Ok(Self {
-            resolver,
+            resolver: Arc::new(resolver),
             declaration,
             implementations,
             operation,
@@ -173,6 +173,10 @@ impl FunctionBindingResolver for WindowOffsetOwner {
 }
 
 impl PureFunctionMetadataOwner for WindowOffsetOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -201,41 +205,21 @@ impl FunctionEffectOwner for WindowOffsetOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        let result = (|| {
-            let exact_header = input.function_id == self.declaration.function_id()
-                && input.kind == FunctionKind::Window;
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if !exact_header {
-                return Err(FunctionBindingError::UnknownFunction.into());
-            }
-            let exact_scope = input.environment.is_empty()
-                && (matches!(input.proof_scope, CallProofScope::Unconditional)
-                    || input.proof_scope == CallProofScope::Domain(input.context.domain));
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if !exact_scope {
-                return Err(FunctionBindingError::InvalidBinding(
-                    "window_offset has no environment dependencies and requires an exact proof scope"
-                        .into(),
-                )
-                .into());
-            }
-            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        self.refine_core(input, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => {
-                        FunctionEffectOwnerError::Control(error)
-                    }
-                    other => FunctionEffectOwnerError::Owner(other),
-                })?;
-            Ok(self.call_effects(input.proof_scope))
-        })();
-        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
-            return result;
-        }
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        result
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_core(input, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -246,65 +230,21 @@ impl PureWindowImplementation for WindowOffsetOwner {
         contract: Arc<WindowCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedWindowKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        let result: Result<Arc<dyn PreparedWindowKernel>, KernelFailure> = (|| {
-            let exact_call = input.function_id == self.declaration.function_id()
-                && input.kind == FunctionKind::Window
-                && contract.call().function_id() == input.function_id
-                && std::ptr::eq(contract.call().selected(), input.selected)
-                && contract.call().context() == input.context
-                && contract.call().decimal_overflow_policy() == input.decimal_overflow_policy
-                && contract.call().effects() == &self.call_effects(input.proof_scope)
-                && input.environment.is_empty();
-            work.step().map_err(compile_failure)?;
-            if !exact_call {
-                return Err(invalid(
-                    "window_offset preparation differs from its exact checked call",
-                ));
-            }
-            work.flush().map_err(compile_failure)?;
+        self.prepare_core(input, contract, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => compile_failure(error),
-                    _ => invalid("window_offset preparation has a stale selected binding"),
-                })?;
-            let offset = canonical_call(input, *contract.options(), &mut work)?;
-            let default = if input.request.arguments.len() == 3 {
-                let FunctionArgumentType::Value(source) = &input.selected.argument_types[2] else {
-                    return Err(invalid(
-                        "LEAD/LAG default requires its complete selected value domain",
-                    ));
-                };
-                work.flush().map_err(compile_failure)?;
-                let recipe = DefaultValueRecipe::try_new(source, contract.result_type(), control)?;
-                work.flush().map_err(compile_failure)?;
-                Some(recipe)
-            } else {
-                None
-            };
-            work.flush().map_err(compile_failure)?;
-            // The prepared object retains the same canonical contract. Its body is
-            // a static pure implementation and needs no live resolver or authority.
-            let prepared = Arc::new(PreparedOffset {
-                contract,
-                operation: self.operation,
-                offset,
-                default,
-            }) as Arc<dyn PreparedWindowKernel>;
-            work.flush().map_err(compile_failure)?;
-            Ok(prepared)
-        })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
-            return result;
-        }
-        work.finish().map_err(compile_failure)?;
-        result
+        })
+    }
+    fn prepare_window_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<WindowCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedWindowKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_core(input, contract, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -352,12 +292,15 @@ fn canonical_call(
     let FunctionResultType::Scalar(result) = &input.selected.result_type else {
         return Err(invalid("LEAD/LAG requires a scalar result"));
     };
-    let exact = result.nullable && result.logical_type == source.logical_type;
+    let exact = result.nullable()
+        && result.same_value_domain_observed::<KernelFailure>(source, || {
+            work.step().map_err(compile_failure)
+        })?;
     work.step().map_err(compile_failure)?;
     if !exact
         || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-            &source.data_type,
-            &result.data_type,
+            source.data_type(),
+            result.data_type(),
             || work.step().map_err(compile_failure),
         )?
     {
@@ -382,8 +325,8 @@ fn canonical_call(
             "LEAD/LAG offset requires a canonical value channel",
         ));
     };
-    let canonical = value_type.data_type == arrow_schema::DataType::Int64
-        && value_type.logical_type == novarocks_type_contract::ValueLogicalType::Physical;
+    let canonical = *value_type.data_type() == arrow_schema::DataType::Int64
+        && value_type.logical_type() == novarocks_type_contract::ValueLogicalType::Physical;
     work.step().map_err(compile_failure)?;
     if !canonical {
         return Err(invalid(
@@ -412,4 +355,112 @@ fn canonical_call(
         return Err(invalid("LEAD/LAG offset must be non-negative"));
     }
     Ok(offset)
+}
+
+impl WindowOffsetOwner {
+    fn refine_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        let result = (|| {
+            let exact_header = input.function_id == self.declaration.function_id()
+                && input.kind == FunctionKind::Window;
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if !exact_header {
+                return Err(FunctionBindingError::UnknownFunction.into());
+            }
+            let exact_scope = input.environment.is_empty()
+                && (matches!(input.proof_scope, CallProofScope::Unconditional)
+                    || input.proof_scope == CallProofScope::Domain(input.context.domain));
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if !exact_scope {
+                return Err(FunctionBindingError::InvalidBinding(
+                    "window_offset has no environment dependencies and requires an exact proof scope"
+                        .into(),
+                )
+                .into());
+            }
+            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+                other => FunctionEffectOwnerError::Owner(other),
+            })?;
+            Ok(self.call_effects(input.proof_scope))
+        })();
+        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
+            return result;
+        }
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        result
+    }
+    fn prepare_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<WindowCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedWindowKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        let result: Result<Arc<dyn PreparedWindowKernel>, KernelFailure> = (|| {
+            let exact_call = input.function_id == self.declaration.function_id()
+                && input.kind == FunctionKind::Window
+                && contract.call().function_id() == input.function_id
+                && std::ptr::eq(contract.call().selected(), input.selected)
+                && contract.call().context() == input.context
+                && contract.call().decimal_overflow_policy() == input.decimal_overflow_policy
+                && contract.call().effects() == &self.call_effects(input.proof_scope)
+                && input.environment.is_empty();
+            work.step().map_err(compile_failure)?;
+            if !exact_call {
+                return Err(invalid(
+                    "window_offset preparation differs from its exact checked call",
+                ));
+            }
+            work.flush().map_err(compile_failure)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => compile_failure(error),
+                _ => invalid("window_offset preparation has a stale selected binding"),
+            })?;
+            let offset = canonical_call(input, *contract.options(), &mut work)?;
+            let default = if input.request.arguments.len() == 3 {
+                let FunctionArgumentType::Value(source) = &input.selected.argument_types[2] else {
+                    return Err(invalid(
+                        "LEAD/LAG default requires its complete selected value domain",
+                    ));
+                };
+                work.flush().map_err(compile_failure)?;
+                let recipe = DefaultValueRecipe::try_new(source, contract.result_type(), control)?;
+                work.flush().map_err(compile_failure)?;
+                Some(recipe)
+            } else {
+                None
+            };
+            work.flush().map_err(compile_failure)?;
+            // The prepared object retains the same canonical contract. Its body is
+            // a static pure implementation and needs no live resolver or authority.
+            let prepared = Arc::new(PreparedOffset {
+                contract,
+                operation: self.operation,
+                offset,
+                default,
+            }) as Arc<dyn PreparedWindowKernel>;
+            work.flush().map_err(compile_failure)?;
+            Ok(prepared)
+        })();
+        if matches!(
+            &result,
+            Err(KernelFailure::Cancelled
+                | KernelFailure::DeadlineExceeded
+                | KernelFailure::ResourceExhausted)
+        ) {
+            return result;
+        }
+        work.finish().map_err(compile_failure)?;
+        result
+    }
 }

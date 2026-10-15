@@ -237,7 +237,7 @@ fn units(c: &Control) -> u64 {
 #[test]
 #[allow(
     deprecated,
-    reason = "This oracle checks frozen Arrow dictionary identity."
+    reason = "Source encoding attributes are deliberately absent from value layout."
 )]
 fn writer_schema_complete_independent_wire_preserves_roles_names_revision_and_full_types() {
     let c = Control::default();
@@ -256,23 +256,23 @@ fn writer_schema_complete_independent_wire_preserves_roles_names_revision_and_fu
             .unwrap()
             .0;
         assert_eq!(decoded, schema);
-        assert_eq!(decoded.fields[1].ty.logical_type, ValueLogicalType::Json);
+        assert_eq!(decoded.fields[1].ty.logical_type(), ValueLogicalType::Json);
         assert_eq!(
-            decoded.fields[2].ty.logical_type,
+            decoded.fields[2].ty.logical_type(),
             ValueLogicalType::LargeInt
         );
-        if let DataType::List(field) = &decoded.fields[4].ty.data_type {
-            assert_eq!(field.dict_id(), Some(93));
-            assert_eq!(field.dict_is_ordered(), Some(true));
-            assert_eq!(
-                field.metadata().get("source.key").map(String::as_str),
-                Some("exact / 值")
-            );
-            let original = match &read.value_type(11).unwrap().data_type {
+        if let DataType::List(field) = &decoded.fields[4].ty.data_type() {
+            assert_eq!(field.name(), "item");
+            assert_eq!(field.data_type(), &DataType::Utf8);
+            assert!(field.is_nullable());
+            assert_eq!(field.dict_id(), None);
+            assert_eq!(field.dict_is_ordered(), None);
+            assert_eq!(field.metadata().get("source.key").map(String::as_str), None);
+            let original = match &read.value_type(11).unwrap().data_type() {
                 DataType::List(f) => f,
                 _ => unreachable!(),
             };
-            assert!(Arc::ptr_eq(field, original));
+            assert!(Arc::ptr_eq(&field, &original));
         } else {
             panic!("lost nested full source type");
         }
@@ -311,7 +311,7 @@ fn writer_target_fields_complete_independent_wire_preserves_tokens_hidden_and_nu
         let decoded = decode_writer_target_fields(&input, read, SOURCE, limits(), &c)
             .unwrap()
             .0;
-        assert!(!decoded[0].ty.nullable);
+        assert!(!decoded[0].ty.nullable());
         assert_eq!(decoded[0].input.get(), u32::MAX);
         assert_eq!(decoded[0].token.to_bytes(), [7; 32]);
     });
@@ -430,22 +430,22 @@ fn writer_independent_layout_dictionary_clone_and_seven_caps_all_four_routes() {
             se.allocation_request_bytes_upper_bound,
             5 * size_of::<wire::WriterRelationField>() + names
         );
-        // Only the ROOT Dictionary owns two cloned Box<DataType> requests. The
-        // nested Dictionary under a List FieldRef shares the actual original Arc.
-        assert_eq!(sd.allocation_requests_upper_bound, 14);
+        // Value-type clones retain existing immutable backing; only actual
+        // field/name containers allocate on the receiving path.
+        assert_eq!(sd.allocation_requests_upper_bound, 12);
         assert_eq!(
             sd.allocation_request_bytes_upper_bound,
-            2 * 5 * size_of::<p::WriterRelationField>() + 2 * names + 2 * size_of::<DataType>()
+            2 * 5 * size_of::<p::WriterRelationField>() + 2 * names
         );
         assert_eq!(te.allocation_requests_upper_bound, 5);
         assert_eq!(
             te.allocation_request_bytes_upper_bound,
             2 * size_of::<wire::WriterTargetField>() + 64 + targetnames
         );
-        assert_eq!(td.allocation_requests_upper_bound, 8);
+        assert_eq!(td.allocation_requests_upper_bound, 6);
         assert_eq!(
             td.allocation_request_bytes_upper_bound,
-            2 * 2 * size_of::<p::WriterTargetField>() + 2 * targetnames + 2 * size_of::<DataType>()
+            2 * 2 * size_of::<p::WriterTargetField>() + 2 * targetnames
         );
         for route in 0..4 {
             let f = [se, sd, te, td][route];
@@ -489,13 +489,13 @@ fn writer_exact_type_required_presence_closed_roles_and_tokens_reject_without_de
             assert!(encode_writer_schema(&schema, &ids, types, SOURCE, limits(), &c).is_err());
         }
         let mut metadata_source = schema.clone();
-        if let DataType::List(field) = &metadata_source.fields[4].ty.data_type {
-            metadata_source.fields[4].ty.data_type = DataType::List(Arc::new(
-                field
-                    .as_ref()
-                    .clone()
-                    .with_metadata([("source.key".into(), "changed".into())].into()),
-            ));
+        if let DataType::List(field) = &metadata_source.fields[4].ty.data_type() {
+            metadata_source.fields[4].ty = FunctionValueType::new(
+                DataType::List(Arc::new(
+                    field.as_ref().clone().with_nullable(!field.is_nullable()),
+                )),
+                metadata_source.fields[4].ty.nullable(),
+            );
         }
         c.arm(None);
         assert!(
@@ -864,9 +864,9 @@ fn writer_sole_clone_ceiling_is_admitted_before_walk_and_retained_for_exact_repl
     let c = Control::default();
     with_types(&c, |roots, types, read| {
         let ceiling = physical_type_v2::value_type_clone_preflight_work_upper_bound();
-        assert_eq!(ceiling, 32784);
-        // Plain, root-owned Dictionary, and shared List FieldRef each use the
-        // same clone author, while only the root Dictionary owns two Boxes.
+        assert_eq!(ceiling, 2);
+        // Plain and normalized encoded/nested sources all use the same two
+        // strong-handle clone work units, with no new type allocation.
         for id in [0, 9, 11] {
             let ty = &roots
                 .iter()
@@ -981,11 +981,8 @@ fn writer_sole_clone_ceiling_is_admitted_before_walk_and_retained_for_exact_repl
             .unwrap();
             let clone =
                 physical_type_v2::preflight_value_type_clone(decoded_ty, &mut work).unwrap();
-            assert!(clone.work_upper_bound() < ceiling);
-            assert_eq!(
-                clone.allocation_requests_upper_bound(),
-                if id == 9 { 2 } else { 0 }
-            );
+            assert_eq!(clone.work_upper_bound(), ceiling);
+            assert_eq!(clone.allocation_requests_upper_bound(), 0);
             receive_initial
                 .model
                 .request::<p::WriterRelationField>(1, 2)
@@ -1544,7 +1541,7 @@ fn writer_schema_parent_prefix_replacement_exact_replay_and_actual_callbacks() {
 }
 
 #[test]
-fn writer_schema_parent_dictionary_capture_uses_two_real_boxes_before_lookup_completion() {
+fn writer_schema_parent_actual_name_requests_precede_lookup_completion() {
     let c = Control::default();
     with_types(&c, |roots, _, read| {
         let raw = wire::WriterRelationSchema {
@@ -1557,13 +1554,15 @@ fn writer_schema_parent_dictionary_capture_uses_two_real_boxes_before_lookup_com
             }],
         };
         assert!(matches!(
-            roots.iter().find(|r| r.0 == 9).unwrap().1.data_type,
-            DataType::Dictionary(_, _)
+            roots.iter().find(|r| r.0 == 9).unwrap().1.data_type(),
+            DataType::Utf8
         ));
-        // One base request, Vec+Box fields, and Vec+Box name precede the
-        // captured Dictionary's two Box<DataType> requests.
-        let before = 1 + 2 + 2;
-        let complete_requests = before + 2;
+        // One base request and the actual Vec+Box fields/name requests
+        // precede type lookup; there are no type-clone Box requests.
+        let before = 1 + 2 + 1;
+        // Actual name Vec/Box request pair is gated before the type lookup;
+        // the immutable value-type clone adds no allocation.
+        let complete_requests = before + 1;
         let mut at_capture = None;
         c.arm(None);
         let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
@@ -1582,7 +1581,7 @@ fn writer_schema_parent_dictionary_capture_uses_two_real_boxes_before_lookup_com
         )
         .unwrap();
         finish(work, Ok(())).unwrap();
-        assert_eq!(f.allocation_requests_upper_bound, 2 + 2 + 2);
+        assert_eq!(f.allocation_requests_upper_bound, 2 + 2);
         let capture = at_capture.unwrap();
         for cause in CAUSES {
             c.arm(Some((capture, cause)));
@@ -1661,10 +1660,19 @@ fn writer_schema_captured_comparison_prefix_numeric_first_and_final_peak() {
             c.arm(None);
             let mut snapshots = vec![];
             let f = run(parent_limits(), &mut snapshots).unwrap();
+            // The comparison's fixed scratch initialization is real work;
+            // retained source bytes are a separate floor, never a multiplier.
+            let comparison_prefix = type_binding_prefix_work_upper_bound_in(
+                &schema.fields[0].ty,
+                &schema.fields[0].ty,
+                SOURCE,
+            )
+            .unwrap()
+            .work_upper_bound();
             let (at, captured) = snapshots
                 .iter()
                 .copied()
-                .find(|(_, f)| f.cumulative_work_upper_bound >= SOURCE)
+                .find(|(_, f)| f.cumulative_work_upper_bound >= comparison_prefix)
                 .unwrap();
             let final_node = WriterSchemaNodeAdmission {
                 base: parent_base(),
@@ -1691,15 +1699,12 @@ fn writer_schema_captured_comparison_prefix_numeric_first_and_final_peak() {
     // Actual count-author seam: no datatype walk or allocation is needed to
     // test the sole captured-root arithmetic and its pending-tail priority.
     let ty = FunctionValueType::new(DataType::Int64, false);
-    let scratch = std::alloc::Layout::new::<
-        [Option<(&DataType, usize)>; novarocks_type_contract::MAX_VALUE_TYPE_NODES],
-    >()
-    .size();
-    for source in [
-        usize::MAX,
-        usize::MAX - scratch - 1,
-        usize::MAX - scratch - 2,
-    ] {
+    let prefix = type_binding_prefix_work_upper_bound_in(&ty, &ty, SOURCE)
+        .unwrap()
+        .work_upper_bound();
+    // Overflow genuine cumulative delegated-work addition, independently of
+    // source bytes. This private arithmetic seam performs no fake allocation.
+    for delegated in [usize::MAX, usize::MAX - prefix + 1] {
         for cause in CAUSES {
             c.arm(Some((1, cause)));
             let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
@@ -1712,7 +1717,8 @@ fn writer_schema_captured_comparison_prefix_numeric_first_and_final_peak() {
                 };
             let mut count = Count::new(1);
             count.admit = Some(&mut callback);
-            let result = count.comparison_prefix(&ty, &ty, source, 1, limits());
+            count.model.delegated_work = delegated;
+            let result = count.comparison_prefix(&ty, &ty, SOURCE, 1, limits());
             assert!(matches!(
                 finish(work, result),
                 Err(Error::Control(CompileControlError::ResourceExhausted))

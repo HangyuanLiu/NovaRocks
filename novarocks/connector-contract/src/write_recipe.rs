@@ -18,13 +18,14 @@
 //! Bounded pure writer recipes. Sealing proves provider-private semantics
 //! without opening a writer, resolving credentials or retaining a runtime handle.
 
-use crate::owned_copy::{ObservedCopy, OwnedCopy, PlainCopy};
+use crate::owned_copy::{CreatedWriteCopy, ObservedCopy, OwnedCopy, PlainCopy};
+#[cfg(test)]
+use crate::validate_write_field_schema_events;
 use crate::{
     ConnectorCodecCategory, ConnectorCodecContractError, ConnectorEncodedPayload, ConnectorError,
     ConnectorErrorKind, ConnectorWriteBinding, ConnectorWriteInputRef, ConnectorWriteInputShape,
     MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES, PureProviderCompileError,
     WRITE_FIELD_ALLOCATION_CHARGE, WriteSchemaVisit, WriterOwnedResourceFacts,
-    validate_write_field_schema_events,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
@@ -43,6 +44,7 @@ pub struct ConnectorWriteRecipeDraft {
     binding: ConnectorWriteBinding,
     payload: ConnectorEncodedPayload,
     input: Arc<ConnectorWriteInputShape>,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
     charged_bytes: usize,
     original_metadata_namespace: Option<novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>,
 }
@@ -120,6 +122,29 @@ impl ConnectorWriteRecipeDraft {
         Ok(result)
     }
 
+    /// The same complete writer law and copy body with actual independent
+    /// temporary, recipe and reachable Field construction responsibility.
+    /// Numeric admission remains separate from this genuine factory.
+    pub fn try_new_from_borrowed_input_with_factory_in<
+        H,
+        F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+    >(
+        binding: &ConnectorWriteBinding,
+        payload: &ConnectorEncodedPayload,
+        input: &ConnectorWriteInputRef<'_>,
+        source_retained_bytes: usize,
+        factory: &F,
+        admit: &mut impl FnMut(&WriterOwnedResourceFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, crate::WriterOwnedCreationFailure<H>> {
+        let mut observer = CreatedWriteCopy::new(source_retained_bytes, factory, admit, work)?;
+        let mut materialization =
+            crate::metadata_materialization_copy::MetadataMaterializationCopy::new(&mut observer);
+        let mut result = Self::try_new_core(binding, payload, input, &mut materialization)?;
+        result.original_metadata_namespace = Some(materialization.finish_namespace()?);
+        Ok(result)
+    }
+
     fn try_new_core<F: crate::write_input::WriteInputFields, O: OwnedCopy>(
         binding: &ConnectorWriteBinding,
         payload: &ConnectorEncodedPayload,
@@ -173,8 +198,8 @@ impl ConnectorWriteRecipeDraft {
             if field.field().name().is_empty() {
                 return Err(invalid("writer recipe input field name is empty").into());
             }
-            validate_write_field_schema_events::<O::Error>(
-                field.field(),
+            crate::write_schema::validate_write_bound_field_schema_events::<O::Error>(
+                field,
                 1,
                 &mut schema_bytes,
                 |event| {
@@ -235,6 +260,11 @@ impl ConnectorWriteRecipeDraft {
         let input = input
             .owned_bounded_core(observer)?
             .ok_or_else(|| invalid("writer owned copy did not materialize its input"))?;
+        observer.prefunded_request(
+            std::alloc::Layout::array::<u8>(payload.payload().len())
+                .map_err(|_| observer.arithmetic())?,
+            1,
+        )?;
         let mut copied_payload = Vec::new();
         observer.flush()?;
         let reservation = copied_payload.try_reserve_exact(payload.payload().len());
@@ -244,18 +274,32 @@ impl ConnectorWriteRecipeDraft {
             observer.step()?;
         }
         observer.flush()?;
+        if !copied_payload.is_empty() {
+            let shared = novarocks_type_contract::owned_resources::layout::bytes_shared_upper()
+                .map_err(|_| observer.arithmetic())?;
+            observer.prefunded_request(
+                std::alloc::Layout::array::<u8>(shared).map_err(|_| observer.arithmetic())?,
+                1,
+            )?;
+        }
         let payload = ConnectorEncodedPayload::new(
             payload.header().clone(),
             bytes::Bytes::from(copied_payload),
         );
         observer.step()?;
         observer.flush()?;
+        let request = novarocks_type_contract::owned_resources::layout::arc_layout(
+            std::alloc::Layout::new::<ConnectorWriteInputShape>(),
+        )
+        .map_err(|_| observer.arithmetic())?;
+        observer.prefunded_request(request, 1)?;
         let input = Arc::new(input);
         observer.step()?;
         Ok(Self {
             binding: binding.clone(),
             payload,
             input,
+            _storage: observer.storage_lifetime(),
             charged_bytes,
             original_metadata_namespace: None,
         })

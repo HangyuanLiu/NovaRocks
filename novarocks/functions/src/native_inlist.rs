@@ -330,9 +330,85 @@ pub fn signed_equality_observed<E>(
 pub struct PreparedNativeInListRecipe {
     negated: bool,
     source: novarocks_type_contract::FunctionValueType,
-    candidates: Box<[novarocks_type_contract::FunctionValueType]>,
+    candidates: novarocks_type_contract::FunctionParameterTypes,
     result: novarocks_type_contract::FunctionValueType,
 }
+/// Original comparison refusal and actual construction cause stay distinct.
+#[derive(Debug)]
+pub enum NativeInListCreationFailure<H> {
+    Control(novarocks_type_contract::CompileControlError),
+    Creator(H),
+    Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+    Owner(crate::ComparisonPrepareError),
+}
+impl<H: std::fmt::Display> std::fmt::Display for NativeInListCreationFailure<H> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Control(e) => e.fmt(f),
+            Self::Creator(e) => e.fmt(f),
+            Self::Resource(e) => write!(f, "IN recipe construction resource: {e:?}"),
+            Self::Owner(e) => e.fmt(f),
+        }
+    }
+}
+impl<H: std::error::Error + 'static> std::error::Error for NativeInListCreationFailure<H> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(e) => Some(e),
+            Self::Creator(e) => Some(e),
+            Self::Resource(_) => None,
+            Self::Owner(e) => Some(e),
+        }
+    }
+}
+impl<H> From<crate::ComparisonPrepareError> for NativeInListCreationFailure<H> {
+    fn from(e: crate::ComparisonPrepareError) -> Self {
+        match e.control_error() {
+            Some(cause) => Self::Control(cause),
+            None => Self::Owner(e),
+        }
+    }
+}
+impl<H> From<novarocks_type_contract::CompileControlError> for NativeInListCreationFailure<H> {
+    fn from(e: novarocks_type_contract::CompileControlError) -> Self {
+        Self::Control(e)
+    }
+}
+impl<H> From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for NativeInListCreationFailure<H>
+{
+    fn from(e: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::Resource(e)
+    }
+}
+fn inlist_request<H>(
+    creation: &mut Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    layout: std::alloc::Layout,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<(), NativeInListCreationFailure<H>> {
+    if let Some(creation) = creation.as_mut() {
+        work.flush()?;
+        creation
+            .request_layout(layout)
+            .map_err(NativeInListCreationFailure::Creator)?;
+    }
+    Ok(())
+}
+fn inlist_pure_failure(
+    error: NativeInListCreationFailure<std::convert::Infallible>,
+) -> crate::ComparisonPrepareError {
+    match error {
+        NativeInListCreationFailure::Control(error) => {
+            crate::ComparisonPrepareError::Control(error)
+        }
+        NativeInListCreationFailure::Owner(error) => error,
+        NativeInListCreationFailure::Resource(_) => crate::ComparisonPrepareError::Control(
+            novarocks_type_contract::CompileControlError::ResourceExhausted,
+        ),
+        NativeInListCreationFailure::Creator(never) => match never {},
+    }
+}
+
 impl PreparedNativeInListRecipe {
     pub fn try_new(
         negated: bool,
@@ -341,53 +417,157 @@ impl PreparedNativeInListRecipe {
         result: &novarocks_type_contract::FunctionValueType,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Self, crate::ComparisonPrepareError> {
+        Self::try_new_core::<true, std::convert::Infallible, _>(
+            negated,
+            source,
+            candidates.iter().copied(),
+            result,
+            None,
+            control,
+        )
+        .map(|recipe| recipe.expect("recipe publication requested"))
+        .map_err(inlist_pure_failure)
+    }
+    pub fn try_new_with_creator_in<H>(
+        negated: bool,
+        source: &novarocks_type_contract::FunctionValueType,
+        candidates: &[&novarocks_type_contract::FunctionValueType],
+        result: &novarocks_type_contract::FunctionValueType,
+        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, NativeInListCreationFailure<H>> {
+        Self::try_new_core::<true, H, _>(
+            negated,
+            source,
+            candidates.iter().copied(),
+            result,
+            Some(creation),
+            control,
+        )
+        .map(|recipe| recipe.expect("recipe publication requested"))
+    }
+
+    /// Validate the same original complete source/candidate/result profile
+    /// without publishing a recipe or its otherwise discarded candidate owner.
+    /// Actual prepared instances still consume the original owning constructor.
+    pub fn refine_borrowed_profile<'a>(
+        source: &novarocks_type_contract::FunctionValueType,
+        candidates: impl ExactSizeIterator<Item = &'a novarocks_type_contract::FunctionValueType>,
+        result: &novarocks_type_contract::FunctionValueType,
+        context: novarocks_type_contract::ExpressionEffectContext,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<crate::ScopedExpressionEffects, crate::ComparisonPrepareError> {
+        Self::try_new_core::<false, std::convert::Infallible, _>(
+            false, source, candidates, result, None, control,
+        )
+        .map(|_| inlist_own_effects(context))
+        .map_err(inlist_pure_failure)
+    }
+
+    fn try_new_core<'a, const PUBLISH: bool, H, I>(
+        negated: bool,
+        source: &novarocks_type_contract::FunctionValueType,
+        candidates: I,
+        result: &novarocks_type_contract::FunctionValueType,
+        mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Option<Self>, NativeInListCreationFailure<H>>
+    where
+        I: ExactSizeIterator<Item = &'a novarocks_type_contract::FunctionValueType>,
+    {
         use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueLogicalType};
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-        let outcome = (|| {
+        let outcome: Result<Option<Self>, NativeInListCreationFailure<H>> = (|| {
             crate::kernel_input::validate_type_observed(source, &mut work)
                 .map_err(crate::ComparisonPrepareError::Kernel)?;
             crate::kernel_input::validate_type_observed(result, &mut work)
                 .map_err(crate::ComparisonPrepareError::Kernel)?;
-            if source.logical_type != ValueLogicalType::Physical
-                || !(is_signed_integer_type(&source.data_type)
-                    || source.data_type == DataType::Utf8)
+            if source.logical_type() != ValueLogicalType::Physical
+                || !(is_signed_integer_type(source.data_type())
+                    || source.data_type() == &DataType::Utf8)
             {
-                return Err(crate::ComparisonPrepareError::Unsupported);
+                return Err(crate::ComparisonPrepareError::Unsupported.into());
             }
-            let mut nullable = source.nullable;
-            let mut types = Vec::with_capacity(candidates.len());
+            let mut nullable = source.nullable();
+            if candidates.len() != 0 {
+                let layout = std::alloc::Layout::array::<novarocks_type_contract::FunctionValueType>(
+                    candidates.len(),
+                ).map_err(|_| NativeInListCreationFailure::Resource(
+                    novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?;
+                if PUBLISH {
+                    inlist_request(&mut creation, layout, &mut work)?;
+                }
+            }
+            let mut types = if PUBLISH {
+                Some(Vec::with_capacity(candidates.len()))
+            } else {
+                None
+            };
             for candidate in candidates {
                 crate::kernel_input::validate_type_observed(candidate, &mut work)
                     .map_err(crate::ComparisonPrepareError::Kernel)?;
-                if candidate.logical_type != source.logical_type
-                    || candidate.data_type != source.data_type
+                if candidate.logical_type() != source.logical_type()
+                    || candidate.data_type() != source.data_type()
                 {
-                    return Err(crate::ComparisonPrepareError::TypeMismatch);
+                    return Err(crate::ComparisonPrepareError::TypeMismatch.into());
                 }
-                nullable |= candidate.nullable;
+                nullable |= candidate.nullable();
                 work.flush()?;
-                types.push((*candidate).clone());
+                if let Some(types) = types.as_mut() {
+                    types.push(candidate.clone());
+                }
                 work.step()?;
             }
-            if result.logical_type != ValueLogicalType::Physical
-                || result.data_type != DataType::Boolean
-                || (nullable && !result.nullable)
+            if result.logical_type() != ValueLogicalType::Physical
+                || result.data_type() != &DataType::Boolean
+                || (nullable && !result.nullable())
             {
-                return Err(crate::ComparisonPrepareError::TypeMismatch);
+                return Err(crate::ComparisonPrepareError::TypeMismatch.into());
             }
             work.flush()?;
-            Ok(Self {
+            let Some(types) = types else {
+                return Ok(None);
+            };
+            let facts = novarocks_type_contract::owned_resources::vec::box_facts(&types)
+                .map_err(|e| match e {
+                    novarocks_type_contract::ControlResourceError::Control(e) =>
+                        NativeInListCreationFailure::Control(e),
+                    novarocks_type_contract::ControlResourceError::SourceModel(_) =>
+                        NativeInListCreationFailure::Resource(
+                            novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
+                })?;
+            if let Some(layout) = facts.requested_backing {
+                inlist_request(&mut creation, layout, &mut work)?;
+            }
+            let items = types.into_boxed_slice();
+            let candidates = if let Some(creation) = creation.as_mut() {
+                let storage = creation.storage_lifetime();
+                novarocks_type_contract::FunctionParameterTypes::try_from_boxed_observed(
+                    items,
+                    storage,
+                    |layout| {
+                        work.flush()?;
+                        creation
+                            .request_layout(layout)
+                            .map_err(NativeInListCreationFailure::Creator)
+                    },
+                )?
+            } else {
+                novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(items)
+            };
+            Ok(Some(Self {
                 negated,
                 source: source.clone(),
-                candidates: types.into_boxed_slice(),
+                candidates,
                 result: result.clone(),
-            })
+            }))
         })();
-        if outcome
-            .as_ref()
-            .err()
-            .is_some_and(|e: &crate::ComparisonPrepareError| e.control_error().is_some())
-        {
+        if matches!(
+            outcome,
+            Err(NativeInListCreationFailure::Control(_)
+                | NativeInListCreationFailure::Creator(_)
+                | NativeInListCreationFailure::Resource(_))
+        ) {
             return outcome;
         }
         work.finish()?;
@@ -409,8 +589,13 @@ impl PreparedNativeInListRecipe {
         &self,
         context: novarocks_type_contract::ExpressionEffectContext,
     ) -> crate::ScopedExpressionEffects {
-        crate::ScopedExpressionEffects::pure_value(context)
+        inlist_own_effects(context)
     }
+}
+fn inlist_own_effects(
+    context: novarocks_type_contract::ExpressionEffectContext,
+) -> crate::ScopedExpressionEffects {
+    crate::ScopedExpressionEffects::pure_value(context)
 }
 #[cfg(test)]
 #[path = "native_inlist_tests.rs"]

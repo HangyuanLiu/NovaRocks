@@ -37,130 +37,6 @@ use novarocks_execution::exec::chunk::Chunk;
 use tracing::debug;
 
 #[cfg(test)]
-fn validate_source_domain(
-    field: &arrow::datatypes::Field,
-    expected: Option<novarocks_types::logical::LogicalType>,
-) -> Result<(), String> {
-    use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY};
-    let Some(value) = field.metadata().get(NR_LOGICAL_TYPE_KEY) else {
-        return Ok(());
-    };
-    let value = value.trim();
-    for domain in [
-        LogicalType::Json,
-        LogicalType::Hll,
-        LogicalType::Bitmap,
-        LogicalType::Object,
-        LogicalType::Percentile,
-    ] {
-        if value.eq_ignore_ascii_case(domain.metadata_value()) {
-            if Some(domain) != expected {
-                return Err(
-                    "typed root result source logical domain differs from output domain".into(),
-                );
-            }
-            return Ok(());
-        }
-    }
-    Err("typed root result source contains an unknown logical domain marker".into())
-}
-
-// Check borrowed facts before metadata retagging can replace their identity.
-// Missing source markers may acquire the declared fact; existing facts may not
-// be reinterpreted. Physical compatibility remains the separate existing check.
-#[cfg(test)]
-fn validate_source_field_tree(
-    source: &arrow::datatypes::Field,
-    expected: &arrow::datatypes::Field,
-) -> Result<(), String> {
-    validate_source_domain(source, declared_nested_domain(expected)?)?;
-    validate_source_type_domains(source.data_type(), expected.data_type())
-}
-
-#[cfg(test)]
-fn declared_nested_domain(
-    field: &arrow::datatypes::Field,
-) -> Result<Option<novarocks_types::logical::LogicalType>, String> {
-    use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY};
-    let Some(value) = field.metadata().get(NR_LOGICAL_TYPE_KEY) else {
-        return Ok(None);
-    };
-    [
-        LogicalType::Json,
-        LogicalType::Hll,
-        LogicalType::Bitmap,
-        LogicalType::Object,
-        LogicalType::Percentile,
-    ]
-    .into_iter()
-    .find(|domain| value.trim().eq_ignore_ascii_case(domain.metadata_value()))
-    .map(Some)
-    .ok_or_else(|| {
-        "typed root result declared field contains an unknown logical domain marker".into()
-    })
-}
-
-#[cfg(test)]
-fn validate_source_type_domains(source: &DataType, expected: &DataType) -> Result<(), String> {
-    match (source, expected) {
-        (DataType::Struct(source), DataType::Struct(expected)) => {
-            for (source, expected) in source.iter().zip(expected.iter()) {
-                validate_source_field_tree(source, expected)?;
-            }
-        }
-        (DataType::List(source), DataType::List(expected))
-        | (DataType::LargeList(source), DataType::LargeList(expected))
-        | (DataType::Map(source, _), DataType::Map(expected, _)) => {
-            // Map entries are a real Field, independently of its key/value
-            // children, and therefore also require strict marker validation.
-            validate_source_field_tree(source, expected)?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn validate_source_cache_tree(
-    source: &novarocks_execution::exec::chunk::ChunkFieldSchema,
-    expected_domain: Option<novarocks_types::logical::LogicalType>,
-    expected_type: &DataType,
-) -> Result<(), String> {
-    if source.logical_type().is_some() && source.logical_type() != expected_domain {
-        return Err(
-            "typed root result cached source logical domain differs from output domain".into(),
-        );
-    }
-    let expected_children: &[arrow::datatypes::FieldRef] = match expected_type {
-        DataType::Struct(fields) => fields.as_ref(),
-        DataType::List(item) | DataType::LargeList(item) => std::slice::from_ref(item),
-        DataType::Map(entries, _) => match entries.data_type() {
-            DataType::Struct(fields) => fields.as_ref(),
-            _ => return Err("typed root result declared map entries are not a struct".into()),
-        },
-        _ => &[],
-    };
-    // An absent source cache is a missing fact, not permission to erase
-    // populated children whose shape disagrees with the declared fields.
-    if source.children().is_empty() {
-        return Ok(());
-    }
-    if source.children().len() != expected_children.len() {
-        return Err(
-            "typed root result cached source child count differs from output fields".into(),
-        );
-    }
-    for (source, expected) in source.children().iter().zip(expected_children) {
-        validate_source_cache_tree(
-            source,
-            declared_nested_domain(expected)?,
-            expected.data_type(),
-        )?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
 pub(crate) fn align_fetch_chunks_to_output_columns(
     chunks: Vec<Chunk>,
     output_columns: &[PlanOutputColumn],
@@ -176,11 +52,11 @@ fn align_fetch_chunk_to_output_columns(
     chunk: Chunk,
     output_columns: &[PlanOutputColumn],
 ) -> Result<Chunk, String> {
-    let row_count = chunk.batch.num_rows();
-    if chunk.batch.num_columns() != output_columns.len() {
+    let row_count = chunk.record_batch().num_rows();
+    if chunk.record_batch().num_columns() != output_columns.len() {
         return Err(format!(
             "typed root result column count mismatch: chunk has {}, output metadata has {}",
-            chunk.batch.num_columns(),
+            chunk.record_batch().num_columns(),
             output_columns.len()
         ));
     }
@@ -195,23 +71,25 @@ fn align_fetch_chunk_to_output_columns(
     let mut fields = Vec::with_capacity(output_columns.len());
     let mut arrays = Vec::with_capacity(output_columns.len());
     for (idx, output) in output_columns.iter().enumerate() {
-        output.validate_domain()?;
         let slot = &chunk.chunk_schema().slots()[idx];
-        let expected = output.logical_marker();
-        validate_source_domain(chunk.batch.schema().field(idx), expected)?;
-        validate_source_domain(slot.field(), expected)?;
-        validate_source_type_domains(
-            chunk.batch.schema().field(idx).data_type(),
-            &output.data_type,
+        let source = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
+            slot.typed_binding().clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        if !source.same_semantics(&output.ty) {
+            return Err(
+                "typed root result source complete value type differs from output declaration"
+                    .into(),
+            );
+        }
+        let array = align_typed_root_array(
+            idx,
+            chunk.record_batch().column(idx).clone(),
+            output.data_type(),
         )?;
-        validate_source_type_domains(slot.field().data_type(), &output.data_type)?;
-        validate_source_type_domains(chunk.batch.column(idx).data_type(), &output.data_type)?;
-        validate_source_cache_tree(slot.field_schema(), expected, &output.data_type)?;
-        let array =
-            align_typed_root_array(idx, chunk.batch.column(idx).clone(), &output.data_type)?;
         let dictionary_carrier =
-            result_string_dictionary_carrier(&output.data_type, array.data_type());
-        if matches!(output.data_type, DataType::Utf8 | DataType::LargeUtf8)
+            result_string_dictionary_carrier(output.data_type(), array.data_type());
+        if matches!(output.data_type(), DataType::Utf8 | DataType::LargeUtf8)
             && matches!(array.data_type(), DataType::Dictionary(_, _))
             && !dictionary_carrier
         {
@@ -219,18 +97,22 @@ fn align_fetch_chunk_to_output_columns(
         }
         if !dictionary_carrier
             && let Err(mismatch) = novarocks_execution::exec::chunk::type_compatibility::check_exact(
-                &output.data_type,
+                output.data_type(),
                 array.data_type(),
             )
         {
             return Err(format!(
                 "typed root result column {idx} type mismatch: output={:?} chunk={:?} ({:?})",
-                output.data_type,
+                output.data_type(),
                 array.data_type(),
                 mismatch.kind
             ));
         }
-        let canonical = output.canonical_field(output.nullable || array.null_count() > 0)?;
+        let canonical = arrow::datatypes::Field::new(
+            &output.name,
+            output.data_type().clone(),
+            output.nullable(),
+        );
         let canonical = if dictionary_carrier {
             canonical.with_data_type(array.data_type().clone())
         } else {
@@ -250,32 +132,21 @@ fn align_fetch_chunk_to_output_columns(
         &RecordBatchOptions::new().with_row_count(Some(row_count)),
     )
     .map_err(|e| format!("align typed root result batch failed: {e}"))?;
-    // The incoming cache describes the wire fields. Rebuild it from the
-    // exact result domain, while retaining the already-decoded slot namespace.
+    // Retain the signed value binding while projecting the visible alias.
     let slots = chunk
         .chunk_schema()
         .slots()
         .iter()
         .zip(batch.schema().fields())
-        .map(|(slot, field)| {
-            if Arc::ptr_eq(slot.field_ref(), field)
-                && let Some(origins) = slot.metadata_origins()
-            {
-                novarocks_execution::exec::chunk::ChunkSlotSchema::try_new_with_metadata_origins(
-                    slot.slot_id(),
-                    Arc::clone(field),
-                    origins.clone(),
-                    None,
-                    slot.unique_id(),
-                )
-            } else {
-                novarocks_execution::exec::chunk::ChunkSlotSchema::try_new_with_field_ref(
-                    slot.slot_id(),
-                    Arc::clone(field),
-                    None,
-                    slot.unique_id(),
-                )
-            }
+        .zip(output_columns)
+        .map(|((slot, field), output)| {
+            novarocks_execution::exec::chunk::ChunkSlotSchema::try_new_typed(
+                slot.slot_id(),
+                Arc::clone(field),
+                output.ty.typed_binding().clone(),
+                slot.unique_id(),
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     let chunk_schema = Arc::new(novarocks_execution::exec::chunk::ChunkSchema::try_new(
@@ -575,197 +446,52 @@ fn patch_native_change_stream_router_sink_in_place(
     Ok(())
 }
 
-pub(crate) type CteMulticastConsumer = (
-    FragmentId,
-    i32,
-    novarocks_proto_models::plan::DataPartition,
-    Vec<i32>,
-    Vec<u32>,
-);
+/// Route identities borrowed from the completed native plan's CTE edges.
+/// Partition expressions and producer slots remain inside that exact fragment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct CteMulticastConsumer {
+    pub(crate) fragment_id: FragmentId,
+    pub(crate) exchange_node_id: i32,
+}
 
-pub fn patch_native_cte_multicast_sink(
-    fragment: &mut novarocks_proto_models::plan::PlanFragment,
+pub(crate) fn validate_native_cte_multicast_sink(
+    fragment: &novarocks_proto_models::plan::PlanFragment,
     fragment_id: FragmentId,
     cte_id: u32,
     consumers: &[CteMulticastConsumer],
 ) -> Result<(), String> {
-    if consumers.is_empty() {
-        return Err(format!("CTE fragment (cte_id={cte_id}) has no consumers"));
+    if fragment.fragment_id != fragment_id || fragment.cte_id != Some(cte_id) {
+        return Err("CTE fragment identity differs from its completed plan".into());
     }
-    let mut sinks = Vec::with_capacity(consumers.len());
-    for (
-        consumer_fragment_id,
-        exchange_node_id,
-        partition,
-        output_slot_ids,
-        receive_producer_column_ids,
-    ) in consumers
-    {
-        let sink_output_columns = native_cte_multicast_sink_output_columns(
-            fragment,
-            cte_id,
-            *consumer_fragment_id,
-            *exchange_node_id,
-            output_slot_ids,
-            receive_producer_column_ids,
-        )?;
-        sinks.push(novarocks_proto_models::plan::DataStreamSink {
-            dest_node_id: *exchange_node_id,
-            target_fragment_id: *consumer_fragment_id,
-            output_partition: Some(partition.clone()),
-            output_columns: sink_output_columns,
-            limit: None,
-        });
+    if fragment.execution_types.is_none() {
+        return Err("CTE fragment has no execution type owner".into());
     }
-    fragment.sink = Some(novarocks_proto_models::plan::DataSink {
-        kind: Some(
-            novarocks_proto_models::plan::data_sink::Kind::MultiCastDataStream(
-                novarocks_proto_models::plan::MultiCastDataStreamSink { sinks },
-            ),
-        ),
-    });
-    debug!(
-        "patched native CTE multicast sink: fragment={} cte_id={} sinks={}",
-        fragment_id,
-        cte_id,
-        consumers.len()
-    );
+    let Some(novarocks_proto_models::plan::data_sink::Kind::MultiCastDataStream(multicast)) =
+        fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref())
+    else {
+        return Err("CTE fragment has no encoded multicast sink".into());
+    };
+    if consumers.is_empty() || consumers.len() != multicast.sinks.len() {
+        return Err(format!(
+            "CTE fragment {cte_id} has inconsistent consumer count"
+        ));
+    }
+    let mut remaining = consumers.iter().copied().collect::<BTreeSet<_>>();
+    if remaining.len() != consumers.len() {
+        return Err("CTE fragment has duplicate completed consumer routes".into());
+    }
+    for sink in &multicast.sinks {
+        let consumer = CteMulticastConsumer {
+            fragment_id: sink.target_fragment_id,
+            exchange_node_id: sink.dest_node_id,
+        };
+        if sink.output_partition.is_none() || !remaining.remove(&consumer) {
+            return Err("CTE encoded sink differs from its completed consumer route".into());
+        }
+    }
+    // No partition, slot, or type is regenerated here. The codec validated the
+    // exact edge mapping while borrowing this fragment's own execution table.
     Ok(())
-}
-
-fn native_cte_multicast_sink_output_columns(
-    fragment: &novarocks_proto_models::plan::PlanFragment,
-    cte_id: u32,
-    consumer_fragment_id: FragmentId,
-    exchange_node_id: i32,
-    requested_output_slot_ids: &[i32],
-    receive_producer_column_ids: &[u32],
-) -> Result<Vec<i32>, String> {
-    if requested_output_slot_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // The CTE producer fragment is sealed with `DataSink::Noop`, so the planner
-    // seal (CGO-9C Task 2, `finalize_fragment_output_columns`) adopts the
-    // producer root's wire output wholesale into `fragment.output_columns`. That
-    // sealed contract is the authoritative producer-root output; read it directly
-    // rather than re-walking the encoded tree (the retired
-    // `encoded_fragment_root_output_columns` read-walk, deleted in CGO-9C Task 5).
-    let root_columns = fragment.output_columns.clone();
-    let root_slot_ids = root_columns
-        .iter()
-        .map(|column| {
-            i32::try_from(column.column_id).map_err(|_| {
-                format!(
-                    "native CTE source output column {} cannot convert to slot id",
-                    column.column_id
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let root_slot_id_set = root_slot_ids.iter().copied().collect::<BTreeSet<_>>();
-    if requested_output_slot_ids
-        .iter()
-        .all(|slot_id| root_slot_id_set.contains(slot_id))
-    {
-        return Ok(requested_output_slot_ids.to_vec());
-    }
-    if receive_producer_column_ids.len() == requested_output_slot_ids.len()
-        && let Some(mapped) = receive_producer_column_ids
-            .iter()
-            .map(|column_id| {
-                let slot_id = i32::try_from(*column_id).ok()?;
-                root_slot_id_set.contains(&slot_id).then_some(slot_id)
-            })
-            .collect::<Option<Vec<_>>>()
-    {
-        return Ok(mapped);
-    }
-    let contract_slot_map =
-        native_cte_multicast_contract_slot_map(fragment, &root_columns, &root_slot_id_set);
-    if let Some(mapped) = requested_output_slot_ids
-        .iter()
-        .map(|slot_id| contract_slot_map.get(slot_id).copied())
-        .collect::<Option<Vec<_>>>()
-    {
-        return Ok(mapped);
-    }
-    if requested_output_slot_ids.len() == root_slot_ids.len() {
-        return Ok(root_slot_ids);
-    }
-    Err(format!(
-        "native CTE multicast sink output columns for cte_id={cte_id} consumer_fragment={consumer_fragment_id} exchange_node_id={exchange_node_id} ({requested_output_slot_ids:?}) do not match source root output columns ({root_slot_ids:?})"
-    ))
-}
-
-fn native_cte_multicast_contract_slot_map(
-    fragment: &novarocks_proto_models::plan::PlanFragment,
-    root_columns: &[novarocks_proto_models::common::OutputColumn],
-    root_slot_id_set: &BTreeSet<i32>,
-) -> BTreeMap<i32, i32> {
-    let mut map = BTreeMap::new();
-
-    if fragment.output_exprs.len() == fragment.output_columns.len() {
-        for (output, expr) in fragment
-            .output_columns
-            .iter()
-            .zip(fragment.output_exprs.iter())
-        {
-            let Some(novarocks_proto_models::expr::expr::Kind::ColumnRef(column_ref)) =
-                expr.kind.as_ref()
-            else {
-                continue;
-            };
-            let Ok(contract_id) = i32::try_from(output.column_id) else {
-                continue;
-            };
-            let Ok(root_id) = i32::try_from(column_ref.column_id) else {
-                continue;
-            };
-            if root_slot_id_set.contains(&root_id) {
-                map.insert(contract_id, root_id);
-            }
-        }
-    }
-
-    for output in &fragment.output_columns {
-        let Ok(contract_id) = i32::try_from(output.column_id) else {
-            continue;
-        };
-        if map.contains_key(&contract_id) {
-            continue;
-        }
-        let mut matches = root_columns.iter().filter(|root| {
-            root.name == output.name
-                && root.nullable == output.nullable
-                && root.r#type == output.r#type
-        });
-        let Some(root) = matches.next() else {
-            continue;
-        };
-        if matches.next().is_some() {
-            continue;
-        }
-        if let Ok(root_id) = i32::try_from(root.column_id) {
-            map.insert(contract_id, root_id);
-        }
-    }
-
-    if fragment.output_columns.len() <= root_columns.len() {
-        for (output, root) in fragment.output_columns.iter().zip(root_columns.iter()) {
-            let Ok(contract_id) = i32::try_from(output.column_id) else {
-                continue;
-            };
-            if map.contains_key(&contract_id) {
-                continue;
-            }
-            if let Ok(root_id) = i32::try_from(root.column_id) {
-                map.insert(contract_id, root_id);
-            }
-        }
-    }
-
-    map
 }
 
 #[cfg(test)]
@@ -897,14 +623,17 @@ mod tests {
             vec![chunk],
             &[PlanOutputColumn {
                 name: "col1".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                domain: novarocks_physical_plan::ResultValueDomain::Plain,
+                ty: crate::query_execution::attempt_plan_facts::declared_test_value(
+                    DataType::Int32,
+                    true,
+                    novarocks_physical_plan::ResultValueDomain::Plain,
+                )
+                .unwrap(),
             }],
         )
         .unwrap();
-        assert_eq!(aligned[0].batch.schema().field(0).name(), "col1");
-        assert!(aligned[0].batch.schema().field(0).is_nullable());
+        assert_eq!(aligned[0].record_batch().schema().field(0).name(), "col1");
+        assert!(aligned[0].record_batch().schema().field(0).is_nullable());
 
         let decimal = Decimal128Array::from(vec![Some(100_i128)])
             .with_precision_and_scale(38, 2)
@@ -924,53 +653,65 @@ mod tests {
                 vec![chunk],
                 &[PlanOutputColumn {
                     name: "price".to_string(),
-                    data_type: DataType::Decimal128(20, 2),
-                    nullable: false,
-                    domain: novarocks_physical_plan::ResultValueDomain::Plain,
+                    ty: crate::query_execution::attempt_plan_facts::declared_test_value(
+                        DataType::Decimal128(20, 2),
+                        false,
+                        novarocks_physical_plan::ResultValueDomain::Plain
+                    )
+                    .unwrap(),
                 }],
             )
             .expect_err("decimal precision drift must fail")
-            .contains("type mismatch")
+            .contains("complete value type differs")
         );
     }
 
     #[test]
-    fn patches_cte_multicast_from_sealed_root_output_slots() {
-        let mut fragment = native_plan::PlanFragment {
+    fn cte_freeze_keeps_the_encoded_owner_and_rejects_missing_routes() {
+        let fragment = native_plan::PlanFragment {
             fragment_id: 1,
-            output_columns: vec![novarocks_proto_models::common::OutputColumn {
-                column_id: 10,
-                name: "total".to_string(),
-                r#type: None,
-                nullable: true,
-                is_internal: false,
-            }],
+            cte_id: Some(1),
+            execution_types: Some(Default::default()),
+            sink: Some(native_plan::DataSink {
+                kind: Some(native_plan::data_sink::Kind::MultiCastDataStream(
+                    native_plan::MultiCastDataStreamSink {
+                        sinks: vec![native_plan::DataStreamSink {
+                            dest_node_id: 77,
+                            target_fragment_id: 2,
+                            output_partition: Some(native_plan::DataPartition {
+                                kind: native_plan::PartitionKind::Unpartitioned as i32,
+                                exprs: vec![],
+                            }),
+                            output_columns: vec![10, 10],
+                            limit: None,
+                        }],
+                    },
+                )),
+            }),
             ..Default::default()
         };
-        patch_native_cte_multicast_sink(
-            &mut fragment,
-            1,
-            3,
-            &[(
-                2,
-                77,
-                native_plan::DataPartition {
-                    kind: native_plan::PartitionKind::Unpartitioned as i32,
-                    exprs: Vec::new(),
-                },
-                vec![13],
-                vec![13],
-            )],
-        )
-        .expect("CTE patch");
-        let Some(native_plan::data_sink::Kind::MultiCastDataStream(sink)) =
-            fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref())
-        else {
-            panic!("native multicast sink");
+        let consumer = CteMulticastConsumer {
+            fragment_id: 2,
+            exchange_node_id: 77,
         };
-        assert_eq!(sink.sinks[0].output_columns, vec![10]);
-        assert_eq!(sink.sinks[0].target_fragment_id, 2);
-        assert_eq!(sink.sinks.len(), 1);
+        let before = fragment.clone();
+        validate_native_cte_multicast_sink(&fragment, 1, 1, &[consumer]).unwrap();
+        assert_eq!(fragment, before);
+        assert!(
+            validate_native_cte_multicast_sink(
+                &fragment,
+                1,
+                1,
+                &[CteMulticastConsumer {
+                    fragment_id: 3,
+                    ..consumer
+                }]
+            )
+            .is_err()
+        );
+        let mut missing_owner = fragment;
+        missing_owner.execution_types = None;
+        assert!(validate_native_cte_multicast_sink(&missing_owner, 1, 1, &[consumer]).is_err());
     }
 
     #[test]
@@ -985,110 +726,71 @@ mod tests {
     }
 
     #[test]
-    fn m07_result_alignment_rejects_known_unknown_and_cache_only_domain_conflicts() {
+    fn root_alignment_checks_explicit_domain_and_ignores_source_attributes() {
         use arrow::array::BinaryArray;
-        use novarocks_execution::exec::chunk::{ChunkFieldSchema, ChunkSlotSchema};
+        use novarocks_execution::exec::chunk::ChunkSlotSchema;
         use novarocks_physical_plan::ResultValueDomain as D;
-        use novarocks_types::logical::{
-            LogicalType as L, NR_LOGICAL_TYPE_KEY, field_with_logical_type,
-        };
-        let source = |batch_marker: Option<&str>, slot_marker: Option<&str>, cached: Option<L>| {
-            let field = |marker: Option<&str>| {
-                let field = Field::new("wire", DataType::Binary, false);
-                match marker {
-                    Some(marker) => {
-                        field.with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into())
-                    }
-                    None => field,
-                }
-            };
-            let batch = RecordBatch::try_new(
-                Arc::new(Schema::new(vec![field(batch_marker)])),
-                vec![Arc::new(BinaryArray::from(vec![
-                    b"actual-nonempty".as_slice(),
-                ]))],
-            )
-            .unwrap();
-            let cache_field = match cached {
-                Some(marker) => field_with_logical_type(field(None), marker),
-                None => field(None),
-            };
-            let cache = ChunkFieldSchema::from_field(&cache_field).unwrap();
-            let slot = ChunkSlotSchema::try_new_with_field(
-                SlotId::new(9),
-                field(slot_marker),
-                Some(cache),
-                None,
-            )
-            .unwrap();
-            let mut chunk = Chunk::try_new_with_chunk_schema(
-                batch.clone(),
-                Arc::new(ChunkSchema::try_new(vec![slot]).unwrap()),
-            )
-            .unwrap();
-            // Chunk construction normally reconciles the batch to its slots.
-            // Keep the three actual public facts independent here so each
-            // alignment guard has its own failure oracle.
-            chunk.batch = batch;
-            chunk
-        };
-        let output = |domain| PlanOutputColumn {
-            name: "declared".into(),
-            data_type: DataType::Binary,
-            nullable: false,
-            domain,
-        };
-        // Known semantic identity is checked independently in both actual
-        // Fields and the cached schema; clearing or renaming is not permission.
+        use novarocks_type_contract::ValueTypeStorageLifetime as S;
+        let ty = super::super::attempt_plan_facts::declared_test_value(
+            DataType::Binary,
+            false,
+            D::Bitmap,
+        )
+        .unwrap();
+        let field =
+            Arc::new(Field::new("wire", DataType::Binary, false).with_metadata(
+                [("nr_logical_type".into(), "unknown-source-attribute".into())].into(),
+            ));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field.clone()])),
+            vec![Arc::new(BinaryArray::from(vec![b"payload".as_slice()]))],
+        )
+        .unwrap();
+        let slot = ChunkSlotSchema::try_new_typed(
+            SlotId::new(9),
+            field,
+            ty.typed_binding().clone(),
+            None,
+            S::pure(),
+        )
+        .unwrap();
+        let chunk = Chunk::try_new_with_chunk_schema(
+            batch,
+            Arc::new(ChunkSchema::try_new(vec![slot]).unwrap()),
+        )
+        .unwrap();
         for domain in [D::Hll, D::Object, D::Percentile, D::Plain] {
-            for (batch, slot, cached) in [
-                (Some("bitmap"), None, None),
-                (None, Some("bitmap"), None),
-                (None, None, Some(L::Bitmap)),
-            ] {
-                let error = align_fetch_chunks_to_output_columns(
-                    vec![source(batch, slot, cached)],
-                    &[output(domain)],
+            let output = PlanOutputColumn {
+                name: "declared".into(),
+                ty: super::super::attempt_plan_facts::declared_test_value(
+                    DataType::Binary,
+                    false,
+                    domain,
                 )
-                .unwrap_err();
-                assert!(error.contains("logical domain differs"), "{error}");
-            }
+                .unwrap(),
+            };
+            assert!(
+                align_fetch_chunks_to_output_columns(vec![chunk.clone()], &[output])
+                    .unwrap_err()
+                    .contains("complete value type differs")
+            );
         }
-        for domain in [D::Bitmap, D::Plain] {
-            for (batch, slot) in [
-                (Some("unknown"), None),
-                (None, Some("unknown")),
-                (Some(""), None),
-            ] {
-                let error = align_fetch_chunks_to_output_columns(
-                    vec![source(batch, slot, None)],
-                    &[output(domain)],
-                )
-                .unwrap_err();
-                assert!(error.contains("unknown logical domain"), "{error}");
-            }
-        }
-        let aligned = align_fetch_chunks_to_output_columns(
-            vec![source(None, None, None)],
-            &[output(D::Bitmap)],
-        )
-        .unwrap();
+        let output = PlanOutputColumn {
+            name: "declared".into(),
+            ty: ty.clone(),
+        };
+        let aligned = align_fetch_chunks_to_output_columns(vec![chunk], &[output]).unwrap();
         assert_eq!(
-            aligned[0].chunk_schema().slots()[0]
-                .field_schema()
-                .logical_type(),
-            Some(L::Bitmap)
+            aligned[0].chunk_schema().slots()[0].typed_binding(),
+            ty.typed_binding()
         );
-        let aligned = align_fetch_chunks_to_output_columns(
-            vec![source(Some(" BiTmAp "), Some("bitmap"), Some(L::Bitmap))],
-            &[output(D::Bitmap)],
-        )
-        .unwrap();
-        assert_eq!(
-            aligned[0].chunk_schema().slots()[0]
-                .field_schema()
-                .logical_type(),
-            Some(L::Bitmap)
+        assert!(
+            aligned[0]
+                .record_batch()
+                .schema()
+                .field(0)
+                .metadata()
+                .is_empty()
         );
     }
 }

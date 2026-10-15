@@ -31,13 +31,13 @@ use novarocks_execution::runtime_filter::{
     RuntimeFilterLateApplyGranularity, RuntimeFilterNullSemantics, RuntimeFilterProducerContract,
     RuntimeFilterProducerKind, RuntimeFilterReduction, contribution,
 };
-use novarocks_proto_codec::lifecycle::{QueryExecutionId, RuntimeFilterContribution};
+use novarocks_proto_codec::lifecycle::QueryExecutionId;
+#[cfg(any(test, feature = "test-support"))]
+use novarocks_proto_codec::lifecycle::RuntimeFilterContribution;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, filter, plan};
 use novarocks_types::{BackendProcessId, UniqueId};
 
-use crate::runtime_filter_membership::{MembershipContractDecodeError, decode_membership_contract};
-use novarocks_plan_codec::native_type::decode_type;
 use novarocks_worker::runtime_filter::domain::{
     BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall, BackendCoverage,
     BackendCoverageWitnessId, BackendEnvelopeKind, BackendFrontendFeedbackPublication,
@@ -77,6 +77,55 @@ pub struct DecodedRuntimeFilterContribution {
 
 type CodecResult<T> = Result<T, ProtocolError>;
 
+use crate::fragment_error::NativeFragmentDecodeError;
+use crate::fragment_type_decode::{
+    NativeDecodeResources, NativeTypeDecoder, clone_type, resolve_type, table_failure,
+};
+use crate::native_type_construction::{
+    NativeTypeConstruction, NativeTypeConstructionError, NativeTypeFactory,
+};
+use novarocks_plan_codec::execution_type_table::{
+    ExecutionTypeTableLimits, decode_execution_type_table_with_factory_in,
+};
+use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
+use std::alloc::Layout;
+
+type NativeResult<T> = Result<T, NativeFragmentDecodeError>;
+enum InstallTypeMode<'borrow, 'creator> {
+    Strong(&'borrow mut NativeDecodeResources<'creator>),
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn with_fixture_resources<T>(
+    operation: impl FnOnce(&mut NativeDecodeResources<'_>) -> NativeResult<T>,
+) -> NativeResult<T> {
+    struct Control;
+    impl novarocks_type_contract::PureCompileControl for Control {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+    let tracker =
+        novarocks_execution::runtime::mem_tracker::MemTracker::new_root("runtime-filter fixture");
+    let creation = NativeTypeConstruction::try_with_control(tracker, &Control)?;
+    let mut resources = NativeDecodeResources::try_new(&creation)?;
+    let result = operation(&mut resources)?;
+    resources.finish()?;
+    Ok(result)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn fixture_protocol(error: NativeFragmentDecodeError) -> ProtocolError {
+    match error {
+        NativeFragmentDecodeError::Protocol(error) => error,
+        error => contract_invalid(FieldPath::root("runtime_filter"), error.to_string()),
+    }
+}
+
 /// Rebuild the participant-local install envelope from the manifest
 /// contribution and the admitted execution identity, then decode it.
 ///
@@ -86,32 +135,54 @@ type CodecResult<T> = Result<T, ProtocolError>;
 /// execution identity used here is the admitted one, not a restated copy.
 /// Every structural and cross-field rejection below therefore still runs on
 /// the exact bytes that were admitted.
+#[cfg(any(test, feature = "test-support"))]
 pub fn decode_runtime_filter_contribution(
     execution_id: QueryExecutionId,
     contribution: &RuntimeFilterContribution,
 ) -> Result<DecodedRuntimeFilterContribution, RuntimeFilterContractError> {
-    let wire = contribution.as_proto();
-    let request = filter::InstallRuntimeFilterDeploymentRequest {
-        query_id: Some(common::UniqueId {
-            hi: execution_id.query_id().high(),
-            lo: execution_id.query_id().low(),
-        }),
-        deployment_epoch: execution_id.attempt_id().get(),
-        participant_id: wire.participant_id,
-        lifecycle: wire.lifecycle,
-        install: wire.install.clone(),
-    };
-    // The envelope above is built from the admitted execution identity and the
-    // contribution's own participant id, so the decoded query id, deployment
-    // epoch, and local participant id are those same values travelling back
-    // out. Comparing them against their own source cannot fail and would only
-    // suggest an agreement is being enforced here. The Frontend establishes
-    // that agreement where the identities actually meet: the runtime-filter
-    // deployment derives both from the scheduled execution id, and
-    // `QueryExecutionArtifact` rejects lifecycle options whose execution id
-    // disagrees with the schedule.
-    let decoded = decode_participant_install(&request)
-        .map_err(|error| RuntimeFilterContractError::invalid_contract(error.to_string()))?;
+    with_fixture_resources(|resources| {
+        let wire = contribution.as_proto();
+        let decoded = decode_participant_parts(
+            UniqueId::new(
+                execution_id.query_id().high(),
+                execution_id.query_id().low(),
+            ),
+            execution_id.attempt_id().get(),
+            wire.participant_id,
+            wire.lifecycle.as_ref(),
+            wire.install.as_ref(),
+            &mut InstallTypeMode::Strong(resources),
+        )?;
+        Ok(DecodedRuntimeFilterContribution {
+            lifecycle: decoded.lifecycle,
+            install: decoded.install,
+        })
+    })
+    .map_err(|error: NativeFragmentDecodeError| {
+        RuntimeFilterContractError::invalid_contract(error.to_string())
+    })
+}
+
+/// Borrow the admitted contribution directly; no generated install DTO or
+/// lifecycle manifest is cloned before the actual BE construction observer.
+pub(crate) fn decode_runtime_filter_contribution_with_type_creator(
+    execution_id: QueryExecutionId,
+    contribution: &novarocks_proto_models::novarocks::RuntimeFilterContribution,
+    creator: &NativeTypeConstruction<'_>,
+) -> NativeResult<DecodedRuntimeFilterContribution> {
+    let mut resources = NativeDecodeResources::try_new(creator)?;
+    let decoded = decode_participant_parts(
+        UniqueId::new(
+            execution_id.query_id().high(),
+            execution_id.query_id().low(),
+        ),
+        execution_id.attempt_id().get(),
+        contribution.participant_id,
+        contribution.lifecycle.as_ref(),
+        contribution.install.as_ref(),
+        &mut InstallTypeMode::Strong(&mut resources),
+    )?;
+    resources.finish()?;
     Ok(DecodedRuntimeFilterContribution {
         lifecycle: decoded.lifecycle,
         install: decoded.install,
@@ -159,27 +230,106 @@ fn decode_runtime_filter_logical_domain_and_reduction(
     wire_contract: Option<&plan::RuntimeFilterContract>,
     wire_reduction: Option<&plan::RuntimeFilterReductionContract>,
     path: FieldPath,
-) -> CodecResult<DecodedChannelContract> {
-    let type_path = path.clone().field("value_type");
-    let wire_type = wire_type.ok_or_else(|| {
+    mode: &mut InstallTypeMode<'_, '_>,
+) -> NativeResult<DecodedChannelContract> {
+    let InstallTypeMode::Strong(resources) = mode;
+    resources
+        .work
+        .step()
+        .map_err(NativeTypeConstructionError::Control)?;
+    let wire_contract = wire_contract.ok_or_else(|| {
         contract_missing(
-            type_path.clone(),
-            "runtime filter deployment logical domain is contract_missing value type",
+            path.clone().field("contract"),
+            "runtime filter contract is required",
         )
     })?;
-    let value_type =
-        decode_type(wire_type).map_err(|detail| contract_invalid(type_path, detail))?;
-    let contract = decode_contract(
-        0,
-        &value_type,
-        wire_contract,
-        path.clone().field("contract"),
-    )?;
+    let outer = wire_type.ok_or_else(|| {
+        contract_missing(
+            path.clone().field("value_type"),
+            "runtime filter value reference is required",
+        )
+    })?;
+    let contract =
+        decode_typed_contract_domain(0, wire_contract, Some(outer), path.clone(), resources)?;
     let reduction = decode_reduction(0, &contract, wire_reduction, path.field("reduction"))?;
     Ok(DecodedChannelContract {
         execution: contract,
         reduction,
     })
+}
+
+/// Decode the RF namespace under its actual creator. Fragment endpoint refs
+/// belong to a different owner and are compared only after this domain exists.
+pub(crate) fn decode_typed_contract_domain(
+    binding_id: u32,
+    wire_contract: &plan::RuntimeFilterContract,
+    outer: Option<&common::TypeDesc>,
+    path: FieldPath,
+    resources: &mut NativeDecodeResources<'_>,
+) -> NativeResult<RuntimeFilterExecutionContract> {
+    let domain_path = path.clone().field("contract").field("logical_domain");
+    let domain = wire_contract.logical_domain.as_ref().ok_or_else(|| {
+        contract_missing(
+            domain_path.clone(),
+            "runtime filter requires its independent complete type owner",
+        )
+    })?;
+    let table = domain.execution_types.as_ref().ok_or_else(|| {
+        contract_missing(
+            domain_path.clone().field("execution_types"),
+            "runtime filter type owner is required",
+        )
+    })?;
+    let desc = domain.value_type.as_ref().ok_or_else(|| {
+        contract_missing(
+            domain_path.clone().field("value_type"),
+            "runtime filter complete value reference is required",
+        )
+    })?;
+    let limits = ExecutionTypeTableLimits::for_validated_root_count(table.value_bindings.len())
+        .map_err(NativeTypeConstructionError::Control)?;
+    let factory = NativeTypeFactory::new(resources.creation);
+    let types =
+        decode_execution_type_table_with_factory_in(table, limits, &factory, &mut resources.work)
+            .map_err(|error| table_failure(error, domain_path.clone().field("execution_types")))?;
+    let source = resolve_type(
+        &types,
+        desc,
+        domain_path.clone().field("value_type"),
+        resources,
+    )?;
+    // The deployment's redundant reference must resolve in this same owner.
+    let mut decoder = NativeTypeDecoder::Strong {
+        types: &types,
+        original_requests: None,
+        resources,
+    };
+    if let Some(outer) = outer {
+        let outer_source = resolve_type(
+            &types,
+            outer,
+            path.clone().field("value_type"),
+            match &mut decoder {
+                NativeTypeDecoder::Strong { resources, .. } => resources,
+            },
+        )?;
+        if !decoder.bindings_match(source.typed_binding(), outer_source.typed_binding(), false)? {
+            return Err(contract_inconsistent(
+                path.clone().field("value_type"),
+                "runtime filter value reference differs from its declared logical domain",
+            )
+            .into());
+        }
+    }
+    let contract = decode_contract_with_types(
+        binding_id,
+        source.data_type(),
+        source,
+        Some(wire_contract),
+        path.clone().field("contract"),
+        &mut decoder,
+    )?;
+    Ok(contract)
 }
 
 fn decode_runtime_filter_activation(
@@ -237,12 +387,34 @@ fn decode_runtime_filter_activation(
     }
 }
 
+#[cfg(test)]
 fn decode_contract(
     binding_id: u32,
     expression_type: &arrow::datatypes::DataType,
     wire: Option<&plan::RuntimeFilterContract>,
     path: FieldPath,
 ) -> CodecResult<RuntimeFilterExecutionContract> {
+    crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+        decode_contract_with_types(
+            binding_id,
+            expression_type,
+            &novarocks_functions::FunctionValueType::new(expression_type.clone(), true),
+            wire,
+            path,
+            decoder,
+        )
+    })
+    .map_err(fixture_protocol)
+}
+
+fn decode_contract_with_types(
+    binding_id: u32,
+    expression_type: &arrow::datatypes::DataType,
+    complete_type: &novarocks_functions::FunctionValueType,
+    wire: Option<&plan::RuntimeFilterContract>,
+    path: FieldPath,
+    decoder: &mut NativeTypeDecoder<'_, '_, '_>,
+) -> NativeResult<RuntimeFilterExecutionContract> {
     let wire = wire.ok_or_else(|| {
         contract_missing(
             path.clone(),
@@ -258,26 +430,25 @@ fn decode_contract(
     match kind {
         plan::runtime_filter_contract::Kind::Membership(membership) => {
             let path = path.field("membership").field("null_semantics");
-            let schema = decode_membership_contract(expression_type, membership).map_err(|decode_error| {
-                match decode_error {
-                    MembershipContractDecodeError::UnspecifiedNullSemantics
-                    | MembershipContractDecodeError::UnknownNullSemantics { .. } => error(
-                        path,
-                        ProtocolErrorKind::InvalidEnum,
-                        format!(
-                            "native runtime-filter binding_id={binding_id} contract_invalid {decode_error}"
-                        ),
-                    ),
-                    MembershipContractDecodeError::InvalidExecutionSchema { .. } => {
-                        contract_invalid(
-                            path,
-                            format!(
-                                "native runtime-filter binding_id={binding_id} contract_invalid {decode_error}"
-                            ),
+            let semantics =
+                crate::runtime_filter_membership::decode_membership_null_semantics(membership)
+                    .map_err(|cause| {
+                        error(
+                            path.clone(),
+                            ProtocolErrorKind::InvalidEnum,
+                            cause.to_string(),
                         )
-                    }
-                }
-            })?;
+                    })?;
+            let schema = {
+                let source = complete_type;
+                let NativeTypeDecoder::Strong { resources, .. } = decoder;
+                let source = clone_type(source, resources)?;
+                let scope = resources.creation.begin_scope()?;
+                novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema::new_value_typed_with_storage_observed::<NativeFragmentDecodeError>(
+                    source, semantics, scope.storage_lifetime(), |layout| scope.request_layout(layout).map_err(Into::into),
+                    |units| { for _ in 0..units { resources.work.step().map_err(NativeTypeConstructionError::Control)?; } Ok(()) },
+                )?
+            };
             Ok(RuntimeFilterExecutionContract::Membership(schema))
         }
         plan::runtime_filter_contract::Kind::Ordered(ordered) => {
@@ -289,7 +460,15 @@ fn decode_contract(
                         "native runtime-filter binding_id={binding_id} ordered contract must contain exactly one key, got {}",
                         ordered.keys.len()
                     ),
-                ));
+                ).into());
+            }
+            {
+                let NativeTypeDecoder::Strong { resources, .. } = decoder;
+                resources.request(
+                    Layout::array::<contribution::RuntimeOrderKey>(ordered.keys.len()).map_err(
+                        |_| NativeTypeConstructionError::Resource(LayoutResourceError::Arithmetic),
+                    )?,
+                )?;
             }
             let mut keys = Vec::with_capacity(ordered.keys.len());
             for (index, key) in ordered.keys.iter().enumerate() {
@@ -302,8 +481,8 @@ fn decode_contract(
                         ),
                     )
                 })?;
-                let data_type = decode_type(wire_type)
-                    .map_err(|detail| contract_invalid(key_path.clone().field("type"), detail))?;
+                let data_type = decoder.data_type(wire_type, key_path.clone().field("type"))?;
+                let key_type = decoder.value_type(wire_type, key_path.clone().field("type"))?;
                 let direction = match plan::RuntimeFilterSortDirection::try_from(key.direction) {
                     Ok(plan::RuntimeFilterSortDirection::Ascending) => {
                         contribution::RuntimeOrderSortDirection::Ascending
@@ -319,7 +498,7 @@ fn decode_contract(
                                 "native runtime-filter binding_id={binding_id} contract_invalid sort direction={}",
                                 key.direction
                             ),
-                        ));
+                        ).into());
                     }
                 };
                 let null_order = match plan::RuntimeFilterNullOrder::try_from(key.null_order) {
@@ -337,12 +516,31 @@ fn decode_contract(
                                 "native runtime-filter binding_id={binding_id} contract_invalid null order={}",
                                 key.null_order
                             ),
-                        ));
+                        ).into());
                     }
                 };
-                keys.push(contribution::RuntimeOrderKey::with_order(
-                    data_type, direction, null_order,
-                ));
+                if let Some(actual) = &key_type {
+                    let expected = complete_type;
+                    if !decoder.bindings_match(
+                        actual.typed_binding(),
+                        expected.typed_binding(),
+                        false,
+                    )? {
+                        return Err(contract_inconsistent(
+                            key_path.field("type"),
+                            "ordered key differs from complete runtime filter domain",
+                        )
+                        .into());
+                    }
+                }
+                keys.push(match key_type {
+                    Some(value) => {
+                        contribution::RuntimeOrderKey::with_value_type(value, direction, null_order)
+                    }
+                    None => {
+                        contribution::RuntimeOrderKey::with_order(data_type, direction, null_order)
+                    }
+                });
             }
             if keys[0].data_type() != expression_type {
                 return Err(contract_inconsistent(
@@ -352,7 +550,7 @@ fn decode_contract(
                         keys[0].data_type(),
                         expression_type
                     ),
-                ));
+                ).into());
             }
             let comparator =
                 contract_digest32(binding_id, "comparator_digest", &ordered.comparator_digest)
@@ -367,8 +565,53 @@ fn decode_contract(
             .map_err(|detail| {
                 contract_invalid(path.clone().field("order_contract_digest"), detail)
             })?;
+            contribution::RuntimeOrderContract::validate_fragment_keys_observed(
+                &keys,
+                comparator,
+                order_digest,
+                |units| match decoder {
+                    NativeTypeDecoder::Strong { resources, .. } => {
+                        if units == 0 {
+                            resources
+                                .work
+                                .flush()
+                                .map_err(NativeTypeConstructionError::Control)
+                                .map_err(NativeFragmentDecodeError::from)
+                        } else {
+                            for _ in 0..units {
+                                resources
+                                    .work
+                                    .step()
+                                    .map_err(NativeTypeConstructionError::Control)
+                                    .map_err(NativeFragmentDecodeError::from)?;
+                            }
+                            Ok(())
+                        }
+                    }
+
+                },
+            )
+            .map_err(|failure| match failure {
+                contribution::RuntimeOrderContractValidationFailure::Contract(cause) => {
+                    contract_invalid(
+                        path.clone(),
+                        format!(
+                            "native runtime-filter binding_id={binding_id} ordered contract is noncanonical: {cause:?}"
+                        ),
+                    )
+                    .into()
+                }
+                contribution::RuntimeOrderContractValidationFailure::Work(cause) => cause,
+            })?;
+            {
+                let NativeTypeDecoder::Strong { resources, .. } = decoder;
+                resources.request(
+                    arc_layout(Layout::new::<contribution::RuntimeOrderContract>())
+                        .map_err(NativeTypeConstructionError::Resource)?,
+                )?;
+            }
             Ok(RuntimeFilterExecutionContract::Ordered(
-                std::sync::Arc::new(contribution::RuntimeOrderContract::from_frozen(
+                std::sync::Arc::new(contribution::RuntimeOrderContract::from_frozen_keys(
                     keys,
                     comparator,
                     order_digest,
@@ -623,24 +866,54 @@ fn decode_lifecycle_options(
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn decode_participant_install(
     request: &filter::InstallRuntimeFilterDeploymentRequest,
 ) -> CodecResult<DecodedRuntimeFilterParticipantInstall> {
+    with_fixture_resources(|resources| {
+        let root = FieldPath::root("install_runtime_filter_deployment_request");
+        let query_id = decode_unique_id(request.query_id.as_ref(), root.field("query_id"))?;
+        decode_participant_parts(
+            query_id,
+            request.deployment_epoch,
+            request.participant_id,
+            request.lifecycle.as_ref(),
+            request.install.as_ref(),
+            &mut InstallTypeMode::Strong(resources),
+        )
+    })
+    .map_err(fixture_protocol)
+}
+
+fn decode_participant_parts(
+    query_id: UniqueId,
+    deployment_epoch: u64,
+    participant_id: u32,
+    lifecycle: Option<&filter::RuntimeFilterQueryLifecycleOptions>,
+    install: Option<&filter::RuntimeFilterParticipantInstall>,
+    mode: &mut InstallTypeMode<'_, '_>,
+) -> NativeResult<DecodedRuntimeFilterParticipantInstall> {
     let root = FieldPath::root("install_runtime_filter_deployment_request");
-    let query_id = decode_unique_id(request.query_id.as_ref(), root.clone().field("query_id"))?;
+    {
+        let InstallTypeMode::Strong(resources) = mode;
+        resources
+            .work
+            .step()
+            .map_err(NativeTypeConstructionError::Control)?;
+    }
     reject_zero(
-        request.deployment_epoch,
+        deployment_epoch,
         root.clone().field("deployment_epoch"),
         "deployment epoch",
     )?;
     reject_zero(
-        u64::from(request.participant_id),
+        u64::from(participant_id),
         root.clone().field("participant_id"),
         "participant id",
     )?;
-    let participant = BackendParticipantIdentity::new(query_id, request.deployment_epoch);
-    let lifecycle = decode_lifecycle_options(request.lifecycle.as_ref())?;
-    let wire = request.install.as_ref().ok_or_else(|| {
+    let participant = BackendParticipantIdentity::new(query_id, deployment_epoch);
+    let lifecycle = decode_lifecycle_options(lifecycle)?;
+    let wire = install.ok_or_else(|| {
         missing(
             root.clone().field("install"),
             "participant install is required",
@@ -649,8 +922,9 @@ pub fn decode_participant_install(
     let install = decode_install(
         wire,
         participant,
-        request.participant_id,
+        participant_id,
         root.clone().field("install"),
+        mode,
     )?;
     validate_participant_install(&install)
         .map_err(|detail| invalid(root.field("install"), detail))?;
@@ -666,18 +940,20 @@ fn decode_install(
     participant: BackendParticipantIdentity,
     local_participant_id: u32,
     path: FieldPath,
-) -> CodecResult<BackendParticipantInstall> {
+    mode: &mut InstallTypeMode<'_, '_>,
+) -> NativeResult<BackendParticipantInstall> {
     let mut channels = BTreeMap::new();
     let mut binding_ids = BTreeSet::new();
     let mut consumer_route_ids = BTreeSet::new();
     for (index, channel) in wire.core_channels.iter().enumerate() {
         let item_path = path.clone().field("core_channels").index(index);
-        let decoded = decode_core_channel(channel, participant, item_path.clone())?;
+        let decoded = decode_core_channel(channel, participant, item_path.clone(), mode)?;
         if channels.insert(decoded.channel_id(), decoded).is_some() {
             return Err(duplicate(
                 item_path.field("channel_id"),
                 "duplicate Backend channel id",
-            ));
+            )
+            .into());
         }
         let decoded = channels
             .get(&RuntimeFilterChannelId::new(channel.channel_id))
@@ -687,7 +963,8 @@ fn decode_install(
                 return Err(duplicate(
                     item_path.clone(),
                     "duplicate producer or consumer binding id across core install",
-                ));
+                )
+                .into());
             }
         }
         for route in decoded
@@ -699,7 +976,8 @@ fn decode_install(
                 return Err(duplicate(
                     item_path.clone(),
                     "duplicate consumer route edge id across core install",
-                ));
+                )
+                .into());
             }
         }
     }
@@ -720,14 +998,15 @@ fn decode_install(
         channels.into_values(),
         routing,
     )
-    .map_err(|error| invalid(path, error.to_string()))
+    .map_err(|error| invalid(path, error.to_string()).into())
 }
 
 fn decode_core_channel(
     wire: &filter::RuntimeFilterChannelDeployment,
     participant: BackendParticipantIdentity,
     path: FieldPath,
-) -> CodecResult<BackendChannelInstall> {
+    mode: &mut InstallTypeMode<'_, '_>,
+) -> NativeResult<BackendChannelInstall> {
     reject_zero(
         u64::from(wire.channel_id),
         path.clone().field("channel_id"),
@@ -744,6 +1023,7 @@ fn decode_core_channel(
         logical.contract.as_ref(),
         wire.reduction.as_ref(),
         path.clone(),
+        mode,
     )?;
     let lifecycle = match filter::RuntimeFilterLifecycle::try_from(wire.lifecycle) {
         Ok(filter::RuntimeFilterLifecycle::CompleteOnce) => BackendChannelLifecycle::CompleteOnce,
@@ -755,7 +1035,8 @@ fn decode_core_channel(
                 path.clone().field("lifecycle"),
                 ProtocolErrorKind::InvalidEnum,
                 format!("invalid runtime filter lifecycle={}", wire.lifecycle),
-            ));
+            )
+            .into());
         }
     };
     let availability = decode_coverage(
@@ -784,17 +1065,19 @@ fn decode_core_channel(
                 item_path,
                 ProtocolErrorKind::InvalidEnum,
                 "contract_invalid runtime filter contribution kind=unspecified",
-            ));
+            )
+            .into());
         }
         if !contributions.insert(contribution) {
-            return Err(duplicate(item_path, "duplicate contribution kind"));
+            return Err(duplicate(item_path, "duplicate contribution kind").into());
         }
     }
     if contributions.is_empty() {
         return Err(invalid(
             path.clone().field("allowed_contribution_kinds"),
             "allowed contribution kinds must be nonempty",
-        ));
+        )
+        .into());
     }
     let fenced_final = decode_runtime_filter_completion(
         wire.completion_requirement,
@@ -1873,6 +2156,7 @@ mod tests {
                 7,
                 &DataType::Int64,
                 Some(&plan::RuntimeFilterContract {
+                    logical_domain: None,
                     kind: Some(plan::runtime_filter_contract::Kind::Membership(
                         plan::RuntimeFilterMembershipContract {
                             null_semantics: raw,
@@ -2122,5 +2406,296 @@ mod tests {
 
         validate_participant_install(&install)
             .expect("global coverage may include witnesses owned by remote participants");
+    }
+}
+
+#[cfg(test)]
+mod typed_domain_creation_tests {
+    mod canonical_backing_owner_tests {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/runtime_filter_install/canonical_backing_owner_tests.rs"
+        ));
+    }
+
+    use super::*;
+    use novarocks_execution::runtime::mem_tracker::MemTracker;
+    use novarocks_functions::FunctionValueType;
+    use novarocks_plan_codec::execution_type_table::{
+        ExecutionTypeRoot, ExecutionTypeTableBuilder,
+    };
+    use novarocks_spi::connector::ConnectorStopOwner;
+    use novarocks_type_contract::{
+        CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
+    };
+    use std::sync::Arc;
+
+    struct SourceControl;
+    impl PureCompileControl for SourceControl {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    fn domain(value: &FunctionValueType) -> plan::RuntimeFilterContract {
+        let roots = [ExecutionTypeRoot { id: 0, value }];
+        let mut work = CompileCheckpoints::try_new(&SourceControl, CompilePhase::Encode).unwrap();
+        let table = ExecutionTypeTableBuilder::new(&roots)
+            .encode_observed::<std::convert::Infallible>(
+                ExecutionTypeTableLimits::for_validated_root_count(roots.len()).unwrap(),
+                &mut |_| Ok(()),
+                &mut work,
+            )
+            .unwrap()
+            .into_wire();
+        work.finish().unwrap();
+        plan::RuntimeFilterContract {
+            logical_domain: Some(plan::RuntimeFilterTypeDomain {
+                value_type: Some(common::TypeDesc {
+                    value_binding_id: Some(0),
+                }),
+                execution_types: Some(table),
+            }),
+            kind: Some(plan::runtime_filter_contract::Kind::Membership(
+                plan::RuntimeFilterMembershipContract {
+                    null_semantics: plan::RuntimeFilterMembershipNullSemantics::NeverMatches as i32,
+                },
+            )),
+        }
+    }
+    fn creator(
+        tracker: Arc<MemTracker>,
+        stop: &ConnectorStopOwner,
+    ) -> NativeTypeConstruction<'static> {
+        NativeTypeConstruction::try_new(
+            tracker,
+            stop.view(),
+            novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn independently_decoded_runtime_filter_domain_retains_actual_creator_until_last_binding_reference()
+     {
+        let source = FunctionValueType::try_with_logical_type(
+            arrow::datatypes::DataType::Utf8,
+            true,
+            ValueLogicalType::Json,
+        )
+        .unwrap();
+        let wire = domain(&source);
+        let tracker = MemTracker::new_root("RF complete domain fixture");
+        tracker.install_limit_once(1024 * 1024).unwrap();
+        let stop = ConnectorStopOwner::new();
+        let creation = creator(tracker.clone(), &stop);
+        let mut resources = NativeDecodeResources::try_new(&creation).unwrap();
+        let decoded = decode_typed_contract_domain(
+            7,
+            &wire,
+            None,
+            FieldPath::root("channel"),
+            &mut resources,
+        )
+        .unwrap();
+        resources.finish().unwrap();
+        let independent = decoded.value_type().unwrap().clone();
+        assert_eq!(independent, source);
+        let all_live = tracker.current();
+        drop(decoded);
+        drop(creation);
+        drop(wire);
+        let own = 2
+            * crate::native_type_construction::NativeTypeScope::reservation_allocation_layout()
+                .unwrap()
+                .size()
+            + novarocks_type_contract::ValueTypeRef::storage_allocation_layout()
+                .unwrap()
+                .size()
+            + novarocks_type_contract::ValueLayout::storage_allocation_layout()
+                .unwrap()
+                .size();
+        assert_eq!(tracker.current(), i64::try_from(own).unwrap());
+        assert!(
+            tracker.current() < all_live,
+            "FVT does not retain the canonical or parent scope"
+        );
+        drop(independent);
+        assert_eq!(tracker.current(), 0);
+    }
+    #[test]
+    fn runtime_filter_domain_rejects_inline_or_other_owner_references() {
+        let source = FunctionValueType::new(arrow::datatypes::DataType::Int32, false);
+        for invalid in [
+            common::TypeDesc {
+                value_binding_id: Some(99),
+            },
+            common::TypeDesc {
+                value_binding_id: None,
+            },
+        ] {
+            let wire = domain(&source);
+            let tracker = MemTracker::new_root("RF namespace fixture");
+            tracker.install_limit_once(1024 * 1024).unwrap();
+            let stop = ConnectorStopOwner::new();
+            let creation = creator(tracker, &stop);
+            let mut resources = NativeDecodeResources::try_new(&creation).unwrap();
+            let error = decode_typed_contract_domain(
+                1,
+                &wire,
+                Some(&invalid),
+                FieldPath::root("channel"),
+                &mut resources,
+            )
+            .unwrap_err();
+            assert!(error.construction_cause().is_none());
+        }
+    }
+
+    #[test]
+    fn runtime_filter_scoped_shared_child_releases_unused_names_layouts_and_namespace_scratch() {
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_proto_models::arrow_type::arrow_physical_type::Kind as PhysicalKind;
+        use novarocks_proto_models::value_type::logical_type_definition::Kind as LogicalKind;
+        let source = FunctionValueType::new(DataType::Int64, false);
+        let unused = FunctionValueType::new(
+            DataType::Struct(
+                vec![Arc::new(Field::new(
+                    "unused shared child",
+                    DataType::Int64,
+                    false,
+                ))]
+                .into(),
+            ),
+            false,
+        );
+        let mut wire = domain(&source);
+        let mut work = CompileCheckpoints::try_new(&SourceControl, CompilePhase::Encode).unwrap();
+        let mut table = ExecutionTypeTableBuilder::new(&[
+            ExecutionTypeRoot {
+                id: 0,
+                value: &source,
+            },
+            ExecutionTypeRoot {
+                id: u32::MAX,
+                value: &unused,
+            },
+        ])
+        .encode_observed::<std::convert::Infallible>(
+            ExecutionTypeTableLimits::for_validated_root_count(2).unwrap(),
+            &mut |_| Ok(()),
+            &mut work,
+        )
+        .unwrap()
+        .into_wire();
+        work.finish().unwrap();
+        // This wire author shares the equal scalar child definition explicitly
+        // in this namespace. Both complete declarations and layouts are the
+        // original encoder's facts; no metadata or carrier authors a domain.
+        let selected_id = table
+            .value_bindings
+            .iter()
+            .find(|b| b.id == Some(0))
+            .unwrap()
+            .logical_type_id
+            .unwrap();
+        let unused_binding = table
+            .value_bindings
+            .iter_mut()
+            .find(|b| b.id == Some(u32::MAX))
+            .unwrap();
+        let unused_id = unused_binding.logical_type_id.unwrap();
+        let Some(PhysicalKind::StructType(layout)) =
+            &mut unused_binding.value_layout.as_mut().unwrap().kind
+        else {
+            panic!("fixture Struct layout");
+        };
+        layout.fields[0].logical_type_id = Some(selected_id);
+        let Some(LogicalKind::StructValue(semantic)) = &mut table
+            .logical_types
+            .iter_mut()
+            .find(|d| d.id == Some(unused_id))
+            .unwrap()
+            .kind
+        else {
+            panic!("fixture Struct semantics");
+        };
+        semantic.fields[0].value_type_id = Some(selected_id);
+        wire.logical_domain.as_mut().unwrap().execution_types = Some(table);
+        let tracker = MemTracker::new_root("RF scoped child");
+        let stop = ConnectorStopOwner::new();
+        let creation = creator(tracker.clone(), &stop);
+        let mut resources = NativeDecodeResources::try_new(&creation).unwrap();
+        let contract = decode_typed_contract_domain(
+            7,
+            &wire,
+            None,
+            FieldPath::root("channel"),
+            &mut resources,
+        )
+        .unwrap();
+        let late_child = contract.value_type().unwrap().value_type().clone();
+        resources.finish().unwrap();
+        drop(contract);
+        drop(creation);
+        drop(stop);
+        drop(wire);
+        let own = crate::native_type_construction::NativeTypeScope::reservation_allocation_layout()
+            .unwrap()
+            .size()
+            + novarocks_type_contract::ValueTypeRef::storage_allocation_layout()
+                .unwrap()
+                .size();
+        assert_eq!(tracker.current(), i64::try_from(own).unwrap());
+        drop(late_child);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn runtime_filter_canonical_clone_keeps_its_own_bytes_and_reused_layout_until_last_reference() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        let source = FunctionValueType::new(
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        );
+        let wire = domain(&source);
+        let tracker = MemTracker::new_root("RF canonical scope");
+        let stop = ConnectorStopOwner::new();
+        let creation = creator(tracker.clone(), &stop);
+        let mut resources = NativeDecodeResources::try_new(&creation).unwrap();
+        let contract = decode_typed_contract_domain(
+            7,
+            &wire,
+            None,
+            FieldPath::root("channel"),
+            &mut resources,
+        )
+        .unwrap();
+        let RuntimeFilterExecutionContract::Membership(schema) = &contract else {
+            panic!("fixture membership");
+        };
+        let canonical = schema.canonical_schema().clone();
+        let digest = canonical.digest();
+        let pure = novarocks_local_program::FilterMembershipSchema::try_new(
+            source.data_type(),
+            canonical.null_semantics(),
+        )
+        .unwrap();
+        assert_eq!(
+            canonical, pure,
+            "storage identity does not alter the physical artifact identity"
+        );
+        resources.finish().unwrap();
+        drop(contract);
+        drop(creation);
+        drop(stop);
+        drop(wire);
+        drop(source);
+        assert!(
+            tracker.current() > 0,
+            "canonical owner retains actual construction and its borrowed timezone layout"
+        );
+        assert_eq!(canonical.digest(), digest);
+        assert_eq!(canonical.canonical_bytes(), pure.canonical_bytes());
+        drop(canonical);
+        assert_eq!(tracker.current(), 0);
     }
 }

@@ -491,10 +491,11 @@ impl PlanUnpivotNode {
             )? {
                 return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                     "Unpivot value mapping {index} type mismatch: input {:?}, output {:?}",
-                    input.value_type.data_type, value_output.value_type.data_type
+                    input.value_type.data_type(),
+                    value_output.value_type.data_type()
                 )));
             }
-            value_nullable |= input.value_type.nullable;
+            value_nullable |= input.value_type.nullable();
             if mapping.constants.len() != self.literal_output_column_ids.len() {
                 return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                     "Unpivot value mapping {index} literal count mismatch: expected {}, got {}",
@@ -503,10 +504,12 @@ impl PlanUnpivotNode {
                 )));
             }
         }
-        if value_output.value_type.nullable != value_nullable {
+        if value_output.value_type.nullable() != value_nullable {
             return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                 "Unpivot value output column id {} nullability mismatch: expected {}, got {}",
-                self.value_output_column_id, value_nullable, value_output.value_type.nullable
+                self.value_output_column_id,
+                value_nullable,
+                value_output.value_type.nullable()
             )));
         }
 
@@ -544,7 +547,7 @@ impl PlanUnpivotNode {
                     // remain unchanged in this scalar-only migration.
                     _ => {
                         work.flush()?;
-                        let equal = constant.data_type() == output.value_type.data_type;
+                        let equal = constant.data_type() == *output.value_type.data_type();
                         work.step()?;
                         work.flush()?;
                         equal
@@ -554,15 +557,15 @@ impl PlanUnpivotNode {
                     return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                         "Unpivot value mapping {mapping_index} constant {literal_index} type mismatch: constant {:?}, output {:?}",
                         constant.data_type(),
-                        output.value_type.data_type
+                        output.value_type.data_type()
                     )));
                 }
                 nullable |= constant.nullable();
             }
-            if output.value_type.nullable != nullable {
+            if output.value_type.nullable() != nullable {
                 return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                     "Unpivot literal output column id {output_id} nullability mismatch: expected {nullable}, got {}",
-                    output.value_type.nullable
+                    output.value_type.nullable()
                 )));
             }
         }
@@ -641,16 +644,9 @@ fn same_unpivot_value_domain_observed(
     output: &novarocks_type_contract::FunctionValueType,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<bool, crate::compiler::SqlCompileError> {
-    let logical_equal = input.logical_type == output.logical_type;
-    work.step()?;
-    if !logical_equal {
-        return Ok(false);
-    }
-    Ok(novarocks_type_contract::arrow_data_types_exact_observed::<
-        novarocks_functions::FunctionBindingError,
-    >(&input.data_type, &output.data_type, || {
-        work.step().map_err(Into::into)
-    })?)
+    input.same_physical_binding_ignoring_root_nullability_observed(output, || {
+        work.step().map_err(crate::compiler::SqlCompileError::from)
+    })
 }
 
 fn require_exact_column_shape(
@@ -669,11 +665,11 @@ fn require_exact_column_shape(
         Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
             "Unpivot {role} column shape mismatch: input id {} is {:?} nullable={}, output id {} is {:?} nullable={}",
             input.column_id,
-            input.value_type.data_type,
-            input.value_type.nullable,
+            input.value_type.data_type(),
+            input.value_type.nullable(),
             output.column_id,
-            output.value_type.data_type,
-            output.value_type.nullable
+            output.value_type.data_type(),
+            output.value_type.nullable()
         )))
     } else {
         Ok(())
@@ -1006,7 +1002,7 @@ pub(crate) struct WindowExpr {
 pub(crate) struct AggregateCall {
     pub name: String,
     pub distinct: bool,
-    pub result_type: DataType,
+    pub result_type: novarocks_type_contract::FunctionValueType,
     pub source: crate::binding::AggregateArgumentSource<TypedExpr, SortItem>,
     /// G1: id of THIS aggregate's output column. Planner-created calls are
     /// minted by `collect_aggregates`; rewrite paths should preserve existing

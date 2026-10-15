@@ -815,33 +815,168 @@ pub struct VariantPath {
     pub segments: Vec<VariantPathSegment>,
 }
 
+/// A concrete path constructor operation, observed before it executes.
+#[derive(Clone, Copy, Debug)]
+pub enum VariantPathConstructionStep {
+    Request(std::alloc::Layout),
+    Work(usize),
+}
+
+/// An independently held parsed path. Borrowed segments cannot transfer an
+/// unguarded owned key/vector; its temporary owner ends with this value.
+#[derive(Debug)]
+pub struct ObservedVariantPath {
+    path: VariantPath,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl ObservedVariantPath {
+    pub fn segments(&self) -> &[VariantPathSegment] {
+        &self.path.segments
+    }
+}
+
+type PathObserver<'a, E> = Option<&'a mut dyn FnMut(VariantPathConstructionStep) -> Result<(), E>>;
+fn observe_path<E>(
+    observe: &mut PathObserver<'_, E>,
+    step: VariantPathConstructionStep,
+) -> Result<(), E> {
+    if let Some(observe) = observe {
+        observe(step)?;
+    }
+    Ok(())
+}
+fn request_path_array<
+    T,
+    E: From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+>(
+    count: usize,
+    observe: &mut PathObserver<'_, E>,
+) -> Result<(), E> {
+    let layout = std::alloc::Layout::array::<T>(count).map_err(|_| {
+        E::from(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic)
+    })?;
+    if layout.size() != 0 {
+        observe_path(observe, VariantPathConstructionStep::Request(layout))?;
+    }
+    Ok(())
+}
+fn push_path<T, E: From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>>(
+    values: &mut Vec<T>,
+    value: T,
+    observe: &mut PathObserver<'_, E>,
+) -> Result<(), E> {
+    let facts =
+        novarocks_type_contract::owned_resources::vec::push_growth(values).map_err(|error| {
+            use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+            use novarocks_type_contract::{CompileControlError, ControlResourceError};
+            E::from(match error {
+                ControlResourceError::SourceModel(_) => LayoutResourceError::SourceModel,
+                ControlResourceError::Control(CompileControlError::ResourceExhausted) => {
+                    LayoutResourceError::Arithmetic
+                }
+                // push_growth is a pure checked geometry author, not a control
+                // checkpoint; it cannot originate cancel/deadline.
+                ControlResourceError::Control(
+                    CompileControlError::Cancelled | CompileControlError::DeadlineExceeded,
+                ) => LayoutResourceError::SourceModel,
+            })
+        })?;
+    if let Some(layout) = facts.requested_backing {
+        observe_path(observe, VariantPathConstructionStep::Request(layout))?;
+    }
+    values.push(value);
+    Ok(())
+}
+
+#[derive(Debug)]
+enum PurePathFailure {
+    Source(String),
+    Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+}
+impl From<String> for PurePathFailure {
+    fn from(error: String) -> Self {
+        Self::Source(error)
+    }
+}
+impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for PurePathFailure
+{
+    fn from(error: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::Resource(error)
+    }
+}
+
 pub fn parse_variant_path(path: &str) -> Result<VariantPath, String> {
-    let normalized = normalize_variant_path(path);
-    let mut parser = PathParser::new(&normalized);
-    parser.parse()
+    parse_variant_path_core::<PurePathFailure>(path, &mut None).map_err(|error| match error {
+        PurePathFailure::Source(error) => error,
+        PurePathFailure::Resource(error) => {
+            format!("Variant path storage cannot be represented: {error:?}")
+        }
+    })
+}
+
+pub fn parse_variant_path_with_storage_observed<E>(
+    path: &str,
+    storage: novarocks_type_contract::ValueTypeStorageLifetime,
+    mut observe: impl FnMut(VariantPathConstructionStep) -> Result<(), E>,
+) -> Result<ObservedVariantPath, E>
+where
+    E: From<String> + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+{
+    let path = parse_variant_path_core(path, &mut Some(&mut observe))?;
+    Ok(ObservedVariantPath {
+        path,
+        _storage: storage,
+    })
+}
+
+fn parse_variant_path_core<E>(
+    path: &str,
+    observe: &mut PathObserver<'_, E>,
+) -> Result<VariantPath, E>
+where
+    E: From<String> + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+{
+    let normalized = normalize_variant_path(path, observe)?;
+    PathParser::new(&normalized, observe).parse()
 }
 
 /// Map a `variant_get` type-string literal to its SQL Arrow type.
 pub use novarocks_type_contract::variant_get_target_type;
 
-fn normalize_variant_path(path: &str) -> String {
+fn normalize_variant_path<E>(path: &str, observe: &mut PathObserver<'_, E>) -> Result<String, E>
+where
+    E: From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+{
+    observe_path(observe, VariantPathConstructionStep::Work(path.len()))?;
     let trimmed = path.trim();
-    if trimmed.is_empty() {
-        return "$".to_string();
-    }
-    if trimmed.starts_with('$') {
-        return trimmed.to_string();
-    }
-    if trimmed.starts_with('[') {
-        return format!("${}", trimmed);
-    }
-    if trimmed.starts_with('.') {
-        return format!("${}", trimmed);
-    }
-    if trimmed.chars().all(|c| c.is_ascii_digit()) {
-        return format!("$[{}]", trimmed);
-    }
-    format!("$.{}", trimmed)
+    observe_path(observe, VariantPathConstructionStep::Work(trimmed.len()))?;
+    let (prefix, suffix) = if trimmed.is_empty() {
+        ("$", "")
+    } else if trimmed.starts_with('$') {
+        ("", "")
+    } else if trimmed.starts_with('[') || trimmed.starts_with('.') {
+        ("$", "")
+    } else if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        ("$[", "]")
+    } else {
+        ("$.", "")
+    };
+    let len = trimmed
+        .len()
+        .checked_add(prefix.len())
+        .and_then(|n| n.checked_add(suffix.len()))
+        .ok_or_else(|| {
+            E::from(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            )
+        })?;
+    request_path_array::<u8, E>(len, observe)?;
+    let mut normalized = String::with_capacity(len);
+    normalized.push_str(prefix);
+    normalized.push_str(trimmed);
+    normalized.push_str(suffix);
+    Ok(normalized)
 }
 
 pub fn variant_query(value: &VariantValue, path: &VariantPath) -> Result<VariantValue, String> {
@@ -876,149 +1011,156 @@ pub fn variant_query(value: &VariantValue, path: &VariantPath) -> Result<Variant
     VariantValue::create(value.metadata.raw(), current_value)
 }
 
-struct PathParser<'a> {
+struct PathParser<'a, 'observer, 'port, E> {
     input: &'a [u8],
     pos: usize,
+    observe: &'observer mut PathObserver<'port, E>,
 }
 
-impl<'a> PathParser<'a> {
-    fn new(input: &'a str) -> Self {
+impl<'a, 'observer, 'port, E> PathParser<'a, 'observer, 'port, E>
+where
+    E: From<String> + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+{
+    fn new(input: &'a str, observe: &'observer mut PathObserver<'port, E>) -> Self {
         Self {
             input: input.as_bytes(),
             pos: 0,
+            observe,
         }
     }
-
-    fn parse(&mut self) -> Result<VariantPath, String> {
-        if !self.consume_char(b'$') {
-            return Err("Path must start with '$'".to_string());
+    fn parse(&mut self) -> Result<VariantPath, E> {
+        if !self.consume_char(b'$')? {
+            return Err(E::from("Path must start with '$'".to_string()));
         }
         let mut segments = Vec::new();
         while !self.is_end() {
+            observe_path(self.observe, VariantPathConstructionStep::Work(1))?;
             if self.peek_char() == b'.' {
-                self.advance();
+                self.advance()?;
                 let key = self.parse_unquoted_key()?;
                 if key.is_empty() {
-                    return Err("Expected key after '.'".to_string());
+                    return Err(E::from("Expected key after '.'".to_string()));
                 }
-                segments.push(VariantPathSegment::ObjectKey(key));
+                push_path(
+                    &mut segments,
+                    VariantPathSegment::ObjectKey(key),
+                    self.observe,
+                )?;
             } else if self.peek_char() == b'[' {
                 if let Some(seg) = self.parse_bracket_segment()? {
-                    segments.push(seg);
+                    push_path(&mut segments, seg, self.observe)?;
                 }
             } else {
-                return Err(format!(
+                return Err(E::from(format!(
                     "Unexpected character '{}' at position {}",
                     self.peek_char() as char,
                     self.pos
-                ));
+                )));
             }
         }
         Ok(VariantPath { segments })
     }
-
-    fn parse_bracket_segment(&mut self) -> Result<Option<VariantPathSegment>, String> {
+    fn parse_bracket_segment(&mut self) -> Result<Option<VariantPathSegment>, E> {
         self.expect_char(b'[')?;
         if self.is_end() {
-            return Err("Unexpected end of path".to_string());
+            return Err(E::from("Unexpected end of path".to_string()));
         }
         let ch = self.peek_char();
         if ch == b'\'' || ch == b'"' {
-            let quote = self.advance();
+            let quote = self.advance()?;
             let key = self.parse_quoted_string(quote)?;
             self.expect_char(quote)?;
             self.expect_char(b']')?;
             return Ok(Some(VariantPathSegment::ObjectKey(key)));
         }
-        let number = self.parse_number();
+        let number = self.parse_number()?;
         if number.is_empty() {
-            return Err("Expected array index".to_string());
+            return Err(E::from("Expected array index".to_string()));
         }
         self.expect_char(b']')?;
+        observe_path(
+            self.observe,
+            VariantPathConstructionStep::Work(number.len()),
+        )?;
         let index = number
             .parse::<u32>()
-            .map_err(|_| format!("Invalid array index: {}", number))?;
+            .map_err(|_| E::from(format!("Invalid array index: {}", number)))?;
         Ok(Some(VariantPathSegment::ArrayIndex(index)))
     }
-
-    fn parse_unquoted_key(&mut self) -> Result<String, String> {
-        let mut out = String::new();
+    fn parse_unquoted_key(&mut self) -> Result<String, E> {
+        let start = self.pos;
         while !self.is_end() {
             let c = self.peek_char();
             if c.is_ascii_alphanumeric() || c == b'_' {
-                out.push(c as char);
-                self.advance();
+                self.advance()?;
             } else {
                 break;
             }
         }
-        Ok(out)
+        let bytes = &self.input[start..self.pos];
+        request_path_array::<u8, E>(bytes.len(), self.observe)?;
+        observe_path(self.observe, VariantPathConstructionStep::Work(bytes.len()))?;
+        Ok(std::str::from_utf8(bytes)
+            .expect("unquoted path keys are ASCII")
+            .to_owned())
     }
-
-    fn parse_number(&mut self) -> String {
-        let mut out = String::new();
-        while !self.is_end() {
-            let c = self.peek_char();
-            if c.is_ascii_digit() {
-                out.push(c as char);
-                self.advance();
-            } else {
-                break;
-            }
+    fn parse_number(&mut self) -> Result<&'a str, E> {
+        let start = self.pos;
+        while !self.is_end() && self.peek_char().is_ascii_digit() {
+            self.advance()?;
         }
-        out
+        Ok(std::str::from_utf8(&self.input[start..self.pos]).expect("path indices are ASCII"))
     }
-
-    fn parse_quoted_string(&mut self, quote: u8) -> Result<String, String> {
+    fn parse_quoted_string(&mut self, quote: u8) -> Result<String, E> {
         let mut out = Vec::new();
         while !self.is_end() && self.peek_char() != quote {
-            let c = self.advance();
-            if c == b'\\' && !self.is_end() {
-                let escaped = self.advance();
-                match escaped {
-                    b'"' | b'\'' | b'\\' => out.push(escaped),
-                    b'n' => out.push(b'\n'),
-                    b't' => out.push(b'\t'),
-                    b'r' => out.push(b'\r'),
-                    other => out.push(other),
+            let c = self.advance()?;
+            let byte = if c == b'\\' && !self.is_end() {
+                match self.advance()? {
+                    b'"' => b'"',
+                    b'\'' => b'\'',
+                    b'\\' => b'\\',
+                    b'n' => b'\n',
+                    b't' => b'\t',
+                    b'r' => b'\r',
+                    other => other,
                 }
             } else {
-                out.push(c);
-            }
+                c
+            };
+            push_path(&mut out, byte, self.observe)?;
         }
-        String::from_utf8(out).map_err(|_| "Variant path key is not valid UTF-8".to_string())
+        observe_path(self.observe, VariantPathConstructionStep::Work(out.len()))?;
+        String::from_utf8(out)
+            .map_err(|_| E::from("Variant path key is not valid UTF-8".to_string()))
     }
-
     fn peek_char(&self) -> u8 {
         self.input.get(self.pos).copied().unwrap_or(0)
     }
-
-    fn advance(&mut self) -> u8 {
+    fn advance(&mut self) -> Result<u8, E> {
+        observe_path(self.observe, VariantPathConstructionStep::Work(1))?;
         let ch = self.peek_char();
         self.pos = self.pos.saturating_add(1);
-        ch
+        Ok(ch)
     }
-
-    fn consume_char(&mut self, expected: u8) -> bool {
+    fn consume_char(&mut self, expected: u8) -> Result<bool, E> {
         if self.peek_char() == expected {
-            self.advance();
-            true
+            self.advance()?;
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
-
-    fn expect_char(&mut self, expected: u8) -> Result<(), String> {
-        if self.consume_char(expected) {
+    fn expect_char(&mut self, expected: u8) -> Result<(), E> {
+        if self.consume_char(expected)? {
             Ok(())
         } else {
-            Err(format!(
+            Err(E::from(format!(
                 "Expected '{}' at position {}",
                 expected as char, self.pos
-            ))
+            )))
         }
     }
-
     fn is_end(&self) -> bool {
         self.pos >= self.input.len()
     }
@@ -1476,6 +1618,106 @@ pub fn is_variant_struct_data_type(data_type: &DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Debug, PartialEq)]
+    enum PathFailure {
+        Source(String),
+        Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+        Refused(std::sync::Arc<str>),
+    }
+    impl From<String> for PathFailure {
+        fn from(error: String) -> Self {
+            Self::Source(error)
+        }
+    }
+    impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError> for PathFailure {
+        fn from(
+            error: novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+        ) -> Self {
+            Self::Resource(error)
+        }
+    }
+    fn step_key(step: VariantPathConstructionStep) -> (usize, usize, bool) {
+        match step {
+            VariantPathConstructionStep::Request(layout) => (layout.size(), layout.align(), true),
+            VariantPathConstructionStep::Work(units) => (units, 0, false),
+        }
+    }
+    #[test]
+    fn observed_path_preserves_quoted_numeric_and_original_syntax_errors() {
+        for input in [
+            "",
+            "a.b",
+            "[0].a",
+            "12",
+            "$.a[2]['é']",
+            "$['a\\n\\t'].nested[4294967295]",
+        ] {
+            let plain = parse_variant_path(input).unwrap();
+            let observed = parse_variant_path_with_storage_observed::<PathFailure>(
+                input,
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(
+                format!("{:?}", observed.segments()),
+                format!("{:?}", plain.segments)
+            );
+        }
+        for input in ["$.", "$[", "$['é'", "$[4294967296]", "$[x]", "$.a!"] {
+            let original = parse_variant_path(input).unwrap_err();
+            let observed = parse_variant_path_with_storage_observed::<PathFailure>(
+                input,
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                |_| Ok(()),
+            )
+            .unwrap_err();
+            assert_eq!(observed, PathFailure::Source(original));
+        }
+    }
+    #[test]
+    fn every_actual_path_constructor_and_work_refusal_keeps_original_payload_and_prefix() {
+        let input = "  $['a\\nlongkey'].one.two.three.four.five[123]  ";
+        let mut baseline = Vec::new();
+        let parsed = parse_variant_path_with_storage_observed::<PathFailure>(
+            input,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            |step| {
+                baseline.push(step_key(step));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(parsed.segments().len(), 7);
+        assert!(
+            baseline
+                .iter()
+                .any(|(bytes, _, request)| *request && *bytes > 4)
+        );
+        for at in 0..baseline.len() {
+            let origin: std::sync::Arc<str> = std::sync::Arc::from("original parser refusal");
+            let mut trace = Vec::new();
+            let result = parse_variant_path_with_storage_observed::<PathFailure>(
+                input,
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                |step| {
+                    assert!(trace.len() <= at, "no observer tail after refusal");
+                    trace.push(step_key(step));
+                    if trace.len() == at + 1 {
+                        Err(PathFailure::Refused(origin.clone()))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap_err();
+            let PathFailure::Refused(actual) = result else {
+                panic!("original refusal changed")
+            };
+            assert!(std::sync::Arc::ptr_eq(&actual, &origin));
+            assert_eq!(trace, baseline[..=at]);
+        }
+    }
 
     #[test]
     fn sqlx2_value_codec_variant_get_target_type_is_stable() {

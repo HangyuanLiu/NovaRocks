@@ -77,13 +77,13 @@ impl ArrayKernel {
         }
     }
     fn config(&self) -> ArrayAggConfig<'_> {
-        let DataType::List(item) = &self.contract.final_type().data_type else {
+        let DataType::List(item) = self.contract.final_type().data_type() else {
             unreachable!("validated ARRAY result")
         };
         ArrayAggConfig {
             kind: self.kind(),
-            output_type: &self.contract.final_type().data_type,
-            intermediate_type: &self.contract.intermediate_type().data_type,
+            output_type: self.contract.final_type().data_type(),
+            intermediate_type: self.contract.intermediate_type().data_type(),
             input_arg_type: Some(item.data_type()),
         }
     }
@@ -367,14 +367,6 @@ pub(super) fn validate_contract(
             "ARRAY aggregate requires exactly one logical value channel",
         ));
     }
-    if !matches!(operation, Operation::Unique)
-        && matches!(&arguments[0],FunctionArgumentType::Value(value)if value.logical_type==novarocks_type_contract::ValueLogicalType::LargeInt)
-    {
-        return Err(invalid(&format!(
-            "{} has no installed logical LARGEINT ARRAY input profile",
-            contract.call().function_id().as_str()
-        )));
-    }
     let receipt = contract.state_interpretation().ok_or_else(|| {
         invalid("ARRAY aggregate requires its original state interpretation facts")
     })?;
@@ -392,46 +384,46 @@ pub(super) fn validate_contract(
         let FunctionArgumentType::Value(value) = arg else {
             return Err(invalid("ARRAY aggregate requires canonical value channels"));
         };
-        if !supported(&value.data_type, work)? {
+        if !supported(value.data_type(), work)? {
             return Err(invalid(&format!(
                 "{} has no installed ARRAY input profile for {:?}",
                 contract.call().function_id().as_str(),
-                value.data_type
+                value.data_type()
             )));
         }
     }
     let FunctionArgumentType::Value(value) = &arguments[0] else {
         unreachable!("validated value")
     };
-    if matches!(operation, Operation::Unique) && !matches!(value.data_type, DataType::List(_)) {
+    if matches!(operation, Operation::Unique) && !matches!(value.data_type(), DataType::List(_)) {
         return Err(invalid(
             "array_unique_agg has no installed non-List input profile",
         ));
     }
-    let DataType::List(item) = &contract.final_type().data_type else {
+    let DataType::List(item) = contract.final_type().data_type() else {
         return Err(invalid(
             "ARRAY aggregate selected result must be its exact nullable List profile",
         ));
     };
     let expected_item = if matches!(operation, Operation::Unique) {
-        let DataType::List(source_item) = &value.data_type else {
+        let DataType::List(source_item) = value.data_type() else {
             return Err(invalid(
                 "array_unique_agg has no installed non-List input profile",
             ));
         };
         source_item.data_type()
     } else {
-        &value.data_type
+        value.data_type()
     };
     if item.data_type() != expected_item
-        || !contract.final_type().nullable
-        || !contract.intermediate_type().nullable
+        || !contract.final_type().nullable()
+        || !contract.intermediate_type().nullable()
     {
         return Err(invalid(
             "ARRAY aggregate selected result or state differs from its exact nullable profile",
         ));
     }
-    let intermediate = &contract.intermediate_type().data_type;
+    let intermediate = contract.intermediate_type().data_type();
     if arguments.len() == 1 {
         let DataType::List(state_item) = intermediate else {
             return Err(invalid("ARRAY aggregate plain state must be List"));
@@ -461,12 +453,45 @@ pub(super) fn validate_contract(
                     "ARRAY aggregate ordered state channel must be List",
                 ));
             };
-            if item.data_type() != &value.data_type {
+            if item.data_type() != value.data_type() {
                 return Err(invalid(
                     "ARRAY aggregate ordered state channel differs from its original source",
                 ));
             }
         }
+    }
+    validate_full_selected_types(
+        operation,
+        arguments,
+        contract.final_type(),
+        contract.intermediate_type(),
+        work,
+    )?;
+    Ok(())
+}
+fn validate_full_selected_types(
+    operation: Operation,
+    arguments: &[FunctionArgumentType],
+    output: &FunctionValueType,
+    state: &FunctionValueType,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<(), KernelFailure> {
+    let name = match operation {
+        Operation::Array => "array_agg",
+        Operation::Distinct => "array_agg_distinct",
+        Operation::Unique => "array_unique_agg",
+    };
+    let valid = crate::aggregate_types::matches_selected_array_types_observed(
+        name, arguments, output, state, work,
+    )
+    .map_err(|error| match error {
+        FunctionBindingError::Control(cause) => compile_failure(cause),
+        _ => invalid("ARRAY aggregate original full signature inference failed"),
+    })?;
+    if !valid {
+        return Err(invalid(
+            "ARRAY aggregate selected output or state differs from its original full signature",
+        ));
     }
     Ok(())
 }

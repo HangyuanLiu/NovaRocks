@@ -24,14 +24,14 @@ use crate::{
     assert_rows::reserve_vec, expressions::LoweredExpressions, lowering::FragmentCompileError,
 };
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array, new_empty_array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::DataType;
 use arrow_select::{
     interleave::interleave,
     take::{TakeOptions, take},
 };
 use novarocks_functions::{
-    ConstantError, ConstantValue, KernelFailure,
-    selected_copy::{self, CopyError},
+    ConstantError, ConstantValue, KernelDiagnostic, KernelEvaluationControl, KernelFailure,
+    selected_copy::{self, CopyConstructionError, CopyError, CopyIndexView},
 };
 use novarocks_local_program::{
     ProgramExprId, ProgramNodeKind, StaticExprKind, StaticLayout, StaticValues, StaticValuesCell,
@@ -120,57 +120,92 @@ fn copy_error(error: CopyError, node: novarocks_physical_plan::NodeId) -> Fragme
         },
     }
 }
-fn observe(work: &mut CompileCheckpoints<'_>, boundary: bool) -> Result<(), KernelFailure> {
-    let result = if boundary { work.flush() } else { work.step() };
-    result.map_err(|cause| match cause {
-        CompileControlError::Cancelled => KernelFailure::Cancelled,
-        CompileControlError::DeadlineExceeded => KernelFailure::DeadlineExceeded,
-        CompileControlError::ResourceExhausted => KernelFailure::ResourceExhausted,
-    })
+struct CompileCopyControl<'a>(&'a dyn PureCompileControl);
+impl KernelEvaluationControl for CompileCopyControl<'_> {
+    fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+        self.0
+            .checkpoint(CompilePhase::LowerProgram, units)
+            .map_err(|cause| match cause {
+                CompileControlError::Cancelled => KernelFailure::Cancelled,
+                CompileControlError::DeadlineExceeded => KernelFailure::DeadlineExceeded,
+                CompileControlError::ResourceExhausted => KernelFailure::ResourceExhausted,
+            })
+    }
+    fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+        Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+            "compiler copy observer cannot wait",
+        )))
+    }
+}
+fn copy_construction_error<H>(
+    error: CopyConstructionError<H>,
+    node: novarocks_physical_plan::NodeId,
+) -> crate::FragmentCreationError<H> {
+    match error {
+        CopyConstructionError::Creator(cause) => crate::FragmentCreationError::Creator(cause),
+        CopyConstructionError::Resource(cause) => crate::FragmentCreationError::Resource(cause),
+        CopyConstructionError::Copy(cause) => copy_error(cause, node).into(),
+    }
 }
 
-pub(crate) fn lower_values(
+fn reserve_created<T, H>(
+    values: &mut Vec<T>,
+    count: usize,
+    work: &mut CompileCheckpoints<'_>,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(), crate::FragmentCreationError<H>> {
+    let capacity = values
+        .len()
+        .checked_add(count)
+        .ok_or(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic)?;
+    let layout = std::alloc::Layout::array::<T>(capacity).map_err(|_| {
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic
+    })?;
+    crate::creation::request(layout, creation, work)?;
+    reserve_vec(values, count, work)?;
+    Ok(())
+}
+
+pub(crate) fn lower_values_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     expressions: &LoweredExpressions,
     slots: &[SlotId],
     control: &dyn PureCompileControl,
-) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(package, node, expressions, slots, &mut work);
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    let result = lower_core_with_creation(package, node, expressions, slots, &mut work, creation);
+    crate::creation::finish_attempt(result, work)
 }
-fn lower_core(
+fn lower_core_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     expressions: &LoweredExpressions,
     slots: &[SlotId],
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
     let novarocks_physical_plan::NodeKind::Values { rows } = &node.kind else {
-        return Err(FragmentCompileError::Invalid("Values source kind differs"));
+        return Err((FragmentCompileError::Invalid("Values source kind differs")).into());
     };
     if !node.inputs.is_empty() || slots.len() != node.output.columns.len() {
-        return Err(FragmentCompileError::Invalid(
-            "Values input or channel width differs",
-        ));
+        return Err(
+            (FragmentCompileError::Invalid("Values input or channel width differs")).into(),
+        );
     }
     for row in rows {
         let same = row.len() == slots.len();
         work.step()?;
         if !same {
-            return Err(FragmentCompileError::Invalid("Values row width differs"));
+            return Err((FragmentCompileError::Invalid("Values row width differs")).into());
         }
     }
     // Validate every source before materializing any column. No dynamic call is
     // evaluated, folded, or removed from its original required occurrence: it
     // stays a ValuesCell root at its exact position.
     let mut constant_cells: Vec<usize> = Vec::new();
-    reserve_vec(&mut constant_cells, slots.len(), work)?;
+    reserve_created(&mut constant_cells, slots.len(), work, creation)?;
     for _ in 0..slots.len() {
         constant_cells.push(0);
         work.step()?;
@@ -192,28 +227,35 @@ fn lower_core(
                 .get(&node.output.columns[ordinal])
                 .ok_or(FragmentCompileError::Invalid("missing Values output"))?;
             if source.owner != node.id {
-                return Err(FragmentCompileError::Invalid("foreign Values cell owner"));
+                return Err((FragmentCompileError::Invalid("foreign Values cell owner")).into());
             }
             let ty = match value {
                 Cell::Constant(value) => value.value_type(),
                 Cell::Dynamic(_) => &source.ty,
             };
-            if !ty.exactly_equals_observed::<FragmentCompileError>(&output.ty, || {
+            if !ty.exactly_equals_observed::<crate::FragmentCreationError<H>>(&output.ty, || {
                 work.step().map_err(Into::into)
             })? {
-                return Err(FragmentCompileError::Invalid(
+                return Err((FragmentCompileError::Invalid(
                     "Values cell full type differs from output",
-                ));
+                ))
+                .into());
             }
             match value {
                 Cell::Constant(_) => constant_cells[ordinal] += 1,
-                Cell::Dynamic(definition) => dynamic.push(StaticValuesCell {
-                    row: u32::try_from(row_index)
-                        .map_err(|_| CompileControlError::ResourceExhausted)?,
-                    column: u32::try_from(ordinal)
-                        .map_err(|_| CompileControlError::ResourceExhausted)?,
-                    definition,
-                }),
+                Cell::Dynamic(definition) => {
+                    if dynamic.len() == dynamic.capacity() {
+                        let additional = dynamic.len().max(4);
+                        reserve_created(&mut dynamic, additional, work, creation)?;
+                    }
+                    dynamic.push(StaticValuesCell {
+                        row: u32::try_from(row_index)
+                            .map_err(|_| CompileControlError::ResourceExhausted)?,
+                        column: u32::try_from(ordinal)
+                            .map_err(|_| CompileControlError::ResourceExhausted)?,
+                        definition,
+                    });
+                }
             }
         }
     }
@@ -232,9 +274,11 @@ fn lower_core(
             .ok_or(FragmentCompileError::Invalid("missing Values output type"))?
             .ty;
         work.flush()?;
-        validate_value_type_structure_observed::<FragmentCompileError>(&ty.data_type, |visit| {
-            if let ValueTypeVisit::TypeNode(data_type) = visit {
-                validate_arrow_carrier_parameters_observed::<ConstantError>(data_type, || {
+        validate_value_type_structure_observed::<crate::FragmentCreationError<H>>(
+            &ty.data_type(),
+            |visit| {
+                if let ValueTypeVisit::TypeNode(data_type) = visit {
+                    validate_arrow_carrier_parameters_observed::<ConstantError>(data_type, || {
                     work.step().map_err(Into::into)
                 })
                 .map_err(|error| match error {
@@ -247,33 +291,26 @@ fn lower_core(
                         feature: "Values empty carrier has invalid Arrow constructor parameters",
                     },
                 })?;
-            }
-            let unsupported = matches!(visit, ValueTypeVisit::TypeNode(DataType::Union(fields, _)) if fields.is_empty());
-            work.step()?;
-            if unsupported {
-                return Err(FragmentCompileError::Unsupported {
-                    node: Some(node.id),
-                    feature: "Values empty Union has no Arrow constructor child",
-                });
-            }
-            Ok(())
-        })?;
+                }
+                let unsupported = matches!(visit, ValueTypeVisit::TypeNode(DataType::Union(fields, _)) if fields.is_empty());
+                work.step()?;
+                if unsupported {
+                    return Err((FragmentCompileError::Unsupported {
+                        node: Some(node.id),
+                        feature: "Values empty Union has no Arrow constructor child",
+                    })
+                    .into());
+                }
+                Ok(())
+            },
+        )?;
         work.flush()?;
     }
-    let mut fields: Vec<Field> = Vec::new();
+    let mut typed_layout =
+        crate::typed_layout::TypedLayoutBuilder::new_with_creation(slots.len(), work, creation)?;
+    let mut source_storage = creation.storage_lifetime();
     let mut columns: Vec<ArrayRef> = Vec::new();
-    if package.original_metadata_namespace().is_none() {
-        reserve_vec(&mut fields, slots.len(), work)?;
-    }
-    let mut original_fields = match package.original_metadata_namespace() {
-        Some(_) => {
-            let mut original_fields = Vec::new();
-            reserve_vec(&mut original_fields, slots.len(), work)?;
-            Some(original_fields)
-        }
-        None => None,
-    };
-    reserve_vec(&mut columns, slots.len(), work)?;
+    reserve_created(&mut columns, slots.len(), work, creation)?;
     for (ordinal, output) in node.output.columns.iter().enumerate() {
         let ty = &package
             .fragment()
@@ -290,24 +327,30 @@ fn lower_core(
                 .result()
                 .and_then(|result| result.fields.get(ordinal))
                 .ok_or(FragmentCompileError::Invalid("missing Values result label"))?;
-            field.alias.as_deref().unwrap_or(&field.name).to_owned()
+            crate::typed_layout::copy_name_with_creation(
+                field.alias.as_deref().unwrap_or(&field.name),
+                work,
+                creation,
+            )?
         } else {
-            format!("local_values_{}_{}", node.id.get(), ordinal)
+            crate::typed_layout::local_name_with_creation(
+                "local_values",
+                node.id.get(),
+                ordinal,
+                work,
+                creation,
+            )?
         };
-        if let Some(original_fields) = original_fields.as_mut() {
-            let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(ty, name);
-            work.flush()?;
-            original_fields.push(field?);
-        } else {
-            let field = ty.try_to_field(name);
-            work.flush()?;
-            fields.push(field?);
-        }
+        typed_layout.push_with_creation(ty, name, work, creation)?;
         let column = if constant_cells[ordinal] == 0 {
-            // The sole Arrow empty constructor follows the admitted type. Its
-            // internal type walk/allocation remains opaque, not a MEM grant.
             work.flush()?;
-            let array = new_empty_array(&ty.data_type);
+            selected_copy::preflight_empty_construction(
+                ty.typed_binding().layout(),
+                creation,
+                &CompileCopyControl(work.control()),
+            )
+            .map_err(|error| copy_construction_error(error, node.id))?;
+            let array = new_empty_array(&ty.data_type());
             work.flush()?;
             array
         } else {
@@ -316,12 +359,10 @@ fn lower_core(
             let count = constant_cells[ordinal];
             let mut sources = Vec::new();
             let mut choices = Vec::new();
-            let mut indices = Vec::new();
             let mut raw_indices = Vec::new();
-            reserve_vec(&mut sources, count, work)?;
-            reserve_vec(&mut choices, count, work)?;
-            reserve_vec(&mut indices, count, work)?;
-            reserve_vec(&mut raw_indices, count, work)?;
+            reserve_created(&mut sources, count, work, creation)?;
+            reserve_created(&mut choices, count, work, creation)?;
+            reserve_created(&mut raw_indices, count, work, creation)?;
             let mut first: Option<&ConstantValue> = None;
             let mut same_backing = true;
             for row in rows {
@@ -332,9 +373,18 @@ fn lower_core(
                 };
                 let first = *first.get_or_insert(value);
                 same_backing &= value.pool().backing_identity() == first.pool().backing_identity();
+                let source = value.pool().array_projection();
+                source_storage = source_storage
+                    .retaining_observed::<crate::FragmentCreationError<H>>(
+                        &source.storage_lifetime(),
+                        |layout| {
+                            creation
+                                .request_layout(layout)
+                                .map_err(crate::FragmentCreationError::Creator)
+                        },
+                    )?;
                 sources.push(Arc::clone(value.pool().array()));
                 choices.push((sources.len() - 1, value.ordinal() as usize));
-                indices.push(Some(u64::from(value.ordinal())));
                 raw_indices.push(u64::from(value.ordinal()));
                 work.step()?;
             }
@@ -342,73 +392,73 @@ fn lower_core(
                 "Values constant cell count changed",
             ))?;
             if same_backing {
-                selected_copy::preflight_take(
-                    first.pool().array().as_ref(),
-                    &indices,
-                    |boundary| observe(work, boundary),
-                )
-                .map_err(|error| copy_error(error, node.id))?;
                 work.flush()?;
+                let copy_control = CompileCopyControl(work.control());
+                selected_copy::preflight_uint64_indices_construction(creation, &copy_control)
+                    .map_err(|error| copy_construction_error(error, node.id))?;
                 let indices = UInt64Array::from(raw_indices);
+                selected_copy::preflight_take_construction(
+                    first.pool().array().as_ref(),
+                    CopyIndexView::UInt64(&indices),
+                    creation,
+                    &copy_control,
+                )
+                .map_err(|error| copy_construction_error(error, node.id))?;
+                work.flush()?;
                 let copied = take(
                     first.pool().array().as_ref(),
                     &indices,
                     Some(TakeOptions { check_bounds: true }),
                 );
-                work.flush()?;
-                copied.map_err(|error| FragmentCompileError::Owner {
+                let copied = copied.map_err(|error| FragmentCompileError::Owner {
                     phase: "Values take",
                     error: Box::new(error),
-                })?
+                })?;
+                work.flush()?;
+                copied
             } else {
-                selected_copy::preflight_guarded_interleave(
-                    &ty.data_type,
+                work.flush()?;
+                selected_copy::preflight_interleave_construction(
+                    ty.data_type(),
                     &sources,
                     &choices,
-                    |boundary| observe(work, boundary),
+                    creation,
+                    &CompileCopyControl(work.control()),
                 )
-                .map_err(|error| copy_error(error, node.id))?;
+                .map_err(|error| copy_construction_error(error, node.id))?;
                 let mut borrowed: Vec<&dyn Array> = Vec::new();
-                reserve_vec(&mut borrowed, sources.len(), work)?;
+                reserve_created(&mut borrowed, sources.len(), work, creation)?;
                 for source in &sources {
                     borrowed.push(source.as_ref());
                     work.step()?;
                 }
                 work.flush()?;
                 let copied = interleave(&borrowed, &choices);
-                work.flush()?;
-                copied.map_err(|error| FragmentCompileError::Owner {
+                let copied = copied.map_err(|error| FragmentCompileError::Owner {
                     phase: "Values interleave",
                     error: Box::new(error),
-                })?
+                })?;
+                work.flush()?;
+                copied
             }
         };
+        let column = crate::array_projection::normalize_constant_column_with_creation(
+            &column, ty, work, creation,
+        )?;
         columns.push(column);
         work.step()?;
     }
     work.flush()?;
-    let layout = match (original_fields, package.original_metadata_namespace()) {
-        (Some(fields), Some(namespace)) => {
-            let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema();
-            StaticLayout::try_new_materialized_for_compile(
-                source,
-                Arc::from(slots),
-                work.control(),
-            )?
-        }
-        _ => StaticLayout::try_new_for_compile(
-            Arc::new(Schema::new(fields)),
-            Arc::from(slots),
-            work.control(),
-        )?,
-    };
+    let layout = typed_layout.finish_with_creation(slots, work, creation)?;
     work.flush()?;
     if !dynamic.is_empty() {
-        let values = StaticValues::try_new_with_cells_for_compile(
+        let values = StaticValues::try_new_with_cells_with_creator(
             rows.len(),
             columns,
             dynamic,
             layout.clone(),
+            source_storage,
+            creation,
             work.control(),
         )?;
         work.flush()?;
@@ -424,7 +474,13 @@ fn lower_core(
         phase: "Values batch",
         error: Box::new(error),
     })?;
-    let values = StaticValues::try_new_for_compile(batch, layout.clone(), work.control())?;
+    let values = StaticValues::try_new_with_creator(
+        batch,
+        layout.clone(),
+        source_storage,
+        creation,
+        work.control(),
+    )?;
     work.flush()?;
     Ok((ProgramNodeKind::Values { values }, layout))
 }
@@ -455,4 +511,17 @@ pub(crate) fn retired_values_uses(
         work.step()?;
     }
     Ok(retired)
+}
+
+#[cfg(test)]
+pub(crate) fn lower_values(
+    package: &FragmentPackage,
+    node: &PhysicalNode,
+    expressions: &LoweredExpressions,
+    slots: &[SlotId],
+    control: &dyn PureCompileControl,
+) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
+    crate::creation::pure(|creation| {
+        lower_values_with_creation(package, node, expressions, slots, control, creation)
+    })
 }

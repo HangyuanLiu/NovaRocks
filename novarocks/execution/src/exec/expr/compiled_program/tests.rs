@@ -501,6 +501,7 @@ fn package_with_dictionary(
             )
             .unwrap();
         call_entries.push(FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
@@ -988,8 +989,8 @@ fn every_selected_evaluation_callback_preserves_control_and_poisoned_instance_ne
 }
 
 #[test]
-#[allow(deprecated)] // Arrow's public dict-ID constructor is required to probe exact field identity.
-fn unused_incoming_dictionary_field_id_and_order_drift_is_rejected_even_for_empty_selection() {
+#[allow(deprecated)] // The actual source descriptors are independent IPC facts.
+fn unused_incoming_dictionary_descriptors_are_not_value_identity_but_layout_and_nullability_are() {
     let functions = rng_subset();
     let source = package_with_dictionary(&functions, SeedMode::Input, false, true);
     let providers =
@@ -1001,10 +1002,7 @@ fn unused_incoming_dictionary_field_id_and_order_drift_is_rejected_even_for_empt
     let schema = program.graph().nodes()[2].output_layout().schema().clone();
     assert_eq!(schema.fields().len(), 4);
     let dictionary = schema.field(3);
-    assert_eq!(
-        dictionary.data_type(),
-        &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
-    );
+    assert_eq!(dictionary.data_type(), &DataType::Utf8);
     assert!(dictionary.is_nullable());
     let columns = schema
         .fields()
@@ -1020,9 +1018,7 @@ fn unused_incoming_dictionary_field_id_and_order_drift_is_rejected_even_for_empt
             .selection()
             .is_empty()
     );
-    let id = dictionary.dict_id().unwrap();
-    let ordered = dictionary.dict_is_ordered().unwrap();
-    for (changed_id, changed_order) in [(id + 1, ordered), (id, !ordered)] {
+    for (changed_id, changed_order) in [(17, false), (88, true)] {
         let mut fields = schema.fields().to_vec();
         fields[3] = Arc::new(
             Field::new_dict(
@@ -1035,13 +1031,29 @@ fn unused_incoming_dictionary_field_id_and_order_drift_is_rejected_even_for_empt
             .with_metadata(dictionary.metadata().clone()),
         );
         let drifted = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
-        // This is the real Arrow equality blind spot; no type/name/nullability
-        // or annotation differs. The compiled input contract remains exact.
+        // Planned layouts describe plain values. Actual source IPC attributes
+        // do not change that same value layout, name or nullability.
         assert_eq!(schema.as_ref(), drifted.as_ref());
-        let invalid_input = RecordBatch::try_new(drifted, columns.clone()).unwrap();
+        let actual_input = RecordBatch::try_new(drifted, columns.clone()).unwrap();
+        let mut evaluator = instance(&program, 0);
+        assert!(
+            evaluator
+                .evaluate(&actual_input, Selection::all(0), &RuntimeControl)
+                .unwrap()
+                .selection()
+                .is_empty()
+        );
+    }
+    for (data_type, nullable) in [(DataType::Binary, true), (DataType::Utf8, false)] {
+        let mut fields = schema.fields().to_vec();
+        fields[3] = Arc::new(Field::new(dictionary.name(), data_type.clone(), nullable));
+        let mut actual_columns = columns.clone();
+        actual_columns[3] = new_empty_array(&data_type);
+        let actual_input =
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), actual_columns).unwrap();
         let mut evaluator = instance(&program, 0);
         assert!(matches!(
-            evaluator.evaluate(&invalid_input, Selection::all(0), &RuntimeControl),
+            evaluator.evaluate(&actual_input, Selection::all(0), &RuntimeControl),
             Err(KernelFailure::InvalidProgram(_))
         ));
     }

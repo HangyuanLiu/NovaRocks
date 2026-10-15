@@ -344,7 +344,10 @@ fn make_nullable(
 ) -> Result<(), SqlCompileError> {
     for column in columns {
         work.step()?;
-        column.value_type.nullable = true;
+        column.value_type = column
+            .value_type
+            .with_nullable(true)
+            .expect("validated root NULL contract");
     }
     Ok(())
 }
@@ -387,16 +390,20 @@ fn adapt_opt_expr_output_with_qualifier(
         .zip(target_output_columns.iter())
     {
         work.step()?;
-        if work.opaque(|| source.value_type.data_type != target.value_type.data_type)? {
+        if work.opaque(|| source.value_type.data_type() != target.value_type.data_type())? {
             return Err(SqlCompileError::Compilation(format!(
                 "output type mismatch while adapting subquery/CTE column '{}': child={:?}, target={:?}",
-                target.name, source.value_type.data_type, target.value_type.data_type
+                target.name,
+                source.value_type.data_type(),
+                target.value_type.data_type()
             )));
         }
-        if source.value_type.nullable && !target.value_type.nullable {
+        if source.value_type.nullable() && !target.value_type.nullable() {
             return Err(SqlCompileError::Compilation(format!(
                 "output nullability mismatch while adapting subquery/CTE column '{}': child={}, target={}",
-                target.name, source.value_type.nullable, target.value_type.nullable
+                target.name,
+                source.value_type.nullable(),
+                target.value_type.nullable()
             )));
         }
         work.opaque(|| {
@@ -405,10 +412,9 @@ fn adapt_opt_expr_output_with_qualifier(
         work.checkpoints.flush()?;
         let expr = scalars.intern_observed(
             ScalarNode::ColumnRef(source.column_id),
-            novarocks_type_contract::FunctionValueType {
-                nullable: target.value_type.nullable,
-                ..source.value_type.clone()
-            },
+            (source.value_type.clone())
+                .with_nullable(target.value_type.nullable())
+                .expect("valid value root nullability transform"),
             work.control,
         )?;
         items.push(work.opaque(|| {
@@ -471,16 +477,20 @@ fn adapt_cte_replacement_output_with_qualifier(
                 )
             })
             .map_err(SqlCompileError::Compilation)?;
-        if work.opaque(|| source.value_type.data_type != target.value_type.data_type)? {
+        if work.opaque(|| source.value_type.data_type() != target.value_type.data_type())? {
             return Err(SqlCompileError::Compilation(format!(
                 "output type mismatch while adapting subquery/CTE column '{}': child={:?}, target={:?}",
-                target.name, source.value_type.data_type, target.value_type.data_type
+                target.name,
+                source.value_type.data_type(),
+                target.value_type.data_type()
             )));
         }
-        if source.value_type.nullable && !target.value_type.nullable {
+        if source.value_type.nullable() && !target.value_type.nullable() {
             return Err(SqlCompileError::Compilation(format!(
                 "output nullability mismatch while adapting subquery/CTE column '{}': child={}, target={}",
-                target.name, source.value_type.nullable, target.value_type.nullable
+                target.name,
+                source.value_type.nullable(),
+                target.value_type.nullable()
             )));
         }
         work.opaque(|| {
@@ -489,10 +499,9 @@ fn adapt_cte_replacement_output_with_qualifier(
         work.checkpoints.flush()?;
         let expr = scalars.intern_observed(
             ScalarNode::ColumnRef(source.column_id),
-            novarocks_type_contract::FunctionValueType {
-                nullable: target.value_type.nullable,
-                ..source.value_type.clone()
-            },
+            (source.value_type.clone())
+                .with_nullable(target.value_type.nullable())
+                .expect("valid value root nullability transform"),
             work.control,
         )?;
         items.push(work.opaque(|| {
@@ -526,8 +535,8 @@ fn adapt_cte_replacement_output_with_qualifier(
 fn output_column_metadata_equal(left: &OutputColumn, right: &OutputColumn) -> bool {
     left.column_id == right.column_id
         && left.name == right.name
-        && left.value_type.data_type == right.value_type.data_type
-        && left.value_type.nullable == right.value_type.nullable
+        && left.value_type.data_type() == right.value_type.data_type()
+        && left.value_type.nullable() == right.value_type.nullable()
         && left.is_internal == right.is_internal
 }
 
@@ -741,12 +750,12 @@ mod tests {
         assert_eq!(output[0].column_id, consume_output_columns[0].column_id);
         assert_eq!(output[0].name, consume_output_columns[0].name);
         assert_eq!(
-            output[0].value_type.data_type,
-            consume_output_columns[0].value_type.data_type
+            output[0].value_type.data_type(),
+            consume_output_columns[0].value_type.data_type()
         );
         assert_eq!(
-            output[0].value_type.nullable,
-            consume_output_columns[0].value_type.nullable
+            output[0].value_type.nullable(),
+            consume_output_columns[0].value_type.nullable()
         );
         let Operator::LogicalProject(project) = &rewritten.op else {
             panic!("expected Project adapter");
@@ -757,12 +766,12 @@ mod tests {
             crate::planner::optimizer_bridge::scalar::materialize(&arena, project.items[0].expr);
         let expected = column_ref(&output_columns()[0]);
         assert_eq!(
-            materialized.value_type.data_type,
-            expected.value_type.data_type
+            materialized.value_type.data_type(),
+            expected.value_type.data_type()
         );
         assert_eq!(
-            materialized.value_type.nullable,
-            expected.value_type.nullable
+            materialized.value_type.nullable(),
+            expected.value_type.nullable()
         );
         let ExprKind::ColumnRef {
             column_id,
@@ -846,12 +855,12 @@ mod tests {
         assert_eq!(output[0].column_id, consumer_join_column.column_id);
         assert_eq!(output[0].name, consumer_join_column.name);
         assert_eq!(
-            output[0].value_type.data_type,
-            consumer_join_column.value_type.data_type
+            output[0].value_type.data_type(),
+            consumer_join_column.value_type.data_type()
         );
         assert_eq!(
-            output[0].value_type.nullable,
-            consumer_join_column.value_type.nullable
+            output[0].value_type.nullable(),
+            consumer_join_column.value_type.nullable()
         );
         assert_eq!(output[0].is_internal, consumer_join_column.is_internal);
     }

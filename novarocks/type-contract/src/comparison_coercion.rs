@@ -319,15 +319,15 @@ pub fn comparison_common_value_type(
     right: &FunctionValueType,
 ) -> Result<Option<FunctionValueType>, String> {
     validate_operands(left, right)?;
-    if left.data_type == DataType::Null || right.data_type == DataType::Null {
+    if left.data_type() == &DataType::Null || right.data_type() == &DataType::Null {
         let value = null_common_value(left, right);
         return Ok((value != *left || value != *right).then_some(value));
     }
-    let carrier = comparison_common_type(&left.data_type, &right.data_type)?;
+    let carrier = comparison_common_type(left.data_type(), right.data_type())?;
     let common_exists = carrier.is_some()
-        || crate::arrow_type_equals_ignoring_metadata(&left.data_type, &right.data_type);
-    let candidate = carrier.unwrap_or_else(|| left.data_type.clone());
-    let value = restore_value(candidate, left, right)?;
+        || crate::arrow_type_equals_ignoring_metadata(left.data_type(), right.data_type());
+    let candidate = carrier.unwrap_or_else(|| left.data_type().clone());
+    let value = value_type_for_common_layout(candidate, left, right)?;
     if !common_exists {
         return Ok(None);
     }
@@ -345,10 +345,10 @@ pub fn wider_comparison_value_type(
     right: &FunctionValueType,
 ) -> Result<FunctionValueType, String> {
     validate_operands(left, right)?;
-    if left.data_type == DataType::Null || right.data_type == DataType::Null {
+    if left.data_type() == &DataType::Null || right.data_type() == &DataType::Null {
         return Ok(null_common_value(left, right));
     }
-    restore_value(wider_type(&left.data_type, &right.data_type), left, right)
+    value_type_for_common_layout(wider_type(left.data_type(), right.data_type()), left, right)
 }
 
 fn validate_operands(left: &FunctionValueType, right: &FunctionValueType) -> Result<(), String> {
@@ -358,12 +358,14 @@ fn validate_operands(left: &FunctionValueType, right: &FunctionValueType) -> Res
 }
 
 fn null_common_value(left: &FunctionValueType, right: &FunctionValueType) -> FunctionValueType {
-    let mut result = if left.data_type == DataType::Null {
+    let mut result = if left.data_type() == &DataType::Null {
         right.clone()
     } else {
         left.clone()
     };
-    result.nullable = left.nullable || right.nullable;
+    result = result
+        .with_nullable(left.nullable() || right.nullable())
+        .expect("valid function nullability declaration");
     result
 }
 
@@ -374,247 +376,313 @@ fn signed_integer(data_type: &DataType) -> bool {
     )
 }
 
-fn restore_value(
-    mut carrier: DataType,
+/// Bind the complete semantic result to a layout selected by the calling
+/// owner's existing common-type policy. This restores child domains without
+/// treating format metadata or encoding identifiers as semantic authority.
+/// It authorizes no cast, installed implementation, or allocation capacity.
+pub fn value_type_for_common_layout(
+    carrier: DataType,
     left: &FunctionValueType,
     right: &FunctionValueType,
 ) -> Result<FunctionValueType, String> {
-    if left.data_type == DataType::Null || right.data_type == DataType::Null {
-        return Ok(null_common_value(left, right));
+    value_type_for_common_layout_with_construction::<std::convert::Infallible>(
+        carrier,
+        left,
+        right,
+        crate::ValueTypeStorageLifetime::pure(),
+        None,
+    )
+    .map_err(crate::ValueConstructionFailure::into_pure_string)
+}
+pub fn value_type_for_common_layout_with_construction<E>(
+    carrier: DataType,
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    storage: crate::ValueTypeStorageLifetime,
+    observer: Option<&mut dyn FnMut(crate::ValueConstructionRequest) -> Result<(), E>>,
+) -> Result<FunctionValueType, crate::ValueConstructionFailure<E>> {
+    common_value_core(
+        carrier,
+        left,
+        right,
+        storage,
+        &mut crate::value_construction::ValueConstruction::new(observer),
+    )
+}
+fn common_value_core<E>(
+    mut carrier: DataType,
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    storage: crate::ValueTypeStorageLifetime,
+    creation: &mut crate::value_construction::ValueConstruction<'_, E>,
+) -> Result<FunctionValueType, crate::ValueConstructionFailure<E>> {
+    if left.data_type() == &DataType::Null || right.data_type() == &DataType::Null {
+        let source = if left.data_type() == &DataType::Null {
+            right
+        } else {
+            left
+        };
+        return source.with_nullable_with_construction(
+            left.nullable() || right.nullable(),
+            storage,
+            creation.observer(),
+        );
     }
-    let logical_type = if left.logical_type == right.logical_type {
-        if left.logical_type == ValueLogicalType::Physical
-            && ((crate::is_largeint_data_type(&left.data_type)
-                && (crate::is_numeric_value_type(right) || right.data_type == DataType::Boolean))
-                || (crate::is_largeint_data_type(&right.data_type)
-                    && (crate::is_numeric_value_type(left) || left.data_type == DataType::Boolean)))
+    let logical_type = if left.logical_type() == right.logical_type() {
+        if left.logical_type() == ValueLogicalType::Physical
+            && ((crate::is_largeint_data_type(left.data_type())
+                && (crate::is_numeric_value_type(right)
+                    || right.data_type() == &DataType::Boolean))
+                || (crate::is_largeint_data_type(right.data_type())
+                    && (crate::is_numeric_value_type(left)
+                        || left.data_type() == &DataType::Boolean)))
         {
-            return Err("fixed binary has no declared numeric comparison identity".into());
+            return Err(crate::ValueConstructionFailure::Rule(
+                "fixed binary has no declared numeric comparison identity".into(),
+            ));
         }
-        left.logical_type
+        left.logical_type()
     } else {
-        match (left.logical_type, right.logical_type) {
+        match (left.logical_type(), right.logical_type()) {
             (ValueLogicalType::LargeInt, ValueLogicalType::Physical)
-                if signed_integer(&right.data_type) =>
+                if signed_integer(right.data_type()) =>
             {
-                carrier = left.data_type.clone();
+                carrier = left.data_type().clone();
                 ValueLogicalType::LargeInt
             }
             (ValueLogicalType::Physical, ValueLogicalType::LargeInt)
-                if signed_integer(&left.data_type) =>
+                if signed_integer(left.data_type()) =>
             {
-                carrier = right.data_type.clone();
+                carrier = right.data_type().clone();
                 ValueLogicalType::LargeInt
             }
             (ValueLogicalType::Json, ValueLogicalType::Physical)
-                if right.data_type == DataType::Utf8 =>
+                if right.data_type() == &DataType::Utf8 =>
             {
                 carrier = DataType::Utf8;
                 ValueLogicalType::Physical
             }
             (ValueLogicalType::Physical, ValueLogicalType::Json)
-                if left.data_type == DataType::Utf8 =>
+                if left.data_type() == &DataType::Utf8 =>
             {
                 carrier = DataType::Utf8;
                 ValueLogicalType::Physical
             }
             _ => {
-                return Err(format!(
+                return Err(crate::ValueConstructionFailure::Rule(format!(
                     "comparison has no declared conversion between {:?} and {:?}",
-                    left.logical_type, right.logical_type
-                ));
+                    left.logical_type(),
+                    right.logical_type()
+                )));
             }
         }
     };
-    let data_type = restore_type(carrier, &left.data_type, &right.data_type)?;
-    FunctionValueType::try_with_logical_type(
-        data_type,
-        left.nullable || right.nullable,
-        logical_type,
-    )
-    .map_err(|error| error.to_string())
+    restore_typed_value(carrier, left, right, logical_type, storage, creation)
 }
 
-fn field_value(field: &Field) -> Result<FunctionValueType, String> {
-    FunctionValueType::try_with_logical_type(
-        field.data_type().clone(),
-        field.is_nullable(),
-        crate::field_logical_type(field).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())
-}
-
-fn restore_field(candidate: &Field, left: &Field, right: &Field) -> Result<Arc<Field>, String> {
-    if left.data_type() != &DataType::Null && right.data_type() != &DataType::Null {
-        #[allow(deprecated)]
-        let dictionary_identity_matches =
-            left.dict_id() == right.dict_id() && left.dict_is_ordered() == right.dict_is_ordered();
-        if !dictionary_identity_matches {
-            return Err("comparison cannot change a dictionary field identity".into());
-        }
-    }
-    let value = restore_value(
-        candidate.data_type().clone(),
-        &field_value(left)?,
-        &field_value(right)?,
-    )?;
-    // NULL has no nested identity to donate. Preserve the decided source's
-    // metadata and dictionary attributes, with the existing left layout name.
-    let decided = if left.data_type() == &DataType::Null {
-        right
+fn restore_typed_value<E>(
+    carrier: DataType,
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    logical: ValueLogicalType,
+    storage: crate::ValueTypeStorageLifetime,
+    creation: &mut crate::value_construction::ValueConstruction<'_, E>,
+) -> Result<FunctionValueType, crate::ValueConstructionFailure<E>> {
+    use crate::{ValueField, ValueKind, ValueLayout, ValueTypeRef, ValueUnionField};
+    let fail = || {
+        crate::ValueConstructionFailure::Rule(
+            "comparison cannot erase an unsupported typed semantic structure".to_string(),
+        )
+    };
+    let layout =
+        ValueLayout::try_new_with_construction(&carrier, storage.clone(), creation.observer())?;
+    let child = |index: usize,
+                 target: &DataType,
+                 creation: &mut crate::value_construction::ValueConstruction<'_, E>|
+     -> Result<ValueTypeRef, crate::ValueConstructionFailure<E>> {
+        let a = left
+            .child_at_with_construction(index, storage.clone(), creation.observer())?
+            .ok_or_else(fail)?;
+        let b = right
+            .child_at_with_construction(index, storage.clone(), creation.observer())?
+            .ok_or_else(fail)?;
+        Ok(
+            common_value_core(target.clone(), &a, &b, storage.clone(), creation)?
+                .value_type()
+                .clone(),
+        )
+    };
+    let kind = if logical != ValueLogicalType::Physical {
+        ValueKind::Nominal(logical)
     } else {
-        left
-    };
-    let mut metadata = decided.metadata().clone();
-    match value.logical_type.metadata_value() {
-        Some(domain) => {
-            metadata.insert(crate::NR_LOGICAL_TYPE_KEY.into(), domain.into());
-        }
-        None => {
-            metadata.remove(crate::NR_LOGICAL_TYPE_KEY);
-        }
-    }
-    Ok(Arc::new(
-        decided
-            .clone()
-            .with_name(left.name())
-            .with_data_type(value.data_type)
-            .with_nullable(value.nullable)
-            .with_metadata(metadata),
-    ))
-}
-
-fn restore_type(
-    candidate: DataType,
-    left: &DataType,
-    right: &DataType,
-) -> Result<DataType, String> {
-    macro_rules! list {
-        ($variant:ident, $target:ident, $lhs:ident, $rhs:ident) => {
-            Ok(DataType::$variant(restore_field($target, $lhs, $rhs)?))
-        };
-    }
-    match (&candidate, left, right) {
-        (DataType::List(t), DataType::List(l), DataType::List(r)) => list!(List, t, l, r),
-        (DataType::LargeList(t), DataType::LargeList(l), DataType::LargeList(r)) => {
-            list!(LargeList, t, l, r)
-        }
-        (DataType::ListView(t), DataType::ListView(l), DataType::ListView(r)) => {
-            list!(ListView, t, l, r)
-        }
-        (DataType::LargeListView(t), DataType::LargeListView(l), DataType::LargeListView(r)) => {
-            list!(LargeListView, t, l, r)
-        }
-        (
-            DataType::FixedSizeList(t, n),
-            DataType::FixedSizeList(l, ln),
-            DataType::FixedSizeList(r, rn),
-        ) if n == ln && ln == rn => Ok(DataType::FixedSizeList(restore_field(t, l, r)?, *n)),
-        (DataType::Map(t, sorted), DataType::Map(l, _), DataType::Map(r, _)) => {
-            Ok(DataType::Map(restore_field(t, l, r)?, *sorted))
-        }
-        (DataType::Struct(t), DataType::Struct(l), DataType::Struct(r))
-            if t.len() == l.len() && l.len() == r.len() =>
-        {
-            let right_by_name = r
-                .iter()
-                .map(|field| (field.name().as_str(), field))
-                .collect::<std::collections::HashMap<_, _>>();
-            let by_name = l
-                .iter()
-                .all(|field| right_by_name.contains_key(field.name().as_str()));
-            let fields = t
-                .iter()
-                .zip(l.iter())
-                .enumerate()
-                .map(|(index, (target, left))| {
-                    let right = if by_name {
-                        right_by_name[left.name().as_str()]
-                    } else {
-                        &r[index]
-                    };
-                    restore_field(target, left, right)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(DataType::Struct(fields.into()))
-        }
-        (
-            DataType::Dictionary(tk, tv),
-            DataType::Dictionary(lk, lv),
-            DataType::Dictionary(rk, rv),
-        ) if tk == lk && lk == rk => Ok(DataType::Dictionary(
-            tk.clone(),
-            Box::new(restore_type((**tv).clone(), lv, rv)?),
-        )),
-        (
-            DataType::RunEndEncoded(tre, tv),
-            DataType::RunEndEncoded(lre, lv),
-            DataType::RunEndEncoded(rre, rv),
-        ) => Ok(DataType::RunEndEncoded(
-            restore_field(tre, lre, rre)?,
-            restore_field(tv, lv, rv)?,
-        )),
-        (DataType::Union(t, tm), DataType::Union(l, lm), DataType::Union(r, rm))
-            if tm == lm && lm == rm && t.len() == l.len() && l.len() == r.len() =>
-        {
-            let fields = t
-                .iter()
-                .zip(l.iter())
-                .map(|((tag, target), (left_tag, left))| {
-                    if tag != left_tag {
-                        return Err("comparison cannot change union field identity".into());
-                    }
-                    let right = r
-                        .iter()
-                        .find_map(|(right_tag, field)| (right_tag == tag).then_some(field))
-                        .ok_or_else(|| {
-                            "comparison cannot change union field identity".to_string()
-                        })?;
-                    Ok((tag, restore_field(target, left, right)?))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            Ok(DataType::Union(fields.into_iter().collect(), *tm))
-        }
-        _ => {
-            // The carrier fallback can select one whole shape. A shape change
-            // may not silently discard any nested semantic or dictionary fact.
-            if (contains_identity(left)? || contains_identity(right)?)
-                && (!crate::arrow_data_types_exact(&candidate, left)
-                    || !crate::arrow_data_types_exact(left, right))
+        match (
+            layout.data_type(),
+            left.value_type().kind(),
+            right.value_type().kind(),
+        ) {
+            (
+                DataType::List(field)
+                | DataType::LargeList(field)
+                | DataType::ListView(field)
+                | DataType::LargeListView(field),
+                ValueKind::List(_),
+                ValueKind::List(_),
+            ) => ValueKind::List(child(0, field.data_type(), creation)?),
+            (
+                DataType::FixedSizeList(field, length),
+                ValueKind::FixedSizeList { length: a, .. },
+                ValueKind::FixedSizeList { length: b, .. },
+            ) if length == a && a == b => ValueKind::FixedSizeList {
+                item: child(0, field.data_type(), creation)?,
+                length: *length,
+            },
+            (DataType::Struct(target), ValueKind::Struct(a), ValueKind::Struct(b))
+                if target.len() == a.len() && a.len() == b.len() =>
             {
-                return Err("comparison cannot erase an unsupported nested identity".into());
+                let by_name = a
+                    .iter()
+                    .all(|field| b.iter().any(|other| other.name() == field.name()));
+                creation.collected_box_slice::<ValueField>(target.len())?;
+                let fields = target
+                    .iter()
+                    .enumerate()
+                    .map(|(index, target)| {
+                        let right_index = if by_name {
+                            b.iter()
+                                .position(|other| other.name() == a[index].name())
+                                .ok_or_else(fail)?
+                        } else {
+                            index
+                        };
+                        let a = left
+                            .child_at_with_construction(
+                                index,
+                                storage.clone(),
+                                creation.observer(),
+                            )?
+                            .ok_or_else(fail)?;
+                        let b = right
+                            .child_at_with_construction(
+                                right_index,
+                                storage.clone(),
+                                creation.observer(),
+                            )?
+                            .ok_or_else(fail)?;
+                        let value = common_value_core(
+                            target.data_type().clone(),
+                            &a,
+                            &b,
+                            storage.clone(),
+                            creation,
+                        )?;
+                        ValueField::from_borrowed_name_with_construction(
+                            target.name().as_str(),
+                            value.value_type().clone(),
+                            storage.clone(),
+                            creation.observer(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, crate::ValueConstructionFailure<E>>>()?;
+                ValueKind::Struct(fields.into())
             }
-            Ok(candidate)
+            (DataType::Map(entries, _), ValueKind::Map { .. }, ValueKind::Map { .. }) => {
+                let DataType::Struct(fields) = entries.data_type() else {
+                    return Err(fail());
+                };
+                ValueKind::Map {
+                    key: child(0, fields[0].data_type(), creation)?,
+                    value: child(1, fields[1].data_type(), creation)?,
+                }
+            }
+            (DataType::Union(target, _), ValueKind::Union(a), ValueKind::Union(b))
+                if target.len() == a.len() && a.len() == b.len() =>
+            {
+                creation.collected_box_slice::<ValueUnionField>(target.len())?;
+                let fields = target
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (id, target))| {
+                        if a[index].type_id != id {
+                            return Err(fail());
+                        }
+                        let right_index = b
+                            .iter()
+                            .position(|other| other.type_id == id)
+                            .ok_or_else(fail)?;
+                        let a = left
+                            .child_at_with_construction(
+                                index,
+                                storage.clone(),
+                                creation.observer(),
+                            )?
+                            .ok_or_else(fail)?;
+                        let b = right
+                            .child_at_with_construction(
+                                right_index,
+                                storage.clone(),
+                                creation.observer(),
+                            )?
+                            .ok_or_else(fail)?;
+                        let value = common_value_core(
+                            target.data_type().clone(),
+                            &a,
+                            &b,
+                            storage.clone(),
+                            creation,
+                        )?;
+                        Ok(ValueUnionField {
+                            type_id: id,
+                            field: ValueField::from_borrowed_name_with_construction(
+                                target.name().as_str(),
+                                value.value_type().clone(),
+                                storage.clone(),
+                                creation.observer(),
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, crate::ValueConstructionFailure<E>>>()?;
+                ValueKind::Union(fields.into())
+            }
+            (target, _, _) => {
+                // An existing whole-carrier fallback may choose scalar shapes;
+                // it has no authority to discard already-decided child domains.
+                if ((left.value_type().child_count() > 0 && has_nominal_child(left.value_type()))
+                    || (right.value_type().child_count() > 0
+                        && has_nominal_child(right.value_type())))
+                    && !left.same_value_domain(right)
+                {
+                    return Err(fail());
+                }
+                let declared = ValueTypeRef::try_from_declared_arrow_with_construction(
+                    target,
+                    left.nullable() || right.nullable(),
+                    logical,
+                    storage.clone(),
+                    creation.observer(),
+                )?;
+                match declared.kind() {
+                    ValueKind::Struct(fields) => creation.array::<ValueField>(fields.len())?,
+                    ValueKind::Union(fields) => creation.array::<ValueUnionField>(fields.len())?,
+                    _ => {}
+                }
+                declared.kind().clone()
+            }
         }
-    }
+    };
+    let value = ValueTypeRef::try_new_with_construction(
+        kind,
+        left.nullable() || right.nullable(),
+        storage,
+        creation.observer(),
+    )?;
+    FunctionValueType::try_from_value(value, layout).map_err(Into::into)
 }
 
-fn contains_identity(data_type: &DataType) -> Result<bool, String> {
-    fn field(field: &Field) -> Result<bool, String> {
-        #[allow(deprecated)]
-        let dictionary = field.dict_id().is_some() || field.dict_is_ordered().is_some();
-        Ok(dictionary
-            || crate::field_logical_type(field).map_err(|error| error.to_string())?
-                != ValueLogicalType::Physical
-            || contains_identity(field.data_type())?)
+fn has_nominal_child(value: &crate::ValueTypeRef) -> bool {
+    if matches!(value.kind(), crate::ValueKind::Nominal(_)) {
+        return true;
     }
-    match data_type {
-        DataType::List(f)
-        | DataType::LargeList(f)
-        | DataType::ListView(f)
-        | DataType::LargeListView(f)
-        | DataType::FixedSizeList(f, _)
-        | DataType::Map(f, _) => field(f),
-        DataType::Struct(fields) => fields
-            .iter()
-            .try_fold(false, |found, f| Ok(found || field(f)?)),
-        DataType::Union(fields, _) => fields
-            .iter()
-            .try_fold(false, |found, (_, f)| Ok(found || field(f)?)),
-        DataType::RunEndEncoded(run_ends, values) => Ok(field(run_ends)? || field(values)?),
-        DataType::Dictionary(..) => Ok(true),
-        _ => Ok(false),
-    }
+    (0..value.child_count()).any(|index| value.child_type_at(index).is_some_and(has_nominal_child))
 }
 
 #[cfg(test)]
@@ -623,7 +691,7 @@ mod value_tests {
     use arrow_schema::TimeUnit;
 
     fn value(carrier: DataType, logical: ValueLogicalType, nullable: bool) -> FunctionValueType {
-        FunctionValueType::try_with_logical_type(carrier, nullable, logical).unwrap()
+        FunctionValueType::try_from_legacy_declared_projection(carrier, nullable, logical).unwrap()
     }
     fn physical(carrier: DataType, nullable: bool) -> FunctionValueType {
         value(carrier, ValueLogicalType::Physical, nullable)
@@ -730,7 +798,9 @@ mod value_tests {
         let source = value(DataType::Utf8, ValueLogicalType::Json, false);
         let null = physical(DataType::Null, true);
         let mut expected = source.clone();
-        expected.nullable = true;
+        expected = expected
+            .with_nullable(true)
+            .expect("valid function nullability declaration");
         assert_eq!(
             comparison_common_value_type(&null, &source).unwrap(),
             Some(expected.clone())
@@ -749,12 +819,14 @@ mod value_tests {
             false,
         );
         let mut expected = list.clone();
-        expected.nullable = true;
+        expected = expected
+            .with_nullable(true)
+            .expect("valid function nullability declaration");
         assert_eq!(wider_comparison_value_type(&null, &list).unwrap(), expected);
     }
 
     #[test]
-    fn nested_common_retains_selected_field_facts_and_changes_only_declared_domain() {
+    fn nested_common_uses_canonical_layout_and_complete_declared_domain() {
         let left_item = field("source_item", DataType::Utf8, ValueLogicalType::Json, false);
         let right_item = field(
             "other_item",
@@ -770,14 +842,18 @@ mod value_tests {
                 .unwrap(),
             wider_comparison_value_type(&left, &right).unwrap(),
         ] {
-            let DataType::List(item) = result.data_type else {
+            let DataType::List(item) = result.data_type() else {
                 panic!("expected List")
             };
-            assert_eq!(item.name(), "source_item");
+            assert_eq!(item.name(), "item");
             assert!(item.is_nullable());
-            assert_eq!(item.metadata().get("provider.field-id").unwrap(), "73");
+            assert!(item.metadata().is_empty());
+            assert_eq!(
+                result.child_at(0).unwrap().logical_type(),
+                ValueLogicalType::Physical
+            );
             assert!(!item.metadata().contains_key(crate::NR_LOGICAL_TYPE_KEY));
-            assert!(result.nullable);
+            assert!(result.nullable());
         }
         assert_eq!(
             crate::field_logical_type(&left_item).unwrap(),
@@ -786,7 +862,7 @@ mod value_tests {
     }
 
     #[test]
-    fn nested_signed_to_largeint_retains_authoritative_domain_and_metadata() {
+    fn nested_signed_to_largeint_retains_authoritative_semantic_domain() {
         let left = physical(
             DataType::Struct(
                 vec![field(
@@ -814,19 +890,19 @@ mod value_tests {
         let result = comparison_common_value_type(&left, &right)
             .unwrap()
             .unwrap();
-        let DataType::Struct(fields) = result.data_type else {
+        let DataType::Struct(fields) = result.data_type() else {
             panic!("expected Struct")
         };
         assert_eq!(
-            crate::field_logical_type(&fields[0]).unwrap(),
+            result.child_at(0).unwrap().logical_type(),
             ValueLogicalType::LargeInt
         );
-        assert_eq!(fields[0].metadata().get("provider.field-id").unwrap(), "73");
+        assert!(fields[0].metadata().is_empty());
         assert!(fields[0].is_nullable());
     }
 
     #[test]
-    fn dictionary_attributes_survive_and_conflicting_identity_is_an_error() {
+    fn dictionary_encoding_attributes_do_not_decide_value_identity() {
         #[allow(deprecated)]
         let make = |id, nullable| {
             physical(
@@ -856,8 +932,14 @@ mod value_tests {
             wider_comparison_value_type(&left, &right).unwrap(),
             expected
         );
-        assert!(comparison_common_value_type(&left, &make(74, true)).is_err());
-        assert!(wider_comparison_value_type(&left, &make(74, true)).is_err());
+        assert_eq!(
+            comparison_common_value_type(&left, &make(74, true)).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            wider_comparison_value_type(&left, &make(74, true)).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -881,7 +963,7 @@ mod value_tests {
     }
 
     #[test]
-    fn map_fallback_preserves_original_field_attributes() {
+    fn map_fallback_uses_canonical_roles_and_complete_semantics() {
         let entries = field(
             "actual_entries",
             DataType::Struct(
@@ -931,22 +1013,19 @@ mod value_tests {
             false,
         );
         let result = wider_comparison_value_type(&left, &right).unwrap();
-        let DataType::Map(fields, sorted) = result.data_type else {
+        let DataType::Map(fields, sorted) = result.data_type() else {
             panic!("expected Map")
         };
         assert!(!sorted); // Existing wider_type carrier behavior.
-        assert_eq!(fields.name(), "actual_entries");
-        assert_eq!(fields.metadata(), entries.metadata());
+        assert_eq!(fields.name(), "entries");
+        assert!(fields.metadata().is_empty());
         let DataType::Struct(children) = fields.data_type() else {
             panic!("expected entries")
         };
-        assert_eq!(children[1].name(), "actual_value");
+        assert_eq!(children[1].name(), "value");
+        assert!(children[1].metadata().is_empty());
         assert_eq!(
-            children[1].metadata().get("provider.field-id").unwrap(),
-            "73"
-        );
-        assert_eq!(
-            crate::field_logical_type(&children[1]).unwrap(),
+            result.child_at(1).unwrap().logical_type(),
             ValueLogicalType::Physical
         );
     }

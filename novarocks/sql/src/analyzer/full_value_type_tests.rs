@@ -136,10 +136,10 @@ fn catalog_root_identity_survives_projection_alias_derived_cte_and_outer_padding
             .zip(&select.projection)
             .zip(expected)
         {
-            assert_eq!(output.value_type.logical_type, logical, "{sql}");
+            assert_eq!(output.value_type.logical_type(), logical, "{sql}");
             assert_eq!(project.expr.value_type, output.value_type, "{sql}");
             if sql.contains("LEFT JOIN") {
-                assert!(output.value_type.nullable);
+                assert!(output.value_type.nullable());
             }
         }
     }
@@ -158,27 +158,27 @@ fn actual_field_domain_reaches_lambda_parameter_body_and_bound_result() {
     let ExprKind::LambdaFunction { params, body } = &args[0].kind else {
         panic!("expected lambda");
     };
-    assert_eq!(params[0].value_type.logical_type, ValueLogicalType::Json);
+    assert_eq!(params[0].value_type.logical_type(), ValueLogicalType::Json);
     assert_eq!(body.value_type, params[0].value_type);
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
     else {
         panic!("expected scalar");
     };
     assert_eq!(&expression.value_type, result);
-    let DataType::List(item) = &result.data_type else {
+    let DataType::List(item) = &result.data_type() else {
         panic!("expected list");
     };
-    assert_eq!(
-        novarocks_type_contract::field_logical_type(item),
-        Ok(ValueLogicalType::Json)
-    );
+    let expected =
+        crate::test_value_types::string_list(item.is_nullable(), true, result.nullable());
+    assert_eq!(result, &expected);
+    assert_eq!(item.metadata().capacity(), 0);
 }
 
 #[test]
 fn unnest_uses_complete_selected_relation_domain() {
     let resolved = analyze("SELECT u.* FROM source, UNNEST(ja) u");
     assert_eq!(
-        resolved.output_columns[0].value_type.logical_type,
+        resolved.output_columns[0].value_type.logical_type(),
         ValueLogicalType::Json
     );
 }
@@ -191,26 +191,26 @@ fn explicit_largeint_and_typed_null_are_authored_by_syntax_not_carrier() {
     ] {
         let resolved = analyze(sql);
         assert_eq!(
-            resolved.output_columns[0].value_type.logical_type,
+            resolved.output_columns[0].value_type.logical_type(),
             ValueLogicalType::LargeInt
         );
     }
     assert_eq!(
         analyze("SELECT raw FROM source").output_columns[0]
             .value_type
-            .logical_type,
+            .logical_type(),
         ValueLogicalType::Physical
     );
     assert_eq!(
         analyze("SELECT CAST(NULL AS JSON)").output_columns[0]
             .value_type
-            .logical_type,
+            .logical_type(),
         ValueLogicalType::Json
     );
     assert_eq!(
         analyze("SELECT CAST('not JSON' AS JSON)").output_columns[0]
             .value_type
-            .logical_type,
+            .logical_type(),
         ValueLogicalType::Physical
     );
 }
@@ -222,7 +222,7 @@ fn empty_array_declares_expected_result_only_to_its_exact_owner() {
         panic!("expected select");
     };
     let expression = &select.projection[0].expr;
-    assert!(!expression.value_type.nullable);
+    assert!(!expression.value_type.nullable());
     let ExprKind::FunctionCall { args, binding, .. } = &expression.kind else {
         panic!("expected direct bound literal owner");
     };
@@ -232,13 +232,13 @@ fn empty_array_declares_expected_result_only_to_its_exact_owner() {
         panic!("expected scalar");
     };
     assert_eq!(&expression.value_type, result);
-    let DataType::List(item) = &result.data_type else {
+    let DataType::List(item) = &result.data_type() else {
         panic!("expected list");
     };
-    assert_eq!(
-        novarocks_type_contract::field_logical_type(item),
-        Ok(ValueLogicalType::Json)
-    );
+    let expected =
+        crate::test_value_types::string_list(item.is_nullable(), true, result.nullable());
+    assert_eq!(result, &expected);
+    assert_eq!(item.metadata().capacity(), 0);
     assert_eq!(item.data_type(), &DataType::Utf8);
 }
 
@@ -280,7 +280,7 @@ fn declared_source_validation_preserves_typed_control_at_entry_and_inside_fields
     }
     let validated =
         helpers::column_value_type(&source, crate::optimizer::test_optimizer_control()).unwrap();
-    assert_eq!(validated.data_type, source.data_type);
+    assert_eq!(validated.data_type().clone(), source.data_type);
 }
 
 #[test]
@@ -293,7 +293,7 @@ fn conflicting_catalog_tag_is_rejected_without_carrier_guess() {
     assert_eq!(
         helpers::column_value_type(&source, crate::optimizer::test_optimizer_control())
             .unwrap()
-            .logical_type,
+            .logical_type(),
         ValueLogicalType::Physical
     );
 }
@@ -353,14 +353,15 @@ fn assignment_common_owner_preserves_complete_same_domain_and_null_sources() {
     let left = helpers::column_value_type(&left, control).unwrap();
     let right = helpers::column_value_type(&right, control).unwrap();
     let common = helpers::assignment_common_value_type(&left, &right, control).unwrap();
-    let DataType::List(item) = &common.data_type else {
+    let DataType::List(item) = &common.data_type() else {
         panic!("expected list");
     };
     assert!(item.is_nullable());
     assert_eq!(
-        novarocks_type_contract::field_logical_type(item),
-        Ok(ValueLogicalType::Json)
+        common,
+        crate::test_value_types::string_list(true, true, false)
     );
+    assert_eq!(item.metadata().capacity(), 0);
 }
 
 #[test]
@@ -371,7 +372,7 @@ fn case_union_and_values_use_the_same_authored_source_domains() {
         "VALUES (parse_json('{}')),(NULL)",
     ] {
         assert_eq!(
-            analyze(sql).output_columns[0].value_type.logical_type,
+            analyze(sql).output_columns[0].value_type.logical_type(),
             ValueLogicalType::Json,
             "{sql}"
         );
@@ -460,8 +461,14 @@ fn round_and_truncate_decimal_result_is_the_exact_selected_binding() {
             let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
                 panic!("expected the actual selected decimal call: {sql}");
             };
-            assert_eq!(args[0].value_type.data_type, DataType::Decimal128(18, 6));
-            assert_eq!(args[0].value_type.logical_type, ValueLogicalType::Physical);
+            assert_eq!(
+                args[0].value_type.data_type().clone(),
+                DataType::Decimal128(18, 6)
+            );
+            assert_eq!(
+                args[0].value_type.logical_type(),
+                ValueLogicalType::Physical
+            );
             if digits == Some("digits") {
                 assert!(matches!(args[1].kind, ExprKind::ColumnRef { .. }));
             }
@@ -518,11 +525,11 @@ impl ScalePreservingRoundResolver {
             work.step()?;
             if request.logical_argument_count != 2
                 || request.expected_result_type.is_some()
-                || source.logical_type != ValueLogicalType::Physical
-                || source.data_type != DataType::Decimal128(18, 6)
-                || digits.logical_type != ValueLogicalType::Physical
+                || source.logical_type() != ValueLogicalType::Physical
+                || *source.data_type() != DataType::Decimal128(18, 6)
+                || digits.logical_type() != ValueLogicalType::Physical
                 || !matches!(
-                    digits.data_type,
+                    digits.data_type(),
                     DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
                 )
             {
@@ -532,11 +539,13 @@ impl ScalePreservingRoundResolver {
             Ok(FunctionBindingSelection {
                 overload: FunctionOverloadId::try_new("test.scalar/scale_preserving_round/0/v1")
                     .unwrap(),
-                argument_types: vec![
-                    FunctionArgumentType::Value(source.clone()),
-                    FunctionArgumentType::Value(digits.clone()),
-                ]
-                .into_boxed_slice(),
+                argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    vec![
+                        FunctionArgumentType::Value(source.clone()),
+                        FunctionArgumentType::Value(digits.clone()),
+                    ]
+                    .into_boxed_slice(),
+                ),
                 result_type: FunctionResultType::Scalar(FunctionValueType::new(
                     DataType::Decimal128(38, 6),
                     true,
@@ -717,7 +726,7 @@ fn explicit_logical_casts_use_exact_selected_conversion_bindings() {
     ] {
         let expression = projection(sql);
         assert_selected_conversion(&expression, suffix);
-        assert_eq!(expression.value_type.logical_type, logical);
+        assert_eq!(expression.value_type.logical_type(), logical);
     }
     assert!(matches!(
         projection("SELECT CAST(j AS JSON) FROM source").kind,
@@ -750,15 +759,15 @@ fn only_literal_null_is_declared_without_running_its_source() {
         literal.kind,
         ExprKind::Literal(crate::analysis::LiteralValue::Null)
     ));
-    assert_eq!(literal.value_type.logical_type, ValueLogicalType::Json);
-    assert!(literal.value_type.nullable);
+    assert_eq!(literal.value_type.logical_type(), ValueLogicalType::Json);
+    assert!(literal.value_type.nullable());
     let expression = projection("SELECT CAST(element_at([], 1) AS JSON)");
     assert_selected_conversion(&expression, "null_to_typed_nullable/v1");
     let ExprKind::FunctionCall { args, .. } = expression.kind else {
         panic!("expected evaluated NULL lift");
     };
     assert!(matches!(args[0].kind, ExprKind::FunctionCall { .. }));
-    assert_eq!(args[0].value_type.data_type, DataType::Null);
+    assert_eq!(args[0].value_type.data_type().clone(), DataType::Null);
 }
 
 #[test]
@@ -854,7 +863,10 @@ fn selected_scalar_text_argument_converts_source_json_before_rebinding() {
             novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID
         );
         assert_selected_conversion(&args[0], "json_text_same_structure/v1");
-        assert_eq!(args[0].value_type.logical_type, ValueLogicalType::Physical);
+        assert_eq!(
+            args[0].value_type.logical_type(),
+            ValueLogicalType::Physical
+        );
     }
 }
 
@@ -876,26 +888,42 @@ fn nested_json_conversion_preserves_source_facts_before_same_domain_cast() {
         novarocks_type_contract::DecimalOverflowPolicy::ReportError
     );
     assert_selected_conversion(expr, "json_text_same_structure/v1");
-    let DataType::List(item) = &expr.value_type.data_type else {
+    let DataType::List(item) = &expr.value_type.data_type() else {
         panic!("expected exact intermediate list");
     };
-    assert_eq!(item.name(), "source_item");
+    assert_eq!(item.name(), "item");
     assert!(!item.is_nullable());
+    assert_eq!(item.metadata().capacity(), 0);
     assert_eq!(
-        item.metadata().get("provider").map(String::as_str),
+        expr.value_type,
+        crate::test_value_types::string_list(false, false, false),
+    );
+    let source = SourceCatalog
+        .resolve_table_for_analysis(None, "default", "source")
+        .unwrap();
+    let declared = source
+        .catalog
+        .columns
+        .iter()
+        .find(|column| column.name == "ja_meta")
+        .unwrap();
+    let DataType::List(source_item) = &declared.data_type else {
+        panic!("expected original source list");
+    };
+    assert_eq!(source_item.name(), "source_item");
+    assert_eq!(
+        source_item.metadata().get("provider").map(String::as_str),
         Some("retained-source")
     );
-    assert_eq!(
-        novarocks_type_contract::field_logical_type(item),
-        Ok(ValueLogicalType::Physical)
-    );
-    let DataType::List(target) = &expression.value_type.data_type else {
+    let DataType::List(target) = &expression.value_type.data_type() else {
         panic!("expected final list");
     };
     assert!(target.is_nullable());
+    assert_eq!(target.name(), "item");
+    assert_eq!(target.metadata().capacity(), 0);
     assert_eq!(
-        novarocks_type_contract::field_logical_type(target),
-        Ok(ValueLogicalType::Physical)
+        expression.value_type,
+        crate::test_value_types::string_list(true, false, true)
     );
 }
 
@@ -965,8 +993,8 @@ fn function_binding_adapters_preserve_control_at_entry_and_inside_actual_argumen
     else {
         panic!("coalesce must have a scalar result");
     };
-    assert_eq!(result.data_type, DataType::Int64);
-    assert_eq!(result.logical_type, ValueLogicalType::Physical);
+    assert_eq!(result.data_type().clone(), DataType::Int64);
+    assert_eq!(result.logical_type(), ValueLogicalType::Physical);
 }
 
 #[test]

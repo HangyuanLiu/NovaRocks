@@ -154,11 +154,17 @@ impl Fixture {
             id: FunctionId::try_new("fixture/table/exact-owner").unwrap(),
             selected: Arc::new(FunctionBindingSelection {
                 overload: FunctionOverloadId::try_new("fixture/table/exact-relation").unwrap(),
-                argument_types: arguments
-                    .iter()
-                    .map(FunctionArgument::argument_type)
-                    .collect(),
-                result_type: FunctionResultType::Relation(results.into()),
+                argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                    arguments
+                        .iter()
+                        .map(FunctionArgument::argument_type)
+                        .collect::<Box<[_]>>(),
+                ),
+                result_type: FunctionResultType::Relation(
+                    novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                        results.to_vec().into_boxed_slice(),
+                    ),
+                ),
                 aggregate: None,
             }),
             uses: (0..arguments.len())

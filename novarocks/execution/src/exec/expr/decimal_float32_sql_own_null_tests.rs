@@ -77,23 +77,26 @@ fn same_source_case(wide: bool, scale: i8, expected_null_values: bool) {
         before.plan().result_port().unwrap().fields.as_ref()
     );
     assert_eq!(original.fields().len(), 1);
-    assert_eq!(original.fields()[0].ty.data_type, DataType::Float32);
+    assert_eq!(
+        original.fields()[0].ty.data_type().clone(),
+        DataType::Float32
+    );
     // Explicit SQL CAST is originally nullable=true, even from a non-NULL column.
     // Do not manufacture a false public obligation for this actual source shape.
-    assert!(original.fields()[0].ty.nullable);
-    assert!(computed.fields[0].ty.nullable);
+    assert!(original.fields()[0].ty.nullable());
+    assert!(computed.fields[0].ty.nullable());
     assert_eq!(computed.output, original.original_port().output);
     let mut casts = 0;
     for fragment in source.plan().fragments().values() {
         for (_, node) in fragment.expressions().iter() {
             if let ExprKind::Cast { expr, target, .. } = &node.kind {
                 let operand = fragment.expressions().get(*expr).unwrap();
-                if operand.ty.data_type == dtype && target == &DataType::Float32 {
+                if *operand.ty.data_type() == dtype && target == &DataType::Float32 {
                     casts += 1;
-                    assert!(!operand.ty.nullable);
-                    assert!(node.ty.nullable);
+                    assert!(!operand.ty.nullable());
+                    assert!(node.ty.nullable());
                     // Cast target is a DataType, not a second root-nullability declaration.
-                    assert_eq!(&node.ty.data_type, target);
+                    assert_eq!(&node.ty.data_type().clone(), target);
                 }
             }
         }
@@ -201,7 +204,7 @@ fn decimal_float32_sql_explicit_cast_actual_decimal256_literal_and_unary_frame_p
                 ));
             }
             for (_, expression) in fragment.expressions().iter() {
-                if matches!(expression.ty.data_type, DataType::Decimal256(p, s) if p > 38 && s == 1)
+                if matches!(expression.ty.data_type(), DataType::Decimal256(p, s) if *p > 38 && *s == 1)
                 {
                     actual_wide += 1;
                 }
@@ -212,8 +215,11 @@ fn decimal_float32_sql_explicit_cast_actual_decimal256_literal_and_unary_frame_p
             "the actual SQL literal author must retain Decimal256"
         );
         let original = source.original_public_result_declaration().unwrap();
-        assert_eq!(original.fields()[0].ty.data_type, DataType::Float32);
-        assert!(original.fields()[0].ty.nullable);
+        assert_eq!(
+            original.fields()[0].ty.data_type().clone(),
+            DataType::Float32
+        );
+        assert!(original.fields()[0].ty.nullable());
         let lowered = programs(&source);
         // Borrow actual compiled root bindings. Project is preferred when the
         // original optimizer retained it; a dynamic Values cell has the same

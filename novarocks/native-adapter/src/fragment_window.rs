@@ -20,18 +20,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Fields};
+use arrow::datatypes::DataType;
 
 use crate::fragment_aggregate::decode_resolved_aggregate_signature;
 use crate::fragment_decode_context::NativePlanDecodeContext;
 use crate::fragment_error::NativeFragmentDecodeError;
-use crate::fragment_expression::decode_expr_for_slot_layout;
-use crate::fragment_layout::decode_fragment_output_layout;
+use crate::fragment_expression::decode_expr_for_slot_layout_with_types;
+
 use crate::fragment_plan_node::NativeLoweredPlanNode as DecodedNode;
 use crate::fragment_plan_node::lower_sort_items_for_layout;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use novarocks_execution::exec::expr::{ExprArena, ExprNode};
+use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::analytic::{
     AnalyticNode, AnalyticOutputColumn, WindowAggregateBinding, WindowBoundary, WindowFrame,
     WindowFunctionKind, WindowFunctionSpec, WindowType,
@@ -47,7 +47,7 @@ use novarocks_types::SlotId;
     clippy::too_many_arguments,
     reason = "The frozen native boundary keeps independently validated inputs explicit."
 )]
-pub fn lower_window_node(
+pub(crate) fn lower_window_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
     window: &plan::WindowNode,
@@ -56,6 +56,8 @@ pub fn lower_window_node(
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let child = children.pop().expect("child");
     if window.window_exprs.is_empty() {
@@ -78,7 +80,7 @@ pub fn lower_window_node(
             "WindowNode output_columns missing",
         ));
     }
-    let output_layout = decode_fragment_output_layout(output_columns, output_columns_path)?;
+    let output_layout = type_decoder.output_layout(output_columns, output_columns_path)?;
     let final_layout = Layout::for_slots(output_layout.slot_ids().iter().copied());
     let final_output_schema = output_layout.chunk_schema();
 
@@ -110,6 +112,7 @@ pub fn lower_window_node(
                 path.clone().field("window_exprs").index(first_idx),
                 current,
                 arena,
+                type_decoder,
             )?;
             next_node_id = next_node_id.checked_add(1).ok_or_else(|| {
                 NativeFragmentDecodeError::out_of_range(
@@ -130,6 +133,7 @@ pub fn lower_window_node(
                 window,
                 &final_output_schema,
                 path.clone(),
+                type_decoder,
             )?
         };
 
@@ -138,7 +142,7 @@ pub fn lower_window_node(
             .iter()
             .enumerate()
             .map(|(idx, expr)| {
-                decode_expr_for_slot_layout(
+                decode_expr_for_slot_layout_with_types(
                     expr,
                     path.clone()
                         .field("window_exprs")
@@ -147,6 +151,7 @@ pub fn lower_window_node(
                         .index(idx),
                     arena,
                     &current.layout,
+                    type_decoder,
                 )
             })
             .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
@@ -167,7 +172,13 @@ pub fn lower_window_node(
                         format!("WindowNode group {group_idx} order_by[{idx}] expr missing"),
                     )
                 })?;
-                decode_expr_for_slot_layout(expr, item_path.field("expr"), arena, &current.layout)
+                decode_expr_for_slot_layout_with_types(
+                    expr,
+                    item_path.field("expr"),
+                    arena,
+                    &current.layout,
+                    type_decoder,
+                )
             })
             .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
         let frame = first
@@ -200,6 +211,7 @@ pub fn lower_window_node(
                 arena,
                 &current.layout,
                 ctx,
+                type_decoder,
             )?);
         }
 
@@ -266,14 +278,17 @@ fn sort_window_group_input(
     path: FieldPath,
     input: DecodedNode,
     arena: &mut ExprArena,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let mut order_by = Vec::with_capacity(first.partition_by.len() + first.order_by.len());
     for (idx, expr) in first.partition_by.iter().enumerate() {
-        let expr = decode_expr_for_slot_layout(
+        let expr = decode_expr_for_slot_layout_with_types(
             expr,
             path.clone().field("partition_by").index(idx),
             arena,
             &input.layout,
+            type_decoder,
         )?;
         order_by.push(SortExpression {
             expr,
@@ -287,6 +302,7 @@ fn sort_window_group_input(
         path.field("order_by"),
         arena,
         &input.layout,
+        type_decoder,
     )?);
 
     Ok(DecodedNode {
@@ -331,6 +347,8 @@ fn intermediate_window_output(
     window: &plan::WindowNode,
     final_output_schema: &ChunkSchema,
     path: FieldPath,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<(Layout, ChunkSchemaRef), NativeFragmentDecodeError> {
     let mut slot_ids = current.layout.order().to_vec();
     let mut slots = Vec::with_capacity(slot_ids.len() + group_indices.len());
@@ -355,6 +373,7 @@ fn intermediate_window_output(
             expr,
             final_output_schema,
             path.clone().field("window_exprs").index(*expr_idx),
+            type_decoder,
         )?);
     }
 
@@ -371,6 +390,8 @@ fn window_expr_slot_schema(
     expr: &plan::WindowExpr,
     final_output_schema: &ChunkSchema,
     path: FieldPath,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ChunkSlotSchema, NativeFragmentDecodeError> {
     let slot_id = SlotId::new(expr.output_column_id);
     if let Some(slot) = final_output_schema.slot(slot_id) {
@@ -383,14 +404,22 @@ fn window_expr_slot_schema(
             format!("window function {} result_type missing", expr.name),
         )
     })?;
-    let data_type = NativeFragmentDecodeError::map_invalid(
-        path.clone().field("result_type"),
-        novarocks_plan_codec::native_type::decode_type(type_desc),
-    )?;
-    let field = Field::new(&expr.output_name, data_type, true);
-    NativeFragmentDecodeError::map_invalid(
+    let source = type_decoder
+        .value_type(type_desc, path.clone().field("result_type"))?
+        .ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone().field("result_type"),
+                "Window output requires its complete original declaration",
+            )
+        })?;
+    let projected = type_decoder
+        .synthetic_nullable_binding(&source, true)?
+        .expect("complete native synthetic field");
+    type_decoder.synthetic_binding_slot(
+        &projected,
+        &expr.output_name,
+        slot_id,
         path.field("output_column_id"),
-        ChunkSchema::slot_schema_from_arrow_field(slot_id, &field),
     )
 }
 
@@ -430,6 +459,8 @@ fn lower_window_function(
     arena: &mut ExprArena,
     input_layout: &Layout,
     ctx: &NativePlanDecodeContext,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<WindowFunctionSpec, NativeFragmentDecodeError> {
     let name = expr.name.to_ascii_lowercase();
     let function_order = expr
@@ -447,20 +478,18 @@ fn lower_window_function(
             format!("window function {} result_type missing", expr.name),
         )
     })?;
-    let return_type = NativeFragmentDecodeError::map_invalid(
-        path.clone().field("result_type"),
-        novarocks_plan_codec::native_type::decode_type(return_type),
-    )?;
+    let return_type = type_decoder.data_type(return_type, path.clone().field("result_type"))?;
     let logical_args = expr
         .args
         .iter()
         .enumerate()
         .map(|(idx, arg)| {
-            decode_expr_for_slot_layout(
+            decode_expr_for_slot_layout_with_types(
                 arg,
                 path.clone().field("args").index(idx),
                 arena,
                 input_layout,
+                type_decoder,
             )
         })
         .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
@@ -482,16 +511,52 @@ fn lower_window_function(
                     format!("window aggregate {name} function_order_by[{idx}] expr missing"),
                 )
             })?;
-            decode_expr_for_slot_layout(order_expr, item_path.field("expr"), arena, input_layout)
+            decode_expr_for_slot_layout_with_types(
+                order_expr,
+                item_path.field("expr"),
+                arena,
+                input_layout,
+                type_decoder,
+            )
         })
         .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
     let aggregate_binding = if is_aggregate_window_kind(&kind) {
         let executable_name = mangle_distinct_aggregate_name(&name, expr.distinct);
-        let planned = decode_resolved_aggregate_signature(
+        let frozen = type_decoder.frozen_aggregate(
             expr.aggregate_binding.as_ref(),
-            &executable_name,
+            ctx,
+            crate::fragment_original_requests::OriginalOccurrence::Window {
+                expression: expr.original_expression_definition_id,
+            },
             path.clone().field("aggregate_binding"),
         )?;
+        type_decoder.validate_actual_aggregate_arguments(
+            expr.aggregate_binding
+                .as_ref()
+                .expect("checked aggregate signature"),
+            expr.args.iter().chain(
+                expr.function_order_by
+                    .iter()
+                    .filter_map(|key| key.expr.as_ref()),
+            ),
+            path.clone(),
+        )?;
+        let planned = if let Some(frozen) = frozen.as_deref() {
+            type_decoder.validate_aggregate_name(
+                frozen,
+                ctx,
+                &executable_name,
+                path.clone().field("name"),
+            )?;
+            type_decoder.aggregate_projection(frozen)?
+        } else {
+            decode_resolved_aggregate_signature(
+                expr.aggregate_binding.as_ref(),
+                &executable_name,
+                path.clone().field("aggregate_binding"),
+                type_decoder,
+            )?
+        };
         let logical_argument_types = logical_args
             .iter()
             .map(|arg| {
@@ -529,26 +594,29 @@ fn lower_window_function(
                 format!("window aggregate {name} requires the process engine function catalog"),
             )
         })?;
-        let selected = function_catalog
-            .resolve_aggregate_update_trusted(
-                &executable_name,
-                &logical_argument_types,
-                &update_argument_types,
-            )
-            .map_err(|error| {
-                NativeFragmentDecodeError::invalid_value(
-                    path.clone().field("aggregate_binding"),
-                    format!("window aggregate {name} resolution: {error}"),
+        if frozen.is_none() {
+            let selected = function_catalog
+                .resolve_aggregate_update_trusted(
+                    &executable_name,
+                    &logical_argument_types,
+                    &update_argument_types,
                 )
-            })?;
-        if selected != planned {
-            return Err(NativeFragmentDecodeError::invalid_value(
-                path.clone().field("aggregate_binding"),
-                format!(
-                    "window aggregate {name} resolved signature drift: planned={planned:?} catalog={selected:?}"
-                ),
-            ));
+                .map_err(|error| {
+                    NativeFragmentDecodeError::invalid_value(
+                        path.clone().field("aggregate_binding"),
+                        format!("window aggregate {name} resolution: {error}"),
+                    )
+                })?;
+            if selected != planned {
+                return Err(NativeFragmentDecodeError::invalid_value(
+                    path.clone().field("aggregate_binding"),
+                    format!(
+                        "window aggregate {name} resolved signature drift: planned={planned:?} catalog={selected:?}"
+                    ),
+                ));
+            }
         }
+        let selected = planned;
         if return_type != selected.output_type {
             return Err(NativeFragmentDecodeError::invalid_value(
                 path.clone().field("result_type"),
@@ -558,7 +626,45 @@ fn lower_window_function(
                 ),
             ));
         }
+        if let Some(frozen) = frozen.as_deref() {
+            let novarocks_functions::FunctionResultType::Scalar(expected) =
+                &frozen.selected().result_type
+            else {
+                unreachable!("checked frozen scalar result");
+            };
+            type_decoder.require_descriptor_binding(
+                expr.result_type.as_ref().expect("checked result type"),
+                expected,
+                path.clone().field("result_type"),
+            )?;
+            for (index, actual) in logical_args
+                .iter()
+                .chain(function_order_args.iter())
+                .enumerate()
+            {
+                let actual = arena.value_type(*actual).ok_or_else(|| {
+                    NativeFragmentDecodeError::missing(
+                        path.clone().field("args").index(index),
+                        "window argument has no complete binding",
+                    )
+                })?;
+                let novarocks_functions::FunctionArgumentType::Value(expected) =
+                    &frozen.selected().argument_types[index]
+                else {
+                    return Err(NativeFragmentDecodeError::unsupported(
+                        path.clone(),
+                        "window aggregate cannot consume a lambda",
+                    ));
+                };
+                type_decoder.require_argument_binding(
+                    actual,
+                    expected,
+                    path.clone().field("args").index(index),
+                )?;
+            }
+        }
         Some(WindowAggregateBinding {
+            frozen,
             function_name: executable_name,
             resolved: selected,
         })
@@ -578,10 +684,8 @@ fn lower_window_function(
         kind,
         WindowFunctionKind::ArrayAgg { .. } | WindowFunctionKind::MaxBy | WindowFunctionKind::MinBy
     ) {
-        args = NativeFragmentDecodeError::map_invalid(
-            path.clone().field("args"),
-            pack_window_function_inputs(args, arena),
-        )?;
+        args =
+            type_decoder.packed_struct_expression(args, arena, true, path.clone().field("args"))?;
     }
     NativeFragmentDecodeError::map_invalid(
         path.clone(),
@@ -695,28 +799,6 @@ fn lower_window_frame(
         end,
         window_type,
     })
-}
-
-fn pack_window_function_inputs(
-    args: Vec<novarocks_execution::exec::expr::ExprId>,
-    arena: &mut ExprArena,
-) -> Result<Vec<novarocks_execution::exec::expr::ExprId>, String> {
-    if args.len() <= 1 {
-        return Ok(args);
-    }
-    let mut fields = Vec::with_capacity(args.len());
-    for (idx, expr_id) in args.iter().enumerate() {
-        let data_type = arena
-            .data_type(*expr_id)
-            .ok_or_else(|| "window function input type missing".to_string())?;
-        if matches!(data_type, DataType::Null) {
-            return Err("window function input type is null".to_string());
-        }
-        fields.push(Field::new(format!("f{idx}"), data_type.clone(), true));
-    }
-    let struct_type = DataType::Struct(Fields::from(fields));
-    let struct_expr = arena.push_typed(ExprNode::StructExpr { fields: args }, struct_type);
-    Ok(vec![struct_expr])
 }
 
 fn validate_window_function_signature(

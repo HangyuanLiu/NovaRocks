@@ -28,6 +28,18 @@ use novarocks_type_contract::{
     CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
 };
 use std::sync::Mutex;
+
+fn replace_argument_type(
+    types: &mut novarocks_type_contract::FunctionArgumentTypes,
+    index: usize,
+    replacement: FunctionArgumentType,
+) {
+    let mut revised = types.to_vec();
+    revised[index] = replacement;
+    *types =
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(revised.into_boxed_slice());
+}
+
 #[test]
 fn e08s1_time_static_profile_actual_source_and_all_six_nullable_profiles_use_same_original_author()
 {
@@ -74,18 +86,25 @@ fn e08s1_time_static_profile_refuses_stale_full_type_nominal_arity_and_result_wi
                     DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 ] {
                     let mut bad = binding.clone();
-                    bad.selected.argument_types[index] =
-                        FunctionArgumentType::Value(FunctionValueType::new(carrier, true));
+                    replace_argument_type(
+                        &mut bad.selected.argument_types,
+                        index,
+                        FunctionArgumentType::Value(FunctionValueType::new(carrier, true)),
+                    );
                     stale.push(bad);
                 }
                 let mut bad = binding.clone();
-                bad.selected.argument_types[index] = FunctionArgumentType::Value(
-                    FunctionValueType::try_with_logical_type(
-                        DataType::Utf8,
-                        true,
-                        ValueLogicalType::Json,
-                    )
-                    .unwrap(),
+                replace_argument_type(
+                    &mut bad.selected.argument_types,
+                    index,
+                    FunctionArgumentType::Value(
+                        FunctionValueType::try_with_logical_type(
+                            DataType::Utf8,
+                            true,
+                            ValueLogicalType::Json,
+                        )
+                        .unwrap(),
+                    ),
                 );
                 stale.push(bad);
             }
@@ -93,29 +112,35 @@ fn e08s1_time_static_profile_refuses_stale_full_type_nominal_arity_and_result_wi
             let FunctionResultType::Scalar(out) = &mut bad.selected.result_type else {
                 unreachable!()
             };
-            out.nullable = false;
+            *out = out
+                .with_nullable(false)
+                .expect("valid test root nullability");
             stale.push(bad);
             let mut bad = binding.clone();
             let FunctionResultType::Scalar(out) = &mut bad.selected.result_type else {
                 unreachable!()
             };
-            out.data_type = DataType::Binary;
+            *out = FunctionValueType::new(DataType::Binary, out.nullable());
             stale.push(bad);
             let mut bad = binding.clone();
-            bad.selected.result_type =
-                FunctionResultType::Relation(Box::new([FunctionValueType::new(
-                    DataType::Utf8,
-                    true,
-                )]));
+            bad.selected.result_type = FunctionResultType::Relation(
+                novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(Box::new([
+                    FunctionValueType::new(DataType::Utf8, true),
+                ])),
+            );
             stale.push(bad);
             let mut bad = binding.clone();
             bad.logical_argument_count = 0;
-            bad.selected.argument_types = Box::new([]);
+            bad.selected.argument_types =
+                novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::new([]));
             stale.push(bad);
             let mut bad = binding.clone();
             let mut t = bad.selected.argument_types.to_vec();
             t.push(t[0].clone());
-            bad.selected.argument_types = t.into_boxed_slice();
+            bad.selected.argument_types =
+                novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                    t.into_boxed_slice(),
+                );
             bad.logical_argument_count += 1;
             stale.push(bad);
             for bad in stale {

@@ -45,7 +45,7 @@ fn dtype<'a>(
             "temporal source definition is absent",
         ))?
         .ty
-        .data_type)
+        .data_type())
 }
 fn cast_kind(
     arena: &ExprArena,
@@ -262,8 +262,8 @@ pub fn regexp_count_pattern_source_observed(
             "regexp_count requires checked native-v1 source; unchecked Literal is not emitted",
         ));
     }
-    if pattern.ty.logical_type != novarocks_type_contract::ValueLogicalType::Physical
-        || pattern.ty.data_type != DataType::Utf8
+    if pattern.ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
+        || *pattern.ty.data_type() != DataType::Utf8
     {
         return Err(TemporalSourceProjectionError::Invalid(
             "regexp_count emitted pattern is not exact Physical Utf8",
@@ -300,8 +300,8 @@ pub fn to_base64_byte_source_observed(
             "to_base64 requires checked native-v1 source; unchecked Literal is not emitted",
         ));
     }
-    if child.ty.logical_type != novarocks_type_contract::ValueLogicalType::Physical
-        || child.ty.data_type != DataType::Utf8
+    if child.ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
+        || *child.ty.data_type() != DataType::Utf8
     {
         return Err(TemporalSourceProjectionError::Invalid(
             "to_base64 emitted source is not exact Physical Utf8",

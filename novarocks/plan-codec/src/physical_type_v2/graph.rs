@@ -168,7 +168,10 @@ impl<'source> Index<'source> {
         source_retained_bytes: usize,
     ) -> Result<IndexProjectionFacts, E> {
         let vertices = numeric_add(table.carriers.len(), table.fields.len())?;
-        let definitions = numeric_add(vertices, table.value_types.len())?;
+        let definitions = numeric_add(
+            numeric_add(vertices, table.value_types.len())?,
+            table.logical_types.len(),
+        )?;
         if definitions > limits.max_definitions {
             return Err(E::InvalidShape("type projection exceeds caller limit"));
         }
@@ -214,6 +217,26 @@ impl<'source> Index<'source> {
         admit: &mut impl FnMut(&IndexProjectionFacts) -> Result<(), CompileControlError>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, E> {
+        Self::prepare_observed_with_host::<std::convert::Infallible>(
+            table,
+            limits,
+            source_retained_bytes,
+            &mut |facts| admit(facts).map_err(Into::into),
+            work,
+        )
+        .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+    }
+
+    pub(super) fn prepare_observed_with_host<H>(
+        table: &'source wire::TypeTable,
+        limits: TypeProjectionLimits,
+        source_retained_bytes: usize,
+        admit: &mut impl FnMut(
+            &IndexProjectionFacts,
+        )
+            -> Result<(), crate::host_projection_v2::ProjectionFailure<E, H>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, crate::host_projection_v2::ProjectionFailure<E, H>> {
         let facts = Self::projection_facts(table, limits, source_retained_bytes)?;
         // All requests and fixed-header work are known before the first
         // callback or BTree insertion. No second wallet or source is created.
@@ -229,11 +252,15 @@ impl<'source> Index<'source> {
                 table.value_types.capacity(),
                 size_of::<wire::ValueTypeDefinition>(),
             )?,
+            numeric_mul(
+                table.logical_types.capacity(),
+                size_of::<novarocks_proto_models::value_type::LogicalTypeDefinition>(),
+            )?,
         ] {
             floor = numeric_add(floor, backing)?;
         }
         if floor > source_retained_bytes {
-            return Err(E::InvalidShape("type graph source invoice is understated"));
+            return Err(E::InvalidShape("type graph source invoice is understated").into());
         }
         work.flush()?;
         let mut index = Self {
@@ -247,7 +274,7 @@ impl<'source> Index<'source> {
             work.step()?;
             work.flush()?;
             if duplicate {
-                return Err(E::InvalidShape("duplicate carrier type identity"));
+                return Err(E::InvalidShape("duplicate carrier type identity").into());
             }
             carrier
                 .kind
@@ -260,7 +287,7 @@ impl<'source> Index<'source> {
             work.step()?;
             work.flush()?;
             if duplicate {
-                return Err(E::InvalidShape("duplicate field identity"));
+                return Err(E::InvalidShape("duplicate field identity").into());
             }
         }
         Ok(index)

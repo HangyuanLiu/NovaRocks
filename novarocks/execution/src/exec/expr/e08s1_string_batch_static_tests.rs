@@ -51,6 +51,18 @@ fn full_binding(name: &str, mask: usize) -> ResolvedFunctionBinding {
         .resolve_scalar_binding(name, &arguments, &SqlCompileControl::unbounded())
         .unwrap()
 }
+
+fn replace_argument_type(
+    types: &mut novarocks_type_contract::FunctionArgumentTypes,
+    index: usize,
+    replacement: FunctionArgumentType,
+) {
+    let mut revised = types.to_vec();
+    revised[index] = replacement;
+    *types =
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(revised.into_boxed_slice());
+}
+
 #[test]
 fn e08s1_string_batch_static_full_families_nullable_axes_and_original_dynamic_caps_stay_delayed() {
     let original = builtin_sql_function_catalog().snapshot();
@@ -92,24 +104,34 @@ fn e08s1_string_batch_static_exact_arity_nominal_result_and_nullability_refusal(
         let mut wrong = Vec::new();
         for index in 0..binding.selected.argument_types.len() {
             let mut bad = binding.clone();
-            bad.selected.argument_types[index] =
-                FunctionArgumentType::Value(FunctionValueType::new(DataType::Binary, true));
+            replace_argument_type(
+                &mut bad.selected.argument_types,
+                index,
+                FunctionArgumentType::Value(FunctionValueType::new(DataType::Binary, true)),
+            );
             wrong.push(bad);
-            if matches!(&binding.selected.argument_types[index],FunctionArgumentType::Value(v) if v.data_type==DataType::Utf8)
+            if matches!(&binding.selected.argument_types[index],FunctionArgumentType::Value(v) if *v.data_type()==DataType::Utf8)
             {
                 let mut bad = binding.clone();
-                bad.selected.argument_types[index] = FunctionArgumentType::Value(
-                    FunctionValueType::try_with_logical_type(
-                        DataType::Utf8,
-                        true,
-                        ValueLogicalType::Json,
-                    )
-                    .unwrap(),
+                replace_argument_type(
+                    &mut bad.selected.argument_types,
+                    index,
+                    FunctionArgumentType::Value(
+                        FunctionValueType::try_with_logical_type(
+                            DataType::Utf8,
+                            true,
+                            ValueLogicalType::Json,
+                        )
+                        .unwrap(),
+                    ),
                 );
                 wrong.push(bad);
                 let mut bad = binding.clone();
-                bad.selected.argument_types[index] =
-                    FunctionArgumentType::Value(FunctionValueType::new(DataType::LargeUtf8, true));
+                replace_argument_type(
+                    &mut bad.selected.argument_types,
+                    index,
+                    FunctionArgumentType::Value(FunctionValueType::new(DataType::LargeUtf8, true)),
+                );
                 wrong.push(bad);
             }
         }
@@ -117,26 +139,33 @@ fn e08s1_string_batch_static_exact_arity_nominal_result_and_nullability_refusal(
         let FunctionResultType::Scalar(v) = &mut bad.selected.result_type else {
             unreachable!()
         };
-        v.nullable = !v.nullable;
+        *v = v
+            .with_nullable(!v.nullable())
+            .expect("valid test root nullability");
         wrong.push(bad);
         let mut bad = binding.clone();
         let FunctionResultType::Scalar(v) = &mut bad.selected.result_type else {
             unreachable!()
         };
-        v.data_type = DataType::Binary;
+        *v = FunctionValueType::new(DataType::Binary, v.nullable());
         wrong.push(bad);
         let mut bad = binding.clone();
-        bad.selected.result_type =
-            FunctionResultType::Relation(Box::new([FunctionValueType::new(DataType::Utf8, true)]));
+        bad.selected.result_type = FunctionResultType::Relation(
+            novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(Box::new([
+                FunctionValueType::new(DataType::Utf8, true),
+            ])),
+        );
         wrong.push(bad);
         let mut bad = binding.clone();
-        bad.selected.argument_types = Box::new([]);
+        bad.selected.argument_types =
+            novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::new([]));
         bad.logical_argument_count = 0;
         wrong.push(bad);
         let mut bad = binding.clone();
         let mut t = bad.selected.argument_types.to_vec();
         t.push(t[0].clone());
-        bad.selected.argument_types = t.into_boxed_slice();
+        bad.selected.argument_types =
+            novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(t.into_boxed_slice());
         bad.logical_argument_count += 1;
         wrong.push(bad);
         for stale in wrong {

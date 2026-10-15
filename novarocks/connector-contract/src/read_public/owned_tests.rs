@@ -178,14 +178,17 @@ fn borrowed_read_preserves_original_logical_and_structural_error_categories() {
     )
     .unwrap();
     assert_eq!(actual.logical_types(), logical);
-    assert!(actual.matches_value_type(
-        0,
-        &FunctionValueType {
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: ValueLogicalType::Json,
-        }
-    ));
+    assert!(
+        actual.matches_value_type(
+            0,
+            &FunctionValueType::try_from_legacy_declared_projection(
+                DataType::Utf8,
+                true,
+                ValueLogicalType::Json
+            )
+            .expect("valid temporary legacy value projection")
+        )
+    );
 }
 #[test]
 fn borrowed_read_primitive_requests_match_independent_layout_inventory() {

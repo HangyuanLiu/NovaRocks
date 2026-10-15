@@ -130,22 +130,34 @@ fn sql_presence_candidate_snapshot_keeps_exact_bindings_and_table_owner_separate
     let original_binding = original
         .resolve_scalar_binding("reverse", &args, &control)
         .unwrap();
-    assert_eq!(original_binding.admitted_execution_abi, None);
-    // Scoped admission adds its exact ABI without replacing original facts.
+    assert_eq!(
+        original_binding.admitted_execution_abi, None,
+        "original declaration is not admission"
+    );
+    let actual_abi = original
+        .pure_overload_declaration_observed(
+            &original_binding.function_id,
+            original_binding.kind,
+            &original_binding.selected.overload,
+            &control,
+        )
+        .unwrap()
+        .implementation()
+        .abi;
+    // Scoped admission adds the real installed ABI without replacing source facts.
     let mut expected = original_binding.clone();
-    expected.admitted_execution_abi = Some(novarocks_functions::PureKernelAbi::ScalarV1);
-    assert_eq!(
-        scoped
+    expected.admitted_execution_abi = Some(actual_abi);
+    for scope in [scoped.as_ref(), again.as_ref()] {
+        let mut admitted = scope
             .resolve_scalar_binding("reverse", &args, &control)
-            .unwrap(),
-        expected
-    );
-    assert_eq!(
-        again
-            .resolve_scalar_binding("reverse", &args, &control)
-            .unwrap(),
-        expected
-    );
+            .unwrap();
+        assert_eq!(admitted.admitted_execution_abi, Some(actual_abi));
+        assert_eq!(admitted, expected);
+        // Only the independently checked admission refinement differs. Every
+        // original function, selected signature, semantics and source fact stays.
+        admitted.admitted_execution_abi = None;
+        assert_eq!(admitted, original_binding);
+    }
     let hour = [argument(DataType::Int64)];
     let bound = original
         .resolve_scalar_binding("hour_from_unixtime", &hour, &control)
@@ -164,20 +176,26 @@ fn sql_presence_candidate_snapshot_keeps_exact_bindings_and_table_owner_separate
         .unwrap();
     assert_eq!(table.kind, FunctionKind::Table);
     assert_eq!(table.admitted_execution_abi, None);
-    let mut expected_table = table.clone();
-    expected_table.admitted_execution_abi = Some(novarocks_functions::PureKernelAbi::TableV1);
-    assert_eq!(
-        scoped
+    let actual_table_abi = original
+        .pure_overload_declaration_observed(
+            &table.function_id,
+            table.kind,
+            &table.selected.overload,
+            &control,
+        )
+        .unwrap()
+        .implementation()
+        .abi;
+    for scope in [scoped.as_ref(), again.as_ref()] {
+        let mut admitted = scope
             .resolve_table_binding("unnest", &bounds, &control)
-            .unwrap(),
-        expected_table
-    );
-    assert_eq!(
-        again
-            .resolve_table_binding("unnest", &bounds, &control)
-            .unwrap(),
-        expected_table
-    );
+            .unwrap();
+        assert_eq!(admitted.admitted_execution_abi, Some(actual_table_abi));
+        // The actual table implementation author establishes the admission
+        // refinement independently; all original complete binding facts agree.
+        admitted.admitted_execution_abi = None;
+        assert_eq!(admitted, table);
+    }
 }
 
 #[test]

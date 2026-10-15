@@ -19,7 +19,7 @@
 
 use arrow::datatypes::DataType;
 
-use super::{decode_expr_at, lower_required_unboxed_child};
+use super::{decode_expr_at_with_types, lower_required_unboxed_child};
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::expr;
@@ -32,6 +32,8 @@ pub(crate) fn lower_case(
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
     data_type: DataType,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, super::NativeExpressionDecodeError> {
     let mut children = Vec::with_capacity(
         usize::from(case_expr.operand.is_some())
@@ -39,11 +41,12 @@ pub(crate) fn lower_case(
             + usize::from(case_expr.else_expr.is_some()),
     );
     if let Some(operand) = &case_expr.operand {
-        children.push(decode_expr_at(
+        children.push(decode_expr_at_with_types(
             operand,
             path.clone().field("operand"),
             arena,
             input_layout,
+            type_decoder,
         )?);
     }
     for (idx, branch) in case_expr.when_then.iter().enumerate() {
@@ -52,20 +55,23 @@ pub(crate) fn lower_case(
             path.clone().field("when_then").index(idx).field("when"),
             arena,
             input_layout,
+            type_decoder,
         )?);
         children.push(lower_required_unboxed_child(
             &branch.then,
             path.clone().field("when_then").index(idx).field("then"),
             arena,
             input_layout,
+            type_decoder,
         )?);
     }
     if let Some(else_expr) = &case_expr.else_expr {
-        children.push(decode_expr_at(
+        children.push(decode_expr_at_with_types(
             else_expr,
             path.field("else_expr"),
             arena,
             input_layout,
+            type_decoder,
         )?);
     }
     Ok(arena.push_typed(

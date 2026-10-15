@@ -150,115 +150,7 @@ fn check(spec: ScalarDiffSpec) {
     assert_eq!(summary.legacy_batch_errors, 0);
     assert_eq!(summary.attributed_row_errors, 0);
 }
-#[test]
-fn pure_differential_round_dynamic_all28_admitted_leaf_value_shapes_unary_binary_slice_null_empty()
-{
-    let digits: ArrayRef = Arc::new(Int64Array::from(vec![
-        Some(0),
-        Some(1),
-        Some(-2),
-        Some(309),
-        Some(-309),
-        Some(4294967296),
-        Some(i64::MAX),
-        None,
-    ]));
-    for policy in [
-        DecimalOverflowPolicy::OutputNull,
-        DecimalOverflowPolicy::ReportError,
-    ] {
-        let sources = leaves()
-            .into_iter()
-            .filter(|ty| arrow::compute::can_cast_types(ty, &DataType::Float64))
-            .collect::<Vec<_>>();
-        assert_eq!(sources.len(), 28);
-        for ty in sources {
-            let source = value(&ty);
-            check(
-                ScalarDiffSpec::new("round")
-                    .column(source.clone())
-                    .decimal_overflow(policy),
-            );
-            // Modest decimal source witnesses avoid an existing, separately pinned failure.
-            let d = if matches!(ty, DataType::Decimal128(_, _)) {
-                Arc::new(Int64Array::from(vec![
-                    Some(0),
-                    Some(1),
-                    Some(-2),
-                    Some(2),
-                    Some(0),
-                    Some(1),
-                    Some(2),
-                    None,
-                ])) as ArrayRef
-            } else {
-                digits.clone()
-            };
-            check(
-                ScalarDiffSpec::new("round")
-                    .column(source.clone())
-                    .column(d.clone())
-                    .decimal_overflow(policy),
-            );
-            check(
-                ScalarDiffSpec::new("round")
-                    .column(source.slice(1, 6))
-                    .column(d.slice(1, 6))
-                    .decimal_overflow(policy),
-            );
-            check(
-                ScalarDiffSpec::new("round")
-                    .column(new_null_array(&ty, 8))
-                    .column(d)
-                    .decimal_overflow(policy),
-            );
-            check(
-                ScalarDiffSpec::new("round")
-                    .column(new_empty_array(&ty))
-                    .decimal_overflow(policy),
-            );
-        }
-    }
-}
-#[test]
-fn pure_differential_round_dynamic_all34_leaf_digits_shapes_columns_and_constant() {
-    let source: ArrayRef = Arc::new(Float64Array::from(vec![
-        Some(1.25),
-        Some(-1.25),
-        Some(-0.0),
-        Some(0.0),
-        Some(2.5),
-        Some(-2.5),
-        Some(3.0),
-        None,
-    ]));
-    for policy in [
-        DecimalOverflowPolicy::OutputNull,
-        DecimalOverflowPolicy::ReportError,
-    ] {
-        for ty in leaves() {
-            let digits = value(&ty);
-            check(
-                ScalarDiffSpec::new("round")
-                    .column(source.clone())
-                    .column(digits.clone())
-                    .decimal_overflow(policy),
-            );
-            check(
-                ScalarDiffSpec::new("round")
-                    .column(source.clone())
-                    .constant_array(digits.slice(3, 1))
-                    .decimal_overflow(policy),
-            );
-            check(
-                ScalarDiffSpec::new("round")
-                    .constant_array(source.slice(1, 1))
-                    .column(digits)
-                    .decimal_overflow(policy),
-            );
-        }
-    }
-}
+
 #[test]
 fn pure_differential_round_dynamic_encoded_cast_paths_original_value_and_digits_sources() {
     let f: ArrayRef = Arc::new(Float64Array::from(vec![
@@ -384,7 +276,166 @@ fn pure_differential_round_exact_dynamic_admission_retains_non_float_temporal_re
 }
 
 #[test]
-fn pure_differential_round_dynamic_all28_by34_admitted_leaf_pair_witnesses() {
+fn pure_differential_round_integer_value_precision_loss_is_original_arrow_float_projection() {
+    let source: ArrayRef = Arc::new(Int64Array::from(vec![
+        Some(i64::MIN),
+        Some(-9007199254740993),
+        Some(9007199254740993),
+        Some(i64::MAX),
+        None,
+    ]));
+    check(ScalarDiffSpec::new("round").column(source.clone()));
+    check(
+        ScalarDiffSpec::new("round")
+            .column(source)
+            .column(Arc::new(Int64Array::from(vec![Some(0); 5]))),
+    );
+}
+
+// Raw owner/profile and prepared-source replacement passed before retirement
+// of the superseded engine-ingress mismatch witnesses.
+fn check_plain_views(spec: ScalarDiffSpec) {
+    let summary = super::assert_scalar_matches_v1_with_plain_views(
+        spec.float_comparison(FloatComparison::Exact)
+            .sparse_selections(7, 0x524f554e44),
+    );
+    assert_eq!(summary.overload.as_str(), "builtin.scalar/round/dynamic-v1");
+    assert_eq!(summary.legacy_batch_errors, 0);
+    assert_eq!(summary.attributed_row_errors, 0);
+}
+
+#[test]
+fn pure_differential_round_dynamic_all28_admitted_leaf_value_shapes_unary_binary_slice_null_empty_prepared_plain_views()
+ {
+    let digits: ArrayRef = Arc::new(Int64Array::from(vec![
+        Some(0),
+        Some(1),
+        Some(-2),
+        Some(309),
+        Some(-309),
+        Some(4294967296),
+        Some(i64::MAX),
+        None,
+    ]));
+    for policy in [
+        DecimalOverflowPolicy::OutputNull,
+        DecimalOverflowPolicy::ReportError,
+    ] {
+        let sources = leaves()
+            .into_iter()
+            .filter(|ty| arrow::compute::can_cast_types(ty, &DataType::Float64))
+            .collect::<Vec<_>>();
+        assert_eq!(sources.len(), 28);
+        for ty in sources {
+            let source = value(&ty);
+            check_plain_views(
+                ScalarDiffSpec::new("round")
+                    .typed_column(FunctionValueType::new(ty.clone(), true), source.clone())
+                    .decimal_overflow(policy),
+            );
+            // Modest decimal source witnesses avoid an existing, separately pinned failure.
+            let d = if matches!(ty, DataType::Decimal128(_, _)) {
+                Arc::new(Int64Array::from(vec![
+                    Some(0),
+                    Some(1),
+                    Some(-2),
+                    Some(2),
+                    Some(0),
+                    Some(1),
+                    Some(2),
+                    None,
+                ])) as ArrayRef
+            } else {
+                digits.clone()
+            };
+            check_plain_views(
+                ScalarDiffSpec::new("round")
+                    .typed_column(FunctionValueType::new(ty.clone(), true), source.clone())
+                    .typed_column(FunctionValueType::new(DataType::Int64, true), d.clone())
+                    .decimal_overflow(policy),
+            );
+            check_plain_views(
+                ScalarDiffSpec::new("round")
+                    .typed_column(FunctionValueType::new(ty.clone(), true), source.slice(1, 6))
+                    .typed_column(FunctionValueType::new(DataType::Int64, true), d.slice(1, 6))
+                    .decimal_overflow(policy),
+            );
+            check_plain_views(
+                ScalarDiffSpec::new("round")
+                    .typed_column(
+                        FunctionValueType::new(ty.clone(), true),
+                        new_null_array(&ty, 8),
+                    )
+                    .typed_column(FunctionValueType::new(DataType::Int64, true), d)
+                    .decimal_overflow(policy),
+            );
+            check_plain_views(
+                ScalarDiffSpec::new("round")
+                    .typed_column(
+                        FunctionValueType::new(ty.clone(), true),
+                        new_empty_array(&ty),
+                    )
+                    .decimal_overflow(policy),
+            );
+        }
+    }
+}
+
+#[test]
+fn pure_differential_round_dynamic_all34_leaf_digits_shapes_columns_and_constant_prepared_plain_views()
+ {
+    let source: ArrayRef = Arc::new(Float64Array::from(vec![
+        Some(1.25),
+        Some(-1.25),
+        Some(-0.0),
+        Some(0.0),
+        Some(2.5),
+        Some(-2.5),
+        Some(3.0),
+        None,
+    ]));
+    for policy in [
+        DecimalOverflowPolicy::OutputNull,
+        DecimalOverflowPolicy::ReportError,
+    ] {
+        for ty in leaves() {
+            let digits = value(&ty);
+            check_plain_views(
+                ScalarDiffSpec::new("round")
+                    .typed_column(
+                        FunctionValueType::new(DataType::Float64, true),
+                        source.clone(),
+                    )
+                    .typed_column(FunctionValueType::new(ty.clone(), true), digits.clone())
+                    .decimal_overflow(policy),
+            );
+            check_plain_views(
+                ScalarDiffSpec::new("round")
+                    .typed_column(
+                        FunctionValueType::new(DataType::Float64, true),
+                        source.clone(),
+                    )
+                    .constant(super::constant(
+                        FunctionValueType::new(ty.clone(), ty == DataType::Null),
+                        digits.slice(3, 1),
+                    ))
+                    .decimal_overflow(policy),
+            );
+            check_plain_views(
+                ScalarDiffSpec::new("round")
+                    .constant(super::constant(
+                        FunctionValueType::new(DataType::Float64, false),
+                        source.slice(1, 1),
+                    ))
+                    .typed_column(FunctionValueType::new(ty.clone(), true), digits)
+                    .decimal_overflow(policy),
+            );
+        }
+    }
+}
+
+#[test]
+fn pure_differential_round_dynamic_all28_by34_admitted_leaf_pair_witnesses_prepared_plain_views() {
     let sources = leaves()
         .into_iter()
         .filter(|ty| arrow::compute::can_cast_types(ty, &DataType::Float64))
@@ -402,8 +453,14 @@ fn pure_differential_round_dynamic_all28_by34_admitted_leaf_pair_witnesses() {
                 // counterexample domain separately exercised, never excluded
                 // from the generic overload's completion assessment.
                 let spec = ScalarDiffSpec::new("round")
-                    .column(value(&source_type))
-                    .column(value(digits_type))
+                    .typed_column(
+                        FunctionValueType::new(source_type.clone(), true),
+                        value(&source_type),
+                    )
+                    .typed_column(
+                        FunctionValueType::new(digits_type.clone(), true),
+                        value(digits_type),
+                    )
                     .decimal_overflow(policy);
                 if matches!(source_type, DataType::Decimal128(_, _))
                     && matches!(
@@ -419,25 +476,9 @@ fn pure_differential_round_dynamic_all28_by34_admitted_leaf_pair_witnesses() {
                         "original required error versus owner policy: {result:?}"
                     );
                 } else {
-                    check(spec);
+                    check_plain_views(spec);
                 }
             }
         }
     }
-}
-#[test]
-fn pure_differential_round_integer_value_precision_loss_is_original_arrow_float_projection() {
-    let source: ArrayRef = Arc::new(Int64Array::from(vec![
-        Some(i64::MIN),
-        Some(-9007199254740993),
-        Some(9007199254740993),
-        Some(i64::MAX),
-        None,
-    ]));
-    check(ScalarDiffSpec::new("round").column(source.clone()));
-    check(
-        ScalarDiffSpec::new("round")
-            .column(source)
-            .column(Arc::new(Int64Array::from(vec![Some(0); 5]))),
-    );
 }

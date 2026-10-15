@@ -21,12 +21,9 @@ use super::{
 };
 use crate::{
     allocation_exit_v2::reserve_exit,
-    borrowed_type_resources::{
-        type_binding_prefix_work_upper_bound_in, verify_type_binding,
-        verify_type_binding_admitted_in,
-    },
+    borrowed_type_resources::{type_binding_prefix_work_upper_bound_in, verify_type_binding},
     physical_type_v2::{
-        DecodedTypeTable, ValueTypeCloneFacts, clone_value_type_observed,
+        DecodedTypeTable, TypeCodecError, ValueTypeCloneFacts, clone_value_type_observed,
         preflight_value_type_clone, preflight_value_type_clone_admitted,
         value_type_clone_root_facts,
     },
@@ -42,15 +39,73 @@ use novarocks_type_contract::{
 };
 use std::{alloc::Layout, mem::size_of};
 
+/// Both wire containers borrow their own complete type owner. No package
+/// table, inline Field or shadow semantic tree is synthesized for PlanTree.
+#[derive(Clone, Copy)]
+pub enum CallRequestTypeOwner<'a> {
+    Package(&'a DecodedTypeTable),
+    PlanTree(&'a crate::execution_type_table::DecodedExecutionTypeTable),
+}
+impl CallRequestTypeOwner<'_> {
+    fn len(self) -> usize {
+        match self {
+            Self::Package(types) => types.value_types().len(),
+            Self::PlanTree(types) => types.len(),
+        }
+    }
+    fn inline_bytes(self) -> usize {
+        match self {
+            Self::Package(types) => std::mem::size_of_val(types),
+            Self::PlanTree(types) => std::mem::size_of_val(types),
+        }
+    }
+}
+impl<'a> CallRequestTypeOwner<'a> {
+    fn lookup(
+        self,
+        id: u32,
+        w: &mut CompileCheckpoints<'_>,
+    ) -> Result<Option<&'a FunctionValueType>, E> {
+        match self {
+            Self::Package(types) => Ok(types.value_type(id)),
+            Self::PlanTree(types) => types
+                .get_observed(id, w)
+                .map_err(TypeCodecError::from)
+                .map_err(E::from),
+        }
+    }
+}
+
+trait ReadFailure:
+    From<E>
+    + From<TypeCodecError>
+    + From<CompileControlError>
+    + From<novarocks_physical_plan::ConstantReferenceError>
+{
+    fn is_primary_refusal(&self) -> bool;
+}
+impl ReadFailure for E {
+    fn is_primary_refusal(&self) -> bool {
+        matches!(self, Self::Control(_))
+    }
+}
+impl<H> ReadFailure for crate::host_projection_v2::ProjectionFailure<E, H> {
+    fn is_primary_refusal(&self) -> bool {
+        matches!(self, Self::Host(_) | Self::Codec(E::Control(_)))
+    }
+}
+type Parent<'a, F> = dyn FnMut(&Facts) -> Result<(), F> + 'a;
+
 /// This token loans the original DTO, checked type roots and admitted pools.
 /// Its raw output still requires the original Fragment coverage constructor.
 pub struct PreparedCallRequestsDecode<'loan> {
     source: &'loan wire::FragmentCallRequests,
-    types: &'loan DecodedTypeTable,
+    types: CallRequestTypeOwner<'loan>,
     _pools: &'loan ConstantPools,
     control: &'loan dyn PureCompileControl,
     facts: Facts,
     _keys: Vec<PhysicalCallDefinition>,
+    creation_storage: Option<novarocks_type_contract::ValueTypeStorageLifetime>,
 }
 impl PreparedCallRequestsDecode<'_> {
     pub fn facts(&self) -> &Facts {
@@ -84,8 +139,14 @@ fn gate(value: usize, maximum: usize) -> Result<(), E> {
 // A numerical refusal is already a primary resource cause; never observe a
 // later callback which could replace it. Ordinary source-shape outcomes still
 // record their completed calculation before the encompassing footer.
-fn observed<T>(result: Result<T, E>, w: &mut CompileCheckpoints<'_>) -> Result<T, E> {
-    if matches!(&result, Err(E::Control(_))) {
+fn observed<T, F: ReadFailure>(
+    result: Result<T, F>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<T, F> {
+    if result
+        .as_ref()
+        .is_err_and(|error| error.is_primary_refusal())
+    {
         return result;
     }
     w.step()?;
@@ -167,12 +228,12 @@ fn reference(input: &wire::ConstantReference) -> Result<ConstantReference, E> {
     })
 }
 fn value<'a>(
-    types: &'a DecodedTypeTable,
+    types: CallRequestTypeOwner<'a>,
     id: u32,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<&'a FunctionValueType, E> {
     w.flush()?;
-    let found = types.value_type(id);
+    let found = types.lookup(id, w)?;
     w.step()?;
     w.flush()?;
     found.ok_or_else(|| invalid("request value type ID is absent from the original table"))
@@ -195,6 +256,29 @@ fn boxed<T>(output: Vec<T>, w: &mut CompileCheckpoints<'_>) -> Result<Box<[T]>, 
     w.step()?;
     w.flush()?;
     Ok(output)
+}
+
+#[derive(Clone, Copy)]
+enum Profile {
+    Receiving(Limits),
+    InputDerived,
+}
+impl From<Limits> for Profile {
+    fn from(value: Limits) -> Self {
+        Self::Receiving(value)
+    }
+}
+impl Profile {
+    fn remaining_work(self, used: usize) -> Result<Option<usize>, E> {
+        match self {
+            Self::Receiving(limits) => limits
+                .max_work
+                .checked_sub(used)
+                .map(Some)
+                .ok_or_else(resource),
+            Self::InputDerived => Ok(None),
+        }
+    }
 }
 
 struct Model {
@@ -221,11 +305,11 @@ impl Model {
         }
         Ok(())
     }
-    fn admit(
+    fn admit<F: ReadFailure>(
         &mut self,
-        limits: Limits,
-        parent: &mut Option<&mut CallRequestAdmit<'_>>,
-    ) -> Result<(), E> {
+        limits: Profile,
+        parent: &mut Option<&mut Parent<'_, F>>,
+    ) -> Result<(), F> {
         // Original checked clone grammar bounds its fixed borrowed scratch and
         // all possible visited owned Dictionary nodes BEFORE that helper runs.
         // This deliberately conservative per-reference envelope is not an
@@ -260,34 +344,36 @@ impl Model {
             add(self.source, size_of::<PreparedCallRequestsDecode<'_>>())?,
             self.facts.request_bytes_upper_bound,
         )?;
-        gate(self.facts.definition_count, limits.max_definitions)?;
-        gate(self.facts.type_reference_count, limits.max_type_references)?;
-        gate(
-            self.facts.request_bytes_upper_bound,
-            limits.max_request_bytes,
-        )?;
-        gate(
-            self.facts.allocation_requests_upper_bound,
-            limits.max_allocation_requests,
-        )?;
-        gate(
-            self.facts.coexisting_source_and_request_bytes_upper_bound,
-            limits.max_coexisting_source_and_request_bytes,
-        )?;
-        gate(self.facts.cumulative_work_upper_bound, limits.max_work)?;
+        if let Profile::Receiving(limits) = limits {
+            gate(self.facts.definition_count, limits.max_definitions)?;
+            gate(self.facts.type_reference_count, limits.max_type_references)?;
+            gate(
+                self.facts.request_bytes_upper_bound,
+                limits.max_request_bytes,
+            )?;
+            gate(
+                self.facts.allocation_requests_upper_bound,
+                limits.max_allocation_requests,
+            )?;
+            gate(
+                self.facts.coexisting_source_and_request_bytes_upper_bound,
+                limits.max_coexisting_source_and_request_bytes,
+            )?;
+            gate(self.facts.cumulative_work_upper_bound, limits.max_work)?;
+        }
         source_gate(self.source, add(self.known, self.maximum_type_backing)?)?;
         if let Some(parent) = parent.as_deref_mut() {
             parent(&self.facts)?;
         }
         Ok(())
     }
-    fn type_reference(
+    fn type_reference<F: ReadFailure>(
         &mut self,
         ty: &FunctionValueType,
-        limits: Limits,
-        parent: &mut Option<&mut CallRequestAdmit<'_>>,
+        limits: Profile,
+        parent: &mut Option<&mut Parent<'_, F>>,
         w: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), E> {
+    ) -> Result<(), F> {
         if parent.is_some() {
             let requests = self.facts.allocation_requests_upper_bound;
             let bytes = self.facts.request_bytes_upper_bound;
@@ -321,14 +407,14 @@ impl Model {
         // admitted grammar envelope above covers its complete own walk.
         observed(self.admit(limits, parent), w)
     }
-    fn value<'a>(
+    fn value<'a, F: ReadFailure>(
         &mut self,
-        types: &'a DecodedTypeTable,
+        types: CallRequestTypeOwner<'a>,
         id: u32,
-        limits: Limits,
-        parent: &mut Option<&mut CallRequestAdmit<'_>>,
+        limits: Profile,
+        parent: &mut Option<&mut Parent<'_, F>>,
         w: &mut CompileCheckpoints<'_>,
-    ) -> Result<&'a FunctionValueType, E> {
+    ) -> Result<&'a FunctionValueType, F> {
         if parent.is_none() {
             let ty = value(types, id, w)?;
             self.type_reference(ty, limits, parent, w)?;
@@ -337,31 +423,32 @@ impl Model {
         // The model has admitted the opaque lookup work. Capture its actual
         // root and admit the sole clone before any pending observation; Plain
         // retains its original pre-lookup flush in value() above.
-        let ty = types.value_type(id);
+        let ty = types.lookup(id, w)?;
         if let Some(ty) = ty {
             self.type_reference(ty, limits, parent, w)?;
         }
         w.step()?;
         w.flush()?;
-        ty.ok_or_else(|| invalid("request value type ID is absent from the original table"))
+        ty.ok_or_else(|| {
+            F::from(invalid(
+                "request value type ID is absent from the original table",
+            ))
+        })
     }
-    fn compare(
+    fn compare<F: ReadFailure>(
         &mut self,
         left: &FunctionValueType,
         right: &FunctionValueType,
-        limits: Limits,
-        parent: &mut Option<&mut CallRequestAdmit<'_>>,
+        limits: Profile,
+        parent: &mut Option<&mut Parent<'_, F>>,
         w: &mut CompileCheckpoints<'_>,
-    ) -> Result<bool, E> {
-        let remaining = limits
-            .max_work
-            .checked_sub(self.raw_work)
-            .ok_or_else(resource)?;
+    ) -> Result<bool, F> {
+        let remaining = limits.remaining_work(self.raw_work)?;
         let baseline = self.comparisons;
         let prefix = type_binding_prefix_work_upper_bound_in(left, right, self.source)?;
         self.comparisons = add(baseline, prefix.work_upper_bound())?;
         self.admit(limits, parent)?;
-        let compared = verify_type_binding_admitted_in(
+        let compared = crate::borrowed_type_resources::verify_type_binding_optional_work_in(
             left,
             right,
             self.source,
@@ -377,12 +464,12 @@ impl Model {
         Ok(compared.matches())
     }
 }
-fn capture_arguments(
+fn capture_arguments<F: ReadFailure>(
     entry: &wire::OriginalCallRequest,
     model: &mut Model,
-    limits: Limits,
-    parent: &mut Option<&mut CallRequestAdmit<'_>>,
-) -> Result<(), E> {
+    limits: Profile,
+    parent: &mut Option<&mut Parent<'_, F>>,
+) -> Result<(), F> {
     model.arguments = add(model.arguments, entry.arguments.len())?;
     model.known = add(
         model.known,
@@ -394,17 +481,17 @@ fn capture_arguments(
     }
     Ok(())
 }
-fn preflight(
+fn preflight<F: ReadFailure>(
     source: &wire::FragmentCallRequests,
-    types: &DecodedTypeTable,
+    types: CallRequestTypeOwner<'_>,
     pools: &ConstantPools,
     invoice: usize,
-    limits: Limits,
-    parent: &mut Option<&mut CallRequestAdmit<'_>>,
+    limits: Profile,
+    parent: &mut Option<&mut Parent<'_, F>>,
     w: &mut CompileCheckpoints<'_>,
-) -> Result<Facts, E> {
+) -> Result<Facts, F> {
     let n = source.entries.len();
-    let type_count = types.value_types().len();
+    let type_count = types.len();
     let pool_count = pools.entries().len();
     let raw = add(
         size_of::<wire::FragmentCallRequests>(),
@@ -414,7 +501,7 @@ fn preflight(
         type_count,
         add(size_of::<u32>(), size_of::<FunctionValueType>())?,
     )?;
-    let type_roots = add(size_of::<DecodedTypeTable>(), type_roots)?;
+    let type_roots = add(types.inline_bytes(), type_roots)?;
     let pool_roots = mul(
         pool_count,
         add(
@@ -479,9 +566,7 @@ fn preflight(
         let valid = logical <= entry.arguments.len();
         w.step()?;
         if !valid {
-            return Err(invalid(
-                "request logical argument count exceeds actual channels",
-            ));
+            return Err(invalid("request logical argument count exceeds actual channels").into());
         }
         let p = policy(entry.constant_policy.as_ref());
         w.step()?;
@@ -511,7 +596,7 @@ fn preflight(
                                 &mut |found, w| {
                                     matches =
                                         model.compare(ty, found.value_type(), limits, parent, w)?;
-                                    Ok::<_, E>(())
+                                    Ok::<_, F>(())
                                 },
                                 w,
                             );
@@ -523,19 +608,23 @@ fn preflight(
                             matches
                         } else {
                             w.flush()?;
-                            let found = pools.resolve_source_observed(address, w).map_err(E::from);
+                            let found = pools.resolve_source_observed(address, w).map_err(F::from);
                             let found = observed(found, w);
-                            if matches!(&found, Err(E::Control(_))) {
+                            if found
+                                .as_ref()
+                                .is_err_and(|error| error.is_primary_refusal())
+                            {
                                 return found.map(|_| model.facts);
                             }
                             w.flush()?;
                             let found = found?;
-                            let remaining = limits
-                                .max_work
-                                .checked_sub(model.facts.cumulative_work_upper_bound)
-                                .ok_or_else(resource)?;
-                            let compared =
-                                verify_type_binding(ty, found.value_type(), invoice, remaining, w)?;
+                            let remaining =
+                                limits.remaining_work(model.facts.cumulative_work_upper_bound)?;
+                            let compared = match remaining {
+                                Some(maximum) => verify_type_binding(ty,found.value_type(),invoice,maximum,w)?,
+                                None => crate::borrowed_type_resources::verify_type_binding_optional_work_in::<TypeCodecError>(
+                                    ty,found.value_type(),invoice,None,&mut |_| Ok(()),w)?,
+                            };
                             model.comparisons =
                                 add(model.comparisons, compared.work_upper_bound())?;
                             observed(model.admit(limits, parent), w)?;
@@ -557,6 +646,13 @@ fn preflight(
                         bytes::<u32>(input.parameter_value_type_ids.capacity())?,
                     )?;
                     model.request::<FunctionValueType>(input.parameter_value_type_ids.len(), 2)?;
+                    if !input.parameter_value_type_ids.is_empty() {
+                        let layout=novarocks_type_contract::FunctionParameterTypes::storage_allocation_layout().map_err(|_|resource())?;
+                        model.facts.allocation_requests_upper_bound =
+                            add(model.facts.allocation_requests_upper_bound, 1)?;
+                        model.facts.request_bytes_upper_bound =
+                            add(model.facts.request_bytes_upper_bound, layout.size())?;
+                    }
                     observed(model.admit(limits, parent), w)?;
                     for &id in &input.parameter_value_type_ids {
                         model.value(types, id, limits, parent, w)?;
@@ -571,7 +667,7 @@ fn preflight(
                 }
                 None => {
                     w.step()?;
-                    return Err(invalid("request argument kind is absent"));
+                    return Err(invalid("request argument kind is absent").into());
                 }
             }
             w.step()?;
@@ -646,15 +742,15 @@ fn index(
     }
     Ok(keys)
 }
-fn prepare_core<'loan, 'control: 'loan>(
+fn prepare_core<'loan, 'control: 'loan, F: ReadFailure>(
     source: Option<&'loan wire::FragmentCallRequests>,
-    types: &'loan DecodedTypeTable,
+    types: CallRequestTypeOwner<'loan>,
     pools: &'loan ConstantPools,
     source_retained_bytes: usize,
-    limits: Limits,
-    parent: &mut Option<&mut CallRequestAdmit<'_>>,
+    limits: Profile,
+    parent: &mut Option<&mut Parent<'_, F>>,
     work: &mut CompileCheckpoints<'control>,
-) -> Result<PreparedCallRequestsDecode<'loan>, E> {
+) -> Result<PreparedCallRequestsDecode<'loan>, F> {
     let source = source.ok_or_else(|| invalid("fragment call request table is absent"))?;
     let facts = preflight(
         source,
@@ -674,6 +770,7 @@ fn prepare_core<'loan, 'control: 'loan>(
         control: work.control(),
         facts,
         _keys: keys,
+        creation_storage: None,
     })
 }
 
@@ -688,11 +785,11 @@ pub fn prepare_call_requests_decode<'loan>(
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = prepare_core(
         source,
-        types,
+        CallRequestTypeOwner::Package(types),
         pools,
         source_retained_bytes,
-        limits,
-        &mut None,
+        limits.into(),
+        &mut None::<&mut Parent<'_, E>>,
         &mut work,
     );
     finish(work, result)
@@ -711,18 +808,98 @@ pub(crate) fn prepare_call_requests_decode_in<'loan, 'control: 'loan>(
 ) -> Result<PreparedCallRequestsDecode<'loan>, E> {
     prepare_core(
         source,
-        types,
+        CallRequestTypeOwner::Package(types),
         pools,
         source_retained_bytes,
-        limits,
-        &mut Some(admit),
+        limits.into(),
+        &mut Some(&mut |facts: &Facts| admit(facts).map_err(E::from)),
         work,
     )
+}
+
+pub fn prepare_call_requests_decode_with_creator_in<'loan, 'control: 'loan, H>(
+    source: Option<&'loan wire::FragmentCallRequests>,
+    types: CallRequestTypeOwner<'loan>,
+    pools: &'loan ConstantPools,
+    original_source_bytes: usize,
+    limits: Limits,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedCallRequestsDecode<'loan>, crate::host_projection_v2::ProjectionFailure<E, H>> {
+    prepare_with_creator_core(
+        source,
+        types,
+        pools,
+        original_source_bytes,
+        limits.into(),
+        creation,
+        work,
+    )
+}
+
+/// Finite checked construction/work facts are sealed by this input's sole
+/// model. Source provenance and actual BE creator remain mandatory; original
+/// sender policy does not become receiving admission.
+pub fn prepare_call_requests_decode_input_derived_with_creator_in<'loan, 'control: 'loan, H>(
+    source: Option<&'loan wire::FragmentCallRequests>,
+    types: CallRequestTypeOwner<'loan>,
+    pools: &'loan ConstantPools,
+    original_source_bytes: usize,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedCallRequestsDecode<'loan>, crate::host_projection_v2::ProjectionFailure<E, H>> {
+    prepare_with_creator_core(
+        source,
+        types,
+        pools,
+        original_source_bytes,
+        Profile::InputDerived,
+        creation,
+        work,
+    )
+}
+
+fn prepare_with_creator_core<'loan, 'control: 'loan, H>(
+    source: Option<&'loan wire::FragmentCallRequests>,
+    types: CallRequestTypeOwner<'loan>,
+    pools: &'loan ConstantPools,
+    original_source_bytes: usize,
+    limits: Profile,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'control>,
+) -> Result<PreparedCallRequestsDecode<'loan>, crate::host_projection_v2::ProjectionFailure<E, H>> {
+    let mut previous = 0usize;
+    let mut token = prepare_core::<crate::host_projection_v2::ProjectionFailure<E, H>>(
+        source,
+        types,
+        pools,
+        original_source_bytes,
+        limits,
+        &mut Some(&mut |facts: &Facts| {
+            let additional = facts
+                .request_bytes_upper_bound
+                .checked_sub(previous)
+                .ok_or_else(|| {
+                    crate::host_projection_v2::ProjectionFailure::<E, H>::from(resource())
+                })?;
+            if additional != 0 {
+                creation
+                    .observe_opaque_upper_bound(additional)
+                    .map_err(crate::host_projection_v2::ProjectionFailure::Host)?;
+            }
+            previous = facts.request_bytes_upper_bound;
+            Ok(())
+        }),
+        work,
+    )?;
+    token.creation_storage = Some(creation.storage_lifetime());
+    Ok(token)
 }
 
 fn decode_core(
     token: PreparedCallRequestsDecode<'_>,
     work: &mut CompileCheckpoints<'_>,
+    storage: Option<&novarocks_type_contract::ValueTypeStorageLifetime>,
 ) -> Result<Vec<(PhysicalCallDefinition, PhysicalCallRequest)>, E> {
     let mut output = reserve(token.source.entries.len(), work)?;
     for entry in &token.source.entries {
@@ -768,7 +945,22 @@ fn decode_core(
                     let result_type =
                         clone_value_type_observed(value(token.types, id?, work)?, work)?;
                     StaticFunctionArgument::Lambda {
-                        parameter_types: boxed(parameters, work)?,
+                        parameter_types: {
+                            let boxed = boxed(parameters, work)?;
+                            match storage {
+                                Some(storage) => {
+                                    novarocks_type_contract::FunctionParameterTypes::from_boxed_in(
+                                        boxed,
+                                        storage.clone(),
+                                    )
+                                }
+                                None => {
+                                    novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                                        boxed,
+                                    )
+                                }
+                            }
+                        },
                         result_type,
                     }
                 }
@@ -813,7 +1005,7 @@ pub fn decode_call_requests(
     token: PreparedCallRequestsDecode<'_>,
 ) -> Result<Vec<(PhysicalCallDefinition, PhysicalCallRequest)>, E> {
     let mut work = CompileCheckpoints::try_new(token.control, CompilePhase::Decode)?;
-    let result = decode_core(token, &mut work);
+    let result = decode_core(token, &mut work, None);
     finish(work, result)
 }
 
@@ -830,8 +1022,42 @@ pub(crate) fn decode_call_requests_in(
     // Immutable preparation bills every ensuing copy. The complete parent
     // gate precedes the first real output reserve or opaque clone boundary.
     admit(&token.facts)?;
-    decode_core(token, work)
+    decode_core(token, work, None)
 }
+pub struct DecodedCallRequests {
+    entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+    storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl DecodedCallRequests {
+    pub fn entries(&self) -> &[(PhysicalCallDefinition, PhysicalCallRequest)] {
+        &self.entries
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
+        novarocks_type_contract::ValueTypeStorageLifetime,
+    ) {
+        (self.entries, self.storage)
+    }
+}
+pub fn decode_call_requests_with_creator_in<H>(
+    mut token: PreparedCallRequestsDecode<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<DecodedCallRequests, crate::host_projection_v2::ProjectionFailure<E, H>> {
+    if !std::ptr::addr_eq(token.control, work.control()) {
+        return Err(invalid("call request prepared controller differs from caller").into());
+    }
+    let storage = token.creation_storage.take().ok_or_else(|| {
+        crate::host_projection_v2::ProjectionFailure::<E, H>::from(invalid(
+            "request token has no original construction owner",
+        ))
+    })?;
+    // Preparation admitted all ensuing output requests before any actual copy.
+    let entries = decode_core(token, work, Some(&storage))?;
+    Ok(DecodedCallRequests { entries, storage })
+}
+
 #[cfg(test)]
 #[path = "read_tests.rs"]
 mod tests;

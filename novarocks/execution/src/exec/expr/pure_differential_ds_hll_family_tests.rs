@@ -52,8 +52,11 @@ fn aggregate(name: &str, arity: usize) {
             .partitions(5, 9100 + arity as u64),
     );
     assert_eq!(summary.matched_failures, 0);
-    assert_eq!(summary.result_type.data_type, DataType::Int64);
-    assert_eq!(summary.pure_state_type.data_type, DataType::Binary);
+    assert_eq!(summary.result_type.data_type().clone(), DataType::Int64);
+    assert_eq!(
+        summary.pure_state_type.data_type().clone(),
+        DataType::Binary
+    );
     assert_eq!(summary.null_results, 0);
 }
 #[test]
@@ -105,7 +108,7 @@ fn pure_differential_ds_hll_merge_payload_single_and_final() {
             .partitions(5, 9108),
     );
     assert_eq!(out.matched_failures, 0);
-    assert_eq!(out.result_type.data_type, DataType::Int64);
+    assert_eq!(out.result_type.data_type().clone(), DataType::Int64);
     assert_eq!(out.null_results, 0);
 }
 #[test]
@@ -117,7 +120,7 @@ fn pure_differential_ds_hll_union_payload_single_and_final() {
             .partitions(5, 9109),
     );
     assert_eq!(out.matched_failures, 0);
-    assert_eq!(out.result_type.data_type, DataType::Binary);
+    assert_eq!(out.result_type.data_type().clone(), DataType::Binary);
     assert_eq!(out.null_results, 0);
 }
 fn state(arity: usize) {

@@ -30,11 +30,11 @@ pub(crate) struct IpcReaderProgressFacts {
     pub cumulative_library_work_upper_bound: usize,
 }
 
-pub(crate) type ReaderAdmit<'a> =
-    dyn FnMut(&IpcReaderProgressFacts) -> Result<(), CompileControlError> + 'a;
+pub(crate) type ReaderAdmit<'a, E = CompileControlError> =
+    dyn FnMut(&IpcReaderProgressFacts) -> Result<(), E> + 'a;
 
-pub(crate) struct Admission<'a, 'b> {
-    admit: &'a mut ReaderAdmit<'b>,
+pub(crate) struct Admission<'a, 'b, E = CompileControlError> {
+    admit: &'a mut ReaderAdmit<'b, E>,
     facts: IpcReaderProgressFacts,
     requests: [(usize, usize); 6],
     constant: (usize, usize, usize),
@@ -45,9 +45,10 @@ pub(crate) struct Admission<'a, 'b> {
     clone_work: usize,
     sealed: Option<IpcReaderProgressFacts>,
     limits: Option<(usize, usize, usize)>,
+    construction: Option<&'a mut dyn FnMut(std::alloc::Layout) -> Result<(), E>>,
 }
-impl<'a, 'b> Admission<'a, 'b> {
-    pub(crate) fn new(source: usize, admit: &'a mut ReaderAdmit<'b>) -> Self {
+impl<'a, 'b, E: From<CompileControlError>> Admission<'a, 'b, E> {
+    pub(crate) fn new(source: usize, admit: &'a mut ReaderAdmit<'b, E>) -> Self {
         Self {
             admit,
             facts: IpcReaderProgressFacts {
@@ -63,23 +64,27 @@ impl<'a, 'b> Admission<'a, 'b> {
             clone_work: 0,
             sealed: None,
             limits: None,
+            construction: None,
         }
     }
-    pub(crate) fn limits(
-        &mut self,
-        bytes: usize,
-        coexist: usize,
-        work: usize,
-    ) -> Result<(), CompileControlError> {
+    pub(crate) fn with_construction(
+        mut self,
+        request: Option<&'a mut dyn FnMut(std::alloc::Layout) -> Result<(), E>>,
+    ) -> Self {
+        self.construction = request;
+        self
+    }
+    pub(crate) fn construction_request(&mut self, layout: std::alloc::Layout) -> Result<(), E> {
+        if let Some(request) = &mut self.construction {
+            request(layout)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn limits(&mut self, bytes: usize, coexist: usize, work: usize) -> Result<(), E> {
         self.limits = Some((bytes, coexist, work));
         self.check()
     }
-    pub(crate) fn requests(
-        &mut self,
-        part: usize,
-        bytes: usize,
-        count: usize,
-    ) -> Result<(), CompileControlError> {
+    pub(crate) fn requests(&mut self, part: usize, bytes: usize, count: usize) -> Result<(), E> {
         self.requests[part].0 = self.requests[part].0.max(bytes);
         self.requests[part].1 = self.requests[part].1.max(count);
         if part == 0 {
@@ -88,10 +93,7 @@ impl<'a, 'b> Admission<'a, 'b> {
         }
         self.check()
     }
-    pub(crate) fn seed_prefix(
-        &mut self,
-        facts: IpcReaderProgressFacts,
-    ) -> Result<(), CompileControlError> {
+    pub(crate) fn seed_prefix(&mut self, facts: IpcReaderProgressFacts) -> Result<(), E> {
         self.requests[0] = (
             facts.geometry_scratch_request_bytes,
             facts.geometry_scratch_request_count,
@@ -111,23 +113,19 @@ impl<'a, 'b> Admission<'a, 'b> {
         self.geometry_work = facts.cumulative_library_work_upper_bound;
         self.check()
     }
-    pub(crate) fn count_work(
-        &mut self,
-        part: usize,
-        upper: usize,
-    ) -> Result<(), CompileControlError> {
+    pub(crate) fn count_work(&mut self, part: usize, upper: usize) -> Result<(), E> {
         self.count_work[part] = self.count_work[part].max(upper);
         self.check()
     }
-    pub(crate) fn clone_work(&mut self, upper: usize) -> Result<(), CompileControlError> {
+    pub(crate) fn clone_work(&mut self, upper: usize) -> Result<(), E> {
         self.clone_work = self.clone_work.max(upper);
         self.check()
     }
-    pub(crate) fn schema_work(&mut self, upper: usize) -> Result<(), CompileControlError> {
+    pub(crate) fn schema_work(&mut self, upper: usize) -> Result<(), E> {
         self.schema_work = self.schema_work.max(upper);
         self.check()
     }
-    pub(crate) fn batch_work_add(&mut self, upper: usize) -> Result<(), CompileControlError> {
+    pub(crate) fn batch_work_add(&mut self, upper: usize) -> Result<(), E> {
         self.geometry_work = self
             .geometry_work
             .checked_add(upper)
@@ -137,14 +135,11 @@ impl<'a, 'b> Admission<'a, 'b> {
     pub(crate) fn batch_step(
         &mut self,
         work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
-    ) -> Result<(), CompileControlError> {
+    ) -> Result<(), E> {
         self.batch_work_add(1)?;
-        work.step()
+        work.step().map_err(Into::into)
     }
-    pub(crate) fn seed(
-        &mut self,
-        facts: IpcReaderProgressFacts,
-    ) -> Result<(), CompileControlError> {
+    pub(crate) fn seed(&mut self, facts: IpcReaderProgressFacts) -> Result<(), E> {
         self.requests[0] = (
             facts.geometry_scratch_request_bytes,
             facts.geometry_scratch_request_count,
@@ -174,22 +169,17 @@ impl<'a, 'b> Admission<'a, 'b> {
     ) -> Result<T, super::FlatPoolResourceError> {
         result.map_err(|_| CompileControlError::ResourceExhausted.into())
     }
-    pub(crate) fn reader_work(&mut self, upper: usize) -> Result<(), CompileControlError> {
+    pub(crate) fn reader_work(&mut self, upper: usize) -> Result<(), E> {
         self.reader_work = self.reader_work.max(upper);
         self.check()
     }
-    pub(crate) fn constant(
-        &mut self,
-        bytes: usize,
-        count: usize,
-        work: usize,
-    ) -> Result<(), CompileControlError> {
+    pub(crate) fn constant(&mut self, bytes: usize, count: usize, work: usize) -> Result<(), E> {
         self.constant.0 = self.constant.0.max(bytes);
         self.constant.1 = self.constant.1.max(count);
         self.constant.2 = self.constant.2.max(work);
         self.check()
     }
-    pub(crate) fn check(&mut self) -> Result<(), CompileControlError> {
+    pub(crate) fn check(&mut self) -> Result<(), E> {
         let add = |a: usize, b: usize| {
             a.checked_add(b)
                 .ok_or(CompileControlError::ResourceExhausted)
@@ -224,7 +214,7 @@ impl<'a, 'b> Admission<'a, 'b> {
                 || coexist > c
                 || self.facts.cumulative_library_work_upper_bound > w)
         {
-            return Err(CompileControlError::ResourceExhausted);
+            return Err(CompileControlError::ResourceExhausted.into());
         }
         if let Some(full) = self.sealed
             && (self.facts.source_retained_bytes != full.source_retained_bytes
@@ -237,11 +227,25 @@ impl<'a, 'b> Admission<'a, 'b> {
                 || self.facts.cumulative_library_work_upper_bound
                     > full.cumulative_library_work_upper_bound)
         {
-            return Err(CompileControlError::ResourceExhausted);
+            return Err(CompileControlError::ResourceExhausted.into());
         }
         (self.admit)(&self.facts)
     }
     pub(crate) fn facts(&self) -> IpcReaderProgressFacts {
         self.facts
     }
+}
+
+/// Exact caller failure used by the shared borrowed framing and geometry body.
+pub(crate) trait ReaderGeometryFailure:
+    From<CompileControlError>
+    + From<crate::physical_type_v2::TypeCodecError>
+    + From<novarocks_type_contract::ValueTypeError>
+{
+}
+impl<E> ReaderGeometryFailure for E where
+    E: From<CompileControlError>
+        + From<crate::physical_type_v2::TypeCodecError>
+        + From<novarocks_type_contract::ValueTypeError>
+{
 }

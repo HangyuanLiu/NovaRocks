@@ -21,7 +21,7 @@
 use super::*;
 
 #[test]
-fn array_state_source_real_ordered_distinct_update_and_final_receipts() {
+fn array_state_source_real_ordered_distinct_single_receipt_without_split_capability() {
     for (sql, distinct, ascending, nulls_first) in [
         (
             "SELECT ARRAY_AGG(order_key ORDER BY order_key DESC NULLS FIRST) FROM orders",
@@ -37,8 +37,41 @@ fn array_state_source_real_ordered_distinct_update_and_final_receipts() {
         ),
     ] {
         let owner = crate::compiler::compile_authored_aggregate_for_test(sql);
-        let partial = loan(&owner, true);
-        let original = partial
+        let mut single = None;
+        for fragment in owner.plan().fragments().values() {
+            for node in fragment.nodes().values() {
+                if let NodeKind::Aggregate { calls, .. } = &node.kind {
+                    for (ordinal, source) in calls.iter().enumerate() {
+                        assert!(
+                            matches!(source.binding.phase, AggregatePhase::Single),
+                            "ordered/distinct ARRAY_AGG has no installed split law"
+                        );
+                        let control = Control::default();
+                        let mut work = CompileCheckpoints::try_new(
+                            &control,
+                            CompilePhase::FunctionSpecialization,
+                        )
+                        .unwrap();
+                        let site = PhysicalCallSite::Aggregate {
+                            node: node.id,
+                            call: u32::try_from(ordinal).unwrap(),
+                        };
+                        let entry = owner
+                            .checked_aggregate_source_observed(
+                                fragment, node, site, source, &mut work,
+                            )
+                            .unwrap();
+                        work.finish().unwrap();
+                        assert!(
+                            single.replace(entry).is_none(),
+                            "one actual ARRAY_AGG occurrence"
+                        );
+                    }
+                }
+            }
+        }
+        let single_entry = single.expect("genuine Single ARRAY_AGG receipt");
+        let original = single_entry
             .captured()
             .binding()
             .aggregate_state_source()
@@ -51,57 +84,26 @@ fn array_state_source_real_ordered_distinct_update_and_final_receipts() {
                 nulls_first
             }]
         );
-        assert!(partial.captured().binding().group_concat_source().is_none());
+        assert!(
+            single_entry
+                .captured()
+                .binding()
+                .group_concat_source()
+                .is_none()
+        );
         assert_eq!(
-            partial.source().binding.state_interpretation.as_ref(),
+            single_entry.source().binding.state_interpretation.as_ref(),
             Some(original)
         );
-        let update = run(&partial, &Control::default()).unwrap();
+        let update = run(&single_entry, &Control::default()).unwrap();
         let PureCallPreparation::Aggregate { options, .. } = update.preparation(effects()) else {
-            panic!("Partial preparation")
+            panic!("Single preparation")
         };
-        assert_eq!(options.phase, AggregateKernelPhase::Partial);
+        assert_eq!(options.phase, AggregateKernelPhase::Single);
         assert_eq!(options.distinct, distinct);
         assert_eq!(options.order_keys.len(), 1);
         assert_eq!(options.state_interpretation.as_deref(), Some(original));
-        let final_entry = loan(&owner, false);
-        assert!(!final_entry.source().distinct);
-        assert!(final_entry.source().order_by.is_empty());
-        let control = Control::default();
-        let mut work =
-            CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
-        let merge =
-            author_physical_aggregate_merge_request_observed(&final_entry, &mut work).unwrap();
-        let mut actual_producers = 0;
-        merge
-            .state_inputs()
-            .visit_observed(
-                &mut work,
-                |producer, _, work| {
-                    actual_producers += 1;
-                    assert_eq!(
-                        producer.captured().binding().aggregate_state_source(),
-                        Some(original)
-                    );
-                    assert_eq!(
-                        producer.source().binding.state_interpretation.as_ref(),
-                        Some(original)
-                    );
-                    work.step()?;
-                    Ok(())
-                },
-                |_, _, _, _| Ok(()),
-            )
-            .unwrap();
-        assert!(actual_producers > 0);
-        let PureCallPreparation::Aggregate { options, .. } = merge.preparation(effects()) else {
-            panic!("Final preparation")
-        };
-        assert_eq!(options.phase, AggregateKernelPhase::Final);
-        assert!(!options.distinct);
-        assert!(options.order_keys.is_empty());
-        assert_eq!(options.state_interpretation.as_deref(), Some(original));
-        work.finish().unwrap();
+        prefixes(|control| run(&single_entry, control).map(|_| ()), true);
     }
 }
 

@@ -49,23 +49,18 @@ fn event(visit: ValueTypeVisit<'_>) -> (u8, usize) {
 }
 
 #[test]
-fn original_root_carrier_mismatch_precedes_every_nested_observer_and_scratch_write() {
-    let ty = FunctionValueType {
-        data_type: DataType::List(Arc::new(Field::new("nested", DataType::Int32, true))),
-        nullable: true,
-        logical_type: ValueLogicalType::Json,
-    };
-    let expected = ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::Json);
-    assert_eq!(ty.validate(), Err(expected));
-    let mut scratch: TypeValidationScratch<'_> = [None; MAX_VALUE_TYPE_NODES];
-    let mut calls = 0;
-    let result = ty.validate_with_scratch_observed::<Error>(&mut scratch, |_| {
-        calls += 1;
-        Err(CompileControlError::Cancelled.into())
-    });
-    assert_eq!(result, Err(Error::Value(expected)));
-    assert_eq!(calls, 0);
-    assert!(scratch.iter().all(Option::is_none));
+fn invalid_declared_root_is_rejected_before_a_binding_exists() {
+    let result = FunctionValueType::try_from_legacy_declared_projection(
+        DataType::List(Arc::new(Field::new("nested", DataType::Int32, true))),
+        true,
+        ValueLogicalType::Json,
+    );
+    assert_eq!(
+        result,
+        Err(ValueTypeError::InvalidLogicalCarrier(
+            ValueLogicalType::Json
+        ))
+    );
 }
 
 #[test]
@@ -76,7 +71,7 @@ fn shared_nested_fields_keep_original_law_and_exact_borrowed_occurrence_events()
             ("provider".to_owned(), "same-original-field".to_owned()),
         ])),
     );
-    let valid = FunctionValueType::new(
+    let valid = FunctionValueType::from_legacy_declared_projection(
         DataType::Struct(vec![shared.clone(), shared.clone()].into()),
         true,
     );
@@ -94,10 +89,11 @@ fn shared_nested_fields_keep_original_law_and_exact_borrowed_occurrence_events()
     );
     for ty in [&valid, &bad] {
         let mut original = Vec::new();
-        let expected = crate::validate_value_type_structure_observed::<Error>(&ty.data_type, |v| {
-            original.push(event(v));
-            Ok(())
-        });
+        let expected =
+            crate::validate_value_type_structure_observed::<Error>(ty.data_type(), |v| {
+                original.push(event(v));
+                Ok(())
+            });
         let mut scratch: TypeValidationScratch<'_> = [None; MAX_VALUE_TYPE_NODES];
         let mut actual = Vec::new();
         let result = ty.validate_with_scratch_observed::<Error>(&mut scratch, |v| {
@@ -107,22 +103,10 @@ fn shared_nested_fields_keep_original_law_and_exact_borrowed_occurrence_events()
         assert_eq!(result, expected);
         assert_eq!(result, ty.validate().map_err(Error::Value));
         assert_eq!(actual, original);
-        if std::ptr::eq(ty, &valid) {
-            assert_eq!(
-                actual
-                    .iter()
-                    .filter(|entry| **entry == (2, shared.as_ref() as *const Field as usize))
-                    .count(),
-                2
-            );
-        } else {
-            assert_eq!(
-                result,
-                Err(Error::Value(ValueTypeError::InvalidLogicalCarrier(
-                    ValueLogicalType::Json
-                )))
-            );
-        }
+        assert_eq!(
+            actual.iter().filter(|entry| entry.0 == 2).count(),
+            if std::ptr::eq(ty, &valid) { 2 } else { 1 }
+        );
     }
 }
 
@@ -163,7 +147,7 @@ fn run(ty: &FunctionValueType, control: &Control) -> Result<(), Error> {
 
 #[test]
 fn actual_nested_success_and_ordinary_tail_preserve_every_three_cause_control_prefix() {
-    let valid = FunctionValueType::new(
+    let valid = FunctionValueType::from_legacy_declared_projection(
         DataType::Struct(
             (0..320)
                 .map(|i| Arc::new(Field::new(format!("field_{i}"), DataType::Utf8, true)))
@@ -172,7 +156,8 @@ fn actual_nested_success_and_ordinary_tail_preserve_every_three_cause_control_pr
         ),
         false,
     );
-    let bad = FunctionValueType::new(
+    let bad_source = Field::new(
+        "unknown-root",
         DataType::List(Arc::new(
             Field::new("unknown", DataType::Utf8, true).with_metadata(HashMap::from([(
                 NR_LOGICAL_TYPE_KEY.to_owned(),
@@ -181,7 +166,11 @@ fn actual_nested_success_and_ordinary_tail_preserve_every_three_cause_control_pr
         )),
         true,
     );
-    for ty in [&valid, &bad] {
+    assert_eq!(
+        FunctionValueType::try_from_legacy_field_projection(&bad_source),
+        Err(ValueTypeError::UnknownLogicalMetadata)
+    );
+    for ty in [&valid] {
         let control = Control::default();
         assert_eq!(run(ty, &control), ty.validate().map_err(Error::Value));
         let trace = control.trace.lock().unwrap().clone();

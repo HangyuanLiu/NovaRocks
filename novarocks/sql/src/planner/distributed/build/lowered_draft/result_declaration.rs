@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Original ordered result declaration from the same unpublished SQL emission.
-//! This receipt is an output-check obligation, not a computed kernel type.
+//! This receipt freezes completed guarantees from the same expression owner.
+//! It does not derive kernel types or NULL policy from presentation metadata.
 use novarocks_physical_plan::{PlanVersionId, ResultField, ResultPort};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, ValueTypeError,
-    arrow_data_types_exact_borrowed_observed,
 };
 
 #[derive(Debug)]
@@ -101,12 +101,31 @@ impl SqlResultDeclaration {
         &self.original
     }
     pub(super) fn publish(
-        self,
+        mut self,
         version: PlanVersionId,
         computed: &ResultPort,
         control: &dyn PureCompileControl,
     ) -> Result<PublishedSqlResultDeclaration, ResultDeclarationError> {
-        self.check_computed_port(version, computed, control)?;
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        let result = (|| {
+            // Before publication the same original owner may widen only a
+            // root guarantee. All occurrence identity, child semantics and
+            // layout facts must remain exact.
+            self.check_inner(version, computed, true, &mut work)?;
+            for (declared, actual) in self.original.fields.iter_mut().zip(&computed.fields) {
+                work.step()?;
+                declared.ty = actual.ty.clone_observed(|| work.step())?;
+            }
+            work.flush()?;
+            self.original.scalar_schema = computed.scalar_schema.clone();
+            work.step()?;
+            Ok::<_, ResultDeclarationError>(())
+        })();
+        if matches!(&result, Err(ResultDeclarationError::Control(_))) {
+            return result.map(|()| PublishedSqlResultDeclaration { declaration: self });
+        }
+        work.finish()?;
+        result?;
         Ok(PublishedSqlResultDeclaration { declaration: self })
     }
 
@@ -128,7 +147,7 @@ impl SqlResultDeclaration {
         control: &dyn PureCompileControl,
     ) -> Result<CheckedSqlResultDeclaration<'a>, ResultDeclarationError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
-        let result = self.check_inner(version, computed, &mut work);
+        let result = self.check_inner(version, computed, false, &mut work);
         if matches!(&result, Err(ResultDeclarationError::Control(_))) {
             return result;
         }
@@ -140,6 +159,7 @@ impl SqlResultDeclaration {
         &'a self,
         version: PlanVersionId,
         computed: &ResultPort,
+        allow_unpublished_root_widening: bool,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<CheckedSqlResultDeclaration<'a>, ResultDeclarationError> {
         work.step()?;
@@ -164,22 +184,24 @@ impl SqlResultDeclaration {
         {
             work.step()?;
             if declared.value != actual.value
+                || declared.domain != actual.domain
                 || declared.value != self.original.output.columns[ordinal]
                 || actual.value != computed.output.columns[ordinal]
                 || !text_equal(&declared.name, &actual.name, work)?
                 || !alias_equal(declared.alias.as_deref(), actual.alias.as_deref(), work)?
-                || declared.ty.logical_type != actual.ty.logical_type
-                // Only root false -> true admission widening is permitted.
-                // Nested nullable/dictionary/metadata facts remain exact below.
-                || (declared.ty.nullable && !actual.ty.nullable)
-                || !arrow_data_types_exact_borrowed_observed::<ResultDeclarationError>(
-                    &declared.ty.data_type,
-                    &actual.ty.data_type,
-                    || work.step().map_err(ResultDeclarationError::from),
+                // An immutable public guarantee is exact. Admission widening
+                // exists only inside the consumed prepublication owner.
+                || if allow_unpublished_root_widening {
+                    declared.ty.nullable() && !actual.ty.nullable()
+                } else {
+                    declared.ty.nullable() != actual.ty.nullable()
+                }
+                || !declared.ty.same_physical_binding_ignoring_root_nullability_observed(
+                    &actual.ty, || work.step().map_err(ResultDeclarationError::from),
                 )?
             {
                 return Err(ResultDeclarationError::Association(
-                    "source result declaration differs beyond root nullable admission",
+                    "source result declaration differs from its completed guarantee",
                 ));
             }
         }
@@ -216,5 +238,76 @@ fn alias_equal(
         (Some(a), Some(b)) => text_equal(a, b, work),
         (None, None) => Ok(true),
         _ => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+    use novarocks_physical_plan::{FragmentId, NodeId, OutputPort, ResultValueDomain, ValueId};
+    use novarocks_type_contract::FunctionValueType;
+
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert!(units <= 256);
+            Ok(())
+        }
+    }
+    fn port(ty: FunctionValueType) -> ResultPort {
+        ResultPort {
+            scalar_schema: None,
+            fragment: FragmentId::new(0),
+            output: OutputPort {
+                node: NodeId::new(1),
+                columns: Box::from([ValueId::new(2)]),
+            },
+            fields: Box::from([ResultField {
+                domain: ResultValueDomain::Plain,
+                name: "value".into(),
+                alias: Some("alias".into()),
+                value: ValueId::new(2),
+                ty,
+            }]),
+        }
+    }
+    #[test]
+    fn published_guarantee_is_exact_after_original_owner_admission() {
+        let version = PlanVersionId::try_new([5; 16]).unwrap();
+        let required = port(FunctionValueType::new(DataType::Int8, false));
+        let nullable = port(required.fields[0].ty.with_nullable(true).unwrap());
+        let admitted = SqlResultDeclaration::capture(version, required.clone())
+            .publish(version, &nullable, &Control)
+            .unwrap();
+        assert_eq!(admitted.checked_loan().original_port(), &nullable);
+        admitted
+            .recheck_observed(version, &nullable, &Control)
+            .unwrap();
+        assert!(matches!(
+            admitted.recheck_observed(version, &required, &Control),
+            Err(ResultDeclarationError::Association(
+                "source result declaration differs from its completed guarantee"
+            ))
+        ));
+        let unchanged = SqlResultDeclaration::capture(version, required.clone())
+            .publish(version, &required, &Control)
+            .unwrap();
+        // A published required guarantee cannot silently widen later either.
+        assert!(matches!(
+            unchanged.recheck_observed(version, &nullable, &Control),
+            Err(ResultDeclarationError::Association(
+                "source result declaration differs from its completed guarantee"
+            ))
+        ));
+        let different_carrier = port(FunctionValueType::new(DataType::Int16, true));
+        assert!(matches!(
+            SqlResultDeclaration::capture(version, required).publish(
+                version,
+                &different_carrier,
+                &Control
+            ),
+            Err(ResultDeclarationError::Association(_))
+        ));
     }
 }

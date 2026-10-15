@@ -167,7 +167,7 @@ fn tree_error(error: BTreeResourceError) -> TypeCodecError {
     }
 }
 
-struct Classification<'index, 'source, 'admit, A> {
+struct Classification<'index, 'source, 'admit, H> {
     index: &'index Index<'source>,
     flags: BTreeMap<Node, u8>,
     stack: Vec<Node>,
@@ -176,13 +176,17 @@ struct Classification<'index, 'source, 'admit, A> {
     lookup: usize,
     insertion: InsertionOnlyFacts,
     root_work: usize,
-    admit: &'admit mut A,
+    admit: &'admit mut dyn FnMut(
+        &TypeGraphDomainFacts,
+    ) -> Result<
+        (),
+        crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+    >,
 }
-impl<A> Classification<'_, '_, '_, A>
-where
-    A: FnMut(&TypeGraphDomainFacts) -> Result<(), CompileControlError>,
-{
-    fn gate(&mut self) -> Result<(), TypeCodecError> {
+impl<H> Classification<'_, '_, '_, H> {
+    fn gate(
+        &mut self,
+    ) -> Result<(), crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
         self.facts.cumulative_work_upper_bound = domain_work(
             self.facts.definitions,
             self.facts.graph_edges,
@@ -199,7 +203,7 @@ where
         &mut self,
         node: Node,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), TypeCodecError> {
+    ) -> Result<(), crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
         self.gate()?;
         work.flush()?;
         let found = match node {
@@ -208,13 +212,13 @@ where
         };
         work.step()?;
         work.flush()?;
-        found
+        found.map_err(Into::into)
     }
     fn bits(
         &mut self,
         node: Node,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<u8, TypeCodecError> {
+    ) -> Result<u8, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
         self.gate()?;
         work.flush()?;
         let bits = self.flags.get(&node).copied().unwrap_or(0);
@@ -228,7 +232,7 @@ where
         bit: u8,
         enqueue: bool,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), TypeCodecError> {
+    ) -> Result<(), crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
         self.valid_node(node, work)?;
         let previous = self.bits(node, work)?;
         if previous & bit == 0 {
@@ -253,7 +257,7 @@ where
         &mut self,
         domain: u8,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), TypeCodecError> {
+    ) -> Result<(), crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
         while let Some(node) = self.stack.pop() {
             work.step()?;
             self.gate()?;
@@ -278,14 +282,19 @@ where
 /// own allocations/work are a separate caller contribution. This component
 /// admits only its discovery flags/one reusable stack plus enumeration work;
 /// the caller supplies a complete retained union invoice and owns all tails.
-pub(super) fn prepare_domains<'source>(
+pub(super) fn prepare_domains_with_host<'source, H>(
     index: &Index<'source>,
     roots: &PackageTypeRootSources<'source>,
     package: &'source package_wire::FragmentPackage,
     source_bytes: usize,
-    admit: &mut impl FnMut(&TypeGraphDomainFacts) -> Result<(), CompileControlError>,
+    admit: &mut impl FnMut(
+        &TypeGraphDomainFacts,
+    ) -> Result<
+        (),
+        crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+    >,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<RootDomains<'source>, TypeCodecError> {
+) -> Result<RootDomains<'source>, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
     let definitions = index.vertex_count()?;
     let scratch = DomainScratchFacts::prepare(definitions)?;
     let insertion = scratch.insertion;
@@ -349,12 +358,14 @@ pub(super) fn prepare_domains<'source>(
     if !same_table {
         return Err(TypeCodecError::InvalidShape(
             "type graph roots and index have different tables",
-        ));
+        )
+        .into());
     }
     if source_floor > source_bytes {
         return Err(TypeCodecError::InvalidShape(
             "type graph domain source invoice is understated",
-        ));
+        )
+        .into());
     }
     state.gate()?;
     // Admit each newly exposed edge count before the completed header callback.
@@ -381,24 +392,23 @@ pub(super) fn prepare_domains<'source>(
     reservation.map_err(|_| CompileControlError::ResourceExhausted)?;
     work.step()?;
     work.flush()?;
-    roots.visit::<TypeCodecError>(
+    roots.visit::<crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>>(
         &mut |source, work| {
-            let root = match source {
-                PackageTypeRootSource::Value(value) => value
-                    .carrier_type_id
-                    .map(Node::Carrier)
-                    .ok_or(TypeCodecError::InvalidShape(
-                        "missing value root carrier reference",
-                    )),
-                PackageTypeRootSource::SchemaField { field_id, .. }
-                | PackageTypeRootSource::IpcField { field_id, .. } => Ok(Node::Field(field_id)),
-                PackageTypeRootSource::WriterField { binding, .. } => binding
-                    .field_id
-                    .map(Node::Field)
-                    .ok_or(TypeCodecError::InvalidShape(
-                        "missing writer root field reference",
-                    )),
-            };
+            let root =
+                match source {
+                    PackageTypeRootSource::Value(value) => {
+                        value.carrier_type_id.map(Node::Carrier).ok_or(
+                            TypeCodecError::InvalidShape("missing value root carrier reference"),
+                        )
+                    }
+                    PackageTypeRootSource::SchemaField { field_id, .. }
+                    | PackageTypeRootSource::IpcField { field_id, .. } => Ok(Node::Field(field_id)),
+                    PackageTypeRootSource::WriterField { binding, .. } => {
+                        binding.source_field_id.map(Node::Field).ok_or(
+                            TypeCodecError::InvalidShape("missing writer root field reference"),
+                        )
+                    }
+                };
             work.step()?;
             let node = root?;
             match source {
@@ -431,9 +441,31 @@ pub(super) fn prepare_domains<'source>(
     })
 }
 
+pub(super) fn prepare_domains<'source>(
+    index: &Index<'source>,
+    roots: &PackageTypeRootSources<'source>,
+    package: &'source package_wire::FragmentPackage,
+    source_bytes: usize,
+    admit: &mut impl FnMut(&TypeGraphDomainFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<RootDomains<'source>, TypeCodecError> {
+    prepare_domains_with_host::<std::convert::Infallible>(
+        index,
+        roots,
+        package,
+        source_bytes,
+        &mut |facts| admit(facts).map_err(Into::into),
+        work,
+    )
+    .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::{TypeProjectionLimits, root_sources::prepare_package_type_root_sources};
+    use super::super::{
+        TypeProjectionLimits,
+        root_sources::{TypeNamespace, prepare_package_type_root_sources_namespace_with_host},
+    };
     use super::*;
     use novarocks_type_contract::{CompilePhase, PureCompileControl};
     use package_wire::connector_write_input_shape::Kind;
@@ -492,8 +524,9 @@ mod tests {
     }
     fn binding(id: u32) -> package_wire::ConnectorWriteFieldBinding {
         package_wire::ConnectorWriteFieldBinding {
-            field_id: Some(id),
+            source_field_id: Some(id),
             field_token: vec![],
+            value_type_id: None,
         }
     }
     fn recipe(kind: Kind) -> package_wire::FrozenWriterRecipe {
@@ -509,10 +542,23 @@ mod tests {
     }
     fn fixture() -> package_wire::FragmentPackage {
         package_wire::FragmentPackage {
-            types: Some(wire::TypeTable {
-                carriers: vec![primitive(0), primitive(u32::MAX)],
-                fields: vec![field(0, 0), field(u32::MAX, u32::MAX)],
-                value_types: vec![],
+            source_fields: Some(wire::SourceFieldTable {
+                shape: Some(wire::TypeTable {
+                    logical_types: Vec::new(),
+                    carriers: vec![primitive(0), primitive(u32::MAX)],
+                    fields: vec![field(0, 0), field(u32::MAX, u32::MAX)],
+                    value_types: vec![],
+                }),
+                field_facts: vec![
+                    wire::SourceArrowFieldFacts {
+                        field_id: Some(0),
+                        ..Default::default()
+                    },
+                    wire::SourceArrowFieldFacts {
+                        field_id: Some(u32::MAX),
+                        ..Default::default()
+                    },
+                ],
             }),
             writes: vec![data(vec![binding(0)])],
             ..Default::default()
@@ -522,9 +568,23 @@ mod tests {
         package: &'s package_wire::FragmentPackage,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(Index<'s>, PackageTypeRootSources<'s>), TypeCodecError> {
-        let roots = prepare_package_type_root_sources(package, SOURCE, &mut |_| Ok(()), work)?;
+        let roots =
+            prepare_package_type_root_sources_namespace_with_host::<std::convert::Infallible>(
+                package,
+                TypeNamespace::Source,
+                SOURCE,
+                &mut |_| Ok(()),
+                work,
+            )
+            .map_err(crate::host_projection_v2::ProjectionFailure::without_host)?;
         let index = Index::prepare_observed(
-            package.types.as_ref().unwrap(),
+            package
+                .source_fields
+                .as_ref()
+                .unwrap()
+                .shape
+                .as_ref()
+                .unwrap(),
             TypeProjectionLimits {
                 max_definitions: 20_000,
                 max_expanded_nodes: 100_000,
@@ -560,16 +620,27 @@ mod tests {
     #[test]
     fn five_writer_roles_strict_roots_intersection_and_unused_sparse_definitions() {
         let mut package = fixture();
-        let table = package.types.as_mut().unwrap();
+        let table = package
+            .source_fields
+            .as_mut()
+            .unwrap()
+            .shape
+            .as_mut()
+            .unwrap();
         table.fields = (0..8)
             .map(|id| field(id, 0))
             .chain([field(u32::MAX, u32::MAX)])
             .collect();
-        table.value_types = vec![wire::ValueTypeDefinition {
-            id: u32::MAX,
-            carrier_type_id: Some(0),
-            ..Default::default()
-        }];
+        // Source shapes contain no execution Value roots.
+        let field_facts = table
+            .fields
+            .iter()
+            .map(|field| wire::SourceArrowFieldFacts {
+                field_id: Some(field.id),
+                ..Default::default()
+            })
+            .collect();
+        package.source_fields.as_mut().unwrap().field_facts = field_facts;
         package.writes = vec![
             data(vec![binding(0)]),
             recipe(Kind::RowLineage(
@@ -599,11 +670,18 @@ mod tests {
         package.schemas = vec![package_wire::SchemaDefinition {
             id: 0,
             field_ids: vec![2, 2],
-            metadata: vec![],
         }];
         package.constants = vec![
             package_wire::IpcConstantPool {
-                field_id: Some(4),
+                source_field_id: Some(2),
+                ..Default::default()
+            },
+            package_wire::IpcConstantPool {
+                source_field_id: Some(2),
+                ..Default::default()
+            },
+            package_wire::IpcConstantPool {
+                source_field_id: Some(4),
                 ..Default::default()
             },
             package_wire::IpcConstantPool::default(),
@@ -613,7 +691,7 @@ mod tests {
         let (index, roots) = prerequisites(&package, &mut work).unwrap();
         let domains =
             prepare_domains(&index, &roots, &package, SOURCE, &mut |_| Ok(()), &mut work).unwrap();
-        assert_eq!(domains.facts().root_occurrences, 12);
+        assert_eq!(domains.facts().root_occurrences, 11);
         assert_eq!(domains.facts().graph_edges, 9);
         for id in 0..8 {
             assert!(domains.writer(&index, Node::Field(id)).unwrap());
@@ -634,7 +712,13 @@ mod tests {
     #[test]
     fn writer_wide_5000_is_reachability_and_metadata_20000_is_not_a_law_grant() {
         let mut package = fixture();
-        let table = package.types.as_mut().unwrap();
+        let table = package
+            .source_fields
+            .as_mut()
+            .unwrap()
+            .shape
+            .as_mut()
+            .unwrap();
         table.carriers = vec![
             wire::CarrierTypeDefinition {
                 id: 0,
@@ -651,10 +735,23 @@ mod tests {
             .map(|id| field(id, 7))
             .chain([field(0, 0)])
             .collect();
-        table.fields[5000].metadata = vec![novarocks_proto_models::plan::ArrowFieldMetadataEntry {
-            key: "metadata".into(),
-            value: "x".repeat(20_000),
-        }];
+        let field_facts = table
+            .fields
+            .iter()
+            .map(|field| wire::SourceArrowFieldFacts {
+                field_id: Some(field.id),
+                metadata: if field.id == 0 {
+                    vec![novarocks_proto_models::plan::ArrowFieldMetadataEntry {
+                        key: "metadata".into(),
+                        value: "x".repeat(20_000),
+                    }]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            })
+            .collect();
+        package.source_fields.as_mut().unwrap().field_facts = field_facts;
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
         let (index, roots) = prerequisites(&package, &mut work).unwrap();
@@ -671,14 +768,14 @@ mod tests {
             assert!(!only_writer.strict(&index, node).unwrap());
         }
         assert!(only_writer.strict(&index, Node::Carrier(u32::MAX)).unwrap());
-        // The same raw Field root becomes strict via the original schema root.
+        // The same Source Field becomes strict via an actual IPC source occurrence.
         let mut intersection_package = package.clone();
         intersection_package
-            .schemas
-            .push(package_wire::SchemaDefinition {
+            .constants
+            .push(package_wire::IpcConstantPool {
                 id: 0,
-                field_ids: vec![0],
-                metadata: vec![],
+                source_field_id: Some(0),
+                ..Default::default()
             });
         let (index, roots) = prerequisites(&intersection_package, &mut work).unwrap();
         let both = prepare_domains(
@@ -698,8 +795,15 @@ mod tests {
     #[test]
     fn cycles_terminate_without_acyclic_certification_and_dangling_roots_refuse() {
         let mut package = fixture();
-        package.types.as_mut().unwrap().carriers[0].kind =
-            Some(wire::carrier_type_definition::Kind::ListFieldId(0));
+        package
+            .source_fields
+            .as_mut()
+            .unwrap()
+            .shape
+            .as_mut()
+            .unwrap()
+            .carriers[0]
+            .kind = Some(wire::carrier_type_definition::Kind::ListFieldId(0));
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
         let (index, roots) = prerequisites(&package, &mut work).unwrap();
@@ -709,15 +813,22 @@ mod tests {
         assert!(!domains.strict(&index, Node::Carrier(0)).unwrap());
         assert_eq!(domains.facts().graph_edges, 3);
         let mut dangling = package.clone();
-        dangling.types.as_mut().unwrap().carriers[0].kind =
-            Some(wire::carrier_type_definition::Kind::ListFieldId(9));
+        dangling
+            .source_fields
+            .as_mut()
+            .unwrap()
+            .shape
+            .as_mut()
+            .unwrap()
+            .carriers[0]
+            .kind = Some(wire::carrier_type_definition::Kind::ListFieldId(9));
         assert!(matches!(
             invoke(&dangling, &Control::default()),
             Err(TypeCodecError::InvalidShape("dangling field reference"))
         ));
         let mut missing = fixture();
         if let Some(Kind::Data(input)) = missing.writes[0].input.as_mut().unwrap().kind.as_mut() {
-            input.fields[0].field_id = None;
+            input.fields[0].source_field_id = None;
         }
         assert!(matches!(
             invoke(&missing, &Control::default()),
@@ -725,15 +836,58 @@ mod tests {
                 "missing writer root field reference"
             ))
         ));
-        let mut missing_value = fixture();
-        missing_value
-            .types
-            .as_mut()
-            .unwrap()
-            .value_types
-            .push(wire::ValueTypeDefinition::default());
+        // A present IPC source ID must resolve in the Source field namespace.
+        let mut missing_ipc = fixture();
+        missing_ipc.constants.push(package_wire::IpcConstantPool {
+            source_field_id: Some(99),
+            ..Default::default()
+        });
         assert!(matches!(
-            invoke(&missing_value, &Control::default()),
+            invoke(&missing_ipc, &Control::default()),
+            Err(TypeCodecError::InvalidShape("dangling field reference"))
+        ));
+        // Preserve the original missing Value carrier negative in its actual
+        // Execution namespace rather than placing semantic entries in Source.
+        let missing_value = package_wire::FragmentPackage {
+            types: Some(wire::TypeTable {
+                carriers: vec![primitive(0)],
+                fields: vec![],
+                value_types: vec![wire::ValueTypeDefinition::default()],
+                logical_types: vec![],
+            }),
+            ..Default::default()
+        };
+        let value_roots =
+            prepare_package_type_root_sources_namespace_with_host::<std::convert::Infallible>(
+                &missing_value,
+                TypeNamespace::Execution,
+                SOURCE,
+                &mut |_| Ok(()),
+                &mut work,
+            )
+            .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+            .unwrap();
+        let value_index = Index::prepare_observed(
+            missing_value.types.as_ref().unwrap(),
+            TypeProjectionLimits {
+                max_definitions: 20000,
+                max_expanded_nodes: 100000,
+                max_string_bytes: 1 << 25,
+            },
+            SOURCE,
+            &mut |_| Ok(()),
+            &mut work,
+        )
+        .unwrap();
+        assert!(matches!(
+            prepare_domains(
+                &value_index,
+                &value_roots,
+                &missing_value,
+                SOURCE,
+                &mut |_| Ok(()),
+                &mut work
+            ),
             Err(TypeCodecError::InvalidShape(
                 "missing value root carrier reference"
             ))
@@ -924,7 +1078,15 @@ mod tests {
         let success_trace = success.trace();
         assert!(success_trace.iter().any(|&units| units > 0));
         let mut ordinary = fixture();
-        ordinary.types.as_mut().unwrap().fields[0].carrier_type_id = Some(99);
+        ordinary
+            .source_fields
+            .as_mut()
+            .unwrap()
+            .shape
+            .as_mut()
+            .unwrap()
+            .fields[0]
+            .carrier_type_id = Some(99);
         let failure = Control::default();
         assert!(matches!(
             invoke(&ordinary, &failure),

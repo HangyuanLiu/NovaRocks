@@ -144,12 +144,12 @@ impl TypedConnectorScanShared {
     /// Turn one read chunk into the node's output chunk.
     ///
     /// Ordinary output was already checked and retagged by its page converter.
-    fn materialize_output(&self, chunk: Chunk) -> Result<Chunk, String> {
-        materialize_output(
-            self.output_materialization.as_ref(),
-            &self.output_schema,
-            chunk,
-        )
+    fn materialize_output(
+        &self,
+        chunk: Chunk,
+        factory: &dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<Chunk> {
+        materialize_output(self.output_materialization.as_ref(), chunk, factory)
     }
 
     /// Fail fast on a cancelled or expired attempt, before any provider call.
@@ -169,15 +169,13 @@ impl TypedConnectorScanShared {
 /// Ordinary output was already checked and retagged by its page converter.
 fn materialize_output(
     materialization: Option<&OutputMaterialization>,
-    output_schema: &ChunkSchemaRef,
     chunk: Chunk,
-) -> Result<Chunk, String> {
+    factory: &dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
+) -> novarocks_execution::runtime::fragment::ExecutionResult<Chunk> {
     let Some(materialization) = materialization else {
         return Ok(chunk);
     };
-    let batch = materialization.transform.transform(chunk.batch)?;
-    Chunk::try_new_with_chunk_schema(batch, Arc::clone(output_schema))
-        .map_err(|error| error.to_string())
+    materialization.transform.transform(chunk, factory)
 }
 
 /// Emit one connector-reader evidence marker, behind the shared test gate.
@@ -576,12 +574,12 @@ struct TypedSystemTableScanShared {
 }
 
 impl TypedSystemTableScanShared {
-    fn materialize_output(&self, chunk: Chunk) -> Result<Chunk, String> {
-        materialize_output(
-            self.output_materialization.as_ref(),
-            &self.output_schema,
-            chunk,
-        )
+    fn materialize_output(
+        &self,
+        chunk: Chunk,
+        factory: &dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<Chunk> {
+        materialize_output(self.output_materialization.as_ref(), chunk, factory)
     }
 
     /// Fail fast on a cancelled or expired attempt, before any provider call.

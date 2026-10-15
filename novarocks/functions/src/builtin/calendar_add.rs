@@ -61,17 +61,17 @@ pub(super) fn evaluate_day_shift<'a>(
             return Err(invalid("day shift requires its exact two value arguments"));
         };
         let target = input.target;
-        let expected_result = if date_type.data_type == DataType::Date32 {
+        let expected_result = if date_type.data_type() == &DataType::Date32 {
             DataType::Date32
         } else {
             DataType::Timestamp(TimeUnit::Microsecond, None)
         };
-        if target.logical_type != ValueLogicalType::Physical
-            || !target.nullable
-            || interval_type.logical_type != ValueLogicalType::Physical
-            || interval_type.data_type != DataType::Int64
+        if target.logical_type() != ValueLogicalType::Physical
+            || !target.nullable()
+            || interval_type.logical_type() != ValueLogicalType::Physical
+            || interval_type.data_type() != &DataType::Int64
             || interval_arg.array().data_type() != &DataType::Int64
-            || (!input.legacy && target.data_type != expected_result)
+            || (!input.legacy && *target.data_type() != expected_result)
         {
             return Err(invalid("day shift differs from its exact declared profile"));
         }
@@ -99,7 +99,8 @@ pub(super) fn evaluate_day_shift<'a>(
             }
             let date_null = date_arg.array().is_null(date_row);
             let interval_null = intervals.is_null(interval_row);
-            if (date_null && !date_type.nullable) || (interval_null && !interval_type.nullable) {
+            if (date_null && !date_type.nullable()) || (interval_null && !interval_type.nullable())
+            {
                 return Err(internal("day shift non-null source contains SQL NULL"));
             }
             work.step()?;
@@ -142,7 +143,7 @@ pub(super) fn evaluate_day_shift<'a>(
             work.flush()?;
             for value in values {
                 projected.push(
-                    value.and_then(|date| timestamp_value_for_type(date, &target.data_type).ok()),
+                    value.and_then(|date| timestamp_value_for_type(date, target.data_type()).ok()),
                 );
                 work.step()?;
             }

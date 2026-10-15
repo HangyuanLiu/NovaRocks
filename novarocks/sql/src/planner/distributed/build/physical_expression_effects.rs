@@ -643,7 +643,7 @@ fn primitive_own_effects(
         } => {
             if !arrow_data_types_exact_observed::<PhysicalExpressionEffectsError>(
                 target,
-                &source.ty.data_type,
+                &source.ty.data_type(),
                 || work.step().map_err(Into::into),
             )? {
                 return Err(PhysicalExpressionEffectsError::InvalidSource(
@@ -667,8 +667,8 @@ fn primitive_own_effects(
             )
             .map_err(|error| match error {
                 CastPrepareError::Unsupported => PhysicalExpressionEffectsError::UnsupportedCast {
-                    from: child.ty.data_type.clone(),
-                    to: source.ty.data_type.clone(),
+                    from: child.ty.data_type().clone(),
+                    to: source.ty.data_type().clone(),
                 },
                 other => other.into(),
             })?;

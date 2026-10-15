@@ -499,15 +499,6 @@ fn flatten_homogeneous_union_all(
     scalars: &mut ScalarArena,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<Option<OptExpr>, crate::compiler::SqlCompileError> {
-    enum CompareError {
-        Control(novarocks_type_contract::CompileControlError),
-        Type(novarocks_type_contract::ValueTypeError),
-    }
-    impl From<novarocks_type_contract::ValueTypeError> for CompareError {
-        fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
-            Self::Type(error)
-        }
-    }
     work.step()?;
     let control = work.control();
     let LogicalPlanKind::Union(root) = &plan.kind else {
@@ -557,18 +548,12 @@ fn flatten_homogeneous_union_all(
         }
         for (child, output) in columns.iter().zip(&root.output_columns) {
             work.step()?;
-            if child.value_type.logical_type != output.value_type.logical_type
-                || !novarocks_type_contract::arrow_data_types_exact_observed::<CompareError>(
-                    &child.value_type.data_type,
-                    &output.value_type.data_type,
-                    || work.step().map_err(CompareError::Control),
-                )
-                .map_err(|error| match error {
-                    CompareError::Control(error) => crate::compiler::SqlCompileError::from(error),
-                    CompareError::Type(error) => {
-                        crate::compiler::SqlCompileError::Compilation(error.to_string())
-                    }
-                })?
+            if !child
+                .value_type
+                .same_physical_binding_ignoring_root_nullability_observed(
+                    &output.value_type,
+                    || work.step().map_err(crate::compiler::SqlCompileError::from),
+                )?
             {
                 return Ok(None);
             }

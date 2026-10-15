@@ -131,7 +131,7 @@ fn prefixes<T>(run: impl Fn(&Control) -> Result<T, ConstantError>) {
 }
 
 #[test]
-fn nested_long_metadata_remains_unordered_exact_and_selected_value_equality_is_not_pool_identity() {
+fn nested_source_attributes_are_counted_but_selected_equality_uses_complete_binding() {
     let left_child = child(false, false, false);
     let right_child = child(true, false, false);
     let left = admit(
@@ -166,8 +166,7 @@ fn nested_long_metadata_remains_unordered_exact_and_selected_value_equality_is_n
         .value(0)
         .unwrap();
         assert!(
-            !left
-                .equals_observed(&other, PHASE, &Control::default())
+            left.equals_observed(&other, PHASE, &Control::default())
                 .unwrap()
         );
         prefixes(|control| left.equals_observed(&other, PHASE, control));
@@ -218,11 +217,9 @@ fn borrowed_constructor_comparisons_keep_both_exact_type_gates_and_original_cont
             control,
         )
     };
-    assert!(matches!(
-        run(&Control::default()),
-        Err(ConstantError::Invalid(
-            "constant field differs from exact value carrier"
-        ))
-    ));
+    assert!(
+        run(&Control::default()).is_ok(),
+        "source attribute changes cannot alter the complete typed binding"
+    );
     prefixes(run);
 }

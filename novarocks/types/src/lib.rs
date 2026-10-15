@@ -40,10 +40,7 @@ pub mod value;
 pub use cluster_role::ClusterRole;
 pub use coercion::{comparison_common_type, undecorated_nested_type, wider_type};
 pub use engine_error_codes::EngineErrorCode;
-pub use field_render::{
-    format_mysql_container_value_with_schema, http_json_row_from_arrays_with_primitives,
-    is_zero_date_sentinel_date32, mysql_text_row_from_arrays_with_primitives,
-};
+pub use field_render::is_zero_date_sentinel_date32;
 pub use field_render_schema::FieldRenderSchema;
 pub use identity::{
     AttemptId, BackendProcessId, BackendProcessIdentityError, ExecutionIdentityError,
@@ -64,5 +61,10 @@ pub use slot_id::SlotId;
 /// shared process-independent sizing contract.
 pub const WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
+mod execution_value_type;
+pub use execution_value_type::{
+    ExecutionColumnTypeError, execution_value_type_from_declaration, sql_type_from_execution_value,
+    sql_type_from_execution_value_observed, validate_execution_declaration_observed,
+};
 mod column_value_type;
 pub use column_value_type::{ColumnValueTypeError, sql_type_from_value_type};

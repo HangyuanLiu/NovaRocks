@@ -339,10 +339,10 @@ fn validate_scan(scan: &PlanScanNode) -> Result<(), String> {
         Some(SqlScanKind::Delta { .. }) => match action_columns.as_slice() {
             [] => Err(format!("Delta-bound scan {fqn} missing action column")),
             [col] => {
-                if col.value_type.data_type != DataType::Int8 {
+                if *col.value_type.data_type() != DataType::Int8 {
                     return Err(format!("Delta-bound scan {fqn} has non-Int8 action column"));
                 }
-                if col.value_type.nullable {
+                if col.value_type.nullable() {
                     return Err(format!("Delta-bound scan {fqn} has nullable action column"));
                 }
                 // V7: _row_id must be present so the apply-key projection can reference it.
@@ -478,8 +478,8 @@ mod tests {
         let col = ImvActionColumn::output_column(ColumnId(7));
         assert_eq!(col.column_id, ColumnId(7));
         assert_eq!(col.name, "__change_op");
-        assert_eq!(col.value_type.data_type, DataType::Int8);
-        assert!(!col.value_type.nullable);
+        assert_eq!(col.value_type.data_type().clone(), DataType::Int8);
+        assert!(!col.value_type.nullable());
         assert!(col.is_internal);
     }
 
@@ -663,7 +663,12 @@ mod tests {
     #[test]
     fn validation_rejects_non_int8_action_column() {
         let mut bad = ImvActionColumn::output_column(ColumnId(100));
-        bad.value_type.data_type = DataType::Int64;
+        bad.value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            DataType::Int64,
+            bad.value_type.nullable(),
+            bad.value_type.logical_type(),
+        )
+        .unwrap();
         let plan = scan_plan(delta_scan_with(Some(bad)));
         let err = validate(&plan).expect_err("non-Int8 must fail");
         assert!(err.contains("non-Int8"), "got: {err}");
@@ -672,7 +677,7 @@ mod tests {
     #[test]
     fn validation_rejects_nullable_action_column() {
         let mut bad = ImvActionColumn::output_column(ColumnId(100));
-        bad.value_type.nullable = true;
+        bad.value_type = bad.value_type.with_nullable(true).unwrap();
         let plan = scan_plan(delta_scan_with(Some(bad)));
         let err = validate(&plan).expect_err("nullable must fail");
         assert!(err.contains("nullable"), "got: {err}");

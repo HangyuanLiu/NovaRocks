@@ -69,12 +69,17 @@ pub fn admitted_change_facts(
 /// Assemble the one canonical rewrite value from already frozen D/L/P/C and
 /// provider facts. Runtime handles and a second Current observation are not
 /// accepted at this boundary.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen MV context retains independent source schema, complete types and original publication facts."
+)]
 pub fn build_neutral_refresh_rewrite_context(
     projection: Arc<StoredMvProjection>,
     current: Vec<MvRewriteSourceSnapshot>,
     previous: Vec<MvRewriteSourceSnapshot>,
     target_table_uuid: String,
     target_arrow_schema: arrow::datatypes::SchemaRef,
+    target_write_fields: Arc<[novarocks_spi::connector::ConnectorWriteFieldRequest]>,
     exact_target: MvExactTargetSchemaFacts,
     analysis: MvRewriteAnalysisFacts,
 ) -> Result<Arc<IcebergMvRewriteContext>, String> {
@@ -84,6 +89,7 @@ pub fn build_neutral_refresh_rewrite_context(
         previous,
         target_table_uuid,
         target_arrow_schema,
+        target_write_fields,
         exact_target,
         analysis,
     )
@@ -155,6 +161,7 @@ pub(crate) fn freeze_refresh_rewrite_context(
         )?,
         inputs.target_binding.table_uuid().to_string(),
         inputs.target_binding.physical_write_schema()?,
+        inputs.target_binding.write_input_fields()?,
         inputs.target_observation.exact_schema().clone(),
         analysis,
     )
@@ -253,7 +260,7 @@ pub(crate) fn observe_and_admit_change_window_for_table(
     }
     let scan = crate::connector::scan_admission::admit_connector_change_window(
         &metadata.table,
-        &metadata.schema,
+        &metadata.schema(),
         &exact_lease,
         connector_context.clone(),
         window,

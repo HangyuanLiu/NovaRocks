@@ -29,6 +29,17 @@ use novarocks_type_contract::{
 };
 use std::sync::{Arc, Mutex};
 
+fn replace_argument_type(
+    types: &mut novarocks_type_contract::FunctionArgumentTypes,
+    index: usize,
+    replacement: FunctionArgumentType,
+) {
+    let mut revised = types.to_vec();
+    revised[index] = replacement;
+    *types =
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(revised.into_boxed_slice());
+}
+
 #[test]
 fn e08s1_append_static_full_original_source_nullability_and_delayed_suffix_are_admitted() {
     let original = builtin_sql_function_catalog().snapshot();
@@ -50,14 +61,19 @@ fn e08s1_append_static_full_original_source_nullability_and_delayed_suffix_are_a
             for left in [false, true] {
                 for right in [false, true] {
                     let mut full = binding.clone();
+                    let mut revised = full.selected.argument_types.to_vec();
                     for (index, nullable) in [left, right].into_iter().enumerate() {
-                        let FunctionArgumentType::Value(ty) =
-                            &mut full.selected.argument_types[index]
-                        else {
+                        let FunctionArgumentType::Value(ty) = &mut revised[index] else {
                             unreachable!()
                         };
-                        ty.nullable = nullable;
+                        *ty = ty
+                            .with_nullable(nullable)
+                            .expect("valid test root nullability");
                     }
+                    full.selected.argument_types =
+                        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                            revised.into_boxed_slice(),
+                        );
                     // Selected type-only probe, not a replacement source or an execution contract.
                     scoped
                         .admit_bound_lifecycle_observed(&full, PureCallLifecycle::Scalar, &control)
@@ -88,7 +104,11 @@ fn e08s1_append_static_refuses_stale_complete_profile_before_any_preparation() {
                 .unwrap(),
         ] {
             let mut changed = binding.clone();
-            changed.selected.argument_types[index] = FunctionArgumentType::Value(ty);
+            replace_argument_type(
+                &mut changed.selected.argument_types,
+                index,
+                FunctionArgumentType::Value(ty),
+            );
             stale.push(changed);
         }
     }
@@ -103,17 +123,23 @@ fn e08s1_append_static_refuses_stale_complete_profile_before_any_preparation() {
         stale.push(changed);
     }
     let mut relation = binding.clone();
-    relation.selected.result_type =
-        FunctionResultType::Relation(Box::new([FunctionValueType::new(DataType::Utf8, true)]));
+    relation.selected.result_type = FunctionResultType::Relation(
+        novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(Box::new([
+            FunctionValueType::new(DataType::Utf8, true),
+        ])),
+    );
     stale.push(relation);
     let mut one = binding.clone();
-    one.selected.argument_types = one.selected.argument_types[..1].to_vec().into_boxed_slice();
+    one.selected.argument_types = novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+        one.selected.argument_types[..1].to_vec().into_boxed_slice(),
+    );
     one.logical_argument_count = 1;
     stale.push(one);
     let mut three = binding.clone();
     let mut types = three.selected.argument_types.to_vec();
     types.push(types[0].clone());
-    three.selected.argument_types = types.into_boxed_slice();
+    three.selected.argument_types =
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(types.into_boxed_slice());
     three.logical_argument_count = 3;
     stale.push(three);
     for changed in stale {

@@ -113,6 +113,15 @@ fn group_layout() -> Result<Layout, HashMapResourceError> {
 pub fn fresh_table_layout<K, V>(
     unique_count: usize,
 ) -> Result<FreshTableFacts, HashMapResourceError> {
+    table_allocation_shape::<K, V>(unique_count)
+}
+
+// ONE RawTable capacity_to_buckets/TableLayout implementation is shared by
+// fresh construction and the independent incremental operation upper bound.
+// This numerical shape alone never establishes metadata origin or custody.
+fn table_allocation_shape<K, V>(
+    unique_count: usize,
+) -> Result<FreshTableFacts, HashMapResourceError> {
     let group = group_layout()?;
     if unique_count == 0 {
         return Ok(FreshTableFacts {
@@ -168,6 +177,101 @@ pub fn fresh_table_layout<K, V>(
         allocation_requests_upper_bound: 1,
         request_bytes_upper_bound: size,
     })
+}
+
+/// ONE original fresh std map, no reserve/removal/shrink, with exactly the
+/// supplied number of unique insertion occurrences. The source author has
+/// already distinguished duplicates. Emits each actual locked growth table
+/// separately, with whether it is the final retained table. Neither this
+/// sequence nor a Layout alone establishes an arbitrary map's source origin.
+pub fn original_fresh_unique_insert_tables_observed<K, V, E>(
+    unique_count: usize,
+    mut observe: impl FnMut() -> Result<(), E>,
+    mut allocation: impl FnMut(FreshTableFacts, bool) -> Result<(), E>,
+) -> Result<(), E>
+where
+    E: From<HashMapResourceError>,
+{
+    let mut len = 0_usize;
+    let mut capacity = 0_usize;
+    while len < unique_count {
+        observe()?;
+        if len == capacity {
+            let table =
+                table_allocation_shape::<K, V>(add(len, 1).map_err(E::from)?).map_err(E::from)?;
+            // hashbrown0.17 buckets_to_capacity: small tables keep one empty
+            // bucket; larger tables use the original 7/8 load factor.
+            capacity = if table.buckets < 8 {
+                table.buckets - 1
+            } else {
+                table.buckets / 8 * 7
+            };
+            allocation(table, capacity >= unique_count)?;
+        }
+        len = add(len, 1).map_err(E::from)?;
+    }
+    Ok(())
+}
+
+/// Cumulative opaque allocation upper bound of empty std HashMap followed
+/// by at most `max_entries` incremental insertion occurrences, without remove,
+/// reserve, shrink or mutable escape. This is an operation bound, not the
+/// fresh-reservation contract, an allocation measurement or an origin receipt.
+/// The prospective powers-of-two table shapes cover every actual RawTable
+/// growth threshold (load factor 7/8) and its old/new table coexistence.
+/// Caller control observes each actual prospective calculation, preserves its
+/// first nominal refusal, and receives no synthetic completed insertion work.
+pub fn incremental_insert_allocation_upper_bound_observed<K, V, E>(
+    max_entries: usize,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<usize, E>
+where
+    E: From<HashMapResourceError>,
+{
+    if max_entries == 0 {
+        return Ok(0);
+    }
+    let mut entries = 1;
+    let mut bytes = 0;
+    loop {
+        observe()?;
+        let shape = table_allocation_shape::<K, V>(entries).map_err(E::from)?;
+        bytes = add(bytes, shape.request_bytes_upper_bound).map_err(E::from)?;
+        if entries == max_entries {
+            return Ok(bytes);
+        }
+        entries = mul(entries, 2).map_err(E::from)?.min(max_entries);
+    }
+}
+
+/// Allocation upper bound for ONE prospective unique insertion into an owned
+/// std HashMap which has no intervening reserve/shrink/remove operation. The
+/// owner supplies actual public len/capacity solely to select whether this
+/// insertion can grow. They establish neither retained bytes nor provenance.
+/// The same sole RawTable shape describes the new table; the old table remains
+/// held by its original owner during insert and is released after actual growth.
+/// This is not the cumulative insertion-history bound.
+pub fn next_insert_allocation_upper_bound_observed<K, V, E>(
+    len: usize,
+    capacity: usize,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<usize, E>
+where
+    E: From<HashMapResourceError>,
+{
+    observe()?;
+    if len > capacity {
+        return Err(E::from(SourceModel(
+            "HashMap insertion length exceeds capacity",
+        )));
+    }
+    if len < capacity {
+        return Ok(0);
+    }
+    let next = add(len, 1).map_err(E::from)?;
+    Ok(table_allocation_shape::<K, V>(next)
+        .map_err(E::from)?
+        .request_bytes_upper_bound)
 }
 
 /// Only std String/&str keys and std RandomState/SipHasher13, not arbitrary
@@ -291,3 +395,53 @@ pub fn source_iterator_work_upper_bound(
 #[cfg(test)]
 #[path = "hashmap/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod next_insert_operation_tests {
+    use super::*;
+    #[test]
+    fn next_growth_tracks_real_owned_map_spare_without_rebilling_history() {
+        let mut map = std::collections::HashMap::<u32, u32>::new();
+        let mut actual_grows = 0;
+        for key in 0..32 {
+            let len = map.len();
+            let capacity = map.capacity();
+            let bound =
+                next_insert_allocation_upper_bound_observed::<u32, u32, HashMapResourceError>(
+                    len,
+                    capacity,
+                    || Ok(()),
+                )
+                .unwrap();
+            map.insert(key, key);
+            if map.capacity() != capacity {
+                actual_grows += 1;
+                assert!(bound > 0);
+            } else {
+                assert_eq!(bound, 0);
+            }
+        }
+        assert!(actual_grows > 1);
+    }
+    #[test]
+    fn next_growth_preserves_first_observer_refusal_without_tail() {
+        #[derive(Debug, PartialEq)]
+        enum Failure {
+            Host,
+            Model(HashMapResourceError),
+        }
+        impl From<HashMapResourceError> for Failure {
+            fn from(error: HashMapResourceError) -> Self {
+                Self::Model(error)
+            }
+        }
+        let mut calls = 0;
+        let error = next_insert_allocation_upper_bound_observed::<u32, u32, Failure>(0, 0, || {
+            calls += 1;
+            Err(Failure::Host)
+        })
+        .unwrap_err();
+        assert_eq!(error, Failure::Host);
+        assert_eq!(calls, 1);
+    }
+}

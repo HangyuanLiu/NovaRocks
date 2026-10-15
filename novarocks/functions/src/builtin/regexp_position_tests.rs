@@ -70,7 +70,7 @@ fn regexp_position_actual_instance_every_checkpoint_preserves_seven_causes_and_l
     ];
     let sources = arrays
         .iter()
-        .map(|a| FunctionValueType::new(a.data_type().clone(), true))
+        .map(|a| FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true))
         .collect::<Vec<_>>();
     let prepared = prepared(&sources);
     let rows = [0, 1, 2];
@@ -173,7 +173,9 @@ fn regexp_position_each_carrier_has_its_own_compact_scalar_and_constant_address(
     ];
     let sources = arguments
         .iter()
-        .map(|a| FunctionValueType::new(a.array().data_type().clone(), false))
+        .map(|a| {
+            FunctionValueType::from_legacy_declared_projection(a.array().data_type().clone(), false)
+        })
         .collect::<Vec<_>>();
     let out = ScalarEvaluationInstance::instantiate(prepared(&sources))
         .unwrap()

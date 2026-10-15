@@ -130,7 +130,10 @@ pub(crate) fn append_union_roots<R: DerivedSlotRoot>(
     control: &dyn PureCompileControl,
 ) -> Result<(), FragmentCompileError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let outcome = append(roots, minted, domains, uses, bindings, slots, &mut work);
+    let outcome = append::<R, std::convert::Infallible>(
+        roots, minted, domains, uses, bindings, slots, &mut work, None,
+    )
+    .map_err(crate::FragmentCreationError::into_compile);
     if matches!(&outcome, Err(FragmentCompileError::Control(_))) {
         return outcome;
     }
@@ -138,7 +141,34 @@ pub(crate) fn append_union_roots<R: DerivedSlotRoot>(
     outcome
 }
 
-fn append<R: DerivedSlotRoot>(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "original derived-root inputs and actual scratch port remain explicit"
+)]
+pub(crate) fn append_union_roots_with_creator<R: DerivedSlotRoot, H>(
+    roots: &[R],
+    minted: &BTreeSet<ExpressionUseId>,
+    domains: &mut Vec<ExpressionEvaluationDomain>,
+    uses: &mut Vec<ProgramExpressionUse>,
+    bindings: &mut Vec<ProgramRootUseBinding>,
+    slots: &mut Vec<ProgramSlotBinding>,
+    temporary: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+    control: &dyn PureCompileControl,
+) -> Result<(), crate::FragmentCreationError<H>> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let outcome = append(
+        roots,
+        minted,
+        domains,
+        uses,
+        bindings,
+        slots,
+        &mut work,
+        Some(temporary),
+    );
+    crate::creation::finish_attempt(outcome, work)
+}
+fn append<R: DerivedSlotRoot, H>(
     roots: &[R],
     minted: &BTreeSet<ExpressionUseId>,
     domains: &mut Vec<ExpressionEvaluationDomain>,
@@ -146,7 +176,8 @@ fn append<R: DerivedSlotRoot>(
     bindings: &mut Vec<ProgramRootUseBinding>,
     slots: &mut Vec<ProgramSlotBinding>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), FragmentCompileError> {
+    mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<(), crate::FragmentCreationError<H>> {
     let domain_count = count(domains.len(), roots.len(), MAX_CONTROL_DEFINITIONS)?;
     let use_count = count(uses.len(), roots.len(), MAX_CONTROL_USE_REFERENCES)?;
     let binding_count = count(bindings.len(), roots.len(), MAX_CONTROL_USE_REFERENCES)?;
@@ -177,7 +208,23 @@ fn append<R: DerivedSlotRoot>(
         return Ok(());
     }
 
+    if let Some(c) = crate::creation::borrow_scope(&mut temporary) {
+        crate::creation::request(
+            Layout::array::<bool>(domain_count)
+                .map_err(|_| CompileControlError::ResourceExhausted)?,
+            c,
+            work,
+        )?;
+    }
     let mut occupied_domains = occupancy(domain_count, work)?;
+    if let Some(c) = crate::creation::borrow_scope(&mut temporary) {
+        crate::creation::request(
+            Layout::array::<bool>(use_candidates)
+                .map_err(|_| CompileControlError::ResourceExhausted)?,
+            c,
+            work,
+        )?;
+    }
     let mut occupied_uses = occupancy(use_candidates, work)?;
     for domain in domains.iter() {
         if let Ok(index) = usize::try_from(domain.id.get())
@@ -196,9 +243,65 @@ fn append<R: DerivedSlotRoot>(
         }
         work.step()?;
     }
+    if let Some(c) = crate::creation::borrow_scope(&mut temporary) {
+        let next = domains
+            .len()
+            .checked_add(roots.len())
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        if next > domains.capacity() {
+            crate::creation::request(
+                Layout::array::<ExpressionEvaluationDomain>(next)
+                    .map_err(|_| CompileControlError::ResourceExhausted)?,
+                c,
+                work,
+            )?;
+        }
+    }
     reserve(domains, roots.len(), work)?;
+    if let Some(c) = crate::creation::borrow_scope(&mut temporary) {
+        let next = uses
+            .len()
+            .checked_add(roots.len())
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        if next > uses.capacity() {
+            crate::creation::request(
+                Layout::array::<ProgramExpressionUse>(next)
+                    .map_err(|_| CompileControlError::ResourceExhausted)?,
+                c,
+                work,
+            )?;
+        }
+    }
     reserve(uses, roots.len(), work)?;
+    if let Some(c) = crate::creation::borrow_scope(&mut temporary) {
+        let next = bindings
+            .len()
+            .checked_add(roots.len())
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        if next > bindings.capacity() {
+            crate::creation::request(
+                Layout::array::<ProgramRootUseBinding>(next)
+                    .map_err(|_| CompileControlError::ResourceExhausted)?,
+                c,
+                work,
+            )?;
+        }
+    }
     reserve(bindings, roots.len(), work)?;
+    if let Some(c) = crate::creation::borrow_scope(&mut temporary) {
+        let next = slots
+            .len()
+            .checked_add(roots.len())
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        if next > slots.capacity() {
+            crate::creation::request(
+                Layout::array::<ProgramSlotBinding>(next)
+                    .map_err(|_| CompileControlError::ResourceExhausted)?,
+                c,
+                work,
+            )?;
+        }
+    }
     reserve(slots, roots.len(), work)?;
     let mut next_domain = 0;
     let mut next_use = 0;

@@ -39,14 +39,16 @@ use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileContr
 pub(crate) mod progress;
 pub(crate) mod resource_work;
 pub(crate) use progress::IpcReaderProgressFacts;
-mod pool_resources;
+use progress::ReaderGeometryFailure;
+pub(crate) mod pool_resources;
 pub use pool_resources::{FlatPoolResourceError, FlatPoolResourceProjection};
 mod reader;
 pub(crate) mod reader_allocations;
+pub(crate) mod reader_creation;
 pub(crate) mod reader_diagnostics;
 mod reader_work;
-pub(crate) use reader::PreparedFlatReader;
 pub use reader::{FlatReaderError, FlatReaderProjectionLimits, FlatReaderResourceFacts};
+pub(crate) use reader::{PreparedFlatReader, ReaderFailure, ReaderResourceFailure};
 
 /// All limits originate with the admitted caller, not the stream or defaults.
 #[derive(Clone, Copy, Debug)]
@@ -108,10 +110,10 @@ pub(crate) fn require(
     }
 }
 
-pub(crate) fn framing_step(
-    admission: &mut Option<&mut progress::Admission<'_, '_>>,
+pub(crate) fn framing_step<E: ReaderGeometryFailure>(
+    admission: &mut Option<&mut progress::Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), TypeCodecError> {
+) -> Result<(), E> {
     if let Some(a) = admission.as_deref_mut() {
         a.batch_step(work)?;
     } else {
@@ -119,25 +121,25 @@ pub(crate) fn framing_step(
     }
     Ok(())
 }
-pub(crate) fn framing_require(
+pub(crate) fn framing_require<E: ReaderGeometryFailure>(
     condition: bool,
     message: &'static str,
-    mut admission: Option<&mut progress::Admission<'_, '_>>,
+    mut admission: Option<&mut progress::Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), TypeCodecError> {
+) -> Result<(), E> {
     framing_step(&mut admission, work)?;
     if condition {
         Ok(())
     } else {
-        Err(TypeCodecError::InvalidShape(message))
+        Err((TypeCodecError::InvalidShape(message)).into())
     }
 }
-pub(crate) fn framing_limit(
+pub(crate) fn framing_limit<E: ReaderGeometryFailure>(
     condition: bool,
     message: &'static str,
-    admission: Option<&mut progress::Admission<'_, '_>>,
+    admission: Option<&mut progress::Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), TypeCodecError> {
+) -> Result<(), E> {
     if admission.is_some() && !condition {
         return Err(novarocks_type_contract::CompileControlError::ResourceExhausted.into());
     }
@@ -152,24 +154,31 @@ pub(crate) fn metadata<'a>(
 ) -> Result<(&'a [u8], usize), TypeCodecError> {
     metadata_in(input, offset, limit, None, None, work)
 }
-pub(crate) fn metadata_in<'a>(
+pub(crate) fn metadata_in<'a, E: ReaderGeometryFailure>(
     input: &'a [u8],
     offset: usize,
     limit: usize,
     verifier_apparent: Option<usize>,
-    admission: Option<&mut progress::Admission<'_, '_>>,
+    admission: Option<&mut progress::Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(&'a [u8], usize), TypeCodecError> {
-    metadata_core(input, offset, limit, verifier_apparent, admission, work)
+) -> Result<(&'a [u8], usize), E> {
+    metadata_core(
+        input,
+        offset,
+        Some(limit),
+        verifier_apparent,
+        admission,
+        work,
+    )
 }
-fn metadata_core<'a>(
+pub(crate) fn metadata_core<'a, E: ReaderGeometryFailure>(
     input: &'a [u8],
     offset: usize,
-    limit: usize,
+    limit: Option<usize>,
     verifier_apparent: Option<usize>,
-    mut admission: Option<&mut progress::Admission<'_, '_>>,
+    mut admission: Option<&mut progress::Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(&'a [u8], usize), TypeCodecError> {
+) -> Result<(&'a [u8], usize), E> {
     let prefix = continuation_prefix(input, offset);
     if let (Some(a), Some(apparent), Ok(ContinuationPrefix::Metadata { len, .. })) =
         (admission.as_deref_mut(), verifier_apparent, &prefix)
@@ -183,14 +192,15 @@ fn metadata_core<'a>(
     let prefix = prefix
         .map_err(|_| TypeCodecError::InvalidShape("invalid constant IPC continuation prefix"))?;
     let ContinuationPrefix::Metadata { start, len } = prefix else {
-        return Err(TypeCodecError::InvalidShape(
+        return Err((TypeCodecError::InvalidShape(
             "constant IPC stream ended before its required message",
-        ));
+        ))
+        .into());
     };
     // MessageReader interprets this wire length as signed i32, even though
     // the neutral prefix primitive can project every u32 without allocating.
     framing_limit(
-        len <= i32::MAX as usize && len <= limit,
+        len <= i32::MAX as usize && limit.is_none_or(|limit| len <= limit),
         "constant IPC metadata length exceeds envelope",
         admission.as_deref_mut(),
         work,
@@ -238,12 +248,36 @@ pub(crate) fn preflight_flat_constant_stream_in<'a, 'f>(
     admit: &mut progress::ReaderAdmit<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<FlatConstantStream<'a, 'f>, TypeCodecError> {
+    preflight_flat_constant_stream_observed(
+        input,
+        expected,
+        limits,
+        verifier,
+        source_retained_bytes,
+        &mut |facts| admit(facts).map_err(TypeCodecError::from),
+        None,
+        work,
+    )
+}
+
+pub(crate) fn preflight_flat_constant_stream_observed<'a, 'f, 'port, E: ReaderGeometryFailure>(
+    input: &'a [u8],
+    expected: &'f Field,
+    limits: FlatStreamProjectionLimits,
+    verifier: &VerifierOptions,
+    source_retained_bytes: usize,
+    admit: &'port mut progress::ReaderAdmit<'port, E>,
+    construction: Option<&'port mut (dyn FnMut(std::alloc::Layout) -> Result<(), E> + 'port)>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatConstantStream<'a, 'f>, E> {
     if input.len() > source_retained_bytes {
-        return Err(TypeCodecError::InvalidShape(
+        return Err((TypeCodecError::InvalidShape(
             "flat stream source retention is below visible input",
-        ));
+        ))
+        .into());
     }
-    let mut admission = progress::Admission::new(source_retained_bytes, admit);
+    let mut admission =
+        progress::Admission::new(source_retained_bytes, admit).with_construction(construction);
     admission.check()?;
     preflight_core(
         input,
@@ -264,30 +298,87 @@ fn preflight<'a, 'f>(
 ) -> Result<FlatConstantStream<'a, 'f>, TypeCodecError> {
     preflight_core(input, expected, limits, verifier, None, work)
 }
-fn preflight_core<'a, 'f>(
+fn preflight_core<'a, 'f, E: ReaderGeometryFailure>(
     input: &'a [u8],
     expected: &'f Field,
     limits: FlatStreamProjectionLimits,
     verifier: &VerifierOptions,
-    mut admission: Option<&mut progress::Admission<'_, '_>>,
+    admission: Option<&mut progress::Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<FlatConstantStream<'a, 'f>, TypeCodecError> {
+) -> Result<FlatConstantStream<'a, 'f>, E> {
+    preflight_profile_core(
+        input,
+        expected,
+        Some(limits),
+        Some(verifier),
+        admission,
+        work,
+    )
+}
+pub(crate) fn preflight_flat_constant_stream_input_derived_observed<
+    'a,
+    'f,
+    'port,
+    E: ReaderGeometryFailure,
+>(
+    input: &'a [u8],
+    expected: &'f Field,
+    source: usize,
+    admit: &'port mut progress::ReaderAdmit<'port, E>,
+    construction: Option<&'port mut (dyn FnMut(std::alloc::Layout) -> Result<(), E> + 'port)>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatConstantStream<'a, 'f>, E> {
+    if input.len() > source {
+        return Err(TypeCodecError::InvalidShape(
+            "flat stream source retention is below visible input",
+        )
+        .into());
+    }
+    let mut admission = progress::Admission::new(source, admit).with_construction(construction);
+    admission.check()?;
+    preflight_profile_core(input, expected, None, None, Some(&mut admission), work)
+}
+/// The supported RecordBatch has exactly Message/RecordBatch tables and three
+/// inline vectors (FieldNodes, Buffer descriptors, variadic counts). Cover each
+/// apparent visit from the actual metadata extent, with checked arithmetic.
+pub(crate) fn input_derived_batch_verifier(
+    metadata_bytes: usize,
+) -> Result<VerifierOptions, TypeCodecError> {
+    Ok(VerifierOptions {
+        max_depth: 3,
+        max_tables: 2,
+        max_apparent_size: metadata_bytes
+            .checked_mul(2 + 3)
+            .ok_or(TypeCodecError::Control(
+                novarocks_type_contract::CompileControlError::ResourceExhausted,
+            ))?,
+        ignore_missing_null_terminator: false,
+    })
+}
+fn preflight_profile_core<'a, 'f, E: ReaderGeometryFailure>(
+    input: &'a [u8],
+    expected: &'f Field,
+    limits: Option<FlatStreamProjectionLimits>,
+    verifier: Option<&VerifierOptions>,
+    mut admission: Option<&mut progress::Admission<'_, '_, E>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatConstantStream<'a, 'f>, E> {
     if admission.is_some() {
-        if input.len() > limits.max_input_bytes {
+        if limits.is_some_and(|limits| input.len() > limits.max_input_bytes) {
             return Err(novarocks_type_contract::CompileControlError::ResourceExhausted.into());
         }
     } else {
         require(
-            input.len() <= limits.max_input_bytes,
+            limits.is_none_or(|limits| input.len() <= limits.max_input_bytes),
             "constant IPC input envelope exceeded",
             work,
         )?;
     }
-    let (schema, schema_end) = metadata_in(
+    let (schema, schema_end) = metadata_core(
         input,
         0,
-        limits.schema.max_flatbuffer_bytes,
-        Some(verifier.max_apparent_size),
+        limits.map(|limits| limits.schema.max_flatbuffer_bytes),
+        verifier.map(|verifier| verifier.max_apparent_size),
         admission.as_deref_mut(),
         work,
     )?;
@@ -302,28 +393,63 @@ fn preflight_core<'a, 'f>(
             a.requests(4, f.request_bytes, f.request_count)?;
             a.schema_work(f.work_upper_bound)
         };
-        crate::ipc_schema_v2::verify_single_field_schema_in(
+        let mut host = |facts: &crate::ipc_schema_v2::SchemaWriterRequestFacts| {
+            capture(facts).map_err(crate::host_projection_v2::ProjectionFailure::Host)
+        };
+        let verified = if let (Some(limits), Some(verifier)) = (limits, verifier) {
+            crate::ipc_schema_v2::verify_single_field_schema_with_host_in(
+                schema,
+                expected,
+                limits.schema,
+                verifier,
+                source,
+                usize::MAX,
+                &mut host,
+                work,
+            )
+        } else {
+            crate::ipc_schema_v2::verify_single_field_schema_input_derived_with_host_in(
+                schema, expected, source, &mut host, work,
+            )
+            .map(|_| ())
+        };
+        verified.map_err(|error| match error {
+            crate::host_projection_v2::ProjectionFailure::Host(error) => error,
+            crate::host_projection_v2::ProjectionFailure::Codec(error) => E::from(error),
+        })?;
+    } else {
+        verify_single_field_schema_with_work(
             schema,
             expected,
-            limits.schema,
-            verifier,
-            source,
-            usize::MAX,
-            &mut capture,
+            limits.expect("fixed plain schema profile").schema,
+            verifier.expect("fixed plain verifier"),
             work,
         )?;
-    } else {
-        verify_single_field_schema_with_work(schema, expected, limits.schema, verifier, work)?;
     }
-    let (batch_metadata, body_start) = metadata_in(
+    let (batch_metadata, body_start) = metadata_core(
         input,
         schema_end,
-        limits.batch.max_metadata_bytes,
-        Some(verifier.max_apparent_size),
+        limits.map(|limits| limits.batch.max_metadata_bytes),
+        verifier.map(|verifier| verifier.max_apparent_size),
         admission.as_deref_mut(),
         work,
     )?;
-    let message = verified_message_observed(batch_metadata, verifier, work)?;
+    let derived;
+    let batch_verifier = if let Some(verifier) = verifier {
+        verifier
+    } else {
+        derived = input_derived_batch_verifier(batch_metadata.len())?;
+        if let Some(a) = admission.as_deref_mut() {
+            a.batch_work_add(
+                derived
+                    .max_apparent_size
+                    .checked_add(batch_metadata.len())
+                    .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?,
+            )?;
+        }
+        &derived
+    };
+    let message = verified_message_observed(batch_metadata, batch_verifier, work)?;
     framing_require(
         message.header_type() == arrow::ipc::MessageHeader::RecordBatch,
         "constant IPC schema must precede exactly one RecordBatch",
@@ -334,7 +460,7 @@ fn preflight_core<'a, 'f>(
         TypeCodecError::InvalidShape("negative or unrepresentable constant IPC body length")
     })?;
     framing_limit(
-        body_length <= limits.batch.max_body_bytes,
+        limits.is_none_or(|limits| body_length <= limits.batch.max_body_bytes),
         "constant IPC body envelope exceeded",
         admission.as_deref_mut(),
         work,
@@ -353,16 +479,22 @@ fn preflight_core<'a, 'f>(
     let body_end = range.end;
     let batch_body = &input[range];
     let geometry = if let Some(a) = admission.as_deref_mut() {
-        crate::ipc_flat_batch_v2::preflight_verified_flat_record_batch_in(
+        crate::ipc_flat_batch_v2::preflight_verified_flat_record_batch_profile(
             message,
             batch_body,
             expected,
-            limits.batch,
-            a,
+            limits.map(|limits| limits.batch),
+            Some(a),
             work,
         )?
     } else {
-        preflight_verified_flat_record_batch(message, batch_body, expected, limits.batch, work)?
+        preflight_verified_flat_record_batch(
+            message,
+            batch_body,
+            expected,
+            limits.expect("fixed plain geometry profile").batch,
+            work,
+        )?
     };
     let batch = message
         .header_as_record_batch()

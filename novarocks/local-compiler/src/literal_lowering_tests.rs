@@ -257,10 +257,9 @@ fn cases() -> Vec<(FunctionValueType, LiteralValue)> {
 fn exact_scalar_literals_compile_through_the_complete_package_owner() {
     for (ty, literal) in cases() {
         for nullable in [false, true] {
-            let ty = FunctionValueType {
-                nullable,
-                ..ty.clone()
-            };
+            let ty = (ty.clone())
+                .with_nullable(nullable)
+                .expect("valid value root nullability transform");
             let program = compile_literal(
                 literal_package(ty.clone(), literal.clone()),
                 &FixtureControl,
@@ -284,7 +283,7 @@ fn exact_scalar_literals_compile_through_the_complete_package_owner() {
             assert_eq!(constants.len(), 1);
             let value = constants[0];
             assert_eq!(value.value_type(), &ty);
-            assert_eq!(value.pool().array().data_type(), &ty.data_type);
+            assert_eq!(value.pool().array().data_type(), ty.data_type());
             assert_eq!(value.pool().array().len(), 1);
             assert!(!value.pool().array().is_null(0));
             match &literal {
@@ -324,7 +323,7 @@ fn exact_scalar_literals_compile_through_the_complete_package_owner() {
 #[test]
 fn null_literals_preserve_the_declared_complete_type() {
     for (mut ty, _) in cases() {
-        ty.nullable = true;
+        ty = ty.with_nullable(true).unwrap();
         let program = compile_literal(
             literal_package(ty.clone(), LiteralValue::Null),
             &FixtureControl,

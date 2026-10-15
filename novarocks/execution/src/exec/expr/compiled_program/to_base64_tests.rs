@@ -578,13 +578,13 @@ fn to_base64_physical_author_exact_declared_carriers_and_immediate_definitions()
         ));
         let direct = classify(nodes.clone(), &[call]);
         if name == "to_binary" {
-            assert_eq!(result.data_type, DataType::Binary);
+            assert_eq!(result.data_type().clone(), DataType::Binary);
             assert!(
                 direct.is_err(),
                 "actual Binary declaration is not the raw typed-Utf8 shell domain"
             );
         } else {
-            assert_eq!(result.data_type, DataType::Utf8);
+            assert_eq!(result.data_type().clone(), DataType::Utf8);
             assert_eq!(direct.unwrap(), expected);
         }
         let cast = ExprId::new(count as u32 + 1);

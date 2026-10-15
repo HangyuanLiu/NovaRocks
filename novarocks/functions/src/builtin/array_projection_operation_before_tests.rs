@@ -188,7 +188,10 @@ fn array_operation_original_case_colliding_fields_require_the_real_conditional_c
     .unwrap();
     let arguments = [
         FunctionArgument::Value {
-            value_type: FunctionValueType::new(input.data_type().clone(), false),
+            value_type: FunctionValueType::from_legacy_declared_projection(
+                input.data_type().clone(),
+                false,
+            ),
             constant: None,
         },
         FunctionArgument::Value {
@@ -212,13 +215,13 @@ fn array_operation_original_case_colliding_fields_require_the_real_conditional_c
     let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
         panic!("original scalar binding")
     };
-    let DataType::List(item) = &result.data_type else {
+    let DataType::List(item) = result.data_type() else {
         panic!("original List result")
     };
     // Actual original binder picks the first case-insensitive field, Int32.
     assert_eq!(item.data_type(), &DataType::Int32);
     let names: ArrayRef = Arc::new(StringArray::from(vec!["id"; 3]));
-    let output = project(&input, &names, Some(&result.data_type)).unwrap();
+    let output = project(&input, &names, Some(result.data_type())).unwrap();
     let output = output.as_any().downcast_ref::<ListArray>().unwrap();
     let values = output
         .values()

@@ -48,37 +48,45 @@ pub(super) fn validate_profile(
     };
     observe()?;
     let result = contract.result_type();
-    if list.logical_type != ValueLogicalType::Physical
-        || result.logical_type != ValueLogicalType::Physical
-        || !result.nullable
+    if list.logical_type() != ValueLogicalType::Physical
+        || result.logical_type() != ValueLogicalType::Physical
+        || !result.nullable()
     {
         return Err(invalid(
             "array_append requires a Physical List and its real nullable List result",
         ));
     }
-    let (DataType::List(source), DataType::List(output)) = (&list.data_type, &result.data_type)
+    let (DataType::List(source), DataType::List(output)) = (list.data_type(), result.data_type())
     else {
         return Err(invalid(
             "array_append requires exact frozen List source/result fields",
         ));
     };
-    let source = FunctionValueType::try_from_field(source)
-        .map_err(|_| invalid("array_append has an invalid frozen source item identity"))?;
-    let output = FunctionValueType::try_from_field(output)
-        .map_err(|_| invalid("array_append has an invalid frozen result item identity"))?;
-    if source.logical_type != value.logical_type
-        || source.logical_type != output.logical_type
-        || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-            &source.data_type,
-            &value.data_type,
-            &mut observe,
-        )?
-        || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-            &source.data_type,
-            &output.data_type,
-            &mut observe,
-        )?
-    {
+    let source_semantic = list
+        .value_type()
+        .child_type_at(0)
+        .ok_or_else(|| invalid("array_append has no source semantic item"))?;
+    let output_semantic = result
+        .value_type()
+        .child_type_at(0)
+        .ok_or_else(|| invalid("array_append has no result semantic item"))?;
+    if !FunctionValueType::borrowed_value_domains_equal_observed(
+        source_semantic,
+        value.value_type(),
+        &mut observe,
+    )? || !FunctionValueType::borrowed_value_domains_equal_observed(
+        source_semantic,
+        output_semantic,
+        &mut observe,
+    )? || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+        source.data_type(),
+        value.data_type(),
+        &mut observe,
+    )? || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+        source.data_type(),
+        output.data_type(),
+        &mut observe,
+    )? {
         return Err(invalid(
             "array_append requires already-materialized exact item arguments and result",
         ));
@@ -94,7 +102,7 @@ pub(super) fn evaluate<'a>(
     let result = (|| {
         validate_profile(input.contract(), || work.borrow_mut().step())?;
         let result = input.contract().result_type();
-        let DataType::List(field) = &result.data_type else {
+        let DataType::List(field) = result.data_type() else {
             unreachable!("checked List result")
         };
         let [list, target] = input.arguments() else {
@@ -174,7 +182,7 @@ pub(super) fn evaluate<'a>(
             &mut observer,
         )
         .map_err(failure)?;
-        SelectedValues::try_new(selection, &result.data_type, values, Box::default())
+        SelectedValues::try_new(selection, result.data_type(), values, Box::default())
             .map_err(|_| internal("array_append compact output violates its frozen contract"))
     })();
     work.into_inner().finish_result(result)

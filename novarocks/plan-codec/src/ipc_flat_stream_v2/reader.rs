@@ -52,6 +52,10 @@ pub struct FlatReaderResourceFacts {
     pub source_retained_bytes: usize,
     pub payload_request_bytes_upper_bound: usize,
     pub structural_request_bytes_upper_bound: usize,
+    pub constant_owner_request_bytes_upper_bound: usize,
+    pub retained_reader_request_bytes_upper_bound: usize,
+    pub retained_pool_data_request_bytes_upper_bound: usize,
+    pub retained_payload_request_bytes_upper_bound: usize,
     pub diagnostic_request_bytes_upper_bound: usize,
     pub allocation_request_count_upper_bound: usize,
     pub new_allocation_request_bytes_upper_bound: usize,
@@ -84,6 +88,83 @@ impl std::fmt::Display for FlatReaderError {
     }
 }
 impl std::error::Error for FlatReaderError {}
+impl From<TypeCodecError> for FlatReaderError {
+    fn from(error: TypeCodecError) -> Self {
+        Self::Projection(error.into())
+    }
+}
+impl From<novarocks_constant_contract::ConstantError> for FlatReaderError {
+    fn from(error: novarocks_constant_contract::ConstantError) -> Self {
+        Self::Projection(error.into())
+    }
+}
+impl From<novarocks_type_contract::ValueTypeError> for FlatReaderError {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Projection(error.into())
+    }
+}
+impl From<novarocks_type_contract::CarrierParameterError> for FlatReaderError {
+    fn from(error: novarocks_type_contract::CarrierParameterError) -> Self {
+        Self::Projection(error.into())
+    }
+}
+
+impl<H> From<novarocks_type_contract::CompileControlError>
+    for crate::host_projection_v2::ProjectionFailure<FlatReaderError, H>
+{
+    fn from(error: novarocks_type_contract::CompileControlError) -> Self {
+        Self::Codec(FlatReaderError::from(error))
+    }
+}
+impl<H> From<TypeCodecError> for crate::host_projection_v2::ProjectionFailure<FlatReaderError, H> {
+    fn from(error: TypeCodecError) -> Self {
+        Self::Codec(FlatReaderError::from(error))
+    }
+}
+impl<H> From<FlatPoolResourceError>
+    for crate::host_projection_v2::ProjectionFailure<FlatReaderError, H>
+{
+    fn from(error: FlatPoolResourceError) -> Self {
+        Self::Codec(FlatReaderError::from(error))
+    }
+}
+impl<H> From<novarocks_constant_contract::ConstantError>
+    for crate::host_projection_v2::ProjectionFailure<FlatReaderError, H>
+{
+    fn from(error: novarocks_constant_contract::ConstantError) -> Self {
+        Self::Codec(FlatReaderError::from(error))
+    }
+}
+impl<H> From<novarocks_type_contract::ValueTypeError>
+    for crate::host_projection_v2::ProjectionFailure<FlatReaderError, H>
+{
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Codec(FlatReaderError::from(error))
+    }
+}
+impl<H> From<novarocks_type_contract::CarrierParameterError>
+    for crate::host_projection_v2::ProjectionFailure<FlatReaderError, H>
+{
+    fn from(error: novarocks_type_contract::CarrierParameterError) -> Self {
+        Self::Codec(FlatReaderError::from(error))
+    }
+}
+pub(crate) trait ReaderResourceFailure:
+    super::progress::ReaderGeometryFailure
+    + From<FlatPoolResourceError>
+    + From<novarocks_constant_contract::ConstantError>
+    + From<novarocks_type_contract::CarrierParameterError>
+{
+}
+impl<E> ReaderResourceFailure for E where
+    E: super::progress::ReaderGeometryFailure
+        + From<FlatPoolResourceError>
+        + From<novarocks_constant_contract::ConstantError>
+        + From<novarocks_type_contract::CarrierParameterError>
+{
+}
+pub(crate) trait ReaderFailure: ReaderResourceFailure + From<FlatReaderError> {}
+impl<E> ReaderFailure for E where E: ReaderResourceFailure + From<FlatReaderError> {}
 fn shape(message: &'static str) -> FlatPoolResourceError {
     FlatPoolResourceError::Shape(TypeCodecError::InvalidShape(message))
 }
@@ -136,6 +217,35 @@ impl PreparedFlatReader<'_, '_, '_, '_> {
         if !std::ptr::addr_eq(original, work.control()) {
             return Err(shape("flat reader belongs to another original control").into());
         }
+        let mut adapter =
+            |facts: &IpcReaderProgressFacts| admit(facts).map_err(FlatReaderError::from);
+        let mut admission = Admission::new(self.parts.facts.source_retained_bytes, &mut adapter);
+        admission.seed(
+            self.parts
+                .progress
+                .ok_or_else(|| shape("flat reader is missing caller-owned facts"))?,
+        )?;
+        self.stream
+            .materialize_parts_core(self.parts, Some(&mut admission), None, None, work)
+    }
+
+    pub(crate) fn materialize_pure_observed<E: ReaderFailure>(
+        self,
+        admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_, E>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantPool, E> {
+        let Some(original) = self.original_control else {
+            return Err(FlatReaderError::from(shape(
+                "flat reader requires caller-owned preparation",
+            ))
+            .into());
+        };
+        if !std::ptr::addr_eq(original, work.control()) {
+            return Err(FlatReaderError::from(shape(
+                "flat reader belongs to another original control",
+            ))
+            .into());
+        }
         let mut admission = Admission::new(self.parts.facts.source_retained_bytes, admit);
         admission.seed(
             self.parts
@@ -143,7 +253,110 @@ impl PreparedFlatReader<'_, '_, '_, '_> {
                 .ok_or_else(|| shape("flat reader is missing caller-owned facts"))?,
         )?;
         self.stream
-            .materialize_parts_core(self.parts, Some(&mut admission), work)
+            .materialize_parts_core(self.parts, Some(&mut admission), None, None, work)
+    }
+
+    pub(crate) fn materialize_with_creator_observed<H>(
+        self,
+        source: novarocks_constant_contract::ConstantSourceOwner,
+        creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+        admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<
+            '_,
+            crate::host_projection_v2::ProjectionFailure<FlatReaderError, H>,
+        >,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantPool, crate::host_projection_v2::ProjectionFailure<FlatReaderError, H>>
+    {
+        creation.with_error_mapping(
+            crate::host_projection_v2::ProjectionFailure::Host,
+            |mapped| self.materialize_with_scope_observed(source, mapped, admit, work),
+        )
+    }
+    pub(crate) fn materialize_with_scope_observed<E: ReaderFailure>(
+        self,
+        source: novarocks_constant_contract::ConstantSourceOwner,
+        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<E>,
+        admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_, E>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<ConstantPool, E> {
+        let Some(original) = self.original_control else {
+            return Err(FlatReaderError::from(shape(
+                "flat reader requires caller-owned preparation",
+            ))
+            .into());
+        };
+        if !std::ptr::addr_eq(original, work.control()) {
+            return Err(FlatReaderError::from(shape(
+                "flat reader belongs to another original control",
+            ))
+            .into());
+        }
+        let mut admission = Admission::new(self.parts.facts.source_retained_bytes, admit);
+        admission.seed(
+            self.parts
+                .progress
+                .ok_or_else(|| shape("flat reader is missing caller-owned facts"))?,
+        )?;
+        self.stream.materialize_parts_core(
+            self.parts,
+            Some(&mut admission),
+            Some(source),
+            Some(crate::ipc_flat_stream_v2::reader_creation::ReaderCreation::Single(creation)),
+            work,
+        )
+    }
+    pub(crate) fn materialize_with_paired_creator_observed<H>(
+        self,
+        source: novarocks_constant_contract::ConstantSourceOwner,
+        temporary: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        retained: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        pool: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<
+            '_,
+            crate::host_projection_v2::ProjectionFailure<
+                crate::ipc_flat_stream_v2::FlatReaderError,
+                H,
+            >,
+        >,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<
+        ConstantPool,
+        crate::host_projection_v2::ProjectionFailure<crate::ipc_flat_stream_v2::FlatReaderError, H>,
+    > {
+        let Some(original) = self.original_control else {
+            return Err(FlatReaderError::from(shape(
+                "flat reader requires caller-owned preparation",
+            ))
+            .into());
+        };
+        if !std::ptr::addr_eq(original, work.control()) {
+            return Err(FlatReaderError::from(shape(
+                "flat reader belongs to another original control",
+            ))
+            .into());
+        }
+        let mut temporary = crate::ipc_flat_stream_v2::reader_creation::MappedScope(temporary);
+        let mut retained = crate::ipc_flat_stream_v2::reader_creation::MappedScope(retained);
+        let mut pool = crate::ipc_flat_stream_v2::reader_creation::MappedScope(pool);
+        let mut admission = Admission::new(self.parts.facts.source_retained_bytes, admit);
+        admission.seed(
+            self.parts
+                .progress
+                .ok_or_else(|| shape("flat reader is missing caller-owned facts"))?,
+        )?;
+        self.stream.materialize_parts_core(
+            self.parts,
+            Some(&mut admission),
+            Some(source),
+            Some(
+                crate::ipc_flat_stream_v2::reader_creation::ReaderCreation::Paired {
+                    temporary: &mut temporary,
+                    retained: &mut retained,
+                    pool: &mut pool,
+                },
+            ),
+            work,
+        )
     }
 
     pub(crate) fn materialize(
@@ -211,21 +424,40 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
             work,
         )
     }
-    fn reader_resources_core(
+    fn reader_resources_core<E: ReaderResourceFailure>(
         &self,
         value_type: &FunctionValueType,
         source_retained_bytes: usize,
         policy: ConstantPolicy,
         limits: FlatReaderProjectionLimits,
-        mut admission: Option<&mut Admission<'_, '_>>,
+        admission: Option<&mut Admission<'_, '_, E>>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<FlatReaderResourceFacts, FlatPoolResourceError> {
+    ) -> Result<FlatReaderResourceFacts, E> {
+        self.reader_resources_profile_core(
+            value_type,
+            source_retained_bytes,
+            Some(policy),
+            Some(limits),
+            admission,
+            work,
+        )
+        .map(|(facts, _)| facts)
+    }
+    fn reader_resources_profile_core<E: ReaderResourceFailure>(
+        &self,
+        value_type: &FunctionValueType,
+        source_retained_bytes: usize,
+        policy: Option<ConstantPolicy>,
+        limits: Option<FlatReaderProjectionLimits>,
+        mut admission: Option<&mut Admission<'_, '_, E>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(FlatReaderResourceFacts, ConstantPolicy), E> {
         cap(
             self.input().len(),
             source_retained_bytes,
             "flat reader source retention is below visible input",
         )?;
-        if let Some(a) = admission.as_deref_mut() {
+        if let (Some(a), Some(limits)) = (admission.as_deref_mut(), limits) {
             a.limits(
                 limits.max_new_allocation_request_bytes,
                 limits.max_coexisting_source_and_request_bytes,
@@ -246,16 +478,23 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
         } else {
             reader_work::source_metadata_work(source_retained_bytes, work)?
         };
-        cap(
-            source_work,
-            limits.max_cumulative_library_work,
-            "flat reader source metadata work envelope exceeded",
-        )?;
+        if let Some(limits) = limits {
+            cap(
+                source_work,
+                limits.max_cumulative_library_work,
+                "flat reader source metadata work envelope exceeded",
+            )?;
+        }
         work.flush()?;
-        let pool = if let Some(a) = admission.as_deref_mut() {
-            self.pool_resources_in(value_type, policy, a, work)?
+        let (pool, sealed) = if let Some(a) = admission.as_deref_mut() {
+            self.pool_resources_profile_core(value_type, policy, Some(a), work)?
         } else {
-            self.preflight_pool_resources(value_type, policy, work.control())?
+            let policy = policy
+                .ok_or_else(|| shape("input-derived reader requires original observation"))?;
+            (
+                self.preflight_pool_resources(value_type, policy, work.control())?,
+                policy,
+            )
         };
         let structures = if let Some(a) = admission.as_deref_mut() {
             let mut observed = CapturedWork {
@@ -337,42 +576,62 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
                 work,
             )?
         };
-        cap(
-            requested,
-            limits.max_new_allocation_request_bytes,
-            "flat reader allocation request envelope exceeded",
-        )?;
-        cap(
-            coexisting,
-            limits.max_coexisting_source_and_request_bytes,
-            "flat reader source coexistence envelope exceeded",
-        )?;
-        cap(
-            library_work,
-            limits.max_cumulative_library_work,
-            "flat reader cumulative library work envelope exceeded",
-        )?;
+        if let Some(limits) = limits {
+            cap(
+                requested,
+                limits.max_new_allocation_request_bytes,
+                "flat reader allocation request envelope exceeded",
+            )?;
+            cap(
+                coexisting,
+                limits.max_coexisting_source_and_request_bytes,
+                "flat reader source coexistence envelope exceeded",
+            )?;
+            cap(
+                library_work,
+                limits.max_cumulative_library_work,
+                "flat reader cumulative library work envelope exceeded",
+            )?;
+        }
         work.step()?;
         let payload_requests = usize::from(pool.owned_body_capacity_bytes > 0)
             + usize::from(pool.alignment_repair_capacity_bytes_upper_bound > 0)
             + usize::from(pool.empty_offset_capacity_bytes > 0);
-        Ok(FlatReaderResourceFacts {
-            source_retained_bytes,
-            payload_request_bytes_upper_bound: payload,
-            structural_request_bytes_upper_bound: structures.structural_request_bytes_upper_bound,
-            diagnostic_request_bytes_upper_bound: diagnostics.request_bytes_upper_bound,
-            allocation_request_count_upper_bound: add(
-                add(
-                    structures.allocation_requests_upper_bound,
-                    diagnostics.allocation_requests_upper_bound,
+        Ok((
+            FlatReaderResourceFacts {
+                source_retained_bytes,
+                payload_request_bytes_upper_bound: payload,
+                retained_payload_request_bytes_upper_bound: if self.geometry().buffer_descriptors
+                    != 0
+                    || pool.empty_offset_capacity_bytes != 0
+                {
+                    payload
+                } else {
+                    0
+                },
+                structural_request_bytes_upper_bound: structures
+                    .structural_request_bytes_upper_bound,
+                retained_reader_request_bytes_upper_bound: structures
+                    .retained_reader_request_bytes_upper_bound,
+                retained_pool_data_request_bytes_upper_bound: structures
+                    .retained_pool_data_request_bytes_upper_bound,
+                constant_owner_request_bytes_upper_bound: structures
+                    .constant_owner_request_bytes_upper_bound,
+                diagnostic_request_bytes_upper_bound: diagnostics.request_bytes_upper_bound,
+                allocation_request_count_upper_bound: add(
+                    add(
+                        structures.allocation_requests_upper_bound,
+                        diagnostics.allocation_requests_upper_bound,
+                    )?,
+                    payload_requests,
                 )?,
-                payload_requests,
-            )?,
-            new_allocation_request_bytes_upper_bound: requested,
-            coexisting_source_and_request_bytes_upper_bound: coexisting,
-            cumulative_library_work_upper_bound: library_work,
-            pool,
-        })
+                new_allocation_request_bytes_upper_bound: requested,
+                coexisting_source_and_request_bytes_upper_bound: coexisting,
+                cumulative_library_work_upper_bound: library_work,
+                pool,
+            },
+            sealed,
+        ))
     }
 
     /// Invokes the actual public safe reader with the same original Field Arc.
@@ -481,6 +740,27 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
         admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_>,
         work: &mut CompileCheckpoints<'c>,
     ) -> Result<PreparedFlatReader<'a, 'f, 'v, 'c>, FlatReaderError> {
+        self.prepare_pool_borrowed_observed(
+            field,
+            value_type,
+            source_retained_bytes,
+            policy,
+            limits,
+            &mut |facts| admit(facts).map_err(FlatReaderError::from),
+            work,
+        )
+    }
+
+    pub(crate) fn prepare_pool_borrowed_observed<'v, 'c, E: ReaderFailure>(
+        self,
+        field: Arc<Field>,
+        value_type: &'v FunctionValueType,
+        source_retained_bytes: usize,
+        policy: ConstantPolicy,
+        limits: FlatReaderProjectionLimits,
+        admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_, E>,
+        work: &mut CompileCheckpoints<'c>,
+    ) -> Result<PreparedFlatReader<'a, 'f, 'v, 'c>, E> {
         let mut admission = Admission::new(source_retained_bytes, admit);
         admission.limits(
             limits.max_new_allocation_request_bytes,
@@ -525,16 +805,63 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
             work,
         )
     }
-    fn prepare_parts_core<'v>(
+    fn prepare_parts_core<'v, E: ReaderFailure>(
         &self,
         field: Arc<Field>,
         value_type: Cow<'v, FunctionValueType>,
         source_retained_bytes: usize,
         policy: ConstantPolicy,
         limits: FlatReaderProjectionLimits,
-        mut admission: Option<&mut Admission<'_, '_>>,
+        admission: Option<&mut Admission<'_, '_, E>>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<PreparedParts<'v>, FlatReaderError> {
+    ) -> Result<PreparedParts<'v>, E> {
+        self.prepare_parts_profile_core(
+            field,
+            value_type,
+            source_retained_bytes,
+            Some(policy),
+            Some(limits),
+            admission,
+            work,
+        )
+    }
+    pub(crate) fn prepare_pool_borrowed_input_derived_observed<'v, 'c, E: ReaderFailure>(
+        self,
+        field: Arc<Field>,
+        value_type: &'v FunctionValueType,
+        source: usize,
+        admit: &mut crate::ipc_flat_stream_v2::progress::ReaderAdmit<'_, E>,
+        work: &mut CompileCheckpoints<'c>,
+    ) -> Result<PreparedFlatReader<'a, 'f, 'v, 'c>, E> {
+        let mut admission = Admission::new(source, admit);
+        if let Some(prefix) = self.progress {
+            admission.seed_prefix(prefix)?;
+        }
+        let parts = self.prepare_parts_profile_core(
+            field,
+            Cow::Borrowed(value_type),
+            source,
+            None,
+            None,
+            Some(&mut admission),
+            work,
+        )?;
+        Ok(PreparedFlatReader {
+            original_control: Some(work.control()),
+            stream: self,
+            parts,
+        })
+    }
+    fn prepare_parts_profile_core<'v, E: ReaderFailure>(
+        &self,
+        field: Arc<Field>,
+        value_type: Cow<'v, FunctionValueType>,
+        source_retained_bytes: usize,
+        policy: Option<ConstantPolicy>,
+        limits: Option<FlatReaderProjectionLimits>,
+        mut admission: Option<&mut Admission<'_, '_, E>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<PreparedParts<'v>, E> {
         if !std::ptr::eq(self.field(), field.as_ref()) {
             return Err(shape("flat reader requires the original source Field Arc").into());
         }
@@ -557,7 +884,7 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
                     .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?,
             )?;
             a.clone_work(crate::physical_type_v2::value_type_clone_preflight_work_upper_bound())?;
-            crate::physical_type_v2::preflight_value_type_clone_admitted::<FlatPoolResourceError>(
+            crate::physical_type_v2::preflight_value_type_clone_admitted::<E>(
                 value_type.as_ref(),
                 &mut |f, _| {
                     a.requests(
@@ -572,7 +899,7 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
             )?;
         }
         work.step()?;
-        let mut facts = self.reader_resources_core(
+        let (mut facts, sealed) = self.reader_resources_profile_core(
             value_type.as_ref(),
             source_retained_bytes,
             policy,
@@ -598,7 +925,7 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
         Ok(PreparedParts {
             field,
             value_type,
-            policy,
+            policy: sealed,
             facts,
             progress,
         })
@@ -609,21 +936,39 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
         parts: PreparedParts<'_>,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<ConstantPool, FlatReaderError> {
-        self.materialize_parts_core(parts, None, work)
+        self.materialize_parts_core(parts, None, None, None, work)
     }
-    fn materialize_parts_core(
+    fn materialize_parts_core<E: ReaderFailure>(
         &self,
         parts: PreparedParts<'_>,
-        admission: Option<&mut Admission<'_, '_>>,
+        admission: Option<&mut Admission<'_, '_, E>>,
+        source: Option<novarocks_constant_contract::ConstantSourceOwner>,
+        mut creation: Option<crate::ipc_flat_stream_v2::reader_creation::ReaderCreation<'_, E>>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<ConstantPool, FlatReaderError> {
+    ) -> Result<ConstantPool, E> {
         let PreparedParts {
             field,
             value_type,
             policy,
-            facts: _,
-            progress: _,
+            facts,
+            progress,
         } = parts;
+        if let Some(creation) = creation.as_mut() {
+            let operation = facts
+                .new_allocation_request_bytes_upper_bound
+                .checked_sub(facts.constant_owner_request_bytes_upper_bound)
+                .and_then(|bytes| {
+                    bytes.checked_sub(progress.map_or(0, |p| p.geometry_scratch_request_bytes))
+                })
+                .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+            creation.operation(
+                operation,
+                facts.retained_payload_request_bytes_upper_bound,
+                facts.retained_reader_request_bytes_upper_bound,
+                facts.retained_pool_data_request_bytes_upper_bound,
+                work,
+            )?;
+        }
         work.flush()?;
         let schema = Arc::new(Schema::new([Arc::clone(&field)]));
         if admission.is_some() {
@@ -671,8 +1016,36 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
                     f.cumulative_work_upper_bound,
                 )
             };
-            ConstantPool::try_new_in(field, value_type, data, policy, &mut capture, work)
-                .map_err(FlatPoolResourceError::from)?
+            if let Some(creation) = creation {
+                let source = source.ok_or_else(|| {
+                    shape("flat creator reader is missing original source custody")
+                })?;
+                creation
+                    .pool(
+                        field,
+                        value_type,
+                        data,
+                        policy,
+                        source,
+                        &mut |facts| {
+                            capture(facts).map_err(
+                                novarocks_constant_contract::ConstantCreationFailure::Creator,
+                            )
+                        },
+                        work,
+                    )
+                    .map_err(crate::ipc_flat_stream_v2::pool_resources::flatten_constant_failure)?
+            } else {
+                ConstantPool::try_new_pure_observed_in(
+                    field,
+                    value_type,
+                    data,
+                    policy,
+                    &mut capture,
+                    work,
+                )
+                .map_err(crate::ipc_flat_stream_v2::pool_resources::flatten_constant_failure)?
+            }
         } else {
             ConstantPool::try_new(
                 field,

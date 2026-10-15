@@ -71,7 +71,7 @@ fn profiles(nullable: bool) -> Vec<FunctionValueType> {
 }
 
 fn profile_values(source: &FunctionValueType, rows: usize) -> ArrayRef {
-    if source.data_type == DataType::FixedSizeBinary(16) {
+    if *source.data_type() == DataType::FixedSizeBinary(16) {
         // Genuine physical 16-byte carrier, with original endian/sign codec.
         // Binding stays Physical; this fixture does not assert logical LARGEINT.
         let pattern = [
@@ -86,7 +86,9 @@ fn profile_values(source: &FunctionValueType, rows: usize) -> ArrayRef {
         ];
         return novarocks_types::largeint::array_from_i128(
             &(0..rows)
-                .map(|row| pattern[row % pattern.len()].or_else(|| (!source.nullable).then_some(7)))
+                .map(|row| {
+                    pattern[row % pattern.len()].or_else(|| (!source.nullable()).then_some(7))
+                })
                 .collect::<Vec<_>>(),
         )
         .unwrap();
@@ -131,7 +133,7 @@ fn pure_differential_n_every_complete_scalar_codec_profile_and_signed_limit_carr
                                 .float_comparison(FloatComparison::Exact),
                         );
                         assert_eq!(summary.matched_failures, 0);
-                        assert!(summary.result_type.nullable);
+                        assert!(summary.result_type.nullable());
                         // Empty groups remain non-null empty Lists.
                         assert_eq!(summary.null_results, 0);
                     }
@@ -149,9 +151,9 @@ fn pure_differential_n_empty_all_null_values_and_constant_limits_keep_empty_list
         {
             for rows in [0, ROWS] {
                 let values = if rows == 0 {
-                    new_empty_array(&source.data_type)
+                    new_empty_array(&source.data_type())
                 } else {
-                    new_null_array(&source.data_type, rows)
+                    new_null_array(&source.data_type(), rows)
                 };
                 let summary = assert_aggregate_matches_v1(
                     AggregateDiffSpec::new(name)
@@ -241,7 +243,7 @@ fn pure_differential_n_logical_largeint_freezes_full_legacy_metadata_drift_and_n
                 for limit_nullable in [false, true] {
                     for rows in [0usize, 8] {
                         let values = if rows == 0 {
-                            new_empty_array(&source.data_type)
+                            new_empty_array(&source.data_type())
                         } else {
                             InputGenerator::new(1821).column(
                                 &source,
@@ -254,19 +256,21 @@ fn pure_differential_n_logical_largeint_freezes_full_legacy_metadata_drift_and_n
                             .typed_column(source.clone(), values)
                             .typed_column(limit.clone(), limits(&n, rows, 3));
                         let failure = run_aggregate_differential(&spec).unwrap_err();
+                        // Complete semantics now reach the actual selected owner
+                        // before the legacy emitter can import nominal metadata.
+                        // Keep the explicit unsupported profile, not retired
+                        // planned-vs-imported Field annotation drift as authority.
                         match failure {
-                            DifferentialFailure::LegacyUnavailable {
-                                name: actual,
-                                reason,
-                            } => {
-                                assert_eq!(actual, name);
-                                let expected = format!(
-                                    "bind aggregate `{name}`: aggregate `{name}` resolved signature drift: planned=ResolvedAggregateSignature {{ overload: AggregateOverloadIdentity(\"builtin.aggregate/{name}/derived-v1\"), argument_types: [FixedSizeBinary(16), {n:?}], intermediate_type: Binary, output_type: List(Field {{ data_type: FixedSizeBinary(16), nullable: true, metadata: {{\"nr_logical_type\": \"largeint\"}} }}), state_format: AggregateStateFormatId(\"novarocks/{name}/state-v1\") }}, local=ResolvedAggregateSignature {{ overload: AggregateOverloadIdentity(\"builtin.aggregate/{name}/derived-v1\"), argument_types: [FixedSizeBinary(16), {n:?}], intermediate_type: Binary, output_type: List(Field {{ data_type: FixedSizeBinary(16), nullable: true }}), state_format: AggregateStateFormatId(\"novarocks/{name}/state-v1\") }}"
+                            DifferentialFailure::Specialization(reason) => {
+                                assert_eq!(
+                                    reason,
+                                    format!(
+                                        "invalid kernel program: builtin.aggregate/{name}/v1 has no installed min_n/max_n logical input profile for LargeInt"
+                                    )
                                 );
-                                assert_eq!(reason, expected);
                             }
                             other => panic!(
-                                "expected frozen logical LARGEINT legacy metadata drift: {other}"
+                                "expected original selected LARGEINT profile refusal: {other}"
                             ),
                         }
                         let catalog = builtin_engine_function_catalog();
@@ -326,7 +330,7 @@ fn pure_differential_n_logical_largeint_freezes_full_legacy_metadata_drift_and_n
                         let failure = match result {
                             Err(error) => error,
                             Ok(_) => panic!(
-                                "logical LARGEINT must explicitly reject unresolved metadata drift"
+                                "logical LARGEINT must explicitly reject its unsupported installed profile"
                             ),
                         };
                         assert!(

@@ -140,7 +140,7 @@ pub fn build_sql_mv_aggregate_physical_layout(
             physical_columns.push(physical_column(
                 column.name.clone(),
                 sql_type,
-                column.value_type.nullable,
+                column.value_type.nullable(),
                 true,
                 false,
             ));
@@ -166,7 +166,7 @@ pub fn build_sql_mv_aggregate_physical_layout(
         })?;
         validate_aggregate_state_visible_type(
             call.function(),
-            &visible.value_type.data_type,
+            &visible.value_type.data_type(),
             aggregate_input_types
                 .get(aggregate_index)
                 .and_then(Option::as_ref),
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn mv_ddl_uses_authored_domains_instead_of_carrier_guesses() {
-        use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+        use novarocks_type_contract::ValueLogicalType;
         let cases = [
             (DataType::Utf8, ValueLogicalType::Json, SqlType::Json),
             (
@@ -434,24 +434,22 @@ mod tests {
         ];
         for (data_type, logical_type, expected) in cases {
             assert_eq!(
-                mv_value_type_to_sql_type(&FunctionValueType {
-                    data_type,
-                    logical_type,
-                    nullable: true
-                })
+                mv_value_type_to_sql_type(
+                    &FunctionValueType::try_from_legacy_declared_projection(
+                        data_type,
+                        true,
+                        logical_type
+                    )
+                    .expect("valid temporary legacy value projection")
+                )
                 .unwrap(),
                 expected
             );
         }
-        let item = Field::new("item", DataType::Utf8, true)
-            .with_metadata([(NR_LOGICAL_TYPE_KEY.to_string(), "json".to_string())].into());
         assert_eq!(
-            mv_value_type_to_sql_type(&FunctionValueType::new(
-                DataType::List(Arc::new(item)),
-                false
-            ))
-            .unwrap(),
-            SqlType::Array(Box::new(SqlType::Json))
+            mv_value_type_to_sql_type(&crate::test_value_types::string_list(true, true, false))
+                .unwrap(),
+            SqlType::Array(Box::new(SqlType::Json)),
         );
     }
 

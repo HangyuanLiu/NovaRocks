@@ -114,8 +114,8 @@ fn float_decimal128_complete_metadata_effect_nullable_and_policy() {
                                     .may_raise_row_error
                             );
                             assert!(carrier_cast_can_produce_null(
-                                &source.data_type,
-                                &target.data_type,
+                                source.data_type(),
+                                target.data_type(),
                                 allow
                             ));
                         }
@@ -130,13 +130,10 @@ fn float_decimal128_complete_metadata_effect_nullable_and_policy() {
         DataType::Decimal128(1, 2),
     ] {
         assert!(
-            PreparedCastRecipe::try_new(
-                CastOperation::Carrier,
-                &FunctionValueType::new(DataType::Float64, true),
-                &FunctionValueType::new(target, true),
-                DecimalOverflowPolicy::OutputNull,
-                false,
-                &Control::default()
+            FunctionValueType::try_with_logical_type(
+                target,
+                true,
+                novarocks_type_contract::ValueLogicalType::Physical
             )
             .is_err()
         );
@@ -145,7 +142,7 @@ fn float_decimal128_complete_metadata_effect_nullable_and_policy() {
         assert_eq!(
             PreparedCastRecipe::try_new(
                 CastOperation::Carrier,
-                &FunctionValueType::new(source, true),
+                &FunctionValueType::from_legacy_declared_projection(source, true),
                 &FunctionValueType::new(DataType::Decimal128(18, 4), true),
                 DecimalOverflowPolicy::OutputNull,
                 false,
@@ -370,7 +367,7 @@ fn float_decimal128_compile_callbacks_preserve_three_causes_no_tail() {
             CastOperation::Time,
         ),
     ] {
-        let source = FunctionValueType::new(source, true);
+        let source = FunctionValueType::from_legacy_declared_projection(source, true);
         let baseline = CompileControl {
             calls: Mutex::new(vec![]),
             refusal: None,
@@ -386,8 +383,8 @@ fn float_decimal128_compile_callbacks_preserve_three_causes_no_tail() {
         assert_eq!(
             original.is_ok(),
             op == CastOperation::Carrier
-                && result.nullable
-                && source.data_type == DataType::Float64
+                && result.nullable()
+                && source.data_type() == &DataType::Float64
         );
         let trace = baseline.calls.lock().unwrap().clone();
         assert!(!trace.is_empty());

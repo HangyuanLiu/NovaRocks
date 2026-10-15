@@ -201,15 +201,15 @@ fn declared_metadata_fields(
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
 ) -> Result<Vec<arrow::datatypes::FieldRef>, String> {
     let column_facts = metadata.planning_facts.column_facts();
-    if !column_facts.is_empty() && column_facts.len() != metadata.schema.fields().len() {
+    if !column_facts.is_empty() && column_facts.len() != metadata.schema().fields().len() {
         return Err(format!(
             "CREATE source planning facts cover {} columns but its read schema has {}",
             column_facts.len(),
-            metadata.schema.fields().len()
+            metadata.schema().fields().len()
         ));
     }
     Ok(metadata
-        .schema
+        .schema()
         .fields()
         .iter()
         .enumerate()
@@ -251,21 +251,27 @@ mod tests {
             namespace: Arc::from("db"),
             table: Arc::from("source"),
         };
-        let metadata = novarocks_spi::connector::ConnectorTableMetadata {
-            identity: identity.clone(),
-            schema: Arc::new(arrow::datatypes::Schema::new(vec![
+        let metadata = crate::connector::schema_creation::declared_test_metadata(
+            novarocks_spi::connector::ConnectorTableMetadataHeader {
+                identity: identity.clone(),
+                planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
+                definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
+                version: Some(Bytes::from_static(b"schema-1")),
+                statistics_data_version: None,
+                table: novarocks_spi::connector::ConnectorTableHandle::try_new(
+                    identity.instance_id.clone(),
+                    Bytes::from_static(b"provider-table"),
+                )
+                .expect("table handle"),
+            },
+            Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
             ])),
-            planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
-            definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
-            version: Some(Bytes::from_static(b"schema-1")),
-            statistics_data_version: None,
-            table: novarocks_spi::connector::ConnectorTableHandle::try_new(
-                identity.instance_id.clone(),
-                Bytes::from_static(b"provider-table"),
-            )
-            .expect("table handle"),
-        };
+            vec![novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            )],
+        );
         let observed = MvCreateSourceObservation::try_new(
             identity,
             ConnectorTableObjectId::try_new(Bytes::from_static(b"object-1")).expect("object"),

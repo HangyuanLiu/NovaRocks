@@ -30,8 +30,7 @@ use crate::{
 use arrow::datatypes::{DataType, Field};
 use novarocks_proto_models::{physical_type_v2 as wire, plan};
 use novarocks_type_contract::{
-    CompileControlError, MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_METADATA_ENTRIES,
-    MAX_ARROW_FIELD_NAME_BYTES, MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES, owned_resources::hashmap,
+    CompileControlError, MAX_ARROW_FIELD_METADATA_BYTES, owned_resources::hashmap,
 };
 use std::{alloc::Layout, sync::Arc};
 
@@ -108,7 +107,11 @@ pub(super) struct Model {
     strict_node_work: usize,
 }
 impl Model {
-    fn request(&mut self, layout: Layout, count: usize) -> Result<(), E> {
+    pub(super) fn request(
+        &mut self,
+        layout: Layout,
+        count: usize,
+    ) -> Result<(), CompileControlError> {
         if layout.size() == 0 || count == 0 {
             return Ok(());
         }
@@ -210,15 +213,9 @@ impl Model {
         if roots > limits.max_definitions {
             return Err(CompileControlError::ResourceExhausted.into());
         }
-        // One strict validator node: its Field metadata source iteration and
-        // bounded name/metadata/zone byte walks, plus its carrier visit.
-        let iteration =
-            hashmap::source_iterator_work_upper_bound(source, MAX_ARROW_FIELD_METADATA_ENTRIES)
-                .map_err(hash_error)?;
-        let strict_bytes = add(
-            add(MAX_ARROW_FIELD_METADATA_BYTES, MAX_ARROW_FIELD_NAME_BYTES)?,
-            MAX_ARROW_TIMESTAMP_TIMEZONE_BYTES,
-        )?;
+        // Strict walks inspect actual carrier/Field events below. Header and
+        // stack work is known here; metadata-free nodes do not probe an
+        // imagined source annotation map or scan the caller's whole invoice.
         let mut model = Self {
             source,
             definitions: 0,
@@ -227,7 +224,7 @@ impl Model {
             requests: 0,
             bytes: 0,
             work: 256,
-            strict_node_work: add(iteration, add(1024, mul(strict_bytes, 8)?)?)?,
+            strict_node_work: 1024,
         };
         model.tree(value_roots)?;
         model.tree(field_roots)?;
@@ -269,6 +266,30 @@ impl Model {
         self.work = add(self.work, mul(count, self.strict_node_work)?)?;
         Ok(())
     }
+    /// Work of the actual strict Field visit, admitted before its iterator.
+    /// A zero-capacity map is constant. Nonempty/deleted source maps keep their
+    /// original source envelope; it is never reused for execution-only nodes.
+    pub(super) fn strict_field(&mut self, field: &Field) -> Result<(), E> {
+        self.work = add(self.work, add(128, mul(field.name().len(), 8)?)?)?;
+        if field.metadata().capacity() != 0 {
+            let iteration =
+                hashmap::source_iterator_work_upper_bound(self.source, field.metadata().len())
+                    .map_err(hash_error)?;
+            self.work = add(
+                self.work,
+                add(iteration, mul(MAX_ARROW_FIELD_METADATA_BYTES, 8)?)?,
+            )?;
+        } else {
+            self.work = add(self.work, 1)?;
+        }
+        Ok(())
+    }
+    pub(super) fn strict_carrier(&mut self, ty: &DataType) -> Result<(), E> {
+        if let DataType::Timestamp(_, Some(zone)) = ty {
+            self.work = add(self.work, mul(zone.len(), 8)?)?;
+        }
+        Ok(())
+    }
     /// Header-only numerical contribution, before any child traversal.
     pub(super) fn carrier(&mut self, ty: &DataType) -> Result<(), E> {
         match ty {
@@ -298,20 +319,26 @@ impl Model {
         self.string(field.name().len())?;
         self.request(array::<(&str, &str)>(entries)?, 1)?;
         self.request(array::<plan::ArrowFieldMetadataEntry>(entries)?, 1)?;
-        // The original Count walk and encode_metadata each iterate the
-        // same source map once. Strict pre-validation is admitted in new().
-        self.work = add(
-            self.work,
-            mul(
-                hashmap::source_iterator_work_upper_bound(self.source, entries)
-                    .map_err(hash_error)?,
-                2,
-            )?,
-        )?;
-        let pairs = mul(entries, entries.saturating_sub(1))? / 2;
-        // At most B equal-prefix bytes, one length/order comparison and one
-        // swap per pair. B is the truthful union, not len()/capacity().
-        self.work = add(self.work, mul(pairs, add(self.source, 2)?)?)?;
+        // Empty zero-capacity metadata has no deleted buckets to visit.
+        // Existing arbitrary maps retain the original source-provenance bound.
+        if field.metadata().capacity() == 0 {
+            self.work = add(self.work, 2)?;
+        } else {
+            // The original Count walk and encode_metadata each iterate the
+            // same source map once. Strict pre-validation is admitted in new().
+            self.work = add(
+                self.work,
+                mul(
+                    hashmap::source_iterator_work_upper_bound(self.source, entries)
+                        .map_err(hash_error)?,
+                    2,
+                )?,
+            )?;
+            let pairs = mul(entries, entries.saturating_sub(1))? / 2;
+            // At most B equal-prefix bytes, one length/order comparison and one
+            // swap per pair. B is the truthful union, not len()/capacity().
+            self.work = add(self.work, mul(pairs, add(self.source, 2)?)?)?;
+        }
         self.work = add(self.work, mul(entries, 128)?)?;
         Ok(())
     }
@@ -345,6 +372,35 @@ impl Model {
         self.request(array::<wire::CarrierTypeDefinition>(carriers)?, 1)?;
         self.request(array::<wire::FieldDefinition>(fields)?, 1)?;
         self.request(array::<wire::ValueTypeDefinition>(values)?, 1)?;
+        Ok(())
+    }
+    pub(super) fn source_output(&mut self, fields: usize) -> Result<(), E> {
+        self.request(array::<wire::SourceArrowFieldFacts>(fields)?, 1)?;
+        Ok(())
+    }
+    pub(super) fn additional_value_roots(&mut self, roots: usize) -> Result<(), E> {
+        self.tree(roots)?;
+        self.work = add(self.work, mul(roots, 256)?)?;
+        Ok(())
+    }
+    pub(super) fn associated_field_work(
+        &mut self,
+        actual_profile_work: usize,
+    ) -> Result<(), CompileControlError> {
+        // A second borrowed exact layout walk of this actual semantic tree.
+        // Its nodes, role wrappers, names and parameters fit the shared per-node
+        // work profile; it does not allocate metadata fingerprint buckets.
+        self.work = add(self.work, actual_profile_work)?;
+        Ok(())
+    }
+    pub(super) fn semantic_profile(
+        &mut self,
+        profile: &super::semantic::Profile,
+    ) -> Result<(), CompileControlError> {
+        self.definitions = add(self.definitions, profile.definitions)?;
+        self.expanded = add(self.expanded, profile.expanded)?;
+        self.strings = add(self.strings, profile.strings)?;
+        self.work = add(self.work, profile.work)?;
         Ok(())
     }
     pub(super) fn facts(
@@ -518,11 +574,11 @@ mod tests {
             );
         }
     }
-    /// The actual-size charge never exceeds the former per-type maximum: a
-    /// root of the maximum node count charges exactly what every strict root
-    /// used to, and its validator work still scales with the source invoice.
+    /// Stack geometry remains the original per-node upper. Metadata-free
+    /// node headers do not perform source-map work; actual source Field visits
+    /// still carry their original iterator bound.
     #[test]
-    fn strict_nodes_at_the_type_maximum_reproduce_the_former_per_root_charge() {
+    fn strict_nodes_keep_original_stack_upper_and_only_actual_source_maps_scale_with_invoice() {
         let tuple = std::mem::size_of::<(&DataType, usize)>();
         let mut low = Model::new(1024, 1, 0, 0, 0, limits()).unwrap();
         let mut high = Model::new(4096, 1, 0, 0, 0, limits()).unwrap();
@@ -542,10 +598,18 @@ mod tests {
         let low_work = low_nodes.cumulative_work_upper_bound - low_base.cumulative_work_upper_bound;
         let high_work =
             facts(&high).cumulative_work_upper_bound - high_base.cumulative_work_upper_bound;
-        // The locked metadata iterator's 32 units per source byte, per node.
-        assert_eq!(
-            high_work - low_work,
-            MAX_VALUE_TYPE_NODES * (4096 - 1024) * 32
+        assert_eq!(high_work, low_work);
+        let field = Field::new("source", DataType::Int64, false)
+            .with_metadata(HashMap::from([("external".into(), "attribute".into())]));
+        let (low_before, high_before) = (
+            facts(&low).cumulative_work_upper_bound,
+            facts(&high).cumulative_work_upper_bound,
+        );
+        low.strict_field(&field).unwrap();
+        high.strict_field(&field).unwrap();
+        assert!(
+            facts(&high).cumulative_work_upper_bound - high_before
+                > facts(&low).cumulative_work_upper_bound - low_before
         );
     }
     #[test]
@@ -853,5 +917,135 @@ mod tests {
             )),
             Err(E::Control(CompileControlError::ResourceExhausted))
         ));
+    }
+    #[test]
+    fn metadata_free_wide_execution_actual_encoder_does_not_multiply_whole_source_work() {
+        use super::super::{TypeCodecError, encode_borrowed_type_namespaces_sources_in};
+        use novarocks_type_contract::FunctionValueType;
+        struct Control {
+            stop: Option<(usize, CompileControlError)>,
+            trace: Mutex<Vec<u32>>,
+        }
+        impl PureCompileControl for Control {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                let mut trace = self.trace.lock().unwrap();
+                let at = trace.len();
+                if let Some((stop, _)) = self.stop {
+                    assert!(at <= stop, "callback after refusal");
+                }
+                trace.push(units);
+                if let Some((stop, cause)) = self.stop
+                    && stop == at
+                {
+                    Err(cause)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let ty = FunctionValueType::new(
+            DataType::Struct(
+                (0..320)
+                    .map(|id| Field::new(format!("c{id}"), DataType::Int32, false))
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
+            false,
+        );
+        let roots = [(0, &ty)];
+        let caps = PackageTypeProjectionLimits {
+            max_definitions: 16384,
+            max_expanded_nodes: 65536,
+            max_string_bytes: 65536,
+            max_allocation_requests: 1_000_000,
+            max_allocation_request_bytes: 128 * 1024 * 1024,
+            max_coexisting_source_and_request_bytes: 256 * 1024 * 1024,
+            max_work: 2_000_000_000,
+        };
+        let run = |source, caps, control: &Control| {
+            let mut last = PackageTypeProjectionFacts::default();
+            let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+            let result = encode_borrowed_type_namespaces_sources_in(
+                &roots,
+                &[],
+                &[],
+                &[],
+                source,
+                caps,
+                &mut |facts| {
+                    last = *facts;
+                    Ok(())
+                },
+                &mut work,
+            );
+            if matches!(result, Err(TypeCodecError::Control(_))) {
+                return result.map(|_| last);
+            }
+            work.finish()?;
+            result.map(|_| last)
+        };
+        let low = Control {
+            stop: None,
+            trace: Mutex::new(Vec::new()),
+        };
+        let low_facts = run(1024 * 1024, caps, &low).unwrap();
+        let high = Control {
+            stop: None,
+            trace: Mutex::new(Vec::new()),
+        };
+        let high_facts = run(2 * 1024 * 1024, caps, &high).unwrap();
+        assert_eq!(
+            high_facts.cumulative_work_upper_bound,
+            low_facts.cumulative_work_upper_bound
+        );
+        assert_eq!(
+            high_facts.coexisting_source_and_request_bytes_upper_bound
+                - low_facts.coexisting_source_and_request_bytes_upper_bound,
+            1024 * 1024
+        );
+        assert_eq!(*high.trace.lock().unwrap(), *low.trace.lock().unwrap());
+        let exact = PackageTypeProjectionLimits {
+            max_work: high_facts.cumulative_work_upper_bound,
+            ..caps
+        };
+        let control = Control {
+            stop: None,
+            trace: Mutex::new(Vec::new()),
+        };
+        assert!(run(2 * 1024 * 1024, exact, &control).is_ok());
+        let control = Control {
+            stop: None,
+            trace: Mutex::new(Vec::new()),
+        };
+        assert!(matches!(
+            run(
+                2 * 1024 * 1024,
+                PackageTypeProjectionLimits {
+                    max_work: exact.max_work - 1,
+                    ..exact
+                },
+                &control
+            ),
+            Err(TypeCodecError::Control(
+                CompileControlError::ResourceExhausted
+            ))
+        ));
+        let baseline = high.trace.lock().unwrap().clone();
+        for at in 0..baseline.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = Control {
+                    stop: Some((at, cause)),
+                    trace: Mutex::new(Vec::new()),
+                };
+                assert!(
+                    matches!(run(2*1024*1024,caps,&control),Err(TypeCodecError::Control(actual))if actual==cause)
+                );
+                assert_eq!(*control.trace.lock().unwrap(), baseline[..=at]);
+            }
+        }
     }
 }

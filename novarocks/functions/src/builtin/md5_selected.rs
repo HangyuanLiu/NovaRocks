@@ -78,7 +78,7 @@ pub(super) fn validate_profile(
         let FunctionArgumentType::Value(source) = ty else {
             return Err(invalid("MD5 family requires value arguments"));
         };
-        if !source_supported(op, &source.data_type, &source.logical_type) {
+        if !source_supported(op, source.data_type(), &source.logical_type()) {
             return Err(invalid(
                 "MD5 family source has no installed exact flat byte or VARCHAR cast profile",
             ));
@@ -87,12 +87,12 @@ pub(super) fn validate_profile(
     let target = contract.result_type();
     step()?;
     let expected = if op == Operation::Md5sumNumeric {
-        target.data_type == DataType::FixedSizeBinary(16)
-            && target.logical_type == ValueLogicalType::LargeInt
+        target.data_type() == &DataType::FixedSizeBinary(16)
+            && target.logical_type() == ValueLogicalType::LargeInt
     } else {
-        target.data_type == DataType::Utf8 && target.logical_type == ValueLogicalType::Physical
+        target.data_type() == &DataType::Utf8 && target.logical_type() == ValueLogicalType::Physical
     };
-    if !expected || !target.nullable {
+    if !expected || !target.nullable() {
         return Err(invalid(
             "MD5 family differs from its exact nullable installed result identity",
         ));
@@ -218,14 +218,14 @@ pub(super) fn evaluate<'a>(
                     input.arguments()[idx].value_row(ordinal, row)
                 }
             },
-            Some(&input.contract().result_type().data_type),
+            Some(input.contract().result_type().data_type()),
             false,
             &mut |event| md5_shared::observe(&mut work, event),
         )
         .map_err(|error| core_failure(op, error))?;
         SelectedValues::try_new_observed(
             selection,
-            &input.contract().result_type().data_type,
+            input.contract().result_type().data_type(),
             out,
             Box::default(),
             || work.step(),

@@ -69,7 +69,7 @@ fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
                     novarocks_physical_plan::AggregatePhase::Single
                 );
                 assert!(function_order_by.is_empty());
-                assert!(node.ty.nullable);
+                assert!(node.ty.nullable());
             }
         }
     }

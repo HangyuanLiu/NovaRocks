@@ -200,7 +200,7 @@ mod tests {
                 .pull_chunk(&state)
                 .expect("active source pull")
                 .expect("active source chunk")
-                .batch
+                .record_batch()
                 .num_rows(),
             1
         );

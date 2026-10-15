@@ -262,7 +262,35 @@ pub struct WriterStatisticsTargetInput<'a> {
     /// Exact Arrow relation produced by the terminal writer projection. Slot
     /// IDs are its one-based ordinals, matching the frozen target schema.
     pub input_schema: &'a Schema,
+    /// Original complete catalog declarations, in this same occurrence order.
+    /// Arrow fields cannot reconstruct nominal semantics.
+    pub input_columns: &'a [novarocks_types::schema::ColumnDef],
     pub requirements: &'a [StatisticsRequiredAggregation],
+}
+
+pub(super) enum WriterInputTypeError {
+    Declaration(novarocks_types::ColumnValueTypeError),
+    Control(novarocks_type_contract::CompileControlError),
+}
+impl From<novarocks_types::ColumnValueTypeError> for WriterInputTypeError {
+    fn from(error: novarocks_types::ColumnValueTypeError) -> Self {
+        Self::Declaration(error)
+    }
+}
+impl From<novarocks_type_contract::ValueTypeError> for WriterInputTypeError {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Declaration(error.into())
+    }
+}
+impl WriterInputTypeError {
+    pub(super) fn into_compile_error(self) -> crate::compiler::SqlCompileError {
+        match self {
+            Self::Control(error) => error.into(),
+            Self::Declaration(error) => {
+                crate::compiler::SqlCompileError::Compilation(error.to_string())
+            }
+        }
+    }
 }
 
 /// Resolve Connector-selected names once and erase the Connector descriptors
@@ -328,9 +356,34 @@ pub fn plan_writer_statistics(
                         target.target.get()
                     )
                 })?;
-            let input_value_type =
-                novarocks_type_contract::FunctionValueType::try_from_field(input)
-                    .map_err(|error| error.to_string())?;
+            let declaration = target
+                .input_columns
+                .get(requirement.input().ordinal())
+                .ok_or_else(|| {
+                    format!(
+                        "write aggregate input declaration ordinal {} is absent for target {}",
+                        requirement.input().ordinal(),
+                        target.target.get()
+                    )
+                })?;
+            control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+            let input_value_type = declaration
+                .declared_value_type_observed::<WriterInputTypeError>(|| {
+                    control
+                        .checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+                        .map_err(WriterInputTypeError::Control)
+                })
+                .map_err(WriterInputTypeError::into_compile_error)?;
+            if input.name() != &declaration.name
+                || input.data_type() != input_value_type.data_type()
+                || input.is_nullable() != input_value_type.nullable()
+            {
+                return Err(
+                    "writer input representation differs from its complete declaration"
+                        .to_string()
+                        .into(),
+                );
+            }
             if input.name() != requirement.input().name()
                 || &input_value_type != requirement.input().value_type()
             {
@@ -369,14 +422,14 @@ pub fn plan_writer_statistics(
                     requirement.input().data_type()
                 )),
             })?;
-            if crate::functions::aggregate_result_type(&resolved).data_type != DataType::Binary
-                || crate::functions::aggregate_result_type(&resolved).logical_type
+            if *crate::functions::aggregate_result_type(&resolved).data_type() != DataType::Binary
+                || crate::functions::aggregate_result_type(&resolved).logical_type()
                     != novarocks_type_contract::ValueLogicalType::Physical
             {
                 return Err(format!(
                     "write aggregate `{}` output {:?} cannot feed the binary Root value slot",
                     requirement.function_name(),
-                    crate::functions::aggregate_result_type(&resolved).data_type
+                    crate::functions::aggregate_result_type(&resolved).data_type()
                 )
                 .into());
             }
@@ -408,7 +461,9 @@ pub fn plan_writer_statistics(
                                 crate::functions::aggregate_selection(&resolved)
                                     .intermediate_type
                                     .clone();
-                            transport_type.nullable = true;
+                            transport_type = transport_type
+                                .with_nullable(true)
+                                .expect("validated root NULL contract");
                             transport_type
                         },
                     )
@@ -553,7 +608,9 @@ fn validate_plan(
         let mut transport_type = crate::functions::aggregate_selection(call.source.binding())
             .intermediate_type
             .clone();
-        transport_type.nullable = true;
+        transport_type = transport_type
+            .with_nullable(true)
+            .expect("validated root NULL contract");
         if **data_type != transport_type {
             return Err(
                 "write aggregate intermediate type differs from its typed tail".to_string(),
@@ -641,6 +698,16 @@ mod tests {
         .expect("requirement")
     }
 
+    fn input_columns() -> Vec<novarocks_types::schema::ColumnDef> {
+        vec![novarocks_types::schema::ColumnDef {
+            name: "k".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: Some(novarocks_types::schema::SqlType::BigInt),
+        }]
+    }
+
     fn input_schema() -> Schema {
         Schema::new(vec![arrow::datatypes::Field::new(
             "k",
@@ -670,6 +737,7 @@ mod tests {
             &[WriterStatisticsTargetInput {
                 target,
                 input_schema: &input_schema,
+                input_columns: &input_columns(),
                 requirements: &required,
             }],
             &build_builtin_engine_function_catalog().expect("builtin function catalog"),
@@ -690,6 +758,7 @@ mod tests {
             &[WriterStatisticsTargetInput {
                 target,
                 input_schema: &schema,
+                input_columns: &input_columns(),
                 requirements: &required,
             }],
             &binary_catalog(),
@@ -733,11 +802,13 @@ mod tests {
                 WriterStatisticsTargetInput {
                     target: target(0),
                     input_schema: &schema,
+                    input_columns: &input_columns(),
                     requirements: &first,
                 },
                 WriterStatisticsTargetInput {
                     target: target(1),
                     input_schema: &schema,
+                    input_columns: &input_columns(),
                     requirements: &second,
                 },
             ],
@@ -773,6 +844,7 @@ mod tests {
             &[WriterStatisticsTargetInput {
                 target: WriteTargetOrdinal::try_new(0).expect("target"),
                 input_schema: &schema,
+                input_columns: &input_columns(),
                 requirements: &requirements,
             }],
             &binary_catalog(),
@@ -796,11 +868,13 @@ mod tests {
                 WriterStatisticsTargetInput {
                     target: target(0),
                     input_schema: &schema,
+                    input_columns: &input_columns(),
                     requirements: &first,
                 },
                 WriterStatisticsTargetInput {
                     target: target(1),
                     input_schema: &schema,
+                    input_columns: &input_columns(),
                     requirements: &second,
                 },
             ],
@@ -840,11 +914,13 @@ mod tests {
                 WriterStatisticsTargetInput {
                     target: target(1),
                     input_schema: &schema,
+                    input_columns: &input_columns(),
                     requirements: &second,
                 },
                 WriterStatisticsTargetInput {
                     target: target(0),
                     input_schema: &schema,
+                    input_columns: &input_columns(),
                     requirements: &first,
                 },
             ],
@@ -870,6 +946,7 @@ mod tests {
                 &[WriterStatisticsTargetInput {
                     target,
                     input_schema: &schema,
+                    input_columns: &input_columns(),
                     requirements: &requirements,
                 }],
                 &binary_catalog(),

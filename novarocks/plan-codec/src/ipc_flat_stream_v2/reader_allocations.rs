@@ -42,6 +42,11 @@ use std::{alloc::Layout, mem, ptr::NonNull};
 pub(super) struct ReaderAllocationRequests {
     pub structural_request_bytes_upper_bound: usize,
     pub allocation_requests_upper_bound: usize,
+    /// Contribution observed by the actual ConstantPool constructor separately.
+    pub constant_owner_request_bytes_upper_bound: usize,
+    /// Result headers only; consumed projections and validation scratch are temporary.
+    pub retained_reader_request_bytes_upper_bound: usize,
+    pub retained_pool_data_request_bytes_upper_bound: usize,
 }
 
 fn invalid(message: &'static str) -> FlatPoolResourceError {
@@ -97,7 +102,7 @@ fn bytes_layout() -> Layout {
     argument_layout(Buffer::from_bytes)
 }
 
-pub(crate) fn environment(work: &mut impl ResourceWork) -> Result<Layout, FlatPoolResourceError> {
+pub(crate) fn environment<W: ResourceWork>(work: &mut W) -> Result<Layout, W::Error> {
     let bytes = bytes_layout();
     let supported = LOCKED_FAMILY
         && LOCKED_TOOLCHAIN
@@ -107,9 +112,7 @@ pub(crate) fn environment(work: &mut impl ResourceWork) -> Result<Layout, FlatPo
         && bytes == Layout::new::<NoPoolBytes>();
     work.step()?;
     if !supported {
-        return Err(invalid(
-            "flat reader allocation source or feature model changed",
-        ));
+        return Err(invalid("flat reader allocation source or feature model changed").into());
     }
     // LOCKED_TOOLCHAIN is the common source owner's actual compiler build
     // receipt; an unreviewed +toolchain override fails before this code builds.
@@ -120,14 +123,16 @@ pub(crate) fn environment(work: &mut impl ResourceWork) -> Result<Layout, FlatPo
 pub(crate) struct Requests {
     pub(crate) bytes: usize,
     pub(crate) count: usize,
+    pub(crate) retained: usize,
+    pub(crate) retained_data: usize,
 }
 impl Requests {
-    pub(crate) fn record(
+    pub(crate) fn record<W: ResourceWork>(
         &mut self,
         layout: Layout,
         copies: usize,
-        work: &mut impl ResourceWork,
-    ) -> Result<(), FlatPoolResourceError> {
+        work: &mut W,
+    ) -> Result<(), W::Error> {
         let result = (|| {
             self.bytes =
                 work.numeric(add(self.bytes, work.numeric(mul(layout.size(), copies))?))?;
@@ -144,12 +149,49 @@ impl Requests {
             result
         }
     }
-    pub(crate) fn exact_vec<T>(
+    pub(crate) fn retain_delta(&mut self, previous: usize) {
+        // A subset of the already checked cumulative sum cannot overflow.
+        self.retained += self.bytes - previous;
+    }
+    pub(crate) fn retained_record<W: ResourceWork>(
+        &mut self,
+        layout: Layout,
+        copies: usize,
+        work: &mut W,
+    ) -> Result<(), W::Error> {
+        let previous = self.bytes;
+        self.record(layout, copies, work)?;
+        self.retain_delta(previous);
+        Ok(())
+    }
+    pub(crate) fn retained_arc<W: ResourceWork>(
+        &mut self,
+        payload: Layout,
+        copies: usize,
+        work: &mut W,
+    ) -> Result<(), W::Error> {
+        let previous = self.bytes;
+        self.arc(payload, copies, work)?;
+        self.retain_delta(previous);
+        Ok(())
+    }
+    pub(crate) fn retained_vec<T, W: ResourceWork>(
         &mut self,
         count: usize,
         copies: usize,
-        work: &mut impl ResourceWork,
-    ) -> Result<(), FlatPoolResourceError> {
+        work: &mut W,
+    ) -> Result<(), W::Error> {
+        let previous = self.bytes;
+        self.exact_vec::<T, W>(count, copies, work)?;
+        self.retain_delta(previous);
+        Ok(())
+    }
+    pub(crate) fn exact_vec<T, W: ResourceWork>(
+        &mut self,
+        count: usize,
+        copies: usize,
+        work: &mut W,
+    ) -> Result<(), W::Error> {
         if count == 0 || mem::size_of::<T>() == 0 {
             work.step()?;
             return Ok(());
@@ -157,12 +199,12 @@ impl Requests {
         let layout = work.numeric(array_layout::<T>(count))?;
         self.record(layout, copies, work)
     }
-    pub(crate) fn arc(
+    pub(crate) fn arc<W: ResourceWork>(
         &mut self,
         payload: Layout,
         copies: usize,
-        work: &mut impl ResourceWork,
-    ) -> Result<(), FlatPoolResourceError> {
+        work: &mut W,
+    ) -> Result<(), W::Error> {
         let layout = if work.parent() {
             use novarocks_type_contract::owned_resources::layout::{self, LayoutResourceError};
             layout::arc_layout(payload).map_err(|error| match error {
@@ -176,11 +218,11 @@ impl Requests {
         };
         self.record(layout, copies, work)
     }
-    pub(crate) fn growing_vec<T>(
+    pub(crate) fn growing_vec<T, W: ResourceWork>(
         &mut self,
         count: usize,
-        work: &mut impl ResourceWork,
-    ) -> Result<(), FlatPoolResourceError> {
+        work: &mut W,
+    ) -> Result<(), W::Error> {
         if count == 0 || mem::size_of::<T>() == 0 {
             work.step()?;
             return Ok(());
@@ -229,18 +271,33 @@ impl Requests {
         work.step()?;
         result
     }
-    pub(crate) fn view_to_data(
+    pub(crate) fn view_to_data<W: ResourceWork>(
         &mut self,
         variadic: usize,
-        work: &mut impl ResourceWork,
-    ) -> Result<(), FlatPoolResourceError> {
+        work: &mut W,
+    ) -> Result<(), W::Error> {
+        self.view_to_data_classified(variadic, false, work)
+    }
+    pub(crate) fn view_to_data_classified<W: ResourceWork>(
+        &mut self,
+        variadic: usize,
+        retained_data: bool,
+        work: &mut W,
+    ) -> Result<(), W::Error> {
         // GenericByteViewArray::into ArrayData first to_vec(V), then insert(0).
         // The existing V-header Vec and its grow request can coexist.
-        self.exact_vec::<Buffer>(variadic, 1, work)?;
+        self.exact_vec::<Buffer, _>(variadic, 1, work)?;
         let grown = 4usize
             .max(work.numeric(mul(variadic, 2))?)
             .max(work.numeric(add(variadic, 1))?);
-        self.exact_vec::<Buffer>(grown, 1, work)
+        if retained_data {
+            let before = self.bytes;
+            self.exact_vec::<Buffer, _>(grown, 1, work)?;
+            self.retained_data += self.bytes - before;
+            Ok(())
+        } else {
+            self.exact_vec::<Buffer, _>(grown, 1, work)
+        }
     }
 }
 
@@ -309,18 +366,25 @@ pub(crate) fn concrete_array_layout(ty: &DataType) -> Result<Layout, FlatPoolRes
 /// Requires the pool projection computed for this same checked stream. This
 /// private helper borrows the parent's original checkpoints; parent owns its
 /// success/ordinary tail and primary refusal handling. It makes no allocations.
-fn header_requests(
+fn header_requests<W: ResourceWork>(
     field: &arrow::datatypes::Field,
     bytes: Layout,
     owners: usize,
-    work: &mut impl ResourceWork,
-) -> Result<Requests, FlatPoolResourceError> {
+    retains_body: bool,
+    work: &mut W,
+) -> Result<Requests, W::Error> {
     let mut requests = Requests::default();
     requests.arc(work.numeric(array_layout::<FieldRef>(1))?, 1, work)?;
     requests.arc(Layout::new::<Schema>(), 1, work)?;
-    requests.arc(bytes, owners, work)?;
-    requests.arc(concrete_array_layout(field.data_type())?, 2, work)?;
-    requests.exact_vec::<ArrayRef>(4, 1, work)?;
+    if retains_body {
+        requests.retained_arc(bytes, owners, work)?;
+    } else {
+        requests.arc(bytes, owners, work)?;
+    }
+    let concrete = concrete_array_layout(field.data_type())?;
+    requests.arc(concrete, 2, work)?;
+    requests.retained += work.numeric(arc_layout(concrete))?.size();
+    requests.exact_vec::<ArrayRef, _>(4, 1, work)?;
     Ok(requests)
 }
 pub(super) fn initial_header(
@@ -328,18 +392,27 @@ pub(super) fn initial_header(
 ) -> Result<ReaderAllocationRequests, FlatPoolResourceError> {
     let mut work = super::resource_work::HeaderWork;
     let bytes = environment(&mut work)?;
-    let requests = header_requests(field, bytes, 1, &mut work)?;
+    let requests = header_requests(
+        field,
+        bytes,
+        1,
+        !matches!(field.data_type(), DataType::Null),
+        &mut work,
+    )?;
     Ok(ReaderAllocationRequests {
         structural_request_bytes_upper_bound: requests.bytes,
         allocation_requests_upper_bound: requests.count,
+        constant_owner_request_bytes_upper_bound: 0,
+        retained_reader_request_bytes_upper_bound: requests.retained,
+        retained_pool_data_request_bytes_upper_bound: requests.retained_data,
     })
 }
 
-pub(super) fn preflight(
+pub(super) fn preflight<W: ResourceWork>(
     stream: &FlatConstantStream<'_, '_>,
     pool: &FlatPoolResourceProjection,
-    work: &mut impl ResourceWork,
-) -> Result<ReaderAllocationRequests, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<ReaderAllocationRequests, W::Error> {
     let bytes = environment(work)?;
     let flat = layout(stream.field().data_type())?;
     work.step()?;
@@ -350,27 +423,39 @@ pub(super) fn preflight(
         work.numeric(add(1, usize::from(pool.alignment_repair_possible)))?,
         usize::from(pool.empty_offset_capacity_bytes != 0),
     ))?;
-    let mut requests = header_requests(stream.field(), bytes, owners, work)?;
+    let mut requests = header_requests(
+        stream.field(),
+        bytes,
+        owners,
+        geometry.buffer_descriptors != 0 || pool.empty_offset_capacity_bytes != 0,
+        work,
+    )?;
     match flat {
         FlatLayout::Null => {}
         FlatLayout::Views => {
             // Generic VecDeque<i64> collection of the one variadic count.
-            requests.exact_vec::<i64>(4, 1, work)?;
+            requests.exact_vec::<i64, _>(4, 1, work)?;
             // Result collection of D read Buffer headers, then builder to_vec.
-            requests.growing_vec::<Buffer>(geometry.buffer_descriptors, work)?;
-            requests.exact_vec::<Buffer>(work.numeric(add(variadic, 1))?, 1, work)?;
-            requests.arc(work.numeric(array_layout::<Buffer>(variadic))?, 2, work)?;
+            requests.growing_vec::<Buffer, _>(geometry.buffer_descriptors, work)?;
+            requests.exact_vec::<Buffer, _>(work.numeric(add(variadic, 1))?, 1, work)?;
+            let backing = work.numeric(array_layout::<Buffer>(variadic))?;
+            requests.arc(backing, 2, work)?;
+            // The canonical view Array owns one variadic Arc; the reader's
+            // previous Arc has exited. Final ArrayData owns its Buffer Vec.
+            requests.retained += work.numeric(arc_layout(backing))?.size();
             requests.view_to_data(variadic, work)?;
-            requests.view_to_data(variadic, work)?;
+            requests.view_to_data_classified(variadic, true, work)?;
         }
         FlatLayout::Offsets(_) => {
             // Reader builder, input array.to_data and canonical array.to_data.
-            requests.exact_vec::<Buffer>(2, 3, work)?;
+            requests.exact_vec::<Buffer, _>(2, 3, work)?;
+            requests.retained_data += work.numeric(array_layout::<Buffer>(2))?.size();
         }
         FlatLayout::Bits | FlatLayout::Fixed(_) => {
             // Reader .add_buffer push, then two exact vec![Buffer] projections.
-            requests.exact_vec::<Buffer>(4, 1, work)?;
-            requests.exact_vec::<Buffer>(1, 2, work)?;
+            requests.exact_vec::<Buffer, _>(4, 1, work)?;
+            requests.exact_vec::<Buffer, _>(1, 2, work)?;
+            requests.retained_data += work.numeric(array_layout::<Buffer>(1))?.size();
         }
     }
     // ArrayData::align_buffers plus four possible validate_data calls: reader
@@ -382,14 +467,15 @@ pub(super) fn preflight(
         FlatLayout::Offsets(_) => 2,
         _ => 1,
     };
-    requests.exact_vec::<BufferSpec>(specs, 5, work)?;
+    requests.exact_vec::<BufferSpec, _>(specs, 5, work)?;
     // Include the completed shape prefix cumulatively: two schema walks, one
     // batch walk, one pool bridge and one post-array validate_type. Each runs
     // the same flat walker vec![(&DataType,1)] with no children. Prefix
     // admission and its actual lifetime remain separately owned by the host.
     if !work.parent() {
-        requests.exact_vec::<(&DataType, usize)>(1, 5, work)?;
+        requests.exact_vec::<(&DataType, usize), _>(1, 5, work)?;
     }
+    let before_constant_owner = requests.bytes;
     if !matches!(flat, FlatLayout::Null) {
         // Sole semantic validator's exact private frame layout, no enum mirror.
         // Flat Range processing pop/push retains capacity one, even for N=0.
@@ -399,6 +485,9 @@ pub(super) fn preflight(
     Ok(ReaderAllocationRequests {
         structural_request_bytes_upper_bound: requests.bytes,
         allocation_requests_upper_bound: requests.count,
+        constant_owner_request_bytes_upper_bound: requests.bytes - before_constant_owner,
+        retained_reader_request_bytes_upper_bound: requests.retained,
+        retained_pool_data_request_bytes_upper_bound: requests.retained_data,
     })
 }
 
@@ -596,6 +685,19 @@ mod tests {
             assert!(requests.allocation_requests_upper_bound >= 11);
             assert!(control.0.lock().unwrap().iter().all(|&units| units <= 256));
             by_family.push(requests);
+        }
+        assert_eq!(
+            by_family[0].retained_reader_request_bytes_upper_bound,
+            arc_layout(Layout::new::<NullArray>()).unwrap().size(),
+            "compact Null keeps only its canonical Array header, not the input Bytes owner",
+        );
+        for requests in &by_family {
+            assert!(
+                requests.retained_reader_request_bytes_upper_bound
+                    + requests.retained_pool_data_request_bytes_upper_bound
+                    <= requests.structural_request_bytes_upper_bound
+                        - requests.constant_owner_request_bytes_upper_bound
+            );
         }
         assert!(
             by_family[1].structural_request_bytes_upper_bound

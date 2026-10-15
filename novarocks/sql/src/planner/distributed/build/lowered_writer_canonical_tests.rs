@@ -96,10 +96,13 @@ fn fixture(
         StatisticsArtifactIdentity::try_new(vec![1], "test-writer-stat-v1").unwrap(),
     )
     .unwrap();
+    let declared_input =
+        simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal);
     let auxiliary = plan_writer_statistics(
         &[WriterStatisticsTargetInput {
             target: WriteTargetOrdinal::try_new(0).unwrap(),
             input_schema: &schema,
+            input_columns: &declared_input.contract.input_columns,
             requirements: &[requirement],
         }],
         functions.as_ref(),
@@ -268,7 +271,18 @@ fn real_theta_writer_partial_canonical_and_final_original_capture_are_distinct()
     assert_eq!(partial.site(), writer_call(&owner, true).2);
     assert!(std::ptr::eq(partial.node(), writer_call(&owner, true).1));
     let final_call = entry(&owner, false);
-    assert!(final_call.canonical().is_none());
+    let final_canonical = final_call.canonical().unwrap();
+    assert!(final_canonical.belongs_to(final_call.captured()));
+    assert!(!Arc::ptr_eq(final_canonical, canonical));
+    assert_argument(&final_canonical.request().arguments[0], false);
+    assert_eq!(
+        final_canonical.selected().argument_types.as_ref(),
+        final_call.source().binding.function.argument_types.as_ref()
+    );
+    assert_eq!(
+        final_canonical.selected().result_type,
+        FunctionResultType::Scalar(final_call.source().binding.function.result_type.clone())
+    );
     assert!(matches!(final_call.phase(), AggregatePhase::Final { .. }));
     assert_eq!(
         final_call.runtime(),
@@ -300,7 +314,7 @@ fn writer_update_reselects_actual_nullable_input_without_replacing_original_capt
     assert!(
         partial.fragment().values()[&partial.source().input]
             .ty
-            .nullable
+            .nullable()
     );
     assert_eq!(
         partial.source().binding.function.argument_types.as_ref(),

@@ -146,6 +146,7 @@ fn fixture_calls(fragment: &Fragment, uses: &PhysicalRootUses) -> FrozenFragment
                 panic!("the parameter fixture requires its selected timezone reference");
             };
             calls.push(FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -978,8 +979,8 @@ fn public_read(
             .map(|(ordinal, field)| {
                 arrow_schema::Field::new(
                     format!("v{ordinal}"),
-                    field.ty.data_type.clone(),
-                    field.ty.nullable,
+                    field.ty.data_type().clone(),
+                    field.ty.nullable(),
                 )
             })
             .collect::<Vec<_>>(),
@@ -991,7 +992,7 @@ fn public_read(
         relation
             .schema()
             .iter()
-            .map(|field| field.ty.logical_type)
+            .map(|field| field.ty.logical_type())
             .collect(),
     )?;
     FrozenConnectorRead::try_new(scan, public)
@@ -1309,7 +1310,11 @@ fn result_and_annotation_facts_are_checked_at_the_local_boundary() {
     });
     FragmentPackage::try_new(input.clone(), package_admission(), &Control).unwrap();
     let mut wrong_result = input.clone();
-    wrong_result.result.as_mut().unwrap().fields[0].ty.nullable = true;
+    wrong_result.result.as_mut().unwrap().fields[0].ty =
+        wrong_result.result.as_ref().unwrap().fields[0]
+            .ty
+            .with_nullable(true)
+            .unwrap();
     assert!(
         FragmentPackage::try_new(wrong_result, package_admission(), &Control)
             .unwrap_err()
@@ -1530,7 +1535,9 @@ fn parameter_occurrences_fragment(reference: SemanticParameterRef, occurrences: 
                     function_id: FunctionId::try_new("test.parameter").unwrap(),
                     overload: FunctionOverloadId::try_new("test.parameter.zero").unwrap(),
                     kind: FunctionKind::Scalar,
-                    argument_types: Box::default(),
+                    argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        Box::default(),
+                    ),
                     result_type: value_type.clone(),
                     legacy_metadata: Some(crate::LegacyBindingMetadata {
                         volatility: FunctionVolatility::Stable,
@@ -1792,6 +1799,7 @@ fn parameter_calls_with_references(
             assert!(function.argument_types.is_empty());
             assert!(args.is_empty());
             FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -2101,8 +2109,8 @@ fn writer_package_requires_the_exact_public_input_recipe() {
                 field.token,
                 arrow_schema::Field::new(
                     field.provider_name.as_ref(),
-                    field.ty.data_type.clone(),
-                    field.ty.nullable,
+                    field.ty.data_type().clone(),
+                    field.ty.nullable(),
                 ),
             )
         })
@@ -2168,7 +2176,7 @@ fn writer_package_requires_the_exact_public_input_recipe() {
 }
 
 #[test]
-fn writer_package_preserves_nested_dictionary_field_identity() {
+fn writer_package_separates_declared_value_binding_from_provider_dictionary_facts() {
     use novarocks_connector_contract::{
         ConnectorWriteBinding, ConnectorWriteFieldBinding, ConnectorWriteInputShape,
         ConnectorWriteRecipeDraft,
@@ -2197,10 +2205,12 @@ fn writer_package_preserves_nested_dictionary_field_identity() {
         unreachable!()
     };
     let input_value = target.target_fields[0].input;
-    target.target_fields[0].ty.data_type = nested_type(1);
+    target.target_fields[0].ty =
+        ValueType::new(nested_type(1), target.target_fields[0].ty.nullable());
     let target = target.clone();
     let mut values = original.values().clone();
-    values.get_mut(&input_value).unwrap().ty.data_type = nested_type(1);
+    let value = values.get_mut(&input_value).unwrap();
+    value.ty = ValueType::new(nested_type(1), value.ty.nullable());
     let fragment = Fragment::from(crate::plan::FragmentParts {
         id: original.id(),
         root: original.root(),
@@ -2217,7 +2227,7 @@ fn writer_package_preserves_nested_dictionary_field_identity() {
     for cut in &mut input.cuts.inbound {
         for import in &mut cut.imports {
             if import.destination == input_value {
-                import.source.ty.data_type = nested_type(1);
+                import.source.ty = ValueType::new(nested_type(1), import.source.ty.nullable());
             }
         }
     }
@@ -2231,14 +2241,16 @@ fn writer_package_preserves_nested_dictionary_field_identity() {
             .target_fields
             .iter()
             .map(|field| {
-                ConnectorWriteFieldBinding::new(
+                ConnectorWriteFieldBinding::try_new_typed(
                     field.token,
                     arrow_schema::Field::new(
                         field.provider_name.as_ref(),
                         nested_type(id),
-                        field.ty.nullable,
+                        field.ty.nullable(),
                     ),
+                    field.ty.clone(),
                 )
+                .unwrap()
             })
             .collect();
         let recipe = ConnectorWriteRecipeDraft::try_new(
@@ -2249,16 +2261,7 @@ fn writer_package_preserves_nested_dictionary_field_identity() {
         .unwrap();
         input.writes.insert(original.root(), recipe);
         let result = FragmentPackage::try_new(input.clone(), package_admission(), &Control);
-        if id == 1 {
-            result.unwrap();
-        } else {
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("input field occurrence")
-            );
-        }
+        result.unwrap();
     }
 }
 

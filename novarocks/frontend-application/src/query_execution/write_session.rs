@@ -1477,14 +1477,22 @@ pub(crate) mod tests {
                     )?;
                     let handle = self.adapter.wrap_writer_handle(FakeHandle(ordinal.get()));
                     let input = novarocks_spi::connector::ConnectorWriteInputShape::Data {
-                        fields: vec![novarocks_spi::connector::ConnectorWriteFieldBinding::new(
-                            novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([1; 32]),
-                            arrow::datatypes::Field::new(
-                                "v",
-                                arrow::datatypes::DataType::Int64,
-                                true,
-                            ),
-                        )],
+                        fields: vec![
+                            novarocks_spi::connector::ConnectorWriteFieldBinding::try_new_typed(
+                                novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes(
+                                    [1; 32],
+                                ),
+                                arrow::datatypes::Field::new(
+                                    "v",
+                                    arrow::datatypes::DataType::Int64,
+                                    true,
+                                ),
+                                novarocks_type_contract::FunctionValueType::new(
+                                    arrow::datatypes::DataType::Int64,
+                                    true,
+                                ),
+                            )?,
+                        ],
                     };
                     let target = ConnectorWriteTargetPlan::new(ordinal, handle, input.clone());
                     if !self.statistics {
@@ -1766,9 +1774,16 @@ pub(crate) mod tests {
             intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
             purpose: novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
             input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
-                fields: vec![novarocks_spi::connector::ConnectorWriteFieldRequest::new(
-                    arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, true),
-                )],
+                fields: vec![
+                    novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                        arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, true),
+                        novarocks_type_contract::FunctionValueType::new(
+                            arrow::datatypes::DataType::Int64,
+                            true,
+                        ),
+                    )
+                    .expect("caller complete input declaration"),
+                ],
             },
             base: None,
             flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::Ordinary,

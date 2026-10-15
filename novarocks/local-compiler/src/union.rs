@@ -22,7 +22,6 @@
 //! not a host allocation grant or a model of Arrow's internal copy behavior.
 
 use crate::{FragmentCompileError, assert_rows::reserve_vec, channels::UnionChannelBranch};
-use arrow_schema::{Field, Schema};
 use novarocks_local_program::{
     DiagnosticSourceNodeId, MAX_PROGRAM_NODES, MAX_PROGRAM_TYPED_CHANNELS, MAX_STATIC_EXPRESSIONS,
     ProgramChannelLayoutRole, ProgramChannelSite, ProgramExprId, ProgramNode, ProgramNodeId,
@@ -33,14 +32,14 @@ use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
 };
 use novarocks_types::SlotId;
-use std::{alloc::Layout, sync::Arc};
+use std::alloc::Layout;
 
 /// Emit ordered subordinate normalizers followed by the actual UnionAll.
 /// `definitions` are already authored SlotId reads with each source's complete
 /// type; their arena, lexical bindings, total counts and identity allocation
 /// remain with the original compiler owners. Shared layouts preserve the
 /// published output types without changing the source expression definitions.
-pub(crate) fn lower_union(
+pub(crate) fn lower_union_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     local: ProgramNodeId,
@@ -48,9 +47,10 @@ pub(crate) fn lower_union(
     definitions: &[Vec<ProgramExprId>],
     slots: &[SlotId],
     control: &dyn PureCompileControl,
-) -> Result<Vec<ProgramNode>, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<Vec<ProgramNode>, crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(
+    let result = lower_core_with_creation(
         package,
         node,
         local,
@@ -58,15 +58,12 @@ pub(crate) fn lower_union(
         definitions,
         slots,
         &mut work,
+        creation,
     );
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    crate::creation::finish_attempt(result, work)
 }
 
-fn lower_core(
+fn lower_core_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     local: ProgramNodeId,
@@ -74,24 +71,24 @@ fn lower_core(
     definitions: &[Vec<ProgramExprId>],
     slots: &[SlotId],
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<ProgramNode>, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<Vec<ProgramNode>, crate::FragmentCreationError<H>> {
     let fragment = package.fragment();
     let original = fragment.nodes().get(&node.id);
     let same = original.is_some_and(|original| std::ptr::eq(original, node));
     work.step()?;
     if !same {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "UnionAll source is outside its original fragment",
-        ));
+        ))
+        .into());
     }
     let NodeKind::SetOp {
         kind: SetOperationKind::UnionAll,
         input_mappings,
     } = &node.kind
     else {
-        return Err(FragmentCompileError::Invalid(
-            "UnionAll source kind differs",
-        ));
+        return Err((FragmentCompileError::Invalid("UnionAll source kind differs")).into());
     };
     let width = node.output.columns.len();
     let shape = node.inputs.len() >= 2
@@ -101,9 +98,10 @@ fn lower_core(
         && slots.len() == width;
     work.step()?;
     if !shape {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "UnionAll branch or output occurrence shape differs",
-        ));
+        ))
+        .into());
     }
     // Bound this leaf's real expanded contributions before traversing inner
     // mappings or reserving outputs. The final owners also admit global totals.
@@ -141,9 +139,10 @@ fn lower_core(
             && branch.input != local;
         work.step()?;
         if !shape {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "UnionAll normalization branch shape differs",
-            ));
+            ))
+            .into());
         }
         let child = child.ok_or(FragmentCompileError::Invalid(
             "UnionAll physical input is absent",
@@ -165,9 +164,10 @@ fn lower_core(
             let output_value = fragment.values().get(&output);
             work.step()?;
             if !same {
-                return Err(FragmentCompileError::Invalid(
+                return Err((FragmentCompileError::Invalid(
                     "UnionAll mapping differs from its proved input occurrence",
-                ));
+                ))
+                .into());
             }
             let source_value = source_value.ok_or(FragmentCompileError::Invalid(
                 "UnionAll mapped value is absent",
@@ -176,23 +176,32 @@ fn lower_core(
                 "UnionAll output value is absent",
             ))?;
             exact_type(&source.ty, &source_value.ty, work)?;
-            let widens = !source_value.ty.nullable || output_value.ty.nullable;
+            let widens = !source_value.ty.nullable() || output_value.ty.nullable();
             work.step()?;
             if !widens {
-                return Err(FragmentCompileError::Invalid(
+                return Err((FragmentCompileError::Invalid(
                     "UnionAll output narrows input nullability",
-                ));
+                ))
+                .into());
             }
             work.flush()?;
-            let mut expected = source_value.ty.clone();
-            expected.nullable = output_value.ty.nullable;
-            work.step()?;
+            if !source_value
+                .ty
+                .same_physical_binding_ignoring_root_nullability_observed(
+                    &output_value.ty,
+                    || work.step().map_err(FragmentCompileError::from),
+                )?
+            {
+                return Err((FragmentCompileError::Invalid(
+                    "UnionAll complete value types differ",
+                ))
+                .into());
+            }
             work.flush()?;
-            exact_type(&expected, &output_value.ty, work)?;
         }
     }
 
-    let layout = output_layout(package, node, local, slots, work)?;
+    let layout = output_layout_with_creation(package, node, local, slots, work, creation)?;
     let mut nodes = Vec::new();
     reserve_vec(&mut nodes, node_count, work)?;
     let mut inputs = Vec::new();
@@ -250,13 +259,14 @@ fn exact_type(
     Ok(())
 }
 
-fn output_layout(
+fn output_layout_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     local: ProgramNodeId,
     slots: &[SlotId],
     work: &mut CompileCheckpoints<'_>,
-) -> Result<StaticLayout, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<StaticLayout, crate::FragmentCreationError<H>> {
     let mut result_names = package
         .result()
         .filter(|result| result.output.columns.len() == node.output.columns.len());
@@ -270,18 +280,8 @@ fn output_layout(
             }
         }
     }
-    let mut fields = Vec::<Field>::new();
-    if package.original_metadata_namespace().is_none() {
-        reserve_vec(&mut fields, slots.len(), work)?;
-    }
-    let mut original_fields = match package.original_metadata_namespace() {
-        Some(_) => {
-            let mut original_fields = Vec::new();
-            reserve_vec(&mut original_fields, slots.len(), work)?;
-            Some(original_fields)
-        }
-        None => None,
-    };
+    let mut typed_layout =
+        crate::typed_layout::TypedLayoutBuilder::new_with_creation(slots.len(), work, creation)?;
     for (ordinal, &value) in node.output.columns.iter().enumerate() {
         let definition = package.fragment().values().get(&value);
         let result_name = result_names.and_then(|result| result.fields.get(ordinal));
@@ -290,48 +290,29 @@ fn output_layout(
             "UnionAll output value is absent",
         ))?;
         let name = if let Some(field) = result_name {
-            copy_name(field.alias.as_deref().unwrap_or(&field.name), work)?
+            copy_name_with_creation(
+                field.alias.as_deref().unwrap_or(&field.name),
+                work,
+                creation,
+            )?
         } else {
             work.flush()?;
-            let name = format!("local_{}_{}", local.index(), ordinal);
+            let name = crate::typed_layout::local_name_with_creation(
+                "local",
+                local.index(),
+                ordinal,
+                work,
+                creation,
+            )?;
             work.step()?;
             work.flush()?;
             name
         };
         work.flush()?;
-        if let Some(original_fields) = original_fields.as_mut() {
-            let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(&definition.ty, name);
-            work.step()?;
-            work.flush()?;
-            original_fields.push(field?);
-        } else {
-            let field = definition.ty.try_to_field(name);
-            work.step()?;
-            work.flush()?;
-            fields.push(field?);
-        }
+        typed_layout.push_with_creation(&definition.ty, name, work, creation)?;
         work.step()?;
     }
-    let copied_slots = copy_items(slots, work)?;
-    work.flush()?;
-    let materialized = match (original_fields, package.original_metadata_namespace()) {
-        (Some(fields), Some(namespace)) => Some(novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema()),
-        _ => None,
-    };
-    let schema = if let Some(source) = &materialized {
-        source.schema_owner().schema().clone()
-    } else {
-        Arc::new(Schema::new(fields))
-    };
-    let slots = Arc::from(copied_slots);
-    work.step()?;
-    work.flush()?;
-    let layout = match materialized {
-        Some(source) => {
-            StaticLayout::try_new_materialized_for_compile(source, slots, work.control())?
-        }
-        None => StaticLayout::try_new_for_compile(schema, slots, work.control())?,
-    };
+    let layout = typed_layout.finish_with_creation(slots, work, creation)?;
     work.flush()?;
     Ok(layout)
 }
@@ -360,28 +341,10 @@ fn source_diagnostic(
     Ok(sources)
 }
 
-fn copy_name(
+fn copy_name_with_creation<H>(
     source: &str,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<String, FragmentCompileError> {
-    Layout::array::<u8>(source.len()).map_err(|_| CompileControlError::ResourceExhausted)?;
-    let mut copied = String::new();
-    work.flush()?;
-    let reserved = copied.try_reserve_exact(source.len());
-    reserved.map_err(|_| CompileControlError::ResourceExhausted)?;
-    work.flush()?;
-    let mut start = 0usize;
-    while start < source.len() {
-        let mut end = start.saturating_add(256).min(source.len());
-        while !source.is_char_boundary(end) {
-            end -= 1;
-            work.step()?;
-        }
-        copied.push_str(&source[start..end]);
-        for _ in start..end {
-            work.step()?;
-        }
-        start = end;
-    }
-    Ok(copied)
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<String, crate::FragmentCreationError<H>> {
+    crate::typed_layout::copy_name_with_creation(source, work, creation).map_err(Into::into)
 }

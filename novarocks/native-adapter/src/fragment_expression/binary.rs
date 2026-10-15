@@ -32,6 +32,8 @@ pub(crate) fn lower_binary_op(
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
     data_type: DataType,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, super::NativeExpressionDecodeError> {
     let policy = super::decode_decimal_overflow_policy(
         binary.decimal_overflow_policy,
@@ -53,12 +55,14 @@ pub(crate) fn lower_binary_op(
         path.clone().field("left"),
         arena,
         input_layout,
+        type_decoder,
     )?;
     let right = lower_required_child(
         &binary.right,
         path.clone().field("right"),
         arena,
         input_layout,
+        type_decoder,
     )?;
     let node = match op {
         expr::BinaryOp::Unspecified => {

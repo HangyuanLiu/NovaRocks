@@ -366,13 +366,46 @@ def verify_server_direct_dependencies(metadata):
 
 def verify_failpoint_typed_closure(metadata):
     failpoint = package_by_name(metadata, FAILPOINT)
-    typed_features = set(failpoint.get("features", {}).get("typed", []))
-    if typed_features != {"dep:novarocks-types"}:
+    dependencies = {
+        dependency.get("rename") or dependency["name"]: dependency
+        for dependency in failpoint["dependencies"]
+        if dependency["kind"] is None
+    }
+    activated = {
+        dependency["name"]
+        for dependency in dependencies.values()
+        if not dependency.get("optional", False)
+    }
+    features = failpoint.get("features", {})
+    pending = ["typed"]
+    visited = set()
+    while pending:
+        feature = pending.pop()
+        if feature in visited:
+            continue
+        visited.add(feature)
+        for activation in features.get(feature, []):
+            if activation.startswith("dep:"):
+                dependency = dependencies.get(activation.removeprefix("dep:"))
+            elif "/" in activation:
+                # Forwarding dep/feature enables an optional dependency, while
+                # dep?/feature only forwards when it was enabled elsewhere.
+                alias = activation.split("/", 1)[0]
+                dependency = None if alias.endswith("?") else dependencies.get(alias)
+            else:
+                pending.append(activation)
+                continue
+            if dependency is not None:
+                activated.add(dependency["name"])
+    if TYPES not in activated:
         fail(
-            f"{FAILPOINT} feature typed must be exactly: dep:novarocks-types"
+            f"{FAILPOINT} feature typed must activate neutral normal dependency {TYPES}"
         )
 
-    forbidden = sorted(normal_closure(metadata, FAILPOINT) & (WIRE_PACKAGES | {SPI}))
+    closure = normal_closure(metadata, FAILPOINT)
+    if TYPES not in closure:
+        fail(f"{FAILPOINT} typed normal dependency closure must contain {TYPES}")
+    forbidden = sorted(closure & (WIRE_PACKAGES | {SPI}))
     if forbidden:
         fail(
             f"{FAILPOINT} typed normal dependency closure contains forbidden packages: "

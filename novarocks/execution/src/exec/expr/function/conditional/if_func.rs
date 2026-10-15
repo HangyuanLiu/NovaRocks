@@ -142,9 +142,9 @@ pub fn eval_if(
             .collect::<Vec<_>>(),
     );
 
-    let then_batch = arrow::compute::filter_record_batch(&chunk.batch, &then_mask)
+    let then_batch = arrow::compute::filter_record_batch(&chunk.record_batch(), &then_mask)
         .map_err(|e| format!("if: failed to filter then-rows: {e}"))?;
-    let else_batch = arrow::compute::filter_record_batch(&chunk.batch, &else_mask)
+    let else_batch = arrow::compute::filter_record_batch(&chunk.record_batch(), &else_mask)
         .map_err(|e| format!("if: failed to filter else-rows: {e}"))?;
 
     let then_chunk = Chunk::new_like(then_batch, chunk);

@@ -170,7 +170,7 @@ fn fixture(
                 owner: NodeId::new(44),
                 lambda_scope: None,
                 ty: ty.clone(),
-                kind: ExprKind::Literal(if ty.nullable {
+                kind: ExprKind::Literal(if ty.nullable() {
                     LiteralValue::Null
                 } else {
                     LiteralValue::Int64(number)
@@ -222,7 +222,7 @@ fn fixture(
             ArithmeticOperator::Modulo,
         )
         .unwrap();
-        ty.nullable = true;
+        ty = ty.with_nullable(true).unwrap();
         builder
             .insert_expression(ExprNode {
                 id: child,
@@ -244,7 +244,7 @@ fn fixture(
     };
     let mut result =
         arithmetic_result_value_type_with_op(&effective_type, &right_type, op).unwrap();
-    result.nullable = result_nullable;
+    result = result.with_nullable(result_nullable).unwrap();
     let root = ExprId::new(940);
     builder
         .insert_expression(ExprNode {
@@ -541,7 +541,7 @@ fn signed_arithmetic_compiles_exact_ordered_types_policies_scopes_and_lexical_so
                 let recipe = program.arithmetic_recipe(occurrence).unwrap();
                 let mut expected =
                     arithmetic_result_value_type_with_op(&left_type, &right_type, op).unwrap();
-                expected.nullable = true;
+                expected = expected.with_nullable(true).unwrap();
                 assert_eq!(recipe.operator(), op);
                 assert_eq!(recipe.left_type(), &left_type);
                 assert_eq!(recipe.right_type(), &right_type);
@@ -657,9 +657,9 @@ fn nested_signed_arithmetic_preserves_independent_scoped_switches_and_child_row_
             .unwrap();
         assert_eq!(outer.allow_throw_exception(), allow);
         assert_eq!(inner.allow_throw_exception(), !allow);
-        assert_eq!(outer.left_type().data_type, DataType::Int16);
-        assert!(outer.left_type().nullable);
-        assert_eq!(outer.result_type().data_type, DataType::Int32);
+        assert_eq!(outer.left_type().data_type(), &DataType::Int16);
+        assert!(outer.left_type().nullable());
+        assert_eq!(outer.result_type().data_type(), &DataType::Int32);
         let parent = outer.own_effects(invocation.context);
         let argument = inner.own_effects(child.context);
         assert!(
@@ -733,7 +733,7 @@ fn nullable_false_division_cannot_hide_a_successful_null_behind_nonnullable_resu
             .get(fixture.root)
             .unwrap()
             .ty
-            .nullable
+            .nullable()
     );
     assert_arithmetic_failure(
         compile(source, &functions, &Control).unwrap_err(),
@@ -756,6 +756,12 @@ fn floating_arithmetic_preserves_exact_prepared_types_and_policies() {
             false,
         );
         let program = compile(package(&fixture), &functions, &Control).unwrap();
+        let layout = program.graph().nodes().last().unwrap().output_layout();
+        assert!(layout.is_typed());
+        assert!(matches!(
+            layout.value_binding_at(0).unwrap().layout().data_type(),
+            DataType::Float64
+        ));
         let recipe = program.arithmetic_recipe(occurrence(&program)).unwrap();
         assert_eq!(recipe.operator(), ArithmeticOperator::Add);
         assert_eq!(recipe.left_type(), &ty);

@@ -137,20 +137,19 @@ fn relation_caller_owned_hand_wire_layout_and_original_namespace_loans() {
         assert!(std::ptr::eq(decoded.as_wire(), raw.as_slice()));
         let source = receiving_types.value_type(42).unwrap();
         let actual = &decoded.relation_in(0, &mut work)?.unwrap().schema()[2].ty;
-        match (&source.data_type, &actual.data_type) {
+        match (&source.data_type(), &actual.data_type()) {
             (DataType::Struct(a), DataType::Struct(b)) => assert!(Arc::ptr_eq(&a[0], &b[0])),
             _ => panic!("complete Struct source lost"),
         }
         // Per occurrence: schema Vec/Box, guarantees Vec/Box, ordering
-        // Vec/Box, two root-Dictionary Boxes, and five promotable Shared
-        // ceilings (3 columns + table/view). Metadata adds String+coverage2.
-        assert_eq!(decoded.facts().allocation_requests_upper_bound, 31);
+        // Vec/Box and five promotable Shared ceilings (3 columns +
+        // table/view). Type handles share backing; Metadata adds String+coverage2.
+        assert_eq!(decoded.facts().allocation_requests_upper_bound, 27);
         let expected_bytes = Layout::array::<usize>(2).unwrap().size()
             + Layout::array::<p::Relation>(2).unwrap().size()
             + 2 * (2 * Layout::array::<p::RelationField>(3).unwrap().size()
                 + 2 * Layout::array::<p::PredicateGuarantee>(3).unwrap().size()
-                + 2 * Layout::array::<p::OrderingKey>(2).unwrap().size()
-                + 2 * Layout::new::<DataType>().size())
+                + 2 * Layout::array::<p::OrderingKey>(2).unwrap().size())
             + kind_bytes
             + 6
             + 10 * bytes_shared_upper()?;
@@ -419,7 +418,7 @@ fn relation_caller_owned_known_root_and_dictionary_requests_precede_late_control
                 work.step()?;
             }
             let mut bounded = limits();
-            bounded.max_allocation_requests = 1;
+            bounded.max_work = 0;
             let mut admission = |_: &RelationProjectionFacts| Ok(());
             let mut model = Model {
                 admission: Some(Admission {
@@ -430,8 +429,8 @@ fn relation_caller_owned_known_root_and_dictionary_requests_precede_late_control
                 }),
                 ..Model::default()
             };
-            // The sole original clone walker captures two root Dictionary
-            // boxes together, before its first completed-work step.
+            // The original two-handle clone work is admitted before any
+            // pending observation, without predicting Dictionary boxes.
             let result = model.clone_prefix(dictionary, &mut work, true).map(|_| ());
             assert!(matches!(
                 finish(result, work),
@@ -490,8 +489,8 @@ fn run_selected(
         .map(|relation| {
             assert_eq!(relation, sources[1]);
             match (
-                &namespace.relations[1].schema()[2].ty.data_type,
-                &relation.schema()[2].ty.data_type,
+                &namespace.relations[1].schema()[2].ty.data_type(),
+                &relation.schema()[2].ty.data_type(),
             ) {
                 (DataType::Struct(a), DataType::Struct(b)) => assert!(Arc::ptr_eq(&a[0], &b[0])),
                 _ => panic!("selected full Struct carrier changed"),
@@ -664,7 +663,7 @@ fn relation_caller_owned_actual_wide_guarantees_keep_order_and_sample_real_quant
 }
 
 #[test]
-fn relation_receiver_captured_dictionary_prefix_beats_its_late_lookup_observation() {
+fn relation_receiver_actual_ordering_request_beats_late_control() {
     let control = Control::default();
     with_sources(&control, |_, reads, types| {
         let bindings = decode_provider_bindings(
@@ -702,8 +701,8 @@ fn relation_receiver_captured_dictionary_prefix_beats_its_late_lookup_observatio
             limits(),
             &mut |facts| {
                 // One root index+output, schema2, guarantees2, five Shared
-                // ceilings, ordering2 = 13. This source's Dictionary adds two.
-                if facts.allocation_requests_upper_bound == 15 && captured_at.is_none() {
+                // ceilings, ordering2 = 13. Type-handle clones add no requests.
+                if facts.allocation_requests_upper_bound == 13 && captured_at.is_none() {
                     captured_at = Some(trace(&control).len());
                 }
                 Ok(())
@@ -712,13 +711,13 @@ fn relation_receiver_captured_dictionary_prefix_beats_its_late_lookup_observatio
         )?;
         work.finish()?;
         let baseline = trace(&control);
-        let at = captured_at.expect("actual Dictionary request snapshot");
+        let at = captured_at.expect("actual ordering container request snapshot");
         assert!(at < baseline.len());
         for cause in CAUSES {
             control.arm(Some((at, cause)));
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode)?;
             let mut bounded = limits();
-            bounded.max_allocation_requests = 14;
+            bounded.max_allocation_requests = 12;
             let result = decode_relations_in(
                 &definitions,
                 &reads,

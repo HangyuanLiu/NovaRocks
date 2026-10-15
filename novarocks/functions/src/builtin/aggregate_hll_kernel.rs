@@ -534,16 +534,24 @@ pub(super) fn validate_contract(
     };
     // Generic binding is preserved: unsupported raw carriers fail in the original
     // selected hash reader only when actually demanded, rather than narrowing admission.
-    for (actual, expected) in [
-        (output, FunctionValueType::new(DataType::Int64, true)),
-        (
-            contract.intermediate_type(),
-            FunctionValueType::new(DataType::Binary, true),
-        ),
+    for (actual, carrier) in [
+        (output, DataType::Int64),
+        (contract.intermediate_type(), DataType::Binary),
     ] {
-        if !actual.exactly_equals_observed::<KernelFailure>(&expected, || {
-            work.step().map_err(compile_failure)
-        })? {
+        // Borrow the original canonical type recipe instead of publishing
+        // two expected FVT/layout owners used only for this comparison.
+        let matches = crate::aggregate_types::AggregateTypeRecipe::Scalar(carrier)
+            .matches_value_observed(
+                actual.typed_binding().borrowed(),
+                true,
+                novarocks_type_contract::ValueLogicalType::Physical,
+                work,
+            )
+            .map_err(|error| match error {
+                FunctionBindingError::Control(cause) => compile_failure(cause),
+                _ => invalid("NDV canonical type comparison failed"),
+            })?;
+        if !matches {
             return Err(invalid(
                 "NDV requires its exact nullable Int64 result and Binary state",
             ));

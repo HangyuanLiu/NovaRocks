@@ -657,7 +657,7 @@ fn whole_chunk_proof_refuses_foreign_equal_schema_with_unknown_empty_table_histo
     )
     .unwrap();
     let chunk = Chunk::try_new_with_chunk_schema(batch, Arc::clone(&schema)).unwrap();
-    assert!(Arc::ptr_eq(&chunk.batch.schema(), &actual));
+    assert!(Arc::ptr_eq(&chunk.record_batch().schema(), &actual));
     assert!(!Arc::ptr_eq(&actual, &schema.arrow_schema_ref()));
     assert_eq!(
         no_allocation(|| borrowed_root_chunk_storage(&chunk, storage_limits(96 * 1024 * 1024))),

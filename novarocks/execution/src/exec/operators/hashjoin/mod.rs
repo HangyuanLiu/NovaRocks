@@ -43,3 +43,10 @@ pub(crate) mod partitioned_join_shared;
 pub use broadcast_join_probe_processor::BroadcastJoinProbeProcessorFactory;
 pub use hash_join_build_sink::HashJoinBuildSinkFactory;
 pub use partitioned_join_probe_processor::PartitionedJoinProbeProcessorFactory;
+
+#[cfg(test)]
+pub(crate) use join_hash_map::gather::gather_probe_build_batches_typed;
+pub(crate) use join_hash_map::gather::{
+    JoinGatherError, TypedJoinBatch, filter_probe_typed, gather_join_batch_typed,
+    gather_left_with_null_right_typed,
+};

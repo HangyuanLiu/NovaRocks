@@ -45,7 +45,7 @@ pub(super) fn validate_profile(
         };
         step()?;
         let admitted = matches!(
-            ty.data_type,
+            ty.data_type(),
             DataType::Null
                 | DataType::Boolean
                 | DataType::Int8
@@ -60,12 +60,12 @@ pub(super) fn validate_profile(
                 | DataType::LargeUtf8
                 | DataType::Date32
                 | DataType::Timestamp(..)
-        ) || novarocks_type_contract::is_largeint_data_type(&ty.data_type);
+        ) || novarocks_type_contract::is_largeint_data_type(ty.data_type());
         if !admitted
-            || first.logical_type != ty.logical_type
+            || first.logical_type() != ty.logical_type()
             || !arrow_data_types_exact_observed::<KernelFailure>(
-                &first.data_type,
-                &ty.data_type,
+                first.data_type(),
+                ty.data_type(),
                 &mut step,
             )?
         {
@@ -76,9 +76,9 @@ pub(super) fn validate_profile(
     }
     let target = contract.result_type();
     step()?;
-    if target.logical_type != ValueLogicalType::Physical
-        || target.data_type != DataType::Int32
-        || target.nullable
+    if target.logical_type() != ValueLogicalType::Physical
+        || target.data_type() != &DataType::Int32
+        || target.nullable()
     {
         return Err(invalid(
             "FIELD exact result is a non-null Int32 first-match index",

@@ -51,18 +51,18 @@ fn quoted(bytes: usize) -> Result<usize, FlatPoolResourceError> {
     // non-ASCII scalars require <=6 times their UTF8 byte count. Include quotes.
     add(mul(bytes, 6)?, 2)
 }
-fn vectors<T>(
+fn vectors<T, W: ResourceWork>(
     count: usize,
-    work: &mut impl ResourceWork,
-) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<ReaderDiagnosticRequests, W::Error> {
     let mut requests = Requests::default();
-    requests.growing_vec::<T>(count, work)?;
+    requests.growing_vec::<T, _>(count, work)?;
     Ok(ReaderDiagnosticRequests {
         request_bytes_upper_bound: requests.bytes,
         allocation_requests_upper_bound: requests.count,
     })
 }
-fn metadata(field: &Field, work: &mut impl ResourceWork) -> Result<Render, FlatPoolResourceError> {
+fn metadata<W: ResourceWork>(field: &Field, work: &mut W) -> Result<Render, W::Error> {
     if field.metadata().is_empty() {
         work.step()?;
         return Ok(Render::default());
@@ -85,15 +85,17 @@ fn metadata(field: &Field, work: &mut impl ResourceWork) -> Result<Render, FlatP
         work.step()?;
     }
     work.flush()?;
-    let requests = string_requests(length, work)?
-        .plus(vectors::<(&String, &String)>(field.metadata().len(), work)?)?;
+    let requests = string_requests(length, work)?.plus(vectors::<(&String, &String), _>(
+        field.metadata().len(),
+        work,
+    )?)?;
     Ok(Render { length, requests })
 }
-fn field_render(
+fn field_render<W: ResourceWork>(
     field: &Field,
     depth: usize,
-    work: &mut impl ResourceWork,
-) -> Result<Render, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<Render, W::Error> {
     let ty = type_render(field.data_type(), depth, work)?;
     let meta = metadata(field, work)?;
     // Covers both FormatField Display and the larger optional Field Debug
@@ -120,13 +122,13 @@ fn field_render(
     work.step()?;
     Ok(Render { length, requests })
 }
-fn type_render(
+fn type_render<W: ResourceWork>(
     ty: &DataType,
     depth: usize,
-    work: &mut impl ResourceWork,
-) -> Result<Render, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<Render, W::Error> {
     if depth > MAX_VALUE_TYPE_DEPTH {
-        return Err(invalid("recursive reader diagnostic type depth"));
+        return Err(invalid("recursive reader diagnostic type depth").into());
     }
     let out = match ty {
         DataType::Struct(fields) => {
@@ -140,7 +142,7 @@ fn type_render(
             }
             // datatype_display.rs format_field collect::<Vec<String>> + join.
             requests = requests
-                .plus(vectors::<String>(fields.len(), work)?)?
+                .plus(vectors::<String, _>(fields.len(), work)?)?
                 .plus(string_requests(length, work)?)?;
             Render { length, requests }
         }
@@ -208,17 +210,17 @@ const CONTAINER_LITERALS: &str = concat!(
     "Offset invariant failure: non-monotonic offset at slot :  > ",
 );
 
-pub(super) fn preflight(
+pub(super) fn preflight<W: ResourceWork>(
     input: &ReaderInput<'_, '_>,
-    work: &mut impl ResourceWork,
-) -> Result<ReaderDiagnosticRequests, FlatPoolResourceError> {
+    work: &mut W,
+) -> Result<ReaderDiagnosticRequests, W::Error> {
     let digits = decimal_digits(usize::MAX, work)?;
     let mut path: [Option<Render>; MAX_VALUE_TYPE_DEPTH] = [None; MAX_VALUE_TYPE_DEPTH];
     let mut largest = ReaderDiagnosticRequests::default();
     let mut eager = ReaderDiagnosticRequests::default();
     for node in input.nodes {
         if node.depth == 0 || node.depth > path.len() {
-            return Err(invalid("recursive reader diagnostic node depth"));
+            return Err(invalid("recursive reader diagnostic node depth").into());
         }
         let render = field_render(node.field, 1, work)?;
         let shared = preflight_field(node.field, work)?;

@@ -692,7 +692,7 @@ fn expression(
                 BinOp::Or => "OR",
             };
             let (left, right) = if matches!(op, BinOp::Eq | BinOp::EqForNull)
-                && matches!(left.kind, ExprKind::Literal(_))
+                && matches!(left.kind, ExprKind::Literal(_) | ExprKind::Constant(_))
                 && matches!(right.kind, ExprKind::ColumnRef { .. })
             {
                 (right.as_ref(), left.as_ref())

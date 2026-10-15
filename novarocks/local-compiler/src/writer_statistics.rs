@@ -27,23 +27,19 @@
 //! binding, the original request and the frozen call effects; the display
 //! name copied into a local call is a diagnostic tag only.
 //!
-//! A writer call's input is a materialized relation value, not an expression
-//! occurrence: the frontend mints that value's occurrence outside the frozen
-//! flow and freezes only the call's relational context. This compiler mints
-//! its own: one pure materialized Value occurrence in a dedicated scope that
-//! holds nothing but that value, with an identity distinct from the call's
-//! context. The occurrence feeds preparation only and is never published into
-//! a flow; the local program binds the call to its channel slots instead.
+//! The frontend freezes the writer's actual materialized Value context. Its
+//! root domain belongs to the original flow, while its use is not an expression
+//! invocation. Both native carriers borrow that receipt through one preparation
+//! body; this compiler never reconstructs a substitute context.
 
 use crate::{
     aggregate::kernel_phase, assert_rows::reserve_vec, expressions::ExpressionLoweringError,
     lowering::FragmentCompileError,
 };
 use novarocks_functions::{
-    AggregateBindingSelection, AggregateKernelPhase, AggregateOverloadIdentity,
-    AggregatePreparationOptions, CallArgumentUses, CallEffectInput, ConstantError,
-    FunctionBindingSelection, FunctionResultType, PureCallPreparation, PureCallSpecialization,
-    PureEngineFunctionCatalog, ResolvedAggregateSignature, ScopedExpressionEffects,
+    AggregateBindingSelection, AggregateKernelPhase, AggregateOverloadIdentity, ConstantError,
+    FunctionBindingSelection, FunctionResultType, PureCallSpecialization,
+    PureEngineFunctionCatalog, ResolvedAggregateSignature,
 };
 use novarocks_local_program::{
     ProgramCallSite, ProgramChannelSite, ProgramExprId, ProgramNodeId, UnpivotConstant,
@@ -57,8 +53,7 @@ use novarocks_physical_plan::{
     WriterRelationFieldRole, WriterRelationSchema, WriterTarget,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDemand, EvaluationDomainId,
-    ExpressionEffectContext, ExpressionUseId, FunctionKind, FunctionValueType,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionKind, FunctionValueType,
 };
 use novarocks_types::SlotId;
 use std::{collections::BTreeMap, sync::Arc};
@@ -294,7 +289,7 @@ fn resolved_signature(
             ));
         };
         work.flush()?;
-        argument_types.push(value.data_type.clone());
+        argument_types.push(value.data_type().clone());
         work.step()?;
     }
     let overload =
@@ -313,8 +308,8 @@ fn resolved_signature(
         ResolvedAggregateSignature {
             overload,
             argument_types,
-            intermediate_type: binding.intermediate_type.data_type.clone(),
-            output_type: function.result_type.data_type.clone(),
+            intermediate_type: binding.intermediate_type.data_type().clone(),
+            output_type: function.result_type.data_type().clone(),
             state_format: binding.state_format.clone(),
         },
     ))
@@ -323,18 +318,20 @@ fn resolved_signature(
 /// Lower one writer's partial calls. A call reads the projected field of the
 /// first target input position holding its value and writes the multiplex
 /// slot of its auxiliary output field.
-pub(crate) fn lower_partial_calls(
+pub(crate) fn lower_partial_calls<H>(
     target: &WriterTarget,
     projection_slots: &[SlotId],
     output_slots: &[SlotId],
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<WriterPartialAggregateCall>, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<Vec<WriterPartialAggregateCall>, crate::FragmentCreationError<H>> {
     if projection_slots.len() != target.input.len()
         || output_slots.len() != target.output_schema.fields.len()
     {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "writer statistics channels differ from the writer relations",
-        ));
+        ))
+        .into());
     }
     let mut calls = Vec::new();
     reserve_vec(&mut calls, target.partial_aggregates.len(), work)?;
@@ -353,6 +350,11 @@ pub(crate) fn lower_partial_calls(
         ))?;
         let (function_name, resolved) = resolved_signature(&call.binding, work)?;
         calls.push(WriterPartialAggregateCall {
+            frozen: Some(crate::aggregate::freeze_binding_with_creation(
+                &call.binding,
+                work,
+                creation,
+            )?),
             input_slot_id: projection_slots[input],
             function_name,
             resolved,
@@ -391,15 +393,17 @@ pub(crate) fn finish_statistics_slots(spec: &WriterFinishSpec) -> usize {
 }
 
 /// Lower one admitted finish's final calls and grouped Unpivot.
-pub(crate) fn lower_finish_statistics(
+pub(crate) fn lower_finish_statistics<H>(
     package: &FragmentPackage,
     spec: &WriterFinishSpec,
     channels: FinishStatisticsChannels<'_>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<LoweredFinishStatistics, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<LoweredFinishStatistics, crate::FragmentCreationError<H>> {
     let Some(unpivot) = &spec.grouped_unpivot else {
         return Ok(LoweredFinishStatistics {
             plan: WriterFinalAggregatePlan {
+                prepared: None, // CompiledPackage uses its actual state-template owner.
                 calls: Vec::new(),
                 unpivot: None,
             },
@@ -410,9 +414,10 @@ pub(crate) fn lower_finish_statistics(
         || channels.root_slots.len() != spec.output_schema.fields.len()
         || channels.statistics_slots.len() != finish_statistics_slots(spec)
     {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "writer statistics channels differ from the finish relations",
-        ));
+        ))
+        .into());
     }
     let (grouping_output_slot_id, final_slots) =
         channels
@@ -439,6 +444,11 @@ pub(crate) fn lower_finish_statistics(
         ))?;
         let (function_name, resolved) = resolved_signature(&call.binding, work)?;
         calls.push(WriterFinalAggregateCall {
+            frozen: Some(crate::aggregate::freeze_binding_with_creation(
+                &call.binding,
+                work,
+                creation,
+            )?),
             function_name,
             resolved,
             intermediate_input_slot_id: channels.input_slots[input],
@@ -516,15 +526,17 @@ pub(crate) fn lower_finish_statistics(
             .same_value_domain_observed::<FragmentCompileError>(value_output, || {
                 work.step().map_err(Into::into)
             })?;
-        if !same_domain || (source.nullable && !value_output.nullable) {
-            return Err(FragmentCompileError::Invalid(
+        if !same_domain || (source.nullable() && !value_output.nullable()) {
+            return Err((FragmentCompileError::Invalid(
                 "writer grouped Unpivot final value differs from its Root value field",
-            ));
+            ))
+            .into());
         }
         if mapping.constants.len() != unpivot.literal_outputs.len() {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "writer grouped Unpivot constant width differs from its literal outputs",
-            ));
+            ))
+            .into());
         }
         let mut constants = Vec::new();
         reserve_vec(&mut constants, mapping.constants.len(), work)?;
@@ -554,12 +566,13 @@ pub(crate) fn lower_finish_statistics(
         FragmentCompileError::Invalid("writer grouped Unpivot byte bound exceeds host range")
     })?;
     if max_output_rows == 0 || max_output_bytes == 0 {
-        return Err(FragmentCompileError::Invalid(
-            "writer grouped Unpivot bounds are zero",
-        ));
+        return Err(
+            (FragmentCompileError::Invalid("writer grouped Unpivot bounds are zero")).into(),
+        );
     }
     Ok(LoweredFinishStatistics {
         plan: WriterFinalAggregatePlan {
+            prepared: None, // CompiledPackage uses its actual state-template owner.
             calls,
             unpivot: Some(WriterGroupedUnpivotPlan {
                 grouping_input_slot_id,
@@ -598,17 +611,19 @@ fn collection_domain(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), FragmentCompileError> {
     work.step()?;
-    if source.nullable {
-        return Err(FragmentCompileError::Invalid(
+    if source.nullable() {
+        return Err((FragmentCompileError::Invalid(
             "writer grouped Unpivot collection constant must be nonnull",
-        ));
+        ))
+        .into());
     }
     if !source.same_value_domain_observed::<FragmentCompileError>(output, || {
         work.step().map_err(Into::into)
     })? {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "writer grouped Unpivot collection constant differs from its Root field",
-        ));
+        ))
+        .into());
     }
     Ok(())
 }
@@ -643,18 +658,17 @@ fn lower_constant(
                     "writer grouped Unpivot scalar source is not a static constant",
                 ));
             }
-            if definition.ty.nullable && !output.nullable {
+            if definition.ty.nullable() && !output.nullable() {
                 return Err(FragmentCompileError::Invalid(
                     "writer grouped Unpivot constant narrows its Root field",
                 ));
             }
             work.flush()?;
-            let mut expected = definition.ty.clone();
-            expected.nullable = output.nullable;
-            work.flush()?;
-            let same = expected.exactly_equals_observed::<FragmentCompileError>(output, || {
-                work.step().map_err(Into::into)
-            })?;
+            let same = definition
+                .ty
+                .same_physical_binding_ignoring_root_nullability_observed(output, || {
+                    work.step().map_err(FragmentCompileError::from)
+                })?;
             if !same {
                 return Err(FragmentCompileError::Invalid(
                     "writer grouped Unpivot constant differs from its Root field",
@@ -664,7 +678,7 @@ fn lower_constant(
                 expr_id: *expressions.get(id).ok_or(FragmentCompileError::Invalid(
                     "missing lowered writer grouped Unpivot constant",
                 ))?,
-                nullable: definition.ty.nullable,
+                nullable: definition.ty.nullable(),
             })
         }
         SourceConstant::Int32List(reference) => {
@@ -732,29 +746,17 @@ fn lower_constant(
     }
 }
 
-/// The materialized input occurrence of one writer call: the only occurrence
-/// of its dedicated scope, a pure unguarded Value in a root domain. Its
-/// identity is the smallest one distinct from the call's own context, so a
-/// merging owner can tell the state it reads from the call that reads it.
-pub(crate) fn materialized_input_context(call: ExpressionEffectContext) -> ExpressionEffectContext {
-    let other = |taken: u32| u32::from(taken == 0);
-    ExpressionEffectContext {
-        use_id: ExpressionUseId::new(other(call.use_id.get())),
-        domain: EvaluationDomainId::new(other(call.domain.get())),
-        demand: EvaluationDemand::Value,
-    }
-}
-
 /// Prepare every frozen writer Partial and Final call of the fragment through
 /// its exact installed owner. `nodes` names the local node each physical
 /// writer-family node lowers to.
-pub(crate) fn prepare_writer_calls(
+pub(crate) fn prepare_writer_calls<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     functions: &PureEngineFunctionCatalog,
     nodes: &BTreeMap<NodeId, ProgramNodeId>,
     tokens: &mut BTreeMap<ProgramCallSite, PureCallSpecialization>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), ExpressionLoweringError> {
+    creation: crate::expressions::CallCreation<'_, F>,
+) -> Result<(), crate::expressions::ExpressionCreationFailure<H>> {
     let mut prepared = 0usize;
     for node in package.fragment().nodes().values() {
         work.step()?;
@@ -797,11 +799,12 @@ pub(crate) fn prepare_writer_calls(
                     },
                 ),
             };
-            let token = prepare_call(package, functions, site, phase, call, work)?;
+            let token = prepare_call(package, functions, site, phase, call, work, creation)?;
             if tokens.insert(local_site, token).is_some() {
                 return Err(ExpressionLoweringError::Invalid(
                     "writer aggregate call site is prepared twice",
-                ));
+                )
+                .into());
             }
             prepared += 1;
             work.step()?;
@@ -821,23 +824,25 @@ pub(crate) fn prepare_writer_calls(
     if frozen != prepared {
         return Err(ExpressionLoweringError::Invalid(
             "frozen writer aggregate calls differ from the actual writer aggregate calls",
-        ));
+        )
+        .into());
     }
     Ok(())
 }
 
-fn prepare_call(
+fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     functions: &PureEngineFunctionCatalog,
     site: PhysicalCallSite,
     phase: AggregateKernelPhase,
     call: &WriterAggregateCall,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<PureCallSpecialization, ExpressionLoweringError> {
+    creation: crate::expressions::CallCreation<'_, F>,
+) -> Result<PureCallSpecialization, crate::expressions::ExpressionCreationFailure<H>> {
     let binding = &call.binding;
     let function = &binding.function;
     if function.kind != FunctionKind::Aggregate || kernel_phase(binding.phase) != phase {
-        return Err(ExpressionLoweringError::UnsupportedCall(site));
+        return Err(ExpressionLoweringError::UnsupportedCall(site).into());
     }
     let frozen = package
         .calls()
@@ -854,10 +859,11 @@ fn prepare_call(
     let source_request = source_request.ok_or(ExpressionLoweringError::Invalid(
         "missing original writer aggregate call request",
     ))?;
-    let request = crate::original_requests::materialize_call_request_observed(
+    let request = crate::original_requests::materialize_call_request_created(
         source_request,
         package.constants(),
         work,
+        creation,
     )?;
     work.flush()?;
     // The selection is the frozen binding itself, never a re-resolution.
@@ -872,12 +878,14 @@ fn prepare_call(
         }),
     });
     work.flush()?;
-    functions.metadata().validate_frozen_selection(
+    crate::expressions::validate_call_created(
+        functions.metadata(),
         &function.function_id,
         FunctionKind::Aggregate,
         selection.as_ref(),
         request.request(),
         work.control(),
+        creation,
     )?;
     work.flush()?;
     let input_type = &package
@@ -888,60 +896,43 @@ fn prepare_call(
             "missing writer aggregate input value",
         ))?
         .ty;
-    let input = materialized_input_context(frozen.context);
-    let children = ScopedExpressionEffects::pure_value(input).for_use(input)?;
-    let argument_uses = [Some(input.use_id)];
-    let (argument_uses, options) = if phase.consumes_logical_arguments() {
-        (
-            CallArgumentUses::SelectedChannels(&argument_uses),
-            AggregatePreparationOptions {
-                state_interpretation: None,
-                phase,
-                distinct: false,
-                order_keys: Arc::from([]),
-                state_input_type: None,
-            },
-        )
-    } else {
-        work.flush()?;
-        (
-            CallArgumentUses::AggregateMerge {
-                phase,
-                state_context: input,
-                state_input_type: input_type,
-            },
-            AggregatePreparationOptions {
-                state_interpretation: None,
-                phase,
-                distinct: false,
-                order_keys: Arc::from([]),
-                state_input_type: Some(input_type.clone()),
-            },
-        )
-    };
-    work.flush()?;
-    let effect_input = CallEffectInput {
-        context: frozen.context,
-        argument_uses,
+    let input_context =
+        frozen
+            .materialized_writer_input
+            .ok_or(ExpressionLoweringError::Invalid(
+                "frozen writer lacks its original materialized Value context",
+            ))?;
+    let source = novarocks_functions::FrozenWriterAggregatePreparation {
         function_id: &function.function_id,
-        kind: FunctionKind::Aggregate,
-        selected: selection.as_ref(),
-        request: request.request(),
-        environment: &frozen.effects.environment,
-        parameters: package.parameters(),
+        selected: &selection,
+        original_request: request.request(),
+        call_context: frozen.context,
+        materialized_input_context: input_context,
+        frozen_effects: &frozen.effects,
         decimal_overflow_policy: frozen.decimal_overflow_policy,
-        proof_scope: frozen.effects.proof_scope,
+        parameters: package.parameters(),
+        actual_input_type: input_type,
+        phase,
     };
-    let token = functions.prepare_frozen(
-        effect_input,
-        Arc::clone(&selection),
-        &frozen.effects,
-        PureCallPreparation::Aggregate {
-            arguments: ScopedExpressionEffects::primitive(frozen.context, children),
-            options,
-        },
-        work.control(),
-    )?;
+    let token = match creation {
+        Some((factory, policy)) => {
+            let mut scope = factory
+                .begin_scope()
+                .map_err(crate::expressions::ExpressionCreationFailure::Creator)?;
+            novarocks_functions::prepare_frozen_writer_aggregate_with_creator_in(
+                functions.metadata(),
+                source,
+                policy,
+                &mut scope,
+                work.control(),
+            )?
+        }
+        None => novarocks_functions::prepare_frozen_writer_aggregate(
+            functions.metadata(),
+            source,
+            work.control(),
+        )?,
+    };
     work.flush()?;
     Ok(token)
 }

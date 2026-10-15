@@ -36,7 +36,6 @@ use novarocks_spi::connector::{
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompilePhase, PureCompileControl, ValueLogicalType,
-    arrow_fields_exact_observed,
 };
 use sha2::{Digest, Sha256};
 
@@ -78,6 +77,23 @@ fn compile(
     let scan = frozen.scan();
     let draft = scan.recipe();
     let public = frozen.public_facts();
+    let execution = public.execution_schema().ok_or_else(|| {
+        invalid(
+            "schema",
+            "Paimon frozen read has no complete execution declaration",
+        )
+    })?;
+    let source_schema = public
+        .source_schema_facts()
+        .ok_or_else(|| invalid("schema", "Paimon frozen read has no separate source facts"))?;
+    if !source_schema.schema_attributes().is_empty()
+        || source_schema.field_facts().len() != draft.columns().len()
+    {
+        return Err(invalid(
+            "schema",
+            "Paimon frozen source facts differ from its SDK author",
+        ));
+    }
     let source = public.source();
     work.step()?;
     if draft.binding().descriptor().provider_id.as_str() != PROVIDER_ID
@@ -183,20 +199,43 @@ fn compile(
             work,
             decode_column,
         )?;
-        let field = &public.schema().fields()[ordinal];
-        if public.logical_types()[ordinal] != ValueLogicalType::Physical {
+        let binding = execution
+            .binding(ordinal)
+            .ok_or_else(|| invalid("columns", "Paimon private column has no execution binding"))?;
+        let field = &source_schema.shape().schema().fields()[ordinal];
+        if binding.logical_type() != ValueLogicalType::Physical {
             return Err(invalid(
                 "columns",
                 "Paimon PAI-1 source has a non-physical logical domain",
             ));
         }
-        work.flush()?;
-        let expected = column_field(&column);
+        let expected_type = typed_source::data_type(column.data_type());
         work.step()?;
-        if !arrow_fields_exact_observed(&expected, field, || work.step())? {
+        let path = [u32::try_from(ordinal).map_err(|_| {
+            invalid(
+                "columns",
+                "Paimon source occurrence ordinal exceeds address space",
+            )
+        })?];
+        let fact = source_schema.field_fact(&path).ok_or_else(|| {
+            invalid(
+                "columns",
+                "Paimon public source column has no field identity",
+            )
+        })?;
+        work.step()?;
+        if binding.nullable() != column.nullable()
+            || binding.data_type() != &expected_type
+            || field.data_type() != &expected_type
+            || field.is_nullable() != column.nullable()
+            || !bytes_equal(field.name().as_bytes(), column.name().as_bytes(), work)?
+            || fact.field_id() != Some(column.field_id())
+            || fact.initial_default().is_some()
+            || !fact.attributes().is_empty()
+        {
             return Err(invalid(
                 "columns",
-                "Paimon private column differs from its complete public field",
+                "Paimon private column differs from its complete execution/source declaration",
             ));
         }
         if let Some(existing) = by_id.get(&column.field_id()) {
@@ -384,31 +423,17 @@ fn digest_bytes(
 /// table's own catalog-visible columns; its alias never names its field.
 pub(super) fn public_read_schema(
     table_columns: &[PaimonColumn],
-    columns: &[PaimonColumn],
-) -> Result<ConnectorReadPublicSchema, ConnectorError> {
-    if let Some(foreign) = columns
-        .iter()
-        .find(|column| !table_columns.contains(column))
-    {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            format!(
-                "Paimon column {} (field ID {}) is not a column of its frozen table",
-                foreign.name(),
-                foreign.field_id()
-            ),
-        ));
-    }
-    ConnectorReadPublicSchema::try_new(
-        Arc::new(Schema::new(
-            columns.iter().map(column_field).collect::<Vec<_>>(),
-        )),
-        vec![ValueLogicalType::Physical; columns.len()],
-    )
+    columns: &[&PaimonColumn],
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<ConnectorReadPublicSchema, PureProviderCompileError<ConnectorError>> {
+    typed_source::publish(table_columns, columns, creation)
 }
+
+mod typed_source;
 
 /// The admitted PAI-1 projection of the SDK build_target_arrow_schema author.
 /// Field ID metadata is source identity; scan variables are separate aliases.
+#[cfg(test)]
 fn column_field(column: &PaimonColumn) -> Field {
     let data_type = match column.data_type() {
         PaimonDataType::Boolean => DataType::Boolean,
@@ -454,6 +479,26 @@ mod tests {
     };
     use novarocks_spi::connector::read_stack::SchemaTableName;
     use novarocks_type_contract::{CompileControlError, arrow_fields_exact};
+    fn public_read_schema(
+        table_columns: &[PaimonColumn],
+        columns: &[PaimonColumn],
+    ) -> Result<ConnectorReadPublicSchema, ConnectorError> {
+        let borrowed = columns.iter().collect::<Vec<_>>();
+        let mut request = |_| Ok(());
+        let mut work = |_| Ok(());
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
+        match super::public_read_schema(table_columns, &borrowed, &mut creation) {
+            Ok(schema) => Ok(schema),
+            Err(PureProviderCompileError::Provider(error)) => Err(error),
+            Err(PureProviderCompileError::Control(cause)) => {
+                panic!("fixture creation was interrupted: {cause}")
+            }
+        }
+    }
     use paimon::spec::{self, DataField, TableSchema};
 
     use super::*;
@@ -674,11 +719,78 @@ mod tests {
                 ConnectorReadWorkSource::RuntimeSplits,
             )
             .unwrap();
-            let public = ConnectorReadPublicFacts::try_new(
+            let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+            let fields = self
+                .fields
+                .iter()
+                .map(|field| field.clone().with_metadata(HashMap::new()))
+                .collect::<Vec<_>>();
+            let schema = Arc::new(Schema::new(fields));
+            let bindings = self
+                .fields
+                .iter()
+                .zip(&self.logical)
+                .map(|(field, logical)| {
+                    novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                        field.data_type().clone(),
+                        field.is_nullable(),
+                        *logical,
+                    )
+                    .unwrap()
+                })
+                .collect::<Box<[_]>>();
+            let execution = novarocks_connector_contract::ConnectorReadExecutionSchema::try_new(
+                schema.clone(),
+                bindings,
+                storage.clone(),
+            )
+            .unwrap();
+            let shape = novarocks_connector_contract::ConnectorSourceSchemaShape::try_new(
+                schema,
+                storage.clone(),
+            )
+            .unwrap();
+            let facts = self
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(ordinal, field)| {
+                    // Explicit fixture ingress: only its declared ID key is an
+                    // identity fact; all remaining source attributes stay separate.
+                    let id = field
+                        .metadata()
+                        .get(FIELD_ID_KEY)
+                        .map(|id| id.parse::<i32>().unwrap());
+                    let attrs = field
+                        .metadata()
+                        .iter()
+                        .filter(|(key, _)| key.as_str() != FIELD_ID_KEY)
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    novarocks_connector_contract::ConnectorSourceFieldFacts::try_new(
+                        vec![ordinal as u32].into(),
+                        id,
+                        None,
+                        attrs,
+                        &[FIELD_ID_KEY],
+                        storage.clone(),
+                    )
+                    .unwrap()
+                })
+                .collect::<Box<[_]>>();
+            let source_schema = novarocks_connector_contract::ConnectorSourceSchemaFacts::try_new(
+                shape,
+                HashMap::new(),
+                facts,
+                storage.clone(),
+            )
+            .unwrap();
+            let public = ConnectorReadPublicFacts::try_new_typed(
                 self.source.clone(),
                 None,
-                Schema::new(self.fields.clone()),
-                self.logical.clone(),
+                execution,
+                source_schema,
+                storage,
             )
             .unwrap();
             FrozenConnectorRead::try_new(scan, public).unwrap()
@@ -871,13 +983,16 @@ mod tests {
             .enumerate()
         {
             assert!(
-                arrow_fields_exact(field, sdk),
-                "field {ordinal} differs from the SDK author"
+                arrow_fields_exact(field, &sdk.clone().with_metadata(HashMap::new())),
+                "field {ordinal} differs from the SDK physical declaration"
             );
-            assert_eq!(
-                field.metadata()[FIELD_ID_KEY],
-                fixture.columns[ordinal].field_id().to_string()
-            );
+            assert!(field.metadata().is_empty());
+            let fact = published
+                .source_schema_facts()
+                .unwrap()
+                .field_fact(&[ordinal as u32])
+                .unwrap();
+            assert_eq!(fact.field_id(), Some(fixture.columns[ordinal].field_id()));
             assert_eq!(field.name(), fixture.columns[ordinal].name());
         }
         assert_eq!(
@@ -885,13 +1000,6 @@ mod tests {
             [ValueLogicalType::Physical; 3].as_slice()
         );
 
-        fixture.fields = published
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| field.as_ref().clone())
-            .collect();
-        fixture.logical = published.logical_types().to_vec();
         let frozen = fixture.frozen();
         let recipe = catalog.compile_read(&frozen, &Control::default()).unwrap();
         assert_eq!(recipe.frozen(), &frozen);

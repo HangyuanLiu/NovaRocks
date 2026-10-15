@@ -39,7 +39,7 @@ fn named_source() -> Chunk {
 fn by_runtime_memory_ready_original_regroup_schema_and_field_escape_are_independent() {
     let source = named_source();
     let original_schema = source.schema();
-    let keys = vec![source.batch.column(0).clone()];
+    let keys = vec![source.record_batch().column(0).clone()];
     let control = Control::new(None);
     let drops = Arc::new(AtomicUsize::new(0));
     let mut work = Work::new(&control, drops.clone());
@@ -77,7 +77,7 @@ fn by_runtime_memory_ready_original_split_schema_escape_outlives_all_stage_chunk
     let source = named_source();
     let original_schema = source.schema();
     let output = source.chunk_schema_ref();
-    let columns = source.batch.columns().to_vec();
+    let columns = source.record_batch().columns().to_vec();
     let control = Control::new(None);
     let drops = Arc::new(AtomicUsize::new(0));
     let mut work = Work::new(&control, drops.clone());

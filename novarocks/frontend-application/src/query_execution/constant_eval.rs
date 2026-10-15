@@ -40,8 +40,8 @@ use novarocks_sql::compiler::{
     BinOp, FoldNodeKind, FoldRequest, SqlConstantEvaluationError, SqlConstantEvaluator, UnOp,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl, ValueLogicalType,
-    ValueTypeVisit, field_logical_type, validate_value_type_structure_observed,
+    CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl, ValueKind,
+    ValueLogicalType, ValueTypeRef,
 };
 use std::sync::Arc;
 
@@ -98,7 +98,7 @@ impl SqlConstantEvaluator for ExecutionConstantEvaluator {
             for arg in &request.args {
                 arg_ids.push(arena.push_typed(
                     ExprNode::Constant(arg.value.clone()),
-                    arg.value_type.data_type.clone(),
+                    arg.value_type.data_type().clone(),
                 ));
                 work.step()?;
             }
@@ -106,7 +106,7 @@ impl SqlConstantEvaluator for ExecutionConstantEvaluator {
             let Some(root_node) = root_node_for(&request.kind, &arg_ids) else {
                 return Ok(None);
             };
-            let root = arena.push_typed(root_node, request.result_type.data_type.clone());
+            let root = arena.push_typed(root_node, request.result_type.data_type().clone());
             work.flush()?;
             let chunk = single_row_chunk()?;
             work.flush()?;
@@ -123,7 +123,7 @@ impl SqlConstantEvaluator for ExecutionConstantEvaluator {
             }
             if !novarocks_type_contract::arrow_data_types_exact_observed::<
                 SqlConstantEvaluationError,
-            >(output.data_type(), &request.result_type.data_type, || {
+            >(output.data_type(), request.result_type.data_type(), || {
                 work.step()?;
                 Ok(())
             })? {
@@ -131,7 +131,7 @@ impl SqlConstantEvaluator for ExecutionConstantEvaluator {
                     .to_owned()
                     .into());
             }
-            if output.is_null(0) && !request.result_type.nullable {
+            if output.is_null(0) && !request.result_type.nullable() {
                 return Ok(None);
             }
             // Preserve the old optional fold refusal for decimal results that
@@ -147,7 +147,11 @@ impl SqlConstantEvaluator for ExecutionConstantEvaluator {
             if !decimal_fits {
                 return Ok(None);
             }
-            let field = Arc::new(request.result_type.try_to_field("literal")?);
+            let field = Arc::new(arrow::datatypes::Field::new(
+                "literal",
+                request.result_type.data_type().clone(),
+                request.result_type.nullable(),
+            ));
             let data = output.to_data();
             work.flush()?;
             let pool = ConstantPool::try_new(
@@ -260,30 +264,33 @@ fn legacy_value_type_supported(
 ) -> Result<bool, SqlConstantEvaluationError> {
     work.step()?;
     value_type
-        .logical_type
-        .validate_carrier(&value_type.data_type)?;
+        .logical_type()
+        .validate_carrier(value_type.data_type())?;
     // The function owner supplies the actual type/metadata resource limits.
     // Its borrowed walk observes entries, not opaque cloning or kernel work.
     validate_function_value_type_observed(value_type, work)?;
-    let mut nested_physical = true;
-    validate_value_type_structure_observed::<SqlConstantEvaluationError>(
-        &value_type.data_type,
-        |visit| {
+    fn supported(
+        value: &ValueTypeRef,
+        root: bool,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<bool, SqlConstantEvaluationError> {
+        work.step()?;
+        let mut allowed = match value.kind() {
+            ValueKind::Nominal(ValueLogicalType::LargeInt) => root,
+            ValueKind::Nominal(_) => false,
+            ValueKind::Scalar(DataType::FixedSizeBinary(_)) => false,
+            _ => true,
+        };
+        for ordinal in 0..value.child_count() {
             work.step()?;
-            if let ValueTypeVisit::Field(field) = visit {
-                nested_physical &= field_logical_type(field)? == ValueLogicalType::Physical;
-            }
-            Ok(())
-        },
-    )?;
-    Ok(nested_physical
-        && match value_type.logical_type {
-            ValueLogicalType::Physical => {
-                !matches!(value_type.data_type, DataType::FixedSizeBinary(_))
-            }
-            ValueLogicalType::LargeInt => true,
-            _ => false,
-        })
+            let child = value
+                .child_type_at(ordinal)
+                .expect("immutable value node exposes every declared child");
+            allowed &= supported(child, false, work)?;
+        }
+        Ok(allowed)
+    }
+    supported(value_type.value_type(), true, work)
 }
 
 /// A schemaless chunk with exactly one row.

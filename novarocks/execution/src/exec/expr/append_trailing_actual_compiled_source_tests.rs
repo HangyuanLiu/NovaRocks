@@ -49,8 +49,8 @@ fn check(mode: SqlPhysicalEmissionMode) {
             else {
                 panic!("actual append_trailing selected result must be scalar");
             };
-            assert_eq!(result.data_type, DataType::Utf8);
-            assert!(result.nullable);
+            assert_eq!(result.data_type().clone(), DataType::Utf8);
+            assert!(result.nullable());
             eprintln!(
                 "append_trailing actual compiled retained call mode={mode:?} fragment={fragment:?} site={site:?} contract={contract:?} implementation={:?}",
                 call.implementation()

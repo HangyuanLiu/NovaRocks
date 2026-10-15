@@ -91,8 +91,8 @@ fn definition(
     if definition.owner != site.node || definition.lambda_scope.is_some() {
         return Err(PredicateSourceError::InvalidScope);
     }
-    if definition.ty.data_type != arrow_schema::DataType::Boolean
-        || definition.ty.logical_type != ValueLogicalType::Physical
+    if *definition.ty.data_type() != arrow_schema::DataType::Boolean
+        || definition.ty.logical_type() != ValueLogicalType::Physical
     {
         return Err(PredicateSourceError::NotBoolean);
     }

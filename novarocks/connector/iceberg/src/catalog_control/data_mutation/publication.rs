@@ -503,15 +503,23 @@ mod tests {
         let adapter = IcebergDataMutationAdapter::try_new(provider.clone()).unwrap();
         let plan = if truncate {
             let metadata = provider
-                .load_table(novarocks_spi::connector::ConnectorTableRequest {
-                    table: novarocks_spi::connector::ConnectorTableIdentity {
-                        instance_id: provider.descriptor().instance_id.clone(),
-                        namespace: "db".into(),
-                        table: "t".into(),
+                .load_table(
+                    novarocks_spi::connector::ConnectorTableRequest {
+                        table: novarocks_spi::connector::ConnectorTableIdentity {
+                            instance_id: provider.descriptor().instance_id.clone(),
+                            namespace: "db".into(),
+                            table: "t".into(),
+                        },
+                        resolution:
+                            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                        context: table_context(),
                     },
-                    resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-                    context: table_context(),
-                })
+                    &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                        &mut |_| Ok(()),
+                        &mut |_| Ok(()),
+                    ),
+                )
                 .unwrap();
             adapter
                 .plan_mutation(
@@ -856,15 +864,22 @@ mod tests {
             .map(|mapping| hex_encode(Sha256::digest(mapping.as_bytes())));
         *manifest = source_manifest;
         let resolved = provider
-            .load_table(ConnectorTableRequest {
-                table: ConnectorTableIdentity {
-                    instance_id: provider.descriptor().instance_id.clone(),
-                    namespace: "db".into(),
-                    table: "t".into(),
+            .load_table(
+                ConnectorTableRequest {
+                    table: ConnectorTableIdentity {
+                        instance_id: provider.descriptor().instance_id.clone(),
+                        namespace: "db".into(),
+                        table: "t".into(),
+                    },
+                    resolution: ConnectorTableResolution::StrictBaseTable,
+                    context: table_context(),
                 },
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                context: table_context(),
-            })
+                &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    &mut |_| Ok(()),
+                    &mut |_| Ok(()),
+                ),
+            )
             .unwrap();
         let request = ConnectorDataMutationPlanningRequest::try_new(
             ConnectorMutationOperationId::new(),

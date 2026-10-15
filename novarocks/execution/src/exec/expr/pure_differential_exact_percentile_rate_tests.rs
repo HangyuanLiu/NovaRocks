@@ -76,7 +76,7 @@ fn scalar_shapes() -> Vec<DataType> {
     types
 }
 fn generated(ty: &FunctionValueType, rows: usize) -> ArrayRef {
-    if ty.data_type == DataType::FixedSizeBinary(16) {
+    if *ty.data_type() == DataType::FixedSizeBinary(16) {
         // The generator has no Physical fixed-binary author. These exact raw
         // bytes are produced by the existing LARGEINT encoder; the explicit
         // selected FVT remains Physical, and separately tests nominal tags.

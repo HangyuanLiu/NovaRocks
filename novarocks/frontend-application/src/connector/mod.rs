@@ -26,6 +26,7 @@ pub mod unified_statistics;
 pub mod write_target;
 
 mod application;
+pub(crate) mod schema_creation;
 
 #[cfg(test)]
 pub mod fixture;
@@ -45,15 +46,12 @@ pub use application::{
 pub(crate) use application::{
     connector_planning_context_for_query, connector_planning_context_for_query_on_runtime,
     connector_request_context_for_execution_on_runtime,
-    connector_request_context_for_query_on_runtime, context_for_planning_lease,
-    context_for_planning_lease_typed, metadata_binding_typed,
+    connector_request_context_for_query_on_runtime, connector_write_column,
+    context_for_planning_lease, context_for_planning_lease_typed, metadata_binding_typed,
     metadata_load_connector_table_with_planning_lease_typed, query_connector_request_context,
-    query_connector_request_context_on_runtime, sql_column_from_connector_field,
+    query_connector_request_context_on_runtime, sql_column_from_connector_binding,
 };
 pub use unified_statistics::UnifiedStatisticsResolver;
-
-#[cfg(test)]
-pub(crate) use application::sql_columns_from_connector_schema;
 
 #[cfg(test)]
 pub use application::test_request_context;

@@ -86,8 +86,8 @@ fn binding(
     let original = crate::analysis::test_function_binding(
         "logical_capture",
         args,
-        result.data_type.clone(),
-        result.nullable,
+        result.data_type().clone(),
+        result.nullable(),
         FunctionVolatility::Immutable,
     );
     let mut resolved = original.resolved().clone();
@@ -203,7 +203,10 @@ fn logical_capture_typed_null_and_nested_full_type_are_distinct_original_channel
     let (actual_type, cv) = value(&captured.request().arguments[0]);
     assert_eq!(actual_type, &nested_type);
     let cv = cv.unwrap();
-    assert_eq!(cv.field().data_type(), &nested_type.data_type);
+    assert_eq!(
+        cv.field().data_type().clone(),
+        nested_type.data_type().clone()
+    );
     assert!(
         cv.is_null_observed(CompilePhase::FunctionSpecialization, &Control::default())
             .unwrap()
@@ -344,7 +347,7 @@ fn logical_capture_lambda_preserves_complete_parameter_and_result_domains() {
         assert_eq!(actual, &original.value_type);
     }
     assert_eq!(result_type, &body.value_type);
-    assert_eq!(result_type.logical_type, ValueLogicalType::Json);
+    assert_eq!(result_type.logical_type(), ValueLogicalType::Json);
     prefixes(&selected, 1, &args, true);
 }
 

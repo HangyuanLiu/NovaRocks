@@ -202,6 +202,7 @@ message IcebergTableHandle {
   optional IcebergReadDomain read_domain = 15;
   map<int32, string> scalar_integer_domains = 16;
   optional IcebergCowSourceProof frozen_cow_source = 17;
+  map<int32, string> nominal_declarations = 18;
 }
 
 message TableChangesFunctionHandle {
@@ -223,6 +224,7 @@ message IcebergChangeWindowHandle {
   map<int32, string> partition_spec_jsons = 7;
   optional IcebergReadDomain from_read_domain = 8;
   optional IcebergReadDomain to_read_domain = 9;
+  map<int32, string> nominal_declarations = 10;
 }
 
 enum IcebergSystemTableType {

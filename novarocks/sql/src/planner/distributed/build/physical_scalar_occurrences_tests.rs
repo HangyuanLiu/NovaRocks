@@ -1046,7 +1046,9 @@ fn scalar_occurrences_typeof_unknown_and_metadata_only_catalog_never_supply_owne
     );
     let arguments = [
         FunctionArgument::Lambda {
-            parameter_types: Box::from([integer.clone()]),
+            parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                integer.clone(),
+            ])),
             result_type: integer.clone(),
         },
         FunctionArgument::Value {

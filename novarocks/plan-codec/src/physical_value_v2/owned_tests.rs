@@ -193,13 +193,10 @@ fn observed_values_preserve_sparse_original_namespaces_and_independent_request_l
                 std::slice::from_ref(value)
             );
             let final_facts = prefixes.last().unwrap();
-            assert_eq!(final_facts.allocation_requests_upper_bound, 5);
+            assert_eq!(final_facts.allocation_requests_upper_bound, 3);
             assert_eq!(
                 final_facts.allocation_request_bytes_upper_bound,
-                size_of::<usize>()
-                    + size_of::<p::ValueDef>()
-                    + 2 * size_of::<DataType>()
-                    + bytes_shared_upper().unwrap()
+                size_of::<usize>() + size_of::<p::ValueDef>() + bytes_shared_upper().unwrap()
             );
             assert_eq!(final_facts.origin_reference_count, 2);
             assert!(
@@ -595,7 +592,7 @@ fn observed_values_wide_actual_index_quantum_preserves_all_ordered_source_ids() 
 }
 
 #[test]
-fn observed_nested_dictionary_requests_are_admitted_at_the_original_clone_prefix() {
+fn observed_normalized_binding_clones_allocate_nothing_and_real_containers_preserve_refusal() {
     let control = Control::default();
     let ty = ty(DataType::Dictionary(
         Box::new(DataType::Int8),
@@ -640,43 +637,35 @@ fn observed_nested_dictionary_requests_are_admitted_at_the_original_clone_prefix
         &mut work,
     );
     let decoded = finish(result, work).unwrap();
-    assert_eq!(decoded.facts().allocation_requests_upper_bound, 6);
+    assert_eq!(decoded.facts().allocation_requests_upper_bound, 2);
     assert_eq!(
         decoded.facts().allocation_request_bytes_upper_bound,
-        size_of::<usize>() + size_of::<p::ValueDef>() + 4 * size_of::<DataType>()
+        size_of::<usize>() + size_of::<p::ValueDef>()
     );
+    let value = decoded.value(0).unwrap().unwrap();
+    assert!(std::ptr::eq(
+        value.ty.data_type(),
+        receiving_types.value_type(u32::MAX).unwrap().data_type()
+    ));
+    assert_eq!(value.ty.data_type(), &DataType::Utf8);
     assert_eq!(decoded.into_values(), [source]);
-    assert!(
-        prefixes
-            .iter()
-            .any(|f| f.allocation_requests_upper_bound == 4)
-    );
-    assert!(
-        prefixes
-            .iter()
-            .any(|f| f.allocation_requests_upper_bound == 6)
-    );
     for cause in CAUSES {
-        control.arm(None);
-        let mut armed = false;
-        let mut trace_at_outer = Vec::new();
+        // The real index/output container requests are known together. Refuse
+        // their one-under cap before any armed subsequent control callback.
+        control.arm(Some((1, cause)));
+        let mut called = false;
         let mut cap = limits();
-        cap.max_allocation_requests = 5;
+        cap.max_allocation_requests = 1;
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate).unwrap();
+        let at_gate = control.trace();
         let result = decode_values_observed_in(
             &raw,
             &receiving_payloads,
             &receiving_types,
             SOURCE,
             cap,
-            &mut |f| {
-                if f.allocation_requests_upper_bound == 4 && !armed {
-                    // The real outer Dictionary prefix, before its next completed
-                    // clone step, arms the next actual controller callback.
-                    trace_at_outer = control.trace();
-                    *control.stop.lock().unwrap() = Some((trace_at_outer.len(), cause));
-                    armed = true;
-                }
+            &mut |_| {
+                called = true;
                 Ok(())
             },
             &mut work,
@@ -685,15 +674,8 @@ fn observed_nested_dictionary_requests_are_admitted_at_the_original_clone_prefix
             finish(result, work),
             Err(Error::Control(CompileControlError::ResourceExhausted))
         ));
-        assert!(
-            armed,
-            "the actual clone author must expose its outer request prefix"
-        );
-        assert_eq!(
-            control.trace(),
-            trace_at_outer,
-            "known inner Dictionary requests refuse before the armed late observer"
-        );
+        assert!(!called);
+        assert_eq!(control.trace(), at_gate);
         control.arm(None);
         let mut reached = false;
         let mut at_refusal = Vec::new();
@@ -704,8 +686,8 @@ fn observed_nested_dictionary_requests_are_admitted_at_the_original_clone_prefix
             &receiving_types,
             SOURCE,
             limits(),
-            &mut |f| {
-                if f.allocation_requests_upper_bound == 6 {
+            &mut |facts| {
+                if facts.allocation_requests_upper_bound == 2 {
                     reached = true;
                     at_refusal = control.trace();
                     Err(cause)
@@ -715,7 +697,7 @@ fn observed_nested_dictionary_requests_are_admitted_at_the_original_clone_prefix
             },
             &mut work,
         );
-        assert!(matches!(finish(result,work),Err(Error::Control(actual))if actual==cause));
+        assert!(matches!(finish(result, work), Err(Error::Control(actual)) if actual == cause));
         assert!(reached);
         assert_eq!(control.trace(), at_refusal);
     }
@@ -741,7 +723,6 @@ fn original_decoded_values_header_floor_has_no_observer_and_keeps_dictionary_bac
                         + size_of::<DecodedValues<'_, '_, '_>>()
                         + size_of::<usize>()
                         + size_of::<p::ValueDef>()
-                        + 2 * size_of::<DataType>()
             );
             for cause in CAUSES {
                 control.arm(Some((1, cause)));

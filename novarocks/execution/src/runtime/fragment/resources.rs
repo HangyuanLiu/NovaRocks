@@ -226,6 +226,9 @@ impl ExchangeRegistration {
         program: &FragmentProgram,
         instance: &FragmentInstanceSpec,
         cleanup_should_fail: bool,
+        creation_factory: Option<
+            Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+        >,
     ) -> Result<Option<Self>, FragmentLaunchError> {
         if program.exchange_inputs().is_empty() {
             return Ok(None);
@@ -251,6 +254,13 @@ impl ExchangeRegistration {
                 expected_chunk_schema: Arc::clone(contract.expected_schema()),
                 // Legacy fragments share one slot namespace across the edge.
                 column_binding: ExchangeColumnBinding::BySlotId,
+                creation_factory: creation_factory.as_ref().cloned().ok_or_else(|| {
+                    FragmentLaunchError::from_failure(
+                        crate::runtime::fragment::FragmentLaunchStage::Register,
+                        crate::runtime::fragment::FragmentLaunchErrorKind::ResourceUnavailable,
+                        crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into(),
+                    )
+                })?,
             }) {
                 let diagnostics = registration.rollback().err().into_iter().collect();
                 return Err(registration_error(error).with_cleanup_diagnostics(diagnostics));
@@ -469,12 +479,16 @@ impl FragmentResources {
         &mut self,
         program: &FragmentProgram,
         instance: &FragmentInstanceSpec,
+        creation_factory: Option<
+            Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+        >,
     ) -> Result<(), FragmentLaunchError> {
         self.exchange = ExchangeRegistration::acquire(
             Arc::clone(&self.exchange_receiver_port),
             program,
             instance,
             self.cleanup_faults.should_fail(ResourceKind::Exchange),
+            creation_factory,
         )?;
         Ok(())
     }

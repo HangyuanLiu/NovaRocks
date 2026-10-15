@@ -526,8 +526,14 @@ mod tests {
         let mut scan = make_scan(&[("payload", source_id)]);
         scan.table.columns[0].data_type = DataType::LargeBinary;
         scan.table.columns[0].nullable = true;
-        scan.columns[0].value_type.data_type = DataType::LargeBinary;
-        scan.columns[0].value_type.nullable = true;
+        scan.columns[0].value_type =
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                scan.columns[0].value_type.nullable(),
+                scan.columns[0].value_type.logical_type(),
+            )
+            .unwrap();
+        scan.columns[0].value_type = scan.columns[0].value_type.with_nullable(true).unwrap();
         let source = TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: source_id,

@@ -200,6 +200,18 @@ impl MultiCastDataStreamSinkOperator {
 }
 
 impl Operator for MultiCastDataStreamSinkOperator {
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        for sink in &mut self.sinks {
+            sink.op.set_construction_factory(factory.clone());
+        }
+    }
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

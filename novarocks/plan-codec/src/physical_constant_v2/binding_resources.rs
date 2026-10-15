@@ -250,7 +250,7 @@ fn preflight_core(
     work.flush()?;
     let mut metrics = Metrics::default();
     validate_value_type_structure_with_scratch_observed::<TypeCodecError>(
-        &pool.value_type().data_type,
+        &pool.value_type().data_type(),
         &mut scratch,
         |event| {
             metrics.observe(

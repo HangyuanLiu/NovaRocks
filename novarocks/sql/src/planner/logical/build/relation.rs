@@ -412,6 +412,7 @@ fn plan_iceberg_delta_scan(
 
 pub(super) fn plan_set_operation_scoped(
     set_op: ResolvedSetOp,
+    output_columns: &[OutputColumn],
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
     control: &dyn PureCompileControl,
@@ -421,6 +422,7 @@ pub(super) fn plan_set_operation_scoped(
     // planning stack while retaining every pairwise type-widening step.
     let mut operations = Vec::new();
     let mut current = set_op;
+    let mut declared_output = output_columns.to_vec();
     let base_left = loop {
         let ResolvedSetOp {
             kind,
@@ -428,26 +430,11 @@ pub(super) fn plan_set_operation_scoped(
             left,
             right,
         } = current;
-        let output_columns: Vec<OutputColumn> = left
-            .output_columns
-            .iter()
-            .zip(right.output_columns.iter())
-            .map(|(lc, rc)| {
-                let dt =
-                    novarocks_types::wider_type(&lc.value_type.data_type, &rc.value_type.data_type);
-                OutputColumn {
-                    column_id: lc.column_id,
-                    name: lc.name.clone(),
-                    value_type: novarocks_type_contract::FunctionValueType::new(
-                        dt,
-                        lc.value_type.nullable || rc.value_type.nullable,
-                    ),
-
-                    is_internal: lc.is_internal && rc.is_internal,
-                }
-            })
-            .collect();
-        operations.push((kind, all, right, output_columns));
+        // The analyzer already authored each pairwise common value type,
+        // including nominal children and NULL neutrality. Flattening the set
+        // spine must carry that declaration instead of deriving a new type
+        // from Arrow carriers and erasing the original domains.
+        operations.push((kind, all, right, declared_output));
         let ResolvedQuery {
             body,
             order_by,
@@ -463,6 +450,7 @@ pub(super) fn plan_set_operation_scoped(
                     && offset.is_none()
                     && local_cte_ids.is_empty() =>
             {
+                declared_output = output_columns;
                 current = inner;
                 continue;
             }

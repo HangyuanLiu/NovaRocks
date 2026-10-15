@@ -261,7 +261,7 @@ fn hll_hash_actual_original_required_sql_full_signature_source() {
                 };
                 assert_eq!(actual, selected);
                 // The original analyzer inserts this Cast before binding HLL_HASH.
-                assert_eq!(selected.data_type, DataType::Utf8);
+                assert_eq!(selected.data_type().clone(), DataType::Utf8);
                 let argument = fragment
                     .expressions()
                     .get(args[0])
@@ -275,13 +275,13 @@ fn hll_hash_actual_original_required_sql_full_signature_source() {
                     .expressions()
                     .get(*expr)
                     .expect("actual HLL cast source");
-                assert_eq!(input.ty.data_type, DataType::Int32);
-                assert!(selected.nullable);
+                assert_eq!(input.ty.data_type().clone(), DataType::Int32);
+                assert!(selected.nullable());
                 assert_eq!(
-                    selected.logical_type,
+                    selected.logical_type(),
                     novarocks_type_contract::ValueLogicalType::Physical
                 );
-                assert_eq!(node.ty.data_type, DataType::Binary);
+                assert_eq!(node.ty.data_type().clone(), DataType::Binary);
                 eprintln!(
                     "HLL_HASH actual original source fragment={:?} id={id:?} function={function:?} request={request:?} argument={:?} output={:?}",
                     fragment.id(),

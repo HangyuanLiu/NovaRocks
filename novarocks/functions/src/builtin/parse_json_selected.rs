@@ -40,11 +40,11 @@ pub(super) fn original_native_profile(selected: &FunctionBindingSelection, count
     };
     count == 1
         && selected.aggregate.is_none()
-        && source.logical_type == ValueLogicalType::Physical
-        && source.data_type == DataType::Utf8
-        && target.logical_type == ValueLogicalType::Json
-        && target.data_type == DataType::Utf8
-        && target.nullable
+        && source.logical_type() == ValueLogicalType::Physical
+        && source.data_type() == &DataType::Utf8
+        && target.logical_type() == ValueLogicalType::Json
+        && target.data_type() == &DataType::Utf8
+        && target.nullable()
 }
 pub(super) fn validate_profile(
     contract: &ScalarCallContract,
@@ -132,7 +132,7 @@ pub(super) fn evaluate<'a>(
             )?;
             let result = SelectedValues::try_new_observed::<KernelFailure>(
                 selection,
-                &input.contract().result_type().data_type,
+                input.contract().result_type().data_type(),
                 retained.values,
                 Box::default(),
                 || work.step(),

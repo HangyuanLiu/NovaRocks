@@ -61,6 +61,19 @@ use crate::typed_page_source::TypedConnectorReaderMarker;
 use crate::typed_page_source::flush_page_source_file_metrics;
 use crate::typed_preparation_flow::StreamPreparationFlow;
 
+/// The concrete stream Box is admitted before its constructor runs. The
+/// resulting stream keeps this finite scope; page chunks use separate scopes.
+fn create_scan_stream<T>(
+    schema: &novarocks_execution::exec::chunk::ChunkSchema,
+    factory: &dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
+    create: impl FnOnce(novarocks_type_contract::ValueTypeStorageLifetime) -> T,
+) -> novarocks_execution::runtime::fragment::ExecutionResult<Pin<Box<T>>> {
+    let owner = factory.begin_typed_construction(schema)?;
+    owner.request(std::alloc::Layout::new::<T>())?;
+    let stream = create(owner.storage_lifetime());
+    Ok(Box::pin(stream))
+}
+
 /// Hands a typed scan's one stream to the driver that runs it.
 pub(super) struct TypedScanStreamSource {
     shared: Arc<TypedConnectorScanShared>,
@@ -104,29 +117,42 @@ impl ScanStreamSource for TypedScanStreamSource {
         &self,
         budget: ConnectorPollBudget,
         profile: Option<RuntimeProfile>,
-    ) -> Result<ScanOutputStream, String> {
+        construction: std::sync::Arc<
+            dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
+        >,
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<ScanOutputStream> {
         if self.claimed.swap(true, Ordering::AcqRel) {
-            return Err("typed connector scan stream is already claimed".to_string());
+            return Err("typed connector scan stream is already claimed"
+                .to_string()
+                .into());
         }
-        Ok(Box::pin(TypedConnectorScanStream {
-            provider: self.shared.provider.resolve()?,
-            converter: if self.shared.output_materialization.is_some() {
-                // Derived columns consume a read intermediate, then the frozen
-                // output is bound after the explicit transform.
-                SourcePageConverter::new(self.shared.slot_ids.clone())
-            } else {
-                SourcePageConverter::with_output_schema(Arc::clone(&self.shared.output_schema))
-            },
-            shared: Arc::clone(&self.shared),
-            queue: Arc::clone(&self.queue),
-            split_wake: Arc::clone(&self.split_wake),
-            flow: Arc::clone(&self.flow),
-            budget,
-            profile,
-            step: SplitStep::Idle,
-            claims: VecDeque::new(),
-            ended: false,
-        }))
+        let provider = self.shared.provider.resolve()?;
+        let read_schema = self
+            .shared
+            .output_materialization
+            .as_ref()
+            .map_or(&self.shared.output_schema, |materialization| {
+                materialization.transform.read_schema()
+            });
+        let converter = SourcePageConverter::with_output_schema(Arc::clone(read_schema));
+        let stream = create_scan_stream(read_schema, construction.as_ref(), |stream_storage| {
+            TypedConnectorScanStream {
+                provider,
+                _construction_storage: stream_storage,
+                construction: Arc::clone(&construction),
+                converter,
+                shared: Arc::clone(&self.shared),
+                queue: Arc::clone(&self.queue),
+                split_wake: Arc::clone(&self.split_wake),
+                flow: Arc::clone(&self.flow),
+                budget,
+                profile,
+                step: SplitStep::Idle,
+                claims: VecDeque::new(),
+                ended: false,
+            }
+        })?;
+        Ok(stream)
     }
 }
 
@@ -139,6 +165,10 @@ struct TypedConnectorScanStream {
     budget: ConnectorPollBudget,
     profile: Option<RuntimeProfile>,
     converter: SourcePageConverter,
+    construction:
+        std::sync::Arc<dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory>,
+    // Only the concrete stream Box's creating scope, independent of page chunks.
+    _construction_storage: novarocks_type_contract::ValueTypeStorageLifetime,
     step: SplitStep,
     /// Splits taken from the queue ahead of the one being read.
     claims: VecDeque<PreparedClaim>,
@@ -208,10 +238,13 @@ enum NextSplit {
 impl TypedConnectorScanStream {
     /// Ends delivery on `error`. Whatever is open stays for `close`, which
     /// observes its exit.
-    fn fail(&mut self, error: String) -> Poll<Option<Result<Chunk, String>>> {
+    fn fail(
+        &mut self,
+        error: impl Into<novarocks_execution::runtime::fragment::ExecutionFailure>,
+    ) -> Poll<Option<novarocks_execution::runtime::fragment::ExecutionResult<Chunk>>> {
         self.ended = true;
         self.flow.stop();
-        Poll::Ready(Some(Err(error)))
+        Poll::Ready(Some(Err(error.into())))
     }
 
     fn next_split(&self, cx: &mut Context<'_>) -> NextSplit {
@@ -406,17 +439,20 @@ impl TypedConnectorScanStream {
             .saturating_sub(self.flow.retained_input_bytes())
     }
 
-    fn chunk_of(&mut self, page: SourcePage) -> Result<Chunk, String> {
+    fn chunk_of(
+        &mut self,
+        page: SourcePage,
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<Chunk> {
         let chunk = self
             .converter
-            .convert(page)
-            .map_err(|error| error.to_string())?;
-        self.shared.materialize_output(chunk)
+            .convert_with_factory(page, self.construction.as_ref())?;
+        self.shared
+            .materialize_output(chunk, self.construction.as_ref())
     }
 }
 
 impl Stream for TypedConnectorScanStream {
-    type Item = Result<Chunk, String>;
+    type Item = novarocks_execution::runtime::fragment::ExecutionResult<Chunk>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -634,25 +670,38 @@ impl ScanStreamSource for TypedSystemTableStreamSource {
         &self,
         budget: ConnectorPollBudget,
         profile: Option<RuntimeProfile>,
-    ) -> Result<ScanOutputStream, String> {
+        construction: std::sync::Arc<
+            dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
+        >,
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<ScanOutputStream> {
         if self.claimed.swap(true, Ordering::AcqRel) {
-            return Err("typed system relation scan stream is already claimed".to_string());
+            return Err("typed system relation scan stream is already claimed"
+                .to_string()
+                .into());
         }
-        Ok(Box::pin(TypedSystemTableStream {
-            provider: self.shared.provider.resolve()?,
-            converter: if self.shared.output_materialization.is_some() {
-                // Derived columns consume a read intermediate, then the frozen
-                // output is bound after the explicit transform.
-                SourcePageConverter::new(self.shared.slot_ids.clone())
-            } else {
-                SourcePageConverter::with_output_schema(Arc::clone(&self.shared.output_schema))
-            },
-            shared: Arc::clone(&self.shared),
-            budget,
-            profile,
-            step: SystemStep::Unopened,
-            failed: false,
-        }))
+        let provider = self.shared.provider.resolve()?;
+        let read_schema = self
+            .shared
+            .output_materialization
+            .as_ref()
+            .map_or(&self.shared.output_schema, |materialization| {
+                materialization.transform.read_schema()
+            });
+        let converter = SourcePageConverter::with_output_schema(Arc::clone(read_schema));
+        let stream = create_scan_stream(read_schema, construction.as_ref(), |stream_storage| {
+            TypedSystemTableStream {
+                provider,
+                _construction_storage: stream_storage,
+                construction: Arc::clone(&construction),
+                converter,
+                shared: Arc::clone(&self.shared),
+                budget,
+                profile,
+                step: SystemStep::Unopened,
+                failed: false,
+            }
+        })?;
+        Ok(stream)
     }
 }
 
@@ -662,6 +711,10 @@ struct TypedSystemTableStream {
     budget: ConnectorPollBudget,
     profile: Option<RuntimeProfile>,
     converter: SourcePageConverter,
+    construction:
+        std::sync::Arc<dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory>,
+    // Only the concrete stream Box's creating scope, independent of page chunks.
+    _construction_storage: novarocks_type_contract::ValueTypeStorageLifetime,
     step: SystemStep,
     /// Delivery ended on an error; what is open stays for `close`.
     failed: bool,
@@ -705,22 +758,28 @@ impl TypedSystemTableStream {
         Ok(stream)
     }
 
-    fn chunk_of(&mut self, page: SourcePage) -> Result<Chunk, String> {
+    fn chunk_of(
+        &mut self,
+        page: SourcePage,
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<Chunk> {
         let chunk = self
             .converter
-            .convert(page)
-            .map_err(|error| error.to_string())?;
-        self.shared.materialize_output(chunk)
+            .convert_with_factory(page, self.construction.as_ref())?;
+        self.shared
+            .materialize_output(chunk, self.construction.as_ref())
     }
 
-    fn fail(&mut self, error: String) -> Poll<Option<Result<Chunk, String>>> {
+    fn fail(
+        &mut self,
+        error: impl Into<novarocks_execution::runtime::fragment::ExecutionFailure>,
+    ) -> Poll<Option<novarocks_execution::runtime::fragment::ExecutionResult<Chunk>>> {
         self.failed = true;
-        Poll::Ready(Some(Err(error)))
+        Poll::Ready(Some(Err(error.into())))
     }
 }
 
 impl Stream for TypedSystemTableStream {
-    type Item = Result<Chunk, String>;
+    type Item = novarocks_execution::runtime::fragment::ExecutionResult<Chunk>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -847,5 +906,111 @@ impl ScanChunkStream for TypedSystemTableStream {
                 first_error.map_or(Ok(()), Err)
             }),
         })
+    }
+}
+
+#[cfg(test)]
+mod stream_construction_tests {
+    use super::*;
+    use novarocks_execution::exec::chunk::ChunkSchema;
+    use novarocks_execution::exec::pipeline::operator::input_construction::{
+        ConstructionFailure, InputConstructionFactory, try_runtime_input_construction_factory,
+    };
+    use novarocks_execution::runtime::fragment::{ExecutionFailure, ExecutionFailureCause};
+    use novarocks_execution::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeErrorState};
+    use novarocks_type_contract::ValueTypeStorageLifetime;
+
+    struct StreamStorage {
+        _storage: ValueTypeStorageLifetime,
+        initialized: [u8; 256],
+    }
+    fn declared_schema() -> ChunkSchema {
+        ChunkSchema::try_new_typed(vec![], ValueTypeStorageLifetime::pure()).unwrap()
+    }
+    fn factory(
+        tracker: &Arc<MemTracker>,
+        error: Arc<RuntimeErrorState>,
+    ) -> Arc<dyn InputConstructionFactory> {
+        try_runtime_input_construction_factory(
+            novarocks_execution::exec::pipeline::pipeline::representation_construction_profile()
+                .unwrap(),
+            tracker.clone(),
+            error,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn claim_box_keeps_its_own_finite_storage_after_factory_and_control_exit() {
+        let tracker = MemTracker::new_root("actual claim Box");
+        let error = Arc::new(RuntimeErrorState::default());
+        let controller = Arc::downgrade(&error);
+        let factory = factory(&tracker, error);
+        let boxed = create_scan_stream(&declared_schema(), factory.as_ref(), |storage| {
+            StreamStorage {
+                _storage: storage,
+                initialized: [7; 256],
+            }
+        })
+        .unwrap();
+        assert_eq!(boxed.initialized, [7; 256]);
+        drop(factory);
+        assert!(controller.upgrade().is_none());
+        assert!(tracker.current() > 0);
+        drop(boxed);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn claim_box_memory_and_original_stop_refuse_before_the_constructor_runs() {
+        let tracker = MemTracker::new_root("claim constructor admission");
+        let error = Arc::new(RuntimeErrorState::default());
+        let factory = factory(&tracker, error.clone());
+        let initial = tracker.current();
+        let schema = declared_schema();
+        let sample = create_scan_stream(&schema, factory.as_ref(), |storage| StreamStorage {
+            _storage: storage,
+            initialized: [0; 256],
+        })
+        .unwrap();
+        let requests = tracker.current() - initial;
+        drop(sample);
+        assert_eq!(tracker.current(), initial);
+        tracker.install_limit_once(initial + requests - 1).unwrap();
+        let entered = std::cell::Cell::new(false);
+        let refusal = create_scan_stream(&schema, factory.as_ref(), |storage| {
+            entered.set(true);
+            StreamStorage {
+                _storage: storage,
+                initialized: [1; 256],
+            }
+        })
+        .err()
+        .expect("real Box request refuses");
+        assert!(matches!(
+            refusal.cause(),
+            ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
+        ));
+        assert!(
+            !entered.get(),
+            "no constructor tail after the original tracker refusal"
+        );
+        assert_eq!(tracker.current(), initial);
+        let original = ExecutionFailure::from("original claim stop".to_owned());
+        error.set_error(original.clone());
+        let refusal = create_scan_stream(&schema, factory.as_ref(), |storage| {
+            entered.set(true);
+            StreamStorage {
+                _storage: storage,
+                initialized: [2; 256],
+            }
+        })
+        .err()
+        .unwrap();
+        assert_eq!(refusal, original);
+        assert!(!entered.get());
+        assert_eq!(tracker.current(), initial);
+        drop(factory);
+        assert_eq!(tracker.current(), 0);
     }
 }

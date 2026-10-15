@@ -241,5 +241,8 @@ fn build_query_result(
 }
 
 fn column(name: &str, data_type: DataType, nullable: bool) -> QueryResultColumn {
-    QueryResultColumn::new(name, data_type, nullable, None)
+    QueryResultColumn::new(
+        name,
+        novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+    )
 }

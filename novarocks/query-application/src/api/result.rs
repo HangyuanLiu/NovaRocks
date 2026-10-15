@@ -34,49 +34,44 @@ use novarocks_execution_contract::ResultPacketSequence;
 use novarocks_result_contract::{
     ClientRowProfile, ClientRowStreamCursor, RootOutputKind, ValidatedClientBody,
 };
-use novarocks_types::{QueryExecutionId, QueryId, schema::SqlType};
+use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+use novarocks_types::{QueryExecutionId, QueryId};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::root_delivery::{RetainedRootReply, RootReplyView};
 use super::{QueryExecutionError, QueryExecutionErrorKind};
 
+/// One client-visible name and its complete execution value binding.
+/// Clones retain the immutable semantic tree, exact layout and creation lifetime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResultField {
     name: Arc<str>,
-    data_type: DataType,
-    nullable: bool,
-    logical_type: Option<SqlType>,
+    ty: FunctionValueType,
 }
 
 impl ResultField {
-    pub fn new(
-        name: impl Into<Arc<str>>,
-        data_type: DataType,
-        nullable: bool,
-        logical_type: Option<SqlType>,
-    ) -> Self {
+    pub fn new(name: impl Into<Arc<str>>, ty: FunctionValueType) -> Self {
         Self {
             name: name.into(),
-            data_type,
-            nullable,
-            logical_type,
+            ty,
         }
     }
 
     pub fn name(&self) -> &str {
         &self.name
     }
-
-    pub const fn data_type(&self) -> &DataType {
-        &self.data_type
+    pub fn value_type(&self) -> &FunctionValueType {
+        &self.ty
     }
-
-    pub const fn nullable(&self) -> bool {
-        self.nullable
+    pub fn data_type(&self) -> &DataType {
+        self.ty.data_type()
     }
-
-    pub const fn logical_type(&self) -> Option<&SqlType> {
-        self.logical_type.as_ref()
+    pub fn nullable(&self) -> bool {
+        self.ty.nullable()
+    }
+    /// A root convenience only; recursive consumers use `value_type()`.
+    pub fn logical_type(&self) -> ValueLogicalType {
+        self.ty.logical_type()
     }
 }
 
@@ -793,10 +788,49 @@ mod tests {
     fn result_schema() -> ResultSchema {
         ResultSchema::new(vec![ResultField::new(
             "value",
-            DataType::Int64,
-            false,
-            Some(SqlType::BigInt),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         )])
+    }
+
+    #[test]
+    fn result_field_clone_preserves_recursive_binding_and_final_creator_lifetime() {
+        use novarocks_type_contract::{
+            ValueKind, ValueLayout, ValueLogicalType as L, ValueTypeRef, ValueTypeStorageHold,
+            ValueTypeStorageLifetime as S,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Hold(Arc<AtomicUsize>);
+        impl ValueTypeStorageHold for Hold {}
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let exits = Arc::new(AtomicUsize::new(0));
+        let storage = S::held(Arc::new(Hold(exits.clone())));
+        let child =
+            ValueTypeRef::try_new(ValueKind::Nominal(L::Json), true, storage.clone()).unwrap();
+        let value = ValueTypeRef::try_new(ValueKind::List(child), false, storage.clone()).unwrap();
+        let layout = ValueLayout::try_new(
+            &DataType::LargeList(Arc::new(Field::new("anonymous", DataType::Utf8, true))),
+            storage.clone(),
+        )
+        .unwrap();
+        let ty = FunctionValueType::try_from_value(value, layout).unwrap();
+        let original = ResultField::new("source", ty);
+        let retained = ResultField::new("alias", original.value_type().clone());
+        drop(original);
+        drop(storage);
+        assert_eq!(exits.load(Ordering::SeqCst), 0);
+        assert_eq!(retained.name(), "alias");
+        let ValueKind::List(item) = retained.value_type().value_type().kind() else {
+            panic!("full list declaration lost");
+        };
+        assert_eq!(item.kind(), &ValueKind::Nominal(L::Json));
+        assert!(item.nullable());
+        assert!(matches!(retained.data_type(), DataType::LargeList(_)));
+        drop(retained);
+        assert_eq!(exits.load(Ordering::SeqCst), 1);
     }
 
     fn workload() -> (
@@ -857,8 +891,14 @@ mod tests {
     fn generic_immediate_result_projection_preserves_typed_columns() {
         let result = build_arrow_query_result(
             vec![
-                ResultField::new("count", DataType::Int64, false, None),
-                ResultField::new("active", DataType::Boolean, true, None),
+                ResultField::new(
+                    "count",
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                ),
+                ResultField::new(
+                    "active",
+                    novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+                ),
             ],
             vec![
                 Arc::new(Int64Array::from(vec![3_i64])) as ArrayRef,
@@ -882,7 +922,10 @@ mod tests {
     #[test]
     fn generic_immediate_result_projection_rejects_mismatched_columns_and_arrays() {
         let error = build_arrow_query_result(
-            vec![ResultField::new("count", DataType::Int64, false, None)],
+            vec![ResultField::new(
+                "count",
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            )],
             Vec::new(),
         )
         .expect_err("mismatched immediate result must fail");

@@ -138,7 +138,9 @@ fn binding(args: Vec<FunctionArgumentType>) -> p::BoundFunction {
         function_id: FunctionId::try_new("test/codec-original-request").unwrap(),
         overload: FunctionOverloadId::try_new("test/codec-original-request/v1").unwrap(),
         kind: FunctionKind::Scalar,
-        argument_types: args.into_boxed_slice(),
+        argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+            args.into_boxed_slice(),
+        ),
         result_type: int(),
 
         legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
@@ -235,8 +237,10 @@ fn fixture_with_parameters(reference: p::ConstantReference, parameter_count: usi
                     FunctionArgumentType::Value(int()),
                     FunctionArgumentType::Value(int()),
                     FunctionArgumentType::Lambda {
-                        parameter_types: vec![nested("payload"); parameter_count]
-                            .into_boxed_slice(),
+                        parameter_types:
+                            novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                                vec![nested("payload"); parameter_count].into_boxed_slice(),
+                            ),
                         result_type: int(),
                     },
                 ]),
@@ -288,8 +292,10 @@ fn fixture_with_parameters(reference: p::ConstantReference, parameter_count: usi
                             constant: Some(reference),
                         },
                         Argument::Lambda {
-                            parameter_types: vec![nested("payload"); parameter_count]
-                                .into_boxed_slice(),
+                            parameter_types:
+                                novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                                    vec![nested("payload"); parameter_count].into_boxed_slice(),
+                                ),
                             result_type: int(),
                         },
                     ]),
@@ -361,6 +367,7 @@ fn original_value_none_typed_null_lambda_constraint_and_all_policy_fields_have_i
     let (actual, facts) = run(&f, &c, limits(), SOURCE, false).unwrap();
     let expected = wire::FragmentCallRequests {
         entries: vec![wire::OriginalCallRequest {
+            request_id: None,
             definition: Some(wire::CallRequestDefinition {
                 kind: Some(wire::call_request_definition::Kind::ExpressionDefinitionId(
                     0,

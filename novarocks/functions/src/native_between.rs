@@ -46,9 +46,9 @@ impl PreparedNativeBetweenRecipe {
             work.flush()?;
             let upper = PreparedComparisonRecipe::try_new(plan.upper(), operand, high, control)?;
             work.flush()?;
-            if result.data_type != arrow_schema::DataType::Boolean
-                || result.logical_type != ValueLogicalType::Physical
-                || ((lower.nullable_result() || upper.nullable_result()) && !result.nullable)
+            if *result.data_type() != arrow_schema::DataType::Boolean
+                || result.logical_type() != ValueLogicalType::Physical
+                || ((lower.nullable_result() || upper.nullable_result()) && !result.nullable())
             {
                 return Err(ComparisonPrepareError::TypeMismatch);
             }

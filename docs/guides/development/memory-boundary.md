@@ -52,6 +52,12 @@ TLS 是无需析构的 const `Cell`，线程只有一个 Q=1 MiB 槽。切槽、
 
 完整合同见 [ADR-0167](../../adr/ADR-0167-size-banded-allocation-attribution.md)，验证入口见 [memory tests](../../../novarocks/memory/tests/README.md)。当前阶段仅维护功能与数据正确性，归属/资金测量载体已退出；历史 Linux 成本结论仍只能按其原输入和版本解释，不能补为当前通过。Loom/Miri 与 unsafe 地址、别名和生命周期要求保留；本地 smoke、模型完成及文档检查不代替 Miri 地址验证。
 
+## 执行结构的独立持有
+
+递归类型、schema 与投影的构造责任由实际 BE 作者承担，FE 保持纯构造。独立 FVT/child/field/schema 的小型 storage hold 只保活自己的有限结构；它不是资金 writer、不授予下一次分配权，也不能把整个 query 或构造主账挂在晚到引用上。共享不可变对象不重计 payload，真实最后引用退出才释放相应责任。此接缝与 allocator 归属、RSS 和 M07 result window 分别成立。
+
+使用方式见 [执行类型与构造责任](typed-execution-types.md)，长期裁决见 [ADR-0176](../../adr/ADR-0176-recursive-execution-types-and-independent-storage-ownership.md)。文档不代替实际 producer/consumer、原拒绝和最后引用退出的功能验证。
+
 ## CI 依赖门
 
 `tools/ci/check-memory-dependency-boundary.py` 同时读取 Cargo resolved graph 和 declared dependency edges，后者包含默认 feature 未启用的 optional 边。检查三项能力约束：

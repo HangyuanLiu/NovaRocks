@@ -100,9 +100,10 @@ fn text(column: &ArrayRef, row: usize) -> Option<String> {
     Some(format!("{:.6}", values.value(row)))
 }
 
-fn table(batches: &[RecordBatch]) -> Vec<Vec<Option<String>>> {
+fn table(batches: &[crate::exec::chunk::ChunkBatchProjection]) -> Vec<Vec<Option<String>>> {
     let mut rows = Vec::new();
     for batch in batches {
+        let batch = batch.record_batch();
         for row in 0..batch.num_rows() {
             rows.push(
                 batch
@@ -307,11 +308,11 @@ fn evaluate_partition(partition: &[Row], shape: &Shape) -> Vec<Vec<Option<String
     values
 }
 
-fn run(program: &Arc<LocalProgram>) -> Vec<RecordBatch> {
+fn run(program: &Arc<LocalProgram>) -> Vec<crate::exec::chunk::ChunkBatchProjection> {
     try_run(program)
         .unwrap_or_else(|error| panic!("compiled window runs: {error}"))
         .into_iter()
-        .map(|chunk| chunk.batch)
+        .map(Chunk::into_batch_projection)
         .collect()
 }
 
@@ -545,7 +546,11 @@ fn analytic(program: &LocalProgram) -> (ProgramNodeId, Arc<arrow::datatypes::Sch
 
 /// Push `batch` into a fresh processor of the program's Analytic node in
 /// slices of `step` rows, then finish it; return every emitted batch.
-fn drive(program: &Arc<LocalProgram>, batch: &RecordBatch, step: usize) -> Vec<RecordBatch> {
+fn drive(
+    program: &Arc<LocalProgram>,
+    batch: &RecordBatch,
+    step: usize,
+) -> Vec<crate::exec::chunk::ChunkBatchProjection> {
     let (node, _) = analytic(program);
     let input = &program.graph().nodes()[match program.graph().nodes()[node.index()].kind() {
         ProgramNodeKind::Analytic { input, .. } => input.index(),
@@ -559,6 +564,13 @@ fn drive(program: &Arc<LocalProgram>, batch: &RecordBatch, step: usize) -> Vec<R
     )
     .unwrap();
     let mut operator = factory.create(1, 0);
+    let tracker = crate::runtime::mem_tracker::MemTracker::new_root("window oracle construction");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+        tracker,
+        Arc::new(RuntimeErrorState::default()),
+    ));
+    operator.prepare().unwrap();
     let processor = operator.as_processor_mut().unwrap();
     let state = RuntimeState::default();
     let mut output = Vec::new();
@@ -573,13 +585,13 @@ fn drive(program: &Arc<LocalProgram>, batch: &RecordBatch, step: usize) -> Vec<R
             )
             .unwrap();
         while let Some(chunk) = processor.pull_chunk(&state).unwrap() {
-            output.push(chunk.batch);
+            output.push(chunk.into_batch_projection());
         }
         offset += len;
     }
     processor.set_finishing(&state).unwrap();
     while let Some(chunk) = processor.pull_chunk(&state).unwrap() {
-        output.push(chunk.batch);
+        output.push(chunk.into_batch_projection());
     }
     assert!(processor.is_finished());
     output

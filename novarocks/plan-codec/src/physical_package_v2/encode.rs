@@ -64,6 +64,10 @@ use crate::physical_provider_binding_v2::{
 use crate::physical_provider_read_v2::{
     ProviderReadCodecError, ProviderReadProjectionLimits, encode_provider_reads_in,
 };
+use crate::physical_public_source_schema_v2::{
+    PublicSourceSchemaCodecError, encode_public_source_schemas_pure_in,
+    encoded_public_source_schemas_backing_bytes,
+};
 use crate::physical_read_scan_v2::{
     ReadScanCodecError, ReadScanEncodeContext, ReadScanProjectionLimits, encode_read_scans_observed,
 };
@@ -77,7 +81,7 @@ use crate::physical_semantics_v2::{
     encode_frozen_pruning_observed, prepare_semantic_parameters_encode_observed_in,
 };
 use crate::physical_type_v2::{
-    PackageTypeProjectionLimits, TypeCodecError, encode_borrowed_type_table_writer_sources_in,
+    PackageTypeProjectionLimits, TypeCodecError, encode_borrowed_type_namespaces_sources_in,
 };
 use crate::physical_value_v2::{ValueCodecError, ValueProjectionLimits, encode_values_observed_in};
 use crate::physical_writer_recipe_v2::{
@@ -139,6 +143,7 @@ pub enum PackageEncodeError {
     Read(ProviderReadCodecError),
     Relation(RelationCodecError),
     Schema(SchemaCodecError),
+    PublicSourceSchema(PublicSourceSchemaCodecError),
     Constant(PhysicalConstantCodecError),
     Semantics(SemanticsCodecError),
     Value(ValueCodecError),
@@ -178,6 +183,7 @@ component_error!(
     Read(ProviderReadCodecError),
     Relation(RelationCodecError),
     Schema(SchemaCodecError),
+    PublicSourceSchema(PublicSourceSchemaCodecError),
     Constant(PhysicalConstantCodecError),
     Semantics(SemanticsCodecError),
     Value(ValueCodecError),
@@ -202,6 +208,7 @@ impl fmt::Display for PackageEncodeError {
             Self::Read(e) => e.fmt(f),
             Self::Relation(e) => e.fmt(f),
             Self::Schema(e) => e.fmt(f),
+            Self::PublicSourceSchema(e) => e.fmt(f),
             Self::Constant(e) => e.fmt(f),
             Self::Semantics(e) => e.fmt(f),
             Self::Value(e) => e.fmt(f),
@@ -306,9 +313,10 @@ fn encode_fragment_package_in<'s>(
         work,
     )?;
     source = grow(source, &requested, &metadata)?;
-    let types = encode_borrowed_type_table_writer_sources_in(
+    let types = encode_borrowed_type_namespaces_sources_in(
         views.values(),
         views.fields(),
+        views.source_fields(),
         &writer_types,
         source,
         l.types,
@@ -381,6 +389,13 @@ fn encode_fragment_package_in<'s>(
     )?
     .emit_observed_in(seen!(allocation_request_bytes_upper_bound), work)?;
     source = grow(source, &requested, &schemas)?;
+    let public_source_schemas =
+        encode_public_source_schemas_pure_in(provider_inputs.source_schemas(), work)?;
+    source = source
+        .checked_add(encoded_public_source_schemas_backing_bytes(
+            &public_source_schemas,
+        )?)
+        .ok_or(CompileControlError::ResourceExhausted)?;
     let constants = prepare_constant_namespace_write_in(
         package.constants(),
         definitions.constant_type_ids(),
@@ -537,6 +552,7 @@ fn encode_fragment_package_in<'s>(
             bindings: &provider_bindings,
             payloads: &payloads,
             schemas: &schemas,
+            source_schemas: provider_inputs.source_schemas(),
         },
         source,
         l.scans,
@@ -567,8 +583,9 @@ fn encode_fragment_package_in<'s>(
     let schemas = schemas.into_wire();
     let provider_bindings = provider_bindings.into_wire();
     let provider_payloads = payloads.into_wire();
-    let types = types.into_wire();
+    let (types, source_fields) = types.into_namespaces();
     let output = wire::FragmentPackage {
+        public_source_schemas,
         plan_version: metadata.plan_version,
         required: Some(metadata.required),
         fragment: Some(wire::Fragment {
@@ -583,6 +600,7 @@ fn encode_fragment_package_in<'s>(
             call_requests: Some(call_requests),
         }),
         types: Some(types),
+        source_fields,
         schemas,
         constants,
         function_bindings,

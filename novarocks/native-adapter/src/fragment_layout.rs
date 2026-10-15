@@ -20,181 +20,97 @@
 //! All values here are immutable projections from the native plan wire.  The
 //! Backend remains the owner of plan lowering and fragment lifecycle.
 
-use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use novarocks_execution::exec::fragment::program::{ExchangeInputContract, FragmentNodeId};
-use novarocks_plan_codec::native_type::{decode_field_type_owned, preflight_native_output_fields};
-use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_execution::exec::chunk::{ChunkSchemaRef, ChunkSlotSchema};
+#[cfg(test)]
+use novarocks_proto_codec::FieldPath;
+#[cfg(test)]
 use novarocks_proto_models::{common, plan};
 use novarocks_types::SlotId;
 
+#[cfg(test)]
 use crate::fragment_error::NativeFragmentDecodeError;
 
-pub fn chunk_schema_from_output_columns(
-    columns: &[common::OutputColumn],
-    path: FieldPath,
-) -> Result<ChunkSchemaRef, ProtocolError> {
-    decode_output_layout(columns, path).map(|layout| layout.chunk_schema())
-}
+mod typed;
+pub use typed::{
+    NativeExchangeContracts, NativeLayoutProjectionError,
+    chunk_schema_from_output_columns_typed_observed, decode_exchange_contracts_typed_observed,
+    decode_fragment_output_layout_typed_observed, decode_output_layout_typed_observed,
+    decode_output_layout_typed_with_factory_in, slot_schema_from_binding_typed_observed,
+};
 
 #[derive(Clone, Debug)]
-pub struct NativeOutputLayout {
+pub struct NativeOutputLayout(Arc<NativeOutputLayoutStorage>);
+
+#[derive(Debug)]
+struct NativeOutputLayoutStorage {
     slot_ids: Vec<SlotId>,
     chunk_schema: ChunkSchemaRef,
     slot_schemas: Vec<ChunkSlotSchema>,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 
 impl NativeOutputLayout {
-    fn new(
+    fn allocation_layout() -> Result<
+        std::alloc::Layout,
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    > {
+        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            NativeOutputLayoutStorage,
+        >())
+    }
+
+    fn new_with_storage(
         slot_ids: Vec<SlotId>,
         chunk_schema: ChunkSchemaRef,
         slot_schemas: Vec<ChunkSlotSchema>,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
     ) -> Self {
-        Self {
+        Self(Arc::new(NativeOutputLayoutStorage {
             slot_ids,
             chunk_schema,
             slot_schemas,
-        }
+            _storage: storage,
+        }))
     }
-
     pub fn slot_ids(&self) -> &[SlotId] {
-        &self.slot_ids
+        &self.0.slot_ids
     }
-
     pub fn chunk_schema(&self) -> ChunkSchemaRef {
-        self.chunk_schema.clone()
+        self.0.chunk_schema.clone()
     }
-
     pub fn slot_schemas(&self) -> &[ChunkSlotSchema] {
-        &self.slot_schemas
+        &self.0.slot_schemas
     }
 }
 
-pub fn decode_output_layout(
-    columns: &[common::OutputColumn],
-    path: FieldPath,
-) -> Result<NativeOutputLayout, ProtocolError> {
-    preflight_native_output_fields(columns)
-        .map_err(|detail| error(path.clone(), ProtocolErrorKind::Capacity, detail))?;
-    let mut slots = Vec::with_capacity(columns.len());
-    let mut seen = HashMap::with_capacity(columns.len());
-    for (index, column) in columns.iter().enumerate() {
-        let column_path = path.clone().index(index);
-        let slot_id = SlotId::new(column.column_id);
-        if let Some(first_index) = seen.insert(slot_id, index) {
-            return Err(error(
-                column_path.field("column_id"),
-                ProtocolErrorKind::InconsistentFields,
-                format!(
-                    "duplicate OutputColumn.column_id {} at index {} (first seen at index {})",
-                    column.column_id, index, first_index
-                ),
-            ));
-        }
-        let type_desc = column.r#type.as_ref().ok_or_else(|| {
-            error(
-                column_path.clone().field("type"),
-                ProtocolErrorKind::MissingField,
-                format!(
-                    "OutputColumn.type missing for column_id={} name='{}' at index {}",
-                    column.column_id, column.name, index
-                ),
-            )
-        })?;
-        let field = decode_field_type_owned(&column.name, column.nullable, type_desc).map_err(|detail| {
-            error(
-                column_path.field("type"),
-                ProtocolErrorKind::InvalidValue,
-                format!(
-                    "OutputColumn.type decode failed for column_id={} name='{}' at index {}: {}",
-                    column.column_id, column.name, index, detail
-                ),
-            )
-        })?;
-        slots.push(
-            ChunkSlotSchema::try_new_with_metadata_origins(
-                slot_id,
-                Arc::clone(field.field()),
-                field.metadata_origins().clone(),
-                None,
-                None,
-            )
-            .map_err(|detail| error(path.clone(), ProtocolErrorKind::InvalidValue, detail))?,
-        );
-    }
-    let chunk_schema = ChunkSchema::try_new(slots.clone())
-        .map(Arc::new)
-        .map_err(|detail| error(path, ProtocolErrorKind::InvalidValue, detail))?;
-    Ok(NativeOutputLayout::new(
-        slots.iter().map(|slot| slot.slot_id()).collect(),
-        chunk_schema,
-        slots,
-    ))
-}
-
-pub fn decode_fragment_output_layout(
+#[cfg(test)]
+pub(crate) fn decode_output_layout(
     columns: &[common::OutputColumn],
     path: FieldPath,
 ) -> Result<NativeOutputLayout, NativeFragmentDecodeError> {
-    decode_output_layout(columns, path).map_err(NativeFragmentDecodeError::from)
+    crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+        decoder.output_layout(columns, path)
+    })
 }
-
-pub fn decode_exchange_contracts(
+#[cfg(test)]
+fn decode_exchange_contracts(
     root: &plan::DistributedNode,
     path: FieldPath,
-) -> Result<BTreeMap<FragmentNodeId, ExchangeInputContract>, ProtocolError> {
-    fn visit(
-        node: &plan::DistributedNode,
-        path: FieldPath,
-        contracts: &mut BTreeMap<FragmentNodeId, ExchangeInputContract>,
-    ) -> Result<(), ProtocolError> {
-        if let Some(plan::distributed_node::Payload::Exchange(exchange)) = node.payload.as_ref() {
-            let schema = chunk_schema_from_output_columns(
-                &exchange.output_columns,
-                path.clone()
-                    .field("payload")
-                    .field("exchange")
-                    .field("output_columns"),
-            )?;
-            if contracts
-                .insert(
-                    FragmentNodeId::new(node.node_id),
-                    ExchangeInputContract::new(schema),
-                )
-                .is_some()
-            {
-                return Err(error(
-                    path.field("node_id"),
-                    ProtocolErrorKind::InconsistentFields,
-                    format!("duplicate exchange node_id={}", node.node_id),
-                ));
-            }
-        }
-        for (index, child) in node.children.iter().enumerate() {
-            visit(
-                child,
-                path.clone().field("children").index(index),
-                contracts,
-            )?;
-        }
-        Ok(())
-    }
-
-    let mut contracts = BTreeMap::new();
-    visit(root, path, &mut contracts)?;
-    Ok(contracts)
+) -> Result<
+    novarocks_execution::exec::fragment::program::ExchangeInputContracts,
+    NativeFragmentDecodeError,
+> {
+    crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+        decoder.exchange_contracts(root, path)
+    })
 }
-
-fn error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) -> ProtocolError {
-    ProtocolError::new(path, kind, detail)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{decode_exchange_contracts, decode_output_layout};
     use novarocks_proto_codec::FieldPath;
+    #[cfg(test)]
     use novarocks_proto_models::{common, plan};
     use novarocks_types::SlotId;
 
@@ -203,12 +119,9 @@ mod tests {
             column_id,
             name: name.to_string(),
             nullable: true,
-            r#type: Some(common::TypeDesc {
-                kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-                    r#type: common::PrimitiveType::Int as i32,
-                    ..Default::default()
-                })),
-            }),
+            r#type: Some(crate::fragment_expression::fixture_sources::type_desc(
+                &arrow::datatypes::DataType::Int32,
+            )),
             is_internal: false,
         }
     }

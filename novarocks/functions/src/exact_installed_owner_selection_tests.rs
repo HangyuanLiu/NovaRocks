@@ -50,7 +50,9 @@ fn catalog() -> EngineFunctionCatalog {
     builtin::catalogue::build_builtin_engine_function_catalog().unwrap()
 }
 fn value(ty: DataType, nullable: bool) -> FunctionArgument {
-    full_value(FunctionValueType::new(ty, nullable))
+    full_value(FunctionValueType::from_legacy_declared_projection(
+        ty, nullable,
+    ))
 }
 fn full_value(value_type: FunctionValueType) -> FunctionArgument {
     FunctionArgument::Value {
@@ -152,7 +154,7 @@ fn scalar_carrier(selected: &FunctionBindingSelection) -> &DataType {
     let FunctionResultType::Scalar(result) = &selected.result_type else {
         panic!("scalar selected result")
     };
-    &result.data_type
+    result.data_type()
 }
 fn list(nullable: bool) -> FunctionArgument {
     value(
@@ -165,7 +167,7 @@ fn map(nullable: bool) -> FunctionArgument {
         "entries",
         DataType::Struct(
             vec![
-                Arc::new(Field::new("key", DataType::Utf8, true)),
+                Arc::new(Field::new("key", DataType::Utf8, false)),
                 Arc::new(Field::new("value", DataType::Int64, true)),
             ]
             .into(),
@@ -357,7 +359,10 @@ fn installed_exact_count_min_max_keep_actual_aggregate_state_and_full_signature(
             aggregate.state_format,
             original.selected.aggregate.as_ref().unwrap().state_format
         );
-        assert_eq!(aggregate.intermediate_type.data_type, DataType::Int64);
+        assert_eq!(
+            aggregate.intermediate_type.data_type().clone(),
+            DataType::Int64
+        );
     }
     // This is selected binding/state-format authoring, not phase preparation,
     // a COUNT Window adapter, DISTINCT, or a SUM overflow decision.
@@ -452,11 +457,18 @@ fn installed_exact_unnest_preserves_whole_relation_and_nested_full_type() {
     let FunctionResultType::Relation(results) = &selected.result_type else {
         panic!("whole selected Relation")
     };
-    assert_eq!(results.as_ref(), &[FunctionValueType::new(element, true)]);
-    let DataType::Struct(fields) = &results[0].data_type else {
+    assert_eq!(
+        results.as_ref(),
+        &[FunctionValueType::from_legacy_declared_projection(
+            element, true
+        )]
+    );
+    let DataType::Struct(fields) = results[0].data_type() else {
         unreachable!()
     };
-    assert!(Arc::ptr_eq(&fields[0], &field));
+    assert_eq!(fields[0].name(), field.name());
+    assert_eq!(fields[0].data_type(), field.data_type());
+    assert!(fields[0].metadata().is_empty());
     assert!(selected.aggregate.is_none());
 }
 

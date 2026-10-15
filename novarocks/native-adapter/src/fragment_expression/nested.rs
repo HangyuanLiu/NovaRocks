@@ -19,7 +19,7 @@
 
 use arrow::datatypes::DataType;
 
-use super::{decode_expr_at, decode_expr_type_at};
+use super::{decode_expr_at_with_types, decode_expr_type_at};
 use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::expr;
@@ -32,6 +32,8 @@ pub(crate) fn lower_nested(
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
     data_type: DataType,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, super::NativeExpressionDecodeError> {
     let inner = nested.inner.as_ref().ok_or_else(|| {
         super::NativeExpressionDecodeError::missing(
@@ -39,14 +41,20 @@ pub(crate) fn lower_nested(
             "native NestedExpr requires inner",
         )
     })?;
-    let inner_type = decode_expr_type_at(inner, path.clone().field("inner"))?;
+    let inner_type = decode_expr_type_at(inner, path.clone().field("inner"), type_decoder)?;
     if inner_type != data_type {
         return Err(super::NativeExpressionDecodeError::inconsistent(
             path.clone().field("inner").field("type"),
             format!("NestedExpr type {data_type:?} does not match inner type {inner_type:?}"),
         ));
     }
-    decode_expr_at(inner, path.field("inner"), arena, input_layout)
+    decode_expr_at_with_types(
+        inner,
+        path.field("inner"),
+        arena,
+        input_layout,
+        type_decoder,
+    )
 }
 
 pub(super) fn is_encoded_variant_payload_source(data_type: &DataType) -> bool {

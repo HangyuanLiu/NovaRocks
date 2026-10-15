@@ -302,11 +302,11 @@ impl ScalarArena {
     }
 
     pub(crate) fn data_type(&self, id: ScalarId) -> &DataType {
-        &self.value_type(id).data_type
+        &self.value_type(id).data_type()
     }
 
     pub(crate) fn nullable(&self, id: ScalarId) -> bool {
-        self.value_type(id).nullable
+        self.value_type(id).nullable()
     }
 
     pub(crate) fn value_type(&self, id: ScalarId) -> &FunctionValueType {
@@ -455,10 +455,13 @@ pub(crate) fn function_argument(
     let value_type = arena.value_type(arg);
     Ok(match arena.node(arg) {
         ScalarNode::LambdaFunction { params, body } => FunctionArgument::Lambda {
-            parameter_types: params
-                .iter()
-                .map(|param| param.value_type.clone())
-                .collect(),
+            // This is a pure FE semantic author; it creates no capacity grant.
+            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                params
+                    .iter()
+                    .map(|param| param.value_type.clone())
+                    .collect(),
+            ),
             result_type: arena.value_type(*body).clone(),
         },
         ScalarNode::Literal(HashableLiteral(value)) => FunctionArgument::Value {
@@ -525,23 +528,28 @@ pub(crate) fn test_function_binding(
         ResolvedFunctionBinding,
     };
 
-    let selected_arguments = args
-        .iter()
-        .map(|argument| match arena.node(*argument) {
-            ScalarNode::LambdaFunction { params, body } => {
-                novarocks_functions::FunctionArgumentType::Lambda {
-                    parameter_types: params
-                        .iter()
-                        .map(|param| param.value_type.clone())
-                        .collect(),
-                    result_type: arena.value_type(*body).clone(),
+    let selected_arguments = novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+        args.iter()
+            .map(|argument| match arena.node(*argument) {
+                ScalarNode::LambdaFunction { params, body } => {
+                    novarocks_functions::FunctionArgumentType::Lambda {
+                        parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                            params
+                                .iter()
+                                .map(|param| param.value_type.clone())
+                                .collect::<Vec<_>>()
+                                .into_boxed_slice(),
+                        ),
+                        result_type: arena.value_type(*body).clone(),
+                    }
                 }
-            }
-            _ => novarocks_functions::FunctionArgumentType::Value(
-                arena.value_type(*argument).clone(),
-            ),
-        })
-        .collect();
+                _ => novarocks_functions::FunctionArgumentType::Value(
+                    arena.value_type(*argument).clone(),
+                ),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
     crate::binding::SqlFunctionBinding::new(
         ResolvedFunctionBinding {
             admitted_execution_abi: None,
@@ -629,7 +637,10 @@ pub(crate) fn test_table_binding(
     binding.selected.overload =
         FunctionOverloadId::try_new(format!("test.table/{name}/overload-v1"))
             .expect("test table function overload identity");
-    binding.selected.result_type = FunctionResultType::Relation(result_columns.into());
+    binding.selected.result_type =
+        FunctionResultType::Relation(novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+            result_columns.to_vec().into_boxed_slice(),
+        ));
     crate::binding::SqlFunctionBinding::new(
         binding,
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -1183,7 +1194,7 @@ mod bridge_tests {
                 logical,
             )
             .unwrap();
-            let mut source = col(700, value_type.data_type.clone());
+            let mut source = col(700, value_type.data_type().clone());
             source.value_type = value_type.clone();
             let id = intern_typed(
                 &mut arena,
@@ -1236,14 +1247,25 @@ mod bridge_tests {
         };
         let mut arena = ScalarArena::new();
         let mut ids = Vec::new();
-        for value_type in [
-            nested(7, false, true, "1"),
+        let original = nested(7, false, true, "1");
+        for same_value in [
             nested(8, false, true, "1"),
             nested(7, true, true, "1"),
-            nested(7, false, false, "1"),
             nested(7, false, true, "2"),
         ] {
-            let mut source = col(701, value_type.data_type.clone());
+            assert_eq!(original, same_value);
+        }
+        for value_type in [
+            original,
+            nested(7, false, false, "1"),
+            FunctionValueType::new(
+                DataType::Struct(
+                    vec![Arc::new(Field::new("different_name", DataType::Utf8, true))].into(),
+                ),
+                false,
+            ),
+        ] {
+            let mut source = col(701, value_type.data_type().clone());
             source.value_type = value_type.clone();
             let id = intern_typed(
                 &mut arena,

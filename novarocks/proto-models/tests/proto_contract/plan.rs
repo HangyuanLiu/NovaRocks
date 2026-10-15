@@ -74,16 +74,7 @@ where
 }
 
 fn scalar_type(prim: common::PrimitiveType) -> common::TypeDesc {
-    common::TypeDesc {
-        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-            r#type: prim as i32,
-            len: None,
-            precision: None,
-            scale: None,
-            time_unit: None,
-            time_zone: None,
-        })),
-    }
+    super::common::scalar_ref(prim, false)
 }
 
 fn output_column(column_id: u32, name: &str, prim: common::PrimitiveType) -> common::OutputColumn {
@@ -102,12 +93,12 @@ fn column_def(name: &str, prim: common::PrimitiveType) -> plan::ColumnDef {
         data_type: Some(scalar_type(prim)),
         nullable: false,
         write_default_json: None,
-        logical_type: None,
     }
 }
 
 fn column_expr(column_id: u32) -> expr::Expr {
     expr::Expr {
+        original_definition_id: None,
         r#type: Some(scalar_type(common::PrimitiveType::Bigint)),
         nullable: false,
         kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
@@ -120,6 +111,7 @@ fn column_expr(column_id: u32) -> expr::Expr {
 
 fn literal_bool(value: bool) -> expr::Expr {
     expr::Expr {
+        original_definition_id: None,
         r#type: Some(scalar_type(common::PrimitiveType::Boolean)),
         nullable: false,
         kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
@@ -199,6 +191,7 @@ fn node_to_proto(node: &INode) -> plan::DistributedNode {
         }),
         IPayload::Exchange { source_fragment_id } => {
             plan::distributed_node::Payload::Exchange(plan::ExchangeReceiver {
+                original_edge_id: None,
                 partition_type: plan::PartitionType::Hash as i32,
                 partition_exprs: vec![column_expr(1)],
                 source_fragment_id: *source_fragment_id,
@@ -323,6 +316,10 @@ fn node_from_proto(proto: &plan::DistributedNode) -> Result<INode, String> {
 
 fn fragment_to_proto(fragment: &IFragment) -> plan::PlanFragment {
     plan::PlanFragment {
+        expression_control: None,
+        frozen_calls: None,
+        semantic_parameters: None,
+        writer_semantic_parameters: None,
         fragment_id: fragment.fragment_id,
         root: Some(node_to_proto(&fragment.root)),
         data_partition: Some(data_partition()),
@@ -336,10 +333,26 @@ fn fragment_to_proto(fragment: &IFragment) -> plan::PlanFragment {
             fragment_id: fragment.fragment_id,
             bindings: vec![],
         }),
+        execution_types: Some(super::common::scalar_table()),
+        original_call_requests: None,
+        constants: vec![],
+        constant_source_fields: None,
     }
 }
 
 fn fragment_from_proto(proto: &plan::PlanFragment) -> Result<IFragment, String> {
+    let table = proto
+        .execution_types
+        .as_ref()
+        .ok_or("PlanFragment.execution_types missing")?;
+    for column in &proto.output_columns {
+        super::common::scalar_from_ref(
+            column.r#type.as_ref().ok_or("OutputColumn.type missing")?,
+            table,
+            column.nullable,
+        )?;
+    }
+
     let sink_result = match proto
         .sink
         .as_ref()

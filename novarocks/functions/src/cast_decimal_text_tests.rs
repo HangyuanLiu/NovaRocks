@@ -60,7 +60,7 @@ impl KernelEvaluationControl for Control {
 fn recipe(ty: DataType, nullable: bool) -> PreparedCastRecipe {
     PreparedCastRecipe::try_new(
         CastOperation::Carrier,
-        &FunctionValueType::new(ty, nullable),
+        &FunctionValueType::from_legacy_declared_projection(ty, nullable),
         &FunctionValueType::new(DataType::Utf8, nullable),
         DecimalOverflowPolicy::ReportError,
         true,
@@ -103,7 +103,7 @@ fn decimal_text_exact_p_s_null_promise_and_other_cast_domains_stay_separate() {
                     let r = recipe(ty.clone(), nullable);
                     assert_eq!(
                         r.source_type(),
-                        &FunctionValueType::new(ty.clone(), nullable)
+                        &FunctionValueType::from_legacy_declared_projection(ty.clone(), nullable)
                     );
                     assert_eq!(
                         r.result_type(),
@@ -122,7 +122,7 @@ fn decimal_text_exact_p_s_null_promise_and_other_cast_domains_stay_separate() {
                 assert_eq!(
                     PreparedCastRecipe::try_new(
                         CastOperation::Carrier,
-                        &FunctionValueType::new(ty.clone(), true),
+                        &FunctionValueType::from_legacy_declared_projection(ty.clone(), true),
                         &FunctionValueType::new(DataType::Utf8, false),
                         DecimalOverflowPolicy::OutputNull,
                         false,
@@ -138,8 +138,8 @@ fn decimal_text_exact_p_s_null_promise_and_other_cast_domains_stay_separate() {
                     assert_eq!(
                         PreparedCastRecipe::try_new(
                             CastOperation::Carrier,
-                            &FunctionValueType::new(ty.clone(), true),
-                            &FunctionValueType::new(target, true),
+                            &FunctionValueType::from_legacy_declared_projection(ty.clone(), true),
+                            &FunctionValueType::from_legacy_declared_projection(target, true),
                             DecimalOverflowPolicy::ReportError,
                             true,
                             &Control::default()
@@ -150,19 +150,16 @@ fn decimal_text_exact_p_s_null_promise_and_other_cast_domains_stay_separate() {
             }
         }
         for (p, s) in [(0, 0), (max + 1, 0), (1, 2)] {
-            let ty = if wide {
+            let data_type = if wide {
                 DataType::Decimal256(p, s)
             } else {
                 DataType::Decimal128(p, s)
             };
             assert!(
-                PreparedCastRecipe::try_new(
-                    CastOperation::Carrier,
-                    &FunctionValueType::new(ty, true),
-                    &FunctionValueType::new(DataType::Utf8, true),
-                    DecimalOverflowPolicy::ReportError,
+                FunctionValueType::try_with_logical_type(
+                    data_type,
                     true,
-                    &Control::default()
+                    novarocks_type_contract::ValueLogicalType::Physical
                 )
                 .is_err()
             );
@@ -175,11 +172,12 @@ fn decimal_text_selected_compact_scalar_slice_and_nonzero_constant_keep_actual_a
     let selection = Selection::try_sparse(3, &rows).unwrap();
     for wide in [false, true] {
         let input = raw(wide, vec![Some(i128::MIN), Some(5), None]);
-        let ty = FunctionValueType::new(input.data_type().clone(), true);
+        let ty =
+            FunctionValueType::from_legacy_declared_projection(input.data_type().clone(), true);
         let r = recipe(input.data_type().clone(), true);
         let compact = SelectedValues::try_new(
             selection,
-            &ty.data_type,
+            ty.data_type(),
             raw(wide, vec![Some(5), None]),
             Box::default(),
         )
@@ -302,7 +300,7 @@ fn decimal_text_null_mask_foreign_carrier_p_s_and_inherited_error_refuse_before_
     let selection = Selection::try_sparse(2, &rows).unwrap();
     let unresolved = SelectedValues::try_new(
         selection,
-        &r.source_type().data_type,
+        r.source_type().data_type(),
         hidden.clone(),
         vec![RowDataError::new(0, "original child")].into_boxed_slice(),
     )

@@ -65,7 +65,9 @@ pub(super) fn evaluate_bitwise<'a>(
                 FunctionArgumentType::Value(other),
             ],
             [left, right],
-        ) if source.logical_type == other.logical_type && source.data_type == other.data_type => {
+        ) if source.logical_type() == other.logical_type()
+            && source.data_type() == other.data_type() =>
+        {
             BitwiseArguments {
                 left: *left,
                 right: Some(*right),
@@ -81,24 +83,24 @@ pub(super) fn evaluate_bitwise<'a>(
     };
     let source = arguments.source;
     let target = input.contract().result_type();
-    if target.logical_type != source.logical_type
-        || target.data_type != source.data_type
-        || !target.nullable
+    if target.logical_type() != source.logical_type()
+        || target.data_type() != source.data_type()
+        || !target.nullable()
     {
         return Err(invalid(
             "bitwise result differs from its exact installed profile",
         ));
     }
-    if arguments.left.array().data_type() != &source.data_type
+    if arguments.left.array().data_type() != source.data_type()
         || arguments
             .right
-            .is_some_and(|right| right.array().data_type() != &source.data_type)
+            .is_some_and(|right| right.array().data_type() != source.data_type())
     {
         return Err(internal(
             "bitwise carrier differs from its checked argument",
         ));
     }
-    let values = match (&source.logical_type, &source.data_type) {
+    let values = match (&source.logical_type(), source.data_type()) {
         (ValueLogicalType::Physical, DataType::Int8) => {
             primitive::<Int8Type>(operation, &input, arguments, control)?
         }
@@ -120,8 +122,13 @@ pub(super) fn evaluate_bitwise<'a>(
             ));
         }
     };
-    SelectedValues::try_new(input.selection(), &target.data_type, values, Box::default())
-        .map_err(|_| internal("bitwise compact output violates its selected contract"))
+    SelectedValues::try_new(
+        input.selection(),
+        target.data_type(),
+        values,
+        Box::default(),
+    )
+    .map_err(|_| internal("bitwise compact output violates its selected contract"))
 }
 
 #[derive(Clone, Copy)]
@@ -144,7 +151,7 @@ impl BitwiseArguments<'_, '_> {
             return Err(internal("bitwise left row is outside its checked carrier"));
         }
         let left_null = self.left.array().is_null(left_row);
-        if left_null && !self.source.nullable {
+        if left_null && !self.source.nullable() {
             return Err(internal("bitwise non-null left contains selected SQL NULL"));
         }
         let (right_row, right_null) = match (self.right, self.right_type) {
@@ -154,7 +161,7 @@ impl BitwiseArguments<'_, '_> {
                     return Err(internal("bitwise right row is outside its checked carrier"));
                 }
                 let is_null = right.array().is_null(row);
-                if is_null && !right_type.nullable {
+                if is_null && !right_type.nullable() {
                     return Err(internal(
                         "bitwise non-null right contains selected SQL NULL",
                     ));
@@ -216,7 +223,7 @@ where
     )?;
     let values = crate::bit_array::finish_i64_observed(
         values,
-        Some(&input.contract().result_type().data_type),
+        Some(input.contract().result_type().data_type()),
         &mut observe,
     )?
     .map_err(|error| internal(&error.legacy_message("bitwise")))?;
@@ -270,7 +277,7 @@ fn largeint<'a>(
     )?;
     let values = crate::bit_array::cast_largeint_output_observed(
         &values,
-        Some(&input.contract().result_type().data_type),
+        Some(input.contract().result_type().data_type()),
         &mut observe,
     )?
     .map_err(|error| internal(&error.legacy_message("bitwise")))?;

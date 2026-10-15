@@ -332,7 +332,7 @@ mod tests {
                 7,
                 FilterConsumerActivation::BlockingSnapshot,
                 StaticFilterContract::membership(
-                    &DataType::Int64,
+                    &novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
                     FilterNullSemantics::NeverMatches,
                 )
                 .expect("membership contract"),

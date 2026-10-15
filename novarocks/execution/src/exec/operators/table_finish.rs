@@ -60,9 +60,11 @@ use crate::exec::node::table_finish::TableFinishRuntimeBinding;
 use crate::exec::node::table_write_aggregate::{
     WriterFinalAggregatePlan, WriterGroupedUnpivotMapping, WriterGroupedUnpivotPlan,
 };
+#[cfg(test)]
+use crate::exec::node::table_write_relation::WriterMultiplexRelationSchema;
 use crate::exec::node::table_write_relation::{
     ConnectorCommitFragmentCarrierValidator, RootWriteResultRelationSchema,
-    WriterMultiplexRelationSchema,
+    RootWriteResultRelationTemplate, WriterMultiplexRelationTemplate, WriterRelationPreparation,
 };
 #[cfg(feature = "test-controls")]
 use crate::exec::node::table_write_relation::{
@@ -74,13 +76,56 @@ use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::operators::table_writer::TableWriteRelationColumns;
 use crate::exec::operators::unpivot_processor::UnpivotProcessorFactory;
 use crate::exec::pipeline::operator::{
-    FinishWatch, Operator, ProcessorOperator, forward_observable,
+    FinishWatch, InputConstructionFactory, Operator, ProcessorOperator, forward_observable,
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+
+#[derive(Clone, Debug)]
+enum FinishCoverageCalls {
+    Original(Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>),
+    Prepared(novarocks_local_program::PreparedWriterAggregateCalls),
+}
+impl Default for FinishCoverageCalls {
+    fn default() -> Self {
+        Self::Original(Vec::new())
+    }
+}
+enum FinishCoverageIter<'a> {
+    Original(
+        std::iter::Copied<std::slice::Iter<'a, (novarocks_types::SlotId, novarocks_types::SlotId)>>,
+    ),
+    Prepared(std::slice::Iter<'a, novarocks_local_program::PreparedWriterAggregateCall>),
+}
+impl Iterator for FinishCoverageIter<'_> {
+    type Item = (novarocks_types::SlotId, novarocks_types::SlotId);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Original(calls) => calls.next(),
+            Self::Prepared(calls) => calls.next().map(|call| (call.input(), call.output())),
+        }
+    }
+}
+impl FinishCoverageCalls {
+    fn len(&self) -> usize {
+        match self {
+            Self::Original(calls) => calls.len(),
+            Self::Prepared(calls) => calls.calls().len(),
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn iter(&self) -> FinishCoverageIter<'_> {
+        match self {
+            Self::Original(calls) => FinishCoverageIter::Original(calls.iter().copied()),
+            Self::Prepared(calls) => FinishCoverageIter::Prepared(calls.calls().iter()),
+        }
+    }
+}
 
 /// The slot facts a finish's statistics are checked against: each final
 /// call's intermediate input and final output channel, in call order, and
@@ -89,7 +134,7 @@ use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 /// identically for every statistics owner.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FinishStatisticsCoverage {
-    calls: Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>,
+    calls: FinishCoverageCalls,
     mappings: Option<Vec<(u32, novarocks_types::SlotId)>>,
 }
 
@@ -98,16 +143,23 @@ impl FinishStatisticsCoverage {
         calls: Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>,
         mappings: Option<Vec<(u32, novarocks_types::SlotId)>>,
     ) -> Self {
-        Self { calls, mappings }
+        Self {
+            calls: FinishCoverageCalls::Original(calls),
+            mappings,
+        }
     }
 
     fn from_plan(plan: &WriterFinalAggregatePlan) -> Self {
         Self {
-            calls: plan
-                .calls
-                .iter()
-                .map(|call| (call.intermediate_input_slot_id, call.final_output_slot_id))
-                .collect(),
+            calls: match &plan.prepared {
+                Some(calls) => FinishCoverageCalls::Prepared(calls.clone()),
+                None => FinishCoverageCalls::Original(
+                    plan.calls
+                        .iter()
+                        .map(|call| (call.intermediate_input_slot_id, call.final_output_slot_id))
+                        .collect(),
+                ),
+            },
             mappings: plan.unpivot.as_ref().map(|unpivot| {
                 unpivot
                     .mappings
@@ -126,7 +178,11 @@ impl FinishStatisticsCoverage {
 pub(crate) trait FinishStatisticsFactory: Send + Sync {
     /// The final aggregate. It takes the finish's filtered `AGGREGATE_PARTIAL`
     /// rows and emits each target group's final values once.
-    fn final_aggregate(&self, state: &RuntimeState) -> Result<Box<dyn Operator>, String>;
+    fn final_aggregate(
+        &self,
+        state: &RuntimeState,
+        factory: &dyn InputConstructionFactory,
+    ) -> ExecutionResult<Box<dyn Operator>>;
 
     /// The grouped Unpivot of one final aggregate batch, emitting Root
     /// artifact rows.
@@ -136,6 +192,7 @@ pub(crate) trait FinishStatisticsFactory: Send + Sync {
         final_chunk: Chunk,
         root_schema: crate::exec::chunk::ChunkSchemaRef,
         tracker: Option<Arc<MemTracker>>,
+        factory: Arc<dyn InputConstructionFactory>,
     ) -> ExecutionResult<Box<dyn GroupedUnpivotSource>>;
 }
 
@@ -143,9 +200,58 @@ pub(crate) trait FinishStatisticsFactory: Send + Sync {
 pub(crate) trait GroupedUnpivotSource: Send {
     /// The batch's targets, each at most once.
     fn targets(&self) -> Vec<u32>;
+    /// Explicit legacy adapter; the modern source overrides this borrowed walk.
+    fn visit_targets(
+        &self,
+        visit: &mut dyn FnMut(u32) -> ExecutionResult<()>,
+    ) -> ExecutionResult<()> {
+        for target in self.targets() {
+            visit(target)?;
+        }
+        Ok(())
+    }
     fn pull(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>>;
     fn is_finished(&self) -> bool;
     fn source_observable(&self) -> Arc<Observable>;
+}
+
+/// Construction state only; type meaning remains in the frozen template.
+#[derive(Clone)]
+enum RootSchemaPreparation {
+    Legacy(RootWriteResultRelationSchema),
+    Compiled {
+        template: RootWriteResultRelationTemplate,
+        prepared: Option<RootWriteResultRelationSchema>,
+    },
+}
+
+impl RootSchemaPreparation {
+    fn is_compiled(&self) -> bool {
+        matches!(self, Self::Compiled { .. })
+    }
+
+    fn prepared(&self) -> Option<&RootWriteResultRelationSchema> {
+        match self {
+            Self::Legacy(schema) => Some(schema),
+            Self::Compiled { prepared, .. } => prepared.as_ref(),
+        }
+    }
+
+    fn prepare(
+        &mut self,
+        factory: Option<&Arc<dyn InputConstructionFactory>>,
+    ) -> ExecutionResult<()> {
+        if let Self::Compiled { template, prepared } = self {
+            if prepared.is_none() {
+                let factory = factory
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+                let schema = factory.create_compiled_chunk_schema(template.layout())?;
+                // Publish only after the complete template/slot check succeeds.
+                *prepared = Some(template.bind_created_schema(schema)?);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Factory for the single-driver table finish operator.
@@ -153,8 +259,8 @@ pub struct TableFinishOperatorFactory {
     name: String,
     expected_targets: Arc<Vec<WriteTargetOrdinal>>,
     fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
-    writer_schema: WriterMultiplexRelationSchema,
-    root_schema: RootWriteResultRelationSchema,
+    writer_schema: WriterRelationPreparation,
+    root_schema: RootSchemaPreparation,
     /// The plan-tree statistics, built from the process function set and
     /// `arena` when `statistics` is absent.
     final_plan: WriterFinalAggregatePlan,
@@ -173,8 +279,35 @@ impl TableFinishOperatorFactory {
     pub(crate) fn new_local(
         node_id: i32,
         expected_targets: Vec<WriteTargetOrdinal>,
-        writer_schema: WriterMultiplexRelationSchema,
-        root_schema: RootWriteResultRelationSchema,
+        writer_schema: WriterMultiplexRelationTemplate,
+        root_schema: RootWriteResultRelationTemplate,
+        final_plan: WriterFinalAggregatePlan,
+        binding: &TableFinishRuntimeBinding,
+        arena: Arc<ExprArena>,
+    ) -> Result<Self, String> {
+        Self::new_core(
+            node_id,
+            expected_targets,
+            WriterRelationPreparation::compiled(writer_schema),
+            RootSchemaPreparation::Compiled {
+                template: root_schema,
+                prepared: None,
+            },
+            final_plan,
+            binding,
+            arena,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The shared constructor keeps explicit legacy and compiled preparation facts"
+    )]
+    fn new_core(
+        node_id: i32,
+        expected_targets: Vec<WriteTargetOrdinal>,
+        writer_schema: WriterRelationPreparation,
+        root_schema: RootSchemaPreparation,
         final_plan: WriterFinalAggregatePlan,
         binding: &TableFinishRuntimeBinding,
         arena: Arc<ExprArena>,
@@ -208,16 +341,19 @@ impl TableFinishOperatorFactory {
     pub(crate) fn new_compiled(
         node_id: i32,
         expected_targets: Vec<WriteTargetOrdinal>,
-        writer_schema: WriterMultiplexRelationSchema,
-        root_schema: RootWriteResultRelationSchema,
+        writer_schema: WriterMultiplexRelationTemplate,
+        root_template: RootWriteResultRelationTemplate,
         statistics: Option<(FinishStatisticsCoverage, Arc<dyn FinishStatisticsFactory>)>,
         binding: &TableFinishRuntimeBinding,
     ) -> Result<Self, String> {
-        let mut factory = Self::new_local(
+        let mut factory = Self::new_core(
             node_id,
             expected_targets,
-            writer_schema,
-            root_schema,
+            WriterRelationPreparation::compiled(writer_schema),
+            RootSchemaPreparation::Compiled {
+                template: root_template,
+                prepared: None,
+            },
             WriterFinalAggregatePlan::default(),
             binding,
             Arc::new(ExprArena::default()),
@@ -241,8 +377,10 @@ impl TableFinishOperatorFactory {
             name,
             expected_targets: Arc::clone(node.expected_targets()),
             fragment_validator: Arc::clone(node.fragment_validator()),
-            writer_schema: node.writer_multiplex_schema().clone(),
-            root_schema: node.root_result_schema().clone(),
+            writer_schema: WriterRelationPreparation::Existing(
+                node.writer_multiplex_schema().clone(),
+            ),
+            root_schema: RootSchemaPreparation::Legacy(node.root_result_schema().clone()),
             final_plan: node.final_aggregate_plan().clone(),
             coverage: FinishStatisticsCoverage::from_plan(node.final_aggregate_plan()),
             statistics: None,
@@ -277,14 +415,14 @@ impl TableFinishOperatorFactory {
             aggregate_guard: Arc::clone(&self.aggregate_guard),
             channel_to_call: self
                 .writer_schema
-                .contract()
-                .auxiliary_channels()
+                .slots()
                 .iter()
-                .map(|channel| {
+                .skip(novarocks_spi::connector::write_stack::WRITE_RELATION_COLUMN_COUNT)
+                .map(|slot| {
                     self.coverage
                         .calls
                         .iter()
-                        .position(|(input, _)| input.0 == channel.slot_id())
+                        .position(|(input, _)| input == *slot)
                 })
                 .collect(),
             arena: Arc::clone(&self.arena),
@@ -293,6 +431,7 @@ impl TableFinishOperatorFactory {
             ledger: PreparedWriteSetLedger::new(),
             fragments: Vec::new(),
             aggregate: None,
+            construction: None,
             aggregate_coverage: HashMap::new(),
             final_groups_seen: HashSet::new(),
             grouped_unpivot: None,
@@ -553,8 +692,8 @@ struct TableFinishOperator {
     name: String,
     expected_targets: Arc<Vec<WriteTargetOrdinal>>,
     fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
-    writer_schema: WriterMultiplexRelationSchema,
-    root_schema: RootWriteResultRelationSchema,
+    writer_schema: WriterRelationPreparation,
+    root_schema: RootSchemaPreparation,
     final_plan: WriterFinalAggregatePlan,
     coverage: FinishStatisticsCoverage,
     statistics: Option<Arc<dyn FinishStatisticsFactory>>,
@@ -567,6 +706,7 @@ struct TableFinishOperator {
     ledger: PreparedWriteSetLedger,
     fragments: Vec<BufferedFragment>,
     aggregate: Option<Box<dyn Operator>>,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
     aggregate_coverage: HashMap<u32, Vec<bool>>,
     final_groups_seen: HashSet<u32>,
     grouped_unpivot: Option<Box<dyn GroupedUnpivotSource>>,
@@ -583,6 +723,15 @@ struct TableFinishOperator {
 }
 
 impl TableFinishOperator {
+    fn prepared_root_schema(&self) -> ExecutionResult<&RootWriteResultRelationSchema> {
+        self.root_schema.prepared().ok_or_else(|| {
+            crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
+                "compiled TableFinish root schema was not prepared".to_string(),
+            )
+            .into()
+        })
+    }
+
     fn install_aggregate(&mut self, aggregate: Box<dyn Operator>) {
         if let Some(processor) = aggregate.as_processor_ref() {
             if let Some(observable) = processor.source_observable() {
@@ -662,6 +811,7 @@ impl TableFinishOperator {
             (!columns.fragments.is_null(row)).then(|| columns.fragments.value(row).len());
         let auxiliary_non_null = self
             .writer_schema
+            .schema()?
             .contract()
             .auxiliary_channels()
             .iter()
@@ -675,7 +825,7 @@ impl TableFinishOperator {
             })
             .collect::<Vec<_>>();
         validate_writer_multiplex_row(
-            self.writer_schema.contract(),
+            self.writer_schema.schema()?.contract(),
             kind,
             row_count,
             fragment_len,
@@ -770,7 +920,7 @@ impl TableFinishOperator {
             .calls
             .iter()
             .enumerate()
-            .map(|(index, (_, output))| (*output, index))
+            .map(|(index, (_, output))| (output, index))
             .collect::<HashMap<_, _>>();
         for (grouping_key, input_value_slot_id) in mappings {
             let call = call_by_output
@@ -797,9 +947,12 @@ impl TableFinishOperator {
 
     fn filter_aggregate_rows(&self, chunk: &Chunk, partial_rows: &[bool]) -> Result<Chunk, String> {
         let mask = BooleanArray::from(partial_rows.to_vec());
-        let batch = filter_record_batch(&chunk.batch, &mask)
+        let batch = filter_record_batch(&chunk.record_batch(), &mask)
             .map_err(|error| format!("table finish filters aggregate partial rows: {error}"))?;
-        Chunk::try_new_with_chunk_schema(batch, Arc::clone(self.writer_schema.chunk_schema()))
+        Chunk::try_new_with_chunk_schema(
+            batch,
+            Arc::clone(self.writer_schema.schema()?.chunk_schema()),
+        )
     }
 
     fn begin_finalize(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
@@ -807,7 +960,7 @@ impl TableFinishOperator {
         self.prefix_output = Some(PrefixOutputDriver::try_new(
             self.rows.get(),
             std::mem::take(&mut self.fragments),
-            Arc::clone(self.root_schema.chunk_schema()),
+            Arc::clone(self.prepared_root_schema()?.chunk_schema()),
             self.output_tracker.as_ref().map(Arc::clone),
         )?);
         let Some(aggregate) = self.aggregate.as_mut() else {
@@ -830,34 +983,56 @@ impl TableFinishOperator {
         state: &RuntimeState,
         final_chunk: Chunk,
     ) -> ExecutionResult<()> {
-        let driver: Box<dyn GroupedUnpivotSource> = match self.statistics.as_ref() {
-            Some(statistics) => statistics.grouped_unpivot(
-                state,
-                final_chunk,
-                Arc::clone(self.root_schema.chunk_schema()),
-                self.output_tracker.as_ref().map(Arc::clone),
-            )?,
-            None => {
-                let arena = Arc::clone(&self.arena);
-                let plan = self.final_plan.unpivot.as_ref().cloned().ok_or_else(|| {
-                    "table finish final aggregate is missing grouped Unpivot".to_string()
-                })?;
-                Box::new(GroupedUnpivotDriver::try_new(
-                    arena,
-                    plan,
-                    Arc::clone(self.root_schema.chunk_schema()),
+        let driver: Box<dyn GroupedUnpivotSource> =
+            match self.statistics.as_ref() {
+                Some(statistics) => statistics.grouped_unpivot(
+                    state,
                     final_chunk,
+                    Arc::clone(self.prepared_root_schema()?.chunk_schema()),
                     self.output_tracker.as_ref().map(Arc::clone),
-                )?)
-            }
-        };
-        for target in driver.targets() {
+                    Arc::clone(self.construction.as_ref().ok_or(
+                        crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                    )?),
+                )?,
+                None if self.final_plan.prepared.is_some() => {
+                    let factory = Arc::clone(self.construction.as_ref().ok_or(
+                        crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                    )?);
+                    let plan = self.final_plan.unpivot.as_ref().ok_or_else(|| {
+                        crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
+                            "writer grouped Unpivot declaration is absent".into(),
+                        )
+                    })?;
+                    super::compiled_writer_statistics::create_prepared_grouped_in(
+                        &self.arena,
+                        plan,
+                        final_chunk,
+                        Arc::clone(self.prepared_root_schema()?.chunk_schema()),
+                        self.output_tracker.as_ref().map(Arc::clone),
+                        factory,
+                        state.error_state(),
+                    )?
+                }
+                None => {
+                    let arena = Arc::clone(&self.arena);
+                    let plan = self.final_plan.unpivot.as_ref().cloned().ok_or_else(|| {
+                        "table finish final aggregate is missing grouped Unpivot".to_string()
+                    })?;
+                    Box::new(GroupedUnpivotDriver::try_new(
+                        arena,
+                        plan,
+                        Arc::clone(self.prepared_root_schema()?.chunk_schema()),
+                        final_chunk,
+                        self.output_tracker.as_ref().map(Arc::clone),
+                    )?)
+                }
+            };
+        driver.visit_targets(&mut |target| {
             if !self.final_groups_seen.insert(target) {
-                return Err(format!(
-                    "table finish final aggregate produced duplicate target {target} across output batches"
-                ).into());
+                return Err(format!("table finish final aggregate produced duplicate target {target} across output batches").into());
             }
-        }
+            Ok(())
+        })?;
         self.install_grouped_unpivot_source(driver);
         Ok(())
     }
@@ -949,6 +1124,7 @@ fn build_final_aggregate(
             call.resolved.intermediate_type.clone(),
         );
         functions.push(AggFunction {
+            frozen: call.frozen.clone(),
             name: call.function_name.to_string(),
             inputs: vec![input],
             input_is_intermediate: true,
@@ -1220,11 +1396,175 @@ impl GroupedUnpivotSource for GroupedUnpivotDriver {
 /// Validate one grouped Unpivot artifact batch and lift it onto the Root
 /// relation: every row is an `ARTIFACT_DRAFT` of its target, with the
 /// relation's own carriers.
+enum RootArtifactStep {
+    Work,
+    IdScratch(usize),
+    PairScratch(usize),
+    Columns,
+    KindWrapper,
+    ListWrapper,
+    MapWrapper,
+}
+
 pub(crate) fn root_artifact_chunk(
     artifact: Chunk,
     root_schema: &crate::exec::chunk::ChunkSchemaRef,
     tracker: Option<&Arc<MemTracker>>,
 ) -> Result<Option<Chunk>, String> {
+    // The explicit legacy adapter shares the exact validation/column body.
+    root_artifact_chunk_core(
+        artifact,
+        root_schema,
+        |_| Ok(()),
+        |ordinal, rows| {
+            Ok(new_null_array(
+                root_schema.arrow_schema_ref().field(ordinal).data_type(),
+                rows,
+            ))
+        },
+        |_, columns, rows| {
+            let batch = RecordBatch::try_new(root_schema.arrow_schema_ref(), columns)
+                .map_err(|error| format!("build table finish artifact Root batch: {error}"))?;
+            let mut output = Chunk::try_new_with_chunk_schema(batch, Arc::clone(root_schema))?;
+            if let Some(tracker) = tracker {
+                output.try_transfer_to(tracker).map_err(|error| {
+                    format!(
+                        "ResourceExhausted: table finish artifact output admission failed: {error}"
+                    )
+                })?;
+            }
+            assert_eq!(output.len(), rows);
+            Ok(Some(output))
+        },
+    )
+}
+
+pub(crate) fn root_artifact_chunk_with_construction(
+    artifact: Chunk,
+    root_schema: &crate::exec::chunk::ChunkSchemaRef,
+    tracker: Option<&Arc<MemTracker>>,
+    factory: &dyn InputConstructionFactory,
+    control: &dyn novarocks_functions::KernelEvaluationControl,
+) -> ExecutionResult<Option<Chunk>> {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use novarocks_functions::KernelFailure;
+    use std::alloc::Layout;
+    if artifact.is_empty() {
+        return Ok(None);
+    }
+    if !artifact.chunk_schema().is_typed() || !root_schema.is_typed() {
+        return Err(ConstructionFailure::MissingOwner.into());
+    }
+    // The protocol explicitly widens NULL promises on these existing value
+    // roles. It does not infer a domain from the source Arrow carrier.
+    for ordinal in [1, 4, 5, 6, 7] {
+        let expected = root_schema
+            .slots()
+            .get(ordinal)
+            .ok_or_else(|| "Root artifact declaration is absent".to_owned())?;
+        let source = artifact
+            .chunk_schema()
+            .slot(expected.slot_id())
+            .ok_or_else(|| "artifact source declaration is absent".to_owned())?;
+        let source = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
+            source.typed_binding().clone(),
+        )
+        .map_err(|_| "artifact source declaration is invalid".to_owned())?;
+        let expected = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
+            expected.typed_binding().clone(),
+        )
+        .map_err(|_| "Root artifact declaration is invalid".to_owned())?;
+        if !source.fits_physical_binding_observed(&expected, || control.checkpoint(1))? {
+            return Err("artifact source differs from its complete Root declaration".into());
+        }
+    }
+    let owner = factory.begin_typed_construction(root_schema)?;
+    let temporary = factory.begin_typed_construction(root_schema)?;
+    root_artifact_chunk_core(
+        artifact,
+        root_schema,
+        |step| {
+            let arc = |payload| {
+                novarocks_type_contract::owned_resources::layout::arc_layout(payload)
+                    .map_err(ConstructionFailure::Resource)
+            };
+            match step {
+                RootArtifactStep::Work => temporary.observe(
+                    0,
+                    &[],
+                    crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
+                        units: 1,
+                    },
+                )?,
+                RootArtifactStep::IdScratch(count) => temporary.request(
+                    Layout::array::<Option<i32>>(count)
+                        .map_err(|_| KernelFailure::ResourceExhausted)?,
+                )?,
+                RootArtifactStep::PairScratch(count) => temporary.request(
+                    Layout::array::<(Option<&str>, Option<&str>)>(count)
+                        .map_err(|_| KernelFailure::ResourceExhausted)?,
+                )?,
+                RootArtifactStep::Columns => owner.request(
+                    Layout::array::<ArrayRef>(8).map_err(|_| KernelFailure::ResourceExhausted)?,
+                )?,
+                RootArtifactStep::KindWrapper => {
+                    super::compiled_writer_statistics::grouped_primitive_adoption(
+                        owner.as_ref(),
+                        control,
+                    )?;
+                    owner.request(arc(Layout::new::<Int8Array>())?)?;
+                }
+                RootArtifactStep::ListWrapper => {
+                    owner.request(arc(Layout::new::<arrow::array::ListArray>())?)?
+                }
+                RootArtifactStep::MapWrapper => {
+                    owner.request(
+                        Layout::array::<ArrayRef>(2)
+                            .map_err(|_| KernelFailure::ResourceExhausted)?,
+                    )?;
+                    owner.request(arc(Layout::new::<arrow::array::MapArray>())?)?;
+                }
+            }
+            Ok(())
+        },
+        |ordinal, rows| {
+            super::compiled_writer_statistics::grouped_null_array(
+                root_schema.slots()[ordinal].typed_binding().layout(),
+                rows,
+                owner.as_ref(),
+                control,
+            )
+        },
+        |artifact, columns, rows| {
+            let storage = artifact.source_storage_lifetime_observed::<ConstructionFailure>(
+                owner.storage_lifetime(),
+                |layout| owner.request(layout),
+            )?;
+            let mut output =
+                Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+                    Arc::clone(root_schema),
+                    columns,
+                    rows,
+                    storage,
+                    |step| owner.observe(0, &[], step),
+                )?;
+            if let Some(tracker) = tracker {
+                output
+                    .try_transfer_to_typed(tracker)
+                    .map_err(ConstructionFailure::Memory)?;
+            }
+            Ok(Some(output))
+        },
+    )
+}
+
+fn root_artifact_chunk_core<E: From<String>>(
+    artifact: Chunk,
+    root_schema: &crate::exec::chunk::ChunkSchemaRef,
+    mut before: impl FnMut(RootArtifactStep) -> Result<(), E>,
+    mut null_array: impl FnMut(usize, usize) -> Result<ArrayRef, E>,
+    construct: impl FnOnce(Chunk, Vec<ArrayRef>, usize) -> Result<Option<Chunk>, E>,
+) -> Result<Option<Chunk>, E> {
     let rows = artifact.len();
     if rows == 0 {
         return Ok(None);
@@ -1256,30 +1596,37 @@ pub(crate) fn root_artifact_chunk(
         .downcast_ref::<Int32Array>()
         .ok_or_else(|| "table finish artifact target is not Int32".to_string())?;
     for row in 0..rows {
-        let list = input_lists.value(row);
-        let ids = list
+        before(RootArtifactStep::Work)?;
+        let ids = input_lists
+            .values()
             .as_any()
             .downcast_ref::<Int32Array>()
             .ok_or_else(|| "table finish artifact input_fields values are not Int32".to_string())?;
-        let ids = (0..ids.len())
+        let begin = usize::try_from(input_lists.value_offsets()[row])
+            .map_err(|_| "table finish artifact input_fields offset is negative".to_owned())?;
+        let end = usize::try_from(input_lists.value_offsets()[row + 1])
+            .map_err(|_| "table finish artifact input_fields offset is negative".to_owned())?;
+        before(RootArtifactStep::IdScratch(end - begin))?;
+        let ids = (begin..end)
             .map(|index| (!ids.is_null(index)).then(|| ids.value(index)))
             .collect::<Vec<_>>();
-        let map = maps.value(row);
-        let entries = map
-            .as_any()
-            .downcast_ref::<arrow::array::StructArray>()
-            .ok_or_else(|| "table finish artifact properties entries are not Struct".to_string())?;
+        let entries = maps.entries();
         let keys = entries
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .ok_or_else(|| "table finish artifact property keys are not Utf8".to_string())?;
+            .ok_or_else(|| "table finish artifact property keys are not Utf8".to_owned())?;
         let values = entries
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .ok_or_else(|| "table finish artifact property values are not Utf8".to_string())?;
-        let pairs = (0..entries.len())
+            .ok_or_else(|| "table finish artifact property values are not Utf8".to_owned())?;
+        let begin = usize::try_from(maps.value_offsets()[row])
+            .map_err(|_| "table finish artifact properties offset is negative".to_owned())?;
+        let end = usize::try_from(maps.value_offsets()[row + 1])
+            .map_err(|_| "table finish artifact properties offset is negative".to_owned())?;
+        before(RootArtifactStep::PairScratch(end - begin))?;
+        let pairs = (begin..end)
             .map(|index| {
                 (
                     (!keys.is_null(index)).then(|| keys.value(index)),
@@ -1307,30 +1654,28 @@ pub(crate) fn root_artifact_chunk(
     // fields. Rebind them to the Root layout's own fields (buffers are shared,
     // nothing is copied) so the Root output carries only metadata owners its
     // own layout provides; a bounded root producer refuses any other owner.
+    before(RootArtifactStep::ListWrapper)?;
     let input_fields = rebind_list(input_lists, root_arrow.field(4).data_type())?;
+    before(RootArtifactStep::MapWrapper)?;
     let properties = rebind_map(maps, root_arrow.field(7).data_type())?;
+    before(RootArtifactStep::Columns)?;
+    before(RootArtifactStep::KindWrapper)?;
+    let null_two = null_array(2, rows)?;
+    let null_three = null_array(3, rows)?;
     let columns = vec![
         Arc::new(Int8Array::from(vec![
             RootRowKind::ArtifactDraft.to_wire();
             rows
         ])) as ArrayRef,
         target,
-        new_null_array(root_arrow.field(2).data_type(), rows),
-        new_null_array(root_arrow.field(3).data_type(), rows),
+        null_two,
+        null_three,
         input_fields,
         blob_type,
         body,
         properties,
     ];
-    let batch = RecordBatch::try_new(root_arrow, columns)
-        .map_err(|error| format!("build table finish artifact Root batch: {error}"))?;
-    let mut output = Chunk::try_new_with_chunk_schema(batch, Arc::clone(root_schema))?;
-    if let Some(tracker) = tracker {
-        output.try_transfer_to(tracker).map_err(|error| {
-            format!("ResourceExhausted: table finish artifact output admission failed: {error}")
-        })?;
-    }
-    Ok(Some(output))
+    construct(artifact, columns, rows)
 }
 
 fn rebind_list(list: &arrow::array::ListArray, root: &DataType) -> Result<ArrayRef, String> {
@@ -1372,6 +1717,19 @@ fn rebind_map(map: &arrow::array::MapArray, root: &DataType) -> Result<ArrayRef,
 }
 
 impl Operator for TableFinishOperator {
+    fn creates_typed_storage(&self) -> bool {
+        self.writer_schema.is_compiled()
+            || self.root_schema.is_compiled()
+            || self.statistics.is_some()
+    }
+
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        if let Some(aggregate) = self.aggregate.as_mut() {
+            aggregate.set_construction_factory(Arc::clone(&factory));
+        }
+        self.construction = Some(factory);
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -1398,6 +1756,12 @@ impl Operator for TableFinishOperator {
                     .into(),
             );
         }
+        if let Err(error) = self.writer_schema.prepare(self.construction.as_ref()) {
+            return self.fail(error);
+        }
+        if let Err(error) = self.root_schema.prepare(self.construction.as_ref()) {
+            return self.fail(error);
+        }
         Ok(())
     }
 
@@ -1418,8 +1782,61 @@ impl Operator for TableFinishOperator {
             return Ok(());
         }
         let mut aggregate = match self.statistics.as_ref() {
-            Some(statistics) => statistics.final_aggregate(state)?,
+            Some(statistics) => statistics.final_aggregate(
+                state,
+                self.construction
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?
+                    .as_ref(),
+            )?,
+            None if self.final_plan.prepared.is_some() => {
+                let factory = self
+                    .construction
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+                let input = Arc::clone(self.writer_schema.schema()?.chunk_schema());
+                let owner = factory.begin_typed_construction(&input)?;
+                let prepared = self
+                    .final_plan
+                    .prepared
+                    .as_ref()
+                    .expect("checked prepared source");
+                if prepared
+                    .calls()
+                    .iter()
+                    .map(|call| (call.input(), call.output()))
+                    .ne(self.coverage.calls.iter())
+                {
+                    return Err(
+                        crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
+                            "writer final prepared occurrences differ from the original coverage"
+                                .into(),
+                        )
+                        .into(),
+                    );
+                }
+                let unpivot = self.final_plan.unpivot.as_ref().ok_or_else(|| {
+                    crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
+                        "writer final grouping declaration is absent".into(),
+                    )
+                })?;
+                super::compiled_writer_statistics::create_prepared_final_in(
+                    prepared.clone(),
+                    unpivot.grouping_input_slot_id,
+                    unpivot.grouping_output_slot_id,
+                    input,
+                    state.error_state(),
+                    owner.as_ref(),
+                )?
+            }
+            None if self.writer_schema.is_compiled() => {
+                return Err(
+                    crate::exec::pipeline::operator::ConstructionFailure::MissingOwner.into(),
+                );
+            }
             None => {
+                // Explicit legacy expansion fixture route; production prepared
+                // relations never resolve a function name here.
                 let arena = Arc::clone(&self.arena);
                 let function_set = state
                     .execution_runtime()
@@ -1438,6 +1855,13 @@ impl Operator for TableFinishOperator {
             aggregate.set_profiles(OperatorProfiles::new(
                 profiles.operator.child("TableFinishFinalAggregate"),
             ));
+        }
+        if aggregate.creates_typed_storage() {
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+            aggregate.set_construction_factory(Arc::clone(factory));
         }
         aggregate.prepare()?;
         aggregate.bind_runtime_state(state)?;
@@ -1572,7 +1996,7 @@ impl ProcessorOperator for TableFinishOperator {
                 "table finish received input while its final aggregate was not ready".to_string(),
             );
         }
-        if chunk.chunk_schema() != self.writer_schema.chunk_schema().as_ref() {
+        if chunk.chunk_schema() != self.writer_schema.schema()?.chunk_schema().as_ref() {
             return self.fail(
                 "table finish writer relation schema drifted from the frozen plan".to_string(),
             );
@@ -1823,6 +2247,122 @@ mod tests {
     use crate::runtime::ExecutionRuntime;
     use crate::runtime::execution_runtime::ExecutionRuntimeConfig;
 
+    fn compiled_root_owner_fixture() -> (
+        TableFinishOperatorFactory,
+        Arc<novarocks_local_program::LocalProgram>,
+        RuntimeState,
+    ) {
+        let (program, binding, state) =
+            crate::exec::pipeline::builder::compiled_statistics_finish_fixture();
+        let factory = crate::exec::operators::compiled_writer::compiled_table_finish_factory(
+            &program,
+            program.graph().root(),
+            0,
+            &binding,
+            &state.error_state(),
+        )
+        .expect("actual compiled TableFinish factory");
+        assert!(factory.root_schema.is_compiled());
+        assert!(
+            factory.root_schema.prepared().is_none(),
+            "factory retains only the frozen Root template"
+        );
+        (factory, program, state)
+    }
+
+    fn install_compiled_root_creator(
+        operator: &mut TableFinishOperator,
+        state: &RuntimeState,
+    ) -> Arc<MemTracker> {
+        let tracker = MemTracker::new_root("compiled-outer-root-creator");
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        assert!(operator.creates_typed_storage());
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            Arc::clone(&tracker), state.error_state(),
+        ).unwrap();
+        operator.set_construction_factory(factory);
+        tracker
+    }
+
+    #[test]
+    fn compiled_outer_root_prepare_retains_creator_until_last_schema_slot() {
+        let (factory, program, state) = compiled_root_owner_fixture();
+        let mut operator = factory.create_operator(1, 0);
+        assert!(operator.root_schema.prepared().is_none());
+        let tracker = install_compiled_root_creator(&mut operator, &state);
+        let installed = tracker.current();
+        operator
+            .prepare()
+            .expect("Root schema created by actual preparation owner");
+        assert!(
+            tracker.current() > installed,
+            "real Root schema construction is observed"
+        );
+        let root = Arc::clone(operator.prepared_root_schema().unwrap().chunk_schema());
+        assert!(root.is_typed());
+        let slot = root.slots()[0].clone();
+        let declared = program.graph().nodes()[program.graph().root().index()].output_layout();
+        assert_eq!(root.slot_ids(), declared.slots());
+        assert_eq!(slot.typed_binding(), declared.value_binding_at(0).unwrap());
+        drop(operator);
+        drop(factory);
+        drop(program);
+        drop(state);
+        assert!(
+            tracker.current() > 0,
+            "Root schema holds only its finite creating responsibility"
+        );
+        drop(root);
+        assert!(
+            tracker.current() > 0,
+            "independent Root slot retains the actual schema creator"
+        );
+        drop(slot);
+        assert_eq!(tracker.current(), 0, "last Root schema holder exits");
+    }
+
+    #[test]
+    fn compiled_outer_root_prepare_preserves_first_tracker_refusal_without_publishing() {
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        use crate::runtime::fragment::ExecutionFailureCause;
+        let (factory, program, state) = compiled_root_owner_fixture();
+        let mut operator = factory.create_operator(1, 0);
+        let tracker = install_compiled_root_creator(&mut operator, &state);
+        let installed = tracker.current();
+        assert!(installed > 0);
+        tracker.install_limit_once(installed).unwrap();
+        let failure = operator
+            .prepare()
+            .expect_err("first actual Root allocation is refused");
+        assert!(
+            matches!(
+                failure.cause(),
+                ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
+            ),
+            "original caller memory cause: {failure:?}"
+        );
+        assert!(
+            operator.root_schema.prepared().is_none(),
+            "no partially prepared Root is published"
+        );
+        assert_eq!(operator.phase, FinishPhase::Failed);
+        assert_eq!(
+            tracker.current(),
+            installed,
+            "refused scope rolls back its partial construction"
+        );
+        drop(operator);
+        drop(factory);
+        drop(program);
+        drop(state);
+        assert_eq!(
+            tracker.current(),
+            0,
+            "refusal retains no uncreated Root schema"
+        );
+    }
+
     #[test]
     fn root_artifact_rebinds_reused_nested_arrays_to_root_layout_fields() {
         use arrow::array::{Int32Array, MapArray, StructArray};
@@ -1880,21 +2420,21 @@ mod tests {
         let root_arrow = root_schema.arrow_schema_ref();
         let (DataType::List(expected_item), DataType::List(actual_item)) = (
             root_arrow.field(4).data_type(),
-            output.batch.column(4).data_type(),
+            output.record_batch().column(4).data_type(),
         ) else {
             panic!("input_fields is a List");
         };
-        assert!(Arc::ptr_eq(expected_item, actual_item));
-        assert!(!Arc::ptr_eq(item, actual_item));
+        assert!(Arc::ptr_eq(expected_item, &actual_item));
+        assert!(!Arc::ptr_eq(item, &actual_item));
         let (DataType::Map(expected_entries, _), DataType::Map(actual_entries, _)) = (
             root_arrow.field(7).data_type(),
-            output.batch.column(7).data_type(),
+            output.record_batch().column(7).data_type(),
         ) else {
             panic!("properties is a Map");
         };
-        assert!(Arc::ptr_eq(expected_entries, actual_entries));
+        assert!(Arc::ptr_eq(expected_entries, &actual_entries));
         let rebound = output
-            .batch
+            .record_batch()
             .column(7)
             .as_any()
             .downcast_ref::<MapArray>()
@@ -2172,7 +2712,7 @@ mod tests {
         // the operator must still validate the row rather than trusting schema
         // metadata as proof about an untrusted Exchange batch.
         let relation = WriterMultiplexRelationSchema::empty();
-        let schema = Arc::clone(relation.contract().arrow_schema());
+        let schema = relation.chunk_schema().arrow_schema_ref();
         let chunk_schema = Arc::clone(relation.chunk_schema());
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int8Array::from(kinds)),
@@ -2222,7 +2762,7 @@ mod tests {
                 .into_iter()
                 .map(|mut builder| Arc::new(builder.finish()) as ArrayRef),
         );
-        let batch = RecordBatch::try_new(schema.contract().arrow_schema().clone(), columns)
+        let batch = RecordBatch::try_new(schema.chunk_schema().arrow_schema_ref(), columns)
             .expect("composite writer batch");
         Chunk::try_new_with_chunk_schema(batch, Arc::clone(schema.chunk_schema()))
             .expect("composite writer chunk")
@@ -2290,6 +2830,8 @@ mod tests {
         let grouping_output_slot_id = novarocks_types::SlotId::new(10_000);
         let calls = (0..channel_count)
             .map(|index| WriterFinalAggregateCall {
+                // Explicit legacy carrier fixture; this is not frozen-binding admission.
+                frozen: None,
                 function_name: Arc::from("any_value"),
                 resolved: resolved.clone(),
                 intermediate_input_slot_id: novarocks_types::SlotId::new(
@@ -2330,6 +2872,7 @@ mod tests {
             )
             .collect();
         let final_plan = WriterFinalAggregatePlan {
+            prepared: None,
             calls,
             unpivot: Some(WriterGroupedUnpivotPlan {
                 grouping_input_slot_id:
@@ -2842,7 +3385,7 @@ mod tests {
                 .expect("stream prefix")
             {
                 assert!(
-                    root_output_size(&output.batch, None).expect("output size")
+                    root_output_size(&output.record_batch(), None).expect("output size")
                         <= MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES
                 );
                 outputs.push(output);
@@ -3404,7 +3947,13 @@ mod tests {
                 .as_ref()
                 .cloned()
                 .expect("grouped Unpivot plan"),
-            Arc::clone(factory.root_schema.chunk_schema()),
+            Arc::clone(
+                factory
+                    .root_schema
+                    .prepared()
+                    .expect("legacy fixture root schema")
+                    .chunk_schema(),
+            ),
             final_chunk,
             None,
         )

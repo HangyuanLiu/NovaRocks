@@ -267,7 +267,7 @@ fn output_error(failure: TopKFailure) -> ScalarStateError {
 
 impl TopKKernel {
     fn output_type(&self) -> &DataType {
-        &self.contract.final_type().data_type
+        self.contract.final_type().data_type()
     }
     fn emit<'s, I>(
         &self,
@@ -744,38 +744,32 @@ pub(super) fn validate_selected_profile(
     intermediate: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), KernelFailure> {
-    let mut types = Vec::new();
     for arg in &selected.argument_types {
-        let FunctionArgumentType::Value(value) = arg else {
+        let FunctionArgumentType::Value(_) = arg else {
             return Err(invalid(
                 "approx_top_k requires original full value arguments",
             ));
         };
-        types.push(value.data_type.clone());
         work.step().map_err(compile_failure)?;
     }
-    if !(1..=3).contains(&types.len()) {
+    if !(1..=3).contains(&selected.argument_types.len()) {
         return Err(invalid(
             "approx_top_k requires original one to three full value arguments",
         ));
     }
-    let (output, state) =
-        crate::aggregate_types::infer_agg_function_types("approx_top_k", &types, false)
-            .map_err(|_| invalid("approx_top_k original signature inference failed"))?;
     let FunctionResultType::Scalar(actual) = &selected.result_type else {
         return Err(invalid("approx_top_k requires its original scalar result"));
     };
-    let expected = FunctionValueType::new(output, true);
-    let state = FunctionValueType::new(
-        state.ok_or_else(|| invalid("approx_top_k original state type is absent"))?,
-        true,
-    );
-    if !expected
-        .exactly_equals_observed::<KernelFailure>(actual, || work.step().map_err(compile_failure))?
-        || !state.exactly_equals_observed::<KernelFailure>(intermediate, || {
-            work.step().map_err(compile_failure)
-        })?
-    {
+    if !crate::aggregate_types::matches_selected_top_k_types_observed(
+        &selected.argument_types,
+        actual,
+        intermediate,
+        work,
+    )
+    .map_err(|error| match error {
+        crate::FunctionBindingError::Control(error) => compile_failure(error),
+        _ => invalid("approx_top_k original signature inference failed"),
+    })? {
         return Err(invalid(
             "approx_top_k selected output or state differs from its original full signature",
         ));

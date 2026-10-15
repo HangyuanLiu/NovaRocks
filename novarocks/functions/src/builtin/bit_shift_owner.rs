@@ -82,7 +82,7 @@ pub(super) fn definition(
 }
 
 struct BitShiftOwner {
-    resolver: BuiltinScalarResolver,
+    resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
     operation: ShiftOp,
@@ -123,7 +123,7 @@ impl BitShiftOwner {
             })
             .collect();
         Ok(Self {
-            resolver,
+            resolver: Arc::new(resolver),
             declaration,
             implementations,
             operation: op,
@@ -176,6 +176,10 @@ impl FunctionBindingResolver for BitShiftOwner {
 }
 
 impl PureFunctionMetadataOwner for BitShiftOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -204,32 +208,21 @@ impl FunctionEffectOwner for BitShiftOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        work.step().map_err(FunctionEffectOwnerError::Control)?;
-        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
-        {
-            return Err(FunctionBindingError::UnknownFunction.into());
-        }
-        if !input.environment.is_empty()
-            || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
-        {
-            return Err(FunctionBindingError::InvalidBinding(
-                "bit shift has no environment dependencies and requires an exact proof scope"
-                    .into(),
-            )
-            .into());
-        }
-        work.flush().map_err(FunctionEffectOwnerError::Control)?;
-        self.validate_selected(input.selected, input.request, control)
-            .map_err(|error| match error {
-                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
-                other => FunctionEffectOwnerError::Owner(other),
-            })?;
-        let result = self.call_effects(input.proof_scope);
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        Ok(result)
+        self.refine_selected_core(input, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_selected_core(input, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -240,35 +233,21 @@ impl PureScalarImplementation for BitShiftOwner {
         contract: Arc<ScalarCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        work.step().map_err(compile_failure)?;
-        if input.function_id != self.declaration.function_id()
-            || input.kind != FunctionKind::Scalar
-            || contract.function_id() != input.function_id
-            || !std::ptr::eq(contract.selected(), input.selected)
-            || contract.context() != input.context
-            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-            || contract.effects() != &self.call_effects(input.proof_scope)
-            || !input.environment.is_empty()
-        {
-            return Err(invalid(
-                "bit shift preparation differs from its exact checked call",
-            ));
-        }
-        work.flush().map_err(compile_failure)?;
-        self.validate_selected(input.selected, input.request, control)
-            .map_err(|error| match error {
-                FunctionBindingError::Control(error) => compile_failure(error),
-                _ => invalid("bit shift preparation has a stale selected binding"),
-            })?;
-        work.finish().map_err(compile_failure)?;
-        // The prepared object retains the same canonical contract. Its body is
-        // a static pure implementation and needs no live resolver or authority.
-        Ok(Arc::new(PreparedBitShift {
-            contract,
-            operation: self.operation,
-        }))
+        self.prepare_selected_core(input, contract, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn prepare_scalar_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_selected_core(input, contract, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -556,7 +535,9 @@ mod tests {
                                 .as_slice()
                         );
                         let mut expected = left.clone();
-                        expected.nullable = true;
+                        expected = expected
+                            .with_nullable(true)
+                            .expect("valid function nullability declaration");
                         assert_eq!(selected.result_type, FunctionResultType::Scalar(expected));
                         for policy in [
                             DecimalOverflowPolicy::OutputNull,
@@ -798,16 +779,18 @@ mod tests {
             FunctionValueType::new(DataType::Float64, false),
             FunctionValueType::new(DataType::Decimal128(18, 3), false),
             FunctionValueType::new(DataType::UInt64, false),
-            FunctionValueType {
-                data_type: DataType::FixedSizeBinary(16),
-                nullable: false,
-                logical_type: ValueLogicalType::Uuid,
-            },
-            FunctionValueType {
-                data_type: DataType::FixedSizeBinary(16),
-                nullable: false,
-                logical_type: ValueLogicalType::LargeInt,
-            },
+            FunctionValueType::try_from_legacy_declared_projection(
+                DataType::FixedSizeBinary(16),
+                false,
+                ValueLogicalType::Uuid,
+            )
+            .expect("valid temporary legacy function value declaration"),
+            FunctionValueType::try_from_legacy_declared_projection(
+                DataType::FixedSizeBinary(16),
+                false,
+                ValueLogicalType::LargeInt,
+            )
+            .expect("valid temporary legacy function value declaration"),
         ] {
             for index in 0..2 {
                 let mut wrong = arguments.clone();
@@ -965,7 +948,7 @@ mod tests {
             argument(FunctionValueType::new(DataType::Int64, false)),
             argument(FunctionValueType::new(DataType::Int64, false)),
         ];
-        let expected = FunctionValueType::new(
+        let expected = FunctionValueType::from_legacy_declared_projection(
             DataType::Struct(
                 (0..128)
                     .map(|index| {
@@ -1008,5 +991,76 @@ mod tests {
                 assert_eq!(control.calls.lock().unwrap().len(), at + 1);
             }
         }
+    }
+}
+
+impl BitShiftOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        work.step().map_err(FunctionEffectOwnerError::Control)?;
+        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
+        {
+            return Err(FunctionBindingError::UnknownFunction.into());
+        }
+        if !input.environment.is_empty()
+            || !matches!(input.proof_scope, CallProofScope::Unconditional)
+                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+        {
+            return Err(FunctionBindingError::InvalidBinding(
+                "bit shift has no environment dependencies and requires an exact proof scope"
+                    .into(),
+            )
+            .into());
+        }
+        work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+            other => FunctionEffectOwnerError::Owner(other),
+        })?;
+        let result = self.call_effects(input.proof_scope);
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        Ok(result)
+    }
+    fn prepare_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        work.step().map_err(compile_failure)?;
+        if input.function_id != self.declaration.function_id()
+            || input.kind != FunctionKind::Scalar
+            || contract.function_id() != input.function_id
+            || !std::ptr::eq(contract.selected(), input.selected)
+            || contract.context() != input.context
+            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
+            || contract.effects() != &self.call_effects(input.proof_scope)
+            || !input.environment.is_empty()
+        {
+            return Err(invalid(
+                "bit shift preparation differs from its exact checked call",
+            ));
+        }
+        work.flush().map_err(compile_failure)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => compile_failure(error),
+            _ => invalid("bit shift preparation has a stale selected binding"),
+        })?;
+        work.finish().map_err(compile_failure)?;
+        // The prepared object retains the same canonical contract. Its body is
+        // a static pure implementation and needs no live resolver or authority.
+        Ok(Arc::new(PreparedBitShift {
+            contract,
+            operation: self.operation,
+        }))
     }
 }

@@ -77,7 +77,7 @@ pub use projection::{
     Assignment, ConstraintApplicationResult, LimitApplicationResult, MAX_PROJECTION_ASSIGNMENTS,
     OrderedAssignments, ProjectionApplicationResult,
 };
-pub use public_schema::ConnectorReadPublicSchema;
+pub use public_schema::{ConnectorReadPublicSchema, ConnectorReadSchemaCreation};
 pub use runtime::{
     ConnectorAdmittedReadProviderFactory, ConnectorFrozenReadSource,
     ConnectorReadAttemptAccessMint, ConnectorReadAttemptAccessReacquirer,

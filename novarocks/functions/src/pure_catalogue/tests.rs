@@ -169,11 +169,13 @@ impl FunctionBindingResolver for Owner {
             .any(|a| matches!(a, FunctionArgument::Lambda { .. }));
         let selection = FunctionBindingSelection {
             overload: overload_id(if higher { HIGHER } else { SCALAR }),
-            argument_types: request
-                .arguments
-                .iter()
-                .map(FunctionArgument::argument_type)
-                .collect(),
+            argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                request
+                    .arguments
+                    .iter()
+                    .map(FunctionArgument::argument_type)
+                    .collect::<Box<[_]>>(),
+            ),
             result_type: FunctionResultType::Scalar(value_type()),
             aggregate: None,
         };
@@ -211,10 +213,12 @@ impl FunctionBindingResolver for Owner {
         if !arguments_match
             || request.logical_argument_count != expected.len()
             || selected.argument_types
-                != expected
-                    .iter()
-                    .map(FunctionArgument::argument_type)
-                    .collect::<Box<[_]>>()
+                != novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                    expected
+                        .iter()
+                        .map(FunctionArgument::argument_type)
+                        .collect::<Box<[_]>>(),
+                )
             || selected.result_type != FunctionResultType::Scalar(value_type())
             || selected.aggregate.is_some()
         {
@@ -385,7 +389,9 @@ fn higher_arguments() -> Vec<FunctionArgument> {
     vec![
         scalar_arguments().remove(0),
         FunctionArgument::Lambda {
-            parameter_types: Box::from([value_type()]),
+            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                Box::from([value_type()]),
+            ),
             result_type: value_type(),
         },
     ]

@@ -22,7 +22,7 @@
 //! registry, process-global runtime, or current-generation lookup participates
 //! in this capability.
 
-// Design: ADR-0176 (docs/adr/ADR-0176-attempt-local-maintenance-inputs-and-single-rewrite-plan.md)
+// Design: ADR-0177 (docs/adr/ADR-0177-attempt-local-maintenance-inputs-and-single-rewrite-plan.md)
 use crate::commit::model::EntryIdentity;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -112,13 +112,15 @@ impl IcebergDistributedRewriteControl {
     fn build_plan(
         &self,
         request: &ConnectorDistributedRewritePlanningRequest,
-    ) -> Result<ConnectorDistributedRewritePlan, ConnectorError> {
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorDistributedRewritePlan,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         validate_context(&request.context)?;
         let target = self.provider.table_payload(request.operation().table())?;
         if target.metadata_table_type.is_some() {
-            return Err(invalid(
-                "Iceberg distributed rewrite requires a base table handle",
-            ));
+            return Err(invalid("Iceberg distributed rewrite requires a base table handle").into());
         }
         self.runtime
             .control_state()
@@ -162,7 +164,8 @@ impl IcebergDistributedRewriteControl {
                 {
                     return Err(invalid(
                         "Iceberg rewrite position delete files requires a format v3 table",
-                    ));
+                    )
+                    .into());
                 }
                 groups
             }
@@ -214,6 +217,7 @@ impl IcebergDistributedRewriteControl {
             scan_schema,
             row_lineage,
             metadata,
+            creation,
         )?;
         let state_digest = rewrite_state_digest(
             metadata.uuid().to_string().as_bytes(),
@@ -265,6 +269,7 @@ impl IcebergDistributedRewriteControl {
             cohorts,
             frozen,
         )
+        .map_err(Into::into)
     }
 }
 
@@ -280,18 +285,20 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
     fn plan_rewrite(
         &self,
         request: ConnectorDistributedRewritePlanningRequest,
-    ) -> Result<ConnectorDistributedRewritePlan, ConnectorError> {
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorDistributedRewritePlan,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         request.validate()?;
         if request.owner() != &self.key {
-            return Err(invalid(
-                "Iceberg distributed rewrite request has a foreign generation",
-            ));
+            return Err(
+                invalid("Iceberg distributed rewrite request has a foreign generation").into(),
+            );
         }
         let target = self.provider.table_payload(request.operation().table())?;
         if target.metadata_table_type.is_some() {
-            return Err(invalid(
-                "Iceberg distributed rewrite requires a base table handle",
-            ));
+            return Err(invalid("Iceberg distributed rewrite requires a base table handle").into());
         }
         let operation = match request.operation() {
             ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
@@ -309,7 +316,7 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
                 request.context.initiation(),
             ))
             .map_err(connector_unsupported)?;
-        self.build_plan(&request)
+        self.build_plan(&request, creation)
     }
 
     /// The write session seals a rewrite's branches from the same frozen
@@ -686,7 +693,11 @@ fn cohort_plans_from_artifact(
     scan_schema: SchemaRef,
     row_lineage: bool,
     metadata: &crate::iceberg::spec::TableMetadata,
-) -> Result<Vec<ConnectorDistributedRewriteCohortPlan>, ConnectorError> {
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<
+    Vec<ConnectorDistributedRewriteCohortPlan>,
+    novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+> {
     let intent = match request.operation() {
         ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
             ConnectorWriteIntent::Overwrite
@@ -695,6 +706,7 @@ fn cohort_plans_from_artifact(
             ConnectorWriteIntent::RowDelta
         }
     };
+    let execution = rewrite_execution_schema(request.operation(), metadata, row_lineage, creation)?;
     artifact
         .groups
         .iter()
@@ -710,8 +722,10 @@ fn cohort_plans_from_artifact(
                 request,
                 intent,
                 scan_schema.as_ref(),
+                &execution,
                 row_lineage,
                 metadata,
+                creation,
             )?;
             // A data-file rewrite reads table rows, and its commit replaces
             // exactly the group's files, so the read is pinned to that same
@@ -743,37 +757,114 @@ fn cohort_plans_from_artifact(
                     )
                 }
             };
-            ConnectorDistributedRewriteCohortPlan::try_new(
+            ConnectorDistributedRewriteCohortPlan::try_new_typed(
                 cohort_id,
                 read,
                 scan_schema.clone(),
+                execution.clone(),
                 arrow_schema_digest(&scan_schema),
                 preparation,
                 group_digest,
+                creation,
             )
         })
         .collect()
 }
 
+fn rewrite_execution_schema(
+    operation: &ConnectorDistributedRewriteOperation,
+    metadata: &crate::iceberg::spec::TableMetadata,
+    row_lineage: bool,
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<
+    novarocks_connector_contract::ConnectorReadExecutionSchema,
+    novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+> {
+    use novarocks_connector_contract::{ConnectorReadExecutionSchema, PureProviderCompileError};
+    if matches!(
+        operation,
+        ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
+    ) {
+        let mut pseudo = creation.reserve::<String>(if row_lineage { 2 } else { 0 })?;
+        if row_lineage {
+            pseudo.push(creation.text(ICEBERG_ROW_ID_COL)?);
+            pseudo.push(creation.text(ICEBERG_LAST_UPDATED_SEQ_COL)?);
+        }
+        return crate::schema_mapping::catalog_value::table(
+            metadata,
+            metadata.current_schema(),
+            &pseudo,
+            creation,
+        );
+    }
+    let mut fields = creation.reserve(2)?;
+    let mut bindings = creation.reserve(2)?;
+    for (name, primitive) in [
+        ("file_path", crate::iceberg::spec::PrimitiveType::String),
+        ("pos", crate::iceberg::spec::PrimitiveType::Long),
+    ] {
+        let declared = crate::schema_mapping::typed_value::from_declaration(
+            &crate::iceberg::spec::Type::Primitive(primitive),
+            false,
+            None,
+            None,
+            creation,
+        )?;
+        let name = creation.text(name)?;
+        fields.push(creation.arc(Field::new(
+            name,
+            declared.binding.data_type().clone(),
+            false,
+        ))?);
+        bindings.push(declared.binding);
+    }
+    let fields = creation.arrow_fields(fields)?;
+    let schema = creation.arc(Schema::new(fields))?;
+    let storage = creation.storage();
+    let (request, work) = creation.observers();
+    ConnectorReadExecutionSchema::try_new_observed(
+        schema,
+        bindings.into_boxed_slice(),
+        storage,
+        |layout| request(layout).map_err(PureProviderCompileError::Control),
+        |units| work(units).map_err(PureProviderCompileError::Control),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn rewrite_preparation(
     owner: &ConnectorProviderBindingKey,
     request: &ConnectorDistributedRewritePlanningRequest,
     intent: ConnectorWriteIntent,
     scan_schema: &Schema,
+    execution: &novarocks_connector_contract::ConnectorReadExecutionSchema,
     row_lineage: bool,
     metadata: &crate::iceberg::spec::TableMetadata,
-) -> Result<ConnectorWritePreparation, ConnectorError> {
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<
+    ConnectorWritePreparation,
+    novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+> {
     let fields = scan_schema
         .fields()
         .iter()
         .enumerate()
         .map(|(ordinal, field)| {
-            ConnectorWriteFieldBinding::new(
+            let value = execution.binding(ordinal).ok_or_else(|| {
+                internal("Iceberg rewrite input has no complete execution declaration")
+            })?;
+            // Provider annotations remain source facts; the already authored
+            // execution declaration chooses the writer's actual value carrier.
+            ConnectorWriteFieldBinding::try_new_typed(
                 rewrite_field_token(owner, request.operation().table(), intent, ordinal, field),
-                field.as_ref().clone(),
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(value.data_type().clone()),
+                value.clone(),
             )
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
     let input = match request.operation() {
         ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } if row_lineage => {
             let row_identity_fields = fields
@@ -811,6 +902,7 @@ fn rewrite_preparation(
                     request.operation().table(),
                     intent,
                     metadata,
+                    creation,
                 )?,
             }
         }
@@ -836,6 +928,7 @@ fn rewrite_preparation(
             snapshot,
         )),
     )
+    .map_err(Into::into)
 }
 
 fn partition_source_bindings(
@@ -843,7 +936,20 @@ fn partition_source_bindings(
     table: &ConnectorTableHandle,
     intent: ConnectorWriteIntent,
     metadata: &crate::iceberg::spec::TableMetadata,
-) -> Result<Vec<ConnectorWriteFieldBinding>, ConnectorError> {
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<
+    Vec<ConnectorWriteFieldBinding>,
+    novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+> {
+    if metadata.default_partition_spec().fields().is_empty() {
+        return Ok(Vec::new());
+    }
+    let execution = crate::schema_mapping::catalog_value::table(
+        metadata,
+        metadata.current_schema(),
+        &[],
+        creation,
+    )?;
     let arrow = crate::iceberg::arrow::schema_to_arrow_schema(metadata.current_schema())
         .map_err(|error| internal(format!("convert Iceberg rewrite partition schema: {error}")))?;
     metadata
@@ -872,10 +978,18 @@ fn partition_source_bindings(
                 .position(|candidate| candidate.id == field.id)
                 .ok_or_else(|| corrupt("Iceberg rewrite partition source is not top-level"))?;
             let exact = arrow.field(field_ordinal).clone();
-            Ok(ConnectorWriteFieldBinding::new(
+            let value = execution.binding(field_ordinal).ok_or_else(|| {
+                internal("Iceberg rewrite partition source has no complete execution declaration")
+            })?;
+            ConnectorWriteFieldBinding::try_new_typed(
                 rewrite_field_token(owner, table, intent, 10_000 + ordinal, &exact),
-                exact.as_ref().clone(),
-            ))
+                exact
+                    .as_ref()
+                    .clone()
+                    .with_data_type(value.data_type().clone()),
+                value.clone(),
+            )
+            .map_err(Into::into)
         })
         .collect()
 }
@@ -1744,6 +1858,175 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_preparation_retains_complete_input_and_partition_declarations() {
+        use crate::iceberg::spec::{
+            FormatVersion, NestedField, PartitionSpec, PrimitiveType, SortOrder,
+            TableMetadataBuilder, Transform, Type,
+        };
+        let declaration = crate::iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "name",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let spec = PartitionSpec::builder(declaration.clone())
+            .with_spec_id(0)
+            .add_partition_field("id", "id", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let metadata = TableMetadataBuilder::new(
+            declaration,
+            spec.into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///warehouse/db/t".to_string(),
+            FormatVersion::V3,
+            std::collections::HashMap::from([(
+                crate::scalar_integer_domain::PROPERTY.to_string(),
+                r#"{"1":"tinyint"}"#.to_string(),
+            )]),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let owner = ConnectorProviderBindingKey {
+            instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("ice").unwrap(),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
+        };
+        for (position, row_lineage) in [(false, false), (false, true), (true, false)] {
+            let table = admission_table(owner.instance_id.clone());
+            let operation = if position {
+                ConnectorDistributedRewriteOperation::RewritePositionDeletes {
+                    table,
+                    rewrite_all: true,
+                    min_input_files: None,
+                }
+            } else {
+                ConnectorDistributedRewriteOperation::RewriteDataFiles {
+                    table,
+                    rewrite_all: true,
+                }
+            };
+            let request = ConnectorDistributedRewritePlanningRequest::try_new(
+                novarocks_spi::connector::ConnectorWriteOperationId::new(),
+                owner.clone(),
+                operation,
+                admission_context("hive"),
+            )
+            .unwrap();
+            let mut layout = |_| Ok(());
+            let mut work = |_| Ok(());
+            let mut creation =
+                novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    &mut layout,
+                    &mut work,
+                );
+            let physical = Arc::new(
+                crate::iceberg::arrow::schema_to_arrow_schema(metadata.current_schema()).unwrap(),
+            );
+            let source = rewrite_input_schema(request.operation(), physical, row_lineage);
+            let execution = rewrite_execution_schema(
+                request.operation(),
+                &metadata,
+                row_lineage,
+                &mut creation,
+            )
+            .unwrap();
+            let preparation = rewrite_preparation(
+                &owner,
+                &request,
+                if position {
+                    ConnectorWriteIntent::RowDelta
+                } else {
+                    ConnectorWriteIntent::Overwrite
+                },
+                &source,
+                &execution,
+                row_lineage,
+                &metadata,
+                &mut creation,
+            )
+            .unwrap();
+            for (ordinal, source_field) in source.fields().iter().enumerate() {
+                let actual = preparation
+                    .input()
+                    .fields()
+                    .into_iter()
+                    .find(|field| field.field().name() == source_field.name())
+                    .unwrap();
+                let expected = execution.binding(ordinal).unwrap();
+                assert_eq!(actual.execution_type(), Some(expected));
+                assert_eq!(actual.field().data_type(), expected.data_type());
+                assert_eq!(actual.field().metadata(), source_field.metadata());
+            }
+            if let ConnectorWriteInputShape::DeletionVector {
+                partition_source_fields,
+                ..
+            } = preparation.input()
+            {
+                let catalog = crate::schema_mapping::catalog_value::table(
+                    &metadata,
+                    metadata.current_schema(),
+                    &[],
+                    &mut creation,
+                )
+                .unwrap();
+                assert_eq!(partition_source_fields.len(), 1);
+                assert_eq!(
+                    partition_source_fields[0].execution_type(),
+                    catalog.binding(0)
+                );
+                assert_eq!(
+                    partition_source_fields[0].field().data_type(),
+                    &DataType::Int8
+                );
+            } else {
+                assert_eq!(
+                    preparation.input().fields()[0].field().data_type(),
+                    &DataType::Int8
+                );
+            }
+        }
+        for cause in [
+            novarocks_type_contract::CompileControlError::Cancelled,
+            novarocks_type_contract::CompileControlError::DeadlineExceeded,
+            novarocks_type_contract::CompileControlError::ResourceExhausted,
+        ] {
+            let mut layout = |_| Ok(());
+            let mut work = |_| Err(cause);
+            let mut creation =
+                novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    &mut layout,
+                    &mut work,
+                );
+            let error = partition_source_bindings(
+                &owner,
+                &admission_table(owner.instance_id.clone()),
+                ConnectorWriteIntent::RowDelta,
+                &metadata,
+                &mut creation,
+            )
+            .unwrap_err();
+            assert!(matches!(error,
+                novarocks_connector_contract::PureProviderCompileError::Control(actual)
+                    if actual == cause
+            ));
+        }
+    }
+
+    #[test]
     fn planning_refuses_hms_and_background_hadoop_before_rewrite_artifacts() {
         use novarocks_spi::connector::{
             ConnectorInstanceId, ConnectorProviderId, ConnectorWriteOperationId,
@@ -1781,9 +2064,21 @@ mod tests {
                     admission_context(catalog_type),
                 )
                 .expect("request");
+                let mut layout = |_| Ok(());
+                let mut work = |_| Ok(());
+                let mut creation =
+                    novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                        &mut layout,
+                        &mut work,
+                    );
                 let error = adapter
-                    .plan_rewrite(request)
+                    .plan_rewrite(request, &mut creation)
                     .expect_err("catalog admission must refuse planning");
+                let novarocks_connector_contract::PureProviderCompileError::Provider(error) = error
+                else {
+                    panic!("catalog admission must retain its provider cause");
+                };
                 assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
                 assert!(error.to_string().contains(if catalog_type == "hive" {
                     "read-only compatibility entry"

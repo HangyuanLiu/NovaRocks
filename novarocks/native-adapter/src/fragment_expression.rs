@@ -20,9 +20,9 @@
 use arrow::datatypes::DataType;
 
 use self::error::NativeExpressionDecodeError;
-use novarocks_execution::exec::chunk::{ChunkFieldSchema, SlotLayout};
+use crate::fragment_type_decode::NativeTypeDecoder;
+use novarocks_execution::exec::chunk::SlotLayout;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
-use novarocks_plan_codec::native_type::{decode_field_type, decode_type};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::expr;
 use novarocks_types::SlotId;
@@ -78,7 +78,8 @@ impl NativeExpressionInputLayout {
     }
 }
 
-#[allow(dead_code)]
+/// Test convenience over the same typed owner used by production.
+#[cfg(test)]
 pub(crate) fn decode_expr(
     e: &expr::Expr,
     arena: &mut ExprArena,
@@ -87,14 +88,62 @@ pub(crate) fn decode_expr(
     decode_expr_at(e, FieldPath::root("expr"), arena, input_layout)
 }
 
+#[cfg(test)]
 pub fn decode_expr_at(
     e: &expr::Expr,
     path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
 ) -> Result<ExprId, NativeExpressionDecodeError> {
-    validate_proto_expr_shape_at(e, path.clone())?;
-    let data_type = decode_expr_type_at(e, path.clone())?;
+    crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+        decode_expr_at_with_types(e, path, arena, input_layout, decoder)
+    })
+}
+
+#[cfg(test)]
+pub fn validate_proto_expr_shape_at(
+    e: &expr::Expr,
+    path: FieldPath,
+) -> Result<(), NativeExpressionDecodeError> {
+    crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+        validate_proto_expr_shape_at_with_types(e, path, decoder)
+    })
+}
+
+#[cfg(test)]
+pub fn decode_expr_for_slot_layout(
+    e: &expr::Expr,
+    path: FieldPath,
+    arena: &mut ExprArena,
+    layout: &SlotLayout,
+) -> Result<ExprId, NativeFragmentDecodeError> {
+    crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+        decode_expr_for_slot_layout_with_types(e, path, arena, layout, decoder)
+    })
+}
+
+fn decode_type_with_decoder(
+    desc: &novarocks_proto_models::common::TypeDesc,
+    path: FieldPath,
+    type_decoder: &mut NativeTypeDecoder<'_, '_, '_>,
+) -> Result<DataType, NativeExpressionDecodeError> {
+    type_decoder.data_type(desc, path).map_err(Into::into)
+}
+
+pub(crate) fn decode_expr_at_with_types(
+    e: &expr::Expr,
+    path: FieldPath,
+    arena: &mut ExprArena,
+    input_layout: &NativeExpressionInputLayout,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
+) -> Result<ExprId, NativeExpressionDecodeError> {
+    validate_proto_expr_shape_at_with_types(e, path.clone(), type_decoder)?;
+    let data_type = decode_expr_type_at(e, path.clone(), type_decoder)?;
+    let declared = type_decoder.value_type(
+        e.r#type.as_ref().expect("validated expression type"),
+        path.clone().field("type"),
+    )?;
     let kind = e.kind.as_ref().expect("validated native expression kind");
 
     let id = match kind {
@@ -103,8 +152,17 @@ pub fn decode_expr_at(
                 .resolve_column_id(column.column_id, path.clone().field("column_ref"))?;
             Ok(arena.push_typed(ExprNode::SlotId(slot_id), data_type))
         }
+        expr::expr::Kind::ConstantReference(reference) => {
+            let value = type_decoder.constant_value(
+                reference,
+                e,
+                path.clone().field("constant_reference"),
+            )?;
+            Ok(arena.push_typed(ExprNode::Constant(value), data_type))
+        }
         expr::expr::Kind::Literal(literal) => {
             let literal_path = path.clone().field("literal");
+            type_decoder.reject_strong_inline_literal(literal_path.clone())?;
             let value = literal::lower_literal_at(literal, &data_type)
                 .map_err(|error| error.into_protocol(literal_path))?;
             Ok(arena.push_typed(ExprNode::Literal(value), data_type))
@@ -115,6 +173,7 @@ pub fn decode_expr_at(
             arena,
             input_layout,
             data_type,
+            type_decoder,
         ),
         expr::expr::Kind::UnaryOp(unary) => unary::lower_unary_op(
             unary,
@@ -122,13 +181,17 @@ pub fn decode_expr_at(
             arena,
             input_layout,
             data_type,
+            type_decoder,
         ),
         expr::expr::Kind::FunctionCall(call) => function_call::lower_function_call(
+            e,
             call,
             path.clone().field("function_call"),
             arena,
             input_layout,
             data_type,
+            declared.as_ref(),
+            type_decoder,
         ),
         expr::expr::Kind::AggregateCall(_) => Err(NativeExpressionDecodeError::unsupported(
             path.clone().field("aggregate_call"),
@@ -138,12 +201,14 @@ pub fn decode_expr_at(
             path.clone().field("window_call"),
             "native scalar expression lowering does not lower WindowCall",
         )),
-        expr::expr::Kind::Cast(cast) => cast::lower_cast(
+        expr::expr::Kind::Cast(cast) => cast::lower_cast_with_binding(
             cast,
             path.clone().field("cast"),
             arena,
             input_layout,
             data_type,
+            declared.as_ref(),
+            type_decoder,
         ),
         expr::expr::Kind::IsNull(is_null) => predicate::lower_is_null(
             is_null,
@@ -151,6 +216,7 @@ pub fn decode_expr_at(
             arena,
             input_layout,
             data_type,
+            type_decoder,
         ),
         expr::expr::Kind::InList(in_list) => predicate::lower_in_list(
             in_list,
@@ -158,6 +224,7 @@ pub fn decode_expr_at(
             arena,
             input_layout,
             data_type,
+            type_decoder,
         ),
         expr::expr::Kind::Between(between) => predicate::lower_between(
             between,
@@ -165,6 +232,8 @@ pub fn decode_expr_at(
             arena,
             input_layout,
             data_type,
+            declared.as_ref(),
+            type_decoder,
         ),
         expr::expr::Kind::Like(like) => predicate::lower_like(
             like,
@@ -172,6 +241,8 @@ pub fn decode_expr_at(
             arena,
             input_layout,
             data_type,
+            declared.as_ref(),
+            type_decoder,
         ),
         expr::expr::Kind::CaseExpr(case_expr) => case::lower_case(
             case_expr,
@@ -179,6 +250,7 @@ pub fn decode_expr_at(
             arena,
             input_layout,
             data_type,
+            type_decoder,
         ),
         expr::expr::Kind::IsTruth(is_truth) => predicate::lower_is_truth(
             is_truth,
@@ -186,6 +258,8 @@ pub fn decode_expr_at(
             arena,
             input_layout,
             data_type,
+            declared.as_ref(),
+            type_decoder,
         ),
         expr::expr::Kind::LambdaParamRef(param) => {
             let slot_id = SlotId::try_from(param.slot_id).map_err(|error| {
@@ -202,6 +276,7 @@ pub fn decode_expr_at(
             arena,
             input_layout,
             data_type,
+            type_decoder,
         ),
         expr::expr::Kind::Nested(nested) => nested::lower_nested(
             nested,
@@ -209,26 +284,32 @@ pub fn decode_expr_at(
             arena,
             input_layout,
             data_type,
+            type_decoder,
         ),
     }?;
-    set_proto_field_schema(e, arena, id);
+
+    type_decoder.save_expression_binding(e, path, id, arena)?;
     Ok(id)
 }
 
-pub fn decode_expr_for_slot_layout(
+pub(crate) fn decode_expr_for_slot_layout_with_types(
     e: &expr::Expr,
     path: FieldPath,
     arena: &mut ExprArena,
     layout: &SlotLayout,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, NativeFragmentDecodeError> {
     let input = NativeExpressionInputLayout::from_slot_ids(layout.order().iter().copied());
-    decode_expr_at(e, path, arena, &input)
-        .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))
+    decode_expr_at_with_types(e, path, arena, &input, type_decoder)
+        .map_err(|error| error.into_native())
 }
 
 fn decode_expr_type_at(
     e: &expr::Expr,
     path: FieldPath,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<DataType, NativeExpressionDecodeError> {
     let desc = e.r#type.as_ref().ok_or_else(|| {
         NativeExpressionDecodeError::missing(
@@ -236,8 +317,7 @@ fn decode_expr_type_at(
             "native Expr requires type",
         )
     })?;
-    decode_type(desc)
-        .map_err(|error| NativeExpressionDecodeError::invalid_value(path.field("type"), error))
+    decode_type_with_decoder(desc, path.field("type"), type_decoder)
 }
 
 pub(crate) fn decode_decimal_overflow_policy(
@@ -280,9 +360,11 @@ pub(crate) fn require_binary_decimal_policy(
     Ok(())
 }
 
-pub fn validate_proto_expr_shape_at(
+pub(crate) fn validate_proto_expr_shape_at_with_types(
     e: &expr::Expr,
     path: FieldPath,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<(), NativeExpressionDecodeError> {
     let type_desc = e.r#type.as_ref().ok_or_else(|| {
         NativeExpressionDecodeError::missing(
@@ -290,12 +372,7 @@ pub fn validate_proto_expr_shape_at(
             "native Expr requires type",
         )
     })?;
-    decode_type(type_desc).map_err(|error| {
-        NativeExpressionDecodeError::invalid_value(
-            path.clone().field("type"),
-            format!("native Expr type is invalid: {error}"),
-        )
-    })?;
+    decode_type_with_decoder(type_desc, path.clone().field("type"), type_decoder)?;
     let kind = e.kind.as_ref().ok_or_else(|| {
         NativeExpressionDecodeError::missing(
             path.clone().field("kind"),
@@ -303,10 +380,12 @@ pub fn validate_proto_expr_shape_at(
         )
     })?;
 
-    let required_boxed = |owner_path: FieldPath,
-                          child: &Option<Box<expr::Expr>>,
-                          field: &'static str|
-     -> Result<(), NativeExpressionDecodeError> {
+    fn required_boxed(
+        owner_path: FieldPath,
+        child: &Option<Box<expr::Expr>>,
+        field: &'static str,
+        type_decoder: &mut NativeTypeDecoder<'_, '_, '_>,
+    ) -> Result<(), NativeExpressionDecodeError> {
         let child_path = owner_path.field(field);
         let child = child.as_deref().ok_or_else(|| {
             NativeExpressionDecodeError::missing(
@@ -314,17 +393,23 @@ pub fn validate_proto_expr_shape_at(
                 format!("native Expr requires {field}"),
             )
         })?;
-        validate_proto_expr_shape_at(child, child_path)
-    };
-    let list = |owner_path: FieldPath,
-                values: &[expr::Expr],
-                field: &'static str|
-     -> Result<(), NativeExpressionDecodeError> {
+        validate_proto_expr_shape_at_with_types(child, child_path, type_decoder)
+    }
+    fn list(
+        owner_path: FieldPath,
+        values: &[expr::Expr],
+        field: &'static str,
+        type_decoder: &mut NativeTypeDecoder<'_, '_, '_>,
+    ) -> Result<(), NativeExpressionDecodeError> {
         for (index, value) in values.iter().enumerate() {
-            validate_proto_expr_shape_at(value, owner_path.clone().field(field).index(index))?;
+            validate_proto_expr_shape_at_with_types(
+                value,
+                owner_path.clone().field(field).index(index),
+                type_decoder,
+            )?;
         }
         Ok(())
-    };
+    }
 
     match kind {
         expr::expr::Kind::BinaryOp(binary) => {
@@ -350,8 +435,8 @@ pub fn validate_proto_expr_shape_at(
                 policy,
                 path.clone().field("decimal_overflow_policy"),
             )?;
-            required_boxed(path.clone(), &binary.left, "left")?;
-            required_boxed(path, &binary.right, "right")?;
+            required_boxed(path.clone(), &binary.left, "left", type_decoder)?;
+            required_boxed(path, &binary.right, "right", type_decoder)?;
         }
         expr::expr::Kind::UnaryOp(unary) => {
             let path = path.clone().field("unary_op");
@@ -367,25 +452,30 @@ pub fn validate_proto_expr_shape_at(
                     "UnaryOp.op is unspecified",
                 ));
             }
-            required_boxed(path, &unary.operand, "operand")?;
+            required_boxed(path, &unary.operand, "operand", type_decoder)?;
         }
         expr::expr::Kind::FunctionCall(call) => {
             let path = path.clone().field("function_call");
             validate_function_name_at(&call.function_name, path.clone().field("function_name"))?;
-            list(path, &call.args, "args")?;
+            list(path, &call.args, "args", type_decoder)?;
         }
         expr::expr::Kind::AggregateCall(call) => {
             let path = path.clone().field("aggregate_call");
             validate_function_name_at(&call.function_name, path.clone().field("function_name"))?;
-            list(path.clone(), &call.args, "args")?;
-            validate_sort_items_at(&call.order_by, path.clone().field("order_by"))?;
+            list(path.clone(), &call.args, "args", type_decoder)?;
+            validate_sort_items_at(&call.order_by, path.clone().field("order_by"), type_decoder)?;
         }
         expr::expr::Kind::WindowCall(call) => {
             let path = path.clone().field("window_call");
             validate_function_name_at(&call.function_name, path.clone().field("function_name"))?;
-            list(path.clone(), &call.args, "args")?;
-            list(path.clone(), &call.partition_by, "partition_by")?;
-            validate_sort_items_at(&call.order_by, path.clone().field("order_by"))?;
+            list(path.clone(), &call.args, "args", type_decoder)?;
+            list(
+                path.clone(),
+                &call.partition_by,
+                "partition_by",
+                type_decoder,
+            )?;
+            validate_sort_items_at(&call.order_by, path.clone().field("order_by"), type_decoder)?;
             if let Some(frame) = &call.frame {
                 validate_window_frame_at(frame, path.clone().field("frame"))?;
             }
@@ -408,10 +498,10 @@ pub fn validate_proto_expr_shape_at(
                     "native Cast requires target",
                 )
             })?;
-            let source_type = decode_expr_type_at(operand, path.clone().field("operand"))?;
-            let target_type = decode_type(target).map_err(|error| {
-                NativeExpressionDecodeError::invalid_value(path.clone().field("target"), error)
-            })?;
+            let source_type =
+                decode_expr_type_at(operand, path.clone().field("operand"), type_decoder)?;
+            let target_type =
+                decode_type_with_decoder(target, path.clone().field("target"), type_decoder)?;
             if !novarocks_type_contract::decimal_error_policy_cast_supported(
                 &source_type,
                 &target_type,
@@ -422,37 +512,44 @@ pub fn validate_proto_expr_shape_at(
                     "ReportError decimal CAST does not support nested type conversion",
                 ));
             }
-            required_boxed(path.clone(), &cast.operand, "operand")?;
+            required_boxed(path.clone(), &cast.operand, "operand", type_decoder)?;
         }
-        expr::expr::Kind::IsNull(is_null) => {
-            required_boxed(path.clone().field("is_null"), &is_null.operand, "operand")?
-        }
+        expr::expr::Kind::IsNull(is_null) => required_boxed(
+            path.clone().field("is_null"),
+            &is_null.operand,
+            "operand",
+            type_decoder,
+        )?,
         expr::expr::Kind::InList(in_list) => {
             let path = path.clone().field("in_list");
-            required_boxed(path.clone(), &in_list.operand, "operand")?;
+            required_boxed(path.clone(), &in_list.operand, "operand", type_decoder)?;
             if in_list.list.is_empty() {
                 return Err(NativeExpressionDecodeError::invalid_value(
                     path.clone().field("list"),
                     "InList.list is empty",
                 ));
             }
-            list(path, &in_list.list, "list")?;
+            list(path, &in_list.list, "list", type_decoder)?;
         }
         expr::expr::Kind::Between(between) => {
             let path = path.clone().field("between");
-            required_boxed(path.clone(), &between.operand, "operand")?;
-            required_boxed(path.clone(), &between.low, "low")?;
-            required_boxed(path, &between.high, "high")?;
+            required_boxed(path.clone(), &between.operand, "operand", type_decoder)?;
+            required_boxed(path.clone(), &between.low, "low", type_decoder)?;
+            required_boxed(path, &between.high, "high", type_decoder)?;
         }
         expr::expr::Kind::Like(like) => {
             let path = path.clone().field("like");
-            required_boxed(path.clone(), &like.operand, "operand")?;
-            required_boxed(path, &like.pattern, "pattern")?;
+            required_boxed(path.clone(), &like.operand, "operand", type_decoder)?;
+            required_boxed(path, &like.pattern, "pattern", type_decoder)?;
         }
         expr::expr::Kind::CaseExpr(case_expr) => {
             let path = path.clone().field("case_expr");
             if let Some(operand) = &case_expr.operand {
-                validate_proto_expr_shape_at(operand, path.clone().field("operand"))?;
+                validate_proto_expr_shape_at_with_types(
+                    operand,
+                    path.clone().field("operand"),
+                    type_decoder,
+                )?;
             }
             if case_expr.when_then.is_empty() {
                 return Err(NativeExpressionDecodeError::invalid_value(
@@ -468,22 +565,37 @@ pub fn validate_proto_expr_shape_at(
                         "native CaseExpr branch requires when",
                     )
                 })?;
-                validate_proto_expr_shape_at(when, branch_path.clone().field("when"))?;
+                validate_proto_expr_shape_at_with_types(
+                    when,
+                    branch_path.clone().field("when"),
+                    type_decoder,
+                )?;
                 let then = branch.then.as_ref().ok_or_else(|| {
                     NativeExpressionDecodeError::missing(
                         branch_path.clone().field("then"),
                         "native CaseExpr branch requires then",
                     )
                 })?;
-                validate_proto_expr_shape_at(then, branch_path.field("then"))?;
+                validate_proto_expr_shape_at_with_types(
+                    then,
+                    branch_path.field("then"),
+                    type_decoder,
+                )?;
             }
             if let Some(else_expr) = &case_expr.else_expr {
-                validate_proto_expr_shape_at(else_expr, path.clone().field("else_expr"))?;
+                validate_proto_expr_shape_at_with_types(
+                    else_expr,
+                    path.clone().field("else_expr"),
+                    type_decoder,
+                )?;
             }
         }
-        expr::expr::Kind::IsTruth(is_truth) => {
-            required_boxed(path.clone().field("is_truth"), &is_truth.operand, "operand")?
-        }
+        expr::expr::Kind::IsTruth(is_truth) => required_boxed(
+            path.clone().field("is_truth"),
+            &is_truth.operand,
+            "operand",
+            type_decoder,
+        )?,
         expr::expr::Kind::Lambda(lambda) => {
             let path = path.clone().field("lambda");
             if lambda.params.is_empty() {
@@ -513,15 +625,16 @@ pub fn validate_proto_expr_shape_at(
                         "native Lambda parameter requires type",
                     )
                 })?;
-                decode_type(param_type).map_err(|error| {
-                    NativeExpressionDecodeError::invalid_value(param_path.field("type"), error)
-                })?;
+                decode_type_with_decoder(param_type, param_path.field("type"), type_decoder)?;
             }
-            required_boxed(path, &lambda.body, "body")?;
+            required_boxed(path, &lambda.body, "body", type_decoder)?;
         }
-        expr::expr::Kind::Nested(nested) => {
-            required_boxed(path.clone().field("nested"), &nested.inner, "inner")?
-        }
+        expr::expr::Kind::Nested(nested) => required_boxed(
+            path.clone().field("nested"),
+            &nested.inner,
+            "inner",
+            type_decoder,
+        )?,
         expr::expr::Kind::ColumnRef(column) => {
             let path = path.clone().field("column_ref");
             if column.column_id == 0 {
@@ -531,8 +644,17 @@ pub fn validate_proto_expr_shape_at(
                 ));
             }
         }
+        expr::expr::Kind::ConstantReference(reference) => {
+            if reference.pool_id.is_none() {
+                return Err(NativeExpressionDecodeError::missing(
+                    path.clone().field("constant_reference").field("pool_id"),
+                    "constant pool reference is absent",
+                ));
+            }
+        }
         expr::expr::Kind::Literal(literal) => {
             let path = path.clone().field("literal");
+            type_decoder.reject_strong_inline_literal(path.clone())?;
             let value = literal.value.as_ref().ok_or_else(|| {
                 NativeExpressionDecodeError::missing(
                     path.clone().field("value"),
@@ -575,6 +697,8 @@ fn validate_function_name_at(
 fn validate_sort_items_at(
     items: &[expr::SortItem],
     path: FieldPath,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<(), NativeExpressionDecodeError> {
     for (index, item) in items.iter().enumerate() {
         let expression_path = path.clone().index(index).field("expr");
@@ -584,7 +708,7 @@ fn validate_sort_items_at(
                 "native SortItem requires expr",
             )
         })?;
-        validate_proto_expr_shape_at(expression, expression_path)?;
+        validate_proto_expr_shape_at_with_types(expression, expression_path, type_decoder)?;
     }
     Ok(())
 }
@@ -656,28 +780,18 @@ fn validate_window_bound_at(
     }
 }
 
-fn set_proto_field_schema(e: &expr::Expr, arena: &mut ExprArena, id: ExprId) {
-    let Some(desc) = e.r#type.as_ref() else {
-        return;
-    };
-    let Ok(field) = decode_field_type("_expr", e.nullable, desc) else {
-        return;
-    };
-    if let Ok(field_schema) = ChunkFieldSchema::from_field(&field) {
-        arena.set_field_schema(id, field_schema);
-    }
-}
-
 fn lower_required_child(
     child: &Option<Box<expr::Expr>>,
     path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, NativeExpressionDecodeError> {
     let child = child.as_ref().ok_or_else(|| {
         NativeExpressionDecodeError::missing(path.clone(), "native Expr child is required")
     })?;
-    decode_expr_at(child, path, arena, input_layout)
+    decode_expr_at_with_types(child, path, arena, input_layout, type_decoder)
 }
 
 fn lower_required_unboxed_child(
@@ -685,11 +799,13 @@ fn lower_required_unboxed_child(
     path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, NativeExpressionDecodeError> {
     let child = child.as_ref().ok_or_else(|| {
         NativeExpressionDecodeError::missing(path.clone(), "native Expr child is required")
     })?;
-    decode_expr_at(child, path, arena, input_layout)
+    decode_expr_at_with_types(child, path, arena, input_layout, type_decoder)
 }
 
 fn lower_expr_list(
@@ -697,13 +813,31 @@ fn lower_expr_list(
     path: FieldPath,
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<Vec<ExprId>, NativeExpressionDecodeError> {
     values
         .iter()
         .enumerate()
-        .map(|(index, value)| decode_expr_at(value, path.clone().index(index), arena, input_layout))
+        .map(|(index, value)| {
+            decode_expr_at_with_types(
+                value,
+                path.clone().index(index),
+                arena,
+                input_layout,
+                type_decoder,
+            )
+        })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "fragment_expression/fixture_sources.rs"]
+pub(crate) mod fixture_sources;
+
+#[cfg(test)]
+#[path = "fragment_expression/fixture_scalar_sources.rs"]
+mod fixture_scalar_sources;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -716,21 +850,84 @@ pub(crate) mod tests {
     use novarocks_execution::exec::expr::{
         ExprArena, ExprNode, LiteralValue, function::FunctionKind,
     };
-    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr};
     use novarocks_types::SlotId;
-    use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
-    pub(crate) fn type_desc(data_type: &DataType) -> common::TypeDesc {
-        encode_type(data_type).expect("encode type")
+    use super::fixture_sources;
+    pub(crate) use fixture_sources::{
+        Declaration, json_type, largeint_type, type_desc, variant_type,
+    };
+
+    pub(crate) fn decode_fixture_expr(
+        e: &expr::Expr,
+        arena: &mut ExprArena,
+        layout: &NativeExpressionInputLayout,
+    ) -> Result<ExprId, NativeExpressionDecodeError> {
+        fixture_sources::decode(e, FieldPath::root("expr"), arena, layout)
     }
 
-    pub(crate) fn scalar_expr(data_type: DataType, kind: expr::expr::Kind) -> expr::Expr {
+    pub(crate) fn scalar_expr(data_type: impl Declaration, kind: expr::expr::Kind) -> expr::Expr {
+        let declared = data_type.declared();
+        let (declared, kind) = match kind {
+            expr::expr::Kind::Literal(literal) => {
+                // This literal's actual constant source is immutable and
+                // non-null unless its independently authored value is NULL.
+                let nullable = matches!(
+                    literal
+                        .value
+                        .as_ref()
+                        .and_then(|value| value.value.as_ref()),
+                    Some(common::literal_value::Value::NullValue(true))
+                );
+                let declared = declared.with_nullable(nullable).unwrap();
+                let reference = fixture_sources::constant_reference(&declared, &literal);
+                (declared, expr::expr::Kind::ConstantReference(reference))
+            }
+            kind => (declared, kind),
+        };
         expr::Expr {
-            r#type: Some(type_desc(&data_type)),
-            nullable: true,
+            original_definition_id: None,
+            r#type: Some(fixture_sources::type_desc_with_nullable(
+                &declared,
+                declared.nullable(),
+            )),
+            nullable: declared.nullable(),
             kind: Some(kind),
         }
+    }
+
+    pub(crate) fn with_fixture_decoder<T>(
+        operation: impl FnOnce(
+            &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
+        ) -> Result<T, NativeExpressionDecodeError>,
+    ) -> Result<T, NativeExpressionDecodeError> {
+        fixture_sources::with_decoder(operation)
+    }
+
+    pub(crate) fn validate_fixture_expression(
+        e: &expr::Expr,
+        path: FieldPath,
+    ) -> Result<(), NativeExpressionDecodeError> {
+        with_fixture_decoder(|decoder| {
+            super::validate_proto_expr_shape_at_with_types(e, path, decoder)
+        })
+    }
+
+    pub(crate) fn fixture_constant_is_null(value: &novarocks_functions::ConstantValue) -> bool {
+        fixture_sources::constant_is_null(value)
+    }
+
+    pub(crate) fn assert_complete_frozen(arena: ExprArena) {
+        let frozen = arena
+            .into_immutable()
+            .expect("complete Native expression freeze");
+        assert!(
+            frozen
+                .nodes()
+                .iter()
+                .all(|node| node.value_type().is_some()),
+            "every original and synthetic node retains its complete authored binding"
+        );
     }
 
     pub(crate) fn int_lit(value: i64) -> expr::Expr {
@@ -777,7 +974,7 @@ pub(crate) mod tests {
         )
     }
 
-    pub(crate) fn col(column_id: u32, data_type: DataType) -> expr::Expr {
+    pub(crate) fn col(column_id: u32, data_type: impl Declaration) -> expr::Expr {
         scalar_expr(
             data_type,
             expr::expr::Kind::ColumnRef(expr::ColumnRef {
@@ -788,21 +985,8 @@ pub(crate) mod tests {
         )
     }
 
-    pub(crate) fn map_string_json_type() -> DataType {
-        DataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                DataType::Struct(Fields::from(vec![
-                    Arc::new(Field::new("key", DataType::Utf8, true)),
-                    Arc::new(field_with_logical_type(
-                        Field::new("value", DataType::Utf8, true),
-                        LogicalType::Json,
-                    )),
-                ])),
-                false,
-            )),
-            false,
-        )
+    pub(crate) fn map_string_json_type() -> novarocks_type_contract::FunctionValueType {
+        fixture_sources::map_json_type()
     }
 
     pub(crate) fn layout_for_slots(slots: &[u32]) -> NativeExpressionInputLayout {
@@ -815,7 +999,7 @@ pub(crate) mod tests {
     ) -> (ExprArena, novarocks_execution::exec::expr::ExprId) {
         let mut arena = ExprArena::default();
         let layout = layout_for_slots(slots);
-        let id = decode_expr(e, &mut arena, &layout).expect("lower proto expr");
+        let id = decode_fixture_expr(e, &mut arena, &layout).expect("lower proto expr");
         (arena, id)
     }
 
@@ -826,7 +1010,9 @@ pub(crate) mod tests {
     pub(crate) fn lower_err_with_slots(e: &expr::Expr, slots: &[u32]) -> String {
         let mut arena = ExprArena::default();
         let layout = layout_for_slots(slots);
-        decode_expr(e, &mut arena, &layout).unwrap_err().to_string()
+        decode_fixture_expr(e, &mut arena, &layout)
+            .unwrap_err()
+            .to_string()
     }
 
     pub(crate) fn make_i64_chunk(slot: SlotId, values: Vec<Option<i64>>) -> Chunk {
@@ -884,6 +1070,7 @@ pub(crate) mod tests {
         let add = scalar_expr(
             DataType::Int64,
             expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                allow_throw_exception: None,
                 decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 op: expr::BinaryOp::Add as i32,
                 left: Some(Box::new(col(7, DataType::Int64))),
@@ -893,21 +1080,32 @@ pub(crate) mod tests {
         let cast = scalar_expr(
             DataType::Utf8,
             expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                allow_throw_exception: None,
                 decimal_overflow_policy: expr::DecimalOverflowPolicy::OutputNull as i32,
                 operand: Some(Box::new(add)),
                 target: Some(type_desc(&DataType::Utf8)),
             })),
         );
-        let call = scalar_expr(
+        let mut call = scalar_expr(
             DataType::Utf8,
             expr::expr::Kind::FunctionCall(expr::FunctionCall {
+                frozen_binding: None,
+                original_request_id: None,
                 function_name: "upper".to_string(),
                 args: vec![cast],
                 distinct: false,
             }),
         );
 
-        let (arena, id) = lower(&call);
+        let source = super::fixture_scalar_sources::ScalarSource::new(
+            "upper",
+            &[novarocks_functions::FunctionArgument::Value {
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+                constant: None,
+            }],
+        );
+        source.attach(&mut call, 700);
+        let (arena, id) = source.lower(&call, &[1, 7, 42], 700);
         let Some(ExprNode::FunctionCall { kind, args }) = arena.node(id) else {
             panic!("expected function call");
         };
@@ -920,7 +1118,7 @@ pub(crate) mod tests {
             arena.node(*add_id),
             Some(ExprNode::Add(left, right, novarocks_type_contract::DecimalOverflowPolicy::OutputNull))
                 if matches!(arena.node(*left), Some(ExprNode::SlotId(SlotId(7))))
-                    && matches!(arena.node(*right), Some(ExprNode::Literal(LiteralValue::Int64(5))))
+                    && matches!(arena.node(*right), Some(ExprNode::Constant(value)) if value.try_i64().unwrap() == Some(5))
         ));
     }
 
@@ -985,6 +1183,7 @@ pub(crate) mod tests {
                 ..
             })
         ));
+        assert_complete_frozen(arena);
     }
 
     #[test]
@@ -1014,7 +1213,7 @@ pub(crate) mod tests {
         for (expr, needle) in [(aggregate, "AggregateCall"), (window, "WindowCall")] {
             let mut arena = ExprArena::default();
             let layout = layout_for_slots(&[]);
-            let err = decode_expr(&expr, &mut arena, &layout).unwrap_err();
+            let err = decode_fixture_expr(&expr, &mut arena, &layout).unwrap_err();
             assert!(err.contains(needle), "{err}");
         }
     }
@@ -1023,6 +1222,7 @@ pub(crate) mod tests {
         scalar_expr(
             DataType::Decimal128(38, 0),
             expr::expr::Kind::Cast(Box::new(expr::CastExpr {
+                allow_throw_exception: None,
                 operand: Some(Box::new(child)),
                 target: Some(type_desc(&DataType::Decimal128(38, 0))),
                 decimal_overflow_policy: policy,
@@ -1039,6 +1239,7 @@ pub(crate) mod tests {
         let wire = scalar_expr(
             DataType::Decimal128(38, 0),
             expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                allow_throw_exception: None,
                 op: expr::BinaryOp::Add as i32,
                 left: Some(Box::new(error_cast)),
                 right: Some(Box::new(policy_cast(
@@ -1095,6 +1296,7 @@ pub(crate) mod tests {
                 scalar_expr(
                     DataType::Int64,
                     expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                        allow_throw_exception: None,
                         op: expr::BinaryOp::Add as i32,
                         left: Some(Box::new(int_lit(1))),
                         right: Some(Box::new(int_lit(1))),
@@ -1106,8 +1308,9 @@ pub(crate) mod tests {
                 // absent policy bytes, not just a hand-constructed zero object.
                 let wire = expr::Expr::decode(wire.encode_to_vec().as_slice()).unwrap();
                 let mut arena = ExprArena::default();
-                let error = decode_expr(&wire, &mut arena, &NativeExpressionInputLayout::default())
-                    .unwrap_err();
+                let error =
+                    decode_fixture_expr(&wire, &mut arena, &NativeExpressionInputLayout::default())
+                        .unwrap_err();
                 assert!(
                     error.to_string().contains("decimal_overflow_policy"),
                     "{error}"
@@ -1117,13 +1320,14 @@ pub(crate) mod tests {
         let wire = scalar_expr(
             DataType::Boolean,
             expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+                allow_throw_exception: None,
                 op: expr::BinaryOp::Eq as i32,
                 left: Some(Box::new(int_lit(1))),
                 right: Some(Box::new(int_lit(1))),
                 decimal_overflow_policy: expr::DecimalOverflowPolicy::ReportError as i32,
             })),
         );
-        let error = decode_expr(
+        let error = decode_fixture_expr(
             &wire,
             &mut ExprArena::default(),
             &NativeExpressionInputLayout::default(),
@@ -1132,3 +1336,7 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("requires OutputNull"));
     }
 }
+
+#[cfg(test)]
+#[path = "fragment_expression/fixture_aggregate_sources.rs"]
+pub(crate) mod fixture_aggregate_sources;

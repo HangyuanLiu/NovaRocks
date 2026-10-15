@@ -46,15 +46,18 @@ pub fn local_mv_scalar_result_to_user_variable_literal(
     let declared = &result.columns[0];
     let field = ScalarField {
         nullable: declared.nullable(),
-        value_type: match declared.data_type() {
-            DataType::Utf8 => ScalarValueType::String,
-            DataType::Boolean => ScalarValueType::Boolean,
+        value_type: match declared.value_type().value_type().kind() {
+            novarocks_type_contract::ValueKind::String
+                if declared.data_type() == &DataType::Utf8 =>
+            {
+                ScalarValueType::String
+            }
+            novarocks_type_contract::ValueKind::Scalar(DataType::Boolean) => {
+                ScalarValueType::Boolean
+            }
             _ => return Err("local MV scalar field is outside its closed source contract".into()),
         },
     };
-    if declared.logical_type().is_some() {
-        return Err("local MV scalar field has unexpected logical metadata".into());
-    }
     let schema = ScalarSchema::try_new(field).map_err(|error| error.to_string())?;
     for batch in &result.batches {
         if batch.num_rows() == 0 {

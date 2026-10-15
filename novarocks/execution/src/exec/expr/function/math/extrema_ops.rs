@@ -246,15 +246,15 @@ mod legacy_extrema_contract_tests {
             let FunctionResultType::Scalar(result) = &bound.selected.result_type else {
                 panic!("scalar result required");
             };
-            assert_eq!(result.logical_type, ValueLogicalType::Json);
-            assert_eq!(result.data_type, DataType::Utf8);
-            assert!(result.nullable);
+            assert_eq!(result.logical_type(), ValueLogicalType::Json);
+            assert_eq!(result.data_type().clone(), DataType::Utf8);
+            assert!(result.nullable());
             // The legacy Arena only carries Utf8. This records its non-JSON
             // formatted output, without inventing a nominal Arena receipt.
             let output = evaluate(
                 name,
                 vec![left.clone(), right.clone()],
-                result.data_type.clone(),
+                result.data_type().clone(),
                 None,
             )
             .unwrap();
@@ -289,12 +289,12 @@ mod legacy_extrema_contract_tests {
             let FunctionResultType::Scalar(result) = &bound.selected.result_type else {
                 panic!("scalar result required");
             };
-            assert_eq!(result.data_type, DataType::Decimal256(39, 1));
-            assert!(result.nullable);
+            assert_eq!(result.data_type().clone(), DataType::Decimal256(39, 1));
+            assert!(result.nullable());
             let output = evaluate(
                 name,
                 vec![left.clone(), right.clone()],
-                result.data_type.clone(),
+                result.data_type().clone(),
                 None,
             )
             .unwrap();

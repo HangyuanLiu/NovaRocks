@@ -69,7 +69,32 @@ pub struct PackageTypeRootSourceFacts {
     pub cumulative_work_upper_bound: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TypeNamespace {
+    Execution,
+    Source,
+}
+impl TypeNamespace {
+    pub(super) fn table<'a>(
+        self,
+        package: &'a raw::FragmentPackage,
+    ) -> Result<&'a types::TypeTable, TypeCodecError> {
+        match self {
+            Self::Execution => package.types.as_ref().ok_or(TypeCodecError::InvalidShape(
+                "package execution types are absent",
+            )),
+            Self::Source => package
+                .source_fields
+                .as_ref()
+                .and_then(|owner| owner.shape.as_ref())
+                .ok_or(TypeCodecError::InvalidShape(
+                    "package source field shape is absent",
+                )),
+        }
+    }
+}
 pub struct PackageTypeRootSources<'source> {
+    namespace: TypeNamespace,
     package: &'source raw::FragmentPackage,
     facts: PackageTypeRootSourceFacts,
 }
@@ -117,12 +142,17 @@ fn mul(left: usize, right: usize) -> Result<usize, TypeCodecError> {
 fn backing<T>(values: &Vec<T>) -> Result<usize, TypeCodecError> {
     mul(values.capacity(), size_of::<T>())
 }
-fn gate(
+fn gate<H>(
     facts: &mut PackageTypeRootSourceFacts,
     package: &raw::FragmentPackage,
     source_retained_bytes: usize,
-    admit: &mut impl FnMut(&PackageTypeRootSourceFacts) -> Result<(), CompileControlError>,
-) -> Result<(), TypeCodecError> {
+    admit: &mut impl FnMut(
+        &PackageTypeRootSourceFacts,
+    ) -> Result<
+        (),
+        crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+    >,
+) -> Result<(), crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
     // Closed scalar/header bookkeeping, preparation plus one full visit.
     // This is not fabricated graph work or a cooperative library-operation bound.
     let mut units = 128;
@@ -141,7 +171,8 @@ fn gate(
     if facts.source_floor > source_retained_bytes {
         return Err(TypeCodecError::InvalidShape(
             "package type roots source invoice is understated",
-        ));
+        )
+        .into());
     }
     Ok(())
 }
@@ -150,16 +181,47 @@ fn gate(
 /// The caller supplies its whole original-source invoice and owns its scope.
 /// Known arithmetic/work refusals return before any later checkpoint. No type
 /// tree walk, scratch initialization, allocation, copy, or control is created.
-pub fn prepare_package_type_root_sources<'source>(
+pub(super) fn prepare_package_type_root_sources_with_host<'source, H>(
     package: &'source raw::FragmentPackage,
     source_retained_bytes: usize,
-    admit: &mut impl FnMut(&PackageTypeRootSourceFacts) -> Result<(), CompileControlError>,
+    admit: &mut impl FnMut(
+        &PackageTypeRootSourceFacts,
+    ) -> Result<
+        (),
+        crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+    >,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<PackageTypeRootSources<'source>, TypeCodecError> {
+) -> Result<
+    PackageTypeRootSources<'source>,
+    crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+> {
+    prepare_package_type_root_sources_namespace_with_host(
+        package,
+        TypeNamespace::Execution,
+        source_retained_bytes,
+        admit,
+        work,
+    )
+}
+
+pub(super) fn prepare_package_type_root_sources_namespace_with_host<'source, H>(
+    package: &'source raw::FragmentPackage,
+    namespace: TypeNamespace,
+    source_retained_bytes: usize,
+    admit: &mut impl FnMut(
+        &PackageTypeRootSourceFacts,
+    ) -> Result<
+        (),
+        crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+    >,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    PackageTypeRootSources<'source>,
+    crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+> {
     let mut facts = PackageTypeRootSourceFacts {
-        value_root_count: package
-            .types
-            .as_ref()
+        value_root_count: namespace
+            .table(package)
             .map_or(0, |table| table.value_types.len()),
         writer_recipe_count: package.writes.len(),
         source_floor: size_of::<raw::FragmentPackage>(),
@@ -172,29 +234,39 @@ pub fn prepare_package_type_root_sources<'source>(
     ] {
         facts.source_floor = add(facts.source_floor, bytes)?;
     }
-    if let Some(table) = package.types.as_ref() {
+    if let Ok(table) = namespace.table(package) {
         facts.source_floor = add(facts.source_floor, backing(&table.value_types)?)?;
     }
     gate(&mut facts, package, source_retained_bytes, admit)?;
-    let table = package.types.as_ref();
+    let table = namespace.table(package);
     work.step()?;
-    table.ok_or(TypeCodecError::InvalidShape(
-        "package type roots type table is absent",
-    ))?;
-    for schema in &package.schemas {
+    table?;
+    for schema in if namespace == TypeNamespace::Execution {
+        package.schemas.as_slice()
+    } else {
+        &[]
+    } {
         facts.strict_field_root_count = add(facts.strict_field_root_count, schema.field_ids.len())?;
         facts.source_floor = add(facts.source_floor, backing(&schema.field_ids)?)?;
         gate(&mut facts, package, source_retained_bytes, admit)?;
         work.step()?;
     }
-    for pool in &package.constants {
-        if pool.field_id.is_some() {
+    for pool in if namespace == TypeNamespace::Source {
+        package.constants.as_slice()
+    } else {
+        &[]
+    } {
+        if pool.source_field_id.is_some() {
             facts.strict_field_root_count = add(facts.strict_field_root_count, 1)?;
         }
         gate(&mut facts, package, source_retained_bytes, admit)?;
         work.step()?;
     }
-    for recipe in &package.writes {
+    for recipe in if namespace == TypeNamespace::Source {
+        package.writes.as_slice()
+    } else {
+        &[]
+    } {
         let groups = writer_roles(recipe);
         // A successful closed shape lookup already exposes both role headers.
         // Admit all their known counts/backing before observing that lookup,
@@ -212,7 +284,26 @@ pub fn prepare_package_type_root_sources<'source>(
             work.step()?;
         }
     }
-    Ok(PackageTypeRootSources { package, facts })
+    Ok(PackageTypeRootSources {
+        namespace,
+        package,
+        facts,
+    })
+}
+
+pub fn prepare_package_type_root_sources<'source>(
+    package: &'source raw::FragmentPackage,
+    source_retained_bytes: usize,
+    admit: &mut impl FnMut(&PackageTypeRootSourceFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PackageTypeRootSources<'source>, TypeCodecError> {
+    prepare_package_type_root_sources_with_host::<std::convert::Infallible>(
+        package,
+        source_retained_bytes,
+        &mut |facts| admit(facts).map_err(Into::into),
+        work,
+    )
+    .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
 }
 
 impl<'source> PackageTypeRootSources<'source> {
@@ -230,12 +321,7 @@ impl<'source> PackageTypeRootSources<'source> {
                 "package type roots belong to another raw package",
             ));
         }
-        self.package
-            .types
-            .as_ref()
-            .ok_or(TypeCodecError::InvalidShape(
-                "package type roots type table is absent",
-            ))
+        self.namespace.table(self.package)
     }
 
     /// No own entry/footer. One admitted visit emits source order and repeated
@@ -263,7 +349,11 @@ impl<'source> PackageTypeRootSources<'source> {
         for value in &table.value_types {
             emit(PackageTypeRootSource::Value(value), visitor, work)?;
         }
-        for schema in &self.package.schemas {
+        for schema in if self.namespace == TypeNamespace::Execution {
+            self.package.schemas.as_slice()
+        } else {
+            &[]
+        } {
             work.step().map_err(TypeCodecError::from).map_err(E::from)?;
             for (ordinal, &field_id) in schema.field_ids.iter().enumerate() {
                 emit(
@@ -277,8 +367,12 @@ impl<'source> PackageTypeRootSources<'source> {
                 )?;
             }
         }
-        for pool in &self.package.constants {
-            let field_id = pool.field_id;
+        for pool in if self.namespace == TypeNamespace::Source {
+            self.package.constants.as_slice()
+        } else {
+            &[]
+        } {
+            let field_id = pool.source_field_id;
             work.step().map_err(TypeCodecError::from).map_err(E::from)?;
             if let Some(field_id) = field_id {
                 emit(
@@ -288,7 +382,11 @@ impl<'source> PackageTypeRootSources<'source> {
                 )?;
             }
         }
-        for recipe in &self.package.writes {
+        for recipe in if self.namespace == TypeNamespace::Source {
+            self.package.writes.as_slice()
+        } else {
+            &[]
+        } {
             let groups = writer_roles(recipe);
             work.step().map_err(TypeCodecError::from).map_err(E::from)?;
             for (role, fields) in groups.map_err(E::from)?.into_iter().flatten() {
@@ -356,7 +454,8 @@ mod tests {
     fn field(id: Option<u32>) -> raw::ConnectorWriteFieldBinding {
         raw::ConnectorWriteFieldBinding {
             field_token: vec![],
-            field_id: id,
+            source_field_id: id,
+            value_type_id: None,
         }
     }
     fn recipe(kind: raw::connector_write_input_shape::Kind) -> raw::FrozenWriterRecipe {
@@ -367,9 +466,28 @@ mod tests {
             input: Some(raw::ConnectorWriteInputShape { kind: Some(kind) }),
         }
     }
+    fn prepare_source_roots<'s>(
+        package: &'s raw::FragmentPackage,
+        source: usize,
+        admit: &mut impl FnMut(&PackageTypeRootSourceFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<PackageTypeRootSources<'s>, TypeCodecError> {
+        prepare_package_type_root_sources_namespace_with_host::<std::convert::Infallible>(
+            package,
+            TypeNamespace::Source,
+            source,
+            &mut |facts| admit(facts).map_err(Into::into),
+            work,
+        )
+        .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+    }
     fn fixture() -> raw::FragmentPackage {
         use raw::connector_write_input_shape::Kind;
         raw::FragmentPackage {
+            source_fields: Some(types::SourceFieldTable {
+                shape: Some(types::TypeTable::default()),
+                field_facts: vec![],
+            }),
             types: Some(types::TypeTable {
                 value_types: vec![
                     types::ValueTypeDefinition {
@@ -386,22 +504,21 @@ mod tests {
             schemas: vec![raw::SchemaDefinition {
                 id: 0,
                 field_ids: vec![0, u32::MAX, 0],
-                metadata: vec![],
             }],
             constants: vec![
                 raw::IpcConstantPool {
                     id: 0,
-                    field_id: Some(0),
+                    source_field_id: Some(0),
                     ..Default::default()
                 },
                 raw::IpcConstantPool {
                     id: 7,
-                    field_id: None,
+                    source_field_id: None,
                     ..Default::default()
                 },
                 raw::IpcConstantPool {
                     id: u32::MAX,
-                    field_id: Some(u32::MAX),
+                    source_field_id: Some(u32::MAX),
                     ..Default::default()
                 },
             ],
@@ -440,8 +557,7 @@ mod tests {
     ) -> Result<PackageTypeRootSourceFacts, TypeCodecError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
         let result = (|| {
-            let token =
-                prepare_package_type_root_sources(package, usize::MAX, &mut |_| Ok(()), &mut work)?;
+            let token = prepare_source_roots(package, usize::MAX, &mut |_| Ok(()), &mut work)?;
             token.visit::<TypeCodecError>(&mut |_, _| Ok(()), &mut work)?;
             Ok(token.facts())
         })();
@@ -460,12 +576,16 @@ mod tests {
         let package = fixture();
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
-        let token =
-            prepare_package_type_root_sources(&package, usize::MAX, &mut |_| Ok(()), &mut work)
-                .unwrap();
+        let token = prepare_source_roots(&package, usize::MAX, &mut |_| Ok(()), &mut work).unwrap();
         assert!(std::ptr::eq(
             token.table_for(&package).unwrap(),
-            package.types.as_ref().unwrap()
+            package
+                .source_fields
+                .as_ref()
+                .unwrap()
+                .shape
+                .as_ref()
+                .unwrap()
         ));
         let foreign = package.clone();
         assert!(matches!(
@@ -542,7 +662,7 @@ mod tests {
                                 },
                                 recipe_id as u64,
                                 ordinal,
-                                binding.field_id,
+                                binding.source_field_id,
                             )
                         }
                     };
@@ -555,11 +675,6 @@ mod tests {
         assert_eq!(
             events,
             [
-                ("value", 0, 0, None),
-                ("value", u32::MAX as u64, 0, None),
-                ("schema", 0, 0, Some(0)),
-                ("schema", 0, 1, Some(u32::MAX)),
-                ("schema", 0, 2, Some(0)),
                 ("ipc", 0, 0, Some(0)),
                 ("ipc", u32::MAX as u64, 0, Some(u32::MAX)),
                 ("data", 0, 0, Some(0)),
@@ -573,9 +688,41 @@ mod tests {
                 ("equality", 4, 0, Some(16)),
             ]
         );
+        let execution = super::prepare_package_type_root_sources(
+            &package,
+            usize::MAX,
+            &mut |_| Ok(()),
+            &mut work,
+        )
+        .unwrap();
+        let mut execution_events = Vec::new();
+        execution
+            .visit::<TypeCodecError>(
+                &mut |root, _| {
+                    execution_events.push(match root {
+                        PackageTypeRootSource::Value(value) => ("value", value.id),
+                        PackageTypeRootSource::SchemaField { field_id, .. } => ("schema", field_id),
+                        _ => panic!("Source occurrence escaped into Execution namespace"),
+                    });
+                    Ok(())
+                },
+                &mut work,
+            )
+            .unwrap();
+        assert_eq!(
+            execution_events,
+            [
+                ("value", 0),
+                ("value", u32::MAX),
+                ("schema", 0),
+                ("schema", u32::MAX),
+                ("schema", 0)
+            ]
+        );
+        assert_eq!(execution.facts().writer_field_root_count, 0);
         let facts = token.facts();
-        assert_eq!(facts.value_root_count, 2);
-        assert_eq!(facts.strict_field_root_count, 5);
+        assert_eq!(facts.value_root_count, 0);
+        assert_eq!(facts.strict_field_root_count, 2);
         assert_eq!(facts.writer_recipe_count, 5);
         assert_eq!(facts.writer_field_root_count, 9);
         work.finish().unwrap();
@@ -588,10 +735,14 @@ mod tests {
         assert!(matches!(
             invoke(&package, &control),
             Err(TypeCodecError::InvalidShape(
-                "package type roots type table is absent"
+                "package source field shape is absent"
             ))
         ));
         package.types = Some(types::TypeTable::default());
+        package.source_fields = Some(types::SourceFieldTable {
+            shape: Some(types::TypeTable::default()),
+            field_facts: vec![],
+        });
         package.writes = vec![raw::FrozenWriterRecipe::default()];
         assert!(matches!(
             invoke(&package, &Control::default()),
@@ -617,10 +768,10 @@ mod tests {
         package.schemas.reserve_exact(7);
         package.schemas[0].field_ids.reserve_exact(19);
         let expected = size_of::<raw::FragmentPackage>()
-            + package.types.as_ref().unwrap().value_types.capacity()
+            + package.source_fields.as_ref().unwrap().shape.as_ref().unwrap().value_types.capacity()
                 * size_of::<types::ValueTypeDefinition>()
             + package.schemas.capacity() * size_of::<raw::SchemaDefinition>()
-            + package.schemas[0].field_ids.capacity() * size_of::<u32>()
+            // Schema field backing belongs to the separate Execution enumeration.
             + package.constants.capacity() * size_of::<raw::IpcConstantPool>()
             + package.writes.capacity() * size_of::<raw::FrozenWriterRecipe>()
             + package
@@ -631,14 +782,12 @@ mod tests {
                 .sum::<usize>();
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
-        let token =
-            prepare_package_type_root_sources(&package, expected, &mut |_| Ok(()), &mut work)
-                .unwrap();
+        let token = prepare_source_roots(&package, expected, &mut |_| Ok(()), &mut work).unwrap();
         assert_eq!(token.facts().source_floor, expected);
         let bound = token.facts().cumulative_work_upper_bound;
         for (cap, accepted) in [(bound, true), (bound - 1, false)] {
             let mut replay = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
-            let result = prepare_package_type_root_sources(
+            let result = prepare_source_roots(
                 &package,
                 expected,
                 &mut |facts| {
@@ -662,7 +811,7 @@ mod tests {
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
         assert!(matches!(
-            prepare_package_type_root_sources(&package, expected - 1, &mut |_| Ok(()), &mut work),
+            prepare_source_roots(&package, expected - 1, &mut |_| Ok(()), &mut work),
             Err(TypeCodecError::InvalidShape(
                 "package type roots source invoice is understated"
             ))
@@ -672,6 +821,10 @@ mod tests {
     #[test]
     fn known_initial_work_refusal_wins_before_pending_255_late_control() {
         let package = raw::FragmentPackage {
+            source_fields: Some(types::SourceFieldTable {
+                shape: Some(types::TypeTable::default()),
+                field_facts: vec![],
+            }),
             types: Some(types::TypeTable::default()),
             ..Default::default()
         };
@@ -685,7 +838,7 @@ mod tests {
                 work.step().unwrap();
             }
             assert_eq!(copied, [3u8; 255]);
-            let result = prepare_package_type_root_sources(
+            let result = prepare_source_roots(
                 &package,
                 usize::MAX,
                 &mut |facts| {
@@ -706,7 +859,7 @@ mod tests {
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
         assert_eq!(
-            prepare_package_type_root_sources(
+            prepare_source_roots(
                 &package,
                 usize::MAX,
                 &mut |facts| if facts.cumulative_work_upper_bound > 128 {
@@ -737,6 +890,10 @@ mod tests {
             }),
         ] {
             let package = raw::FragmentPackage {
+                source_fields: Some(types::SourceFieldTable {
+                    shape: Some(types::TypeTable::default()),
+                    field_facts: vec![],
+                }),
                 types: Some(types::TypeTable::default()),
                 writes: vec![recipe(kind)],
                 ..Default::default()
@@ -755,7 +912,7 @@ mod tests {
                 // reveals at least 320 fields it is >=384 + 320*32 = 10624,
                 // including the second role's contribution, before the
                 // shape-completion step would observe the 256th actual unit.
-                let result = prepare_package_type_root_sources(
+                let result = prepare_source_roots(
                     &package,
                     usize::MAX,
                     &mut |facts| {
@@ -797,6 +954,10 @@ mod tests {
     fn actual_320_writer_bindings_visit_has_bounded_quantum_and_exact_repeated_ordinals() {
         use raw::connector_write_input_shape::Kind;
         let package = raw::FragmentPackage {
+            source_fields: Some(types::SourceFieldTable {
+                shape: Some(types::TypeTable::default()),
+                field_facts: vec![],
+            }),
             types: Some(types::TypeTable::default()),
             writes: vec![recipe(Kind::Data(raw::ConnectorWriteDataInput {
                 fields: (0..320).map(|_| field(Some(u32::MAX))).collect(),
@@ -817,9 +978,7 @@ mod tests {
         }
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
-        let token =
-            prepare_package_type_root_sources(&package, usize::MAX, &mut |_| Ok(()), &mut work)
-                .unwrap();
+        let token = prepare_source_roots(&package, usize::MAX, &mut |_| Ok(()), &mut work).unwrap();
         let mut visited = 0;
         token
             .visit::<TypeCodecError>(
@@ -833,7 +992,7 @@ mod tests {
                     {
                         assert_eq!(role, WriterTypeRootRole::Data);
                         assert_eq!(ordinal, visited);
-                        assert_eq!(binding.field_id, Some(u32::MAX));
+                        assert_eq!(binding.source_field_id, Some(u32::MAX));
                         visited += 1;
                     } else {
                         panic!("unexpected source class");
@@ -860,9 +1019,7 @@ mod tests {
         let package = fixture();
         let control = Control::default();
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
-        let token =
-            prepare_package_type_root_sources(&package, usize::MAX, &mut |_| Ok(()), &mut work)
-                .unwrap();
+        let token = prepare_source_roots(&package, usize::MAX, &mut |_| Ok(()), &mut work).unwrap();
         let before = control.trace();
         let mut visits = 0;
         let result = token.visit::<VisitorError>(

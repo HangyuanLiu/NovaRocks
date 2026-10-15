@@ -78,6 +78,7 @@ mod task_protocol_event;
 mod task_registry;
 mod task_registry_config;
 mod task_registry_entry;
+pub use task_registry_entry::{TaskPreparationStopCause, TaskPreparationStopView};
 #[cfg(test)]
 mod task_registry_tests;
 pub mod typed_connector_runtime;
@@ -130,8 +131,8 @@ pub use host::{
     RunnableTask, SharedFactsRequest, TaskExecutionHost,
 };
 pub use inbound_capability::{
-    InboundFrameAdmission, InboundFrameClaim, NormalClosedInbound, TaskInboundCapabilities,
-    TaskInboundCapabilityLimits,
+    InboundFrameAdmission, InboundFrameClaim, InboundFrameDelivery, NormalClosedInbound,
+    TaskInboundCapabilities, TaskInboundCapabilityLimits,
 };
 pub use ingress::{IngressRejection, authorize_inbound_frame};
 pub use lease::{InstalledLease, LeaseBounds, LeaseProgression, MonotonicInstant, RequestHorizon};

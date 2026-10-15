@@ -101,7 +101,7 @@ fn map() -> MapArray {
     let keys: ArrayRef = Arc::new(StringArray::from(vec![
         Some("prefix"),
         Some("dup"),
-        None,
+        Some(""),
         Some(""),
         Some("dup"),
         Some("dup"),
@@ -118,7 +118,7 @@ fn map() -> MapArray {
     ]));
     let fields = vec![
         Arc::new(
-            Field::new("source_key", DataType::Utf8, true)
+            Field::new("source_key", DataType::Utf8, false)
                 .with_metadata(HashMap::from([("key-source".into(), "retained".into())])),
         ),
         Arc::new(Field::new("source_value", DataType::Utf8, true)),
@@ -216,7 +216,7 @@ fn int32_list_borrows_original_ordinal_slice_field_and_nullable_items() {
 }
 
 #[test]
-fn utf8_map_preserves_null_keys_values_duplicates_order_and_borrowed_payloads() {
+fn utf8_map_preserves_nullable_values_duplicates_order_and_borrowed_payloads() {
     let original = map();
     let p = pool(Arc::new(original.clone()));
     let value = p.value(1).unwrap();
@@ -225,7 +225,10 @@ fn utf8_map_preserves_null_keys_values_duplicates_order_and_borrowed_payloads() 
     assert!(std::ptr::eq(view.source(), &value));
     assert!(std::ptr::eq(view.source().field(), p.field()));
     assert_eq!(view.len(), 4);
-    assert_eq!(view.item(0, PHASE, &control).unwrap(), (None, Some("雪☃")));
+    assert_eq!(
+        view.item(0, PHASE, &control).unwrap(),
+        (Some(""), Some("雪☃"))
+    );
     assert_eq!(view.item(1, PHASE, &control).unwrap(), (Some(""), None));
     assert_eq!(
         view.item(2, PHASE, &control).unwrap(),
@@ -316,7 +319,7 @@ fn selected_collection_roots_resolve_dictionary_runs_and_encoded_nulls() {
             .unwrap()
             .item(0, PHASE, &control)
             .unwrap(),
-        (None, Some("雪☃"))
+        (Some(""), Some("雪☃"))
     );
     assert!(
         p.value(2)
@@ -500,10 +503,10 @@ fn numerical_ordinal_limit_is_primary_without_a_later_callback() {
 
 #[test]
 fn raw_map_and_entry_parent_offsets_are_applied_once_by_original_pool() {
-    let keys = StringArray::from(vec![Some("hidden"), Some("prefix"), None, Some("tail")]);
+    let keys = StringArray::from(vec![Some("hidden"), Some("prefix"), Some(""), Some("tail")]);
     let values = StringArray::from(vec!["hidden", "unused", "雪", "last"]);
     let fields = vec![
-        Arc::new(Field::new("key", DataType::Utf8, true)),
+        Arc::new(Field::new("key", DataType::Utf8, false)),
         Arc::new(Field::new("value", DataType::Utf8, false)),
     ]
     .into();
@@ -548,7 +551,7 @@ fn raw_map_and_entry_parent_offsets_are_applied_once_by_original_pool() {
         assert_eq!(view.len(), 2);
         assert_eq!(
             view.item(0, PHASE, &Control::default()).unwrap(),
-            (None, Some("雪"))
+            (Some(""), Some("雪"))
         );
         assert_eq!(
             view.item(1, PHASE, &Control::default()).unwrap(),

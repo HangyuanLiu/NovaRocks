@@ -234,12 +234,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     )?;
     // The physical write schema the target's own binding produced, which is the
     // same fact a first refresh signs its data input from.
-    let target_write_fields = refresh_rewrite
-        .target_arrow_schema
-        .fields()
-        .iter()
-        .map(|field| field.as_ref().clone())
-        .collect::<Vec<_>>();
+    let target_write_fields = &refresh_rewrite.target_write_fields;
     // The session is opened before the plan is compiled because the plan's
     // writer nodes carry the recipes it seals: a plan and the session that
     // sealed it must not be separable.
@@ -248,7 +243,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         request.target_table(),
         &publication_intent,
         mode,
-        &target_write_fields,
+        target_write_fields,
         connector_context.clone(),
         exact_lease,
         planning_lease,

@@ -206,9 +206,9 @@ pub(super) fn validate_profile(
         }
     }
     let result = contract.result_type();
-    if result.data_type != DataType::Float64
-        || !result.nullable
-        || result.logical_type != novarocks_type_contract::ValueLogicalType::Physical
+    if result.data_type() != &DataType::Float64
+        || !result.nullable()
+        || result.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
     {
         return Err(invalid(
             "percentile_approx_raw requires its exact nullable Physical Float64 result",
@@ -291,7 +291,7 @@ pub(super) fn evaluate<'a>(
         let array = Arc::new(values.finish()) as ArrayRef;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &input.contract().result_type().data_type,
+            input.contract().result_type().data_type(),
             array,
             errors.into_boxed_slice(),
             || rows.step(),

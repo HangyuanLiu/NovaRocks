@@ -259,7 +259,7 @@ fn source_probe(mode: novarocks_sql::compiler::SqlPhysicalEmissionMode) {
                         assert_eq!(node.output.columns, input.output.columns);
                         for (ordinal, id) in predicates.iter().enumerate() {
                             let expression = fragment.expressions().get(*id).unwrap();
-                            assert_eq!(expression.ty.data_type, DataType::Boolean);
+                            assert_eq!(expression.ty.data_type().clone(), DataType::Boolean);
                             eprintln!(
                                 "NDV actual FilterPredicate ordinal={ordinal} id={id:?} expression={expression:?}"
                             );

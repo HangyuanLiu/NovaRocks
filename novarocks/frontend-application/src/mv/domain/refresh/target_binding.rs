@@ -108,10 +108,46 @@ impl MvTargetBinding {
     /// keys and aggregate state are declared physical target fields.
     pub fn physical_write_schema(&self) -> Result<SchemaRef, String> {
         mv_target_physical_write_schema(
-            &self.metadata.schema,
+            &self.metadata.schema(),
             &self.metadata.planning_facts,
             self.observation.field_ids(),
         )
+    }
+
+    /// Preserve the exact target source fields and the same generation's
+    /// complete execution declaration as independent write-admission facts.
+    pub(crate) fn write_input_fields(
+        &self,
+    ) -> Result<Arc<[novarocks_spi::connector::ConnectorWriteFieldRequest]>, String> {
+        let source = self.physical_write_schema()?;
+        let mut fields = Vec::with_capacity(source.fields().len());
+        for (ordinal, _) in self.metadata.schema().fields().iter().enumerate() {
+            if self
+                .metadata
+                .planning_facts
+                .column_facts()
+                .get(ordinal)
+                .is_some_and(|fact| fact.role() == ConnectorTableColumnRole::RowLineageSystem)
+            {
+                continue;
+            }
+            let declaration =
+                crate::connector::connector_write_column(&self.metadata, ordinal, None)?;
+            let value_type = declaration
+                .declared_value_type()
+                .map_err(|error| error.to_string())?;
+            let field = source.fields().get(fields.len()).ok_or_else(|| {
+                "MV target write field order differs from its complete declarations".to_string()
+            })?;
+            fields.push(
+                novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                    field.as_ref().clone(),
+                    value_type,
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+        Ok(fields.into())
     }
 
     pub(crate) const fn observation(&self) -> &MvRefreshTargetObservation {
@@ -232,7 +268,7 @@ pub(crate) fn load_mv_target_binding_with_lease_and_ports_typed(
 }
 
 fn mv_target_physical_write_schema(
-    read_schema: &SchemaRef,
+    read_schema: &arrow::datatypes::Schema,
     planning_facts: &ConnectorTablePlanningFacts,
     field_ids: &[i32],
 ) -> Result<SchemaRef, String> {

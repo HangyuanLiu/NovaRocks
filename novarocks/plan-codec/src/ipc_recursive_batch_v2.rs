@@ -17,7 +17,7 @@
 
 //! Borrowed recursive IPC geometry. Resource admission precedes owned geometry.
 
-use crate::ipc_flat_stream_v2::progress::Admission;
+use crate::ipc_flat_stream_v2::progress::{Admission, ReaderGeometryFailure};
 use arrow::datatypes::Field;
 
 /// One actual FieldNode occurrence in declaration DFS order. All extents are
@@ -109,7 +109,7 @@ fn require(
     if condition {
         Ok(())
     } else {
-        Err(shape(message))
+        Err(shape(message).into())
     }
 }
 
@@ -120,10 +120,10 @@ fn numeric_parent<T>(parent: bool, result: Result<T, TypeCodecError>) -> Result<
         result
     }
 }
-fn parent_step(
-    admission: &mut Option<&mut Admission<'_, '_>>,
+fn parent_step<E: ReaderGeometryFailure>(
+    admission: &mut Option<&mut Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), TypeCodecError> {
+) -> Result<(), E> {
     if let Some(a) = admission.as_deref_mut() {
         a.batch_step(work)?;
     } else {
@@ -131,25 +131,25 @@ fn parent_step(
     }
     Ok(())
 }
-fn require_parent(
+fn require_parent<E: ReaderGeometryFailure>(
     condition: bool,
     message: &'static str,
-    mut admission: Option<&mut Admission<'_, '_>>,
+    mut admission: Option<&mut Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), TypeCodecError> {
+) -> Result<(), E> {
     parent_step(&mut admission, work)?;
     if condition {
         Ok(())
     } else {
-        Err(shape(message))
+        Err(shape(message).into())
     }
 }
-fn limit_parent(
+fn limit_parent<E: ReaderGeometryFailure>(
     condition: bool,
     message: &'static str,
-    admission: Option<&mut Admission<'_, '_>>,
+    admission: Option<&mut Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), TypeCodecError> {
+) -> Result<(), E> {
     if admission.is_some() && !condition {
         return Err(CompileControlError::ResourceExhausted.into());
     }
@@ -191,24 +191,42 @@ pub(crate) fn preflight_verified_recursive_record_batch<'a>(
 ) -> Result<CheckedRecursiveBatch<'a>, TypeCodecError> {
     preflight_core(message, body, expected, limits, None, work)
 }
-pub(crate) fn preflight_verified_recursive_record_batch_in<'a>(
+pub(crate) fn preflight_verified_recursive_record_batch_in<'a, E: ReaderGeometryFailure>(
     message: arrow::ipc::Message<'_>,
     body: &[u8],
     expected: &'a Field,
     limits: RecursiveBatchProjectionLimits,
-    admission: &mut Admission<'_, '_>,
+    admission: &mut Admission<'_, '_, E>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<CheckedRecursiveBatch<'a>, TypeCodecError> {
+) -> Result<CheckedRecursiveBatch<'a>, E> {
     preflight_core(message, body, expected, limits, Some(admission), work)
 }
-fn preflight_core<'a>(
+fn preflight_core<'a, E: ReaderGeometryFailure>(
     message: arrow::ipc::Message<'_>,
     body: &[u8],
     expected: &'a Field,
     limits: RecursiveBatchProjectionLimits,
-    mut admission: Option<&mut Admission<'_, '_>>,
+    admission: Option<&mut Admission<'_, '_, E>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<CheckedRecursiveBatch<'a>, TypeCodecError> {
+) -> Result<CheckedRecursiveBatch<'a>, E> {
+    preflight_verified_recursive_record_batch_profile(
+        message,
+        body,
+        expected,
+        Some(limits),
+        admission,
+        work,
+    )
+}
+/// Input-derived admission shares the fixed-profile geometry and safety body.
+pub(crate) fn preflight_verified_recursive_record_batch_profile<'a, E: ReaderGeometryFailure>(
+    message: arrow::ipc::Message<'_>,
+    body: &[u8],
+    expected: &'a Field,
+    limits: Option<RecursiveBatchProjectionLimits>,
+    mut admission: Option<&mut Admission<'_, '_, E>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<CheckedRecursiveBatch<'a>, E> {
     // Capture this actual borrowed RecordBatch's known geometry allocation
     // before any header completion can invoke the caller's controller.
     if let Some(a) = admission.as_deref_mut()
@@ -216,14 +234,19 @@ fn preflight_core<'a>(
     {
         let layout = std::alloc::Layout::array::<RecursiveNodeGeometry<'_>>(raw.len())
             .map_err(|_| CompileControlError::ResourceExhausted)?;
-        if raw.len() > limits.max_field_nodes || layout.size() > limits.max_geometry_request_bytes {
+        if limits.is_some_and(|limits| {
+            raw.len() > limits.max_field_nodes || layout.size() > limits.max_geometry_request_bytes
+        }) {
             return Err(CompileControlError::ResourceExhausted.into());
         }
         a.requests(0, layout.size(), usize::from(layout.size() != 0))?;
+        if layout.size() != 0 {
+            a.construction_request(layout)?;
+        }
         a.batch_work_add(layout.size())?;
     }
     limit_parent(
-        body.len() <= limits.flat.max_body_bytes,
+        limits.is_none_or(|limits| body.len() <= limits.flat.max_body_bytes),
         "recursive IPC body envelope exceeded",
         admission.as_deref_mut(),
         work,
@@ -236,12 +259,11 @@ fn preflight_core<'a>(
         )?;
     }
     validate_field(expected, work)?;
-    novarocks_type_contract::field_logical_type(expected)?;
     if let Some(a) = admission.as_deref_mut() {
         let shared = std::cell::RefCell::new(a);
-        let mut scratch =
+        let scratch =
             |layout: std::alloc::Layout| shared.borrow_mut().batch_work_add(layout.size());
-        let mut capture = |visit| {
+        let capture = |visit| {
             let mut a = shared.borrow_mut();
             let upper = if matches!(visit, novarocks_type_contract::ValueTypeVisit::Field(_)) {
                 a.source()
@@ -252,12 +274,18 @@ fn preflight_core<'a>(
             };
             a.batch_work_add(upper)
         };
-        crate::physical_type_v2::validate_type_with_scratch_observed(
+        crate::physical_type_v2::validate_type_with_scratch_host_observed(
             expected.data_type(),
-            &mut scratch,
-            &mut capture,
+            &mut |layout| {
+                scratch(layout).map_err(crate::host_projection_v2::ProjectionFailure::Host)
+            },
+            &mut |visit| capture(visit).map_err(crate::host_projection_v2::ProjectionFailure::Host),
             work,
-        )?;
+        )
+        .map_err(|error| match error {
+            crate::host_projection_v2::ProjectionFailure::Host(error) => error,
+            crate::host_projection_v2::ProjectionFailure::Codec(error) => E::from(error),
+        })?;
     } else {
         validate_type(expected.data_type(), work)?;
     }
@@ -286,7 +314,7 @@ fn preflight_core<'a>(
     )?;
     let rows = length(batch.length())?;
     limit_parent(
-        rows <= limits.flat.max_rows,
+        limits.is_none_or(|limits| rows <= limits.flat.max_rows),
         "recursive IPC root row envelope exceeded",
         admission.as_deref_mut(),
         work,
@@ -298,13 +326,14 @@ fn preflight_core<'a>(
         .buffers()
         .ok_or(shape("recursive IPC buffers are missing"))?;
     require_parent(
-        !raw_nodes.is_empty() && raw_nodes.len() <= limits.max_field_nodes,
+        !raw_nodes.is_empty()
+            && limits.is_none_or(|limits| raw_nodes.len() <= limits.max_field_nodes),
         "recursive IPC node envelope exceeded",
         admission.as_deref_mut(),
         work,
     )?;
     limit_parent(
-        buffers.len() <= limits.flat.max_buffer_descriptors,
+        limits.is_none_or(|limits| buffers.len() <= limits.flat.max_buffer_descriptors),
         "recursive IPC buffer envelope exceeded",
         admission.as_deref_mut(),
         work,
@@ -318,13 +347,13 @@ fn preflight_core<'a>(
             }
         })?;
     if let Some(a) = admission.as_deref_mut() {
-        if scratch.size() > limits.max_geometry_request_bytes {
+        if limits.is_some_and(|limits| scratch.size() > limits.max_geometry_request_bytes) {
             return Err(CompileControlError::ResourceExhausted.into());
         }
         a.requests(0, scratch.size(), usize::from(scratch.size() != 0))?;
     }
     limit_parent(
-        scratch.size() <= limits.max_geometry_request_bytes,
+        limits.is_none_or(|limits| scratch.size() <= limits.max_geometry_request_bytes),
         "recursive IPC geometry request envelope exceeded",
         admission.as_deref_mut(),
         work,
@@ -396,11 +425,11 @@ fn preflight_core<'a>(
         scratch_request_count: usize::from(scratch.size() != 0),
     })
 }
-struct Walker<'b, 'a, 'p, 'c, 'd> {
-    admission: Option<&'p mut Admission<'c, 'd>>,
+struct Walker<'b, 'a, 'p, 'c, 'd, E> {
+    admission: Option<&'p mut Admission<'c, 'd, E>>,
     batch: arrow::ipc::RecordBatch<'b>,
     body: &'b [u8],
-    limits: RecursiveBatchProjectionLimits,
+    limits: Option<RecursiveBatchProjectionLimits>,
     nodes: Vec<RecursiveNodeGeometry<'a>>,
     node_cursor: usize,
     buffer_cursor: usize,
@@ -411,14 +440,14 @@ struct Walker<'b, 'a, 'p, 'c, 'd> {
     total_variadic: usize,
     max_depth: usize,
 }
-impl<'b, 'a, 'p, 'c, 'd> Walker<'b, 'a, 'p, 'c, 'd> {
+impl<'b, 'a, 'p, 'c, 'd, E: ReaderGeometryFailure> Walker<'b, 'a, 'p, 'c, 'd, E> {
     fn field(
         &mut self,
         field: &'a Field,
         depth: usize,
         list_map_ancestors: usize,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<RecursiveNodeGeometry<'a>, TypeCodecError> {
+    ) -> Result<RecursiveNodeGeometry<'a>, E> {
         let parent = self.admission.is_some();
         let raw = self
             .batch
@@ -441,7 +470,8 @@ impl<'b, 'a, 'p, 'c, 'd> Walker<'b, 'a, 'p, 'c, 'd> {
         )?;
         self.total_rows = numeric_parent(parent, add(self.total_rows, rows))?;
         limit_parent(
-            self.total_rows <= self.limits.max_total_rows,
+            self.limits
+                .is_none_or(|limits| self.total_rows <= limits.max_total_rows),
             "recursive IPC total row envelope exceeded",
             self.admission.as_deref_mut(),
             work,
@@ -562,9 +592,9 @@ impl<'b, 'a, 'p, 'c, 'd> Walker<'b, 'a, 'p, 'c, 'd> {
             | DataType::FixedSizeList(..)
             | DataType::ListView(..)
             | DataType::LargeListView(..) => {
-                return Err(shape(
-                    "recursive IPC carrier is outside the frozen supported profile",
-                ));
+                return Err(
+                    shape("recursive IPC carrier is outside the frozen supported profile").into(),
+                );
             }
             ty => {
                 let layout = ipc_flat_batch_v2::layout(ty)?;
@@ -599,7 +629,7 @@ impl<'b, 'a, 'p, 'c, 'd> Walker<'b, 'a, 'p, 'c, 'd> {
                     null_count,
                     start,
                     variadic,
-                    self.limits.flat,
+                    self.limits.map(|limits| limits.flat),
                     self.admission.as_deref_mut(),
                     work,
                 )?;
@@ -615,7 +645,9 @@ impl<'b, 'a, 'p, 'c, 'd> Walker<'b, 'a, 'p, 'c, 'd> {
                 self.view_bytes =
                     numeric_parent(parent, add(self.view_bytes, leaf.view_validation_bytes))?;
                 limit_parent(
-                    self.view_bytes <= self.limits.flat.max_view_validation_bytes,
+                    self.limits.is_none_or(|limits| {
+                        self.view_bytes <= limits.flat.max_view_validation_bytes
+                    }),
                     "recursive IPC cumulative view byte envelope exceeded",
                     self.admission.as_deref_mut(),
                     work,
@@ -633,7 +665,7 @@ impl<'b, 'a, 'p, 'c, 'd> Walker<'b, 'a, 'p, 'c, 'd> {
         rows: usize,
         null_count: usize,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<usize, TypeCodecError> {
+    ) -> Result<usize, E> {
         let parent = self.admission.is_some();
         let validity = ipc_flat_batch_v2::buffer(self.batch, self.body, self.buffer_cursor)?;
         self.described = numeric_parent(parent, add(self.described, validity.len()))?;

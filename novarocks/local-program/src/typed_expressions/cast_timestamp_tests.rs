@@ -65,7 +65,7 @@ fn timestamp_cast_all_sixteen_live_and_dead_definitions_keep_successful_null_con
                                                 decimal_overflow_policy: policy,
                                                 allow_throw_exception: allow,
                                             },
-                                            result.data_type.clone(),
+                                            result.data_type().clone(),
                                             None,
                                         ),
                                         slot(2, &boolean(false)),

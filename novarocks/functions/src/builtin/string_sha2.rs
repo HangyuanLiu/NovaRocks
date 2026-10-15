@@ -88,7 +88,8 @@ pub(super) fn evaluate_string_sha2<'a>(
             let FunctionArgumentType::Value(ty) = ty else {
                 return Err(invalid("sha2 requires value arguments"));
             };
-            let exact = ty.logical_type == ValueLogicalType::Physical && ty.data_type == expected;
+            let exact =
+                ty.logical_type() == ValueLogicalType::Physical && *ty.data_type() == expected;
             work.step()?;
             if !exact {
                 return Err(invalid(
@@ -97,9 +98,9 @@ pub(super) fn evaluate_string_sha2<'a>(
             }
         }
         let target = input.contract().result_type();
-        if target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
+        if target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Utf8
+            || !target.nullable()
         {
             return Err(invalid(
                 "sha2 differs from its exact installed result profile",
@@ -132,7 +133,7 @@ pub(super) fn evaluate_string_sha2<'a>(
                     let FunctionArgumentType::Value(ty) = &types[i] else {
                         return Err(invalid("sha2 requires value arguments"));
                     };
-                    if !ty.nullable {
+                    if !ty.nullable() {
                         return Err(internal(
                             "sha2 non-null argument contains selected SQL NULL",
                         ));
@@ -208,7 +209,7 @@ pub(super) fn evaluate_string_sha2<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

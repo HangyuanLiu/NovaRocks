@@ -121,7 +121,7 @@ fn cloned<T: Clone>(value: &T) -> T {
     value.clone()
 }
 fn nested(nullable: bool, child_nullable: bool, metadata: &str) -> FunctionValueType {
-    FunctionValueType::new(
+    FunctionValueType::from_legacy_declared_projection(
         DataType::Struct(
             vec![Arc::new(
                 Field::new("original.child", DataType::Int64, child_nullable).with_metadata(
@@ -143,6 +143,92 @@ fn matches(
     let mut work = CompileCheckpoints::try_new(control, PHASE)?;
     let result = argument.matches_type_observed(expected, &mut work);
     finish_binding_work(result, work)
+}
+
+#[test]
+fn value_argument_matching_keeps_recursive_nominal_domains_on_identical_layouts() {
+    use novarocks_type_contract::{ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime};
+    let list = |domain| {
+        let child = FunctionValueType::try_with_logical_type(DataType::Utf8, true, domain).unwrap();
+        let storage = ValueTypeStorageLifetime::pure();
+        let semantic = ValueTypeRef::try_new(
+            ValueKind::List(child.value_type().clone()),
+            false,
+            storage.clone(),
+        )
+        .unwrap();
+        let layout = ValueLayout::try_new(
+            &DataType::List(Arc::new(Field::new("", DataType::Utf8, true))),
+            storage,
+        )
+        .unwrap();
+        FunctionValueType::try_from_value(semantic, layout).unwrap()
+    };
+    let nominal = list(ValueLogicalType::Json);
+    let physical = list(ValueLogicalType::Physical);
+    assert_eq!(nominal.data_type(), physical.data_type());
+    let argument: FunctionArgument = FunctionArgument::Value {
+        value_type: nominal.clone(),
+        constant: None,
+    };
+    every_prefix(
+        |control| {
+            matches(
+                &argument,
+                &FunctionArgumentType::Value(physical.clone()),
+                control,
+            )
+        },
+        false,
+    );
+    every_prefix(
+        |control| {
+            matches(
+                &argument,
+                &FunctionArgumentType::Value(nominal.clone()),
+                control,
+            )
+        },
+        true,
+    );
+}
+
+#[test]
+fn selected_value_matching_rejects_same_semantics_on_different_physical_offsets() {
+    let small =
+        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Physical)
+            .unwrap();
+    let large = FunctionValueType::try_with_logical_type(
+        DataType::LargeUtf8,
+        true,
+        ValueLogicalType::Physical,
+    )
+    .unwrap();
+    assert!(small.same_semantics(&large));
+    let argument: FunctionArgument = FunctionArgument::Value {
+        value_type: small.clone(),
+        constant: None,
+    };
+    every_prefix(
+        |control| {
+            matches(
+                &argument,
+                &FunctionArgumentType::Value(large.clone()),
+                control,
+            )
+        },
+        false,
+    );
+    every_prefix(
+        |control| {
+            matches(
+                &argument,
+                &FunctionArgumentType::Value(small.clone()),
+                control,
+            )
+        },
+        true,
+    );
 }
 
 #[test]
@@ -168,7 +254,9 @@ fn borrowed_request_is_copy_without_clone_or_copy_transport_carrier() {
             constant: None,
         },
         FunctionArgument::Lambda {
-            parameter_types: vec![ty.clone()].into_boxed_slice(),
+            parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                vec![ty.clone()].into_boxed_slice(),
+            ),
             result_type: ty.clone(),
         },
     ];
@@ -199,7 +287,9 @@ fn borrowed_request_is_copy_without_clone_or_copy_transport_carrier() {
         assert_eq!(
             borrowed.arguments[2].argument_type(),
             FunctionArgumentType::Lambda {
-                parameter_types: vec![ty.clone()].into_boxed_slice(),
+                parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    vec![ty.clone()].into_boxed_slice()
+                ),
                 result_type: ty.clone(),
             }
         );
@@ -266,7 +356,7 @@ fn admitted_nonzero_constant_preserves_selected_source_and_distinguishes_none_fr
 }
 
 #[test]
-fn lambda_comparison_preserves_complete_nominal_and_nested_metadata_with_original_prefixes() {
+fn lambda_comparison_preserves_complete_nominal_types_and_ignores_source_annotations() {
     let largeint = FunctionValueType::try_with_logical_type(
         DataType::FixedSizeBinary(16),
         true,
@@ -275,7 +365,9 @@ fn lambda_comparison_preserves_complete_nominal_and_nested_metadata_with_origina
     .unwrap();
     let physical = FunctionValueType::new(DataType::FixedSizeBinary(16), true);
     let make_lambda = |nominal, metadata| FunctionArgument::Lambda {
-        parameter_types: vec![nominal, nested(false, true, metadata)].into_boxed_slice(),
+        parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+            vec![nominal, nested(false, true, metadata)].into_boxed_slice(),
+        ),
         result_type: nested(true, false, "body"),
     };
     let original = make_lambda(largeint.clone(), "original");
@@ -289,13 +381,17 @@ fn lambda_comparison_preserves_complete_nominal_and_nested_metadata_with_origina
             } => parameter_types.clone(),
             _ => unreachable!(),
         },
-        result_type: nested(true, false, "different body"),
+        result_type: nested(true, true, "different body"),
     };
     every_prefix(
         |control| original.equals_observed(&equal, PHASE, control),
         true,
     );
-    for changed in [changed_nominal, changed_metadata, changed_body] {
+    every_prefix(
+        |control| original.equals_observed(&changed_metadata, PHASE, control),
+        true,
+    );
+    for changed in [changed_nominal, changed_body] {
         every_prefix(
             |control| original.equals_observed(&changed, PHASE, control),
             false,
@@ -346,7 +442,7 @@ fn selected_type_matching_keeps_value_nullability_covariance_but_lambda_exactnes
         },
         false,
     );
-    assert_eq!(root_refusal, vec![(PHASE, 0), (PHASE, 1)]);
+    assert_eq!(root_refusal, vec![(PHASE, 0), (PHASE, 2)]);
     let child_nullable = FunctionArgument::Value {
         value_type: nested(false, true, "same"),
         constant: None,
@@ -362,16 +458,22 @@ fn selected_type_matching_keeps_value_nullability_covariance_but_lambda_exactnes
         false,
     );
     let lambda = FunctionArgument::Lambda {
-        parameter_types: vec![strict.clone()].into_boxed_slice(),
+        parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+            vec![strict.clone()].into_boxed_slice(),
+        ),
         result_type: strict.clone(),
     };
     let exact_lambda = FunctionArgumentType::Lambda {
-        parameter_types: vec![strict.clone()].into_boxed_slice(),
+        parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+            vec![strict.clone()].into_boxed_slice(),
+        ),
         result_type: strict.clone(),
     };
     every_prefix(|control| matches(&lambda, &exact_lambda, control), true);
     let widened_lambda = FunctionArgumentType::Lambda {
-        parameter_types: vec![nullable].into_boxed_slice(),
+        parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+            vec![nullable].into_boxed_slice(),
+        ),
         result_type: strict,
     };
     every_prefix(|control| matches(&lambda, &widened_lambda, control), false);

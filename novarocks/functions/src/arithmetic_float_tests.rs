@@ -76,8 +76,8 @@ const OPS: [ArithmeticOperator; 5] = [
 fn prepare(op: ArithmeticOperator, left: DataType, right: DataType) -> PreparedArithmeticRecipe {
     PreparedArithmeticRecipe::try_new(
         op,
-        &FunctionValueType::new(left, true),
-        &FunctionValueType::new(right, true),
+        &FunctionValueType::from_legacy_declared_projection(left, true),
+        &FunctionValueType::from_legacy_declared_projection(right, true),
         &FunctionValueType::new(DataType::Float64, true),
         DecimalOverflowPolicy::OutputNull,
         false,
@@ -197,8 +197,14 @@ fn float_arithmetic_recipe_full_fvt_result_and_nominal_boundary_is_exact() {
                 (ty.clone(), DataType::Float64),
             ] {
                 let recipe = prepare(op, left.clone(), right.clone());
-                assert_eq!(recipe.left_type(), &FunctionValueType::new(left, true));
-                assert_eq!(recipe.right_type(), &FunctionValueType::new(right, true));
+                assert_eq!(
+                    recipe.left_type(),
+                    &FunctionValueType::from_legacy_declared_projection(left, true)
+                );
+                assert_eq!(
+                    recipe.right_type(),
+                    &FunctionValueType::from_legacy_declared_projection(right, true)
+                );
                 assert_eq!(
                     recipe.result_type(),
                     &FunctionValueType::new(DataType::Float64, true)
@@ -218,7 +224,7 @@ fn float_arithmetic_recipe_full_fvt_result_and_nominal_boundary_is_exact() {
             PreparedArithmeticRecipe::try_new(
                 ArithmeticOperator::Add,
                 &f,
-                &FunctionValueType::new(other, true),
+                &FunctionValueType::from_legacy_declared_projection(other, true),
                 &f,
                 DecimalOverflowPolicy::OutputNull,
                 false,
@@ -317,4 +323,249 @@ fn float_arithmetic_recipe_three_compile_and_seven_runtime_causes_have_no_tail()
             assert_eq!(*c.trace.lock().unwrap(), trace[..=at]);
         }
     }
+}
+
+#[test]
+fn canonical_float_target_actual_factory_precedes_construction_and_survives_last_cast_loan() {
+    use crate::{ArithmeticCreationFailure, ArithmeticTypeCreationFailure};
+    use novarocks_type_contract::{
+        ValueConstructionFailure, ValueSchemaCreationFactory, ValueSchemaCreationScope,
+        ValueSchemaScopeBeginFailure, ValueTypeStorageHold, ValueTypeStorageLifetime,
+    };
+    use std::alloc::Layout;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Hold {
+        charged: AtomicUsize,
+        live: Arc<AtomicUsize>,
+    }
+    impl ValueTypeStorageHold for Hold {}
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            self.live
+                .fetch_sub(*self.charged.get_mut(), Ordering::SeqCst);
+        }
+    }
+    struct Compile(
+        Mutex<Vec<(CompilePhase, u32)>>,
+        Option<(usize, CompileControlError)>,
+    );
+    impl PureCompileControl for Compile {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            let mut trace = self.0.lock().unwrap();
+            let at = trace.len();
+            if let Some((stop, _)) = self.1 {
+                assert!(
+                    at <= stop,
+                    "callback after original arithmetic control refusal"
+                );
+            }
+            trace.push((phase, units));
+            match self.1 {
+                Some((stop, cause)) if at == stop => Err(cause),
+                _ => Ok(()),
+            }
+        }
+    }
+    struct Factory<'a> {
+        control: &'a Compile,
+        attempts: AtomicUsize,
+        fail: Option<usize>,
+        refused_at_control: AtomicUsize,
+        cause: Arc<()>,
+        live: Arc<AtomicUsize>,
+        holds: Mutex<Vec<std::sync::Weak<Hold>>>,
+    }
+    impl Factory<'_> {
+        fn quote(&self, layout: Layout) -> Result<(), Arc<()>> {
+            assert_ne!(layout.size(), 0);
+            let at = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.fail == Some(at) {
+                self.refused_at_control
+                    .store(self.control.0.lock().unwrap().len(), Ordering::SeqCst);
+                return Err(self.cause.clone());
+            }
+            self.live.fetch_add(layout.size(), Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    struct Scope<'a> {
+        factory: &'a Factory<'a>,
+        hold: Arc<Hold>,
+    }
+    impl ValueSchemaCreationScope<Arc<()>> for Scope<'_> {
+        fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+            ValueTypeStorageLifetime::held(self.hold.clone())
+        }
+        fn request_layout(&mut self, layout: Layout) -> Result<(), Arc<()>> {
+            self.factory.quote(layout)?;
+            self.hold.charged.fetch_add(layout.size(), Ordering::SeqCst);
+            Ok(())
+        }
+        fn observe_opaque_upper_bound(&mut self, _: usize) -> Result<(), Arc<()>> {
+            panic!("canonical Float64 creates no opaque collection or payload")
+        }
+    }
+    impl ValueSchemaCreationFactory<Arc<()>> for Factory<'_> {
+        type Scope<'a>
+            = Scope<'a>
+        where
+            Self: 'a;
+        fn begin_scope(&self) -> Result<Self::Scope<'_>, Arc<()>> {
+            let layout =
+                novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<Hold>())
+                    .unwrap();
+            self.quote(layout)?;
+            let hold = Arc::new(Hold {
+                charged: AtomicUsize::new(layout.size()),
+                live: self.live.clone(),
+            });
+            self.holds.lock().unwrap().push(Arc::downgrade(&hold));
+            Ok(Scope {
+                factory: self,
+                hold,
+            })
+        }
+        fn begin_scope_observed<O>(
+            &self,
+            observe: &mut dyn FnMut(Layout) -> Result<(), O>,
+        ) -> Result<Self::Scope<'_>, ValueSchemaScopeBeginFailure<O, Arc<()>>> {
+            let layout =
+                novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<Hold>())
+                    .unwrap();
+            observe(layout).map_err(ValueSchemaScopeBeginFailure::Observer)?;
+            self.begin_scope()
+                .map_err(ValueSchemaScopeBeginFailure::Creator)
+        }
+    }
+    let source = FunctionValueType::new(DataType::Float32, false);
+    let right = FunctionValueType::new(DataType::Int64, false);
+    let output = FunctionValueType::new(DataType::Float64, true);
+    let run = |fail, control_fail, expected_trace: &[(CompilePhase, u32)]| {
+        let control = Compile(Mutex::new(Vec::new()), control_fail);
+        let live = Arc::new(AtomicUsize::new(0));
+        let factory = Factory {
+            control: &control,
+            attempts: AtomicUsize::new(0),
+            fail,
+            refused_at_control: AtomicUsize::new(0),
+            cause: Arc::new(()),
+            live: live.clone(),
+            holds: Mutex::new(Vec::new()),
+        };
+        let result = PreparedArithmeticRecipe::try_new_with_creator_in(
+            ArithmeticOperator::Add,
+            &source,
+            &right,
+            &output,
+            DecimalOverflowPolicy::OutputNull,
+            true,
+            &factory,
+            &control,
+        );
+        let total = factory.attempts.load(Ordering::SeqCst);
+        if let Some(at) = fail {
+            assert!(matches!(result,
+                Err(ArithmeticCreationFailure::Construction(ValueConstructionFailure::Observer(
+                    ArithmeticTypeCreationFailure::Creator(ref actual)))) if Arc::ptr_eq(actual, &factory.cause)));
+            assert_eq!(total, at + 1);
+            assert_eq!(
+                control.0.lock().unwrap().len(),
+                factory.refused_at_control.load(Ordering::SeqCst)
+            );
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        } else if let Some((stop, cause)) = control_fail {
+            match result.unwrap_err() {
+                ArithmeticCreationFailure::Prepare(error) => {
+                    assert_eq!(error.control_error(), Some(cause))
+                }
+                ArithmeticCreationFailure::Construction(ValueConstructionFailure::Observer(
+                    ArithmeticTypeCreationFailure::Control(actual),
+                )) => assert_eq!(actual, cause),
+                other => panic!("wrong original arithmetic cause: {other:?}"),
+            }
+            assert_eq!(*control.0.lock().unwrap(), expected_trace[..=stop]);
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        } else {
+            let prepared = result.unwrap();
+            let super::super::ArithmeticAlgorithm::Float(float) = &prepared.algorithm else {
+                panic!("original Float profile")
+            };
+            let late_target = float.left.result_type().clone();
+            assert!(
+                float
+                    .left
+                    .result_type()
+                    .value_type()
+                    .shares_storage(float.right.result_type().value_type())
+            );
+            let weak = factory.holds.lock().unwrap()[0].clone();
+            assert_eq!(factory.holds.lock().unwrap().len(), 1);
+            drop(prepared);
+            drop(factory);
+            assert!(weak.upgrade().is_some());
+            assert!(live.load(Ordering::SeqCst) > 0);
+            drop(late_target);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        }
+        let trace = control.0.lock().unwrap().clone();
+        (total, trace)
+    };
+    let (total, trace) = run(None, None, &[]);
+    assert!(
+        total >= 3,
+        "actual scope, layout and semantic holder operations"
+    );
+    for at in 0..total {
+        run(Some(at), None, &[]);
+    }
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for stop in 0..trace.len() {
+            run(None, Some((stop, cause)), &trace);
+        }
+    }
+    let control = Compile(Mutex::new(Vec::new()), None);
+    let factory = Factory {
+        control: &control,
+        attempts: AtomicUsize::new(0),
+        fail: Some(0),
+        refused_at_control: AtomicUsize::new(0),
+        cause: Arc::new(()),
+        live: Arc::new(AtomicUsize::new(0)),
+        holds: Mutex::new(Vec::new()),
+    };
+    let unsupported = FunctionValueType::new(DataType::Utf8, false);
+    assert!(matches!(
+        PreparedArithmeticRecipe::try_new_with_creator_in(
+            ArithmeticOperator::Add,
+            &unsupported,
+            &right,
+            &output,
+            DecimalOverflowPolicy::OutputNull,
+            true,
+            &factory,
+            &control,
+        ),
+        Err(ArithmeticCreationFailure::Prepare(
+            ArithmeticPrepareError::Unsupported
+        ))
+    ));
+    assert_eq!(factory.attempts.load(Ordering::SeqCst), 0);
+    let signed_output = FunctionValueType::new(DataType::Int64, true);
+    PreparedArithmeticRecipe::try_new_with_creator_in(
+        ArithmeticOperator::Add,
+        &right,
+        &right,
+        &signed_output,
+        DecimalOverflowPolicy::OutputNull,
+        true,
+        &factory,
+        &control,
+    )
+    .unwrap();
+    assert_eq!(factory.attempts.load(Ordering::SeqCst), 0);
 }

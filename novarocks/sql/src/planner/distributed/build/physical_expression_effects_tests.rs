@@ -571,9 +571,9 @@ fn expression_effects_primitive_cast_successful_null_and_errorful_cast_arithmeti
             .get(successful_null)
             .unwrap()
             .ty
-            .nullable
+            .nullable()
     );
-    assert!(!fragment.expressions().get(row_error).unwrap().ty.nullable);
+    assert!(!fragment.expressions().get(row_error).unwrap().ty.nullable());
 }
 
 #[test]
@@ -621,7 +621,7 @@ fn expression_effects_case_and_boolean_guards_keep_rand_state_and_errorful_cast_
     let compare = builder
         .add_expression(
             owner,
-            ty(DataType::Boolean, rand_ty.nullable),
+            ty(DataType::Boolean, rand_ty.nullable()),
             ExprKind::Binary {
                 left: rand,
                 op: BinaryOperator::Gt,
@@ -634,7 +634,7 @@ fn expression_effects_case_and_boolean_guards_keep_rand_state_and_errorful_cast_
     let case = builder
         .add_expression(
             owner,
-            ty(DataType::Boolean, rand_ty.nullable),
+            ty(DataType::Boolean, rand_ty.nullable()),
             ExprKind::Case {
                 operand: None,
                 when_then: Box::from([(condition, isnull)]),
@@ -645,7 +645,7 @@ fn expression_effects_case_and_boolean_guards_keep_rand_state_and_errorful_cast_
     let root = builder
         .add_expression(
             owner,
-            ty(DataType::Boolean, rand_ty.nullable),
+            ty(DataType::Boolean, rand_ty.nullable()),
             ExprKind::Conjunction {
                 args: Box::from([false_, case]),
             },

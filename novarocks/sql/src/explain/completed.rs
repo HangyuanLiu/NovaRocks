@@ -1045,8 +1045,8 @@ fn render_result_schema(
             quote_text(&field.name),
             OptionalQuoted(field.alias.as_deref()),
             field.value.get(),
-            field.ty.data_type,
-            if field.ty.nullable {
+            field.ty.data_type(),
+            if field.ty.nullable() {
                 "NULL"
             } else {
                 "NOT NULL"
@@ -1603,8 +1603,8 @@ impl fmt::Display for ValueTypeDisplay<'_> {
         write!(
             formatter,
             "{}/{}",
-            self.0.data_type,
-            if self.0.nullable {
+            self.0.data_type(),
+            if self.0.nullable() {
                 "nullable"
             } else {
                 "required"
@@ -2073,8 +2073,8 @@ impl fmt::Display for RuntimeFilterDomainDisplay<'_> {
                 write!(
                     formatter,
                     "Membership(key={}{}, nulls={})",
-                    ty.data_type,
-                    if ty.nullable { " NULLABLE" } else { "" },
+                    ty.data_type(),
+                    if ty.nullable() { " NULLABLE" } else { "" },
                     runtime_filter_null_semantics(*null_semantics)
                 )
             }
@@ -2085,7 +2085,7 @@ impl fmt::Display for RuntimeFilterDomainDisplay<'_> {
             } => write!(
                 formatter,
                 "OrderedBound(key={} {} NULLS {}, inclusive={inclusive}, comparator={})",
-                key.ty.data_type,
+                key.ty.data_type(),
                 sort_direction(key.direction),
                 null_ordering(key.null_ordering),
                 comparator.stable_name()

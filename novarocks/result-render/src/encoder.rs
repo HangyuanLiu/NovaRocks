@@ -1678,6 +1678,7 @@ enum Phase {
 enum SchemaOwner {
     Standalone(Arc<ClientRenderSchema>),
     Root(Arc<RootOutputContract>),
+    TypedRoot(ValidatedMysqlInput),
 }
 impl std::ops::Deref for SchemaOwner {
     type Target = ClientRenderSchema;
@@ -1690,11 +1691,16 @@ impl std::ops::Deref for SchemaOwner {
                 };
                 schema
             }
+            Self::TypedRoot(input) => {
+                let FrozenRootOutput::ClientRows(schema) = input.contract().output() else {
+                    unreachable!("typed root proof validates its purpose");
+                };
+                schema
+            }
         }
     }
 }
 pub struct ArrowMysqlTextEncoder {
-    schema: SchemaOwner,
     batch: RecordBatch,
     stage: Box<[u8; 65536]>,
     lengths: Box<[u32; 4096]>,
@@ -1714,6 +1720,55 @@ pub struct ArrowMysqlTextEncoder {
     cell_atom: Atom,
     moving: usize,
     move_target: usize,
+    // Every batch/cursor array owner is destroyed before its type creator
+    // responsibility. Independent cursors retain this immutable owner.
+    schema: SchemaOwner,
+}
+
+/// Complete input semantics and this renderer's installed layout capability
+/// are checked once. The retained input owner proves each batch schema before
+/// a cursor can reuse the result, independently of per-row encoding checks.
+#[derive(Clone)]
+pub struct ValidatedMysqlInput {
+    types: novarocks_type_contract::ValidatedClientInputTypes,
+}
+impl ValidatedMysqlInput {
+    pub fn try_new(
+        types: novarocks_type_contract::ValidatedClientInputTypes,
+    ) -> Result<Self, RenderError> {
+        let FrozenRootOutput::ClientRows(schema) = types.contract().output() else {
+            return Err(error(E::SchemaMismatch));
+        };
+        for (ordinal, column) in schema.columns().iter().enumerate() {
+            let binding = types
+                .binding_at(column.source_ordinal as usize)
+                .ok_or_else(|| error(E::SchemaMismatch))?;
+            validate_field(&column.field, binding.data_type(), false).map_err(|mut error| {
+                error.output_ordinal = Some(ordinal as u32);
+                error
+            })?;
+        }
+        Ok(Self { types })
+    }
+
+    pub fn contract(&self) -> &Arc<RootOutputContract> {
+        self.types.contract()
+    }
+
+    pub fn is_for(
+        &self,
+        contract: &Arc<RootOutputContract>,
+        input: &Arc<dyn novarocks_type_contract::ClientInputTypeBindings>,
+    ) -> bool {
+        self.types.is_for(contract, input)
+    }
+
+    pub fn rebind_shared(
+        &self,
+        input: Arc<dyn novarocks_type_contract::ClientInputTypeBindings>,
+    ) -> Option<Self> {
+        self.types.rebind_shared(input).map(|types| Self { types })
+    }
 }
 impl ArrowMysqlTextEncoder {
     pub fn try_new(
@@ -1733,28 +1788,48 @@ impl ArrowMysqlTextEncoder {
         }
         Self::try_new_with_owner(SchemaOwner::Root(contract), batch)
     }
+
+    /// Keep the complete input types and their original creator responsibility
+    /// independently of the input Chunk. Physical array validation remains
+    /// separate from this previously established render-purpose proof.
+    pub fn try_new_typed_root(
+        input: ValidatedMysqlInput,
+        batch: RecordBatch,
+    ) -> Result<Self, RenderError> {
+        Self::try_new_with_owner(SchemaOwner::TypedRoot(input), batch)
+    }
     fn try_new_with_owner(schema: SchemaOwner, batch: RecordBatch) -> Result<Self, RenderError> {
         if schema.columns().is_empty() || schema.columns().len() > V::MAX_COLUMNS {
             return Err(error(E::SchemaMismatch));
         }
-        for (ordinal, column) in schema.columns().iter().enumerate() {
-            let i = column.source_ordinal as usize;
-            let field = batch
-                .schema()
-                .fields()
-                .get(i)
-                .cloned()
-                .ok_or_else(|| error(E::SchemaMismatch))?;
-            if field.is_nullable() != column.field.nullable {
-                return Err(RenderError {
-                    kind: E::SchemaMismatch,
-                    output_ordinal: Some(ordinal as u32),
-                });
+        let typed = if let SchemaOwner::TypedRoot(input) = &schema {
+            if !input.types.matches_schema(batch.schema_ref()) {
+                return Err(error(E::SchemaMismatch));
             }
-            validate_field(&column.field, field.data_type(), false).map_err(|mut e| {
-                e.output_ordinal = Some(ordinal as u32);
-                e
-            })?;
+            true
+        } else {
+            false
+        };
+        if !typed {
+            for (ordinal, column) in schema.columns().iter().enumerate() {
+                let i = column.source_ordinal as usize;
+                let field = batch
+                    .schema()
+                    .fields()
+                    .get(i)
+                    .cloned()
+                    .ok_or_else(|| error(E::SchemaMismatch))?;
+                if field.is_nullable() != column.field.nullable {
+                    return Err(RenderError {
+                        kind: E::SchemaMismatch,
+                        output_ordinal: Some(ordinal as u32),
+                    });
+                }
+                validate_field(&column.field, field.data_type(), false).map_err(|mut e| {
+                    e.output_ordinal = Some(ordinal as u32);
+                    e
+                })?;
+            }
         }
         Ok(Self {
             schema,

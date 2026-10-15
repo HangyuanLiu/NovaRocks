@@ -24,7 +24,6 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorPinnedFileSet, ConnectorProviderBindingKey,
     ConnectorTableHandle, write_stack::ConnectorWriteRewriteSource,
@@ -37,7 +36,7 @@ pub struct IcebergCowPendingReadSource {
     pub(crate) original_source: ConnectorTableHandle,
     pub(crate) pinned: ConnectorPinnedFileSet,
     pub(crate) signed_base: [u8; 32],
-    pub(crate) signed_schema: SchemaRef,
+    pub(crate) signed_source: ConnectorWriteRewriteSource,
     pub(crate) metadata: crate::iceberg::spec::TableMetadataRef,
     pub(crate) access: Arc<crate::loaded_table::IcebergAttemptTableAccess>,
     pub(crate) read_file: Arc<crate::read_model::IcebergReadFile>,
@@ -74,7 +73,8 @@ impl IcebergCowPendingReadSource {
         access: Arc<crate::loaded_table::IcebergAttemptTableAccess>,
         read_file: crate::read_model::IcebergReadFile,
     ) -> Result<Self, ConnectorError> {
-        if source.source().owner() != &owner.instance_id
+        if source.frozen_read_source().is_some()
+            || source.source().owner() != &owner.instance_id
             || !matches!(source.pinned_source().files(), [path] if path.as_ref() == read_file.path)
             || metadata
                 .snapshot_by_id(source.pinned_source().version_ordinal())
@@ -92,7 +92,7 @@ impl IcebergCowPendingReadSource {
             original_source: source.source().clone(),
             pinned: source.pinned_source().clone(),
             signed_base: source.base_version_digest(),
-            signed_schema: Arc::clone(source.scan_schema()),
+            signed_source: source.clone(),
             metadata,
             access,
             read_file: Arc::new(read_file),

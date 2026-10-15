@@ -51,7 +51,7 @@ pub enum CallArgumentUses<'a> {
     },
 }
 impl CallArgumentUses<'_> {
-    fn same_borrow(self, other: Self) -> bool {
+    pub(crate) fn same_borrow(self, other: Self) -> bool {
         match (self, other) {
             (Self::SelectedChannels(left), Self::SelectedChannels(right)) => {
                 std::ptr::eq(left, right)
@@ -121,6 +121,31 @@ pub struct CallEffectInput<'a> {
     pub proof_scope: CallProofScope,
 }
 
+impl CallEffectInput<'_> {
+    pub(crate) fn same_borrow(self, input: CallEffectInput<'_>) -> bool {
+        let original = self;
+        !(original.context != input.context
+            || !original.argument_uses.same_borrow(input.argument_uses)
+            || !std::ptr::eq(original.function_id, input.function_id)
+            || original.kind != input.kind
+            || !std::ptr::eq(original.selected, input.selected)
+            || !std::ptr::eq(original.request.arguments, input.request.arguments)
+            || original.request.logical_argument_count != input.request.logical_argument_count
+            || !match (
+                original.request.expected_result_type,
+                input.request.expected_result_type,
+            ) {
+                (None, None) => true,
+                (Some(original), Some(actual)) => std::ptr::eq(original, actual),
+                _ => false,
+            }
+            || !std::ptr::eq(original.environment, input.environment)
+            || !std::ptr::eq(original.parameters, input.parameters)
+            || original.decimal_overflow_policy != input.decimal_overflow_policy
+            || original.proof_scope != input.proof_scope)
+    }
+}
+
 /// Required operations of the exact installed immutable implementation owner.
 /// A refiner validates the already-selected signature, never reselects it, and
 /// uses only exact constants/types/policies/frozen environment. It proves the
@@ -156,6 +181,17 @@ pub trait FunctionEffectOwner: Send + Sync {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>>;
+    /// Internal staged sibling. A checked loan does not authorize a pure
+    /// fallback or replace the actual owner's refinement facts.
+    fn validate_and_refine_checked(
+        &self,
+        _input: CallEffectInput<'_>,
+        _checked: &crate::CheckedCallEffectInput<'_>,
+        _control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        Err(crate::CheckedOwnerFailure::UnconvertedOwner)
+    }
 }
 
 /// Implementation control failures remain typed at the neutral boundary.
@@ -343,8 +379,8 @@ pub fn refine_call_effects<'a, O: FunctionEffectOwner + ?Sized>(
                 ));
             };
             if body_demand == novarocks_type_contract::EvaluationDemand::TruthOnly
-                && (result_type.data_type != arrow_schema::DataType::Boolean
-                    || result_type.logical_type
+                && (*result_type.data_type() != arrow_schema::DataType::Boolean
+                    || result_type.logical_type()
                         != novarocks_type_contract::ValueLogicalType::Physical)
             {
                 return Err(CallEffectRefinementError::InvalidInput(
@@ -556,7 +592,7 @@ fn validate_input_types<E: Error>(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), CallEffectRefinementError<E>> {
     use crate::{FunctionArgument, FunctionArgumentType, FunctionResultType};
-    use novarocks_type_contract::{FunctionValueType, fits_nested_nullability_observed};
+    use novarocks_type_contract::FunctionValueType;
 
     let validate = |value: &FunctionValueType, work: &mut CompileCheckpoints<'_>| {
         crate::kernel_input::validate_type_observed(value, work).map_err(input_type_failure::<E>)
@@ -581,13 +617,10 @@ fn validate_input_types<E: Error>(
             (FunctionArgument::Value { value_type, .. }, FunctionArgumentType::Value(expected)) => {
                 validate(value_type, work)?;
                 validate(expected, work)?;
-                if value_type.logical_type != expected.logical_type
-                    || (value_type.nullable && !expected.nullable)
-                    || !fits_nested_nullability_observed::<crate::KernelFailure>(
-                        &value_type.data_type,
-                        &expected.data_type,
-                        || work.step().map_err(crate::kernel_control::compile_failure),
-                    )
+                if !value_type
+                    .fits_physical_binding_observed(expected, || {
+                        work.step().map_err(crate::kernel_control::compile_failure)
+                    })
                     .map_err(input_type_failure::<E>)?
                 {
                     return Err(CallEffectRefinementError::InvalidInput(
@@ -758,26 +791,7 @@ impl RefinedCallEffects<'_> {
         // exact borrows prevents attaching a proof to a different call without
         // repeatedly comparing/copying recursive schemas and constant backing.
         // These local addresses are never a wire, plan or profile identity.
-        if original.context != input.context
-            || !original.argument_uses.same_borrow(input.argument_uses)
-            || !std::ptr::eq(original.function_id, input.function_id)
-            || original.kind != input.kind
-            || !std::ptr::eq(original.selected, input.selected)
-            || !std::ptr::eq(original.request.arguments, input.request.arguments)
-            || original.request.logical_argument_count != input.request.logical_argument_count
-            || !match (
-                original.request.expected_result_type,
-                input.request.expected_result_type,
-            ) {
-                (None, None) => true,
-                (Some(original), Some(actual)) => std::ptr::eq(original, actual),
-                _ => false,
-            }
-            || !std::ptr::eq(original.environment, input.environment)
-            || !std::ptr::eq(original.parameters, input.parameters)
-            || original.decimal_overflow_policy != input.decimal_overflow_policy
-            || original.proof_scope != input.proof_scope
-        {
+        if !original.same_borrow(input) {
             return Err(EffectContractError::CallIdentityMismatch);
         }
         Ok(())
@@ -975,7 +989,10 @@ mod tests {
                 return Err(FunctionEffectOwnerError::Control(error));
             }
             self.calls.fetch_add(1, Ordering::Relaxed);
-            let ty = FunctionValueType::new(arrow_schema::DataType::Int64, true);
+            let ty = FunctionValueType::from_legacy_declared_projection(
+                arrow_schema::DataType::Int64,
+                true,
+            );
             if input.selected.argument_types.as_ref() != [FunctionArgumentType::Value(ty.clone())]
                 || input.selected.result_type != FunctionResultType::Scalar(ty)
                 || input.environment.len() != 1
@@ -1022,10 +1039,13 @@ mod tests {
         }
     }
     fn selected() -> FunctionBindingSelection {
-        let ty = FunctionValueType::new(arrow_schema::DataType::Int64, true);
+        let ty =
+            FunctionValueType::from_legacy_declared_projection(arrow_schema::DataType::Int64, true);
         FunctionBindingSelection {
             overload: FunctionOverloadId::try_new("fixture/effect/i64").unwrap(),
-            argument_types: vec![FunctionArgumentType::Value(ty.clone())].into_boxed_slice(),
+            argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                vec![FunctionArgumentType::Value(ty.clone())].into_boxed_slice(),
+            ),
             result_type: FunctionResultType::Scalar(ty),
             aggregate: None,
         }
@@ -1036,7 +1056,10 @@ mod tests {
         let id = FunctionId::try_new("fixture/effect").unwrap();
         let selected = selected();
         let args = [FunctionArgument::Value {
-            value_type: FunctionValueType::new(arrow_schema::DataType::Int64, true),
+            value_type: FunctionValueType::from_legacy_declared_projection(
+                arrow_schema::DataType::Int64,
+                true,
+            ),
             constant: None,
         }];
         let environment = [SemanticParameterRef {
@@ -1111,7 +1134,10 @@ mod tests {
             Err(EffectContractError::CallIdentityMismatch)
         );
         let other_args = [FunctionArgument::Value {
-            value_type: FunctionValueType::new(arrow_schema::DataType::Int64, true),
+            value_type: FunctionValueType::from_legacy_declared_projection(
+                arrow_schema::DataType::Int64,
+                true,
+            ),
             constant: Some(
                 crate::ConstantValue::from_i64(
                     std::sync::Arc::new(arrow_schema::Field::new(
@@ -1119,7 +1145,10 @@ mod tests {
                         arrow_schema::DataType::Int64,
                         true,
                     )),
-                    FunctionValueType::new(arrow_schema::DataType::Int64, true),
+                    FunctionValueType::from_legacy_declared_projection(
+                        arrow_schema::DataType::Int64,
+                        true,
+                    ),
                     1,
                     crate::ConstantPolicy {
                         max_rows: 1,
@@ -1341,7 +1370,10 @@ mod tests {
         let id = FunctionId::try_new("fixture/effect").unwrap();
         let selected = selected();
         let args = [FunctionArgument::Value {
-            value_type: FunctionValueType::new(arrow_schema::DataType::Int64, true),
+            value_type: FunctionValueType::from_legacy_declared_projection(
+                arrow_schema::DataType::Int64,
+                true,
+            ),
             constant: None,
         }];
         let environment = [

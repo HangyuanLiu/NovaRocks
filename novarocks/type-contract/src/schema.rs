@@ -18,6 +18,59 @@ use arrow_schema::{DataType, Field, Schema};
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::Hasher;
 
+/// Real comparison work before a closed operation or byte inspection.
+/// This reports no storage facts and grants no capacity. The existing unit
+/// observers adapt one event to one callback without changing their sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypeComparisonStep {
+    Header,
+    Bytes { inspected_bytes: usize },
+}
+impl TypeComparisonStep {
+    pub const fn work_units_upper(self) -> usize {
+        match self {
+            Self::Header => COMPARISON_HEADER_WORK,
+            Self::Bytes { inspected_bytes } => inspected_bytes,
+        }
+    }
+}
+// Includes dispatch, tags, arity/length/NULL/parameter checks and the loop's
+// fixed bookkeeping. Dynamic byte inspection always has a separate event.
+pub(crate) const COMPARISON_HEADER_WORK: usize = 16;
+
+pub(crate) fn comparison_work_add(
+    a: usize,
+    b: usize,
+) -> Result<usize, crate::ExecutionValueTypeError> {
+    a.checked_add(b)
+        .ok_or(crate::ExecutionValueTypeError::Invalid(
+            "type comparison work overflow",
+        ))
+}
+pub(crate) fn comparison_bytes_work(bytes: usize) -> Result<usize, crate::ExecutionValueTypeError> {
+    bytes
+        .checked_mul(2)
+        .ok_or(crate::ExecutionValueTypeError::Invalid(
+            "type comparison work overflow",
+        ))
+}
+// The sole Arrow comparator owns these local contributions. Constructors fold
+// them in their already required canonical traversal, never parse another tree.
+pub(crate) fn type_comparison_node_work(
+    ty: &DataType,
+) -> Result<usize, crate::ExecutionValueTypeError> {
+    comparison_work_add(
+        COMPARISON_HEADER_WORK,
+        match ty {
+            DataType::Timestamp(_, Some(zone)) => comparison_bytes_work(zone.len())?,
+            _ => 0,
+        },
+    )
+}
+pub(crate) fn field_comparison_work(name: &str) -> Result<usize, crate::ExecutionValueTypeError> {
+    comparison_work_add(COMPARISON_HEADER_WORK, comparison_bytes_work(name.len())?)
+}
+
 pub const MAX_ARROW_FIELD_NAME_BYTES: usize = 1024;
 pub const MAX_ARROW_FIELD_METADATA_ENTRIES: usize = 256;
 pub const MAX_ARROW_FIELD_METADATA_KEY_BYTES: usize = 1024;
@@ -61,6 +114,17 @@ pub fn arrow_data_types_exact(left: &DataType, right: &DataType) -> bool {
     .unwrap_or(false)
 }
 
+/// Callback-only comparison for the private, already validated immutable value
+/// vocabulary. Keep this crate-private: raw provider or wire types must pass
+/// their original admission checks before they enter a typed holder.
+pub(crate) fn arrow_validated_data_types_exact_observed<E>(
+    left: &DataType,
+    right: &DataType,
+    observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    compare_types(left, right, FieldMode::Exact, observe, |_, _| Ok(()))
+}
+
 /// The same exact comparison with bounded depth/node traversal and an observer
 /// at every visited type and field. Frozen metadata bounds are validated by
 /// the type owner; this comparison does not allocate a recursive schema copy.
@@ -88,10 +152,33 @@ pub fn arrow_data_types_exact_observed<E: From<crate::ValueTypeError>>(
 pub fn arrow_data_types_exact_borrowed_observed<E: From<crate::ValueTypeError>>(
     left: &DataType,
     right: &DataType,
+    observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    compare_types_borrowed(left, right, FieldMode::Exact, observe)
+}
+
+/// Observe Arrow's original PartialEq rule using the sole traversal and
+/// borrowed metadata. Dictionary Field ids/order remain compatibility facts;
+/// child NULL, names, metadata and all carrier structure are still compared.
+/// As with the exact borrowed port, callers admit retained map iteration and
+/// quadratic metadata candidate work without a new metadata limit.
+pub fn arrow_data_types_equal_borrowed_observed<E: From<crate::ValueTypeError>>(
+    left: &DataType,
+    right: &DataType,
+    observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    compare_types_borrowed(left, right, FieldMode::Compatibility, observe)
+}
+
+fn compare_types_borrowed<E: From<crate::ValueTypeError>>(
+    left: &DataType,
+    right: &DataType,
+    mode: FieldMode,
     mut observe: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
+    let mut weighted = |_: TypeComparisonStep| observe();
     Walk {
-        observe: &mut observe,
+        observe: &mut weighted,
         validate: &mut |depth, nodes| {
             if depth > crate::MAX_VALUE_TYPE_DEPTH {
                 Err(crate::ValueTypeError::TooDeep.into())
@@ -102,7 +189,7 @@ pub fn arrow_data_types_exact_borrowed_observed<E: From<crate::ValueTypeError>>(
             }
         },
         nodes: 0,
-        mode: FieldMode::Exact,
+        mode,
         metadata_mode: MetadataMode::BorrowedLinear,
     }
     .ty(left, right, 1)
@@ -116,8 +203,9 @@ pub fn arrow_fields_exact_borrowed_observed<E>(
     right: &Field,
     mut observe: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
+    let mut weighted = |_: TypeComparisonStep| observe();
     Walk {
-        observe: &mut observe,
+        observe: &mut weighted,
         validate: &mut |_, _| Ok(()),
         nodes: 0,
         mode: FieldMode::Exact,
@@ -161,8 +249,9 @@ pub fn arrow_fields_exact_observed<E>(
     right: &Field,
     mut observe: impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
+    let mut weighted = |_: TypeComparisonStep| observe();
     Walk {
-        observe: &mut observe,
+        observe: &mut weighted,
         validate: &mut |_, _| Ok(()),
         nodes: 0,
         mode: FieldMode::Exact,
@@ -176,6 +265,16 @@ fn compare_types<E>(
     right: &DataType,
     mode: FieldMode,
     mut observe: impl FnMut() -> Result<(), E>,
+    validate: impl FnMut(usize, usize) -> Result<(), E>,
+) -> Result<bool, E> {
+    compare_types_weighted(left, right, mode, |_| observe(), validate)
+}
+
+fn compare_types_weighted<E>(
+    left: &DataType,
+    right: &DataType,
+    mode: FieldMode,
+    mut observe: impl FnMut(TypeComparisonStep) -> Result<(), E>,
     mut validate: impl FnMut(usize, usize) -> Result<(), E>,
 ) -> Result<bool, E> {
     Walk {
@@ -186,6 +285,30 @@ fn compare_types<E>(
         metadata_mode: MetadataMode::Bucketed,
     }
     .ty(left, right, 1)
+}
+
+pub(crate) fn arrow_data_types_exact_weighted_observed<E: From<crate::ValueTypeError>>(
+    left: &DataType,
+    right: &DataType,
+    observe: impl FnMut(TypeComparisonStep) -> Result<(), E>,
+) -> Result<bool, E> {
+    compare_types_weighted(left, right, FieldMode::Exact, observe, |depth, nodes| {
+        if depth > crate::MAX_VALUE_TYPE_DEPTH {
+            Err(crate::ValueTypeError::TooDeep.into())
+        } else if nodes > crate::MAX_VALUE_TYPE_NODES {
+            Err(crate::ValueTypeError::TooManyNodes.into())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+pub(crate) fn arrow_validated_data_types_exact_weighted_observed<E>(
+    left: &DataType,
+    right: &DataType,
+    observe: impl FnMut(TypeComparisonStep) -> Result<(), E>,
+) -> Result<bool, E> {
+    compare_types_weighted(left, right, FieldMode::Exact, observe, |_, _| Ok(()))
 }
 
 #[derive(Clone, Copy)]
@@ -207,13 +330,17 @@ struct Walk<'a, F, B> {
     mode: FieldMode,
     metadata_mode: MetadataMode,
 }
-impl<E, F: FnMut() -> Result<(), E>, B: FnMut(usize, usize) -> Result<(), E>> Walk<'_, F, B> {
+impl<E, F: FnMut(TypeComparisonStep) -> Result<(), E>, B: FnMut(usize, usize) -> Result<(), E>>
+    Walk<'_, F, B>
+{
     fn bytes(&mut self, left: &[u8], right: &[u8]) -> Result<bool, E> {
         if left.len() != right.len() {
             return Ok(false);
         }
         for (left, right) in left.chunks(1024).zip(right.chunks(1024)) {
-            (self.observe)()?;
+            (self.observe)(TypeComparisonStep::Bytes {
+                inspected_bytes: left.len() + right.len(),
+            })?;
             if left != right {
                 return Ok(false);
             }
@@ -221,11 +348,13 @@ impl<E, F: FnMut() -> Result<(), E>, B: FnMut(usize, usize) -> Result<(), E>> Wa
         Ok(true)
     }
     fn key_hash(&mut self, key: &[u8]) -> Result<u64, E> {
-        (self.observe)()?;
+        (self.observe)(TypeComparisonStep::Header)?;
         let mut hash = DefaultHasher::new();
         hash.write_usize(key.len());
         for chunk in key.chunks(1024) {
-            (self.observe)()?;
+            (self.observe)(TypeComparisonStep::Bytes {
+                inspected_bytes: chunk.len(),
+            })?;
             hash.write(chunk);
         }
         Ok(hash.finish())
@@ -245,10 +374,10 @@ impl<E, F: FnMut() -> Result<(), E>, B: FnMut(usize, usize) -> Result<(), E>> Wa
         // must admit the K right-map scans and K^2 candidates, including opaque
         // iteration over retained hash-table capacity, before entering here.
         for (key, value) in left.metadata() {
-            (self.observe)()?;
+            (self.observe)(TypeComparisonStep::Header)?;
             let mut matched = false;
             for (other_key, other_value) in right.metadata() {
-                (self.observe)()?;
+                (self.observe)(TypeComparisonStep::Header)?;
                 if self.bytes(key.as_bytes(), other_key.as_bytes())? {
                     if !self.bytes(value.as_bytes(), other_value.as_bytes())? {
                         return Ok(false);
@@ -286,13 +415,13 @@ impl<E, F: FnMut() -> Result<(), E>, B: FnMut(usize, usize) -> Result<(), E>> Wa
         }
         for (key, value) in left.metadata() {
             let fingerprint = key_hash(self, key.as_bytes())?;
-            (self.observe)()?;
+            (self.observe)(TypeComparisonStep::Header)?;
             let Some(candidates) = buckets.get(&fingerprint) else {
                 return Ok(false);
             };
             let mut matched = false;
             for (other_key, other_value) in candidates {
-                (self.observe)()?;
+                (self.observe)(TypeComparisonStep::Header)?;
                 if self.bytes(key.as_bytes(), other_key.as_bytes())? {
                     if !self.bytes(value.as_bytes(), other_value.as_bytes())? {
                         return Ok(false);
@@ -308,7 +437,7 @@ impl<E, F: FnMut() -> Result<(), E>, B: FnMut(usize, usize) -> Result<(), E>> Wa
         Ok(true)
     }
     fn field(&mut self, left: &Field, right: &Field, depth: usize) -> Result<bool, E> {
-        (self.observe)()?;
+        (self.observe)(TypeComparisonStep::Header)?;
         #[allow(deprecated)]
         let dictionary_equal = match self.mode {
             FieldMode::Exact => {
@@ -327,7 +456,7 @@ impl<E, F: FnMut() -> Result<(), E>, B: FnMut(usize, usize) -> Result<(), E>> Wa
         self.ty(left.data_type(), right.data_type(), depth)
     }
     fn ty(&mut self, left: &DataType, right: &DataType, depth: usize) -> Result<bool, E> {
-        (self.observe)()?;
+        (self.observe)(TypeComparisonStep::Header)?;
         self.nodes += 1;
         (self.validate)(depth, self.nodes)?;
         match (left, right) {
@@ -625,7 +754,7 @@ mod tests {
         }
         let empty = field(&[]);
         let mut observed = 0;
-        let mut observe = || {
+        let mut observe = |_: TypeComparisonStep| {
             observed += 1;
             Ok::<_, std::convert::Infallible>(())
         };
@@ -659,7 +788,7 @@ mod tests {
         let swapped = field(&[("same-prefix-a", "second"), ("same-prefix-b", "first")]);
         for (right, expected) in [(&equal, true), (&missing, false), (&swapped, false)] {
             let mut observed = 0;
-            let mut observe = || {
+            let mut observe = |_: TypeComparisonStep| {
                 observed += 1;
                 Ok::<_, std::convert::Infallible>(())
             };
@@ -671,7 +800,7 @@ mod tests {
                 metadata_mode: MetadataMode::Bucketed,
             }
             .metadata_with_key_hash(&left, right, |walk, _| {
-                (walk.observe)()?;
+                (walk.observe)(TypeComparisonStep::Header)?;
                 Ok(0)
             });
             assert_eq!(result, Ok(expected));
@@ -759,6 +888,12 @@ mod tests {
                     arrow_data_types_equal_observed::<ValueTypeError>(left, right, || Ok(())),
                     Ok(left == right)
                 );
+                assert_eq!(
+                    arrow_data_types_equal_borrowed_observed::<ValueTypeError>(left, right, || Ok(
+                        ()
+                    )),
+                    Ok(left == right)
+                );
                 if left == right {
                     assert_eq!(
                         arrow_data_types_exact_observed::<ValueTypeError>(left, right, || Ok(())),
@@ -792,6 +927,12 @@ mod tests {
             for right in &corpus {
                 assert_eq!(
                     arrow_data_types_equal_observed::<ValueTypeError>(left, right, || Ok(())),
+                    Ok(left == right)
+                );
+                assert_eq!(
+                    arrow_data_types_equal_borrowed_observed::<ValueTypeError>(left, right, || Ok(
+                        ()
+                    )),
                     Ok(left == right)
                 );
             }

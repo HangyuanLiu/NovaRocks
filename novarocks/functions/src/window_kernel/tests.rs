@@ -159,10 +159,12 @@ impl Fixture {
                     "fixture/window-contract/exact-logical-signature",
                 )
                 .unwrap(),
-                argument_types: arguments
-                    .iter()
-                    .map(FunctionArgument::argument_type)
-                    .collect(),
+                argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                    arguments
+                        .iter()
+                        .map(FunctionArgument::argument_type)
+                        .collect::<Box<[_]>>(),
+                ),
                 result_type: FunctionResultType::Scalar(i64_type(false)),
                 aggregate: (kind == FunctionKind::Aggregate).then(|| AggregateBindingSelection {
                     state_argument_contract:

@@ -62,6 +62,8 @@ pub mod fragment_hash_join;
 pub mod fragment_ingress_error;
 pub mod fragment_instance;
 pub mod fragment_layout;
+mod fragment_original_requests;
+mod fragment_original_sources;
 pub mod fragment_plan_decode;
 pub(crate) mod fragment_plan_decode_submission;
 pub mod fragment_plan_node;
@@ -73,6 +75,7 @@ pub mod fragment_scan_decode;
 pub mod fragment_scan_output;
 pub mod fragment_sink;
 pub mod fragment_submission;
+pub(crate) mod fragment_type_decode;
 pub mod fragment_typed_connector_scan;
 pub mod fragment_validation;
 pub mod fragment_variant_path;
@@ -105,6 +108,7 @@ pub mod native_ingress;
 pub mod native_server;
 pub mod native_transport_admission;
 pub mod native_transport_geometry;
+pub(crate) mod native_type_construction;
 #[cfg(test)]
 mod physical_v1_roundtrip;
 pub use native_server::NativeRpcServerHandle;
@@ -437,3 +441,5 @@ pub mod test_observation_controls;
 
 #[cfg(feature = "test-controls")]
 pub mod backend_test_session;
+#[cfg(test)]
+mod root_metadata_origin_tests;

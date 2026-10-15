@@ -179,7 +179,7 @@ fn exact_temporal_factories_keep_units_zones_and_raw_extreme_values() {
             )
             .unwrap();
             assert_eq!(cv.try_time64().unwrap(), Some(value));
-            assert_eq!(cv.pool().array().data_type(), &ty.data_type);
+            assert_eq!(cv.pool().array().data_type(), ty.data_type());
             assert!(cv.try_i64().is_err());
         }
     }
@@ -207,7 +207,7 @@ fn exact_temporal_factories_keep_units_zones_and_raw_extreme_values() {
                 )
                 .unwrap();
                 assert_eq!(cv.try_timestamp().unwrap(), Some(value));
-                assert_eq!(cv.pool().array().data_type(), &ty.data_type);
+                assert_eq!(cv.pool().array().data_type(), ty.data_type());
                 assert_eq!(cv.value_type(), &ty);
                 assert!(cv.try_time64().is_err());
             }
@@ -225,15 +225,11 @@ fn exact_temporal_factories_keep_units_zones_and_raw_extreme_values() {
     .unwrap();
     assert!(cv.try_time64().is_err());
     assert!(cv.try_timestamp().is_err());
-    let bad = physical(DataType::Time64(TimeUnit::Second), false);
     assert!(
-        ConstantValue::from_time64(
-            Arc::new(Field::new("literal", bad.data_type.clone(), false)),
-            bad,
-            1,
-            policy(),
-            CompilePhase::Validate,
-            &Control::default()
+        FunctionValueType::try_with_logical_type(
+            DataType::Time64(TimeUnit::Second),
+            false,
+            ValueLogicalType::Physical
         )
         .is_err()
     );

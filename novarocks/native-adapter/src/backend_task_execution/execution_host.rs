@@ -555,6 +555,7 @@ impl NativeTaskExecutionHost {
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
         compiler: &dyn CompiledPackageCompiler,
+        preparation_stop: novarocks_worker::TaskPreparationStopView,
     ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
         let identity = descriptor.identity();
         let execution = identity.query_execution_id();
@@ -593,7 +594,26 @@ impl NativeTaskExecutionHost {
             Arc::clone(&splits),
         )?;
 
-        let control = TaskPreparationControl::new(task_stop.view());
+        let control = TaskPreparationControl::new(task_stop.view(), preparation_stop.clone());
+        let context_options = self.context_facts.query_options(execution)?;
+        let type_tracker = self
+            .queries
+            .type_construction_tracker(execution, context_options.runtime().exec_mem_limit())
+            .map_err(|error| memory_admission_failure_to_host(identity, &error))?;
+        let type_creation = crate::native_type_construction::NativeTypeConstruction::try_new(
+            type_tracker,
+            task_stop.view(),
+            preparation_stop.clone(),
+        )
+        .map_err(|error| native_type_construction_failure_to_host(identity, &error))?;
+        let type_scopes = super::compiled_package::CompiledTypeScopes::new(&type_creation);
+        let mut request = |layout| type_creation.request_layout(layout);
+        let mut opaque = |bytes| type_creation.request_opaque_upper_bound(bytes);
+        let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
+            type_creation.storage_lifetime(),
+            &mut request,
+            &mut opaque,
+        );
         let CompiledTaskProgram {
             program,
             runtime_filters,
@@ -606,6 +626,8 @@ impl NativeTaskExecutionHost {
                         self.execution_runtime.config().exchange_wait_ms,
                     ),
                 },
+                &mut creation,
+                &type_scopes,
                 &control,
             )
             .map_err(|error| compiled_package_rejection(identity, error))?;
@@ -628,7 +650,6 @@ impl NativeTaskExecutionHost {
         let sink_kind = compiled_sink_kind(Some(sink))
             .map_err(|error| internal(format!("task {identity} compiled sink: {error}")))?;
 
-        let context_options = self.context_facts.query_options(execution)?;
         let instance_input = project_task_instance(
             descriptor,
             assignment
@@ -1125,6 +1146,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         &self,
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
+        preparation_stop: novarocks_worker::TaskPreparationStopView,
     ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
         let identity = descriptor.identity();
         let execution = identity.query_execution_id();
@@ -1141,7 +1163,12 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 .map_err(internal)?;
         }
         if let Some(compiler) = self.compiled.clone() {
-            return self.install_compiled_receiver(descriptor, input, compiler.as_ref());
+            return self.install_compiled_receiver(
+                descriptor,
+                input,
+                compiler.as_ref(),
+                preparation_stop,
+            );
         }
         let (static_fragment, assignment) = input.into_parts();
         let fragment = decode_static_fragment(&static_fragment, FieldPath::root("frozen_fragment"))
@@ -1214,6 +1241,16 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         // The full static-to-assignment cross-check: scan node membership and
         // sink edge binding both run in this decode, before any receiver is
         // registered. The decoded plan is moved in rather than cloned.
+        let type_tracker = self
+            .queries
+            .type_construction_tracker(execution, context_options.runtime().exec_mem_limit())
+            .map_err(|error| memory_admission_failure_to_host(identity, &error))?;
+        let type_creation = crate::native_type_construction::NativeTypeConstruction::try_new(
+            type_tracker,
+            task_stop.view(),
+            preparation_stop.clone(),
+        )
+        .map_err(|error| native_type_construction_failure_to_host(identity, &error))?;
         let request = NativeFragmentRequest::try_decode_task(
             execution,
             fragment.into_plan(),
@@ -1227,8 +1264,17 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             self.test_controls.clone(),
             #[cfg(feature = "test-controls")]
             self.queries.observation_controls(),
+            &type_creation,
         )
-        .map_err(|error| protocol(format!("task {identity} plan is not decodable: {error}")))?;
+        .map_err(|error| {
+            if let Some(cause) = error.specialization_cause() {
+                return native_specialization_failure_to_host(identity, cause);
+            }
+            match error.construction_cause() {
+                Some(cause) => native_type_construction_failure_to_host(identity, cause),
+                None => protocol(format!("task {identity} plan is not decodable: {error}")),
+            }
+        })?;
         if request.sink_kind() != sink_kind {
             // Both answers come from the same decoded plan, so a disagreement
             // is a defect in this binary rather than something a peer sent.
@@ -2148,8 +2194,37 @@ fn failure_cause_category(
     cause: &ExecutionFailureCause,
     opaque_category: TaskFailureCategory,
 ) -> TaskFailureCategory {
+    use novarocks_execution::exec::pipeline::operator::input_construction::ConstructionFailure;
     use novarocks_functions::KernelFailure;
+    use novarocks_type_contract::CompileControlError;
     match cause {
+        ExecutionFailureCause::Construction(ConstructionFailure::Memory(_)) => {
+            TaskFailureCategory::ResourceExhausted
+        }
+        ExecutionFailureCause::Construction(ConstructionFailure::Control(
+            CompileControlError::ResourceExhausted,
+        )) => TaskFailureCategory::ResourceExhausted,
+        ExecutionFailureCause::Construction(ConstructionFailure::Resource(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel,
+        )) => TaskFailureCategory::Internal,
+        ExecutionFailureCause::Construction(ConstructionFailure::Resource(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::ArcHeader
+            | novarocks_type_contract::owned_resources::layout::LayoutResourceError::ArcBacking
+            | novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic
+            | novarocks_type_contract::owned_resources::layout::LayoutResourceError::BytesShared,
+        )) => TaskFailureCategory::ResourceExhausted,
+        ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner) => {
+            TaskFailureCategory::Internal
+        }
+        ExecutionFailureCause::Construction(
+            ConstructionFailure::InvalidSource(_)
+            | ConstructionFailure::Control(
+                CompileControlError::Cancelled | CompileControlError::DeadlineExceeded,
+            ),
+        ) => TaskFailureCategory::Execution,
+        ExecutionFailureCause::Construction(ConstructionFailure::Caller(error)) => {
+            failure_cause_category(error.cause(), opaque_category)
+        }
         ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted) => {
             TaskFailureCategory::ResourceExhausted
         }
@@ -2265,15 +2340,98 @@ fn compiled_package_rejection(
     identity: TaskIdentity,
     error: CompiledPackageError,
 ) -> HostRejection {
+    use novarocks_connector_contract::ConnectorErrorKind;
+    use novarocks_physical_plan::CallRequestError;
+    use novarocks_plan_codec::ipc_flat_stream_v2::{FlatPoolResourceError, FlatReaderError};
+    use novarocks_plan_codec::physical_constant_v2::PhysicalConstantCodecError;
+    use novarocks_plan_codec::physical_package_v2::PackageDecodeError;
+    use novarocks_plan_codec::physical_public_source_schema_v2::PublicSourceSchemaCodecError;
+    use novarocks_plan_codec::physical_read_scan_v2::ReadScanCodecError;
+    use novarocks_plan_codec::physical_schema_v2::SchemaCodecError;
+    use novarocks_plan_codec::physical_type_v2::TypeCodecError;
+    use novarocks_plan_codec::physical_writer_recipe_v2::WriterRecipeCodecError;
     use novarocks_type_contract::CompileControlError;
+    use novarocks_type_contract::owned_resources::btree::BTreeResourceError;
+    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+    if let CompiledPackageError::Construction(cause) = &error {
+        return native_type_construction_failure_to_host(identity, cause);
+    }
     let category = match &error {
-        CompiledPackageError::Control(CompileControlError::ResourceExhausted) => {
-            TaskFailureCategory::ResourceExhausted
-        }
+        CompiledPackageError::Control(CompileControlError::ResourceExhausted)
+        | CompiledPackageError::Decode(PackageDecodeError::Control(
+            CompileControlError::ResourceExhausted,
+        )) => TaskFailureCategory::ResourceExhausted,
         CompiledPackageError::Control(
             CompileControlError::Cancelled | CompileControlError::DeadlineExceeded,
-        ) => TaskFailureCategory::Execution,
+        )
+        | CompiledPackageError::Decode(PackageDecodeError::Control(
+            CompileControlError::Cancelled | CompileControlError::DeadlineExceeded,
+        )) => TaskFailureCategory::Execution,
         CompiledPackageError::Refused(_) => TaskFailureCategory::Protocol,
+        CompiledPackageError::Construction(_) => unreachable!("construction cause handled above"),
+        CompiledPackageError::Decode(PackageDecodeError::Constant(
+            PhysicalConstantCodecError::Reader(FlatReaderError::Projection(
+                FlatPoolResourceError::ConstructionResource(LayoutResourceError::SourceModel)
+                | FlatPoolResourceError::SourceMetadata(_),
+            )),
+        ))
+        | CompiledPackageError::Decode(PackageDecodeError::Type(TypeCodecError::ResourceSource(
+            _,
+        )))
+        | CompiledPackageError::Decode(PackageDecodeError::PublicSourceSchema(
+            PublicSourceSchemaCodecError::SourceModel(_)
+            | PublicSourceSchemaCodecError::Layout(LayoutResourceError::SourceModel),
+        ))
+        | CompiledPackageError::Decode(PackageDecodeError::Scan(
+            ReadScanCodecError::SourceModel(_)
+            | ReadScanCodecError::ConstructionResource(LayoutResourceError::SourceModel)
+            | ReadScanCodecError::InvalidSourceSchema(
+                PublicSourceSchemaCodecError::SourceModel(_)
+                | PublicSourceSchemaCodecError::Layout(LayoutResourceError::SourceModel),
+            ),
+        ))
+        | CompiledPackageError::Decode(PackageDecodeError::Schema(
+            SchemaCodecError::SourceModel(_)
+            | SchemaCodecError::ConstructionResource(LayoutResourceError::SourceModel),
+        ))
+        | CompiledPackageError::Decode(PackageDecodeError::Writer(
+            WriterRecipeCodecError::ConstructionResource(LayoutResourceError::SourceModel),
+        ))
+        | CompiledPackageError::Decode(PackageDecodeError::Requests(
+            CallRequestError::ConstructionResource(LayoutResourceError::SourceModel)
+            | CallRequestError::ConstructionTree(BTreeResourceError::SourceModel(_)),
+        )) => TaskFailureCategory::Internal,
+        CompiledPackageError::Decode(PackageDecodeError::PublicSourceSchema(
+            PublicSourceSchemaCodecError::Layout(_),
+        ))
+        | CompiledPackageError::Decode(PackageDecodeError::Scan(
+            ReadScanCodecError::ConstructionResource(_)
+            | ReadScanCodecError::InvalidSourceSchema(PublicSourceSchemaCodecError::Layout(_)),
+        ))
+        | CompiledPackageError::Decode(PackageDecodeError::Schema(
+            SchemaCodecError::ConstructionResource(_),
+        ))
+        | CompiledPackageError::Decode(PackageDecodeError::Writer(
+            WriterRecipeCodecError::ConstructionResource(_),
+        ))
+        | CompiledPackageError::Decode(PackageDecodeError::Requests(
+            CallRequestError::ConstructionResource(_) | CallRequestError::ConstructionTree(_),
+        )) => TaskFailureCategory::ResourceExhausted,
+        CompiledPackageError::Decode(PackageDecodeError::Constant(
+            PhysicalConstantCodecError::Reader(FlatReaderError::Projection(
+                FlatPoolResourceError::ConstructionResource(_),
+            )),
+        )) => TaskFailureCategory::ResourceExhausted,
+        CompiledPackageError::Decode(PackageDecodeError::PublicSourceSchema(
+            PublicSourceSchemaCodecError::Connector(cause),
+        ))
+        | CompiledPackageError::Decode(PackageDecodeError::Scan(
+            ReadScanCodecError::Provider(cause)
+            | ReadScanCodecError::InvalidSourceSchema(PublicSourceSchemaCodecError::Connector(cause)),
+        )) if cause.kind() == ConnectorErrorKind::ResourceExhausted => {
+            TaskFailureCategory::ResourceExhausted
+        }
+        CompiledPackageError::Decode(_) => TaskFailureCategory::Protocol,
     };
     HostRejection::new(
         category,
@@ -2299,6 +2457,51 @@ fn memory_admission_failure_to_host(
     error: &crate::native_fragment_query::NativeFragmentAdmissionError,
 ) -> HostRejection {
     resource_exhausted(format!("task {identity} could not be admitted: {error}"))
+}
+
+fn native_specialization_failure_to_host(
+    identity: TaskIdentity,
+    cause: &novarocks_functions::FunctionSpecializationFailure,
+) -> HostRejection {
+    use novarocks_functions::FunctionSpecializationFailure as F;
+    use novarocks_type_contract::CompileControlError as C;
+    let category = match cause {
+        F::Control(C::ResourceExhausted) => TaskFailureCategory::ResourceExhausted,
+        F::Control(C::Cancelled | C::DeadlineExceeded) => TaskFailureCategory::Execution,
+        F::Kernel(cause) => failure_cause_category(
+            &ExecutionFailureCause::Kernel(cause.clone()),
+            TaskFailureCategory::Protocol,
+        ),
+        _ => TaskFailureCategory::Protocol,
+    };
+    HostRejection::new(
+        category,
+        format!("task {identity} writer preparation failed: {cause}"),
+    )
+}
+
+fn native_type_construction_failure_to_host(
+    identity: TaskIdentity,
+    error: &crate::native_type_construction::NativeTypeConstructionError,
+) -> HostRejection {
+    use crate::native_type_construction::NativeTypeConstructionError;
+    use novarocks_type_contract::CompileControlError;
+    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+    let category = match error {
+        NativeTypeConstructionError::Control(
+            CompileControlError::Cancelled | CompileControlError::DeadlineExceeded,
+        ) => TaskFailureCategory::Execution,
+        NativeTypeConstructionError::Resource(LayoutResourceError::SourceModel) => {
+            TaskFailureCategory::Internal
+        }
+        NativeTypeConstructionError::Control(CompileControlError::ResourceExhausted)
+        | NativeTypeConstructionError::Capacity(_)
+        | NativeTypeConstructionError::Resource(_) => TaskFailureCategory::ResourceExhausted,
+    };
+    HostRejection::new(
+        category,
+        format!("task {identity} could not construct native types: {error}"),
+    )
 }
 
 /// This process cannot supply what the task needs right now.
@@ -2376,7 +2579,7 @@ mod tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
     use novarocks_types::{NativeCompatibilityId, UniqueId};
-    use novarocks_worker::query_context::{QueryExecutionKey, query_context_manager};
+    use novarocks_worker::query_context::QueryExecutionKey;
     use novarocks_worker::{InboundFrameClaim, IngressRejection, TaskInboundCapabilities};
     use prost::Message;
 
@@ -2412,6 +2615,170 @@ mod tests {
         )
     }
 
+    struct FixtureTypeControl;
+    impl novarocks_type_contract::PureCompileControl for FixtureTypeControl {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+
+    fn fixture_type_reference(id: u32) -> novarocks_proto_models::common::TypeDesc {
+        novarocks_proto_models::common::TypeDesc {
+            value_binding_id: Some(id),
+        }
+    }
+
+    fn encode_fixture_type_table(
+        declarations: &[(u32, &novarocks_type_contract::FunctionValueType)],
+    ) -> plan::ExecutionTypeTable {
+        use novarocks_plan_codec::execution_type_table::{
+            ExecutionTypeRoot, ExecutionTypeTableBuilder, ExecutionTypeTableLimits,
+        };
+        use novarocks_plan_codec::host_projection_v2::AdmissionRefusal;
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+        let roots = declarations
+            .iter()
+            .map(|(id, value)| ExecutionTypeRoot { id: *id, value })
+            .collect::<Vec<_>>();
+        let mut checkpoints =
+            CompileCheckpoints::try_new(&FixtureTypeControl, CompilePhase::Encode).unwrap();
+        // This is a pure author of known test declarations, with ordinary
+        // ownership and no BE grant or invented memory invoice.
+        let mut request =
+            |_: std::alloc::Layout| Ok::<(), AdmissionRefusal<std::convert::Infallible>>(());
+        let table = ExecutionTypeTableBuilder::new(&roots)
+            .encode_observed(
+                ExecutionTypeTableLimits::for_validated_root_count(roots.len()).unwrap(),
+                &mut request,
+                &mut checkpoints,
+            )
+            .unwrap()
+            .into_wire();
+        checkpoints.finish().unwrap();
+        table
+    }
+
+    fn encode_fixture_arrow_schema(
+        fields: &[(u32, &str, &novarocks_type_contract::FunctionValueType)],
+    ) -> plan::ArrowPhysicalSchema {
+        let roots = fields
+            .iter()
+            .enumerate()
+            .map(|(id, (_, _, value))| (id as u32, *value))
+            .collect::<Vec<_>>();
+        let table = encode_fixture_type_table(&roots);
+        let columns = fields
+            .iter()
+            .zip(table.value_bindings)
+            .map(
+                |((slot_id, name, value), binding)| plan::ArrowPhysicalColumn {
+                    slot_id: *slot_id,
+                    is_internal: false,
+                    field: Some(plan::ArrowPhysicalField {
+                        name: (*name).into(),
+                        nullable: value.nullable(),
+                        r#type: binding.value_layout.map(Box::new),
+
+                        logical_type_id: binding.logical_type_id,
+                    }),
+                },
+            )
+            .collect();
+        plan::ArrowPhysicalSchema {
+            columns,
+
+            logical_types: table.logical_types,
+        }
+    }
+
+    /// Actual scalar source pools and their independent field namespace. The
+    /// fixture uses the same pure IPC author as FE; no inline value decoder or
+    /// transported capacity grant participates in BE preparation.
+    fn fixture_constant_sources(
+        sources: &[(
+            u32,
+            novarocks_type_contract::FunctionValueType,
+            arrow::array::ArrayRef,
+        )],
+    ) -> (
+        novarocks_proto_models::physical_type_v2::SourceFieldTable,
+        Vec<novarocks_proto_models::call_request::IpcConstantPool>,
+    ) {
+        use novarocks_plan_codec::{
+            physical_constant_v2::prepare_constant_record_write_pure_in,
+            physical_type_v2::{TypeProjectionLimits, encode_source_field_table_pure_in},
+        };
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+        let mut pools = Vec::new();
+        for (id, value, array) in sources {
+            let name = format!("host source {id}");
+            let field = Arc::new(arrow::datatypes::Field::new(
+                &name,
+                value.data_type().clone(),
+                value.nullable(),
+            ));
+            pools.push(
+                novarocks_functions::ConstantPool::try_new(
+                    field,
+                    value.clone(),
+                    array.to_data(),
+                    // The existing canonical scalar fixture envelope. Subject
+                    // reader/resource/row limits in each test are unchanged.
+                    novarocks_functions::ConstantPolicy {
+                        max_rows: u64::try_from(array.len()).unwrap(),
+                        max_array_nodes: 1,
+                        max_logical_elements: u64::try_from(array.len()).unwrap(),
+                        max_retained_buffer_bytes: 4096,
+                        max_type_depth: 1,
+                        max_type_nodes: 1,
+                        max_dictionary_depth: 1,
+                        max_metadata_bytes: u64::try_from(name.len()).unwrap(),
+                        max_library_validation_work: 65536,
+                        max_library_validation_bytes: 65536,
+                    },
+                    CompilePhase::Validate,
+                    &FixtureTypeControl,
+                )
+                .unwrap(),
+            );
+        }
+        let roots = sources
+            .iter()
+            .zip(&pools)
+            .map(|((id, _, _), pool)| (*id, pool.field_ref()))
+            .collect::<Vec<_>>();
+        let mut work =
+            CompileCheckpoints::try_new(&FixtureTypeControl, CompilePhase::Encode).unwrap();
+        let fields = encode_source_field_table_pure_in(
+            &roots,
+            TypeProjectionLimits::for_validated_source_root_count(roots.len()).unwrap(),
+            &mut work,
+        )
+        .unwrap();
+        let records = sources
+            .iter()
+            .zip(&pools)
+            .map(|((id, _, _), pool)| {
+                prepare_constant_record_write_pure_in(
+                    novarocks_physical_plan::ConstantPoolId::new(*id),
+                    *id,
+                    *id,
+                    pool,
+                    &mut work,
+                )
+                .unwrap()
+                .emit_in(&mut work)
+                .unwrap()
+            })
+            .collect();
+        work.finish().unwrap();
+        (fields, records)
+    }
+
     /// One task's creation body: the static fragment every task of the
     /// fragment shares, and this task's assignment.
     #[derive(Clone)]
@@ -2436,9 +2803,12 @@ mod tests {
                 },
                 Vec::new(),
             );
-            let data_type =
-                novarocks_plan_codec::encode_native_type(&arrow::datatypes::DataType::Int64)
-                    .unwrap();
+            let ty = novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            );
+            let table = encode_fixture_type_table(&[(0, &ty)]);
+            let data_type = fixture_type_reference(0);
             let column = common::OutputColumn {
                 column_id: 10,
                 name: "v".into(),
@@ -2446,7 +2816,15 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             };
+            let (sources, records) = fixture_constant_sources(&[(
+                0,
+                ty.clone(),
+                Arc::new(arrow::array::Int64Array::from(rows.to_vec())),
+            )]);
             let fragment = body.frozen.plan.as_mut().unwrap();
+            fragment.constant_source_fields = Some(sources);
+            fragment.constants = records;
+            fragment.execution_types = Some(table);
             fragment.output_columns = vec![column.clone()];
             let node = fragment.root.as_mut().unwrap();
             let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
@@ -2458,15 +2836,18 @@ mod tests {
                 columns: vec![column],
                 rows: rows
                     .iter()
-                    .map(|value| plan::ExprList {
+                    .enumerate()
+                    .map(|(ordinal, _)| plan::ExprList {
                         values: vec![expr::Expr {
+                            original_definition_id: None,
                             r#type: Some(data_type.clone()),
                             nullable: false,
-                            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-                                value: Some(common::LiteralValue {
-                                    value: Some(common::literal_value::Value::IntValue(*value)),
-                                }),
-                            })),
+                            kind: Some(expr::expr::Kind::ConstantReference(
+                                novarocks_proto_models::call_request::ConstantReference {
+                                    pool_id: Some(0),
+                                    row_ordinal: u32::try_from(ordinal).unwrap(),
+                                },
+                            )),
                         }],
                     })
                     .collect(),
@@ -2489,7 +2870,7 @@ mod tests {
             else {
                 unreachable!()
             };
-            let binary = novarocks_plan_codec::encode_native_type(&DataType::Binary).unwrap();
+            let binary = fixture_type_reference(0);
             let column = common::OutputColumn {
                 column_id: 10,
                 name: "aggregate".into(),
@@ -2502,26 +2883,28 @@ mod tests {
                 columns: vec![column],
                 rows: vec![plan::ExprList {
                     values: vec![expr::Expr {
+                        original_definition_id: None,
                         r#type: Some(binary),
                         nullable: false,
-                        kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-                            value: Some(common::LiteralValue {
-                                value: Some(common::literal_value::Value::BinaryValue(vec![
-                                    255, 0, 3,
-                                ])),
-                            }),
-                        })),
+                        kind: Some(expr::expr::Kind::ConstantReference(
+                            novarocks_proto_models::call_request::ConstantReference {
+                                pool_id: Some(0),
+                                row_ordinal: 0,
+                            },
+                        )),
                     }],
                 }],
             }));
             let label = expr::Expr {
-                r#type: Some(novarocks_plan_codec::encode_native_type(&DataType::Utf8).unwrap()),
+                original_definition_id: None,
+                r#type: Some(fixture_type_reference(1)),
                 nullable: false,
-                kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-                    value: Some(common::LiteralValue {
-                        value: Some(common::literal_value::Value::StringValue("theta".into())),
-                    }),
-                })),
+                kind: Some(expr::expr::Kind::ConstantReference(
+                    novarocks_proto_models::call_request::ConstantReference {
+                        pool_id: Some(1),
+                        row_ordinal: 0,
+                    },
+                )),
             };
             let entries = Arc::new(Field::new(
                 "entries",
@@ -2544,13 +2927,47 @@ mod tests {
                 Field::new("body", DataType::Binary, false),
                 Field::new("properties", DataType::Map(entries, false), false),
             ]);
-            let (columns, schema_metadata) = novarocks_proto_codec::arrow_physical::encode_schema(
-                &schema,
-                &[1, 2, 3, 4],
-                false,
-                FieldPath::root("schema"),
+            use novarocks_type_contract::{
+                FunctionValueType, ValueKind, ValueLayout, ValueTypeRef,
+                ValueTypeStorageLifetime as S,
+            };
+            let binary_value = FunctionValueType::new(DataType::Binary, false);
+            let string_value = FunctionValueType::new(DataType::Utf8, false);
+            let item = ValueTypeRef::try_new(ValueKind::Scalar(DataType::Int32), false, S::pure())
+                .unwrap();
+            let list = FunctionValueType::try_from_value(
+                ValueTypeRef::try_new(ValueKind::List(item), false, S::pure()).unwrap(),
+                ValueLayout::try_new(schema.field(0).data_type(), S::pure()).unwrap(),
             )
             .unwrap();
+            let string = ValueTypeRef::try_new(ValueKind::String, false, S::pure()).unwrap();
+            let properties = FunctionValueType::try_from_value(
+                ValueTypeRef::try_new(
+                    ValueKind::Map {
+                        key: string.clone(),
+                        value: string,
+                    },
+                    false,
+                    S::pure(),
+                )
+                .unwrap(),
+                ValueLayout::try_new(schema.field(3).data_type(), S::pure()).unwrap(),
+            )
+            .unwrap();
+            let output_schema = encode_fixture_arrow_schema(&[
+                (1, "input_fields", &list),
+                (2, "blob_type", &string_value),
+                (3, "body", &binary_value),
+                (4, "properties", &properties),
+            ]);
+            let execution_types = encode_fixture_type_table(&[
+                (0, &binary_value),
+                (1, &string_value),
+                (2, &list),
+                (3, &string_value),
+                (4, &binary_value),
+                (5, &properties),
+            ]);
             root.children = vec![child];
             root.payload = Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
                 output_columns: Vec::new(),
@@ -2580,12 +2997,42 @@ mod tests {
                     }],
                     max_output_rows: 4096,
                     max_output_bytes: 32 << 20,
-                    output_schema: Some(plan::ArrowPhysicalSchema {
-                        columns,
-                        schema_metadata,
-                    }),
+                    output_schema: Some(output_schema),
                 })),
             }));
+            let (sources, records) = fixture_constant_sources(&[
+                (
+                    0,
+                    binary_value,
+                    Arc::new(arrow::array::BinaryArray::from(vec![
+                        [255_u8, 0, 3].as_slice(),
+                    ])),
+                ),
+                (
+                    1,
+                    string_value,
+                    Arc::new(arrow::array::StringArray::from(vec!["theta"])),
+                ),
+            ]);
+            let fragment = body.frozen.plan.as_mut().unwrap();
+            fragment.constant_source_fields = Some(sources);
+            fragment.constants = records;
+            fragment.execution_types = Some(execution_types);
+            fragment.output_columns = [
+                (1, "input_fields", 2),
+                (2, "blob_type", 3),
+                (3, "body", 4),
+                (4, "properties", 5),
+            ]
+            .into_iter()
+            .map(|(column_id, name, binding)| common::OutputColumn {
+                column_id,
+                name: name.into(),
+                r#type: Some(fixture_type_reference(binding)),
+                nullable: false,
+                is_internal: false,
+            })
+            .collect();
             body
         }
 
@@ -2615,6 +3062,23 @@ mod tests {
                     }),
                     plan: Some(plan::PlanFragment {
                         fragment_id: 7,
+                        execution_types: Some(plan::ExecutionTypeTable::default()),
+                        // These closed fixtures contain no ordinary function or
+                        // aggregate binding requests, and no IPC constant pools.
+                        original_call_requests: Some(
+                            novarocks_proto_models::call_request::FragmentCallRequests {
+                                entries: Vec::new(),
+                            },
+                        ),
+                        constants: Vec::new(),
+                        constant_source_fields: Some(
+                            novarocks_proto_models::physical_type_v2::SourceFieldTable {
+                                shape: Some(
+                                    novarocks_proto_models::physical_type_v2::TypeTable::default(),
+                                ),
+                                field_facts: Vec::new(),
+                            },
+                        ),
                         root: Some(plan::DistributedNode {
                             node_id: 10,
                             fragment_id: 7,
@@ -2701,14 +3165,53 @@ mod tests {
         descriptor_with(identity, kernel_key, 1, ExchangeTopology::default())
     }
 
+    fn establish_fixture_resources(
+        queries: &NativeFragmentQueryRuntime,
+        facts: &dyn TaskQueryContextFacts,
+        execution: QueryExecutionId,
+    ) -> Result<(), HostRejection> {
+        let options = facts.query_options(execution)?;
+        let (delivery, query) = novarocks_execution::runtime::query_options::query_expire_durations(
+            Some(options.runtime()),
+        );
+        queries
+            .establish_query_resources(
+                execution,
+                delivery,
+                query,
+                options.runtime().exec_mem_limit(),
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                HostRejection::new(
+                    TaskFailureCategory::ResourceExhausted,
+                    format!("fixture context could not establish execution resources: {error}"),
+                )
+            })
+    }
+
+    fn establish_fixture_context(host: &NativeTaskExecutionHost, identity: TaskIdentity) {
+        establish_fixture_resources(
+            &host.queries,
+            host.context_facts.as_ref(),
+            identity.query_execution_id(),
+        )
+        .expect("the declared fixture context establishes before its task");
+    }
+
     /// Prepares `descriptor` from a VALUES body frozen for its parallelism.
     fn install(
         host: &NativeTaskExecutionHost,
         descriptor: &TaskDescriptor,
     ) -> Result<PreparedTaskFacts, HostRejection> {
+        establish_fixture_context(host, descriptor.identity());
         let dop = u32::try_from(descriptor.pipeline_dop().get()).expect("small dop");
-        host.install_receiver(descriptor, Body::values(dop).input(descriptor))
-            .map(|installed| installed.facts())
+        host.install_receiver(
+            descriptor,
+            Body::values(dop).input(descriptor),
+            novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+        )
+        .map(|installed| installed.facts())
     }
 
     fn inbound_topology(node: FragmentNodeId, sources: Vec<ExchangeSource>) -> ExchangeTopology {
@@ -2773,6 +3276,8 @@ mod tests {
     /// A context host that answers every query-scoped question with the
     /// smallest legal value, and counts what it was asked.
     struct StubContextFacts {
+        memory_authority: Arc<novarocks_memory::MemoryAuthority>,
+        query_manager: Arc<novarocks_worker::query_context::QueryContextManager>,
         query_options: Mutex<QueryOptions>,
         query_options_fingerprint: Mutex<ContentFingerprint>,
         filter_sessions_requested: AtomicUsize,
@@ -2795,6 +3300,9 @@ mod tests {
                 ..proto::QueryOptions::default()
             };
             Self {
+                memory_authority:
+                    novarocks_native_adapter::backend_test_support::test_memory_authority(),
+                query_manager: novarocks_worker::query_context::QueryContextManager::new_for_test(),
                 query_options: Mutex::new(QueryOptions {
                     pipeline_dop: Some(1),
                     ..QueryOptions::default()
@@ -2955,7 +3463,9 @@ mod tests {
         }
     }
 
-    fn test_execution_runtime() -> Arc<ExecutionRuntime> {
+    fn test_execution_runtime(
+        memory_authority: Arc<novarocks_memory::MemoryAuthority>,
+    ) -> Arc<ExecutionRuntime> {
         let mut function_set =
             novarocks_execution::exec::expr::agg::ExecutionFunctionSetBuilder::new();
         novarocks_sql::compiler::contribute_builtin_functions(function_set.catalog_builder_mut())
@@ -2982,7 +3492,7 @@ mod tests {
                     sink_io_max_blocking_threads: 1,
                 },
                 function_set,
-                novarocks_native_adapter::backend_test_support::test_memory_authority(),
+                memory_authority,
             )
             .expect("test execution runtime"),
         )
@@ -3007,9 +3517,12 @@ mod tests {
             novarocks_native_adapter::backend_test_support::test_backend_data_runtime();
         let completion_supervisor =
             TaskCompletionSupervisor::start(data_runtime.handle().clone(), 64);
-        let execution_runtime = test_execution_runtime();
+        let runtime = test_execution_runtime(Arc::clone(&facts.memory_authority));
         NativeTaskExecutionHost::new(
-            NativeFragmentQueryRuntime::global(Arc::clone(execution_runtime.memory_authority())),
+            NativeFragmentQueryRuntime::new_for_test(
+                Arc::clone(&facts.query_manager),
+                Arc::clone(&facts.memory_authority),
+            ),
             facts,
             TaskInboundCapabilities::new(),
             novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
@@ -3027,7 +3540,7 @@ mod tests {
             pool,
             Arc::new(UnavailableExchangeReceiverPort),
             Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
-            execution_runtime,
+            runtime,
             novarocks_worker::ScanStreamHost::new(
                 novarocks_worker::ScanPreparationConfig::default(),
                 novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
@@ -3560,10 +4073,13 @@ mod tests {
         let host = host(Arc::clone(&facts));
         let descriptor = consistent_descriptor(identity(17, 1, 1), UniqueId::new(111, 112));
 
+        establish_fixture_context(&host, descriptor.identity());
+
         let rejection = host
             .install_receiver(
                 &descriptor,
                 TaskCreationInput::new(Body::values(1).frozen_bytes(), Box::new(ForeignAssignment)),
+                novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
             )
             .expect_err("a foreign assignment has no decodable representation");
         assert_eq!(rejection.category(), TaskFailureCategory::Internal);
@@ -3584,6 +4100,8 @@ mod tests {
         let descriptor = consistent_descriptor(identity(18, 1, 1), UniqueId::new(121, 122));
         let assignment = Body::values(1).input(&descriptor).into_parts().1;
 
+        establish_fixture_context(&host, descriptor.identity());
+
         let rejection = host
             .install_receiver(
                 &descriptor,
@@ -3591,6 +4109,7 @@ mod tests {
                     FrozenBytes::freeze(bytes::Bytes::from_static(&[0x0a, 0x80])),
                     assignment,
                 ),
+                novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
             )
             .expect_err("a creation winner must interpret its static fragment");
         assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
@@ -3619,8 +4138,14 @@ mod tests {
             ExchangeTopology::default(),
         );
 
+        establish_fixture_context(&host, descriptor.identity());
+
         let rejection = host
-            .install_receiver(&descriptor, Body::values(1).input(&descriptor))
+            .install_receiver(
+                &descriptor,
+                Body::values(1).input(&descriptor),
+                novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+            )
             .expect_err("a parallelism outside the frozen domain is not this fragment");
         assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
         assert!(
@@ -3641,8 +4166,14 @@ mod tests {
             ranges: Vec::new(),
         }];
 
+        establish_fixture_context(&host, descriptor.identity());
+
         let rejection = host
-            .install_receiver(&descriptor, body.input(&descriptor))
+            .install_receiver(
+                &descriptor,
+                body.input(&descriptor),
+                novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+            )
             .expect_err("a scan assignment must name a scan node of the static plan");
         assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
         assert!(
@@ -3678,8 +4209,14 @@ mod tests {
         // never planned for that partitioning.
         let body = Body::with_sink(1, stream_sink(plan::PartitionKind::Hash), vec![edge.get()]);
 
+        establish_fixture_context(&host, descriptor.identity());
+
         let rejection = host
-            .install_receiver(&descriptor, body.input(&descriptor))
+            .install_receiver(
+                &descriptor,
+                body.input(&descriptor),
+                novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+            )
             .expect_err("a static sink branch must agree with its assigned edge");
         assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
         assert!(
@@ -3740,13 +4277,9 @@ mod tests {
         NativeTaskExecutionHost,
         Arc<novarocks_worker::query_context::QueryContextManager>,
     ) {
-        let manager = novarocks_worker::query_context::QueryContextManager::new_for_test();
-        let mut host = host(Arc::new(StubContextFacts::default()));
-        host.queries = NativeFragmentQueryRuntime::new_for_test(
-            Arc::clone(&manager),
-            Arc::clone(host.execution_runtime.memory_authority()),
-        );
-        (host, manager)
+        let facts = Arc::new(StubContextFacts::default());
+        let manager = Arc::clone(&facts.query_manager);
+        (host(facts), manager)
     }
 
     #[test]
@@ -3795,8 +4328,13 @@ mod tests {
                 },
                 Vec::new(),
             );
+            establish_fixture_context(&host, descriptor.identity());
             let refusal = host
-                .install_receiver(&descriptor, body.input(&descriptor))
+                .install_receiver(
+                    &descriptor,
+                    body.input(&descriptor),
+                    novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+                )
                 .unwrap_err();
             assert_eq!(writer.opens.load(Ordering::SeqCst), 1);
             assert_eq!(refusal.category(), TaskFailureCategory::ResourceExhausted);
@@ -3903,8 +4441,14 @@ mod tests {
             vec![edge.get()],
         );
 
+        establish_fixture_context(&host, descriptor.identity());
+
         let prepared = host
-            .install_receiver(&descriptor, body.input(&descriptor))
+            .install_receiver(
+                &descriptor,
+                body.input(&descriptor),
+                novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+            )
             .expect("a consistent descriptor prepares");
         assert_eq!(
             prepared.facts().sink_kind(),
@@ -3959,8 +4503,13 @@ mod tests {
             stream_sink(plan::PartitionKind::Unpartitioned),
             vec![edge.get()],
         );
-        host.install_receiver(&descriptor, body.input(&descriptor))
-            .expect("prepares");
+        establish_fixture_context(&host, descriptor.identity());
+        host.install_receiver(
+            &descriptor,
+            body.input(&descriptor),
+            novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+        )
+        .expect("prepares");
 
         let replacement_process = TaskIdentity::new(
             consumer.query_execution_id(),
@@ -4430,6 +4979,49 @@ mod tests {
             outcome,
             None,
         )
+    }
+
+    #[test]
+    fn typed_input_construction_failures_preserve_their_native_category() {
+        use novarocks_execution::exec::pipeline::operator::input_construction::ConstructionFailure;
+        use novarocks_execution::runtime::fragment::ExecutionFailure;
+        use novarocks_type_contract::CompileControlError;
+        for (failure, expected) in [
+            (
+                ConstructionFailure::MissingOwner,
+                TaskFailureCategory::Internal,
+            ),
+            (
+                ConstructionFailure::InvalidSource("ResourceExhausted".into()),
+                TaskFailureCategory::Execution,
+            ),
+            (
+                ConstructionFailure::Control(CompileControlError::ResourceExhausted),
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                ConstructionFailure::Control(CompileControlError::Cancelled),
+                TaskFailureCategory::Execution,
+            ),
+            (
+                ConstructionFailure::Control(CompileControlError::DeadlineExceeded),
+                TaskFailureCategory::Execution,
+            ),
+        ] {
+            let original = ExecutionFailure::from(failure);
+            assert_eq!(
+                super::failure_cause_category(original.cause(), TaskFailureCategory::Exchange),
+                expected,
+            );
+        }
+        let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Cancelled);
+        let forwarded =
+            ExecutionFailure::from(ConstructionFailure::Caller(Box::new(original.clone())));
+        assert_eq!(forwarded, original);
+        assert_eq!(
+            super::failure_cause_category(forwarded.cause(), TaskFailureCategory::Exchange),
+            TaskFailureCategory::Execution,
+        );
     }
 
     #[test]
@@ -5135,8 +5727,13 @@ mod tests {
                 ..Default::default()
             },
         ));
-        host.install_receiver(&descriptor, body.input(&descriptor))
-            .expect("prepares");
+        establish_fixture_context(&host, descriptor.identity());
+        host.install_receiver(
+            &descriptor,
+            body.input(&descriptor),
+            novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+        )
+        .expect("prepares");
         let runnable = submit_committed(&host, &descriptor, reporter);
 
         // The owner publishes ABORTING and then asks the task to stand down,
@@ -5376,9 +5973,11 @@ mod tests {
             &self,
             descriptor: &TaskDescriptor,
             input: TaskCreationInput,
+            _preparation_stop: novarocks_worker::TaskPreparationStopView,
         ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
             self.installs.fetch_add(1, Ordering::SeqCst);
-            self.inner.install_receiver(descriptor, input)
+            self.inner
+                .install_receiver(descriptor, input, _preparation_stop)
         }
 
         fn remove_receiver(&self, descriptor: &TaskDescriptor) {
@@ -5413,19 +6012,26 @@ mod tests {
         }
     }
 
-    /// The owner's query-context half. It installs nothing: this host reads
-    /// every query-scoped fact from its own `StubContextFacts`.
-    struct AcceptingContextHost;
+    /// The fixture owns the actual query resources while keeping its unrelated
+    /// catalog and runtime-filter ports closed, as those tests declare.
+    struct AcceptingContextHost {
+        queries: NativeFragmentQueryRuntime,
+        facts: Arc<StubContextFacts>,
+    }
 
     impl QueryContextHost for AcceptingContextHost {
-        fn materialize(&self, _request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
-            Ok(())
+        fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
+            establish_fixture_resources(
+                &self.queries,
+                self.facts.as_ref(),
+                request.context().query_execution_id(),
+            )
         }
-
-        fn release(&self, _context: QueryContextRef) -> ReleasedContextEvidence {
+        fn release(&self, context: QueryContextRef) -> ReleasedContextEvidence {
+            self.queries
+                .retire_idle_execution(context.query_execution_id());
             ReleasedContextEvidence::none()
         }
-
         fn advance_shared_domain(
             &self,
             _context: QueryContextRef,
@@ -5466,6 +6072,7 @@ mod tests {
         registry: Arc<TaskExecutionRegistry>,
         host: Arc<CountingHost>,
         context: QueryContextRef,
+        manager: Arc<novarocks_worker::query_context::QueryContextManager>,
     }
 
     impl OwnerFixture {
@@ -5479,7 +6086,8 @@ mod tests {
             let backend = BackendProcessId::new_v7();
             let facts = Arc::new(StubContextFacts::default());
             facts.set_context_dop(dop);
-            let mut inner = host(facts);
+            let manager = Arc::clone(&facts.query_manager);
+            let mut inner = host(Arc::clone(&facts));
             inner.result_retained_limits = novarocks_worker::WorkerResultRetainedLimits::try_new(
                 legacy_root_bytes,
                 inner.result_retained_limits.per_process().get(),
@@ -5494,7 +6102,10 @@ mod tests {
             let registry = TaskExecutionRegistry::new(
                 config,
                 Arc::new(ManualClock::new()) as Arc<dyn WorkerMonotonicClock>,
-                Arc::new(AcceptingContextHost),
+                Arc::new(AcceptingContextHost {
+                    queries: counting.inner.queries.clone(),
+                    facts,
+                }),
                 Arc::clone(&counting) as Arc<dyn TaskExecutionHost>,
                 novarocks_native_adapter::task_execution_observation::backend_task_execution_ports(
                     #[cfg(feature = "test-controls")]
@@ -5539,6 +6150,7 @@ mod tests {
                 registry,
                 host: counting,
                 context,
+                manager,
             }
         }
 
@@ -5608,11 +6220,7 @@ mod tests {
                 None,
             )
             .expect("preparation creates the zero-fragment query context");
-        assert!(
-            query_context_manager()
-                .query_mem_tracker_execution(query)
-                .is_some()
-        );
+        assert!(fixture.manager.query_mem_tracker_execution(query).is_some());
 
         let quiesced = fixture.registry.quiesce_query_context(
             &novarocks_execution_contract::task_execution::operation::QuiesceQueryContext::new(
@@ -5629,11 +6237,7 @@ mod tests {
                 fixture.context,
             ));
         assert_eq!(released.outcome(), OperationOutcome::Accepted);
-        assert!(
-            query_context_manager()
-                .query_mem_tracker_execution(query)
-                .is_none()
-        );
+        assert!(fixture.manager.query_mem_tracker_execution(query).is_none());
     }
 
     /// A winning round interprets its body once; a replay of the same
@@ -6271,8 +6875,13 @@ mod tests {
             ),
             &[1],
         );
+        establish_fixture_context(&host, descriptor.identity());
         let error = host
-            .install_receiver(&descriptor, body.input(&descriptor))
+            .install_receiver(
+                &descriptor,
+                body.input(&descriptor),
+                novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+            )
             .unwrap_err();
         assert_eq!(error.category(), TaskFailureCategory::Protocol);
         assert!(host.task_runtime(root).is_none());
@@ -6307,7 +6916,12 @@ mod tests {
             drop(credit);
         };
         reserve_remaining("before installation");
-        let error = match host.install_receiver(&descriptor, body.input(&descriptor)) {
+        establish_fixture_context(&host, descriptor.identity());
+        let error = match host.install_receiver(
+            &descriptor,
+            body.input(&descriptor),
+            novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+        ) {
             Err(error) => error,
             Ok(_) => panic!("generic Unpivot must not replace the protected Statistics source"),
         };
@@ -6330,8 +6944,13 @@ mod tests {
         let root = identity(91_003, 1, 1);
         let descriptor = consistent_descriptor(root, UniqueId::new(91_003, 1));
         let body = Body::bounded_root(novarocks_result_contract::FrozenRootOutput::CountOnly, &[1]);
+        establish_fixture_context(&host, descriptor.identity());
         let installation = host
-            .install_receiver(&descriptor, body.input(&descriptor))
+            .install_receiver(
+                &descriptor,
+                body.input(&descriptor),
+                novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+            )
             .unwrap();
         let (_, channel) = installation.into_parts();
         let channel = channel.expect("explicit bounded root installs its provisional channel");
@@ -6360,8 +6979,13 @@ mod tests {
             ),
             &[],
         );
+        establish_fixture_context(&host, descriptor.identity());
         let rejected = host
-            .install_receiver(&descriptor, body.input(&descriptor))
+            .install_receiver(
+                &descriptor,
+                body.input(&descriptor),
+                novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+            )
             .unwrap_err();
         assert_eq!(rejected.category(), TaskFailureCategory::Protocol);
         assert!(
@@ -6392,8 +7016,13 @@ mod tests {
             ),
             &[],
         );
-        host.install_receiver(&descriptor, body.input(&descriptor))
-            .expect("an installed scalar producer admits its typed root");
+        establish_fixture_context(&host, descriptor.identity());
+        host.install_receiver(
+            &descriptor,
+            body.input(&descriptor),
+            novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+        )
+        .expect("an installed scalar producer admits its typed root");
         assert!(host.task_runtime(root).is_some());
         host.remove_receiver(&descriptor);
         host.root_producer_pool.shutdown().unwrap();
@@ -6474,6 +7103,18 @@ mod tests {
     /// carrier is a physical package, received, provider-validated and
     /// compiled during preparation.
     mod compiled_package_host {
+        mod expression_owner_tests {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/backend_task_execution/execution_host/expression_owner_tests.rs"
+            ));
+        }
+        mod schema_owner_tests {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/backend_task_execution/execution_host/schema_owner_tests.rs"
+            ));
+        }
         use super::*;
         use std::collections::BTreeMap;
 
@@ -6599,9 +7240,16 @@ mod tests {
                 &self,
                 package: &[u8],
                 options: CompiledTaskOptions,
+                creation: &mut novarocks_type_contract::ValueSchemaCreation<
+                    '_,
+                    crate::backend_task_execution::NativeTypeConstructionError,
+                >,
+                type_scopes: &crate::backend_task_execution::CompiledTypeScopes<'_, '_>,
                 control: &dyn PureCompileControl,
             ) -> Result<CompiledTaskProgram, CompiledPackageError> {
-                let mut compiled = self.inner.compile(package, options, control)?;
+                let mut compiled =
+                    self.inner
+                        .compile(package, options, creation, type_scopes, control)?;
                 compiled.runtime_filters = self.runtime_filters.clone();
                 Ok(compiled)
             }
@@ -6609,11 +7257,396 @@ mod tests {
 
         /// The producer fragment of a real `SELECT 1` in v2 bytes, and the
         /// consumer exchange node it streams to.
-        fn select_one_producer() -> (Vec<u8>, u32) {
+        struct CandidateTypeFeeAudit {
+            verdict: Result<
+                usize,
+                novarocks_plan_codec::host_projection_v2::ProjectionFailure<
+                    novarocks_plan_codec::physical_type_v2::TypeCodecError,
+                    crate::native_type_construction::NativeTypeConstructionError,
+                >,
+            >,
+            original_creator_bytes: usize,
+            scoped_creator_bytes: usize,
+            remaining_after_exit: i64,
+        }
+
+        fn candidate_pool_namespace_audit(
+            cap: Option<usize>,
+        ) -> (
+            Result<
+                (
+                    novarocks_physical_plan::ConstantPools,
+                    novarocks_plan_codec::physical_constant_v2::ConstantNamespaceResourceFacts,
+                ),
+                novarocks_plan_codec::host_projection_v2::ProjectionFailure<
+                    novarocks_plan_codec::physical_constant_v2::PhysicalConstantCodecError,
+                    crate::native_type_construction::NativeTypeConstructionError,
+                >,
+            >,
+            Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
+            usize,
+        ) {
+            use crate::native_type_construction::{NativeTypeConstruction, NativeTypeFactory};
+            use novarocks_execution::runtime::mem_tracker::MemTracker;
+            use novarocks_plan_codec::physical_constant_v2::prepare_constant_namespace_with_factory_in;
+            use novarocks_plan_codec::physical_package_v2::prepare_package_wire_in;
+            use novarocks_plan_codec::physical_type_v2::decode_package_type_table_with_factory_in;
+            use novarocks_type_contract::{CompileCheckpoints, ValueSchemaCreation};
+            let (raw, _) = select_one_producer();
+            // Preserve the actual complete FE package/request/control graph.
+            // A second unused record has its own ID and the same real source
+            // Field/FVT; unused records remain subject to the whole namespace.
+            let mut authored =
+                novarocks_proto_models::physical_package_v2::FragmentPackage::decode(
+                    raw.as_slice(),
+                )
+                .unwrap();
+            let mut extra = authored
+                .constants
+                .first()
+                .expect("SELECT 1 uses an admitted constant record")
+                .clone();
+            extra.id = authored
+                .constants
+                .iter()
+                .map(|record| record.id)
+                .max()
+                .unwrap()
+                .checked_add(1)
+                .unwrap();
+            authored.constants.push(extra);
+            let raw = authored.encode_to_vec();
+            let tracker = MemTracker::new_root("candidate cumulative pool namespace");
+            let actual =
+                NativeTypeConstruction::try_with_control(tracker.clone(), &Unbounded).unwrap();
+            let mut work = CompileCheckpoints::try_new(&Unbounded, CompilePhase::Decode).unwrap();
+            let model = FragmentDecodeResourceModel::try_new(&Unbounded).unwrap();
+            let prepared = prepare_package_wire_in(
+                &raw,
+                &model,
+                decode_limits().wire,
+                &mut |_| Ok(()),
+                &mut work,
+            )
+            .unwrap();
+            let usage = prepared.projection().usage;
+            actual
+                .request_opaque_upper_bound(usage.peak_requested_heap_bytes_upper)
+                .unwrap();
+            let wire = prepared.materialize_in(&mut |_| Ok(()), &mut work).unwrap();
+            let mut source = usage
+                .input_bytes
+                .checked_add(usage.root_inline_bytes)
+                .unwrap()
+                .checked_add(usage.peak_requested_heap_bytes_upper)
+                .unwrap();
+            let mut exact = |layout| actual.request_layout(layout);
+            let mut opaque = |bytes| actual.request_opaque_upper_bound(bytes);
+            let mut creator =
+                ValueSchemaCreation::new(actual.storage_lifetime(), &mut exact, &mut opaque);
+            let type_factory = NativeTypeFactory::new(&actual);
+            let types = decode_package_type_table_with_factory_in(
+                &wire,
+                source,
+                decode_limits().types,
+                &mut creator,
+                &type_factory,
+                &mut work,
+            )
+            .unwrap();
+            source = source
+                .checked_add(types.creation_request_bytes_upper_bound().unwrap())
+                .unwrap()
+                .checked_add(std::mem::size_of_val(&types))
+                .unwrap();
+            let factory = NativeTypeFactory::new(&actual);
+            let mut limits = decode_limits().constants;
+            if let Some(cap) = cap {
+                limits.max_new_allocation_request_bytes = cap;
+            }
+            let result = prepare_constant_namespace_with_factory_in(
+                &wire.constants,
+                &types,
+                source,
+                types.source_metadata_namespace(),
+                decode_limits().constant_policy,
+                decode_limits().constant_records,
+                limits,
+                &decode_limits().verifier,
+                &factory,
+                &mut |_| Ok(()),
+                &mut work,
+            )
+            .and_then(|prepared| {
+                prepared.materialize_with_factory_in(&factory, &mut |_| Ok(()), &mut work)
+            });
+            let quoted = factory.construction_request_bytes_upper_bound();
+            drop(factory);
+            drop(types);
+            drop(type_factory);
+            drop(creator);
+            drop(wire);
+            drop(work);
+            drop(actual);
+            (result, tracker, quoted)
+        }
+
+        #[test]
+        fn candidate_pool_namespace_keeps_one_cumulative_cap_and_source_invoice() {
+            use novarocks_plan_codec::host_projection_v2::ProjectionFailure;
+            use novarocks_plan_codec::physical_constant_v2::PhysicalConstantCodecError;
+            let (result, tracker, quoted) = candidate_pool_namespace_audit(None);
+            let (pools, facts) = result.unwrap();
+            assert_eq!(facts.record_count, 2);
+            assert_eq!(pools.entries().len(), 2);
+            for pool in pools.entries().values() {
+                assert_eq!(pool.value(0).unwrap().try_i64().unwrap(), Some(1));
+                assert!(!pool.value_type().nullable());
+            }
+            assert_eq!(
+                facts.coexisting_source_and_request_bytes_upper_bound,
+                facts
+                    .source_retained_bytes
+                    .checked_add(facts.new_allocation_request_bytes_upper_bound)
+                    .unwrap()
+            );
+            assert_eq!(
+                quoted, facts.new_allocation_request_bytes_upper_bound,
+                "actual classified requests/scope headers equal the original complete model once"
+            );
+            let completed = facts.new_allocation_request_bytes_upper_bound;
+            drop(pools);
+            assert_eq!(tracker.current(), 0);
+            let (exact, tracker, _) = candidate_pool_namespace_audit(Some(completed));
+            drop(exact.unwrap());
+            assert_eq!(tracker.current(), 0);
+            let (refused, tracker, _) =
+                candidate_pool_namespace_audit(Some(completed.checked_sub(1).unwrap()));
+            assert!(matches!(
+                refused,
+                Err(ProjectionFailure::Codec(
+                    PhysicalConstantCodecError::Control(CompileControlError::ResourceExhausted)
+                ))
+            ));
+            assert_eq!(tracker.current(), 0);
+        }
+
+        fn compiled_constant_after_unrelated_main(
+            scratch_len: usize,
+        ) -> (
+            novarocks_functions::ConstantPool,
+            Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
+        ) {
+            use crate::backend_task_execution::CompiledTypeScopes;
+            use crate::native_type_construction::NativeTypeConstruction;
+            use novarocks_execution::runtime::mem_tracker::MemTracker;
+            use novarocks_type_contract::ValueSchemaCreation;
+            let (bytes, _) = select_one_producer();
+            let tracker = MemTracker::new_root("compiled constant late pool");
+            let actual =
+                NativeTypeConstruction::try_with_control(tracker.clone(), &Unbounded).unwrap();
+            actual
+                .request_layout(std::alloc::Layout::array::<u64>(scratch_len).unwrap())
+                .unwrap();
+            let scratch = Vec::<u64>::with_capacity(scratch_len);
+            let scopes = CompiledTypeScopes::new(&actual);
+            let mut exact = |layout| actual.request_layout(layout);
+            let mut opaque = |bytes| actual.request_opaque_upper_bound(bytes);
+            let mut creation =
+                ValueSchemaCreation::new(actual.storage_lifetime(), &mut exact, &mut opaque);
+            let compiled = interpreter()
+                .compile(
+                    &bytes,
+                    CompiledTaskOptions {
+                        pipeline_dop: NonZeroUsize::MIN,
+                        exchange_wait: Duration::from_millis(1),
+                    },
+                    &mut creation,
+                    &scopes,
+                    &Unbounded,
+                )
+                .unwrap();
+            let late = compiled
+                .program
+                .expressions()
+                .graph()
+                .expressions()
+                .nodes()
+                .iter()
+                .find_map(|node| match node.kind() {
+                    novarocks_local_program::StaticExprKind::Constant(value) => {
+                        Some(value.pool().clone())
+                    }
+                    _ => None,
+                })
+                .expect("SELECT 1 retains its actual admitted constant source");
+            assert_eq!(late.value(0).unwrap().try_i64().unwrap(), Some(1));
+            drop(compiled);
+            drop(creation);
+            drop(scopes);
+            drop(scratch);
+            drop(actual);
+            (late, tracker)
+        }
+
+        #[test]
+        fn compiled_constant_pool_outlives_program_without_unrelated_main_or_namespace_map() {
+            let (small, small_tracker) = compiled_constant_after_unrelated_main(0);
+            let (late, tracker) = compiled_constant_after_unrelated_main(1024);
+            assert_eq!(late.value(0).unwrap().try_i64().unwrap(), Some(1));
+            assert_eq!(late.field_ref().metadata().len(), 0);
+            assert!(tracker.current() > 0);
+            assert_eq!(tracker.current(), small_tracker.current());
+            let array = late.array_projection();
+            let before = tracker.current();
+            drop(late);
+            assert!(
+                tracker.current() < before,
+                "array does not retain pool/container scope"
+            );
+            assert_eq!(array.array().len(), 1);
+            drop(array);
+            assert_eq!(tracker.current(), 0);
+            drop(small);
+            assert_eq!(small_tracker.current(), 0);
+        }
+
+        fn candidate_type_fee_audit(
+            limits: novarocks_plan_codec::physical_type_v2::PackageTypeProjectionLimits,
+        ) -> CandidateTypeFeeAudit {
+            use crate::native_type_construction::{NativeTypeConstruction, NativeTypeFactory};
+            use novarocks_execution::runtime::mem_tracker::MemTracker;
+            use novarocks_plan_codec::physical_package_v2::prepare_package_wire_in;
+            use novarocks_plan_codec::physical_type_v2::decode_package_type_table_with_factory_in;
+            use novarocks_type_contract::{CompileCheckpoints, ValueSchemaCreation};
+            use std::cell::Cell;
+
+            let (raw, _) = select_one_producer();
+            let tracker = MemTracker::new_root("candidate type fee audit");
+            let actual =
+                NativeTypeConstruction::try_with_control(tracker.clone(), &Unbounded).unwrap();
+            let mut work = CompileCheckpoints::try_new(&Unbounded, CompilePhase::Decode).unwrap();
+            let model = FragmentDecodeResourceModel::try_new(&Unbounded).unwrap();
+            let prepared = prepare_package_wire_in(
+                &raw,
+                &model,
+                decode_limits().wire,
+                &mut |_| Ok(()),
+                &mut work,
+            )
+            .unwrap();
+            let usage = prepared.projection().usage;
+            // The same wire-author upper and inline input provenance as the real
+            // package receiver. It is neither encoded-length floor nor a grant.
+            let source = usage
+                .input_bytes
+                .checked_add(usage.root_inline_bytes)
+                .unwrap()
+                .checked_add(usage.peak_requested_heap_bytes_upper)
+                .unwrap();
+            actual
+                .request_opaque_upper_bound(usage.peak_requested_heap_bytes_upper)
+                .unwrap();
+            let wire = prepared.materialize_in(&mut |_| Ok(()), &mut work).unwrap();
+
+            let original = Cell::new(0usize);
+            let mut exact = |layout: std::alloc::Layout| {
+                actual.request_layout(layout)?;
+                original.set(original.get().checked_add(layout.size()).unwrap());
+                Ok::<_, crate::native_type_construction::NativeTypeConstructionError>(())
+            };
+            let mut opaque = |bytes: usize| {
+                actual.request_opaque_upper_bound(bytes)?;
+                original.set(original.get().checked_add(bytes).unwrap());
+                Ok::<_, crate::native_type_construction::NativeTypeConstructionError>(())
+            };
+            let mut creator =
+                ValueSchemaCreation::new(actual.storage_lifetime(), &mut exact, &mut opaque);
+            let factory = NativeTypeFactory::new(&actual);
+            let verdict = decode_package_type_table_with_factory_in(
+                &wire,
+                source,
+                limits,
+                &mut creator,
+                &factory,
+                &mut work,
+            )
+            .map(|decoded| {
+                decoded
+                    .creation_request_bytes_upper_bound()
+                    .expect("actual strong author completion receipt")
+            });
+            let original_creator_bytes = original.get();
+            let scoped_creator_bytes = factory.construction_request_bytes_upper_bound();
+            drop(creator);
+            drop(factory);
+            drop(wire);
+            drop(work);
+            drop(actual);
+            CandidateTypeFeeAudit {
+                verdict,
+                original_creator_bytes,
+                scoped_creator_bytes,
+                remaining_after_exit: tracker.current(),
+            }
+        }
+
+        #[test]
+        fn candidate_logical_scopes_classified_actual_requests_equal_the_sole_completed_model_once()
+        {
+            let audit = candidate_type_fee_audit(decode_limits().types);
+            let completed = audit.verdict.unwrap();
+            assert!(
+                audit.original_creator_bytes > 0,
+                "physical/source creator remains responsible for its original part"
+            );
+            assert!(
+                audit.scoped_creator_bytes > 0,
+                "actual logical scopes include their private reservation holder"
+            );
+            assert_eq!(
+                audit
+                    .original_creator_bytes
+                    .checked_add(audit.scoped_creator_bytes)
+                    .unwrap(),
+                completed,
+                "no duplicated logical charge, omitted scope Arc, or doubled source invoice"
+            );
+            assert_eq!(audit.remaining_after_exit, 0);
+        }
+
+        #[test]
+        fn candidate_logical_scopes_keep_the_original_near_boundary_cumulative_allocation_cap() {
+            use novarocks_plan_codec::host_projection_v2::ProjectionFailure;
+            use novarocks_plan_codec::physical_type_v2::TypeCodecError;
+            let baseline = candidate_type_fee_audit(decode_limits().types);
+            let completed = baseline.verdict.unwrap();
+            let mut limits = decode_limits().types;
+            limits.max_allocation_request_bytes = completed.checked_sub(1).unwrap();
+            let refused = candidate_type_fee_audit(limits);
+            assert!(matches!(
+                refused.verdict,
+                Err(ProjectionFailure::Codec(TypeCodecError::Control(
+                    CompileControlError::ResourceExhausted
+                )))
+            ));
+            assert_eq!(
+                refused.scoped_creator_bytes, baseline.scoped_creator_bytes,
+                "all original logical scopes were traversed; the complete-table cap is not reset for each entity"
+            );
+            assert!(
+                refused.original_creator_bytes + refused.scoped_creator_bytes < completed,
+                "the final refused request does not reach either actual payer"
+            );
+            assert_eq!(refused.remaining_after_exit, 0);
+            assert_eq!(baseline.remaining_after_exit, 0);
+        }
+
+        fn select_sql_producer(sql: &str) -> (Vec<u8>, u32) {
             let control = SqlCompileControl::unbounded();
             let request = SqlFinalPlanCompileRequest::new(
                 PlanVersionId::try_new([9; 16]).expect("plan version"),
-                SqlStatementInput::sql("SELECT 1"),
+                SqlStatementInput::sql(sql),
                 SqlCompileIntent::Query,
                 SqlSessionContext {
                     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
@@ -6703,6 +7736,10 @@ mod tests {
             (bytes, receiver)
         }
 
+        fn select_one_producer() -> (Vec<u8>, u32) {
+            select_sql_producer("SELECT 1")
+        }
+
         fn package_carrier(package: &[u8]) -> FrozenBytes {
             FrozenBytes::freeze(
                 proto::FrozenFragment {
@@ -6788,10 +7825,12 @@ mod tests {
             let host = compiled_host(Arc::clone(&facts));
             let identity = super::identity(70, 1, 1);
             let descriptor = producer_descriptor(identity, receiver, &[]);
+            establish_fixture_context(&host, descriptor.identity());
             let prepared = host
                 .install_receiver(
                     &descriptor,
                     producer_input(&descriptor, package_carrier(&package)),
+                    novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
                 )
                 .expect("the compiled producer installs");
             assert_eq!(prepared.facts().sink_kind(), FragmentSinkKind::DataStream);
@@ -6839,10 +7878,12 @@ mod tests {
             ));
             let identity = super::identity(73, 1, 1);
             let descriptor = producer_descriptor(identity, receiver, &[]);
+            establish_fixture_context(&host, descriptor.identity());
             let refused = host
                 .install_receiver(
                     &descriptor,
                     producer_input(&descriptor, package_carrier(&package)),
+                    novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
                 )
                 .expect_err("binding 3 has no site in the program");
             assert_eq!(refused.category(), TaskFailureCategory::Protocol);
@@ -6873,10 +7914,12 @@ mod tests {
             let compiled = compiled_host(Arc::new(StubContextFacts::default()));
             let identity = super::identity(71, 1, 1);
             let descriptor = producer_descriptor(identity, receiver, &[]);
+            establish_fixture_context(&compiled, descriptor.identity());
             let plan_tree = compiled
                 .install_receiver(
                     &descriptor,
                     producer_input(&descriptor, Body::values(1).frozen_bytes()),
+                    novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
                 )
                 .expect_err("a compiled host reads no plan tree");
             assert_eq!(plan_tree.category(), TaskFailureCategory::Protocol);
@@ -6889,18 +7932,23 @@ mod tests {
             );
 
             let legacy = host(Arc::new(StubContextFacts::default()));
+            establish_fixture_context(&legacy, descriptor.identity());
             let refused = legacy
                 .install_receiver(
                     &descriptor,
                     producer_input(&descriptor, package_carrier(&package)),
+                    novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
                 )
                 .expect_err("a plan-tree host reads no package");
             assert_eq!(refused.category(), TaskFailureCategory::Protocol);
+
+            establish_fixture_context(&compiled, descriptor.identity());
 
             let garbage = compiled
                 .install_receiver(
                     &descriptor,
                     producer_input(&descriptor, package_carrier(b"not a package")),
+                    novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
                 )
                 .expect_err("an unreceivable package");
             assert_eq!(garbage.category(), TaskFailureCategory::Protocol);
@@ -6912,6 +7960,449 @@ mod tests {
                 "{garbage}"
             );
             assert!(compiled.task_runtime(identity).is_none());
+        }
+
+        #[test]
+        fn compiled_interpreter_scoped_logical_leaf_outlives_program_without_parent_charge() {
+            use crate::backend_task_execution::CompiledTypeScopes;
+            use crate::native_type_construction::{NativeTypeConstruction, NativeTypeScope};
+            use novarocks_execution::runtime::mem_tracker::MemTracker;
+            use novarocks_type_contract::{ValueKind, ValueSchemaCreation, ValueTypeRef};
+            let (bytes, _) = select_one_producer();
+            let tracker = MemTracker::new_root("compiled logical late leaf");
+            let actual =
+                NativeTypeConstruction::try_with_control(tracker.clone(), &Unbounded).unwrap();
+            let scopes = CompiledTypeScopes::new(&actual);
+            let mut exact = |layout| actual.request_layout(layout);
+            let mut opaque = |bytes| actual.request_opaque_upper_bound(bytes);
+            let mut creation =
+                ValueSchemaCreation::new(actual.storage_lifetime(), &mut exact, &mut opaque);
+            let compiled = interpreter()
+                .compile(
+                    &bytes,
+                    CompiledTaskOptions {
+                        pipeline_dop: NonZeroUsize::MIN,
+                        exchange_wait: Duration::from_millis(1),
+                    },
+                    &mut creation,
+                    &scopes,
+                    &Unbounded,
+                )
+                .unwrap();
+            let late = compiled
+                .program
+                .graph()
+                .nodes()
+                .iter()
+                .find_map(|node| node.output_layout().value_binding_at(0))
+                .expect("SELECT 1 has a frozen output binding")
+                .value_type()
+                .clone();
+            assert!(matches!(
+                late.kind(),
+                ValueKind::Scalar(arrow::datatypes::DataType::Int64)
+            ));
+            drop(compiled);
+            drop(creation);
+            drop(scopes);
+            drop(actual);
+            let own = NativeTypeScope::reservation_allocation_layout()
+                .unwrap()
+                .size()
+                + ValueTypeRef::storage_allocation_layout().unwrap().size();
+            assert_eq!(
+                tracker.current(),
+                i64::try_from(own).unwrap(),
+                "logical child does not retain package/prost/physical/compiler scratch"
+            );
+            drop(late);
+            assert_eq!(tracker.current(), 0);
+        }
+
+        fn complete_binding_after_unrelated_main_backing(
+            scratch_len: usize,
+        ) -> (
+            novarocks_type_contract::TypedValueBinding,
+            Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
+        ) {
+            use crate::backend_task_execution::CompiledTypeScopes;
+            use crate::native_type_construction::NativeTypeConstruction;
+            use novarocks_execution::runtime::mem_tracker::MemTracker;
+            use novarocks_type_contract::ValueSchemaCreation;
+            let (bytes, _) = select_one_producer();
+            let tracker = MemTracker::new_root("compiled complete binding late reference");
+            let actual =
+                NativeTypeConstruction::try_with_control(tracker.clone(), &Unbounded).unwrap();
+            actual
+                .request_layout(std::alloc::Layout::array::<u64>(scratch_len).unwrap())
+                .unwrap();
+            let scratch = Vec::<u64>::with_capacity(scratch_len);
+            let scopes = CompiledTypeScopes::new(&actual);
+            let mut exact = |layout| actual.request_layout(layout);
+            let mut opaque = |bytes| actual.request_opaque_upper_bound(bytes);
+            let mut creation =
+                ValueSchemaCreation::new(actual.storage_lifetime(), &mut exact, &mut opaque);
+            let compiled = interpreter()
+                .compile(
+                    &bytes,
+                    CompiledTaskOptions {
+                        pipeline_dop: NonZeroUsize::MIN,
+                        exchange_wait: Duration::from_millis(1),
+                    },
+                    &mut creation,
+                    &scopes,
+                    &Unbounded,
+                )
+                .unwrap();
+            // Preserve both semantic and physical owners, unlike the previous
+            // logical-only child probe. This is the real compiled caller.
+            let late = compiled
+                .program
+                .graph()
+                .nodes()
+                .iter()
+                .find_map(|node| node.output_layout().value_binding_at(0))
+                .expect("SELECT 1 has a complete frozen binding")
+                .clone();
+            drop(compiled);
+            drop(creation);
+            drop(scopes);
+            drop(scratch);
+            drop(actual);
+            (late, tracker)
+        }
+
+        fn candidate_nested_type_child_after_unrelated_backing(
+            scratch_len: usize,
+        ) -> (
+            novarocks_type_contract::TypedValueBinding,
+            Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
+        ) {
+            use crate::native_type_construction::{
+                NativeTypeConstruction, NativeTypeConstructionError, NativeTypeFactory,
+            };
+            use novarocks_execution::runtime::mem_tracker::MemTracker;
+            use novarocks_plan_codec::physical_package_v2::prepare_package_wire_in;
+            use novarocks_plan_codec::physical_type_v2::{
+                BorrowedFieldTypeRoot, TypeProjectionLimits,
+                decode_package_type_table_with_factory_in, decode_type_table_pure,
+                encode_borrowed_type_table_associated_sources_pure_in,
+            };
+            use novarocks_type_contract::{
+                CompileCheckpoints, FunctionValueType, ValueSchemaCreation,
+            };
+            // Keep the actual SELECT 1 graph, controls, requests and sources.
+            // A legal unused type is admitted by the real type owner; this
+            // proves no registration or execution capability for SQL ARRAY.
+            let (bytes, _) = select_one_producer();
+            let mut authored =
+                novarocks_proto_models::physical_package_v2::FragmentPackage::decode(
+                    bytes.as_slice(),
+                )
+                .unwrap();
+            let old = authored.types.as_ref().unwrap();
+            let roots = old.value_types.len().checked_add(old.fields.len()).unwrap();
+            let limits = TypeProjectionLimits::for_validated_source_root_count(roots).unwrap();
+            let original = decode_type_table_pure(old, limits, &Unbounded).unwrap();
+            let fresh = old
+                .value_types
+                .iter()
+                .map(|v| v.id)
+                .max()
+                .unwrap()
+                .checked_add(1)
+                .unwrap();
+            let nested = FunctionValueType::new(
+                arrow::datatypes::DataType::List(Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ))),
+                false,
+            );
+            let mut values = original.value_types().collect::<Vec<_>>();
+            values.push((fresh, &nested));
+            let fields = old
+                .fields
+                .iter()
+                .map(|field| BorrowedFieldTypeRoot {
+                    id: field.id,
+                    field: original.field(field.id).unwrap(),
+                    value_type_id: field.value_binding_id,
+                })
+                .collect::<Vec<_>>();
+            let mut encode = CompileCheckpoints::try_new(&Unbounded, CompilePhase::Encode).unwrap();
+            let encoded = encode_borrowed_type_table_associated_sources_pure_in(
+                &values,
+                &fields,
+                TypeProjectionLimits::for_validated_source_root_count(
+                    roots.checked_add(1).unwrap(),
+                )
+                .unwrap(),
+                &mut encode,
+            )
+            .unwrap()
+            .into_wire();
+            encode.finish().unwrap();
+            authored.types = Some(encoded);
+            let bytes = authored.encode_to_vec();
+            let tracker = MemTracker::new_root("candidate complete nested type child");
+            let actual =
+                NativeTypeConstruction::try_with_control(tracker.clone(), &Unbounded).unwrap();
+            actual
+                .request_layout(std::alloc::Layout::array::<u64>(scratch_len).unwrap())
+                .unwrap();
+            let scratch = Vec::<u64>::with_capacity(scratch_len);
+            let mut work = CompileCheckpoints::try_new(&Unbounded, CompilePhase::Decode).unwrap();
+            let model = FragmentDecodeResourceModel::try_new(&Unbounded).unwrap();
+            let prepared = prepare_package_wire_in(
+                &bytes,
+                &model,
+                decode_limits().wire,
+                &mut |_| Ok(()),
+                &mut work,
+            )
+            .unwrap();
+            let usage = prepared.projection().usage;
+            let source = usage
+                .input_bytes
+                .checked_add(usage.root_inline_bytes)
+                .unwrap()
+                .checked_add(usage.peak_requested_heap_bytes_upper)
+                .unwrap();
+            actual
+                .request_opaque_upper_bound(usage.peak_requested_heap_bytes_upper)
+                .unwrap();
+            let wire = prepared.materialize_in(&mut |_| Ok(()), &mut work).unwrap();
+            let factory = NativeTypeFactory::new(&actual);
+            let decoded = {
+                let mut exact = |layout| actual.request_layout(layout);
+                let mut opaque = |bytes| actual.request_opaque_upper_bound(bytes);
+                let mut creation =
+                    ValueSchemaCreation::new(actual.storage_lifetime(), &mut exact, &mut opaque);
+                decode_package_type_table_with_factory_in(
+                    &wire,
+                    source,
+                    decode_limits().types,
+                    &mut creation,
+                    &factory,
+                    &mut work,
+                )
+                .unwrap()
+            };
+            let root = decoded
+                .value_type(fresh)
+                .expect("sole author published the complete unused List declaration");
+            assert_eq!(root, &nested);
+            let child = root
+                .typed_binding()
+                .child_at_observed(
+                    0,
+                    actual.storage_lifetime(),
+                    |_| panic!("actual cached child must not allocate a projection"),
+                    |units| {
+                        for _ in 0..units {
+                            work.step().map_err(NativeTypeConstructionError::Control)?;
+                        }
+                        Ok::<_, NativeTypeConstructionError>(())
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            drop(decoded);
+            drop(wire);
+            work.finish().unwrap();
+            drop(factory);
+            drop(scratch);
+            drop(actual);
+            (child, tracker)
+        }
+
+        #[test]
+        fn candidate_type_owner_late_nested_child_releases_parent_layout_and_unrelated_main() {
+            let (minimal, minimal_tracker) = candidate_nested_type_child_after_unrelated_backing(0);
+            let (late, tracker) = candidate_nested_type_child_after_unrelated_backing(512);
+            assert_eq!(late, minimal);
+            assert_eq!(
+                late.layout().data_type(),
+                &arrow::datatypes::DataType::Int64
+            );
+            assert!(tracker.current() > 0);
+            assert_eq!(
+                tracker.current(),
+                minimal_tracker.current(),
+                "the child cannot pin parent layout/name/pointer backing or package scratch"
+            );
+            let own = 2
+                * crate::native_type_construction::NativeTypeScope::reservation_allocation_layout()
+                    .unwrap()
+                    .size()
+                + novarocks_type_contract::ValueTypeRef::storage_allocation_layout()
+                    .unwrap()
+                    .size()
+                + novarocks_type_contract::ValueLayout::storage_allocation_layout()
+                    .unwrap()
+                    .size();
+            assert_eq!(tracker.current(), i64::try_from(own).unwrap());
+            drop(late);
+            assert_eq!(tracker.current(), 0);
+            drop(minimal);
+            assert_eq!(minimal_tracker.current(), 0);
+        }
+
+        #[test]
+        fn compiled_interpreter_complete_binding_does_not_pin_unrelated_main_backing() {
+            let (minimal, minimal_tracker) = complete_binding_after_unrelated_main_backing(0);
+            let (late, tracker) = complete_binding_after_unrelated_main_backing(512);
+            assert_eq!(late, minimal);
+            assert_eq!(
+                late.layout().data_type(),
+                &arrow::datatypes::DataType::Int64
+            );
+            assert!(!late.value_type().nullable());
+            assert!(
+                tracker.current() > 0,
+                "the complete semantic and physical holders are live"
+            );
+            assert_eq!(
+                tracker.current(),
+                minimal_tracker.current(),
+                "the unrelated actual Vec and main package/compiler allowance have exited while the complete binding remains live"
+            );
+            drop(late);
+            assert_eq!(
+                tracker.current(),
+                0,
+                "last full binding releases its real finite responsibility"
+            );
+            drop(minimal);
+            assert_eq!(minimal_tracker.current(), 0);
+        }
+
+        #[test]
+        fn compiled_interpreter_scoped_decode_keeps_original_whole_type_caps() {
+            use crate::backend_task_execution::CompiledTypeScopes;
+            use crate::native_type_construction::NativeTypeConstruction;
+            use novarocks_execution::runtime::mem_tracker::MemTracker;
+            use novarocks_type_contract::ValueSchemaCreation;
+            let (bytes, _) = select_one_producer();
+            let tracker = MemTracker::new_root("compiled scoped global caps");
+            let actual =
+                NativeTypeConstruction::try_with_control(tracker.clone(), &Unbounded).unwrap();
+            let mut limits = decode_limits();
+            limits.types.max_definitions = 0;
+            let providers =
+                PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Unbounded)
+                    .unwrap();
+            let compiler = CompiledPackageInterpreter::new(
+                FragmentDecodeResourceModel::try_new(&Unbounded).unwrap(),
+                limits,
+                Arc::new(sealed_rand_subset()),
+                Arc::new(providers),
+                constants(),
+            );
+            let scopes = CompiledTypeScopes::new(&actual);
+            let mut exact = |layout| actual.request_layout(layout);
+            let mut opaque = |bytes| actual.request_opaque_upper_bound(bytes);
+            let mut creation =
+                ValueSchemaCreation::new(actual.storage_lifetime(), &mut exact, &mut opaque);
+            let result = compiler.compile(
+                &bytes,
+                CompiledTaskOptions {
+                    pipeline_dop: NonZeroUsize::MIN,
+                    exchange_wait: Duration::from_millis(1),
+                },
+                &mut creation,
+                &scopes,
+                &Unbounded,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(CompiledPackageError::Control(
+                        CompileControlError::ResourceExhausted
+                    ))
+                ),
+                "entity scopes cannot replace the original complete-table cap"
+            );
+            drop(creation);
+            drop(scopes);
+            drop(actual);
+            assert_eq!(tracker.current(), 0);
+        }
+
+        #[test]
+        fn compiled_interpreter_first_actual_tracker_cause_has_no_control_tail() {
+            use crate::backend_task_execution::CompiledTypeScopes;
+            use crate::native_type_construction::{
+                NativeTypeConstruction, NativeTypeConstructionError,
+            };
+            use novarocks_execution::runtime::mem_tracker::MemTracker;
+            use novarocks_type_contract::ValueSchemaCreation;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            struct Trace(AtomicUsize);
+            impl PureCompileControl for Trace {
+                fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+            let (bytes, _) = select_one_producer();
+            let tracker = MemTracker::new_root("compiled first typed refusal");
+            let control = Trace(AtomicUsize::new(0));
+            let actual =
+                NativeTypeConstruction::try_with_control(tracker.clone(), &control).unwrap();
+            let prior = tracker.current();
+            tracker.install_limit_once(prior).unwrap();
+            let scopes = CompiledTypeScopes::new(&actual);
+            let refused_at = std::cell::Cell::new(None);
+            let mut exact = |layout| {
+                let result = actual.request_layout(layout);
+                if result.is_err() {
+                    refused_at.set(Some(control.0.load(Ordering::SeqCst)));
+                }
+                result
+            };
+            let mut opaque = |bytes| {
+                let result = actual.request_opaque_upper_bound(bytes);
+                if result.is_err() {
+                    refused_at.set(Some(control.0.load(Ordering::SeqCst)));
+                }
+                result
+            };
+            let mut creation =
+                ValueSchemaCreation::new(actual.storage_lifetime(), &mut exact, &mut opaque);
+            let result = interpreter().compile(
+                &bytes,
+                CompiledTaskOptions {
+                    pipeline_dop: NonZeroUsize::MIN,
+                    exchange_wait: Duration::from_millis(1),
+                },
+                &mut creation,
+                &scopes,
+                &control,
+            );
+            let Err(CompiledPackageError::Construction(NativeTypeConstructionError::Capacity(
+                original,
+            ))) = result
+            else {
+                panic!("original typed tracker cause was replaced");
+            };
+            assert!(original.contains("compiled first typed refusal"));
+            assert_eq!(
+                Some(control.0.load(Ordering::SeqCst)),
+                refused_at.get(),
+                "no control footer after first H"
+            );
+            assert_eq!(
+                tracker.current(),
+                prior,
+                "failed prospective request is rolled back"
+            );
+            drop(creation);
+            drop(scopes);
+            drop(actual);
+            assert_eq!(tracker.current(), 0);
         }
 
         /// A query context that leases the fixture catalog with its installed
@@ -7034,11 +8525,12 @@ mod tests {
                 Arc::clone(&budget),
             )
             .expect("finite test producer pool");
-            let execution_runtime = test_execution_runtime();
+            let runtime = test_execution_runtime(Arc::clone(&facts.0.memory_authority));
             NativeTaskExecutionHost::new(
-                NativeFragmentQueryRuntime::global(Arc::clone(
-                    execution_runtime.memory_authority(),
-                )),
+                NativeFragmentQueryRuntime::new_for_test(
+                    Arc::clone(&facts.0.query_manager),
+                    Arc::clone(&facts.0.memory_authority),
+                ),
                 facts,
                 TaskInboundCapabilities::new(),
                 novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
@@ -7056,7 +8548,7 @@ mod tests {
                 pool,
                 Arc::new(UnavailableExchangeReceiverPort),
                 Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
-                execution_runtime,
+                runtime,
                 novarocks_worker::ScanStreamHost::new(
                     novarocks_worker::ScanPreparationConfig::default(),
                     novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
@@ -7093,6 +8585,7 @@ mod tests {
             let host = scan_host(Arc::clone(&facts));
             let identity = super::identity(72, 1, 1);
             let descriptor = producer_descriptor(identity, receiver, &[SCAN_NODE]);
+            establish_fixture_context(&host, descriptor.identity());
             let prepared = host
                 .install_receiver(
                     &descriptor,
@@ -7101,6 +8594,7 @@ mod tests {
                         package_carrier(&package),
                         vec![empty_scan_ranges(SCAN_NODE)],
                     ),
+                    novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
                 )
                 .expect("the compiled scan producer installs");
             assert_eq!(prepared.facts().sink_kind(), FragmentSinkKind::DataStream);
@@ -7164,10 +8658,12 @@ mod tests {
             let host = scan_host(Arc::new(ScanContextFacts::default()));
             let refusal = |identity: TaskIdentity, split_nodes: &[i32], initial| {
                 let descriptor = producer_descriptor(identity, receiver, split_nodes);
+                establish_fixture_context(&host, descriptor.identity());
                 let rejection = host
                     .install_receiver(
                         &descriptor,
                         scan_input(&descriptor, package_carrier(&package), initial),
+                        novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
                     )
                     .expect_err("the compiled scan task must be refused");
                 assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
@@ -7324,11 +8820,12 @@ mod tests {
                 Arc::clone(&budget),
             )
             .expect("finite test producer pool");
-            let execution_runtime = test_execution_runtime();
+            let runtime = test_execution_runtime(Arc::clone(&facts.stub.memory_authority));
             NativeTaskExecutionHost::new(
-                NativeFragmentQueryRuntime::global(Arc::clone(
-                    execution_runtime.memory_authority(),
-                )),
+                NativeFragmentQueryRuntime::new_for_test(
+                    Arc::clone(&facts.stub.query_manager),
+                    Arc::clone(&facts.stub.memory_authority),
+                ),
                 facts,
                 TaskInboundCapabilities::new(),
                 novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
@@ -7346,7 +8843,7 @@ mod tests {
                 pool,
                 Arc::new(UnavailableExchangeReceiverPort),
                 Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
-                execution_runtime,
+                runtime,
                 novarocks_worker::ScanStreamHost::new(
                     novarocks_worker::ScanPreparationConfig::default(),
                     novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
@@ -7419,10 +8916,12 @@ mod tests {
             }));
             let identity = super::identity(76, 1, 1);
             let descriptor = writer_descriptor(identity, receiver, UniqueId::new(801, 802));
+            establish_fixture_context(&host, descriptor.identity());
             let prepared = host
                 .install_receiver(
                     &descriptor,
                     producer_input(&descriptor, package_carrier(&package)),
+                    novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
                 )
                 .expect("the compiled writer producer installs");
             assert_eq!(prepared.facts().sink_kind(), FragmentSinkKind::DataStream);
@@ -7446,10 +8945,12 @@ mod tests {
             let host = writer_host(Arc::new(WriteContextFacts::default()));
             let identity = super::identity(77, 1, 1);
             let descriptor = writer_descriptor(identity, receiver, UniqueId::new(803, 804));
+            establish_fixture_context(&host, descriptor.identity());
             let rejection = host
                 .install_receiver(
                     &descriptor,
                     producer_input(&descriptor, package_carrier(&package)),
+                    novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
                 )
                 .expect_err("an unleased writer must be refused");
             assert_eq!(rejection.category(), TaskFailureCategory::Protocol);

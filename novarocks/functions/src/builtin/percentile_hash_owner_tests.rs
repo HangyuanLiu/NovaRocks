@@ -274,7 +274,7 @@ fn hash_native_n1_profile_rejects_deferred_variadic_without_changing_binding() {
         DataType::Null,
     ] {
         let args = [FunctionArgument::Value {
-            value_type: FunctionValueType::new(ty, true),
+            value_type: FunctionValueType::from_legacy_declared_projection(ty, true),
             constant: None,
         }];
         // The actual original selected-domain author rejects these carriers

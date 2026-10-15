@@ -197,10 +197,14 @@ fn sql_selected_port_rejects_substituted_owner_full_type_and_prepares_table_life
         Err(FunctionSpecializationFailure::InvalidInput(_))
     ));
     let mut wrong_type = selected.as_ref().clone();
-    let FunctionArgumentType::Value(value) = &mut wrong_type.argument_types[0] else {
+    let mut wrong_arguments = wrong_type.argument_types.to_vec();
+    let FunctionArgumentType::Value(value) = &mut wrong_arguments[0] else {
         panic!("value channel")
     };
-    value.nullable = false;
+    *value = value.with_nullable(false).unwrap();
+    wrong_type.argument_types = novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+        wrong_arguments.into_boxed_slice(),
+    );
     let wrong_type = Arc::new(wrong_type);
     let wrong_call = input(&bound, &wrong_type, &arguments, &uses, &parameters);
     assert!(matches!(
@@ -254,26 +258,49 @@ fn sql_selected_port_checks_exact_result_environment_and_lifecycle_without_rebin
         novarocks_functions::FunctionOverloadId::try_new("unknown-selected-overload").unwrap();
     variants.push(unknown);
     let mut wrong_result = selected.as_ref().clone();
-    wrong_result.result_type =
-        FunctionResultType::Scalar(FunctionValueType::new(DataType::Int64, true));
+    let FunctionResultType::Scalar(actual_result) = &selected.result_type else {
+        panic!("cardinality scalar result")
+    };
+    let different_width = if actual_result.data_type() == &DataType::Int32 {
+        DataType::Int64
+    } else {
+        DataType::Int32
+    };
+    wrong_result.result_type = FunctionResultType::Scalar(FunctionValueType::new(
+        different_width,
+        actual_result.nullable(),
+    ));
     variants.push(wrong_result);
     let mut wrong_field = selected.as_ref().clone();
-    let FunctionArgumentType::Value(value) = &mut wrong_field.argument_types[0] else {
+    let mut wrong_arguments = wrong_field.argument_types.to_vec();
+    let FunctionArgumentType::Value(value) = &mut wrong_arguments[0] else {
         panic!("value channel")
     };
-    value.data_type = DataType::List(Arc::new(arrow::datatypes::Field::new(
-        "foreign item",
-        DataType::Int64,
-        false,
-    )));
+    let actual_child_nullable = value.child_at(0).unwrap().nullable();
+    *value = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+        DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Int64,
+            !actual_child_nullable,
+        ))),
+        value.nullable(),
+        value.logical_type(),
+    )
+    .unwrap();
+    wrong_field.argument_types = novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+        wrong_arguments.into_boxed_slice(),
+    );
     variants.push(wrong_field);
-    for variant in variants {
+    for (index, variant) in variants.into_iter().enumerate() {
         let variant = Arc::new(variant);
         let wrong_call = input(&bound, &variant, &arguments, &uses, &parameters);
-        assert!(matches!(
-            snapshot.prepare_fresh_selected(wrong_call, variant.clone(), options(), &control),
-            Err(FunctionSpecializationFailure::Binding(_))
-        ));
+        let failure = snapshot
+            .prepare_fresh_selected(wrong_call, variant.clone(), options(), &control)
+            .unwrap_err();
+        assert!(
+            matches!(failure, FunctionSpecializationFailure::Binding(_)),
+            "variant {index}: {failure:?}"
+        );
     }
     let parameter_id = novarocks_type_contract::SemanticParameterId::new(0);
     let parameters = SemanticParameters::try_new([(

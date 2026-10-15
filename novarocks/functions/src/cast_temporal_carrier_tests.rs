@@ -56,8 +56,8 @@ fn prepare(
 ) -> PreparedCastRecipe {
     PreparedCastRecipe::try_new(
         CastOperation::Carrier,
-        &FunctionValueType::new(from, nullable),
-        &FunctionValueType::new(to, nullable),
+        &FunctionValueType::from_legacy_declared_projection(from, nullable),
+        &FunctionValueType::from_legacy_declared_projection(to, nullable),
         policy,
         allow,
         crate::binding_test_control(),

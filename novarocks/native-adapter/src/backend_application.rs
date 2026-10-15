@@ -366,6 +366,7 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
         &self,
         _descriptor: &TaskDescriptor,
         _input: TaskCreationInput,
+        _preparation_stop: novarocks_worker::TaskPreparationStopView,
     ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
         Err(HostRejection::new(
             TaskFailureCategory::Internal,
@@ -496,7 +497,21 @@ fn compose_backend_application_services(
     // One task protocol owner per process, on this process's own identity and
     // its monotonic clock, routed to the real execution owners.
     let runtime_filter_factory = NativeRuntimeFilterParticipantFactory::new(data_runtime.clone());
+    let queries = crate::native_fragment_query::NativeFragmentQueryRuntime::global(Arc::clone(
+        &memory_authority,
+    ));
+    #[cfg(feature = "test-controls")]
+    let queries = match test_session {
+        Some(session) => queries.with_test_controls(Some(session.native.clone())),
+        None => queries,
+    };
+    #[cfg(feature = "test-controls")]
+    let queries = match test_session.and_then(|session| session.observation.as_ref()) {
+        Some(observation) => queries.with_observation_controls(Some(observation.clone())),
+        None => queries,
+    };
     let context_host = crate::backend_task_execution::NativeQueryContextHost::new(
+        queries.clone(),
         Arc::clone(&catalog_manager),
         Arc::clone(&execution_role_binding_factories),
         Arc::new(move |execution_id, contribution| {
@@ -560,20 +575,6 @@ fn compose_backend_application_services(
             compiler,
             admission,
         }) => (Some(compiler), Some(admission)),
-    };
-    let queries =
-        novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime::global(
-            Arc::clone(&memory_authority),
-        );
-    #[cfg(feature = "test-controls")]
-    let queries = match test_session {
-        Some(session) => queries.with_test_controls(Some(session.native.clone())),
-        None => queries,
-    };
-    #[cfg(feature = "test-controls")]
-    let queries = match test_session.and_then(|session| session.observation.as_ref()) {
-        Some(observation) => queries.with_observation_controls(Some(observation.clone())),
-        None => queries,
     };
     let execution_host = crate::backend_task_execution::NativeTaskExecutionHost::new(
         queries,

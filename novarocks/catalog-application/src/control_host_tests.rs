@@ -76,8 +76,12 @@ impl ConnectorMetadata for TestControl {
     fn load_table(
         &self,
         _request: ConnectorTableRequest,
-    ) -> Result<ConnectorTableMetadata, ConnectorError> {
-        Err(unsupported())
+        _creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        Err(novarocks_connector_contract::PureProviderCompileError::Provider(unsupported()))
     }
 }
 
@@ -411,8 +415,12 @@ impl ConnectorDistributedRewrite for TestDistributedRewrite {
     fn plan_rewrite(
         &self,
         _request: ConnectorDistributedRewritePlanningRequest,
-    ) -> Result<ConnectorDistributedRewritePlan, ConnectorError> {
-        Err(unsupported())
+        _creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorDistributedRewritePlan,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        Err(novarocks_connector_contract::PureProviderCompileError::Provider(unsupported()))
     }
 
     fn finalize_rewrite(

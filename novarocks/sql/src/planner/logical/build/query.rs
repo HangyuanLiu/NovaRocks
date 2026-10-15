@@ -85,7 +85,7 @@ pub(super) fn plan_scoped_query(
 
     // Plan the query body first so we can stamp fresh set-op ColumnIds before
     // apply_query_modifiers consumes output_columns.
-    let mut body_plan = plan_body_scoped(body, cte_registry, factory, control)?;
+    let mut body_plan = plan_body_scoped(body, &output_columns, cte_registry, factory, control)?;
 
     // Strategy A: if the body produced a set-op node (Union/Intersect/Except),
     // overwrite its output_columns with the fresh ColumnIds that the analyzer
@@ -705,6 +705,7 @@ fn rewrite_sort_items_to_projection_refs(
 
 fn plan_body_scoped(
     body: QueryBody,
+    output_columns: &[OutputColumn],
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
     control: &dyn PureCompileControl,
@@ -712,7 +713,7 @@ fn plan_body_scoped(
     match body {
         QueryBody::Select(select) => plan_select_scoped(select, cte_registry, factory, control),
         QueryBody::SetOperation(set_op) => {
-            plan_set_operation_scoped(set_op, cte_registry, factory, control)
+            plan_set_operation_scoped(set_op, output_columns, cte_registry, factory, control)
         }
         QueryBody::Values(values) => {
             plan_values(values, factory).map_err(SqlCompileError::Compilation)
@@ -922,9 +923,20 @@ mod constant_identity_tests {
             cause: CompileControlError::Cancelled,
         };
         let (extra, rewritten) = run(&recording).unwrap();
-        assert_eq!(extra.len(), 2);
+        assert_eq!(extra.len(), 1);
         assert_eq!(column_id(&rewritten[0].expr), source.output_column_id);
-        assert_ne!(column_id(&rewritten[1].expr), column_id(&rewritten[2].expr));
+        assert_eq!(column_id(&rewritten[1].expr), extra[0].output_column_id);
+        assert_eq!(column_id(&rewritten[2].expr), source.output_column_id);
+        assert_eq!(
+            rewritten
+                .iter()
+                .map(|item| (item.asc, item.nulls_first))
+                .collect::<Vec<_>>(),
+            orders
+                .iter()
+                .map(|item| (item.asc, item.nulls_first))
+                .collect::<Vec<_>>()
+        );
         let trace = recording.trace.into_inner().unwrap();
         assert!(!trace.is_empty());
         for cause in [

@@ -331,7 +331,7 @@ impl fmt::Debug for ProviderReadColumnNeed {
             .debug_struct("ProviderReadColumnNeed")
             .field("ordinal", &self.ordinal)
             .field("name_bytes", &self.name.len())
-            .field("nullable", &self.engine_type.nullable)
+            .field("nullable", &self.engine_type.nullable())
             .field("connector_type", &self.connector_type)
             .finish()
     }
@@ -1169,7 +1169,7 @@ impl fmt::Debug for ProviderReadColumnFact {
         formatter
             .debug_struct("ProviderReadColumnFact")
             .field("request_ordinal", &self.request_ordinal)
-            .field("nullable", &self.engine_type.nullable)
+            .field("nullable", &self.engine_type.nullable())
             .field(
                 "provider_payload_bytes",
                 &self.column.column_payload.payload().len(),
@@ -2738,7 +2738,7 @@ fn validate_provider_properties(
                     .expect("validated provider ordinal always fits usize");
                 !scheme
                     .algorithm
-                    .supports_partition_key(&need.columns[ordinal].engine_type.data_type)
+                    .supports_partition_key(&need.columns[ordinal].engine_type.data_type())
             }) {
                 return Err(CompletionProtocolError::ProviderPartitionSchemeInvalid {
                     id: need.id,
@@ -2769,7 +2769,7 @@ fn validate_provider_properties(
                     .expect("validated provider ordinal always fits usize");
                 !scheme
                     .hash
-                    .supports_partition_key(&need.columns[ordinal].engine_type.data_type)
+                    .supports_partition_key(&need.columns[ordinal].engine_type.data_type())
             }) {
                 return Err(CompletionProtocolError::ProviderPartitionSchemeInvalid {
                     id: need.id,
@@ -2837,7 +2837,7 @@ fn provider_request_dynamic_bytes(
         checked_sum(columns.iter().map(|column| {
             checked_sum([
                 checked_size(column.name.len()),
-                data_type_dynamic_bytes(&column.engine_type.data_type),
+                data_type_dynamic_bytes(&column.engine_type.data_type()),
             ])
         })),
     ])?;
@@ -3119,7 +3119,7 @@ fn provider_fact_bytes(fact: &ProviderReadFact) -> Result<u64, CompletionProtoco
             checked_sum(contract.schema.iter().map(|field| {
                 checked_sum([
                     provider_column_bytes(&field.column),
-                    data_type_dynamic_bytes(&field.engine_type.data_type),
+                    data_type_dynamic_bytes(&field.engine_type.data_type()),
                 ])
             })),
         ])?;

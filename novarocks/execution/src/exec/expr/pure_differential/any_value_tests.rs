@@ -33,7 +33,7 @@ fn check(source: FunctionValueType, values: ArrayRef) {
             .float_comparison(FloatComparison::Exact),
     );
     assert_eq!(summary.matched_failures, 0);
-    assert!(summary.result_type.nullable);
+    assert!(summary.result_type.nullable());
     assert!(summary.null_results >= 4);
     println!(
         "any_value {} [{}] input={source:?} output={:?} rows={} groups={} nulls={}",
@@ -180,7 +180,7 @@ fn pure_differential_any_value_empty_null_and_literal_constant_partial_final() {
                     .partitions(13, 1631),
             );
             assert_eq!(summary.matched_failures, 0);
-            assert!(summary.result_type.nullable);
+            assert!(summary.result_type.nullable());
             assert_eq!(summary.null_results, 2);
         }
         let summary = assert_aggregate_matches_v1(
@@ -204,6 +204,6 @@ fn pure_differential_any_value_empty_null_and_literal_constant_partial_final() {
                 .partitions(7, 1633),
         );
         assert_eq!(summary.matched_failures, 0);
-        assert!(summary.result_type.nullable);
+        assert!(summary.result_type.nullable());
     }
 }

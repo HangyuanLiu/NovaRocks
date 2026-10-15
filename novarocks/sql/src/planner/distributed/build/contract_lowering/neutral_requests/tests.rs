@@ -387,9 +387,17 @@ fn neutral_sql_partial_final_own_literal_requests_survive_fragment_pool_projecti
                 } else {
                     final_calls += 1;
                     assert!(matches!(source.binding.phase, AggregatePhase::Final { .. }));
-                    assert!(entry.canonical().is_none());
-                    let request = entry.captured().request();
-                    assert!(request.expected_result_type.is_some());
+                    let canonical = entry.canonical().unwrap();
+                    assert!(canonical.belongs_to(entry.captured()));
+                    // The independent logical capture keeps its original SQL
+                    // result; the current operational request is unconstrained.
+                    assert!(entry.captured().request().expected_result_type.is_some());
+                    let request = canonical.request();
+                    assert!(request.expected_result_type.is_none());
+                    assert_eq!(
+                        canonical.selected().argument_types.as_ref(),
+                        source.binding.function.argument_types.as_ref()
+                    );
                     request
                 };
                 assert_request(
@@ -469,8 +477,14 @@ fn neutral_sql_writer_final_keeps_own_capture_and_omissions_are_not_calls() {
                     .unwrap();
                 let request = if final_phase {
                     merges += 1;
-                    assert!(entry.canonical().is_none());
-                    entry.captured().request()
+                    let canonical = entry.canonical().unwrap();
+                    assert!(canonical.belongs_to(entry.captured()));
+                    assert!(entry.captured().request().expected_result_type.is_some());
+                    assert_eq!(
+                        canonical.selected().argument_types.as_ref(),
+                        source.binding.function.argument_types.as_ref()
+                    );
+                    canonical.request()
                 } else {
                     updates += 1;
                     entry.canonical().unwrap().request()
@@ -514,8 +528,8 @@ fn plan(expression: TypedExpr) -> PhysicalPlanNode {
     let mut output = column(
         71,
         "source_result",
-        expression.value_type.data_type.clone(),
-        expression.value_type.nullable,
+        expression.value_type.data_type().clone(),
+        expression.value_type.nullable(),
     );
     output.value_type = expression.value_type.clone();
     PhysicalPlanNode {

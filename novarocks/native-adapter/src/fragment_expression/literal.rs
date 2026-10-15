@@ -304,7 +304,7 @@ pub(super) fn push_zero_literal(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{bool_lit, int_lit, lower, scalar_expr, string_lit};
+    use super::super::tests::{bool_lit, int_lit, largeint_type, lower, scalar_expr, string_lit};
     use arrow::datatypes::DataType;
     use arrow_buffer::i256;
     use novarocks_execution::exec::expr::{ExprNode, LiteralValue};
@@ -457,7 +457,7 @@ mod tests {
                 }),
             ),
             scalar_expr(
-                DataType::FixedSizeBinary(16),
+                largeint_type(),
                 expr::expr::Kind::Literal(expr::LiteralExpr {
                     value: Some(common::LiteralValue {
                         value: Some(common::literal_value::Value::LargeintValue(
@@ -498,7 +498,9 @@ mod tests {
 
         for expr in cases {
             let (arena, id) = lower(&expr);
-            assert!(matches!(arena.node(id), Some(ExprNode::Literal(_))));
+            assert!(
+                matches!(arena.node(id), Some(ExprNode::Constant(value)) if value.value_type().same_physical_binding_ignoring_root_nullability_observed(arena.value_type(id).unwrap(), || Ok::<(), novarocks_type_contract::ValueTypeError>(())).unwrap())
+            );
         }
 
         let (arena, id) = lower(&scalar_expr(
@@ -517,11 +519,8 @@ mod tests {
         ));
         assert!(matches!(
             arena.node(id),
-            Some(ExprNode::Literal(LiteralValue::Decimal128 {
-                value: 12345,
-                precision: 10,
-                scale: 2
-            }))
+            Some(ExprNode::Constant(value)) if value.try_decimal128().unwrap() == Some(12345)
+                && value.value_type().data_type() == &DataType::Decimal128(10, 2)
         ));
     }
 }

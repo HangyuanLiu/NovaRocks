@@ -35,6 +35,7 @@ pub(super) struct Projection<'a> {
     limits: Option<NodeProjectionLimits>,
     admit: Option<&'a mut Admission<'a>>,
     known: usize,
+    input_derived: bool,
 }
 // The numerical Model is closed: its checked arithmetic/caps produce Control,
 // with static source-shape errors retained structurally rather than classified
@@ -54,6 +55,7 @@ impl<'a> Projection<'a> {
             limits: None,
             admit: None,
             known: 0,
+            input_derived: false,
         }
     }
     pub(super) fn observed(
@@ -68,13 +70,34 @@ impl<'a> Projection<'a> {
             limits: Some(limits),
             admit: Some(admit),
             known,
+            input_derived: false,
         };
         Ok(value)
     }
+    pub(super) fn input_derived(source: usize) -> Self {
+        Self {
+            model: Model::default(),
+            source,
+            limits: None,
+            admit: None,
+            known: 0,
+            input_derived: true,
+        }
+    }
     pub(super) fn observed_mode(&self) -> bool {
-        self.admit.is_some()
+        self.admit.is_some() || self.input_derived
     }
     pub(super) fn gate(&mut self) -> Result<(), Error> {
+        if self.input_derived {
+            if self.source < self.known {
+                return Err(Error::InvalidShape(
+                    "semantic source invoice omits original backing",
+                ));
+            }
+            self.model
+                .numerical_input_derived_facts(self.source, 0)
+                .map_err(numerical)?;
+        }
         if let Some(limits) = self.limits {
             if self.source < self.known {
                 return Err(Error::InvalidShape(
@@ -92,6 +115,12 @@ impl<'a> Projection<'a> {
         Ok(())
     }
     pub(super) fn facts(&self) -> Result<NodeProjectionFacts, Error> {
+        if self.input_derived {
+            return self
+                .model
+                .numerical_input_derived_facts(self.source, 0)
+                .map_err(numerical);
+        }
         self.model
             .numerical_facts(
                 self.source,

@@ -177,14 +177,11 @@ fn caller_result_none_empty_and_nominal_dictionary_roots_keep_distinct_values() 
             let decoded =
                 caller_decode(encoded.0.as_ref(), read, limits(), &mut |_| Ok(()), &c).unwrap();
             assert_eq!(decoded.0, Some(input));
-            let dictionary_bytes = if id == u32::MAX {
-                2 * Layout::new::<DataType>().size()
-            } else {
-                0
-            };
+            // Borrowing complete immutable type backing creates no Dict boxes.
+            let dictionary_bytes = 0;
             let roots = 2 * Layout::array::<p::ValueId>(1).unwrap().size()
                 + 2 * Layout::array::<p::ResultField>(1).unwrap().size();
-            // Direct Dictionary owns two Boxes; Struct's FieldRef child is shared.
+            // The already validated complete type is a shared immutable loan.
             assert_eq!(
                 decoded.1.allocation_request_bytes_upper_bound,
                 roots + 2 * "value".len() + dictionary_bytes
@@ -279,7 +276,7 @@ fn caller_result_known_root_requests_refuse_before_pending_quantum_and_late_caus
     });
 }
 #[test]
-fn caller_result_actual_dictionary_capture_gate_precedes_completed_lookup() {
+fn caller_result_actual_name_request_gate_precedes_completed_lookup() {
     let fixture = Fixture::new();
     let c = Control::default();
     fixture.with_tokens(&c, |values, read| {
@@ -299,7 +296,7 @@ fn caller_result_actual_dictionary_capture_gate_precedes_completed_lookup() {
         let roots = 2
             * (Layout::array::<p::ValueId>(1).unwrap().size()
                 + Layout::array::<p::ResultField>(1).unwrap().size());
-        let known = roots + 2 * "value".len() + 2 * Layout::new::<DataType>().size();
+        let known = roots + 2 * "value".len();
         let mut cut = None;
         c.arm(None);
         caller_decode(
@@ -517,7 +514,7 @@ fn caller_result_wide_actual_text_copy_keeps_quantum_and_sampled_first_causes() 
 }
 
 #[test]
-fn caller_result_numeric_comparison_overflow_is_resource_before_ordinary_finish() {
+fn caller_result_source_request_overflow_and_real_comparison_work_keep_first_cause() {
     let fixture = Fixture::new();
     let c = Control::default();
     fixture.with_tokens(&c, |values, read| {
@@ -536,69 +533,43 @@ fn caller_result_numeric_comparison_overflow_is_resource_before_ordinary_finish(
         unbounded.max_allocation_request_bytes = usize::MAX;
         unbounded.max_coexisting_source_and_request_bytes = usize::MAX;
         unbounded.max_work = usize::MAX;
-        for deep in [false, true] {
-            for decode in [false, true] {
-                let requested = if decode {
-                    2 * (Layout::array::<p::ValueId>(1).unwrap().size()
-                        + Layout::array::<p::ResultField>(1).unwrap().size()
-                        + "value".len())
-                } else {
-                    Layout::array::<u32>(1).unwrap().size()
-                        + Layout::array::<wire::ResultField>(1).unwrap().size()
-                        + "value".len()
-                };
-                let facts = if decode { decoded.1 } else { encoded.1 };
-                assert_eq!(facts.allocation_request_bytes_upper_bound, requested);
-                let source = if deep {
-                    usize::MAX / 2
-                } else {
-                    usize::MAX - requested
-                };
-                if deep {
-                    assert!(
-                        crate::borrowed_type_resources::type_binding_prefix_work_upper_bound_in(
-                            &input.fields[0].ty,
-                            &input.fields[0].ty,
-                            source
-                        )
-                        .is_ok(),
-                        "the root prefix must fit before actual TypeNode growth"
-                    );
-                    let plain_control = Control::default();
-                    let mut plain_work =
-                        CompileCheckpoints::try_new(&plain_control, CompilePhase::Encode).unwrap();
-                    assert!(matches!(
-                        crate::borrowed_type_resources::verify_type_binding(
-                            &input.fields[0].ty,
-                            &input.fields[0].ty,
-                            source,
-                            usize::MAX,
-                            &mut plain_work
-                        ),
-                        Err(physical_type_v2::TypeCodecError::InvalidShape(_))
-                    ));
-                } else {
-                    assert!(matches!(
-                        crate::borrowed_type_resources::type_binding_prefix_work_upper_bound(
-                            &input.fields[0].ty,
-                            &input.fields[0].ty,
-                            source
-                        ),
-                        Err(physical_type_v2::TypeCodecError::InvalidShape(_))
-                    ));
-                }
-                let phase = if decode {
-                    CompilePhase::Decode
-                } else {
-                    CompilePhase::Encode
-                };
+        let ty = &input.fields[0].ty;
+        let comparison_prefix =
+            crate::borrowed_type_resources::type_binding_prefix_work_upper_bound(ty, ty, SOURCE)
+                .unwrap()
+                .work_upper_bound();
+        for decode in [false, true] {
+            let requested = if decode {
+                2 * (Layout::array::<p::ValueId>(1).unwrap().size()
+                    + Layout::array::<p::ResultField>(1).unwrap().size()
+                    + "value".len())
+            } else {
+                Layout::array::<u32>(1).unwrap().size()
+                    + Layout::array::<wire::ResultField>(1).unwrap().size()
+                    + "value".len()
+            };
+            let facts = if decode { decoded.1 } else { encoded.1 };
+            assert_eq!(facts.allocation_request_bytes_upper_bound, requested);
+            let phase = if decode {
+                CompilePhase::Decode
+            } else {
+                CompilePhase::Encode
+            };
+            // A real source + constructor request sum has a one-byte overflow.
+            // Huge source custody alone cannot invent comparison work.
+            for overflow in [false, true] {
+                let source = usize::MAX - requested + usize::from(overflow);
+                assert_eq!(
+                    crate::borrowed_type_resources::type_binding_prefix_work_upper_bound(
+                        ty, ty, source
+                    )
+                    .unwrap()
+                    .work_upper_bound(),
+                    comparison_prefix
+                );
                 let invoke = || {
                     let mut work = CompileCheckpoints::try_new(&c, phase)?;
-                    let mut calls = 0;
-                    let mut parent = |_: &NodeProjectionFacts| {
-                        calls += 1;
-                        Ok(())
-                    };
+                    let mut parent = |_: &NodeProjectionFacts| Ok(());
                     let result = if decode {
                         prepare_result_decode_in(
                             Some(raw),
@@ -623,15 +594,16 @@ fn caller_result_numeric_comparison_overflow_is_resource_before_ordinary_finish(
                     };
                     let before = c.trace();
                     let result = finish(work, result);
-                    assert!(calls > 1, "the actual namespace comparison must be reached");
-                    assert_eq!(
-                        c.trace(),
-                        before,
-                        "numeric refusal must not publish an ordinary footer"
-                    );
+                    if overflow {
+                        assert_eq!(c.trace(), before, "numeric refusal has no ordinary footer");
+                    }
                     result
                 };
                 c.arm(None);
+                if !overflow {
+                    invoke().unwrap();
+                    continue;
+                }
                 control_error(invoke(), CompileControlError::ResourceExhausted);
                 let trace = c.trace();
                 for cause in CAUSES {
@@ -639,6 +611,37 @@ fn caller_result_numeric_comparison_overflow_is_resource_before_ordinary_finish(
                     control_error(invoke(), CompileControlError::ResourceExhausted);
                     assert_eq!(c.trace(), trace);
                 }
+            }
+        }
+        // Both the initial scratch prefix and subsequent actual TypeNode/
+        // comparison work have meaningful limits. They use the sole borrowed
+        // author with the original meter, independent of source byte count.
+        for maximum in [comparison_prefix - 1, comparison_prefix] {
+            let invoke = || {
+                let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
+                let result = crate::borrowed_type_resources::preflight_type_binding_admitted_in(
+                    ty,
+                    ty,
+                    SOURCE,
+                    maximum,
+                    &mut |_| Ok::<_, physical_type_v2::TypeCodecError>(()),
+                    &mut work,
+                );
+                assert!(matches!(
+                    result,
+                    Err(physical_type_v2::TypeCodecError::Control(
+                        CompileControlError::ResourceExhausted
+                    ))
+                ));
+                // A direct primary refusal does not receive a finish footer.
+            };
+            c.arm(None);
+            invoke();
+            let trace = c.trace();
+            for cause in CAUSES {
+                c.arm(Some((trace.len(), cause)));
+                invoke();
+                assert_eq!(c.trace(), trace);
             }
         }
     });

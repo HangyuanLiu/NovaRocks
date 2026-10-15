@@ -298,11 +298,88 @@ pub(crate) fn decode_policy(value: i32) -> Result<DecimalOverflowPolicy, E> {
         _ => Err(E::InvalidShape("unknown or unspecified policy")),
     }
 }
-fn encode_effects(
+trait CallProjection {
+    type Error: From<E>;
+    fn reserve<T>(
+        &mut self,
+        count: usize,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Vec<T>, Self::Error>;
+    fn boxed<T>(
+        &mut self,
+        value: Vec<T>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Box<[T]>, Self::Error>;
+}
+impl CallProjection for Projection<'_> {
+    type Error = E;
+    fn reserve<T>(&mut self, n: usize, work: &mut CompileCheckpoints<'_>) -> Result<Vec<T>, E> {
+        Projection::reserve(self, n, work)
+    }
+    fn boxed<T>(
+        &mut self,
+        value: Vec<T>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Box<[T]>, E> {
+        Projection::boxed(self, value, work)
+    }
+}
+struct CreatedCallProjection<'a, 'c, H> {
+    creation: Option<&'a mut novarocks_type_contract::ValueSchemaCreation<'c, H>>,
+}
+impl<H> CallProjection for CreatedCallProjection<'_, '_, H> {
+    type Error = crate::host_projection_v2::ProjectionFailure<E, H>;
+    fn reserve<T>(
+        &mut self,
+        count: usize,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Vec<T>, Self::Error> {
+        work.flush().map_err(E::from)?;
+        let layout = std::alloc::Layout::array::<T>(count)
+            .map_err(|_| E::Control(CompileControlError::ResourceExhausted))?;
+        if let Some(creation) = self.creation.as_mut() {
+            creation
+                .request_layout(layout)
+                .map_err(crate::host_projection_v2::ProjectionFailure::Host)?;
+        }
+        let mut value = Vec::new();
+        value
+            .try_reserve_exact(count)
+            .map_err(|_| E::Control(CompileControlError::ResourceExhausted))?;
+        work.step().map_err(E::from)?;
+        work.flush().map_err(E::from)?;
+        Ok(value)
+    }
+    fn boxed<T>(
+        &mut self,
+        value: Vec<T>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Box<[T]>, Self::Error> {
+        work.flush().map_err(E::from)?;
+        // Vec::into_boxed_slice may shrink excess capacity. This is the
+        // public operation's bounded reallocation, not a retained invoice.
+        if value.capacity() != value.len() {
+            let upper = std::alloc::Layout::array::<T>(value.len())
+                .map_err(|_| E::Control(CompileControlError::ResourceExhausted))?
+                .size();
+            if let Some(creation) = self.creation.as_mut() {
+                creation
+                    .observe_opaque_upper_bound(upper)
+                    .map_err(crate::host_projection_v2::ProjectionFailure::Host)?;
+            }
+        }
+        let value = value.into_boxed_slice();
+        work.step().map_err(E::from)?;
+        work.flush().map_err(E::from)?;
+        Ok(value)
+    }
+}
+
+fn encode_effects<P: CallProjection>(
     value: &CallEffects,
-    resources: &mut Projection<'_>,
+    resources: &mut P,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<wire::CallEffects, E> {
+) -> Result<wire::CallEffects, P::Error> {
     let mut environment = resources.reserve(value.environment.len(), work)?;
     for reference in &value.environment {
         environment.push(encode_reference(reference, work)?);
@@ -323,11 +400,11 @@ fn encode_effects(
         proof_scope: Some(encode_proof(value.proof_scope)),
     })
 }
-fn decode_effects(
+fn decode_effects<P: CallProjection>(
     input: &wire::CallEffects,
-    resources: &mut Projection<'_>,
+    resources: &mut P,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<CallEffects, E> {
+) -> Result<CallEffects, P::Error> {
     // All repeated-field bounds have been checked before allocating any output.
     let observable = input
         .observable_effects
@@ -376,6 +453,77 @@ fn count_references(items: usize, environment: usize) -> Result<usize, E> {
     Ok(count)
 }
 
+fn encode_call_core<P: CallProjection>(
+    call: &FrozenPhysicalCall,
+    resources: &mut P,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::FrozenCall, P::Error> {
+    Ok(wire::FrozenCall {
+        site: Some(encode_site(call.site)),
+        context: Some(encode_context(&call.context)),
+        materialized_writer_input: call.materialized_writer_input.as_ref().map(encode_context),
+        effects: Some(encode_effects(&call.effects, resources, work)?),
+        decimal_overflow_policy: Some(encode_policy(call.decimal_overflow_policy)),
+        regexp_count_pattern_source: call.regexp_count_pattern_source.map(|source| match source {
+            novarocks_type_contract::RegexpCountPatternSource::Dynamic => 0,
+            novarocks_type_contract::RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent => 1,
+        }),
+        to_base64_byte_source: call.to_base64_byte_source.map(|source| match source {
+            novarocks_type_contract::ToBase64ByteSource::Ordinary => 0,
+            novarocks_type_contract::ToBase64ByteSource::NativeV1EncryptionLatin1 => 1,
+        }),
+        temporal_source: call
+            .temporal_source
+            .as_ref()
+            .map(|source| encode_temporal_source(source, resources, work))
+            .transpose()?,
+    })
+}
+fn decode_call_core<P: CallProjection>(
+    call: &wire::FrozenCall,
+    resources: &mut P,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FrozenPhysicalCall, P::Error> {
+    Ok(FrozenPhysicalCall {
+            site: decode_site(
+                call.site
+                    .as_ref()
+                    .ok_or(E::InvalidShape("missing call site"))?,
+            )?,
+            context: decode_context(
+                call.context
+                    .as_ref()
+                    .ok_or(E::InvalidShape("missing call context"))?,
+            )?,
+            materialized_writer_input:call.materialized_writer_input.as_ref().map(decode_context).transpose()?,
+            effects: decode_effects(
+                call.effects
+                    .as_ref()
+                    .ok_or(E::InvalidShape("missing call effects"))?,
+                resources,
+                work,
+            )?,
+            regexp_count_pattern_source: call.regexp_count_pattern_source.map(|source| match source {
+                0 => Ok(novarocks_type_contract::RegexpCountPatternSource::Dynamic),
+                1 => Ok(novarocks_type_contract::RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent),
+                _ => Err(E::InvalidShape("unknown regexp_count pattern source tag")),
+            }).transpose()?,
+            to_base64_byte_source: call.to_base64_byte_source.map(|source| match source {
+                0 => Ok(novarocks_type_contract::ToBase64ByteSource::Ordinary),
+                1 => Ok(novarocks_type_contract::ToBase64ByteSource::NativeV1EncryptionLatin1),
+                _ => Err(E::InvalidShape("unknown to_base64 byte source tag")),
+            }).transpose()?,
+            temporal_source: call
+                .temporal_source
+                .as_ref()
+                .map(|source| decode_temporal_source(source, resources, work))
+                .transpose()?,
+            decimal_overflow_policy: decode_policy(
+                call.decimal_overflow_policy
+                    .ok_or(E::InvalidShape("missing call decimal overflow policy"))?,
+            )?,
+        })
+}
 pub(super) fn encode_calls(
     input: &FrozenFragmentCalls,
     work: &mut CompileCheckpoints<'_>,
@@ -430,25 +578,7 @@ fn encode_calls_core(
     let mut entries = resources.reserve(input.entries().len(), work)?;
     for call in input.entries().values() {
         work.step()?;
-        entries.push(wire::FrozenCall {
-            site: Some(encode_site(call.site)),
-            context: Some(encode_context(&call.context)),
-            effects: Some(encode_effects(&call.effects, resources, work)?),
-            decimal_overflow_policy: Some(encode_policy(call.decimal_overflow_policy)),
-            regexp_count_pattern_source: call.regexp_count_pattern_source.map(|source| match source {
-                novarocks_type_contract::RegexpCountPatternSource::Dynamic => 0,
-                novarocks_type_contract::RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent => 1,
-            }),
-            to_base64_byte_source: call.to_base64_byte_source.map(|source| match source {
-                novarocks_type_contract::ToBase64ByteSource::Ordinary => 0,
-                novarocks_type_contract::ToBase64ByteSource::NativeV1EncryptionLatin1 => 1,
-            }),
-            temporal_source: call
-                .temporal_source
-                .as_ref()
-                .map(|source| encode_temporal_source(source, resources, work))
-                .transpose()?,
-        });
+        entries.push(encode_call_core(call, resources, work)?);
     }
     Ok(wire::FrozenCalls { entries })
 }
@@ -470,14 +600,12 @@ pub(super) fn decode_calls(
     )
 }
 
-fn decode_calls_core(
-    fragment: &Fragment,
-    uses: &PhysicalRootUses,
+fn prepare_decode_calls_prefix(
     input: &wire::FrozenCalls,
     resources: &mut Projection<'_>,
     work: &mut CompileCheckpoints<'_>,
-    control: &dyn PureCompileControl,
-) -> Result<FrozenFragmentCalls, E> {
+    include_final_constructor: bool,
+) -> Result<ControlOwnedResourceFacts, E> {
     if input.entries.len() > MAX_CONTROL_USE_REFERENCES {
         return Err(E::InvalidShape("too many call entries"));
     }
@@ -487,10 +615,25 @@ fn decode_calls_core(
     resources.known::<wire::FrozenCalls>(1)?;
     resources.known::<wire::FrozenCall>(input.entries.capacity())?;
     let mut constructor_prefix = ControlOwnedResourceFacts::default();
-    if resources.observed_mode() {
+    if include_final_constructor && resources.observed_mode() {
         resources.gate()?;
         resources.child(
-            &FrozenFragmentCalls::construction_resources(input.entries.len())?,
+            &FrozenFragmentCalls::construction_resources_with_writer_inputs(
+                input.entries.len(),
+                input
+                    .entries
+                    .iter()
+                    .filter(|call| {
+                        matches!(
+                            call.site.as_ref().and_then(|site| site.kind.as_ref()),
+                            Some(
+                                wire::call_site::Kind::WriterPartial(_)
+                                    | wire::call_site::Kind::WriterFinal(_)
+                            )
+                        )
+                    })
+                    .count(),
+            )?,
             &mut constructor_prefix,
         )?;
     }
@@ -521,47 +664,22 @@ fn decode_calls_core(
         resources.gate()?;
         work.step()?;
     }
+    Ok(constructor_prefix)
+}
+
+fn decode_calls_core(
+    fragment: &Fragment,
+    uses: &PhysicalRootUses,
+    input: &wire::FrozenCalls,
+    resources: &mut Projection<'_>,
+    work: &mut CompileCheckpoints<'_>,
+    control: &dyn PureCompileControl,
+) -> Result<FrozenFragmentCalls, E> {
+    let constructor_prefix = prepare_decode_calls_prefix(input, resources, work, true)?;
     let mut entries = resources.reserve(input.entries.len(), work)?;
     for call in &input.entries {
         work.step()?;
-        entries.push(FrozenPhysicalCall {
-            site: decode_site(
-                call.site
-                    .as_ref()
-                    .ok_or(E::InvalidShape("missing call site"))?,
-            )?,
-            context: decode_context(
-                call.context
-                    .as_ref()
-                    .ok_or(E::InvalidShape("missing call context"))?,
-            )?,
-            effects: decode_effects(
-                call.effects
-                    .as_ref()
-                    .ok_or(E::InvalidShape("missing call effects"))?,
-                resources,
-                work,
-            )?,
-            regexp_count_pattern_source: call.regexp_count_pattern_source.map(|source| match source {
-                0 => Ok(novarocks_type_contract::RegexpCountPatternSource::Dynamic),
-                1 => Ok(novarocks_type_contract::RegexpCountPatternSource::NativeV1Utf8LiteralWhenPresent),
-                _ => Err(E::InvalidShape("unknown regexp_count pattern source tag")),
-            }).transpose()?,
-            to_base64_byte_source: call.to_base64_byte_source.map(|source| match source {
-                0 => Ok(novarocks_type_contract::ToBase64ByteSource::Ordinary),
-                1 => Ok(novarocks_type_contract::ToBase64ByteSource::NativeV1EncryptionLatin1),
-                _ => Err(E::InvalidShape("unknown to_base64 byte source tag")),
-            }).transpose()?,
-            temporal_source: call
-                .temporal_source
-                .as_ref()
-                .map(|source| decode_temporal_source(source, resources, work))
-                .transpose()?,
-            decimal_overflow_policy: decode_policy(
-                call.decimal_overflow_policy
-                    .ok_or(E::InvalidShape("missing call decimal overflow policy"))?,
-            )?,
-        });
+        entries.push(decode_call_core(call, resources, work)?);
     }
     // Flush projection work before entering the real same-snapshot validator.
     // Neither this constructor nor the projection supplies an owner proof.
@@ -608,6 +726,181 @@ pub fn decode_frozen_calls_observed(
     let mut resources = Projection::observed(source_retained_bytes, limits, admit, 0)?;
     let output = decode_calls_core(fragment, uses, input, &mut resources, work, work.control())?;
     Ok((output, resources.facts()?))
+}
+
+/// Grammar-projected calls whose complete graph/effect validation is pending.
+/// Native must map the exact definitions and validate them with its created
+/// ProgramControlFlow/RootAttachment before installing any invocation.
+pub struct CreatedFrozenCallParts {
+    calls: Vec<FrozenPhysicalCall>,
+    storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl CreatedFrozenCallParts {
+    pub fn calls(&self) -> &[FrozenPhysicalCall] {
+        &self.calls
+    }
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<FrozenPhysicalCall>,
+        novarocks_type_contract::ValueTypeStorageLifetime,
+    ) {
+        (self.calls, self.storage)
+    }
+}
+/// Input-derived receiving mode. The sole numerical model keeps counting all
+/// entries/backing/work even without a receiving-profile callback. This is not
+/// an installed-effect proof or capacity grant.
+pub fn decode_frozen_call_parts_input_derived_with_creator_in<H>(
+    input: &wire::FrozenCalls,
+    source_retained_bytes: usize,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    (CreatedFrozenCallParts, NodeProjectionFacts),
+    crate::host_projection_v2::ProjectionFailure<E, H>,
+> {
+    let mut numerical = Projection::input_derived(source_retained_bytes);
+    decode_frozen_call_parts_core(input, &mut numerical, creation, work)
+}
+fn decode_frozen_call_parts_core<H>(
+    input: &wire::FrozenCalls,
+    numerical: &mut Projection<'_>,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    (CreatedFrozenCallParts, NodeProjectionFacts),
+    crate::host_projection_v2::ProjectionFailure<E, H>,
+> {
+    prepare_decode_calls_prefix(input, numerical, work, false)?;
+    numerical.gate()?;
+    let storage = creation.storage_lifetime();
+    let mut projection = CreatedCallProjection {
+        creation: Some(creation),
+    };
+    let mut calls = projection.reserve(input.entries.len(), work)?;
+    for raw in &input.entries {
+        work.step().map_err(E::from)?;
+        calls.push(decode_call_core(raw, &mut projection, work)?);
+    }
+    let facts = numerical.facts()?;
+    Ok((CreatedFrozenCallParts { calls, storage }, facts))
+}
+/// Explicit FE pure sender, sharing the original full call-table writer.
+/// It borrows the original checkpoint stream without a capacity grant/footer.
+pub fn encode_frozen_calls_pure_in(
+    input: &FrozenFragmentCalls,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::FrozenCalls, E> {
+    encode_calls(input, work)
+}
+
+/// A decoded writer call and the actual creator of its effect-reference
+/// backing. The caller moves this guard with the prepared-call source.
+pub struct CreatedFrozenWriterCall {
+    call: FrozenPhysicalCall,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl CreatedFrozenWriterCall {
+    pub fn call(&self) -> &FrozenPhysicalCall {
+        &self.call
+    }
+}
+/// Project one original writer call through the bulk codec's sole field body.
+/// None is the explicit FE pure path, without a memory grant.
+pub fn encode_frozen_writer_call_with_creator_in<H>(
+    call: &FrozenPhysicalCall,
+    creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::FrozenCall, crate::host_projection_v2::ProjectionFailure<E, H>> {
+    work.flush().map_err(E::from)?;
+    validate_writer_source_shape(call)?;
+    encode_call_core(call, &mut CreatedCallProjection { creation }, work)
+}
+/// Decode a writer-only loan, matching its actual original request definition.
+/// The surrounding source author must validate real domain membership; this
+/// grammar projection never claims a whole Fragment or installed effect proof.
+pub fn decode_frozen_writer_call_with_creator_in<H>(
+    raw: &wire::FrozenCall,
+    actual_site: PhysicalCallSite,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<CreatedFrozenWriterCall, crate::host_projection_v2::ProjectionFailure<E, H>> {
+    work.flush().map_err(E::from)?;
+    // Reject unsupported source annotations before any child allocation.
+    if raw.temporal_source.is_some()
+        || raw.regexp_count_pattern_source.is_some()
+        || raw.to_base64_byte_source.is_some()
+    {
+        return Err(E::InvalidShape("writer frozen call contains foreign source controls").into());
+    }
+    let site = decode_site(
+        raw.site
+            .as_ref()
+            .ok_or(E::InvalidShape("missing writer call site"))?,
+    )?;
+    if site != actual_site
+        || !matches!(
+            site,
+            PhysicalCallSite::WriterPartial { .. } | PhysicalCallSite::WriterFinal { .. }
+        )
+    {
+        return Err(
+            E::InvalidShape("writer call differs from its original request definition").into(),
+        );
+    }
+    if raw.materialized_writer_input.is_none() {
+        return Err(E::InvalidShape("missing original writer Value context").into());
+    }
+    let effects = raw
+        .effects
+        .as_ref()
+        .ok_or(E::InvalidShape("missing writer call effects"))?;
+    if effects.environment.len() > MAX_SEMANTIC_PARAMETERS {
+        return Err(E::InvalidShape("writer call environment exceeds original grammar").into());
+    }
+    let storage = creation.storage_lifetime();
+    let call = decode_call_core(
+        raw,
+        &mut CreatedCallProjection {
+            creation: Some(creation),
+        },
+        work,
+    )?;
+    validate_writer_source_shape(&call)?;
+    Ok(CreatedFrozenWriterCall {
+        call,
+        _storage: storage,
+    })
+}
+fn validate_writer_source_shape(call: &FrozenPhysicalCall) -> Result<(), E> {
+    let input = call
+        .materialized_writer_input
+        .ok_or(E::InvalidShape("missing original writer Value context"))?;
+    if !matches!(
+        call.site,
+        PhysicalCallSite::WriterPartial { .. } | PhysicalCallSite::WriterFinal { .. }
+    ) || call.context.demand != novarocks_type_contract::EvaluationDemand::Value
+        || input.demand != novarocks_type_contract::EvaluationDemand::Value
+        || input.use_id == call.context.use_id
+        || input.domain == call.context.domain
+        || call.temporal_source.is_some()
+        || call.regexp_count_pattern_source.is_some()
+        || call.to_base64_byte_source.is_some()
+    {
+        return Err(E::InvalidShape(
+            "writer frozen call changes its original source roles",
+        ));
+    }
+    if call.effects.environment.len() > MAX_SEMANTIC_PARAMETERS
+        || call.effects.proof_scope != CallProofScope::Unconditional
+            && call.effects.proof_scope != CallProofScope::Domain(call.context.domain)
+    {
+        return Err(E::InvalidShape(
+            "writer frozen call has an invalid effect scope",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -665,7 +958,7 @@ mod tests {
             function_id: FunctionId::try_new("fixture/frozen-calls/exact-id").unwrap(),
             overload: FunctionOverloadId::try_new("fixture/frozen-calls/exact-overload").unwrap(),
             kind,
-            argument_types: Box::default(),
+            argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::default()),
             result_type,
 
             legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
@@ -850,6 +1143,7 @@ mod tests {
             .uses()
             .values()
             .map(|invocation| FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -988,8 +1282,12 @@ mod tests {
                 function: BoundTableFunction {
                     function_id: scalar_fields.function_id,
                     overload: scalar_fields.overload,
-                    argument_types: Box::default(),
-                    result_types: Box::from([integer()]),
+                    argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        Box::default(),
+                    ),
+                    result_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        Box::from([integer()]),
+                    ),
 
                     legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
                         volatility: scalar_fields.legacy_metadata.as_ref().unwrap().volatility,
@@ -1035,6 +1333,7 @@ mod tests {
         for (call, use_id) in [(0, special_base), (1, special_base + 1)] {
             let context = context(use_id, 0, EvaluationDemand::Value);
             calls.push(FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -1055,6 +1354,7 @@ mod tests {
             .unwrap()
             .context;
         calls.push(FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
@@ -1065,6 +1365,7 @@ mod tests {
         });
         let context = context(special_base + 2, u32::MAX, EvaluationDemand::Value);
         calls.push(FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
@@ -1662,18 +1963,18 @@ fn validate_wire_source_extent(source: &wire::TemporalSourcePlan) -> Result<(), 
     }
     Ok(())
 }
-fn encode_temporal_source(
+fn encode_temporal_source<P: CallProjection>(
     source: &novarocks_type_contract::TemporalSourcePlan<novarocks_physical_plan::ExprId>,
-    resources: &mut Projection<'_>,
+    resources: &mut P,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<wire::TemporalSourcePlan, E> {
+) -> Result<wire::TemporalSourcePlan, P::Error> {
     use novarocks_type_contract::{TemporalCastKind as C, TemporalSourceRole as R};
     source
         .validate_structure()
         .map_err(|_| E::InvalidShape("invalid temporal source structure"))?;
     let mut cast_chain = resources.reserve(source.facts.cast_chain().len(), work)?;
     for kind in source.facts.cast_chain() {
-        work.step()?;
+        work.step().map_err(E::from)?;
         cast_chain.push(match kind {
             C::Ordinary => wire::TemporalCastKind::Ordinary,
             C::Time => wire::TemporalCastKind::Time,
@@ -1682,7 +1983,7 @@ fn encode_temporal_source(
     }
     let mut sources = resources.reserve(source.sources.len(), work)?;
     for channel in &source.sources {
-        work.step()?;
+        work.step().map_err(E::from)?;
         let role = match channel.role {
             R::Normal => wire::TemporalSourceRole::Normal,
             R::Format => wire::TemporalSourceRole::Format,
@@ -1703,36 +2004,45 @@ fn encode_temporal_source(
         sources,
     })
 }
-fn decode_temporal_source(
+fn decode_temporal_source<P: CallProjection>(
     source: &wire::TemporalSourcePlan,
-    resources: &mut Projection<'_>,
+    resources: &mut P,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<novarocks_type_contract::TemporalSourcePlan<novarocks_physical_plan::ExprId>, E> {
+) -> Result<novarocks_type_contract::TemporalSourcePlan<novarocks_physical_plan::ExprId>, P::Error>
+{
     use novarocks_type_contract::{
         TemporalCastKind as C, TemporalSourceFacts as F, TemporalSourceRole as R,
         TemporalSourceShape as S,
     };
     validate_wire_source_extent(source)?;
-    let shape = crate::physical_control_v2::decode_temporal_shape(source.shape)?;
+    let shape = crate::physical_control_v2::decode_temporal_shape(source.shape).map_err(E::from)?;
     if source.sources.len() != shape.source_count() {
-        return Err(E::InvalidShape("wrong temporal source channel count"));
+        return Err(P::Error::from(E::InvalidShape(
+            "wrong temporal source channel count",
+        )));
     }
     let mut cast_chain = resources.reserve(source.cast_chain.len(), work)?;
     for kind in &source.cast_chain {
-        work.step()?;
+        work.step().map_err(E::from)?;
         cast_chain.push(match wire::TemporalCastKind::try_from(*kind) {
             Ok(wire::TemporalCastKind::Ordinary) => C::Ordinary,
             Ok(wire::TemporalCastKind::Time) => C::Time,
             Ok(wire::TemporalCastKind::TimeFromDatetime) => C::TimeFromDatetime,
-            _ => return Err(E::InvalidShape("unknown or missing temporal cast kind")),
+            _ => {
+                return Err(P::Error::from(E::InvalidShape(
+                    "unknown or missing temporal cast kind",
+                )));
+            }
         });
     }
     if matches!(shape, S::FormatOrdinary | S::FormatUtf8Override) && !cast_chain.is_empty() {
-        return Err(E::InvalidShape("cast trace on TIME_FORMAT source grammar"));
+        return Err(P::Error::from(E::InvalidShape(
+            "cast trace on TIME_FORMAT source grammar",
+        )));
     }
-    work.flush()?;
-    let cast_chain = cast_chain.into_boxed_slice();
-    work.flush()?;
+    work.flush().map_err(E::from)?;
+    let cast_chain = resources.boxed(cast_chain, work)?;
+    work.flush().map_err(E::from)?;
     let facts = match shape {
         S::FormatOrdinary => F::FormatOrdinary,
         S::FormatUtf8Override => F::FormatUtf8Override,
@@ -1743,7 +2053,7 @@ fn decode_temporal_source(
     };
     let mut sources = resources.reserve(source.sources.len(), work)?;
     for channel in &source.sources {
-        work.step()?;
+        work.step().map_err(E::from)?;
         let role = match wire::TemporalSourceRole::try_from(channel.role) {
             Ok(wire::TemporalSourceRole::Normal) => R::Normal,
             Ok(wire::TemporalSourceRole::Format) => R::Format,
@@ -1751,7 +2061,11 @@ fn decode_temporal_source(
             Ok(wire::TemporalSourceRole::OriginalSeconds) => R::OriginalSeconds,
             Ok(wire::TemporalSourceRole::ImmediateCastSource) => R::ImmediateCastSource,
             Ok(wire::TemporalSourceRole::DeepestCastSource) => R::DeepestCastSource,
-            _ => return Err(E::InvalidShape("unknown or missing temporal source role")),
+            _ => {
+                return Err(P::Error::from(E::InvalidShape(
+                    "unknown or missing temporal source role",
+                )));
+            }
         };
         sources.push(novarocks_type_contract::TemporalSourceOccurrence {
             role,
@@ -1765,9 +2079,9 @@ fn decode_temporal_source(
             )?),
         });
     }
-    work.flush()?;
-    let sources = sources.into_boxed_slice();
-    work.flush()?;
+    work.flush().map_err(E::from)?;
+    let sources = resources.boxed(sources, work)?;
+    work.flush().map_err(E::from)?;
     let plan = novarocks_type_contract::TemporalSourcePlan { facts, sources };
     plan.validate_structure()
         .map_err(|_| E::InvalidShape("invalid temporal source structure"))?;
@@ -1777,3 +2091,258 @@ fn decode_temporal_source(
 #[cfg(test)]
 #[path = "temporal_source_codec_tests.rs"]
 mod temporal_source_codec_tests;
+
+#[cfg(test)]
+mod writer_projection_creator_tests {
+    use super::*;
+    use novarocks_type_contract::{
+        CompilePhase, EvaluationDemand, SemanticParameterId, SemanticParameterKey,
+        ValueSchemaCreation, ValueTypeStorageHold, ValueTypeStorageLifetime,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert!(units <= 256);
+            Ok(())
+        }
+    }
+    fn source() -> FrozenPhysicalCall {
+        let context = ExpressionEffectContext {
+            use_id: ExpressionUseId::new(41),
+            domain: EvaluationDomainId::new(17),
+            demand: EvaluationDemand::Value,
+        };
+        FrozenPhysicalCall {
+            site: PhysicalCallSite::WriterPartial {
+                node: NodeId::new(3),
+                call: 0,
+            },
+            context,
+            materialized_writer_input: Some(ExpressionEffectContext {
+                use_id: ExpressionUseId::new(42),
+                domain: EvaluationDomainId::new(18),
+                demand: EvaluationDemand::Value,
+            }),
+            effects: CallEffects {
+                value_stability: FunctionVolatility::Immutable,
+                own_row_error: FunctionIntrinsicRowError::NotRowEvaluated,
+                failure_behavior: FunctionFailureBehavior::Propagate,
+                null_behavior: FunctionNullBehavior::CalledOnNull,
+                argument_control: ArgumentControl::Aggregate,
+                instance_state: FunctionInstanceState::AggregateInstance,
+                observable_effects: ObservableEffects::NONE,
+                environment: Box::from([novarocks_type_contract::SemanticParameterRef {
+                    id: SemanticParameterId::new(7),
+                    expected_key: SemanticParameterKey::TimeZone,
+                }]),
+                proof_scope: CallProofScope::Domain(context.domain),
+            },
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+            temporal_source: None,
+            regexp_count_pattern_source: None,
+            to_base64_byte_source: None,
+        }
+    }
+    struct Scope(Arc<AtomicUsize>);
+    impl ValueTypeStorageHold for Scope {}
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[test]
+    fn writer_projection_roundtrip_keeps_exact_source_context_and_last_creator() {
+        let source = source();
+        let control = Control;
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let raw = encode_frozen_writer_call_with_creator_in::<std::convert::Infallible>(
+            &source, None, &mut work,
+        )
+        .unwrap();
+        work.finish().unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner = Arc::new(Scope(drops.clone()));
+        let storage = ValueTypeStorageLifetime::held(owner.clone());
+        let mut actual = Vec::new();
+        let mut opaque = Vec::new();
+        let mut request = |layout: std::alloc::Layout| {
+            actual.push(layout);
+            Ok::<_, std::convert::Infallible>(())
+        };
+        let mut upper = |bytes| {
+            opaque.push(bytes);
+            Ok::<_, std::convert::Infallible>(())
+        };
+        let mut creation = ValueSchemaCreation::new(storage, &mut request, &mut upper);
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let created =
+            decode_frozen_writer_call_with_creator_in(&raw, source.site, &mut creation, &mut work)
+                .unwrap();
+        work.finish().unwrap();
+        assert_eq!(created.call(), &source);
+        drop(creation);
+        drop(owner);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(actual.iter().any(|request| request.size() > 0));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(created);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn writer_projection_rejects_missing_receipt_and_preserves_original_host_without_tail() {
+        use crate::host_projection_v2::ProjectionFailure;
+        let source = source();
+        let control = Control;
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let raw = encode_frozen_writer_call_with_creator_in::<std::convert::Infallible>(
+            &source, None, &mut work,
+        )
+        .unwrap();
+        let original = Arc::new(17u64);
+        let expected = original.clone();
+        let mut requests = 0usize;
+        let mut request = |_: std::alloc::Layout| {
+            requests += 1;
+            assert_eq!(requests, 1, "allocation after first caller refusal");
+            Err(original.clone())
+        };
+        let mut upper = |_: usize| -> Result<(), Arc<u64>> {
+            panic!("opaque callback after first caller refusal")
+        };
+        let mut creation =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut upper);
+        let mut absent = raw.clone();
+        absent.materialized_writer_input = None;
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        assert!(matches!(
+            decode_frozen_writer_call_with_creator_in(
+                &absent,
+                source.site,
+                &mut creation,
+                &mut work
+            ),
+            Err(ProjectionFailure::Codec(E::InvalidShape(_)))
+        ));
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let result =
+            decode_frozen_writer_call_with_creator_in(&raw, source.site, &mut creation, &mut work);
+        assert!(
+            matches!(result,Err(ProjectionFailure::Host(ref cause)) if Arc::ptr_eq(cause,&expected))
+        );
+        drop(creation);
+        assert_eq!(requests, 1);
+    }
+    #[test]
+    fn whole_call_parts_keep_original_host_before_any_child_or_final_validator() {
+        use crate::host_projection_v2::ProjectionFailure;
+        let source = source();
+        let control = Control;
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let raw = encode_frozen_writer_call_with_creator_in::<std::convert::Infallible>(
+            &source, None, &mut work,
+        )
+        .unwrap();
+        let source = wire::FrozenCalls { entries: vec![raw] };
+        let invoice = std::mem::size_of::<wire::FrozenCalls>()
+            + std::alloc::Layout::array::<wire::FrozenCall>(source.entries.capacity())
+                .unwrap()
+                .size()
+            + std::alloc::Layout::array::<wire::SemanticParameterRef>(
+                source.entries[0]
+                    .effects
+                    .as_ref()
+                    .unwrap()
+                    .environment
+                    .capacity(),
+            )
+            .unwrap()
+            .size();
+        let original = Arc::new(17u64);
+        let expected = original.clone();
+        let mut count = 0;
+        let mut exact = |_: std::alloc::Layout| {
+            count += 1;
+            assert_eq!(count, 1, "allocation after original refusal");
+            Err(original.clone())
+        };
+        let mut opaque =
+            |_: usize| -> Result<(), Arc<u64>> { panic!("opaque tail after original refusal") };
+        let mut creation =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let result = decode_frozen_call_parts_input_derived_with_creator_in(
+            &source,
+            invoice,
+            &mut creation,
+            &mut work,
+        );
+        assert!(
+            matches!(result,Err(ProjectionFailure::Host(cause)) if Arc::ptr_eq(&cause,&expected))
+        );
+        drop(creation);
+        assert_eq!(count, 1);
+    }
+    #[test]
+    fn whole_call_parts_keep_exact_sources_and_last_finite_creator_without_fragment_proof() {
+        let original = source();
+        let control = Control;
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let raw = encode_frozen_writer_call_with_creator_in::<std::convert::Infallible>(
+            &original, None, &mut work,
+        )
+        .unwrap();
+        let source = wire::FrozenCalls { entries: vec![raw] };
+        let invoice = std::mem::size_of::<wire::FrozenCalls>()
+            + std::alloc::Layout::array::<wire::FrozenCall>(source.entries.capacity())
+                .unwrap()
+                .size()
+            + std::alloc::Layout::array::<wire::SemanticParameterRef>(
+                source.entries[0]
+                    .effects
+                    .as_ref()
+                    .unwrap()
+                    .environment
+                    .capacity(),
+            )
+            .unwrap()
+            .size();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner = Arc::new(Scope(drops.clone()));
+        let mut requests = Vec::new();
+        let mut exact = |layout: std::alloc::Layout| {
+            requests.push(layout);
+            Ok::<_, std::convert::Infallible>(())
+        };
+        let mut opaque = |_: usize| Ok::<_, std::convert::Infallible>(());
+        let mut creation = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::held(owner.clone()),
+            &mut exact,
+            &mut opaque,
+        );
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let (parts, facts) = decode_frozen_call_parts_input_derived_with_creator_in(
+            &source,
+            invoice,
+            &mut creation,
+            &mut work,
+        )
+        .unwrap();
+        assert_eq!(parts.calls(), &[original]);
+        assert!(facts.list_item_count >= 1);
+        assert!(facts.allocation_request_bytes_upper_bound > 0);
+        drop(creation);
+        drop(owner);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(requests.iter().any(|layout| layout.size() > 0));
+        let (calls, storage) = parts.into_parts();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(calls);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(storage);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+}

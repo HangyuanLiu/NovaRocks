@@ -109,7 +109,7 @@ fn regexp_position_owner_all_three_fixed_profiles_preserve_exact_contract_and_ef
     for arity in 2..=4 {
         let sources = (0..arity)
             .map(|i| {
-                FunctionValueType::new(
+                FunctionValueType::from_legacy_declared_projection(
                     if i < 2 {
                         DataType::Utf8
                     } else {
@@ -120,7 +120,10 @@ fn regexp_position_owner_all_three_fixed_profiles_preserve_exact_contract_and_ef
             })
             .collect::<Vec<_>>();
         let prepared = prepared_for_test("regexp_position", &sources).unwrap();
-        assert_eq!(prepared.contract().result_type().data_type, DataType::Int32);
+        assert_eq!(
+            prepared.contract().result_type().data_type().clone(),
+            DataType::Int32
+        );
         assert_eq!(prepared.contract().selected().argument_types.len(), arity);
         assert_eq!(
             prepared.contract().effects().own_row_error,
@@ -146,7 +149,7 @@ fn regexp_position_owner_all_three_fixed_profiles_preserve_exact_contract_and_ef
                 panic!("unexpected lambda")
             };
             assert_eq!(
-                ty.data_type,
+                ty.data_type().clone(),
                 if i < 2 {
                     DataType::Utf8
                 } else {

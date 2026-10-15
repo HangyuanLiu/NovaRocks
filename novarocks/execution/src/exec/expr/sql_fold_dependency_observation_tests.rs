@@ -106,7 +106,7 @@ fn calculate(
             assert_eq!(&argument.value_type, argument.value.value_type());
             arena.push_typed(
                 ExprNode::Constant(argument.value.clone()),
-                argument.value_type.data_type.clone(),
+                argument.value_type.data_type().clone(),
             )
         })
         .collect::<Vec<_>>();
@@ -120,7 +120,7 @@ fn calculate(
         FoldNodeKind::Cast(policy) if args.len() == 1 => ExprNode::Cast(args[0], *policy),
         _ => return Ok(None),
     };
-    let root = arena.push_typed(node, request.result_type.data_type.clone());
+    let root = arena.push_typed(node, request.result_type.data_type().clone());
     let schema = Arc::new(ChunkSchema::empty());
     let batch = RecordBatch::try_new_with_options(
         schema.arrow_schema_ref(),
@@ -131,8 +131,11 @@ fn calculate(
     let chunk = Chunk::try_new_with_chunk_schema(batch, schema).unwrap();
     let output = arena.eval(root, &chunk)?;
     assert_eq!(output.len(), 1);
-    assert_eq!(output.data_type(), &request.result_type.data_type);
-    if output.is_null(0) && !request.result_type.nullable {
+    assert_eq!(
+        output.data_type().clone(),
+        request.result_type.data_type().clone()
+    );
+    if output.is_null(0) && !request.result_type.nullable() {
         return Ok(None);
     }
     let field = Arc::new(request.result_type.try_to_field("literal")?);
@@ -482,7 +485,7 @@ fn sql_fold_dependency_cast_intrinsic_retains_exact_source_result_policy() {
     assert!(receipt.binding.is_none());
     assert_eq!(receipt.arguments[0].value.try_i64().unwrap(), Some(12));
     assert_eq!(
-        receipt.request_result.data_type,
+        receipt.request_result.data_type().clone(),
         arrow::datatypes::DataType::Utf8
     );
     assert!(matches!(receipt.outcome, Some(Outcome::Produced(_))));

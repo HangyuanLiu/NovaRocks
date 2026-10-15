@@ -22,7 +22,7 @@
 
 use crate::default_value::ICEBERG_INITIAL_DEFAULT_META_KEY;
 use crate::iceberg::spec::{NestedField, Schema};
-use crate::schema_mapping::{field_id_for_arrow_field, sql_read_schema_from_iceberg};
+use crate::schema_mapping::sql_read_schema_from_iceberg;
 use crate::typed_read::column_handle::parse_type;
 use crate::typed_read::schema_binding::{
     IcebergMetadataColumn, annotated_read_schema, dereference_target_field, metadata_target_field,
@@ -39,14 +39,17 @@ use novarocks_spi::connector::{
     ConnectorCodecError, ConnectorCodecErrorKind, ConnectorError, ConnectorErrorKind,
     ConnectorFieldPath,
 };
+#[cfg(test)]
+use novarocks_type_contract::PureCompileControl;
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
-    ValueLogicalType, ValueTypeError,
+    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, ValueLogicalType,
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use std::{collections::BTreeMap, sync::Arc};
 
 type Failure = PureProviderCompileError<ConnectorCodecError>;
+mod typed_compare;
+mod typed_source;
 
 /// Complete-input correspondence only. Public source properties/coverage and
 /// unsupported relation kinds are also checked by the enclosing source owner.
@@ -65,12 +68,49 @@ pub(super) fn validate_program_columns(
         if !same_count {
             return Err(invalid("private/public read column count differs"));
         }
+        if public.execution_schema().is_none() || public.source_schema_facts().is_none() {
+            return Err(invalid(
+                "Iceberg frozen read lacks complete execution/source declarations",
+            ));
+        }
         match relation {
             IcebergRuntimeRelation::SystemTable(reference) => {
                 // System Arrow schemas have their own exact timestamp/map/JSON
                 // source. Mirror them through the same original forward author,
                 // rather than applying ordinary Iceberg table storage mapping.
                 for (ordinal, column) in columns.iter().enumerate() {
+                    let execution = public
+                        .execution_schema()
+                        .ok_or_else(|| invalid("missing system execution declaration"))?;
+                    let source = public
+                        .source_schema_facts()
+                        .ok_or_else(|| invalid("missing system source facts"))?;
+                    let binding = execution
+                        .binding(ordinal)
+                        .ok_or_else(|| invalid("missing system value binding"))?;
+                    let shape = source
+                        .shape()
+                        .schema()
+                        .fields()
+                        .get(ordinal)
+                        .ok_or_else(|| invalid("missing system source occurrence"))?;
+                    let field = &public.schema().fields()[ordinal];
+                    crate::typed_read::system_page_source::validate_system_column_value(
+                        reference.system_table_type(),
+                        field,
+                        binding,
+                        work,
+                    )
+                    .map_err(|cause| match cause {
+                        PureProviderCompileError::Control(cause) => Failure::Control(cause),
+                        PureProviderCompileError::Provider(cause) => source_error(cause),
+                    })?;
+                    if !equal_text(field.name(), shape.name(), work)?
+                        || field.is_nullable() != shape.is_nullable()
+                    {
+                        return Err(invalid("system source occurrence name/NULL differs"));
+                    }
+                    typed_compare::shape(field.data_type(), shape.data_type(), work)?;
                     check_system_column(
                         reference.system_table_type(),
                         column,
@@ -80,14 +120,36 @@ pub(super) fn validate_program_columns(
                     )?;
                     work.step()?;
                 }
+                for fact in public
+                    .source_schema_facts()
+                    .ok_or_else(|| invalid("missing system source facts"))?
+                    .field_facts()
+                {
+                    work.step()?;
+                    if fact.field_id().is_some() || fact.initial_default().is_some() {
+                        return Err(invalid(
+                            "system relation has no format-assigned source ID/default",
+                        ));
+                    }
+                }
                 Ok(())
             }
             _ => visit_source_fields(
                 relation,
                 columns,
                 work,
-                &mut |ordinal, field, nullable, work| {
-                    compare_public(field, nullable, ordinal, public, work)
+                &mut |ordinal, field, nullable, declaration, input_work, work| {
+                    compare_public(
+                        relation,
+                        &columns[ordinal],
+                        field,
+                        nullable,
+                        ordinal,
+                        public,
+                        declaration,
+                        input_work,
+                        work,
+                    )
                 },
             ),
         }
@@ -109,27 +171,14 @@ pub(super) fn validate_program_columns(
 /// defaults and nested domains included. A metadata relation's fields come from
 /// its frozen system schema instead; see `system_public_read_schema`.
 ///
-/// Legacy table-property declarations of a nominal domain (HLL, BITMAP,
-/// LARGEINT) are not frozen into the read handle, so their columns publish the
-/// physical storage domain the handle proves.
+/// The relation carries its exact provider-authored field-ID declarations;
+/// generic Arrow annotations cannot establish a missing value domain.
 pub(crate) fn public_read_schema(
     relation: &IcebergRuntimeRelation,
-    columns: &[IcebergColumnHandle],
-) -> Result<ConnectorReadPublicSchema, ConnectorError> {
-    let mut fields = Vec::with_capacity(columns.len());
-    let mut logical_types = Vec::with_capacity(columns.len());
-    author(|work| {
-        visit_source_fields(relation, columns, work, &mut |_, field, nullable, _| {
-            let field = field.clone().with_nullable(nullable);
-            logical_types.push(source_logical_type(&field)?);
-            fields.push(Arc::new(field));
-            Ok(())
-        })
-    })?;
-    ConnectorReadPublicSchema::try_new(
-        Arc::new(arrow::datatypes::Schema::new(fields)),
-        logical_types,
-    )
+    columns: &[&IcebergColumnHandle],
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<ConnectorReadPublicSchema, PureProviderCompileError<ConnectorError>> {
+    typed_source::publish(relation, columns, creation)
 }
 
 /// The public schema of a frozen read of `columns` from a metadata relation.
@@ -140,76 +189,27 @@ pub(crate) fn public_read_schema(
 /// the same mirror the pure read compiler applies to a frozen public field.
 pub(crate) fn system_public_read_schema(
     kind: IcebergSystemTableType,
-    columns: &[IcebergColumnHandle],
-    system: &arrow::datatypes::Schema,
-) -> Result<ConnectorReadPublicSchema, ConnectorError> {
-    let mut fields = Vec::with_capacity(columns.len());
-    let mut logical_types = Vec::with_capacity(columns.len());
-    author(|work| {
-        for column in columns {
-            let field = system
-                .fields()
-                .iter()
-                .find(|field| field.name() == column.base_column_identity().name())
-                .ok_or_else(|| unsupported("system relation has no such output column"))?;
-            let logical = source_logical_type(field)?;
-            check_system_column(kind, column, field, logical, work)?;
-            fields.push(Arc::clone(field));
-            logical_types.push(logical);
-            work.step()?;
-        }
-        Ok(())
-    })?;
-    ConnectorReadPublicSchema::try_new(
-        Arc::new(arrow::datatypes::Schema::new(fields)),
-        logical_types,
+    columns: &[&IcebergColumnHandle],
+    schema: &Schema,
+    specs: &[&crate::iceberg::spec::PartitionSpec],
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<ConnectorReadPublicSchema, PureProviderCompileError<ConnectorError>> {
+    crate::typed_read::system_page_source::publish_read_schema(
+        kind, columns, schema, specs, creation,
     )
-}
-
-/// Runs a field author outside pure compilation. The author is the same code
-/// the compiler runs; its checkpoints have no caller budget to observe here.
-fn author(
-    run: impl FnOnce(&mut CompileCheckpoints<'_>) -> Result<(), Failure>,
-) -> Result<(), ConnectorError> {
-    struct Unobserved;
-    impl PureCompileControl for Unobserved {
-        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-            Ok(())
-        }
-    }
-    let mut work = CompileCheckpoints::try_new(&Unobserved, CompilePhase::ProviderValidation)
-        .map_err(|cause| author_error(Failure::Control(cause)))?;
-    run(&mut work).map_err(author_error)?;
-    work.finish()
-        .map_err(|cause| author_error(Failure::Control(cause)))
-}
-
-fn author_error(failure: Failure) -> ConnectorError {
-    match failure {
-        Failure::Provider(error) => ConnectorError::new(
-            match error.kind() {
-                ConnectorCodecErrorKind::Unsupported => ConnectorErrorKind::Unsupported,
-                ConnectorCodecErrorKind::Capacity => ConnectorErrorKind::ResourceExhausted,
-                _ => ConnectorErrorKind::InvalidRequest,
-            },
-            format!("Iceberg public read schema: {}", error.detail()),
-        ),
-        Failure::Control(cause) => ConnectorError::new(
-            ConnectorErrorKind::Internal,
-            format!("Iceberg public read schema author was interrupted: {cause}"),
-        ),
-    }
-}
-
-fn source_logical_type(field: &Field) -> Result<ValueLogicalType, Failure> {
-    novarocks_type_contract::field_logical_type(field)
-        .map_err(|_| invalid("source field has invalid logical identity"))
 }
 
 /// Receives each column's frozen source field and NULL contract, in column
 /// order, at the point the column has been proven against its frozen source.
-type SourceFieldVisitor<'v> =
-    dyn FnMut(usize, &Field, bool, &mut CompileCheckpoints<'_>) -> Result<(), Failure> + 'v;
+type SourceFieldVisitor<'v> = dyn FnMut(
+        usize,
+        &Field,
+        bool,
+        Option<&NestedField>,
+        usize,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<(), Failure>
+    + 'v;
 
 /// The per-column source derivation shared by the pure compiler and the public
 /// field author, for every relation whose fields are derived from its own
@@ -232,7 +232,14 @@ fn visit_source_fields(
                     let expected = opaque_source(work, change_op_column_handle)?;
                     compare_handle(column, &expected, work)?;
                     let field = projected_field(&expected, work)?;
-                    visit(ordinal, &field, column.nullable(), work)?;
+                    visit(
+                        ordinal,
+                        &field,
+                        column.nullable(),
+                        None,
+                        window.table_schema_json().len(),
+                        work,
+                    )?;
                 } else {
                     // The frozen window owns the requested to-schema column
                     // handles, including its exact narrow-integer domains.
@@ -243,8 +250,16 @@ fn visit_source_fields(
                         invalid("column is absent from frozen change-window columns")
                     })?;
                     compare_handle(column, expected, work)?;
-                    let (field, nullable) = source_column_field(column, &index, None, work)?;
-                    visit(ordinal, &field, nullable, work)?;
+                    let (field, nullable, declaration) =
+                        source_column_field(column, &index, None, work)?;
+                    visit(
+                        ordinal,
+                        &field,
+                        nullable,
+                        declaration,
+                        window.table_schema_json().len(),
+                        work,
+                    )?;
                 }
                 work.step()?;
             }
@@ -273,7 +288,14 @@ fn visit_source_fields(
                     })?;
                     compare_handle(column, &expected, work)?;
                     let field = projected_field(&expected, work)?;
-                    visit(ordinal, &field, expected.nullable(), work)?;
+                    visit(
+                        ordinal,
+                        &field,
+                        expected.nullable(),
+                        None,
+                        column.type_json().len(),
+                        work,
+                    )?;
                     work.step()?;
                 }
                 Ok(())
@@ -316,8 +338,16 @@ fn visit_table(
     let arrow = opaque_source(work, || annotated_read_schema(&schema))?;
     let index = source_index(&schema, &arrow, work)?;
     for (ordinal, column) in columns.iter().enumerate() {
-        let (field, nullable) = source_column_field(column, &index, Some(table), work)?;
-        visit(ordinal, &field, nullable, work)?;
+        let (field, nullable, declaration) =
+            source_column_field(column, &index, Some(table), work)?;
+        visit(
+            ordinal,
+            &field,
+            nullable,
+            declaration,
+            table.table_schema_json().len(),
+            work,
+        )?;
         work.step()?;
     }
     Ok(())
@@ -338,12 +368,12 @@ fn source_index<'a>(
 }
 /// One column's frozen source field and NULL contract, after the column is
 /// proven to be exactly the handle its frozen source would author.
-fn source_column_field(
+fn source_column_field<'a>(
     column: &IcebergColumnHandle,
-    index: &SourceIndex<'_>,
+    index: &SourceIndex<'a>,
     table: Option<&IcebergTableHandle>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(FieldRef, bool), Failure> {
+) -> Result<(FieldRef, bool, Option<&'a NestedField>), Failure> {
     if let Some(metadata) = IcebergMetadataColumn::from_field_id(column.base_field_id()) {
         if let Some(source) = table.and_then(IcebergTableHandle::frozen_cow_source) {
             let expected = source
@@ -358,7 +388,7 @@ fn source_column_field(
             }
         }
         let field = opaque_source(work, || metadata_target_field(column, metadata))?;
-        return Ok((field, column.nullable()));
+        return Ok((field, column.nullable(), None));
     }
     let source = index.get(&column.base_field_id()).copied();
     work.step()?;
@@ -385,7 +415,22 @@ fn source_column_field(
             Arc::new(field.as_ref().clone().with_data_type(domain.data_type()))
         })?;
     }
-    Ok((field, expected.nullable()))
+    let mut declaration = source;
+    for id in column.field_id_path() {
+        let crate::iceberg::spec::Type::Struct(fields) = declaration.field_type.as_ref() else {
+            return Err(invalid("source projection does not traverse a struct"));
+        };
+        let mut child = None;
+        for candidate in fields.fields() {
+            work.step()?;
+            if candidate.id == *id {
+                child = Some(candidate.as_ref());
+                break;
+            }
+        }
+        declaration = child.ok_or_else(|| invalid("source projection field ID is absent"))?;
+    }
+    Ok((field, expected.nullable(), Some(declaration)))
 }
 
 fn observed_path(path: &[i32], work: &mut CompileCheckpoints<'_>) -> Result<Vec<i32>, Failure> {
@@ -535,134 +580,62 @@ fn equal_text(a: &str, b: &str, work: &mut CompileCheckpoints<'_>) -> Result<boo
     Ok(true)
 }
 
-#[derive(Debug)]
-enum CompareError {
-    Control(CompileControlError),
-    Value(ValueTypeError),
-}
-impl From<CompileControlError> for CompareError {
-    fn from(e: CompileControlError) -> Self {
-        Self::Control(e)
-    }
-}
-impl From<ValueTypeError> for CompareError {
-    fn from(e: ValueTypeError) -> Self {
-        Self::Value(e)
-    }
-}
-fn comparison_error(error: CompareError) -> Failure {
-    match error {
-        CompareError::Control(error) => Failure::Control(error),
-        CompareError::Value(error) => invalid(format!(
-            "read source has invalid value-type structure: {error}"
-        )),
-    }
-}
 fn compare_public(
+    relation: &IcebergRuntimeRelation,
+    column: &IcebergColumnHandle,
     expected: &Field,
     nullable: bool,
     ordinal: usize,
     public: &ConnectorReadPublicFacts,
+    declaration: Option<&NestedField>,
+    input_work: usize,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), Failure> {
-    let actual = public
+    let execution = public
+        .execution_schema()
+        .ok_or_else(|| invalid("read has no complete execution schema"))?;
+    let source = public
+        .source_schema_facts()
+        .ok_or_else(|| invalid("read has no separate source schema facts"))?;
+    let actual = execution
+        .binding(ordinal)
+        .ok_or_else(|| invalid("missing public read value binding"))?;
+    let shape = source
+        .shape()
         .schema()
         .fields()
         .get(ordinal)
-        .ok_or_else(|| invalid("missing public read column"))?;
-    if !equal_text(expected.name(), actual.name(), work)? || actual.is_nullable() != nullable {
+        .ok_or_else(|| invalid("missing public source occurrence"))?;
+    if !equal_text(expected.name(), shape.name(), work)?
+        || shape.is_nullable() != nullable
+        || actual.nullable() != nullable
+    {
         return Err(invalid(
-            "public read column name or NULL contract differs from source",
+            "public read source name or complete NULL contract differs",
         ));
     }
-    work.step()?;
-    let source_logical = novarocks_type_contract::field_logical_type(expected)
-        .map_err(|_| invalid("source field has invalid logical identity"))?;
-    let public_logical = public.logical_types()[ordinal];
-    let compatible_nominal = source_logical == public_logical
-        || matches!(
-            (source_logical, expected.data_type(), public_logical),
-            (
-                ValueLogicalType::Physical,
-                DataType::Binary,
-                ValueLogicalType::Hll | ValueLogicalType::Bitmap
-            ) | (
-                ValueLogicalType::Physical,
-                DataType::FixedSizeBinary(16),
-                ValueLogicalType::LargeInt
-            )
-        );
-    work.step()?;
-    if !compatible_nominal {
-        return Err(unsupported(
-            "public read nominal domain is not compatible with this frozen storage source",
-        ));
+    let value_declaration = opaque_source(work, || parse_type(column.type_json(), "type_json"))?;
+    typed_compare::value(
+        &value_declaration,
+        actual.value_type(),
+        actual.data_type(),
+        typed_compare::nominal(relation, column),
+        column.scalar_integer_domain(),
+        work,
+    )?;
+    if let Some(declaration) = declaration {
+        typed_compare::declared_shape(
+            &declaration.field_type,
+            shape.data_type(),
+            column.scalar_integer_domain(),
+            work,
+        )?;
+    } else {
+        typed_compare::shape(expected.data_type(), shape.data_type(), work)?;
     }
-    let a = opaque(work, || {
-        FunctionValueType::new(expected.data_type().clone(), nullable)
-    })?;
-    let b = opaque(work, || {
-        FunctionValueType::new(actual.data_type().clone(), actual.is_nullable())
-    })?;
-    let same = a
-        .same_value_domain_observed::<CompareError>(&b, || {
-            work.step().map_err(CompareError::Control)
-        })
-        .map_err(comparison_error)?;
-    if !same {
-        return Err(invalid(
-            "public read carrier or nested domain differs from frozen source",
-        ));
-    }
-    check_known_metadata(expected, actual, work)
-}
-fn check_known_metadata(
-    expected: &Field,
-    actual: &Field,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<(), Failure> {
-    if actual.metadata().contains_key(PARQUET_FIELD_ID_META_KEY) {
-        let a = opaque_source(work, || {
-            field_id_for_arrow_field(actual).map_err(crate::typed_read::column_handle::invalid)
-        })?;
-        let b = opaque_source(work, || {
-            field_id_for_arrow_field(expected).map_err(crate::typed_read::column_handle::invalid)
-        })?;
-        if a != b {
-            return Err(invalid("public read field ID metadata differs from source"));
-        }
-    }
-    work.step()?;
-    if let Some(value) = actual.metadata().get(ICEBERG_INITIAL_DEFAULT_META_KEY) {
-        let expected = expected
-            .metadata()
-            .get(ICEBERG_INITIAL_DEFAULT_META_KEY)
-            .ok_or_else(|| invalid("public read initial default is absent from source"))?;
-        // JSON spelling is not a semantic identity. Original serde conversion
-        // remains opaque under the already admitted metadata byte bound.
-        let same = opaque(work, || {
-            let a: Result<serde_json::Value, _> = serde_json::from_str(value);
-            let b: Result<serde_json::Value, _> = serde_json::from_str(expected);
-            matches!((a,b), (Ok(a), Ok(b)) if a == b)
-        })?;
-        if !same {
-            return Err(invalid("public read initial default differs from source"));
-        }
-    }
-    work.step()?;
-    match (expected.data_type(), actual.data_type()) {
-        (DataType::Struct(a), DataType::Struct(b)) => {
-            for (a, b) in a.iter().zip(b) {
-                check_known_metadata(a, b, work)?;
-            }
-        }
-        (DataType::List(a), DataType::List(b))
-        | (DataType::LargeList(a), DataType::LargeList(b))
-        | (DataType::FixedSizeList(a, _), DataType::FixedSizeList(b, _))
-        | (DataType::Map(a, _), DataType::Map(b, _)) => check_known_metadata(a, b, work)?,
-        _ => {}
-    }
-    Ok(())
+    let path =
+        [u32::try_from(ordinal).map_err(|_| invalid("source ordinal exceeds address space"))?];
+    typed_compare::source_facts(column, declaration, input_work, source, &path, work)
 }
 fn opaque<T>(
     work: &mut CompileCheckpoints<'_>,
@@ -707,6 +680,9 @@ fn unsupported(message: &'static str) -> Failure {
         message,
     ))
 }
+
+#[cfg(test)]
+pub(crate) mod test_ingress;
 
 #[cfg(test)]
 mod tests {
@@ -804,20 +780,90 @@ mod tests {
             vec![],
         )
         .unwrap();
-        ConnectorReadPublicFacts::try_new(
-            source,
-            None,
-            arrow::datatypes::Schema::new(fields),
-            logical,
+        typed_public(source, fields, logical, false)
+    }
+    fn typed_public(
+        source: ConnectorReadStaticFacts<novarocks_connector_contract::ScanColumnId>,
+        fields: Vec<FieldRef>,
+        logical: Vec<ValueLogicalType>,
+        system: bool,
+    ) -> ConnectorReadPublicFacts {
+        use novarocks_connector_contract::{
+            ConnectorReadExecutionSchema, ConnectorSourceSchemaFacts, ConnectorSourceSchemaShape,
+        };
+        use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+        let storage = ValueTypeStorageLifetime::pure();
+        let mut facts = Vec::new();
+        let source_fields = fields
+            .iter()
+            .enumerate()
+            .map(|(ordinal, field)| {
+                if system {
+                    test_ingress::system_source_field(field, &mut vec![ordinal as u32], &mut facts)
+                } else {
+                    test_ingress::source_field(field, &mut vec![ordinal as u32], &mut facts)
+                }
+            })
+            .collect::<Vec<_>>();
+        let source_schema = ConnectorSourceSchemaFacts::try_new(
+            ConnectorSourceSchemaShape::try_new(
+                Arc::new(arrow::datatypes::Schema::new(source_fields)),
+                storage.clone(),
+            )
+            .unwrap(),
+            std::collections::HashMap::new(),
+            facts.into_boxed_slice(),
+            storage.clone(),
         )
-        .unwrap()
+        .unwrap();
+        let bindings = fields
+            .iter()
+            .zip(logical)
+            .map(|(field, domain)| {
+                FunctionValueType::try_with_logical_type(
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                    domain,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let fields = fields
+            .iter()
+            .zip(&bindings)
+            .map(|(field, value)| {
+                Arc::new(Field::new(
+                    field.name(),
+                    value.data_type().clone(),
+                    value.nullable(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let execution = ConnectorReadExecutionSchema::try_new(
+            Arc::new(arrow::datatypes::Schema::new(fields)),
+            bindings.into_boxed_slice(),
+            storage.clone(),
+        )
+        .unwrap();
+        ConnectorReadPublicFacts::try_new_typed(source, None, execution, source_schema, storage)
+            .unwrap()
     }
     fn physical_public(fields: Vec<FieldRef>) -> ConnectorReadPublicFacts {
+        let logical = vec![ValueLogicalType::Physical; fields.len()];
+        public(fields, logical)
+    }
+    fn system_public(
+        kind: IcebergSystemTableType,
+        fields: Vec<FieldRef>,
+    ) -> ConnectorReadPublicFacts {
         let logical = fields
             .iter()
-            .map(|f| novarocks_type_contract::field_logical_type(f).unwrap())
+            .map(|field| {
+                crate::typed_read::system_page_source::system_column_domain(kind, field.name())
+            })
             .collect();
-        public(fields, logical)
+        let base = public(vec![], vec![]);
+        typed_public(base.source().clone(), fields, logical, true)
     }
     fn run(
         relation: &IcebergRuntimeRelation,
@@ -838,6 +884,43 @@ mod tests {
             Err(Failure::Provider(_))
         ));
     }
+    #[test]
+    fn formal_source_shape_keeps_its_anonymous_names_and_rejects_exact_null_or_offset_drift() {
+        let declaration = Type::List(crate::iceberg::spec::ListType::new(Arc::new(
+            NestedField::list_element(2, Type::Primitive(PrimitiveType::String), false),
+        )));
+        let Type::List(list) = &declaration else {
+            unreachable!()
+        };
+        let formal_name = &list.element_field.name;
+        for (actual, accepted) in [
+            (
+                DataType::List(Arc::new(Field::new(formal_name, DataType::Utf8, true))),
+                true,
+            ),
+            (
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                false,
+            ),
+            (
+                DataType::List(Arc::new(Field::new(formal_name, DataType::Utf8, false))),
+                false,
+            ),
+            (
+                DataType::LargeList(Arc::new(Field::new(formal_name, DataType::Utf8, true))),
+                false,
+            ),
+        ] {
+            let control = Control::default();
+            let mut work =
+                CompileCheckpoints::try_new(&control, CompilePhase::ProviderValidation).unwrap();
+            assert_eq!(
+                typed_compare::declared_shape(&declaration, &actual, None, &mut work).is_ok(),
+                accepted
+            );
+        }
+    }
+
     fn replace_column(
         column: &IcebergColumnHandle,
         identity: ColumnIdentity,
@@ -895,7 +978,12 @@ mod tests {
         .unwrap();
         assert_eq!(public, before);
         assert_eq!(
-            public.schema().fields()[0].metadata()["provider.opaque"],
+            public
+                .source_schema_facts()
+                .unwrap()
+                .field_fact(&[0])
+                .unwrap()
+                .attributes()["provider.opaque"],
             "not reconstructed"
         );
     }
@@ -1044,28 +1132,64 @@ mod tests {
             NestedField::required(5, "text", Type::Primitive(PrimitiveType::String)),
         ]);
         let arrow = annotated_read_schema(&schema).unwrap();
+        assert_eq!(
+            arrow.fields()[1]
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("arrow.parquet.variant")
+        );
+        assert!(
+            !arrow.fields()[1]
+                .metadata()
+                .contains_key("ARROW:extension:metadata"),
+            "the actual SDK field author preserves absent extension metadata"
+        );
         let columns = (1..=5)
             .map(|id| IcebergColumnHandle::base_column_of(&schema, id).unwrap())
             .collect::<Vec<_>>();
         let relation = IcebergRuntimeRelation::Table(table(&schema, BTreeMap::new()));
-        let original = physical_public(arrow.fields().iter().cloned().collect());
+        let original = public(
+            arrow.fields().iter().cloned().collect(),
+            vec![
+                ValueLogicalType::Uuid,
+                ValueLogicalType::Variant,
+                ValueLogicalType::Physical,
+                ValueLogicalType::Physical,
+                ValueLogicalType::Physical,
+            ],
+        );
         assert_eq!(original.logical_types()[0], ValueLogicalType::Uuid);
         assert_eq!(original.logical_types()[1], ValueLogicalType::Variant);
         assert_eq!(original.logical_types()[2], ValueLogicalType::Physical);
         run(&relation, &columns, &original, &Control::default()).unwrap();
+        // Same physical shape and complete value declaration cannot repair a
+        // changed known source attribute. Empty is not the SDK's absent key.
+        let mut variant_attrs = arrow.fields()[1].metadata().clone();
+        variant_attrs.insert("ARROW:extension:metadata".into(), String::new());
+        let mut wrong_source = arrow.fields().iter().cloned().collect::<Vec<_>>();
+        wrong_source[1] = Arc::new(
+            arrow.fields()[1]
+                .as_ref()
+                .clone()
+                .with_metadata(variant_attrs),
+        );
+        rejected(
+            &relation,
+            &columns,
+            &public(wrong_source, original.logical_types().to_vec()),
+        );
         let mut logical = original.logical_types().to_vec();
         logical[2] = ValueLogicalType::LargeInt;
         logical[3] = ValueLogicalType::Hll;
         let authored = public(arrow.fields().iter().cloned().collect(), logical.clone());
-        run(&relation, &columns, &authored, &Control::default()).unwrap();
+        rejected(&relation, &columns, &authored);
         logical[3] = ValueLogicalType::Bitmap;
-        run(
+        rejected(
             &relation,
             &columns,
             &public(arrow.fields().iter().cloned().collect(), logical),
-            &Control::default(),
-        )
-        .unwrap();
+        );
         // Erasing the SDK's actual UUID label to Physical cannot pass merely
         // because both values occupy exactly sixteen bytes.
         let uuid_without_label = Arc::new(
@@ -1197,7 +1321,7 @@ mod tests {
             metadata.insert("provider.dynamic".into(), "frozen".into());
             first = first.with_metadata(metadata);
             output[0] = Arc::new(first);
-            let public = physical_public(output);
+            let public = system_public(kind, output);
             let before = public.clone();
             run(&relation, &selected, &public, &Control::default()).unwrap();
             assert_eq!(public, before);
@@ -1207,7 +1331,7 @@ mod tests {
                     arrow::datatypes::TimeUnit::Microsecond,
                     None,
                 )));
-                rejected(&relation, &columns, &physical_public(bad));
+                rejected(&relation, &columns, &system_public(kind, bad));
                 let mut bad = fields.fields().to_vec();
                 let DataType::Map(entries, sorted) = bad[5].data_type() else {
                     panic!("real summary map")
@@ -1228,23 +1352,38 @@ mod tests {
                     ),
                     *sorted,
                 );
-                bad[5] = Arc::new(bad[5].as_ref().clone().with_data_type(bad_type));
-                rejected(&relation, &columns, &physical_public(bad));
+                assert!(
+                    novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                        bad_type,
+                        bad[5].is_nullable(),
+                        ValueLogicalType::Physical
+                    )
+                    .is_err(),
+                    "invalid Map key NULL is refused at the checked author boundary"
+                );
             } else {
                 let at = fields
                     .fields()
                     .iter()
                     .position(|field| field.name() == "readable_metrics")
                     .unwrap();
-                assert_eq!(
-                    novarocks_type_contract::field_logical_type(&fields.fields()[at]).unwrap(),
-                    ValueLogicalType::Json
+                let fields = fields.fields().to_vec();
+                let mut logical = fields
+                    .iter()
+                    .map(|field| {
+                        crate::typed_read::system_page_source::system_column_domain(
+                            kind,
+                            field.name(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(logical[at], ValueLogicalType::Json);
+                logical[at] = ValueLogicalType::Physical;
+                rejected(
+                    &relation,
+                    &columns,
+                    &typed_public(public.source().clone(), fields, logical, true),
                 );
-                let mut bad = fields.fields().to_vec();
-                let mut metadata = bad[at].metadata().clone();
-                metadata.remove(novarocks_type_contract::NR_LOGICAL_TYPE_KEY);
-                bad[at] = Arc::new(bad[at].as_ref().clone().with_metadata(metadata));
-                rejected(&relation, &columns, &physical_public(bad));
             }
         }
     }
@@ -1280,15 +1419,18 @@ mod tests {
             })
             .unwrap(),
         );
-        let public = physical_public(vec![Arc::clone(&fields.fields()[at])]);
+        let public = system_public(kind, vec![Arc::clone(&fields.fields()[at])]);
         let original = columns[at].clone();
         let columns = std::slice::from_ref(&columns[at]);
         // Mutating both private/public top NULL must still refuse the original
         // dynamic source author's nullable ROW declaration.
         let bad_column = replace_column(&original, original.base_column_identity().clone(), false);
-        let bad_public = physical_public(vec![Arc::new(
-            fields.fields()[at].as_ref().clone().with_nullable(false),
-        )]);
+        let bad_public = system_public(
+            kind,
+            vec![Arc::new(
+                fields.fields()[at].as_ref().clone().with_nullable(false),
+            )],
+        );
         rejected(&relation, &[bad_column], &bad_public);
         let baseline = Control::default();
         run(&relation, columns, &public, &baseline).unwrap();
@@ -1372,7 +1514,16 @@ mod tests {
         let op = change_op_column_handle().unwrap();
         let public = physical_public(vec![
             Arc::clone(&annotated_read_schema(&schema).unwrap().fields()[0]),
-            Arc::new(Field::new("__change_op", DataType::Int32, false)),
+            Arc::new(
+                Field::new("__change_op", DataType::Int32, false).with_metadata(
+                    [(
+                        PARQUET_FIELD_ID_META_KEY.into(),
+                        ICEBERG_CHANGE_OP_FIELD_ID.to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            ),
         ]);
         run(
             &relation,

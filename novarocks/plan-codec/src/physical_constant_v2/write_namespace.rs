@@ -357,6 +357,12 @@ fn prepare_core<'pool, 'table, 'control>(
                 table.value_types.capacity(),
             )?,
         )?;
+        source_floor = add(
+            source_floor,
+            array_bytes::<novarocks_proto_models::value_type::LogicalTypeDefinition>(
+                table.logical_types.capacity(),
+            )?,
+        )?;
         cap(
             source_floor,
             source_retained_bytes,
@@ -404,12 +410,12 @@ fn prepare_core<'pool, 'table, 'control>(
                 None
             };
             let field = if let Some(parent) = &mut admit {
-                types.field_captured(
+                types.source_field_captured(
                     binding.field_id,
                     &mut |field, work| {
                         // Invalid semantic flags still belong to the original author.
-                        if ty.nullable == pool.value_type().nullable
-                            && ty.logical_type == pool.value_type().logical_type
+                        if ty.nullable() == pool.value_type().nullable()
+                            && ty.logical_type() == pool.value_type().logical_type()
                         {
                             captured_binding = Some(preflight_constant_binding_resources_in(
                                 pool,
@@ -441,11 +447,11 @@ fn prepare_core<'pool, 'table, 'control>(
                     work,
                 )?
             } else {
-                types.field_observed(binding.field_id, work)?
+                types.source_field_observed(binding.field_id, work)?
             }
             .ok_or_else(|| shape("constant namespace writer references an unknown source Field"))?;
-            let flags_match = ty.nullable == pool.value_type().nullable
-                && ty.logical_type == pool.value_type().logical_type;
+            let flags_match = ty.nullable() == pool.value_type().nullable()
+                && ty.logical_type() == pool.value_type().logical_type();
             work.step()?;
             if !flags_match {
                 return Err(shape(
@@ -481,8 +487,8 @@ fn prepare_core<'pool, 'table, 'control>(
             check(&facts, limits, work)?;
             work.flush()?;
             let types_match = arrow_data_types_exact_borrowed_observed(
-                &pool.value_type().data_type,
-                &ty.data_type,
+                &pool.value_type().data_type(),
+                &ty.data_type(),
                 || work.step().map_err(Error::from),
             )?;
             work.step()?;

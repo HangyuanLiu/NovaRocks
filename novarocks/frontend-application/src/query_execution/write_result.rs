@@ -818,9 +818,11 @@ mod tests {
         use novarocks_native_adapter::root_write_commit_codec::{
             WriteCommitEncoder, WriteCommitTotals,
         };
-        let mut encoder =
-            WriteCommitEncoder::try_new(chunk(rows).batch.clone(), WriteCommitTotals::default())
-                .expect("fixed relation");
+        let mut encoder = WriteCommitEncoder::try_new(
+            chunk(rows).record_batch().clone(),
+            WriteCommitTotals::default(),
+        )
+        .expect("fixed relation");
         let mut stream = Vec::new();
         let mut output = vec![0_u8; 7];
         loop {

@@ -124,7 +124,9 @@ fn function(kind: FunctionKind) -> BoundFunction {
         function_id: FunctionId::try_new("test.expression/signature").unwrap(),
         overload: FunctionOverloadId::try_new("test.expression/signature/exact").unwrap(),
         kind,
-        argument_types: Box::from([FunctionArgumentType::Value(int())]),
+        argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::from(
+            [FunctionArgumentType::Value(int())],
+        )),
         result_type: int(),
 
         legacy_metadata: Some(novarocks_physical_plan::LegacyBindingMetadata {
@@ -194,7 +196,7 @@ impl Fixture {
             .iter()
             .map(|n| Input {
                 id: n.id.get(),
-                type_id: if n.ty.data_type == DataType::Boolean {
+                type_id: if n.ty.data_type() == &DataType::Boolean {
                     u32::MAX
                 } else {
                     0
@@ -830,9 +832,10 @@ fn namespace_full_type_and_original_binding_tokens_refuse_substitution() {
     let mut f = all_kinds();
     f.replace(7, |n| {
         if let ExprKind::FunctionCall { function, .. } = &mut n.kind {
-            function.argument_types = Box::from([FunctionArgumentType::Value(
-                FunctionValueType::new(DataType::Int64, false),
-            )]);
+            function.argument_types =
+                novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::from([
+                    FunctionArgumentType::Value(FunctionValueType::new(DataType::Int64, false)),
+                ]));
         }
     });
     rejected(&f);
@@ -853,11 +856,12 @@ fn namespace_full_type_and_original_binding_tokens_refuse_substitution() {
     rejected(&f);
     for (left, right) in [
         (
-            FunctionValueType {
-                data_type: DataType::Utf8,
-                nullable: true,
-                logical_type: ValueLogicalType::Json,
-            },
+            FunctionValueType::try_from_legacy_declared_projection(
+                DataType::Utf8,
+                true,
+                ValueLogicalType::Json,
+            )
+            .expect("valid temporary legacy value projection"),
             FunctionValueType::new(DataType::Utf8, true),
         ),
         (
@@ -874,7 +878,7 @@ fn namespace_full_type_and_original_binding_tokens_refuse_substitution() {
             FunctionValueType::new(
                 DataType::Struct(
                     vec![Arc::new(
-                        Field::new("a", DataType::Int64, true)
+                        Field::new("a", DataType::Int64, false)
                             .with_metadata(HashMap::from([("origin".into(), "right".into())])),
                     )]
                     .into(),

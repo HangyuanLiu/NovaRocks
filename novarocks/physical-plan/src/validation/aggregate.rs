@@ -205,17 +205,18 @@ fn state_value_types_match(
     ignore_root_nullability: bool,
     charge: &mut impl FnMut(usize) -> Result<(), StateSignatureComparisonError>,
 ) -> Result<bool, StateSignatureComparisonError> {
-    charge(1)?;
-    if left.logical_type != right.logical_type
-        || (!ignore_root_nullability && left.nullable != right.nullable)
-    {
-        return Ok(false);
+    if ignore_root_nullability {
+        if !left.same_value_domain_observed(right, || charge(1))? {
+            return Ok(false);
+        }
+        novarocks_type_contract::arrow_data_types_exact_observed::<StateSignatureComparisonError>(
+            left.data_type(),
+            right.data_type(),
+            || charge(1),
+        )
+    } else {
+        left.exactly_equals_observed(right, || charge(1))
     }
-    novarocks_type_contract::arrow_data_types_exact_observed::<StateSignatureComparisonError>(
-        &left.data_type,
-        &right.data_type,
-        || charge(1),
-    )
 }
 
 fn aggregate_bindings_match_with(

@@ -454,7 +454,8 @@ fn exact_overload_wide_invalid_result_observes_real_type_walk_without_new_lower_
             )
         })
         .collect::<Vec<_>>();
-    let expected = FunctionValueType::new(DataType::Struct(fields.into()), true);
+    let expected =
+        FunctionValueType::from_legacy_declared_projection(DataType::Struct(fields.into()), true);
     let args = [value(true)];
     let request = FunctionBindingRequest {
         expected_result_type: Some(&expected),

@@ -101,7 +101,7 @@ fn types(control: &Control) -> DecodedTypeTable {
         (0, FunctionValueType::new(DataType::Int64, false)),
         (
             u32::MAX,
-            FunctionValueType::new(DataType::Struct(vec![field].into()), true),
+            FunctionValueType::new(DataType::Struct(vec![field.clone()].into()), true),
         ),
         (
             8,
@@ -120,6 +120,7 @@ fn types(control: &Control) -> DecodedTypeTable {
             .unwrap(),
         ),
     ];
+    assert_eq!(field.metadata()["original"], "metadata");
     let limits = TypeProjectionLimits {
         max_definitions: 4096,
         max_expanded_nodes: 16384,
@@ -168,13 +169,14 @@ fn raw_aggregate(id: u32, phase: wire::aggregate_phase::Kind) -> wire::Aggregate
         logical_argument_count: 2,
         intermediate_value_type_id: Some(8),
         state_format: "test/aggregate/state-v1".into(),
-        state_argument_contract: wire::AggregateStateArgumentContract::ExactSignature as i32,
+        state_argument_contract:
+            novarocks_proto_models::common::AggregateStateArgumentContract::ExactSignature as i32,
     }
 }
 fn four_phases() -> Vec<wire::AggregateBindingDefinition> {
     let mut independent = raw_aggregate(0, wire::aggregate_phase::Kind::PartialSequenceId(0));
     independent.state_argument_contract =
-        wire::AggregateStateArgumentContract::ValueRootNullabilityIndependent as i32;
+        novarocks_proto_models::common::AggregateStateArgumentContract::ValueRootNullabilityIndependent as i32;
     independent.logical_argument_count = 0;
     vec![
         raw_aggregate(
@@ -301,11 +303,8 @@ fn aggregate_materialization_all_four_phases_preserve_sparse_order_and_seven_fie
                     AggregateStateArgumentContract::ExactSignature
                 }
             );
-            assert_eq!(
-                binding.intermediate_type.data_type,
-                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
-            );
-            assert!(binding.intermediate_type.nullable);
+            assert_eq!(binding.intermediate_type.data_type(), &DataType::Utf8);
+            assert!(binding.intermediate_type.nullable());
             assert_eq!(binding.function.kind, FunctionKind::Aggregate);
             assert_eq!(binding.function.function_id.as_str(), "test/aggregate");
             assert_eq!(
@@ -318,7 +317,7 @@ fn aggregate_materialization_all_four_phases_preserve_sparse_order_and_seven_fie
             );
             assert!(binding.function.legacy_metadata.is_none());
             assert!(
-                matches!(&binding.function.argument_types[0],FunctionArgumentType::Value(t) if t.data_type == DataType::Dictionary(Box::new(DataType::Int8),Box::new(DataType::Utf8)) && t.nullable)
+                matches!(&binding.function.argument_types[0],FunctionArgumentType::Value(t) if t.data_type() == &DataType::Utf8 && t.nullable())
             );
         }
         let owned = output.into_definitions();
@@ -367,10 +366,10 @@ fn aggregate_materialization_full_lambda_nominal_metadata_and_dictionary_owned_c
             parameter_types[0],
             FunctionValueType::new(DataType::Int64, false)
         );
-        assert_eq!(result_type.logical_type, ValueLogicalType::LargeInt);
-        assert_eq!(result_type.data_type, DataType::FixedSizeBinary(16));
-        assert!(!result_type.nullable);
-        let DataType::Struct(fields) = &parameter_types[1].data_type else {
+        assert_eq!(result_type.logical_type(), ValueLogicalType::LargeInt);
+        assert_eq!(result_type.data_type(), &DataType::FixedSizeBinary(16));
+        assert!(!result_type.nullable());
+        let DataType::Struct(fields) = &parameter_types[1].data_type() else {
             panic!("Struct")
         };
         let DataType::Struct(original) = &headers
@@ -378,31 +377,27 @@ fn aggregate_materialization_full_lambda_nominal_metadata_and_dictionary_owned_c
             .type_table()
             .value_type(u32::MAX)
             .unwrap()
-            .data_type
+            .data_type()
         else {
             panic!("original Struct")
         };
         assert!(Arc::ptr_eq(&fields[0], &original[0]));
         assert_eq!(fields[0].name(), "authored-name");
         assert!(fields[0].is_nullable());
-        assert_eq!(
-            fields[0].metadata().get("original").map(String::as_str),
-            Some("metadata")
+        assert_eq!(fields[0].metadata().capacity(), 0);
+        let original = headers.functions().type_table().value_type(8).unwrap();
+        assert_eq!(binding.intermediate_type, *original);
+        assert_eq!(binding.intermediate_type.data_type(), &DataType::Utf8);
+        assert!(
+            binding
+                .intermediate_type
+                .value_type()
+                .shares_storage(original.value_type())
         );
-        let DataType::Dictionary(a, b) = &binding.intermediate_type.data_type else {
-            panic!("Dictionary")
-        };
-        let DataType::Dictionary(c, d) = &headers
-            .functions()
-            .type_table()
-            .value_type(8)
-            .unwrap()
-            .data_type
-        else {
-            panic!("source Dictionary")
-        };
-        assert!(!std::ptr::eq(a.as_ref(), c.as_ref()));
-        assert!(!std::ptr::eq(b.as_ref(), d.as_ref()));
+        assert!(std::ptr::eq(
+            binding.intermediate_type.data_type(),
+            original.data_type()
+        ));
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
         assert!(std::ptr::eq(
             output.definition_observed(0, &mut work).unwrap().unwrap(),
@@ -439,32 +434,68 @@ fn aggregate_materialization_requests_have_independent_layout_and_retained_oracl
             prepare_aggregate_bindings_materialization(headers, functions, SOURCE, limits())
                 .unwrap();
         let facts = *prepared.facts();
-        let layout = |n| Layout::array::<DataType>(n).unwrap().size();
         let retained = Layout::array::<(u32, AggregateBinding)>(1).unwrap().size()
-            + Layout::array::<FunctionArgumentType>(2).unwrap().size()
-            + Layout::array::<FunctionValueType>(2).unwrap().size()
-            + "test/aggregate".len()
-            + "test/aggregate/overload".len()
-            + "test/aggregate/state-v1".len()
-            + 4 * layout(1);
+            + "test/aggregate/state-v1".len();
+        // Only the outer Vec/Box and newly decoded state text/identity owner
+        // are constructed. The exact function/type signature is shared.
         let requested = 2 * Layout::array::<(u32, AggregateBinding)>(1).unwrap().size()
-            + 2 * Layout::array::<FunctionArgumentType>(2).unwrap().size()
-            + 2 * Layout::array::<FunctionValueType>(2).unwrap().size()
-            + "test/aggregate".len()
-            + "test/aggregate/overload".len()
             + "test/aggregate/state-v1".len()
-            + 4 * layout(1);
-        // Outer2 + arguments2 + Lambda parameters2 + identities2 + state1
-        // + Dictionary argument2 + Dictionary intermediate2 = 13 requests.
+            + novarocks_type_contract::AggregateStateFormatId::storage_allocation_layout()
+                .unwrap()
+                .size();
         assert_eq!(facts.definition_count, 1);
         assert_eq!(facts.type_reference_count, 6);
-        assert_eq!(facts.allocation_requests_upper_bound, 13);
+        assert_eq!(facts.allocation_requests_upper_bound, 4);
         assert_eq!(facts.request_bytes_upper_bound, requested);
         assert_eq!(
             facts.coexisting_source_and_request_bytes_upper_bound,
             SOURCE + requested
         );
-        let output = materialize_aggregate_bindings(prepared).unwrap();
+        // This explicit pure test author observes the real construction body;
+        // it neither grants BE memory nor synthesizes source provenance.
+        let mut layouts = Vec::new();
+        let mut request = |layout| {
+            layouts.push(layout);
+            Ok::<(), std::convert::Infallible>(())
+        };
+        let mut opaque = |_| -> Result<(), std::convert::Infallible> {
+            panic!("this author uses only actual known layouts")
+        };
+        let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut opaque,
+        );
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+        let output =
+            materialize_aggregate_bindings_with_creator_in(prepared, &mut creation, &mut work)
+                .unwrap();
+        work.finish().unwrap();
+        drop(creation);
+        assert_eq!(
+            layouts,
+            [
+                Layout::array::<(u32, AggregateBinding)>(1).unwrap(),
+                Layout::array::<u8>("test/aggregate/state-v1".len()).unwrap(),
+                novarocks_type_contract::AggregateStateFormatId::storage_allocation_layout()
+                    .unwrap(),
+            ]
+        );
+        // Vec-to-Box shrink may request the same outer layout once more. The
+        // original four-request upper covers it, without billing shared types.
+        assert_eq!(
+            requested,
+            layouts.iter().map(Layout::size).sum::<usize>()
+                + Layout::array::<(u32, AggregateBinding)>(1).unwrap().size()
+        );
+        let original_function = match &functions.definitions()[0].1 {
+            crate::physical_binding_v2::MaterializedFunctionBinding::Scalar(value) => value,
+            _ => panic!("aggregate scalar signature"),
+        };
+        assert!(std::ptr::eq(
+            output.definitions()[0].1.function.argument_types.as_ptr(),
+            original_function.argument_types.as_ptr()
+        ));
         assert_eq!(
             output.retained_output_floor().unwrap(),
             size_of::<MaterializedAggregateBindings<'_, '_, '_>>() + retained
@@ -657,4 +688,55 @@ fn aggregate_materialization_wide_actual_320_arguments_and_consumed_emit_prefixe
 
 mod owner_tests {
     include!("owner_tests.rs");
+}
+
+#[test]
+fn logical_aggregate_types_keep_actual_source_encoding_and_attrs_separate() {
+    use novarocks_type_contract::{
+        ValueKind, ValueLayout, ValueTypeError, ValueTypeRef, ValueTypeStorageLifetime,
+        value_layout_matches_carrier_observed,
+    };
+    let carrier = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+    let source = Arc::new(
+        Field::new("source-column", carrier.clone(), true).with_metadata(HashMap::from([
+            ("nr_logical_type".to_owned(), "json".to_owned()),
+            ("provider.opaque".to_owned(), "original".to_owned()),
+        ])),
+    );
+    let pure = ValueTypeStorageLifetime::pure();
+    // This explicit String author does not interpret either opaque source key.
+    let logical = FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(ValueKind::String, true, pure.clone()).unwrap(),
+        ValueLayout::try_new(source.data_type(), pure).unwrap(),
+    )
+    .unwrap();
+    let limits = TypeProjectionLimits {
+        max_definitions: 32,
+        max_expanded_nodes: 128,
+        max_string_bytes: 4096,
+    };
+    let control = Control::default();
+    let wire = encode_type_table(&[(7, logical.clone())], limits, &control).unwrap();
+    let decoded = decode_type_table(&wire, limits, &control).unwrap();
+    let actual = decoded.value_type(7).unwrap();
+    assert_eq!(actual, &logical);
+    assert_eq!(actual.data_type(), &DataType::Utf8);
+    assert_eq!(actual.logical_type(), ValueLogicalType::Physical);
+    assert_eq!(source.data_type(), &carrier);
+    assert_eq!(source.metadata()["nr_logical_type"], "json");
+    assert_eq!(source.metadata()["provider.opaque"], "original");
+    let matches = |carrier: &DataType| {
+        value_layout_matches_carrier_observed(actual.typed_binding().layout(), carrier, |_| {
+            Ok::<(), ValueTypeError>(())
+        })
+        .unwrap()
+    };
+    assert!(matches(source.data_type()));
+    assert!(!matches(&DataType::Dictionary(
+        Box::new(DataType::Int8),
+        Box::new(DataType::LargeUtf8)
+    )));
+    // Logical String agrees, but offset width is a real physical binding fact.
+    assert!(actual.same_semantics(&FunctionValueType::new(DataType::LargeUtf8, true)));
+    assert_ne!(actual, &FunctionValueType::new(DataType::LargeUtf8, true));
 }

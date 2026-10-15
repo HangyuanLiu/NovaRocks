@@ -106,12 +106,25 @@ impl OutputContract {
         }
         match port {
             Some(result) if !result.fields.is_empty() => {
-                if result
-                    .fields
-                    .iter()
-                    .any(|field| !field.domain.matches_storage(&field.ty.data_type))
-                {
-                    return Err("completed result domain differs from its physical carrier".into());
+                use novarocks_physical_plan::ResultValueDomain as D;
+                use novarocks_type_contract::ValueLogicalType as L;
+                for field in &result.fields {
+                    let complete = field.ty.logical_type();
+                    let agrees = match field.domain {
+                        D::Plain => matches!(complete, L::Physical | L::LargeInt | L::Uuid),
+                        D::Json => complete == L::Json,
+                        D::Variant => complete == L::Variant,
+                        D::Hll => complete == L::Hll,
+                        D::Bitmap => complete == L::Bitmap,
+                        D::Object => complete == L::Object,
+                        D::Percentile => complete == L::Percentile,
+                    };
+                    if !agrees {
+                        return Err(
+                            "completed result domain differs from its complete value binding"
+                                .into(),
+                        );
+                    }
                 }
                 Ok(Self::Rows(
                     result
@@ -120,29 +133,7 @@ impl OutputContract {
                         .map(|field| {
                             crate::api::ResultField::new(
                                 field.alias.as_deref().unwrap_or(&field.name).to_string(),
-                                field.ty.data_type.clone(),
-                                field.ty.nullable,
-                                match field.domain {
-                                    novarocks_physical_plan::ResultValueDomain::Plain => None,
-                                    novarocks_physical_plan::ResultValueDomain::Json => {
-                                        Some(novarocks_types::schema::SqlType::Json)
-                                    }
-                                    novarocks_physical_plan::ResultValueDomain::Variant => {
-                                        Some(novarocks_types::schema::SqlType::Variant)
-                                    }
-                                    novarocks_physical_plan::ResultValueDomain::Hll => {
-                                        Some(novarocks_types::schema::SqlType::Hll)
-                                    }
-                                    novarocks_physical_plan::ResultValueDomain::Bitmap => {
-                                        Some(novarocks_types::schema::SqlType::Bitmap)
-                                    }
-                                    novarocks_physical_plan::ResultValueDomain::Object => {
-                                        Some(novarocks_types::schema::SqlType::Object)
-                                    }
-                                    novarocks_physical_plan::ResultValueDomain::Percentile => {
-                                        Some(novarocks_types::schema::SqlType::Percentile)
-                                    }
-                                },
+                                field.ty.clone(),
                             )
                         })
                         .collect(),
@@ -561,20 +552,33 @@ mod tests {
 
     #[tokio::test]
     async fn m07_completed_output_preserves_exact_producer_domains() {
-        use novarocks_types::schema::SqlType as T;
+        use novarocks_type_contract::ValueLogicalType as T;
         for (sql, domain) in [
-            ("select json_object('k', 1) as value", Some(T::Json)),
-            ("select to_bitmap(1) as value", Some(T::Bitmap)),
-            ("select hll_hash(cast(1 as bigint)) as value", Some(T::Hll)),
+            ("select json_object('k', 1) as value", T::Json),
+            ("select to_bitmap(1) as value", T::Bitmap),
+            ("select hll_hash(cast(1 as bigint)) as value", T::Hll),
             (
                 "select percentile_hash(cast(1 as double)) as value",
-                Some(T::Percentile),
+                T::Percentile,
             ),
-            ("select bitmap_to_binary(to_bitmap(1)) as value", None),
-            ("select cast(json_object('k', 1) as varchar) as value", None),
+            (
+                "select bitmap_to_binary(to_bitmap(1)) as value",
+                T::Physical,
+            ),
+            (
+                "select cast(json_object('k', 1) as varchar) as value",
+                T::Physical,
+            ),
         ] {
             let completed =
                 crate::completed_plan_fixture::completed_literal_query([41; 16], sql).await;
+            let port = completed.candidate().plan().result_port().unwrap();
+            assert_eq!(
+                port.fields[0].ty.logical_type(),
+                domain,
+                "{sql}: {:?}",
+                port.fields[0]
+            );
             let output = OutputContract::from_completed_plan(
                 QueryExecutionKind::Read,
                 completed.candidate().plan(),
@@ -582,8 +586,36 @@ mod tests {
             .unwrap();
             assert_eq!(output.fields().len(), 1, "{sql}");
             assert_eq!(output.fields()[0].name(), "value", "{sql}");
-            assert_eq!(output.fields()[0].logical_type(), domain.as_ref(), "{sql}");
+            assert_eq!(output.fields()[0].logical_type(), domain, "{sql}");
         }
+    }
+
+    #[tokio::test]
+    async fn completed_output_preserves_nested_semantics_in_independent_schema() {
+        use novarocks_type_contract::{ValueKind, ValueLogicalType as L};
+        let completed = crate::completed_plan_fixture::completed_literal_query(
+            [42; 16],
+            "select [parse_json('{}')] as nested",
+        )
+        .await;
+        let output = OutputContract::from_completed_plan(
+            QueryExecutionKind::Read,
+            completed.candidate().plan(),
+        )
+        .unwrap();
+        let producer = &completed
+            .candidate()
+            .original_public_result_port()
+            .unwrap()
+            .fields[0]
+            .ty;
+        assert_eq!(output.fields()[0].value_type(), producer);
+        drop(completed);
+        let ValueKind::List(item) = output.fields()[0].value_type().value_type().kind() else {
+            panic!("completed list declaration lost");
+        };
+        assert_eq!(item.kind(), &ValueKind::Nominal(L::Json));
+        assert_eq!(output.fields()[0].name(), "nested");
     }
 
     #[tokio::test]

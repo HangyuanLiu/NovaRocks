@@ -599,7 +599,7 @@ impl StatisticsRootResultDecoder {
         if self.root_eof {
             return Err("statistics Root emitted a trailing batch after EOF".into());
         }
-        let batch = &chunk.batch;
+        let batch = &chunk.record_batch();
         let schema = batch.schema();
         // The Root relation is these four columns in this order. Only the
         // body's nullability is left to the plan: it is whatever the
@@ -1030,7 +1030,7 @@ mod tests {
             StatisticsArtifactEncoder, StatisticsCodecStatus, StatisticsCodecTotals,
         };
         let mut encoder = StatisticsArtifactEncoder::try_new(
-            chunk.batch.clone(),
+            chunk.record_batch().clone(),
             StatisticsCodecTotals::default(),
         )
         .expect("statistics relation");

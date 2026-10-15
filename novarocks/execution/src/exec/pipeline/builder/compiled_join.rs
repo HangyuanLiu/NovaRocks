@@ -92,7 +92,7 @@ fn compiled_join_producers(
                     id.index()
                 )
             })?;
-            Ok(root_value_type(program, site)?.data_type)
+            Ok(root_value_type(program, site)?.data_type().clone())
         },
         session,
         COMPILED_JOIN_BUILD_PARTITIONS,

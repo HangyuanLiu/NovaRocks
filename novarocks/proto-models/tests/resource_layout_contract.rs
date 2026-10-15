@@ -22,7 +22,7 @@ use std::{
 
 use bytes::Bytes;
 use novarocks_proto_models::{
-    FILE_DESCRIPTOR_SET, generated_resource_layouts, novarocks, plan,
+    FILE_DESCRIPTOR_SET, common, generated_resource_layouts, novarocks, plan,
     resource_layout::{
         Cardinality, FieldLayout, GeneratedResourceLayout, ObjectKind, ObjectLayout, RustLayout,
         Storage, WireField, WireKind,
@@ -345,6 +345,18 @@ fn actual_field<T>(layout: &RustLayout, value: &T) {
 
 #[test]
 fn target_layouts_follow_real_hash_maps_bytes_and_automatic_recursive_boxing() {
+    let reference = common::TypeDesc {
+        value_binding_id: Some(0),
+    };
+    let object = actual_object(&reference);
+    assert_eq!(object.fields.len(), 1);
+    let binding = field_named(object, "value_binding_id");
+    actual_field(&binding.rust, &reference.value_binding_id);
+    let Storage::Option(value) = binding.rust.storage else {
+        panic!("binding reference must preserve presence");
+    };
+    dimensions::<u32>(value);
+
     let stats = plan::IcebergColumnStatsMap::default();
     let _: &HashMap<String, plan::IcebergColumnStats> = &stats.entries;
     let stats_field = field_named(actual_object(&stats), "entries");
@@ -381,6 +393,17 @@ fn target_layouts_follow_real_hash_maps_bytes_and_automatic_recursive_boxing() {
     actual_field(&field.rust, &result.result_arrow_ipc);
 
     let field = plan::ArrowPhysicalField::default();
+    let field_layout = actual_object(&field);
+    assert!(
+        !field_layout
+            .fields
+            .iter()
+            .flat_map(|field| field.wire)
+            .any(|wire| matches!(wire.number, 4..=6))
+    );
+    let logical = field_named(field_layout, "logical_type_id");
+    actual_field(&logical.rust, &field.logical_type_id);
+
     let _: &Option<Box<plan::ArrowPhysicalType>> = &field.r#type;
     let recursive = field_named(actual_object(&field), "type");
     actual_field(&recursive.rust, &field.r#type);

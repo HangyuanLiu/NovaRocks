@@ -211,7 +211,7 @@ impl ColumnRefFactory {
         }
         use novarocks_type_contract::ValueLogicalType;
         use novarocks_types::schema::SqlType;
-        match self.value_type(id)?.logical_type {
+        match self.value_type(id)?.logical_type() {
             ValueLogicalType::Json => Some(SqlType::Json),
             ValueLogicalType::Hll => Some(SqlType::Hll),
             ValueLogicalType::Bitmap => Some(SqlType::Bitmap),
@@ -231,13 +231,20 @@ impl ColumnRefFactory {
     ) -> Result<(), &'static str> {
         let original = self.get(source);
         let replacement = self.get(target);
-        if original.value_type.data_type != replacement.value_type.data_type {
+        if original.value_type.data_type() != replacement.value_type.data_type() {
             return Err("same-value column rewrite changed its declared carrier");
         }
-        if original.value_type.logical_type != replacement.value_type.logical_type {
-            return Err("same-value column rewrite changed its declared logical type");
+        if !original
+            .value_type
+            .same_physical_binding_ignoring_root_nullability_observed(
+                &replacement.value_type,
+                || Ok::<(), std::convert::Infallible>(()),
+            )
+            .expect("infallible checked type comparison")
+        {
+            return Err("same-value column rewrite changed its complete declared type");
         }
-        if original.value_type.nullable && !replacement.value_type.nullable {
+        if original.value_type.nullable() && !replacement.value_type.nullable() {
             return Err("same-value column rewrite narrowed its declared nullability");
         }
         if replacement.logical_type.is_some() && replacement.logical_type != original.logical_type {
@@ -331,5 +338,18 @@ mod tests {
         );
         assert_eq!(next, ColumnId(5));
         assert_eq!(factory.column_name(next), "b");
+    }
+    #[test]
+    fn same_value_provenance_preserves_nested_domains_and_root_nullability_rules() {
+        let mut factory = ColumnRefFactory::new();
+        let json = crate::test_value_types::string_structure(&[("payload", true, true)], false);
+        let text = crate::test_value_types::string_structure(&[("payload", true, false)], false);
+        assert_eq!(json.data_type(), text.data_type());
+        let source = factory.create(None, "source".into(), json.clone());
+        let widened = factory.create(None, "widened".into(), json.with_nullable(true).unwrap());
+        let changed = factory.create(None, "changed".into(), text);
+        assert!(factory.transfer_value_provenance(source, widened).is_ok());
+        assert!(factory.transfer_value_provenance(source, changed).is_err());
+        assert!(factory.transfer_value_provenance(widened, source).is_err());
     }
 }

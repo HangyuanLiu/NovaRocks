@@ -213,8 +213,9 @@ pub fn iceberg_connector_table_handle(
     } else {
         context
     };
-    let metadata = exact_lease
-        .load_table(ConnectorTableRequest {
+    let metadata = crate::connector::schema_creation::load_write_table(
+        &exact_lease,
+        ConnectorTableRequest {
             table: ConnectorTableIdentity {
                 instance_id,
                 namespace: Arc::from(target.namespace.as_str()),
@@ -222,10 +223,9 @@ pub fn iceberg_connector_table_handle(
             },
             resolution: ConnectorTableResolution::StrictBaseTable,
             context,
-        })
-        .map_err(|error| {
-            format!("load Iceberg write target through connector metadata: {error}")
-        })?;
+        },
+    )
+    .map_err(|error| format!("load Iceberg write target through connector metadata: {error}"))?;
     Ok(metadata.table)
 }
 

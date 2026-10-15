@@ -74,7 +74,7 @@ pub(super) fn definition(
 }
 
 pub(super) struct ArrayProjectionDiagnosticProbeOwner {
-    resolver: BuiltinDynamicScalarResolver,
+    resolver: Arc<BuiltinDynamicScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
@@ -110,7 +110,7 @@ impl ArrayProjectionDiagnosticProbeOwner {
             })
             .collect();
         Ok(Self {
-            resolver,
+            resolver: Arc::new(resolver),
             declaration,
             implementations,
         })
@@ -172,6 +172,10 @@ impl FunctionBindingResolver for ArrayProjectionDiagnosticProbeOwner {
 }
 
 impl PureFunctionMetadataOwner for ArrayProjectionDiagnosticProbeOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::dynamic_scalar(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -213,41 +217,21 @@ impl FunctionEffectOwner for ArrayProjectionDiagnosticProbeOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        let result = (|| {
-            let exact_header = input.function_id == self.declaration.function_id()
-                && input.kind == FunctionKind::Scalar;
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if !exact_header {
-                return Err(FunctionBindingError::UnknownFunction.into());
-            }
-            let exact_scope = input.environment.is_empty()
-                && (matches!(input.proof_scope, CallProofScope::Unconditional)
-                    || input.proof_scope == CallProofScope::Domain(input.context.domain));
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if !exact_scope {
-                return Err(FunctionBindingError::InvalidBinding(
-                    "__array_struct_subfield has no environment dependencies and requires an exact proof scope"
-                        .into(),
-                )
-                .into());
-            }
-            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        self.refine_selected_core(input, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => {
-                        FunctionEffectOwnerError::Control(error)
-                    }
-                    other => FunctionEffectOwnerError::Owner(other),
-                })?;
-            Ok(self.call_effects(input.proof_scope, input.request.logical_argument_count))
-        })();
-        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
-            return result;
-        }
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        result
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_selected_core(input, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -258,50 +242,22 @@ impl PureInvocationScalarImplementation for ArrayProjectionDiagnosticProbeOwner 
         contract: Arc<ScalarCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedInvocationScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        let result: Result<Arc<dyn PreparedInvocationScalarKernel>, KernelFailure> = (|| {
-            let exact_call = input.function_id == self.declaration.function_id()
-                && input.kind == FunctionKind::Scalar
-                && contract.function_id() == input.function_id
-                && std::ptr::eq(contract.selected(), input.selected)
-                && contract.context() == input.context
-                && contract.decimal_overflow_policy() == input.decimal_overflow_policy
-                && contract.effects()
-                    == &self.call_effects(input.proof_scope, input.request.logical_argument_count)
-                && input.environment.is_empty();
-            work.step().map_err(compile_failure)?;
-            if !exact_call {
-                return Err(invalid(
-                    "__array_struct_subfield preparation differs from its exact checked call",
-                ));
-            }
-            work.flush().map_err(compile_failure)?;
+        self.prepare_selected_core(input, contract, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => compile_failure(error),
-                    _ => {
-                        invalid("__array_struct_subfield preparation has a stale selected binding")
-                    }
-                })?;
-            work.flush().map_err(compile_failure)?;
-            // The prepared object retains the same canonical contract. Its body is
-            // a static pure implementation and needs no live resolver or authority.
-            let prepared = Arc::new(PreparedArrayProjectionDiagnostic { contract })
-                as Arc<dyn PreparedInvocationScalarKernel>;
-            work.flush().map_err(compile_failure)?;
-            Ok(prepared)
-        })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
-            return result;
-        }
-        work.finish().map_err(compile_failure)?;
-        result
+        })
+    }
+    fn prepare_invocation_scalar_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedInvocationScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>>
+    {
+        self.prepare_selected_core(input, contract, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -434,7 +390,7 @@ impl InvocationScalarKernelInstance for ArrayProjectionDiagnosticInstance {
             super::array_struct_subfield_core::project_with_port(
                 &source,
                 &names,
-                Some(&self.contract.result_type().data_type),
+                Some(self.contract.result_type().data_type()),
                 &mut diagnostic,
             )
         };
@@ -444,5 +400,96 @@ impl InvocationScalarKernelInstance for ArrayProjectionDiagnosticInstance {
             Ok(_)=>Err(invalid("ARRAY diagnostic transport probe cannot publish successful computation without the complete original operation host").into()),
         }
         // Actual operand ArrayRefs drop before their metadata leases.
+    }
+}
+
+impl ArrayProjectionDiagnosticProbeOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        let result = (|| {
+            let exact_header = input.function_id == self.declaration.function_id()
+                && input.kind == FunctionKind::Scalar;
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if !exact_header {
+                return Err(FunctionBindingError::UnknownFunction.into());
+            }
+            let exact_scope = input.environment.is_empty()
+                && (matches!(input.proof_scope, CallProofScope::Unconditional)
+                    || input.proof_scope == CallProofScope::Domain(input.context.domain));
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if !exact_scope {
+                return Err(FunctionBindingError::InvalidBinding(
+                    "__array_struct_subfield has no environment dependencies and requires an exact proof scope"
+                        .into(),
+                )
+                .into());
+            }
+            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+                other => FunctionEffectOwnerError::Owner(other),
+            })?;
+            Ok(self.call_effects(input.proof_scope, input.request.logical_argument_count))
+        })();
+        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
+            return result;
+        }
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        result
+    }
+    fn prepare_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedInvocationScalarKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        let result: Result<Arc<dyn PreparedInvocationScalarKernel>, KernelFailure> = (|| {
+            let exact_call = input.function_id == self.declaration.function_id()
+                && input.kind == FunctionKind::Scalar
+                && contract.function_id() == input.function_id
+                && std::ptr::eq(contract.selected(), input.selected)
+                && contract.context() == input.context
+                && contract.decimal_overflow_policy() == input.decimal_overflow_policy
+                && contract.effects()
+                    == &self.call_effects(input.proof_scope, input.request.logical_argument_count)
+                && input.environment.is_empty();
+            work.step().map_err(compile_failure)?;
+            if !exact_call {
+                return Err(invalid(
+                    "__array_struct_subfield preparation differs from its exact checked call",
+                ));
+            }
+            work.flush().map_err(compile_failure)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => compile_failure(error),
+                _ => invalid("__array_struct_subfield preparation has a stale selected binding"),
+            })?;
+            work.flush().map_err(compile_failure)?;
+            // The prepared object retains the same canonical contract. Its body is
+            // a static pure implementation and needs no live resolver or authority.
+            let prepared = Arc::new(PreparedArrayProjectionDiagnostic { contract })
+                as Arc<dyn PreparedInvocationScalarKernel>;
+            work.flush().map_err(compile_failure)?;
+            Ok(prepared)
+        })();
+        if matches!(
+            &result,
+            Err(KernelFailure::Cancelled
+                | KernelFailure::DeadlineExceeded
+                | KernelFailure::ResourceExhausted)
+        ) {
+            return result;
+        }
+        work.finish().map_err(compile_failure)?;
+        result
     }
 }

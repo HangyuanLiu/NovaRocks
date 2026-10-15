@@ -19,7 +19,8 @@ syntax = "proto3";
 
 package novarocks.physical_type_v2;
 
-import "plan.proto";
+import "arrow_type.proto";
+import "value_type.proto";
 
 // Flat type vocabulary for the v2 physical package. This file is a component,
 // not a fragment envelope. Carrier, field and value-type IDs have separate
@@ -30,6 +31,23 @@ message TypeTable {
   repeated CarrierTypeDefinition carriers = 1;
   repeated FieldDefinition fields = 2;
   repeated ValueTypeDefinition value_types = 3;
+  // Shared semantic definitions in this TypeTable's separate logical namespace.
+  repeated novarocks.value_type.LogicalTypeDefinition logical_types = 4;
+}
+
+// Source attributes have their own field namespace. The shape is the same
+// flat Carrier/Field grammar, with no execution definitions/references and no
+// attributes on its Field definitions. Every shape Field, including unused
+// definitions, has exactly one facts row; identity presence is required.
+message SourceFieldTable {
+  TypeTable shape = 1;
+  repeated SourceArrowFieldFacts field_facts = 2;
+}
+message SourceArrowFieldFacts {
+  optional uint32 field_id = 1;
+  repeated novarocks.arrow_type.ArrowFieldMetadataEntry metadata = 2;
+  optional int64 dictionary_id = 3;
+  optional bool dictionary_is_ordered = 4;
 }
 
 // Explicit logical identity is independent of the Arrow carrier. UNSPECIFIED
@@ -50,21 +68,26 @@ enum LogicalType {
 message ValueTypeDefinition {
   uint32 id = 1;
   optional uint32 carrier_type_id = 2;
-  bool nullable = 3;
-  LogicalType logical_type = 4;
+  reserved 3, 4;
+  reserved "nullable", "logical_type";
+  // Complete recursive semantics belong solely to the referenced logical node.
+  optional uint32 logical_type_id = 5;
 }
 
-// All Arrow field attributes survive independently. Nested logical identity
-// lives in the exact field metadata; metadata entries are sorted and unique,
-// rather than a protobuf map that would silently replace duplicate keys.
+// Execution fields are metadata-free layout facts with explicit references.
+// Source attributes live exclusively in SourceFieldTable side rows. Retired
+// inline attribute slots and names remain permanently reserved.
 message FieldDefinition {
   uint32 id = 1;
   string name = 2;
   bool nullable = 3;
   optional uint32 carrier_type_id = 4;
-  repeated novarocks.plan.ArrowFieldMetadataEntry metadata = 5;
-  optional int64 dictionary_id = 6;
-  optional bool dictionary_is_ordered = 7;
+  reserved 5, 6, 7;
+  reserved "metadata", "dictionary_id", "dictionary_is_ordered";
+  // References this TypeTable's logical namespace, never another table's ID.
+  optional uint32 logical_type_id = 8;
+  // Explicit execution projection pairing; its layout remains binding-owned.
+  optional uint32 value_binding_id = 9;
 }
 
 // Nesting uses table references only. No carrier or field message recursively
@@ -73,17 +96,17 @@ message FieldDefinition {
 message CarrierTypeDefinition {
   uint32 id = 1;
   oneof kind {
-    novarocks.plan.ArrowPrimitiveType primitive = 2;
-    novarocks.plan.ArrowTimestampType timestamp = 3;
-    novarocks.plan.ArrowTimeType time32 = 4;
-    novarocks.plan.ArrowTimeType time64 = 5;
-    novarocks.plan.ArrowTimeType duration = 6;
-    novarocks.plan.ArrowIntervalUnit interval = 7;
+    novarocks.arrow_type.ArrowPrimitiveType primitive = 2;
+    novarocks.arrow_type.ArrowTimestampType timestamp = 3;
+    novarocks.arrow_type.ArrowTimeType time32 = 4;
+    novarocks.arrow_type.ArrowTimeType time64 = 5;
+    novarocks.arrow_type.ArrowTimeType duration = 6;
+    novarocks.arrow_type.ArrowIntervalUnit interval = 7;
     int32 fixed_size_binary = 8;
-    novarocks.plan.ArrowDecimalType decimal32 = 9;
-    novarocks.plan.ArrowDecimalType decimal64 = 10;
-    novarocks.plan.ArrowDecimalType decimal128 = 11;
-    novarocks.plan.ArrowDecimalType decimal256 = 12;
+    novarocks.arrow_type.ArrowDecimalType decimal32 = 9;
+    novarocks.arrow_type.ArrowDecimalType decimal64 = 10;
+    novarocks.arrow_type.ArrowDecimalType decimal128 = 11;
+    novarocks.arrow_type.ArrowDecimalType decimal256 = 12;
     uint32 list_field_id = 13;
     uint32 list_view_field_id = 14;
     FixedSizeList fixed_size_list = 15;
@@ -110,7 +133,7 @@ message UnionField {
   optional uint32 field_id = 2;
 }
 message UnionFields {
-  novarocks.plan.ArrowUnionMode mode = 1;
+  novarocks.arrow_type.ArrowUnionMode mode = 1;
   repeated UnionField fields = 2;
 }
 message DictionaryTypes {

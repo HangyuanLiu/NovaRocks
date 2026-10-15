@@ -78,7 +78,7 @@ fn project(
 ) -> Result<Option<ConstantValue>, ExpressionLoweringError> {
     let node = StaticExprNode::new(
         StaticExprKind::Constant(value.clone()),
-        value.value_type().data_type.clone(),
+        value.value_type().data_type().clone(),
         None,
     );
     literal_argument(source, &node, control)
@@ -307,7 +307,7 @@ fn literal_metadata_preserves_nonzero_pool_ordinal_and_null_vs_nonconstant() {
     );
 }
 #[test]
-fn long_literal_metadata_refusal_has_one_original_callback_prefix() {
+fn long_literal_type_sharing_preserves_each_actual_handle_copy_control_prefix() {
     // Full nested metadata, not payload reconstruction, drives the observed traversal.
     let mut metadata = std::collections::HashMap::new();
     for n in 0..320 {
@@ -335,16 +335,14 @@ fn long_literal_metadata_refusal_has_one_original_callback_prefix() {
     let baseline = Control::good();
     project(&value, &source, &baseline).unwrap();
     let trace = baseline.trace.into_inner().unwrap();
-    assert!(trace.iter().any(|(_, units)| *units == 256));
+    assert!(!trace.iter().any(|(_, units)| *units == 256));
     for cause in [
         CompileControlError::Cancelled,
         CompileControlError::DeadlineExceeded,
         CompileControlError::ResourceExhausted,
     ] {
-        // Wide input samples each real positive quantum plus the entry and tail.
-        for at in
-            (1..=trace.len()).filter(|at| *at == 1 || *at == trace.len() || trace[*at - 1].1 == 256)
-        {
+        // Immutable sharing performs handle copies rather than a type-tree walk.
+        for at in 1..=trace.len() {
             let control = Control {
                 trace: Mutex::new(vec![]),
                 refusal: Some((at, cause)),
@@ -360,7 +358,7 @@ fn long_literal_metadata_refusal_has_one_original_callback_prefix() {
 fn completed_mismatch_tail_observes_control_before_returning_data_error() {
     let value = text_value(DataType::LargeUtf8, "abc");
     let mut ty = value.value_type().clone();
-    ty.nullable = true;
+    ty = ty.with_nullable(true).unwrap();
     let source = source(ty, ExprKind::Literal(LiteralValue::Utf8("abc".into())));
     let baseline = Control::good();
     assert!(matches!(

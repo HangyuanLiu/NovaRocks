@@ -600,27 +600,34 @@ pub(super) fn validate_contract(
     };
     // Generic binding is preserved: unsupported raw carriers fail in the original
     // selected hash reader only when actually demanded, rather than narrowing admission.
-    for (actual, expected) in [
-        (
-            output,
-            FunctionValueType::new(
-                match projection {
-                    PayloadProjection::Bytes => DataType::Binary,
-                    PayloadProjection::Cardinality => DataType::Int64,
-                },
-                true,
-            ),
+    let (result_carrier, result_domain) = match projection {
+        PayloadProjection::Bytes => (
+            DataType::Binary,
+            novarocks_type_contract::ValueLogicalType::Hll,
         ),
+        PayloadProjection::Cardinality => (
+            DataType::Int64,
+            novarocks_type_contract::ValueLogicalType::Physical,
+        ),
+    };
+    // Both closed declarations are scalar; immutable validated bindings allow
+    // exact inspection without allocating temporary type trees.
+    for (actual, carrier, domain) in [
+        (output, result_carrier, result_domain),
         (
             contract.intermediate_type(),
-            FunctionValueType::new(DataType::Binary, true),
+            DataType::Binary,
+            novarocks_type_contract::ValueLogicalType::Hll,
         ),
     ] {
-        if !actual.exactly_equals_observed::<KernelFailure>(&expected, || {
-            work.step().map_err(compile_failure)
-        })? {
+        work.step().map_err(compile_failure)?;
+        if !actual.nullable()
+            || actual.logical_type() != domain
+            || actual.data_type() != &carrier
+            || actual.value_type().child_count() != 0
+        {
             return Err(invalid(
-                "HLL payload requires its exact nullable Int64 result and Binary state",
+                "HLL payload requires its exact nullable result and nominal HLL state",
             ));
         }
     }

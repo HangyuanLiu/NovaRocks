@@ -75,7 +75,7 @@ fn context() -> ExpressionEffectContext {
     }
 }
 fn ty(nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(arrow_schema::DataType::Utf8, nullable)
+    FunctionValueType::from_legacy_declared_projection(arrow_schema::DataType::Utf8, nullable)
 }
 struct Fixture {
     catalog: PureEngineFunctionCatalog,
@@ -320,11 +320,12 @@ fn utf8_extrema_real_installed_fresh_frozen_four_phases_preserve_physical_json_a
         ] {
             for logical_type in [ValueLogicalType::Physical, ValueLogicalType::Json] {
                 for nullable in [false, true] {
-                    let source = FunctionValueType {
-                        data_type: DataType::Utf8,
+                    let source = FunctionValueType::try_from_legacy_declared_projection(
+                        DataType::Utf8,
                         nullable,
                         logical_type,
-                    };
+                    )
+                    .expect("valid temporary legacy function value declaration");
                     let fixture = Fixture::new(name, source.clone(), policy);
                     for phase in [
                         AggregateKernelPhase::Single,
@@ -352,7 +353,9 @@ fn utf8_extrema_real_installed_fresh_frozen_four_phases_preserve_physical_json_a
                                 panic!("actual aggregate attachment")
                             };
                             let mut expected = source.clone();
-                            expected.nullable = true;
+                            expected = expected
+                                .with_nullable(true)
+                                .expect("valid function nullability declaration");
                             assert_eq!(handle.contract().final_type(), &expected);
                             assert_eq!(handle.contract().intermediate_type(), &expected);
                             assert_eq!(
@@ -457,7 +460,7 @@ fn json_byte_oracle() {
             Selection::all(4),
         );
         assert_eq!(
-            kernel.contract.final_type().logical_type,
+            kernel.contract.final_type().logical_type(),
             ValueLogicalType::Json
         );
         assert_eq!(

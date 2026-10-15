@@ -36,8 +36,8 @@ pub(super) fn validate_profile(
         return Err(invalid("map_size requires its one exact value argument"));
     };
     observe()?;
-    if source.logical_type != ValueLogicalType::Physical
-        || !matches!(source.data_type, DataType::Map(_, _))
+    if source.logical_type() != ValueLogicalType::Physical
+        || !matches!(source.data_type(), DataType::Map(_, _))
     {
         return Err(invalid(
             "map_size requires its exact frozen Physical Map source",
@@ -45,9 +45,9 @@ pub(super) fn validate_profile(
     }
     let result = contract.result_type();
     observe()?;
-    if result.logical_type != ValueLogicalType::Physical
-        || result.data_type != DataType::Int32
-        || !result.nullable
+    if result.logical_type() != ValueLogicalType::Physical
+        || result.data_type() != &DataType::Int32
+        || !result.nullable()
     {
         return Err(invalid(
             "map_size requires its real nullable Physical Int32 result",
@@ -102,7 +102,7 @@ pub(super) fn evaluate<'a>(
         })?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &input.contract().result_type().data_type,
+            input.contract().result_type().data_type(),
             values,
             Box::default(),
             || work.borrow_mut().step(),

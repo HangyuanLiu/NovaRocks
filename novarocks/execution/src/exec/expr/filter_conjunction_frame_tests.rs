@@ -169,7 +169,7 @@ fn batch(f: &Fixture, counts: &[i64], doubles: &[Option<f64>]) -> RecordBatch {
                 other => panic!("unaccounted actual test Aggregate output {other} for {value:?}"),
             }
         };
-        assert_eq!(&physical.values()[&value].ty.data_type, array.data_type());
+        assert_eq!(physical.values()[&value].ty.data_type(), array.data_type());
         assert_eq!(field.data_type(), array.data_type());
         arrays.push(array);
     }

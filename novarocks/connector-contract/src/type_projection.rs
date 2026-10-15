@@ -80,10 +80,10 @@ pub fn connector_type_for_value_type(
     value_type: &novarocks_type_contract::FunctionValueType,
 ) -> Option<ConnectorValueType> {
     value_type.validate().ok()?;
-    if value_type.logical_type == novarocks_type_contract::ValueLogicalType::Uuid {
+    if value_type.logical_type() == novarocks_type_contract::ValueLogicalType::Uuid {
         Some(ConnectorValueType::Uuid)
     } else {
-        connector_type_for_arrow(&value_type.data_type)
+        connector_type_for_arrow(&value_type.data_type())
     }
 }
 
@@ -137,12 +137,9 @@ mod tests {
             ConnectorValueType::Fixed { length: 16 },
             &uuid
         ));
-        let invalid = FunctionValueType {
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: ValueLogicalType::Uuid,
-        };
-        assert_eq!(connector_type_for_value_type(&invalid), None);
+        assert!(FunctionValueType::try_with_logical_type(
+            DataType::Utf8, false, ValueLogicalType::Uuid,
+        ).is_err(), "an invalid UUID binding is refused by its actual author");
     }
 
     #[test]

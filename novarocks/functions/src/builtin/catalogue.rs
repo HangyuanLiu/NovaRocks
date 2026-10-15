@@ -31,12 +31,16 @@ use crate::{
 };
 use arrow_schema::DataType;
 
-use super::binding_control;
+use super::binding_control::{self, ScalarCarriers, ScalarTypes};
 use super::intrinsic::{BuiltinDisposition, builtin_disposition};
 use super::resolver::ResolveError;
-use super::signature::{field_value_type, merge_value_types, value_field};
+use super::scalar_construction::{borrow_creator, with_binding_creation};
+#[cfg(test)]
+use super::signature::declared_list;
+#[cfg(test)]
+use super::signature::declared_map;
 use super::{registry, resolver};
-use crate::FunctionVolatility;
+use crate::{FunctionBindingCreationFailure, FunctionVolatility};
 use novarocks_type_contract::{CompileCheckpoints, PureCompileControl, ValueLogicalType};
 pub fn resolved_aggregate_signature_from_binding(
     binding: ResolvedFunctionBinding,
@@ -54,10 +58,9 @@ pub fn resolved_aggregate_signature_from_binding(
     let argument_types = binding
         .selected
         .argument_types
-        .into_vec()
         .into_iter()
         .map(|argument| match argument {
-            FunctionArgumentType::Value(value) => Ok(value.data_type),
+            FunctionArgumentType::Value(value) => Ok(value.data_type().clone()),
             FunctionArgumentType::Lambda { .. } => Err(FunctionResolutionError::BadSignature(
                 "aggregate update channel cannot be a lambda".into(),
             )),
@@ -67,8 +70,8 @@ pub fn resolved_aggregate_signature_from_binding(
         overload: AggregateOverloadIdentity::try_new(binding.selected.overload.as_str())
             .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?,
         argument_types,
-        intermediate_type: aggregate.intermediate_type.data_type,
-        output_type: output.data_type,
+        intermediate_type: aggregate.intermediate_type.data_type().clone(),
+        output_type: output.data_type().clone(),
         state_format: aggregate.state_format,
     })
 }
@@ -90,7 +93,12 @@ pub fn resolve_bound_aggregate(
         for data_type in update_arg_types {
             work.step()?;
             arguments.push(FunctionArgument::Value {
-                value_type: FunctionValueType::new(data_type.clone(), true),
+                value_type: FunctionValueType::try_with_logical_type(
+                    data_type.clone(),
+                    true,
+                    ValueLogicalType::Physical,
+                )
+                .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?,
                 constant: None,
             });
         }
@@ -164,7 +172,7 @@ impl AggregateDeclaration {
     }
 }
 
-pub(super) struct BuiltinAggregateResolver {
+pub(crate) struct BuiltinAggregateResolver {
     declaration: AggregateDeclaration,
 }
 
@@ -273,30 +281,193 @@ fn builtin_aggregate_state_argument_contract(
     }
 }
 
-impl BuiltinAggregateResolver {
-    fn bind_value_selection(
+struct BuiltinAggregateDecision<'a> {
+    declaration: AggregateDeclaration,
+    request: FunctionBindingRequest<'a>,
+    output: crate::aggregate_types::AggregateTypeRecipe<'a>,
+    intermediate: crate::aggregate_types::AggregateTypeRecipe<'a>,
+}
+
+impl BuiltinAggregateDecision<'_> {
+    fn matches_selected(
         &self,
-        request: FunctionBindingRequest<'_>,
-        selected: Option<&FunctionOverloadId>,
+        selected: &FunctionBindingSelection,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<bool, FunctionBindingError> {
+        let name = self.declaration.name;
+        if selected.argument_types.len() != self.request.arguments.len()
+            || !builtin_identity_matches(
+                selected.overload.as_str(),
+                "builtin.aggregate/",
+                name,
+                "/derived-v1",
+                work,
+            )?
+        {
+            return Ok(false);
+        }
+        for (actual, expected) in selected.argument_types.iter().zip(self.request.arguments) {
+            work.step()?;
+            let (
+                FunctionArgumentType::Value(actual),
+                FunctionArgument::Value {
+                    value_type: expected,
+                    ..
+                },
+            ) = (actual, expected)
+            else {
+                return Ok(false);
+            };
+            if !actual.exactly_equals_checked_observed(expected, || {
+                work.step().map_err(FunctionBindingError::from)
+            })? {
+                return Ok(false);
+            }
+        }
+        let FunctionResultType::Scalar(output) = &selected.result_type else {
+            return Ok(false);
+        };
+        if !self.output.matches_value_observed(
+            output.typed_binding().borrowed(),
+            builtin_aggregate_output_nullable(name),
+            builtin_aggregate_output_domain(name),
+            work,
+        )? {
+            return Ok(false);
+        }
+        let Some(state) = &selected.aggregate else {
+            return Ok(false);
+        };
+        if state.state_argument_contract != builtin_aggregate_state_argument_contract(name) {
+            return Ok(false);
+        }
+        let suffix = if name == "sum" {
+            "/state-v2"
+        } else {
+            "/state-v1"
+        };
+        if !builtin_identity_matches(
+            state.state_format.as_str(),
+            "novarocks/",
+            name,
+            suffix,
+            work,
+        )? {
+            return Ok(false);
+        }
+        self.intermediate.matches_value_observed(
+            state.intermediate_type.typed_binding().borrowed(),
+            builtin_aggregate_intermediate_nullable(name),
+            builtin_aggregate_intermediate_domain(name),
+            work,
+        )
+    }
+
+    fn materialize_pure(
+        &self,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        request_types_with_constants(request, work)?;
-        let values = binding_control::scalar_types(request, work)?;
-        let mut argument_types = Vec::with_capacity(values.len());
-        for value in &values {
-            work.step()?;
-            argument_types.push(value.data_type.clone());
+        let name = self.declaration.name;
+        work.flush()?;
+        let output = self.output.materialize_value_pure(
+            builtin_aggregate_output_nullable(name),
+            builtin_aggregate_output_domain(name),
+        )?;
+        work.step()?;
+        let intermediate = self.intermediate.materialize_value_pure(
+            builtin_aggregate_intermediate_nullable(name),
+            builtin_aggregate_intermediate_domain(name),
+        )?;
+        binding_control::value_type(&output, work)?;
+        binding_control::value_type(&intermediate, work)?;
+        Ok(FunctionBindingSelection {
+            overload: FunctionOverloadId::try_from_boxed(
+                builtin_aggregate_overload(name).into_boxed_str(),
+            )
+            .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
+            argument_types: binding_control::argument_types(self.request, work)?,
+            result_type: FunctionResultType::Scalar(output),
+            aggregate: Some(crate::AggregateBindingSelection {
+                state_argument_contract: builtin_aggregate_state_argument_contract(name),
+                intermediate_type: intermediate,
+                state_format: AggregateStateFormatIdentity::try_from_boxed(
+                    builtin_aggregate_state_format(name).into_boxed_str(),
+                )
+                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
+            }),
+        })
+    }
+}
+
+/// Compare the actual owner's segmented identity without allocating a formatted
+/// expected label. This is content identity, never pointer/capability identity.
+fn builtin_identity_matches(
+    actual: &str,
+    prefix: &str,
+    name: &str,
+    suffix: &str,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, FunctionBindingError> {
+    work.step()?;
+    if actual.len() != prefix.len() + name.len() + suffix.len() {
+        return Ok(false);
+    }
+    for (actual, expected) in actual
+        .bytes()
+        .zip(prefix.bytes().chain(name.bytes()).chain(suffix.bytes()))
+    {
+        work.step()?;
+        if actual != expected {
+            return Ok(false);
         }
-        let logical_types = &argument_types[..request.logical_argument_count];
+    }
+    Ok(true)
+}
+
+impl BuiltinAggregateResolver {
+    fn value_decision<'a>(
+        &self,
+        request: FunctionBindingRequest<'a>,
+        selected: Option<&FunctionOverloadId>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<BuiltinAggregateDecision<'a>, FunctionBindingError> {
+        request_types_with_constants(request, work)?;
         let declaration = self.declaration;
-        if !(declaration.min_args..=declaration.max_args).contains(&logical_types.len())
-            || !builtin_aggregate_logical_arguments_match(declaration.name, logical_types)
+        let name = declaration.name;
+        let arguments = crate::aggregate_types::AggregateTypeArguments::Values(request.arguments);
+        for argument in request.arguments {
+            work.step()?;
+            if !matches!(argument, FunctionArgument::Value { .. }) {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            }
+        }
+        if !(declaration.min_args..=declaration.max_args).contains(&request.logical_argument_count)
+            || !builtin_aggregate_logical_arguments_match_source(
+                name,
+                arguments,
+                request.logical_argument_count,
+            )
         {
             return Err(FunctionBindingError::NoMatchingOverload);
         }
-        let name = declaration.name;
-        // Numeric readers never reinterpret another semantic value domain as
-        // their carrier. LARGEINT is explicitly admitted only by its owner.
+        if !builtin_supports_ordered_update_channels(name)
+            && !(declaration.min_args..=declaration.max_args).contains(&arguments.len())
+        {
+            return Err(FunctionBindingError::NoMatchingOverload);
+        }
+        if let Some(overload) = selected {
+            if !builtin_identity_matches(
+                overload.as_str(),
+                "builtin.aggregate/",
+                name,
+                "/derived-v1",
+                work,
+            )? {
+                return Err(FunctionBindingError::InvalidBinding(
+                    "builtin aggregate references a foreign overload".into(),
+                ));
+            }
+        }
         if matches!(
             name,
             "sum"
@@ -316,92 +487,41 @@ impl BuiltinAggregateResolver {
                 | "stddev_samp"
                 | "std"
         ) {
-            for value in &values[..request.logical_argument_count] {
+            for index in 0..request.logical_argument_count {
                 work.step()?;
+                let value = arguments
+                    .value_type(index)
+                    .ok_or(FunctionBindingError::NoMatchingOverload)?;
                 let largeint = matches!(name, "sum" | "multi_distinct_sum")
-                    && value.logical_type == ValueLogicalType::LargeInt;
+                    && value.logical_type() == ValueLogicalType::LargeInt;
                 if !largeint
-                    && (value.logical_type != ValueLogicalType::Physical
-                        || matches!(value.data_type, DataType::FixedSizeBinary(_)))
+                    && (value.logical_type() != ValueLogicalType::Physical
+                        || matches!(value.data_type(), DataType::FixedSizeBinary(_)))
                 {
                     return Err(FunctionBindingError::NoMatchingOverload);
                 }
             }
         }
-        work.flush()?;
-        // Legacy carrier derivation remains an opaque owner operation.
-        let resolved = if let Some(selected) = selected {
-            let overload = AggregateOverloadIdentity::try_new(selected.as_str())
-                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
-            self.resolve_update_signature(&overload, &argument_types)
-                .map_err(binding_resolution_error)?
-        } else {
-            let logical = self
-                .resolve_aggregate(logical_types)
-                .map_err(binding_resolution_error)?;
-            if request.logical_argument_count == argument_types.len() {
-                logical
-            } else {
-                self.resolve_update_signature(&logical.overload, &argument_types)
-                    .map_err(binding_resolution_error)?
-            }
-        };
+        let (output, intermediate) =
+            crate::aggregate_types::aggregate_type_recipes(name, arguments)
+                .map_err(|error| FunctionBindingError::InvalidBinding(error.into()))?;
         work.step()?;
-        let mut output = FunctionValueType::new(
-            resolved.output_type,
-            builtin_aggregate_output_nullable(name),
-        );
-        let mut intermediate = FunctionValueType::new(
-            resolved.intermediate_type,
-            builtin_aggregate_intermediate_nullable(name),
-        );
-        if let Some(first) = values.first() {
-            match name {
-                "min" | "max" | "any_value" | "array_unique_agg" | "sum_map" => {
-                    output = first.clone();
-                    intermediate = first.clone();
-                }
-                "max_by" | "min_by" | "percentile_cont" | "percentile_disc"
-                | "percentile_disc_lc" => output = first.clone(),
-                // An exact LARGEINT SUM keeps its result type; its state is
-                // the wider physical intermediate.
-                "sum" | "multi_distinct_sum"
-                    if first.logical_type == ValueLogicalType::LargeInt =>
-                {
-                    output = first.clone();
-                }
-                "array_agg" | "array_agg_distinct" => {
-                    output.data_type = DataType::List(Arc::new(value_field("item", first, true)));
-                    // The implementation's state Fields/ORDER BY channels
-                    // remain the separately derived transport representation.
-                }
-                "min_n" | "max_n" => {
-                    output.data_type = DataType::List(Arc::new(value_field("item", first, true)))
-                }
-                _ => {}
-            }
-        }
-        if name == "map_agg" && values.len() >= 2 {
-            output.data_type = full_map_type(&values[0], &values[1]);
-            intermediate.data_type = output.data_type.clone();
-        }
-        output.nullable = builtin_aggregate_output_nullable(name);
-        intermediate.nullable = builtin_aggregate_intermediate_nullable(name);
-        binding_control::value_type(&output, work)?;
-        binding_control::value_type(&intermediate, work)?;
-        Ok(FunctionBindingSelection {
-            overload: FunctionOverloadId::try_new(resolved.overload.as_str())
-                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
-            argument_types: binding_control::argument_types(request, work)?,
-            result_type: FunctionResultType::Scalar(output),
-            aggregate: Some(crate::AggregateBindingSelection {
-                state_argument_contract: builtin_aggregate_state_argument_contract(
-                    declaration.name,
-                ),
-                intermediate_type: intermediate,
-                state_format: resolved.state_format,
-            }),
+        Ok(BuiltinAggregateDecision {
+            declaration,
+            request,
+            output,
+            intermediate,
         })
+    }
+
+    fn bind_value_selection(
+        &self,
+        request: FunctionBindingRequest<'_>,
+        selected: Option<&FunctionOverloadId>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        self.value_decision(request, selected, work)?
+            .materialize_pure(work)
     }
 }
 
@@ -433,8 +553,8 @@ impl FunctionBindingResolver for BuiltinAggregateResolver {
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
         binding_control::scope(control, |work| {
-            let expected = self.bind_value_selection(request, Some(&selected.overload), work)?;
-            if binding_control::same_selection(&expected, selected, work)? {
+            let decision = self.value_decision(request, Some(&selected.overload), work)?;
+            if decision.matches_selected(selected, work)? {
                 Ok(())
             } else {
                 Err(FunctionBindingError::InvalidBinding(
@@ -472,6 +592,25 @@ fn builtin_aggregate_output_nullable(name: &str) -> bool {
     )
 }
 
+fn builtin_aggregate_output_domain(name: &str) -> ValueLogicalType {
+    match name {
+        "hll_union" | "hll_raw_agg" => ValueLogicalType::Hll,
+        "bitmap_agg" | "bitmap_union" => ValueLogicalType::Bitmap,
+        "percentile_union" => ValueLogicalType::Percentile,
+        _ => ValueLogicalType::Physical,
+    }
+}
+fn builtin_aggregate_intermediate_domain(name: &str) -> ValueLogicalType {
+    match name {
+        "hll_union" | "hll_raw_agg" | "hll_union_agg" => ValueLogicalType::Hll,
+        "bitmap_agg" | "bitmap_union" | "bitmap_union_count" | "bitmap_union_int" => {
+            ValueLogicalType::Bitmap
+        }
+        "percentile_union" => ValueLogicalType::Percentile,
+        _ => ValueLogicalType::Physical,
+    }
+}
+
 fn builtin_aggregate_intermediate_nullable(name: &str) -> bool {
     builtin_aggregate_output_nullable(name)
 }
@@ -484,19 +623,34 @@ fn builtin_supports_ordered_update_channels(name: &str) -> bool {
 }
 
 fn builtin_aggregate_logical_arguments_match(name: &str, argument_types: &[DataType]) -> bool {
+    builtin_aggregate_logical_arguments_match_source(
+        name,
+        crate::aggregate_types::AggregateTypeArguments::Arrow(argument_types),
+        argument_types.len(),
+    )
+}
+fn builtin_aggregate_logical_arguments_match_source(
+    name: &str,
+    arguments: crate::aggregate_types::AggregateTypeArguments<'_>,
+    count: usize,
+) -> bool {
     if name != "dict_merge" {
         return true;
     }
-    let [value_type, threshold_type] = argument_types else {
+    if count != 2 {
+        return false;
+    }
+    let (Some(value_type), Some(threshold_type)) = (arguments.data_type(0), arguments.data_type(1))
+    else {
         return false;
     };
     let value_matches = matches!(value_type, DataType::Utf8)
         || matches!(value_type, DataType::List(item) if matches!(item.data_type(), DataType::Utf8));
-    let threshold_matches = matches!(
-        threshold_type,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-    );
-    value_matches && threshold_matches
+    value_matches
+        && matches!(
+            threshold_type,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        )
 }
 
 /// How one builtin aggregate's single overload is spelled.
@@ -506,30 +660,6 @@ fn builtin_aggregate_logical_arguments_match(name: &str, argument_types: &[DataT
 /// rather than to any other function of that name. The backend spells this
 /// same identity for itself when it registers implementations, so that sealing
 /// compares two independently written sets rather than one copied twice.
-/// Whether two argument types are the same but for what their nested fields
-/// admit. This legacy nullability allowance never erases root or nested
-/// logical identities; provider-only decoration is still ignored.
-fn same_argument_up_to_nested_nullability(
-    types: (&crate::FunctionArgumentType, &crate::FunctionArgumentType),
-) -> bool {
-    use crate::FunctionArgumentType;
-    match types {
-        (FunctionArgumentType::Value(left), FunctionArgumentType::Value(right)) => {
-            left.nullable == right.nullable
-                && left.logical_type == right.logical_type
-                && novarocks_type_contract::preserves_nested_logical_identity(
-                    &left.data_type,
-                    &right.data_type,
-                )
-                && novarocks_type_contract::arrow_type_equals_ignoring_metadata(
-                    &left.data_type,
-                    &right.data_type,
-                )
-        }
-        (left, right) => left == right,
-    }
-}
-
 fn builtin_aggregate_overload(name: &str) -> String {
     format!("builtin.aggregate/{name}/derived-v1")
 }
@@ -713,7 +843,7 @@ fn builtin_array_equality_item(ty: &DataType) -> bool {
 
 fn validate_builtin_selected_domain(
     name: &str,
-    arguments: &[DataType],
+    arguments: ScalarCarriers<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), FunctionBindingError> {
     // Empty constructors ignore arguments. Value consumers must have every
@@ -837,8 +967,8 @@ fn validate_builtin_selected_domain(
             matches!(entries.data_type(),DataType::Struct(fields) if fields.len()==2 &&
                 ((ordered_item(fields[0].data_type()) && *fields[0].data_type()!=DataType::Null)
                     || matches!(fields[0].data_type(),DataType::Decimal256(..)))))),
-        "array_contains_all" | "array_contains_seq" => match arguments {
-            [DataType::List(left), DataType::List(right)] => {
+        "array_contains_all" | "array_contains_seq" => match (arguments.len(), arguments.get(0), arguments.get(1)) {
+            (2, Some(DataType::List(left)), Some(DataType::List(right))) => {
                 if arrow_cast::can_cast_types(right.data_type(),left.data_type()) {
                     builtin_array_equality_item(left.data_type())
                 } else {
@@ -929,7 +1059,7 @@ fn validate_builtin_selected_domain(
     }
 }
 
-pub(super) struct BuiltinScalarResolver {
+pub(crate) struct BuiltinScalarResolver {
     function_id: FunctionId,
     canonical_name: Box<str>,
     overloads: Box<[FunctionOverloadId]>,
@@ -995,8 +1125,8 @@ fn scalar_result_nullable(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<bool, FunctionBindingError> {
     let value_nullable = |index: usize| match request.arguments.get(index) {
-        Some(FunctionArgument::Value { value_type, .. }) => value_type.nullable,
-        Some(FunctionArgument::Lambda { result_type, .. }) => result_type.nullable,
+        Some(FunctionArgument::Value { value_type, .. }) => value_type.nullable(),
+        Some(FunctionArgument::Lambda { result_type, .. }) => result_type.nullable(),
         None => false,
     };
     let first_value = match request.arguments.first() {
@@ -1027,9 +1157,9 @@ fn scalar_result_nullable_from_types(
         // and decimals prove a finite Float64 result for every non-NULL value.
         "positive" => match first_value {
             Some(value_type)
-                if value_type.logical_type == ValueLogicalType::Physical
+                if value_type.logical_type() == ValueLogicalType::Physical
                     && matches!(
-                        value_type.data_type,
+                        value_type.data_type(),
                         DataType::Int8
                             | DataType::Int16
                             | DataType::Int32
@@ -1037,7 +1167,7 @@ fn scalar_result_nullable_from_types(
                             | DataType::Decimal128(_, _)
                     ) =>
             {
-                value_type.nullable
+                value_type.nullable()
             }
             _ => true,
         },
@@ -1120,7 +1250,7 @@ const TOTAL_SCALAR_FUNCTIONS: &[&str] = &[
     "isnull",
 ];
 
-fn binding_resolution_error(error: ResolveError) -> FunctionBindingError {
+pub(super) fn binding_resolution_error(error: ResolveError) -> FunctionBindingError {
     match error {
         ResolveError::UnknownFunction => FunctionBindingError::UnknownFunction,
         ResolveError::HiddenFunction => FunctionBindingError::HiddenFunction,
@@ -1137,7 +1267,90 @@ fn builtin_fixed_result_domain(function_id: &FunctionId) -> Option<ValueLogicalT
         | "builtin.scalar/json_array/v1"
         | "builtin.scalar/to_json/v1"
         | "builtin.scalar/json_query/v1" => Some(ValueLogicalType::Json),
+        "builtin.scalar/hll_hash/v1" => Some(ValueLogicalType::Hll),
+        "builtin.scalar/to_bitmap/v1"
+        | "builtin.scalar/bitmap_or/v1"
+        | "builtin.scalar/bitmap_xor/v1"
+        | "builtin.scalar/bitmap_andnot/v1"
+        | "builtin.scalar/bitmap_intersect/v1"
+        | "builtin.scalar/bitmap_from_string/v1"
+        | "builtin.scalar/bitmap_empty/v1"
+        | "builtin.scalar/bitmap_and/v1"
+        | "builtin.scalar/bitmap_from_binary/v1"
+        | "builtin.scalar/sub_bitmap/v1"
+        | "builtin.scalar/bitmap_subset_limit/v1"
+        | "builtin.scalar/bitmap_subset_in_range/v1" => Some(ValueLogicalType::Bitmap),
+        "builtin.scalar/percentile_hash/v1" | "builtin.scalar/percentile_empty/v1" => {
+            Some(ValueLogicalType::Percentile)
+        }
         _ => None,
+    }
+}
+
+struct FixedScalarResultDecision<'a> {
+    source: Option<&'a FunctionValueType>,
+    domain: Option<ValueLogicalType>,
+    nullable: bool,
+}
+impl FixedScalarResultDecision<'_> {
+    fn materialize(
+        &self,
+        result: FunctionValueType,
+    ) -> Result<FunctionValueType, FunctionBindingError> {
+        self.materialize_with_construction(
+            result,
+            &mut super::scalar_construction::ScalarConstruction::<std::convert::Infallible>::new(
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                None,
+            ),
+        )
+        .map_err(|error| {
+            FunctionBindingError::InvalidBinding(
+                super::scalar_construction::pure_string(error).into(),
+            )
+        })
+    }
+    fn materialize_with_construction<E>(
+        &self,
+        mut result: FunctionValueType,
+        creation: &mut super::scalar_construction::ScalarConstruction<'_, E>,
+    ) -> Result<FunctionValueType, super::scalar_construction::Failure<E>> {
+        if let Some(domain) = self.domain {
+            result = creation.value(result.data_type().clone(), true, domain)?;
+        }
+        if let Some(source) = self.source {
+            result = source.clone();
+        }
+        creation.nullable(&result, self.nullable)
+    }
+    fn matches(
+        &self,
+        original: super::scalar_type_recipe::ScalarTypeRecipe<'_>,
+        actual: &FunctionValueType,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<bool, FunctionBindingError> {
+        work.step()?;
+        if actual.nullable() != self.nullable {
+            return Ok(false);
+        }
+        if let Some(source) = self.source {
+            return source
+                .typed_binding()
+                .borrowed()
+                .same_physical_binding_ignoring_root_nullability_observed(
+                    actual.typed_binding().borrowed(),
+                    || work.step().map_err(FunctionBindingError::from),
+                );
+        }
+        if let Some(domain) = self.domain {
+            original.matches_nominal_result_observed(
+                actual.typed_binding().borrowed(),
+                domain,
+                work,
+            )
+        } else {
+            original.matches_value_observed(actual.typed_binding().borrowed(), work)
+        }
     }
 }
 
@@ -1184,7 +1397,7 @@ impl BuiltinScalarResolver {
                     return Err(FunctionBindingError::NoMatchingOverload);
                 }
             }
-            let value_nullable = |index: usize| types.get(index).is_some_and(|ty| ty.nullable);
+            let value_nullable = |index: usize| types.get(index).is_some_and(|ty| ty.nullable());
             let nullable = scalar_result_nullable_from_types(
                 &self.canonical_name,
                 logical_argument_count,
@@ -1193,7 +1406,7 @@ impl BuiltinScalarResolver {
                 work,
             )?;
             let mut expected = resolved.return_type;
-            expected.nullable = nullable;
+            expected = expected.with_nullable(nullable)?;
             let FunctionResultType::Scalar(actual) = &selected.result_type else {
                 return Err(FunctionBindingError::NoMatchingOverload);
             };
@@ -1236,29 +1449,27 @@ impl BuiltinScalarResolver {
         let index = self.overload_index_observed(overload, work)?;
         let argument_types = binding_control::scalar_types(request, work)?;
         work.flush()?;
-        let resolved = resolver::resolve_scalar_value_signature_at_overload(
+        let resolved = resolver::resolve_scalar_value_signature_view_at_overload(
             &self.canonical_name,
             index,
-            &argument_types,
+            argument_types,
             work.control(),
         )
         .map_err(binding_resolution_error)?;
         self.selection(index, resolved, request, work)
     }
 
-    fn selection(
+    fn apply_argument_rules(
         &self,
-        index: usize,
-        mut resolved: resolver::ResolvedScalarValueSignature,
+        argument_types: &mut Vec<FunctionValueType>,
         request: FunctionBindingRequest<'_>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        let mut carriers = Vec::with_capacity(resolved.argument_types.len());
-        for value in &resolved.argument_types {
+    ) -> Result<(), FunctionBindingError> {
+        for _value in argument_types.iter() {
             work.step()?;
-            carriers.push(value.data_type.clone());
         }
-        validate_builtin_selected_domain(&self.canonical_name, &carriers, work)?;
+        let carriers = ScalarCarriers::from_values(ScalarTypes::from_values(argument_types));
+        validate_builtin_selected_domain(&self.canonical_name, carriers, work)?;
         if matches!(
             self.function_id.as_str(),
             "builtin.scalar/get_json_bool/v1"
@@ -1277,13 +1488,13 @@ impl BuiltinScalarResolver {
                 | "builtin.scalar/json_keys/v1"
                 | "builtin.scalar/variant_typeof/v1"
         ) {
-            let Some(document) = resolved.argument_types.first() else {
+            let Some(document) = argument_types.first() else {
                 return Err(FunctionBindingError::NoMatchingOverload);
             };
-            let admitted = document.data_type == DataType::Null
-                || match document.logical_type {
+            let admitted = document.data_type() == &DataType::Null
+                || match document.logical_type() {
                     ValueLogicalType::Physical => {
-                        matches!(document.data_type, DataType::Utf8 | DataType::LargeUtf8)
+                        matches!(document.data_type(), DataType::Utf8 | DataType::LargeUtf8)
                     }
                     ValueLogicalType::Json | ValueLogicalType::Variant => true,
                     _ => false,
@@ -1293,22 +1504,11 @@ impl BuiltinScalarResolver {
             }
         }
 
-        // These result identities belong to these exact registered owners.
-        // No display name or Utf8 carrier establishes a JSON value domain.
-        if let Some(logical_type) = builtin_fixed_result_domain(&self.function_id) {
-            resolved.return_type = FunctionValueType::try_with_logical_type(
-                resolved.return_type.data_type,
-                true,
-                logical_type,
-            )
-            .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
-        }
         if self.function_id.as_str() == "builtin.scalar/array_sortby/v1" {
             let Some(FunctionArgument::Value { value_type, .. }) = request.arguments.first() else {
                 return Err(FunctionBindingError::NoMatchingOverload);
             };
-            resolved.argument_types[0] = value_type.clone();
-            resolved.return_type = value_type.clone();
+            argument_types[0] = value_type.clone();
         }
         if matches!(
             self.function_id.as_str(),
@@ -1318,7 +1518,7 @@ impl BuiltinScalarResolver {
                 | "builtin.scalar/map_values/v1"
         ) {
             let ([FunctionArgument::Value { value_type, .. }], [target]) =
-                (request.arguments, resolved.argument_types.as_mut_slice())
+                (request.arguments, argument_types.as_mut_slice())
             else {
                 return Err(FunctionBindingError::NoMatchingOverload);
             };
@@ -1326,10 +1526,10 @@ impl BuiltinScalarResolver {
             // variables. Counting offsets needs no conversion of those values.
             // Preserve the actual fields and sorted-map fact instead of adding
             // a nested cast merely to regenerate TypeSpec's field template.
-            let same_container = value_type.logical_type == ValueLogicalType::Physical
-                && target.logical_type == ValueLogicalType::Physical
+            let same_container = value_type.logical_type() == ValueLogicalType::Physical
+                && target.logical_type() == ValueLogicalType::Physical
                 && matches!(
-                    (&value_type.data_type, &target.data_type),
+                    (value_type.data_type(), target.data_type()),
                     (DataType::List(_), DataType::List(_))
                         | (DataType::Map(_, _), DataType::Map(_, _))
                 );
@@ -1341,8 +1541,38 @@ impl BuiltinScalarResolver {
                 work.step()?;
             }
         }
-        resolved.return_type.nullable =
-            scalar_result_nullable(&self.canonical_name, request, work)?;
+        Ok(())
+    }
+    fn result_decision<'a>(
+        &self,
+        request: FunctionBindingRequest<'a>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<FixedScalarResultDecision<'a>, FunctionBindingError> {
+        let source = if self.function_id.as_str() == "builtin.scalar/array_sortby/v1" {
+            let Some(FunctionArgument::Value { value_type, .. }) = request.arguments.first() else {
+                return Err(FunctionBindingError::NoMatchingOverload);
+            };
+            Some(value_type)
+        } else {
+            None
+        };
+        Ok(FixedScalarResultDecision {
+            source,
+            domain: builtin_fixed_result_domain(&self.function_id),
+            nullable: scalar_result_nullable(&self.canonical_name, request, work)?,
+        })
+    }
+    fn selection(
+        &self,
+        index: usize,
+        mut resolved: resolver::ResolvedScalarValueSignature,
+        request: FunctionBindingRequest<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        self.apply_argument_rules(&mut resolved.argument_types, request, work)?;
+        resolved.return_type = self
+            .result_decision(request, work)?
+            .materialize(resolved.return_type)?;
         binding_control::value_type(&resolved.return_type, work)?;
         let mut argument_types = Vec::with_capacity(resolved.argument_types.len());
         for value in resolved.argument_types {
@@ -1351,7 +1581,9 @@ impl BuiltinScalarResolver {
         }
         Ok(FunctionBindingSelection {
             overload: self.overloads[index].clone(),
-            argument_types: argument_types.into_boxed_slice(),
+            argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                argument_types.into_boxed_slice(),
+            ),
             result_type: FunctionResultType::Scalar(resolved.return_type),
             aggregate: None,
         })
@@ -1368,9 +1600,9 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
             request_types_with_constants(request, work)?;
             let argument_types = binding_control::scalar_types(request, work)?;
             work.flush()?;
-            let (index, resolved) = resolver::resolve_scalar_value_signature_with_overload(
+            let (index, resolved) = resolver::resolve_scalar_value_signature_view_with_overload(
                 &self.canonical_name,
-                &argument_types,
+                argument_types,
                 work.control(),
             )
             .map_err(binding_resolution_error)?;
@@ -1395,53 +1627,124 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
         request: FunctionBindingRequest<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
-        binding_control::scope(control, |work| {
-            let expected =
-                self.selection_at_overload_observed(&selected.overload, request, work)?;
-            if binding_control::same_selection(&expected, selected, work)? {
-                return Ok(());
+        self.validate_selected_with_creation::<std::convert::Infallible>(
+            selected, request, None, control,
+        )
+        .map_err(crate::FunctionBindingCreationFailure::into_pure)
+    }
+}
+impl BuiltinScalarResolver {
+    pub(crate) fn validate_selected_with_creator_in<H>(
+        &self,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), crate::FunctionBindingCreationFailure<H>> {
+        self.validate_selected_with_creation(selected, request, Some(creation), control)
+    }
+    fn validate_selected_with_creation<H>(
+        &self,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), crate::FunctionBindingCreationFailure<H>> {
+        binding_control::created_scope(control, |work| {
+            request_types_with_constants(request, work)?;
+            let index = self.overload_index_observed(&selected.overload, work)?;
+            let argument_types = binding_control::scalar_types(request, work)?;
+            work.flush()?;
+            let mut decision = match super::scalar_construction::borrow_creator(&mut creation) {
+                Some(creation) => resolver::scalar_value_decision_at_overload_with_creator_in(
+                    &self.canonical_name,
+                    index,
+                    argument_types,
+                    creation,
+                    work.control(),
+                )
+                .map_err(super::scalar_construction::into_binding_creation)?,
+                None => resolver::scalar_value_decision_at_overload(
+                    &self.canonical_name,
+                    index,
+                    argument_types,
+                    work.control(),
+                )
+                .map_err(binding_resolution_error)?,
+            };
+            self.apply_argument_rules(&mut decision.argument_types, request, work)?;
+            let result = self.result_decision(request, work)?;
+            let mut argument_drift = None;
+            let count_matches = decision.argument_types.len() == selected.argument_types.len();
+            if count_matches {
+                for (index, (expected, actual)) in decision
+                    .argument_types
+                    .iter()
+                    .zip(&selected.argument_types)
+                    .enumerate()
+                {
+                    work.step()?;
+                    let FunctionArgumentType::Value(actual) = actual else {
+                        argument_drift = Some(index);
+                        break;
+                    };
+                    if !binding_control::exact_type(expected, actual, work)? {
+                        argument_drift = Some(index);
+                        break;
+                    }
+                }
             }
-            // What a nested field admits is not part of a type's identity across
-            // this boundary -- a map read from Iceberg has non-null keys while the
-            // same type declared from SQL says they may be null, which is what
-            // `literal::arrow_type_equals_ignoring_metadata` exists to say. So a
-            // binding whose arguments differ only there is the same binding.
-            if expected.overload == selected.overload
-                && expected.result_type == selected.result_type
-                && expected.aggregate == selected.aggregate
-                && expected.argument_types.len() == selected.argument_types.len()
-                && nested_arguments_match(&expected.argument_types, &selected.argument_types, work)?
+            let result_matches = if count_matches && argument_drift.is_none() {
+                match &selected.result_type {
+                    FunctionResultType::Scalar(actual) => {
+                        result.matches(decision.result_recipe(result.nullable), actual, work)?
+                    }
+                    _ => false,
+                }
+            } else {
+                true
+            };
+            if count_matches
+                && argument_drift.is_none()
+                && result_matches
+                && selected.aggregate.is_none()
             {
                 return Ok(());
             }
-            // Name the part that differs: the whole selection does not fit in one
-            // error line, and every field of it can drift for its own reason.
-            let differing = if expected.argument_types != selected.argument_types {
-                let ordinal = expected
-                    .argument_types
-                    .iter()
-                    .zip(selected.argument_types.iter())
-                    .position(|(registry, plan)| registry != plan);
-                match ordinal {
-                    Some(ordinal) => format!(
-                        "argument {ordinal}: plan {:?}, registry {:?}",
-                        selected.argument_types[ordinal], expected.argument_types[ordinal]
-                    ),
-                    None => format!(
-                        "argument count: plan {}, registry {}",
-                        selected.argument_types.len(),
-                        expected.argument_types.len()
-                    ),
-                }
-            } else if expected.result_type != selected.result_type {
+            // Preserve the original diagnostic. Error-only result realization,
+            // pass authorization and Bindings scratch are explicitly not closed
+            // by the successful-path borrowed publication in this checkpoint.
+            let differing = if !count_matches {
+                format!(
+                    "argument count: plan {}, registry {}",
+                    selected.argument_types.len(),
+                    decision.argument_types.len()
+                )
+            } else if let Some(ordinal) = argument_drift {
+                format!(
+                    "argument {ordinal}: plan {:?}, registry {:?}",
+                    selected.argument_types[ordinal],
+                    FunctionArgumentType::Value(decision.argument_types[ordinal].clone())
+                )
+            } else if !result_matches {
+                let expected = decision.diagnostic_return_type();
+                let expected = FunctionResultType::Scalar(
+                    super::scalar_construction::with_resolution_creation(
+                        super::scalar_construction::borrow_creator(&mut creation),
+                        work,
+                        |creation| result.materialize_with_construction(expected, creation),
+                    )
+                    .map_err(super::scalar_construction::into_binding_creation)?,
+                );
                 format!(
                     "result type: registry {:?}, plan {:?}",
-                    expected.result_type, selected.result_type
+                    expected, selected.result_type
                 )
             } else {
                 format!(
                     "aggregate state: registry {:?}, plan {:?}",
-                    expected.aggregate, selected.aggregate
+                    Option::<crate::AggregateBindingSelection>::None,
+                    selected.aggregate
                 )
             };
             Err(FunctionBindingError::InvalidBinding(
@@ -1449,7 +1752,8 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
                     "selected scalar overload differs from exact registry resolution: {differing}"
                 )
                 .into(),
-            ))
+            )
+            .into())
         })
     }
 }
@@ -1459,54 +1763,132 @@ pub(super) const BUILTIN_UNNEST_OVERLOAD_ID: &str = "builtin.table/unnest/array-
 
 pub(super) struct BuiltinUnnestResolver;
 
-fn bind_builtin_unnest(
+fn bind_builtin_unnest_with_creation<H>(
     request: FunctionBindingRequest<'_>,
+    original_overload: Option<&FunctionOverloadId>,
+    mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<FunctionBindingSelection, FunctionBindingError> {
+) -> Result<FunctionBindingSelection, crate::FunctionBindingCreationFailure<H>> {
+    use super::scalar_construction::{borrow_creator, with_binding_creation};
     if request.logical_argument_count != request.arguments.len() || request.arguments.is_empty() {
-        return Err(FunctionBindingError::NoMatchingOverload);
+        return Err(FunctionBindingError::NoMatchingOverload.into());
     }
+    with_binding_creation(borrow_creator(&mut creation), work, |c| {
+        c.array::<FunctionArgumentType>(request.arguments.len())
+    })?;
     let mut argument_types = Vec::with_capacity(request.arguments.len());
+    with_binding_creation(borrow_creator(&mut creation), work, |c| {
+        c.array::<FunctionValueType>(request.arguments.len())
+    })?;
     let mut result_columns = Vec::with_capacity(request.arguments.len());
     for argument in request.arguments {
         work.step()?;
         let FunctionArgument::Value { value_type, .. } = argument else {
-            return Err(FunctionBindingError::NoMatchingOverload);
+            return Err(FunctionBindingError::NoMatchingOverload.into());
         };
-        let DataType::List(item) = &value_type.data_type else {
-            return Err(FunctionBindingError::NoMatchingOverload);
+        let DataType::List(_) = value_type.data_type() else {
+            return Err(FunctionBindingError::NoMatchingOverload.into());
         };
         argument_types.push(FunctionArgumentType::Value(value_type.clone()));
         // The current UNNEST operator exposes nullable output slots so a
         // lateral left join can null-extend them without changing its binding.
-        if value_type.logical_type != ValueLogicalType::Physical {
-            return Err(FunctionBindingError::NoMatchingOverload);
+        if value_type.logical_type() != ValueLogicalType::Physical {
+            return Err(FunctionBindingError::NoMatchingOverload.into());
         }
-        let mut result = field_value_type(item).ok_or(FunctionBindingError::NoMatchingOverload)?;
-        result.nullable = true;
+        let mut result = with_binding_creation(borrow_creator(&mut creation), work, |c| {
+            c.child(value_type, 0)
+        })?
+        .ok_or(FunctionBindingError::NoMatchingOverload)?;
+        result = with_binding_creation(borrow_creator(&mut creation), work, |c| {
+            c.nullable(&result, true)
+        })?;
         result_columns.push(result);
     }
-    Ok(FunctionBindingSelection {
-        overload: FunctionOverloadId::try_new(BUILTIN_UNNEST_OVERLOAD_ID)
+    let overload = match original_overload {
+        None => FunctionOverloadId::try_new(BUILTIN_UNNEST_OVERLOAD_ID)
             .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
-        argument_types: argument_types.into_boxed_slice(),
-        result_type: FunctionResultType::Relation(result_columns.into_boxed_slice()),
+        // The actual immutable declaration, never the selected binding, owns
+        // this label. Validation creates no replacement identity backing.
+        Some(original) => original.clone_observed(|| work.step())?,
+    };
+    let argument_types = with_binding_creation(borrow_creator(&mut creation), work, |c| {
+        c.publish_arguments(argument_types)
+    })?;
+    let result_columns = with_binding_creation(borrow_creator(&mut creation), work, |c| {
+        c.publish_facts(result_columns)
+    })?;
+    Ok(FunctionBindingSelection {
+        overload,
+        argument_types,
+        result_type: FunctionResultType::Relation(result_columns),
         aggregate: None,
     })
 }
 
+fn bind_builtin_unnest(
+    request: FunctionBindingRequest<'_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FunctionBindingSelection, FunctionBindingError> {
+    bind_builtin_unnest_with_creation::<std::convert::Infallible>(request, None, None, work)
+        .map_err(crate::FunctionBindingCreationFailure::into_pure)
+}
+
 impl BuiltinUnnestResolver {
-    fn selection_at_overload_observed(
+    fn selection_at_overload_with_creation<H>(
         &self,
         overload: &FunctionOverloadId,
         request: FunctionBindingRequest<'_>,
+        original_overload: Option<&FunctionOverloadId>,
+        creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+    ) -> Result<FunctionBindingSelection, crate::FunctionBindingCreationFailure<H>> {
         request_types_with_constants(request, work)?;
         if overload.as_str() != BUILTIN_UNNEST_OVERLOAD_ID {
-            return Err(FunctionBindingError::UnknownOverload(overload.clone()));
+            return Err(FunctionBindingError::UnknownOverload(overload.clone()).into());
         }
-        bind_builtin_unnest(request, work)
+        bind_builtin_unnest_with_creation(request, original_overload, creation, work)
+    }
+    pub(crate) fn validate_selected_with_creator_in<H>(
+        &self,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        original_overload: &FunctionOverloadId,
+        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), crate::FunctionBindingCreationFailure<H>> {
+        self.validate_selected_with_creation(
+            selected,
+            request,
+            Some(original_overload),
+            Some(creation),
+            control,
+        )
+    }
+    fn validate_selected_with_creation<H>(
+        &self,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        original_overload: Option<&FunctionOverloadId>,
+        creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), crate::FunctionBindingCreationFailure<H>> {
+        binding_control::created_scope(control, |work| {
+            let expected = self.selection_at_overload_with_creation(
+                &selected.overload,
+                request,
+                original_overload,
+                creation,
+                work,
+            )?;
+            if binding_control::same_selection(selected, &expected, work)? {
+                Ok(())
+            } else {
+                Err(FunctionBindingError::InvalidBinding(
+                    "selected UNNEST binding differs from its declared overload".into(),
+                )
+                .into())
+            }
+        })
     }
 }
 
@@ -1521,7 +1903,6 @@ impl FunctionBindingResolver for BuiltinUnnestResolver {
             bind_builtin_unnest(request, work)
         })
     }
-
     fn select_at_overload_observed(
         &self,
         overload: &FunctionOverloadId,
@@ -1529,27 +1910,22 @@ impl FunctionBindingResolver for BuiltinUnnestResolver {
         control: &dyn PureCompileControl,
     ) -> Result<FunctionBindingSelection, FunctionBindingError> {
         binding_control::scope(control, |work| {
-            self.selection_at_overload_observed(overload, request, work)
+            self.selection_at_overload_with_creation::<std::convert::Infallible>(
+                overload, request, None, None, work,
+            )
+            .map_err(crate::FunctionBindingCreationFailure::into_pure)
         })
     }
-
     fn validate_selected(
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
-        binding_control::scope(control, |work| {
-            let expected =
-                self.selection_at_overload_observed(&selected.overload, request, work)?;
-            if binding_control::same_selection(selected, &expected, work)? {
-                Ok(())
-            } else {
-                Err(FunctionBindingError::InvalidBinding(
-                    "selected UNNEST binding differs from its declared overload".into(),
-                ))
-            }
-        })
+        self.validate_selected_with_creation::<std::convert::Infallible>(
+            selected, request, None, None, control,
+        )
+        .map_err(crate::FunctionBindingCreationFailure::into_pure)
     }
 }
 
@@ -1596,22 +1972,26 @@ pub fn dynamic_scalar_names() -> &'static [&'static str] {
     DYNAMIC_SCALAR_FUNCTIONS
 }
 
-pub(super) struct BuiltinDynamicScalarResolver {
+pub(crate) struct BuiltinDynamicScalarResolver {
     function_id: FunctionId,
     canonical_name: Box<str>,
     overload: FunctionOverloadId,
 }
 
-fn dynamic_argument_data_types(
+fn dynamic_argument_data_types_with_creation<H>(
     request: FunctionBindingRequest<'_>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<DataType>, FunctionBindingError> {
+    creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<Vec<DataType>, FunctionBindingCreationFailure<H>> {
+    with_binding_creation(creation, work, |cx| {
+        cx.array::<DataType>(request.arguments.len())
+    })?;
     let mut types = Vec::with_capacity(request.arguments.len());
     for argument in request.arguments {
         work.step()?;
         types.push(match argument {
-            FunctionArgument::Value { value_type, .. } => value_type.data_type.clone(),
-            FunctionArgument::Lambda { result_type, .. } => result_type.data_type.clone(),
+            FunctionArgument::Value { value_type, .. } => value_type.data_type().clone(),
+            FunctionArgument::Lambda { result_type, .. } => result_type.data_type().clone(),
         });
     }
     Ok(types)
@@ -1683,10 +2063,6 @@ fn struct_field_type(
     Ok(None)
 }
 
-fn list_type(item_type: DataType) -> DataType {
-    DataType::List(Arc::new(arrow_schema::Field::new("item", item_type, true)))
-}
-
 fn list_item_type(data_type: &DataType) -> Option<DataType> {
     match data_type {
         DataType::List(item) => Some(item.data_type().clone()),
@@ -1704,42 +2080,63 @@ fn map_key_value_types(data_type: &DataType) -> Option<(DataType, DataType)> {
     (fields.len() == 2).then(|| (fields[0].data_type().clone(), fields[1].data_type().clone()))
 }
 
-fn map_type(key_type: DataType, value_type: DataType) -> DataType {
-    DataType::Map(
-        Arc::new(arrow_schema::Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Arc::new(arrow_schema::Field::new("key", key_type, true)),
-                    Arc::new(arrow_schema::Field::new("value", value_type, true)),
-                ]
-                .into(),
-            ),
-            false,
-        )),
-        false,
-    )
+fn widen_dynamic_carriers<E>(
+    types: impl Iterator<Item = DataType>,
+    creation: &mut super::scalar_construction::ScalarConstruction<'_, E>,
+) -> Result<DataType, super::scalar_construction::Failure<E>> {
+    let mut types = types;
+    let Some(mut result) = types.next() else {
+        return Ok(DataType::Null);
+    };
+    for value in types {
+        result = creation.wider(&result, &value)?;
+    }
+    Ok(result)
 }
-
+fn list_type_with_construction<E>(
+    item: DataType,
+    creation: &mut super::scalar_construction::ScalarConstruction<'_, E>,
+) -> Result<DataType, super::scalar_construction::Failure<E>> {
+    Ok(DataType::List(creation.field("item", item, true)?))
+}
+fn map_type_with_construction<E>(
+    key: DataType,
+    value: DataType,
+    creation: &mut super::scalar_construction::ScalarConstruction<'_, E>,
+) -> Result<DataType, super::scalar_construction::Failure<E>> {
+    creation.array::<Arc<arrow_schema::Field>>(2)?;
+    let fields = vec![
+        creation.field("key", key, false)?,
+        creation.field("value", value, true)?,
+    ];
+    creation.arc_slice::<Arc<arrow_schema::Field>>(fields.len())?;
+    let entries = creation.field("entries", DataType::Struct(fields.into()), false)?;
+    Ok(DataType::Map(entries, false))
+}
 /// Type-only projection of owner-bound dynamic scalar rules. This exists for
 /// legacy explain/type inspection callers; executable SQL always resolves the
 /// full literal-aware binding below.
 pub fn dynamic_scalar_data_type(name: &str, argument_types: &[DataType]) -> Option<DataType> {
-    let widen_all = |types: &[DataType]| {
-        types
-            .iter()
-            .cloned()
-            .reduce(|left, right| novarocks_type_contract::wider_type(&left, &right))
-            .unwrap_or(DataType::Null)
-    };
-    Some(match name {
-        "__array_literal" => list_type(
-            argument_types
-                .iter()
-                .cloned()
-                .reduce(|left, right| novarocks_type_contract::wider_type(&left, &right))
-                .unwrap_or(DataType::Null),
+    dynamic_scalar_data_type_with_construction(
+        name,
+        argument_types,
+        &mut super::scalar_construction::ScalarConstruction::<std::convert::Infallible>::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            None,
         ),
+    )
+    .expect("pure dynamic carrier author")
+}
+fn dynamic_scalar_data_type_with_construction<E>(
+    name: &str,
+    argument_types: &[DataType],
+    creation: &mut super::scalar_construction::ScalarConstruction<'_, E>,
+) -> Result<Option<DataType>, super::scalar_construction::Failure<E>> {
+    Ok(Some(match name {
+        "__array_literal" => list_type_with_construction(
+            widen_dynamic_carriers(argument_types.iter().cloned(), creation)?,
+            creation,
+        )?,
         "__array_struct_subfield" => DataType::Null,
         "__iceberg_transform_void" => DataType::Null,
         "__struct_subfield" => DataType::Null,
@@ -1757,8 +2154,8 @@ pub fn dynamic_scalar_data_type(name: &str, argument_types: &[DataType]) -> Opti
             Some(_) => DataType::Float64,
             None => DataType::Null,
         },
-        "array_cum_sum" | "array_difference" => {
-            list_type(match argument_types.first().and_then(list_item_type) {
+        "array_cum_sum" | "array_difference" => list_type_with_construction(
+            match argument_types.first().and_then(list_item_type) {
                 Some(
                     DataType::Boolean
                     | DataType::Int8
@@ -1771,26 +2168,33 @@ pub fn dynamic_scalar_data_type(name: &str, argument_types: &[DataType]) -> Opti
                 }
                 Some(other) => other,
                 None => DataType::Null,
-            })
-        }
+            },
+            creation,
+        )?,
         "array_flatten" => match argument_types.first() {
             Some(DataType::List(outer)) => match outer.data_type() {
-                DataType::List(inner) => list_type(inner.data_type().clone()),
+                DataType::List(inner) => {
+                    list_type_with_construction(inner.data_type().clone(), creation)?
+                }
                 _ => argument_types[0].clone(),
             },
             _ => DataType::Null,
         },
-        "array_generate" => list_type(novarocks_type_contract::array_generate_item_type(
-            argument_types,
-        )?),
-        "array_intersect" => list_type(
-            argument_types
-                .iter()
-                .filter_map(list_item_type)
-                .reduce(|left, right| novarocks_type_contract::wider_type(&left, &right))
-                .unwrap_or(DataType::Null),
-        ),
-        "array_repeat" => list_type(argument_types.first().cloned().unwrap_or(DataType::Null)),
+        "array_generate" => {
+            let Some(item) = novarocks_type_contract::array_generate_item_type(argument_types)
+            else {
+                return Ok(None);
+            };
+            list_type_with_construction(item, creation)?
+        }
+        "array_intersect" => list_type_with_construction(
+            widen_dynamic_carriers(argument_types.iter().filter_map(list_item_type), creation)?,
+            creation,
+        )?,
+        "array_repeat" => list_type_with_construction(
+            argument_types.first().cloned().unwrap_or(DataType::Null),
+            creation,
+        )?,
         "array_sum" => match argument_types.first().and_then(list_item_type) {
             Some(
                 DataType::Boolean
@@ -1810,22 +2214,26 @@ pub fn dynamic_scalar_data_type(name: &str, argument_types: &[DataType]) -> Opti
             }
             _ => DataType::Null,
         },
-        "arrays_zip" => list_type(DataType::Struct(
-            argument_types
+        "arrays_zip" => {
+            creation.collected_vec::<Arc<arrow_schema::Field>>(argument_types.len())?;
+            let fields = argument_types
                 .iter()
                 .enumerate()
                 .map(|(index, data_type)| {
-                    Arc::new(arrow_schema::Field::new(
-                        format!("col{}", index + 1),
+                    let name = creation.col_name(index)?;
+                    creation.field_owned(
+                        name,
                         list_item_type(data_type).unwrap_or(DataType::Null),
                         true,
-                    ))
+                    )
                 })
-                .collect::<Vec<_>>()
-                .into(),
-        )),
+                .collect::<Result<Vec<_>, _>>()?;
+            creation.arc_slice::<Arc<arrow_schema::Field>>(fields.len())?;
+            let result = DataType::Struct(fields.into());
+            list_type_with_construction(result, creation)?
+        }
         "greatest" | "least" => {
-            let result = widen_all(argument_types);
+            let result = widen_dynamic_carriers(argument_types.iter().cloned(), creation)?;
             if result == DataType::Date32 {
                 DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
             } else {
@@ -1833,183 +2241,244 @@ pub fn dynamic_scalar_data_type(name: &str, argument_types: &[DataType]) -> Opti
             }
         }
         "map" => {
+            creation.collected_vec::<DataType>(argument_types.len().div_ceil(2))?;
             let keys = argument_types
                 .iter()
                 .step_by(2)
                 .cloned()
                 .collect::<Vec<_>>();
+            creation.collected_vec::<DataType>(argument_types.len() / 2)?;
             let values = argument_types
                 .iter()
                 .skip(1)
                 .step_by(2)
                 .cloned()
                 .collect::<Vec<_>>();
-            map_type(widen_all(&keys), widen_all(&values))
+            map_type_with_construction(
+                widen_dynamic_carriers(keys.iter().cloned(), creation)?,
+                widen_dynamic_carriers(values.iter().cloned(), creation)?,
+                creation,
+            )?
         }
         "map_concat" => {
             let mut entries = argument_types.iter().filter_map(map_key_value_types);
             let Some((mut key, mut value)) = entries.next() else {
-                return Some(DataType::Null);
+                return Ok(Some(DataType::Null));
             };
             for (next_key, next_value) in entries {
-                key = novarocks_type_contract::wider_type(&key, &next_key);
-                value = novarocks_type_contract::wider_type(&value, &next_value);
+                key = creation.wider(&key, &next_key)?;
+                value = creation.wider(&value, &next_value)?;
             }
-            map_type(key, value)
+            map_type_with_construction(key, value, creation)?
         }
-        "map_entries" => argument_types
-            .first()
-            .and_then(|data_type| match data_type {
-                DataType::Map(entries, _) => Some(list_type(entries.data_type().clone())),
-                _ => None,
-            })
-            .unwrap_or(DataType::Null),
+        "map_entries" => match argument_types.first() {
+            Some(DataType::Map(entries, _)) => {
+                list_type_with_construction(entries.data_type().clone(), creation)?
+            }
+            _ => DataType::Null,
+        },
         "map_from_arrays" => match (argument_types.first(), argument_types.get(1)) {
             (Some(DataType::List(keys)), Some(DataType::List(values))) => {
-                map_type(keys.data_type().clone(), values.data_type().clone())
+                map_type_with_construction(
+                    keys.data_type().clone(),
+                    values.data_type().clone(),
+                    creation,
+                )?
             }
             _ => DataType::Null,
         },
         "md5sum_numeric" | "xx_hash3_128" => {
             DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH)
         }
-        "named_struct" => DataType::Struct(
-            argument_types
+        "named_struct" => {
+            creation.collected_vec::<Arc<arrow_schema::Field>>(argument_types.len() / 2)?;
+            let fields = argument_types
                 .iter()
                 .skip(1)
                 .step_by(2)
                 .enumerate()
                 .map(|(index, data_type)| {
-                    Arc::new(arrow_schema::Field::new(
-                        format!("col{}", index + 1),
-                        data_type.clone(),
-                        true,
-                    ))
+                    let name = creation.col_name(index)?;
+                    creation.field_owned(name, data_type.clone(), true)
                 })
-                .collect::<Vec<_>>()
-                .into(),
-        ),
+                .collect::<Result<Vec<_>, _>>()?;
+            creation.arc_slice::<Arc<arrow_schema::Field>>(fields.len())?;
+            let result = DataType::Struct(fields.into());
+            result
+        }
         "null_or_empty" => DataType::Boolean,
-        "row" | "struct" => DataType::Struct(
-            argument_types
+        "row" | "struct" => {
+            creation.collected_vec::<Arc<arrow_schema::Field>>(argument_types.len())?;
+            let fields = argument_types
                 .iter()
                 .enumerate()
                 .map(|(index, data_type)| {
-                    Arc::new(arrow_schema::Field::new(
-                        format!("col{}", index + 1),
-                        data_type.clone(),
-                        true,
-                    ))
+                    let name = creation.col_name(index)?;
+                    creation.field_owned(name, data_type.clone(), true)
                 })
-                .collect::<Vec<_>>()
-                .into(),
-        ),
-        "str_to_map" => map_type(DataType::Utf8, DataType::Utf8),
+                .collect::<Result<Vec<_>, _>>()?;
+            creation.arc_slice::<Arc<arrow_schema::Field>>(fields.len())?;
+            let result = DataType::Struct(fields.into());
+            result
+        }
+        "str_to_map" => map_type_with_construction(DataType::Utf8, DataType::Utf8, creation)?,
         "try_variant_get" | "variant_get" => DataType::LargeBinary,
         "array_map" | "array_sort_lambda" | "map_apply" | "transform_keys" | "transform_values" => {
-            return None;
+            return Ok(None);
         }
-        _ => return None,
-    })
+        _ => return Ok(None),
+    }))
 }
 
-fn full_map_type(key: &FunctionValueType, value: &FunctionValueType) -> DataType {
-    DataType::Map(
-        Arc::new(arrow_schema::Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Arc::new(value_field("key", key, true)),
-                    Arc::new(value_field("value", value, true)),
-                ]
-                .into(),
-            ),
-            false,
-        )),
-        false,
-    )
-}
-
-fn fold_value_types<'a>(
+fn fold_value_types_with_creation<'a, H>(
     values: impl Iterator<Item = &'a FunctionValueType>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<FunctionValueType, FunctionBindingError> {
-    let mut result = FunctionValueType::new(DataType::Null, true);
+    mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<FunctionValueType, FunctionBindingCreationFailure<H>> {
+    let mut result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+        cx.value(DataType::Null, true, ValueLogicalType::Physical)
+    })?;
     for value in values {
         work.step()?;
-        result = merge_value_types(&result, value, true)
-            .ok_or(FunctionBindingError::NoMatchingOverload)?;
+        result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+            super::signature::merge_value_types_with_construction(&result, value, true, cx)
+        })?
+        .ok_or(FunctionBindingError::NoMatchingOverload)?;
     }
     Ok(result)
 }
-
-fn full_list_item(ty: &FunctionValueType) -> Result<FunctionValueType, FunctionBindingError> {
-    if ty.logical_type != ValueLogicalType::Physical {
-        return Err(FunctionBindingError::NoMatchingOverload);
+fn full_list_item_with_creation<H>(
+    ty: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+    creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<FunctionValueType, FunctionBindingCreationFailure<H>> {
+    if ty.logical_type() != ValueLogicalType::Physical {
+        return Err(FunctionBindingError::NoMatchingOverload.into());
     }
-    match &ty.data_type {
-        DataType::List(item) => {
-            field_value_type(item).ok_or(FunctionBindingError::NoMatchingOverload)
-        }
-        DataType::Null => Ok(FunctionValueType::new(DataType::Null, true)),
-        _ => Err(FunctionBindingError::NoMatchingOverload),
+    match ty.data_type() {
+        DataType::List(_) => with_binding_creation(creation, work, |cx| cx.child(ty, 0))?
+            .ok_or_else(|| FunctionBindingError::NoMatchingOverload.into()),
+        DataType::Null => with_binding_creation(creation, work, |cx| {
+            cx.value(DataType::Null, true, ValueLogicalType::Physical)
+        }),
+        _ => Err(FunctionBindingError::NoMatchingOverload.into()),
     }
 }
-
-fn full_map_items(
+fn full_map_items_with_creation<H>(
     ty: &FunctionValueType,
-) -> Result<(FunctionValueType, FunctionValueType), FunctionBindingError> {
-    if ty.logical_type != ValueLogicalType::Physical {
-        return Err(FunctionBindingError::NoMatchingOverload);
+    work: &mut CompileCheckpoints<'_>,
+    mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<(FunctionValueType, FunctionValueType), FunctionBindingCreationFailure<H>> {
+    if ty.logical_type() != ValueLogicalType::Physical {
+        return Err(FunctionBindingError::NoMatchingOverload.into());
     }
-    let DataType::Map(entries, _) = &ty.data_type else {
-        return Err(FunctionBindingError::NoMatchingOverload);
+    let DataType::Map(entries, _) = ty.data_type() else {
+        return Err(FunctionBindingError::NoMatchingOverload.into());
     };
     let DataType::Struct(fields) = entries.data_type() else {
-        return Err(FunctionBindingError::NoMatchingOverload);
+        return Err(FunctionBindingError::NoMatchingOverload.into());
     };
     if fields.len() != 2 {
-        return Err(FunctionBindingError::NoMatchingOverload);
+        return Err(FunctionBindingError::NoMatchingOverload.into());
     }
-    Ok((
-        field_value_type(&fields[0]).ok_or(FunctionBindingError::NoMatchingOverload)?,
-        field_value_type(&fields[1]).ok_or(FunctionBindingError::NoMatchingOverload)?,
-    ))
+    let key = with_binding_creation(borrow_creator(&mut creation), work, |cx| cx.child(ty, 0))?
+        .ok_or(FunctionBindingError::NoMatchingOverload)?;
+    let value = with_binding_creation(borrow_creator(&mut creation), work, |cx| cx.child(ty, 1))?
+        .ok_or(FunctionBindingError::NoMatchingOverload)?;
+    Ok((key, value))
 }
 
-fn bind_dynamic_scalar_result(
+fn dynamic_value<H>(
+    ty: DataType,
+    nullable: bool,
+    domain: ValueLogicalType,
+    work: &mut CompileCheckpoints<'_>,
+    creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<FunctionValueType, FunctionBindingCreationFailure<H>> {
+    with_binding_creation(creation, work, |cx| cx.value(ty, nullable, domain))
+}
+fn dynamic_nullable<H>(
+    ty: &FunctionValueType,
+    nullable: bool,
+    work: &mut CompileCheckpoints<'_>,
+    creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<FunctionValueType, FunctionBindingCreationFailure<H>> {
+    with_binding_creation(creation, work, |cx| cx.nullable(ty, nullable))
+}
+fn dynamic_list<H>(
+    item: &FunctionValueType,
+    nullable: bool,
+    work: &mut CompileCheckpoints<'_>,
+    creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<FunctionValueType, FunctionBindingCreationFailure<H>> {
+    with_binding_creation(creation, work, |cx| {
+        super::signature::declared_list_with_construction(item, nullable, cx)
+    })
+}
+fn dynamic_map<H>(
+    key: &FunctionValueType,
+    value: &FunctionValueType,
+    nullable: bool,
+    work: &mut CompileCheckpoints<'_>,
+    creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<FunctionValueType, FunctionBindingCreationFailure<H>> {
+    with_binding_creation(creation, work, |cx| {
+        super::signature::declared_map_with_construction(key, value, nullable, cx)
+    })
+}
+fn dynamic_struct<H>(
+    fields: Vec<(String, FunctionValueType)>,
+    nullable: bool,
+    work: &mut CompileCheckpoints<'_>,
+    creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<FunctionValueType, FunctionBindingCreationFailure<H>> {
+    with_binding_creation(creation, work, |cx| {
+        super::signature::declared_struct_with_construction(fields, nullable, cx)
+    })
+}
+fn bind_dynamic_scalar_result_with_creation<H>(
     function_id: &FunctionId,
     name: &str,
     request: FunctionBindingRequest<'_>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<FunctionValueType, FunctionBindingError> {
+    mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<FunctionValueType, FunctionBindingCreationFailure<H>> {
     if matches!(name, "round" | "truncate") {
-        return super::rounding_binding::bind_result(name, request, work);
+        return super::rounding_binding::bind_result_with_creation(
+            name,
+            request,
+            work,
+            borrow_creator(&mut creation),
+        );
     }
     if function_id.as_str() == "builtin.scalar/__array_literal/v1"
         && request.arguments.is_empty()
         && let Some(expected) = request.expected_result_type
     {
-        if expected.logical_type != ValueLogicalType::Physical
-            || expected.nullable
-            || !matches!(expected.data_type, DataType::List(_))
+        if expected.logical_type() != ValueLogicalType::Physical
+            || expected.nullable()
+            || !matches!(expected.data_type(), DataType::List(_))
         {
-            return Err(FunctionBindingError::NoMatchingOverload);
+            return Err(FunctionBindingError::NoMatchingOverload.into());
         }
         binding_control::value_type(expected, work)?;
         return Ok(expected.clone());
     }
-    let argument_types = dynamic_argument_data_types(request, work)?;
-    validate_builtin_selected_domain(name, &argument_types, work)?;
+    let argument_types =
+        dynamic_argument_data_types_with_creation(request, work, borrow_creator(&mut creation))?;
+    validate_builtin_selected_domain(name, ScalarCarriers::from_data_types(&argument_types), work)?;
     let mut result = match name {
-        "array_generate" => list_type(
-            novarocks_type_contract::array_generate_item_type(&argument_types)
-                .ok_or(FunctionBindingError::NoMatchingOverload)?,
-        ),
+        "array_generate" => {
+            let item = novarocks_type_contract::array_generate_item_type(&argument_types)
+                .ok_or(FunctionBindingError::NoMatchingOverload)?;
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                list_type_with_construction(item, cx)
+            })?
+        }
         "array_map" => {
             let Some(FunctionArgument::Lambda { result_type, .. }) = request.arguments.first()
             else {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             };
             // A bare NULL is a value of whatever the position holds, exactly
             // as `TypeSpec::List` reads it in a declared signature. Demanding
@@ -2022,26 +2491,20 @@ fn bind_dynamic_scalar_result(
                         matches!(
                             argument,
                             FunctionArgument::Value {
-                                value_type: FunctionValueType {
-                                    logical_type:
-                                        novarocks_type_contract::ValueLogicalType::Physical,
-                                    data_type: DataType::List(_) | DataType::Null,
-                                    ..
-                                },
+                                value_type,
                                 ..
-                            }
+                            } if value_type.logical_type() == ValueLogicalType::Physical
+                                && matches!(value_type.data_type(),DataType::List(_) | DataType::Null)
                         )
                     },
                     work,
                 )?
             {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             }
-            DataType::List(Arc::new(arrow_schema::Field::new(
-                "item",
-                result_type.data_type.clone(),
-                true,
-            )))
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                list_type_with_construction(result_type.data_type().clone(), cx)
+            })?
         }
         "array_sort_lambda" => {
             let [
@@ -2049,12 +2512,12 @@ fn bind_dynamic_scalar_result(
                 FunctionArgument::Lambda { .. },
             ] = request.arguments
             else {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             };
-            if !matches!(value_type.data_type, DataType::List(_)) {
-                return Err(FunctionBindingError::NoMatchingOverload);
+            if !matches!(value_type.data_type(), DataType::List(_)) {
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             }
-            value_type.data_type.clone()
+            value_type.data_type().clone()
         }
         "__array_literal" => {
             // The element type is the one every element fits in, not the one
@@ -2068,15 +2531,21 @@ fn bind_dynamic_scalar_result(
                 work.step()?;
                 item_type = Some(match item_type {
                     None => argument.clone(),
-                    Some(left) => novarocks_type_contract::wider_type(&left, argument),
+                    Some(left) => {
+                        with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                            cx.wider(&left, argument)
+                        })?
+                    }
                 });
             }
             let item_type = item_type.unwrap_or(DataType::Null);
-            DataType::List(Arc::new(arrow_schema::Field::new("item", item_type, true)))
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                list_type_with_construction(item_type, cx)
+            })?
         }
         "__struct_subfield" => {
             let Some(field_name) = utf8_constant(request.arguments.get(1), work)? else {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             };
             struct_field_type(
                 argument_types.first().unwrap_or(&DataType::Null),
@@ -2087,34 +2556,42 @@ fn bind_dynamic_scalar_result(
         }
         "__array_struct_subfield" => {
             let Some(field_name) = utf8_constant(request.arguments.get(1), work)? else {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             };
             let Some(DataType::List(item)) = argument_types.first() else {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             };
             let field_type = struct_field_type(item.data_type(), field_name, work)?
                 .ok_or(FunctionBindingError::NoMatchingOverload)?;
-            DataType::List(Arc::new(arrow_schema::Field::new("item", field_type, true)))
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                list_type_with_construction(field_type, cx)
+            })?
         }
         "named_struct" => {
             if request.arguments.is_empty() || !request.arguments.len().is_multiple_of(2) {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             }
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.array::<Arc<arrow_schema::Field>>(request.arguments.len() / 2)
+            })?;
             let mut fields = Vec::with_capacity(request.arguments.len() / 2);
             for pair in request.arguments.chunks_exact(2) {
                 work.step()?;
                 let Some(field_name) = utf8_constant(pair.first(), work)? else {
-                    return Err(FunctionBindingError::NoMatchingOverload);
+                    return Err(FunctionBindingError::NoMatchingOverload.into());
                 };
                 let FunctionArgument::Value { value_type, .. } = &pair[1] else {
-                    return Err(FunctionBindingError::NoMatchingOverload);
+                    return Err(FunctionBindingError::NoMatchingOverload.into());
                 };
-                fields.push(Arc::new(arrow_schema::Field::new(
-                    field_name,
-                    value_type.data_type.clone(),
-                    true,
-                )));
+                fields.push(with_binding_creation(
+                    borrow_creator(&mut creation),
+                    work,
+                    |cx| cx.field(field_name, value_type.data_type().clone(), true),
+                )?);
             }
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.arc_slice::<Arc<arrow_schema::Field>>(fields.len())
+            })?;
             DataType::Struct(fields.into())
         }
         "map_apply" | "transform_keys" | "transform_values" => {
@@ -2123,18 +2600,20 @@ fn bind_dynamic_scalar_result(
                 FunctionArgument::Value { value_type, .. },
             ] = request.arguments
             else {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             };
-            if !matches!(value_type.data_type, DataType::Map(_, _))
-                || !matches!(result_type.data_type, DataType::Map(_, _))
+            if !matches!(value_type.data_type(), DataType::Map(_, _))
+                || !matches!(result_type.data_type(), DataType::Map(_, _))
             {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             }
-            result_type.data_type.clone()
+            result_type.data_type().clone()
         }
         other => {
             work.flush()?;
-            let result = dynamic_scalar_data_type(other, &argument_types);
+            let result = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                dynamic_scalar_data_type_with_construction(other, &argument_types, cx)
+            })?;
             work.step()?;
             result.ok_or(FunctionBindingError::UnknownFunction)?
         }
@@ -2143,12 +2622,15 @@ fn bind_dynamic_scalar_result(
         if !(2..=3).contains(&request.arguments.len())
             || utf8_constant(request.arguments.get(1), work)?.is_none()
         {
-            return Err(FunctionBindingError::NoMatchingOverload);
+            return Err(FunctionBindingError::NoMatchingOverload.into());
         }
         if request.arguments.len() == 3 {
             let Some(target) = utf8_constant(request.arguments.get(2), work)? else {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             };
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.array::<u8>(target.trim().len())
+            })?;
             result = novarocks_type_contract::variant_get_target_type(target)
                 .map_err(|message| FunctionBindingError::InvalidBinding(message.into()))?;
         }
@@ -2158,41 +2640,77 @@ fn bind_dynamic_scalar_result(
         "__struct_subfield" | "__array_struct_subfield" => true,
         _ => scalar_result_nullable(name, request, work)?,
     };
-    let value = |index: usize| match request.arguments.get(index) {
-        Some(FunctionArgument::Value { value_type, .. }) => Ok(value_type),
-        _ => Err(FunctionBindingError::NoMatchingOverload),
+    let value = |index: usize| -> Result<&FunctionValueType, FunctionBindingError> {
+        match request.arguments.get(index) {
+            Some(FunctionArgument::Value { value_type, .. }) => Ok(value_type),
+            _ => Err(FunctionBindingError::NoMatchingOverload),
+        }
     };
-    let mut full_result = FunctionValueType::new(result, nullable);
+    let mut full_result = dynamic_value(
+        result,
+        nullable,
+        ValueLogicalType::Physical,
+        work,
+        borrow_creator(&mut creation),
+    )?;
     match name {
         "__array_literal" => {
-            let arguments = dynamic_values(request, work)?;
-            let item = fold_value_types(arguments.iter().copied(), work)?;
-            full_result.data_type = DataType::List(Arc::new(value_field("item", &item, true)));
+            let arguments =
+                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
+            let item = fold_value_types_with_creation(
+                arguments.iter().copied(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
+            full_result = dynamic_list(
+                &item,
+                full_result.nullable(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
         }
         "array_repeat" => {
-            if value(1)?.logical_type != ValueLogicalType::Physical {
-                return Err(FunctionBindingError::NoMatchingOverload);
+            if value(1)?.logical_type() != ValueLogicalType::Physical {
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             }
-            full_result.data_type = DataType::List(Arc::new(value_field("item", value(0)?, true)));
+            full_result = dynamic_list(
+                value(0)?,
+                full_result.nullable(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
         }
         "array_intersect" => {
-            let items = dynamic_values(request, work)?
+            let arguments =
+                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.collected_vec::<FunctionValueType>(arguments.len())
+            })?;
+            let items = arguments
                 .into_iter()
                 .map(|value| {
                     work.step()?;
-                    full_list_item(value)
+                    full_list_item_with_creation(value, work, borrow_creator(&mut creation))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let item = fold_value_types(items.iter(), work)?;
-            full_result.data_type = DataType::List(Arc::new(value_field("item", &item, true)));
+            let item =
+                fold_value_types_with_creation(items.iter(), work, borrow_creator(&mut creation))?;
+            full_result = dynamic_list(
+                &item,
+                full_result.nullable(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
         }
         "array_flatten" => {
-            let outer = full_list_item(value(0)?)?;
-            full_result.data_type = DataType::List(Arc::new(value_field(
-                "item",
-                &full_list_item(&outer)?,
-                true,
-            )));
+            let outer =
+                full_list_item_with_creation(value(0)?, work, borrow_creator(&mut creation))?;
+            full_result = dynamic_list(
+                &full_list_item_with_creation(&outer, work, borrow_creator(&mut creation))?,
+                full_result.nullable(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
         }
         "array_map" => {
             let Some(FunctionArgument::Lambda {
@@ -2200,122 +2718,203 @@ fn bind_dynamic_scalar_result(
                 result_type,
             }) = request.arguments.first()
             else {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             };
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.collected_vec::<FunctionValueType>(request.arguments.len() - 1)
+            })?;
             let items = request.arguments[1..]
                 .iter()
                 .map(|argument| {
                     work.step()?;
                     match argument {
-                        FunctionArgument::Value { value_type, .. } => full_list_item(value_type),
-                        _ => Err(FunctionBindingError::NoMatchingOverload),
+                        FunctionArgument::Value { value_type, .. } => full_list_item_with_creation(
+                            value_type,
+                            work,
+                            borrow_creator(&mut creation),
+                        ),
+                        _ => Err(FunctionBindingError::NoMatchingOverload.into()),
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             if items.len() != parameter_types.len() {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             }
             for (item, parameter) in items.iter().zip(parameter_types) {
                 work.step()?;
-                // Preserve the existing lambda source-domain policy. Recursive
-                // carrier equality remains an opaque legacy operation here.
-                if item.data_type != DataType::Null
-                    && (item.logical_type != parameter.logical_type
-                        || item.data_type != parameter.data_type)
+                // The lambda receives the complete selected item domain.
+                if item.data_type() != &DataType::Null
+                    && (!item
+                        .same_value_domain_observed::<crate::KernelFailure>(parameter, || {
+                            work.step().map_err(crate::kernel_control::compile_failure)
+                        })
+                        .map_err(binding_control::type_error)?
+                        || item.data_type() != parameter.data_type())
                 {
-                    return Err(FunctionBindingError::NoMatchingOverload);
+                    return Err(FunctionBindingError::NoMatchingOverload.into());
                 }
             }
-            full_result.data_type =
-                DataType::List(Arc::new(value_field("item", result_type, true)));
+            full_result = dynamic_list(
+                result_type,
+                full_result.nullable(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
         }
         "array_sort_lambda" => {
-            let _ = full_list_item(value(0)?)?;
+            let _ = full_list_item_with_creation(value(0)?, work, borrow_creator(&mut creation))?;
             full_result = value(0)?.clone();
         }
         "arrays_zip" => {
-            let items = dynamic_values(request, work)?
+            let arguments =
+                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.collected_vec::<FunctionValueType>(arguments.len())
+            })?;
+            let items = arguments
                 .into_iter()
                 .map(|value| {
                     work.step()?;
-                    full_list_item(value)
+                    full_list_item_with_creation(value, work, borrow_creator(&mut creation))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            full_result.data_type = DataType::List(Arc::new(arrow_schema::Field::new(
-                "item",
-                DataType::Struct(
-                    items
-                        .iter()
-                        .enumerate()
-                        .map(|(index, item)| {
-                            work.step()?;
-                            Ok(Arc::new(value_field(
-                                &format!("col{}", index + 1),
-                                item,
-                                true,
-                            )))
-                        })
-                        .collect::<Result<Vec<_>, FunctionBindingError>>()?
-                        .into(),
-                ),
-                true,
-            )));
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.collected_vec::<(String, FunctionValueType)>(items.len())
+            })?;
+            let fields = items
+                .into_iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    work.step()?;
+                    Ok((
+                        with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                            cx.col_name(index)
+                        })?,
+                        item,
+                    ))
+                })
+                .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?;
+            full_result = dynamic_list(
+                &dynamic_struct(fields, true, work, borrow_creator(&mut creation))?,
+                full_result.nullable(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
         }
         "greatest" | "least" => {
-            full_result = fold_value_types(dynamic_values(request, work)?.into_iter(), work)?;
-            if full_result.data_type == DataType::Date32 {
-                full_result.data_type =
-                    DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None);
+            full_result = fold_value_types_with_creation(
+                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?
+                    .into_iter(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
+            if full_result.data_type() == &DataType::Date32 {
+                full_result = dynamic_value(
+                    DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                    full_result.nullable(),
+                    full_result.logical_type(),
+                    work,
+                    borrow_creator(&mut creation),
+                )?;
             }
         }
         "map" => {
-            let arguments = dynamic_values(request, work)?;
-            let key = fold_value_types(arguments.iter().step_by(2).copied(), work)?;
-            let value = fold_value_types(arguments.iter().skip(1).step_by(2).copied(), work)?;
-            full_result.data_type = full_map_type(&key, &value);
+            let arguments =
+                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
+            let key = fold_value_types_with_creation(
+                arguments.iter().step_by(2).copied(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
+            let value = fold_value_types_with_creation(
+                arguments.iter().skip(1).step_by(2).copied(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
+            full_result = dynamic_map(
+                &key,
+                &value,
+                full_result.nullable(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
         }
         "map_from_arrays" => {
-            full_result.data_type =
-                full_map_type(&full_list_item(value(0)?)?, &full_list_item(value(1)?)?)
+            full_result = dynamic_map(
+                &full_list_item_with_creation(value(0)?, work, borrow_creator(&mut creation))?,
+                &full_list_item_with_creation(value(1)?, work, borrow_creator(&mut creation))?,
+                full_result.nullable(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
         }
         "map_concat" => {
-            let pairs = dynamic_values(request, work)?
+            let arguments =
+                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.collected_vec::<(FunctionValueType, FunctionValueType)>(arguments.len())
+            })?;
+            let pairs = arguments
                 .into_iter()
                 .map(|value| {
                     work.step()?;
-                    full_map_items(value)
+                    full_map_items_with_creation(value, work, borrow_creator(&mut creation))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             if pairs.is_empty() {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             }
-            full_result.data_type = full_map_type(
-                &fold_value_types(pairs.iter().map(|pair| &pair.0), work)?,
-                &fold_value_types(pairs.iter().map(|pair| &pair.1), work)?,
-            );
+            full_result = dynamic_map(
+                &fold_value_types_with_creation(
+                    pairs.iter().map(|pair| &pair.0),
+                    work,
+                    borrow_creator(&mut creation),
+                )?,
+                &fold_value_types_with_creation(
+                    pairs.iter().map(|pair| &pair.1),
+                    work,
+                    borrow_creator(&mut creation),
+                )?,
+                full_result.nullable(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
         }
         "map_entries" => {
-            let (key, value) = full_map_items(value(0)?)?;
-            let DataType::Map(entries, _) = full_map_type(&key, &value) else {
-                unreachable!("map constructor");
-            };
-            full_result.data_type = DataType::List(Arc::new(arrow_schema::Field::new(
-                "item",
-                entries.data_type().clone(),
+            let (key, value) =
+                full_map_items_with_creation(value(0)?, work, borrow_creator(&mut creation))?;
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.array::<(String, FunctionValueType)>(2)?;
+                cx.array::<u8>("key".len())?;
+                cx.array::<u8>("value".len())
+            })?;
+            let entries = dynamic_struct(
+                vec![("key".into(), key), ("value".into(), value)],
                 true,
-            )));
+                work,
+                borrow_creator(&mut creation),
+            )?;
+            full_result = dynamic_list(
+                &entries,
+                full_result.nullable(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
         }
         "map_apply" | "transform_keys" | "transform_values" => {
-            let _ = full_map_items(value(1)?)?;
+            let _ = full_map_items_with_creation(value(1)?, work, borrow_creator(&mut creation))?;
             let Some(FunctionArgument::Lambda { result_type, .. }) = request.arguments.first()
             else {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             };
-            let _ = full_map_items(result_type)?;
+            let _ = full_map_items_with_creation(result_type, work, borrow_creator(&mut creation))?;
             full_result = result_type.clone();
         }
         "named_struct" | "row" | "struct" => {
             let fields = if name == "named_struct" {
+                with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                    cx.collected_vec::<(String, FunctionValueType)>(request.arguments.len() / 2)
+                })?;
                 request
                     .arguments
                     .chunks_exact(2)
@@ -2324,107 +2923,149 @@ fn bind_dynamic_scalar_result(
                         let name = utf8_constant(pair.first(), work)?
                             .ok_or(FunctionBindingError::NoMatchingOverload)?;
                         let FunctionArgument::Value { value_type, .. } = &pair[1] else {
-                            return Err(FunctionBindingError::NoMatchingOverload);
+                            return Err(FunctionBindingError::NoMatchingOverload.into());
                         };
-                        Ok(Arc::new(value_field(name, value_type, true)))
+                        with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                            cx.array::<u8>(name.len())
+                        })?;
+                        Ok((name.to_string(), value_type.clone()))
                     })
-                    .collect::<Result<Vec<_>, _>>()?
+                    .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?
             } else {
-                dynamic_values(request, work)?
+                let arguments =
+                    dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
+                with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                    cx.collected_vec::<(String, FunctionValueType)>(arguments.len())
+                })?;
+                arguments
                     .iter()
                     .enumerate()
                     .map(|(index, ty)| {
                         work.step()?;
-                        Ok(Arc::new(value_field(
-                            &format!("col{}", index + 1),
-                            ty,
-                            true,
-                        )))
+                        Ok((
+                            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                                cx.col_name(index)
+                            })?,
+                            (*ty).clone(),
+                        ))
                     })
-                    .collect::<Result<Vec<_>, FunctionBindingError>>()?
+                    .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?
             };
-            full_result.data_type = DataType::Struct(fields.into());
+            full_result = dynamic_struct(
+                fields,
+                full_result.nullable(),
+                work,
+                borrow_creator(&mut creation),
+            )?;
         }
         "__struct_subfield" | "__array_struct_subfield" => {
             let name = utf8_constant(request.arguments.get(1), work)?
                 .ok_or(FunctionBindingError::NoMatchingOverload)?;
-            if value(1)?.logical_type != ValueLogicalType::Physical {
-                return Err(FunctionBindingError::NoMatchingOverload);
+            if value(1)?.logical_type() != ValueLogicalType::Physical {
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             }
             let source = if name.is_empty() {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             } else if self_array_subfield(function_id) {
-                full_list_item(value(0)?)?
+                full_list_item_with_creation(value(0)?, work, borrow_creator(&mut creation))?
             } else {
                 value(0)?.clone()
             };
-            if source.logical_type != ValueLogicalType::Physical {
-                return Err(FunctionBindingError::NoMatchingOverload);
+            if source.logical_type() != ValueLogicalType::Physical {
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             }
-            let DataType::Struct(fields) = &source.data_type else {
-                return Err(FunctionBindingError::NoMatchingOverload);
+            let DataType::Struct(fields) = source.data_type() else {
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             };
-            let mut field = None;
-            for candidate in fields {
+            let mut ordinal = None;
+            for (index, candidate) in fields.iter().enumerate() {
                 work.step()?;
                 if candidate.name().eq_ignore_ascii_case(name) {
-                    field = Some(candidate);
+                    ordinal = Some(index);
                     break;
                 }
             }
-            let field = field.ok_or(FunctionBindingError::NoMatchingOverload)?;
-            let projected =
-                field_value_type(field).ok_or(FunctionBindingError::NoMatchingOverload)?;
+            let ordinal = ordinal.ok_or(FunctionBindingError::NoMatchingOverload)?;
+            let projected = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.child(&source, ordinal)
+            })?
+            .ok_or(FunctionBindingError::NoMatchingOverload)?;
             if self_array_subfield(function_id) {
-                full_result.data_type =
-                    DataType::List(Arc::new(value_field("item", &projected, true)));
+                full_result = dynamic_list(
+                    &projected,
+                    full_result.nullable(),
+                    work,
+                    borrow_creator(&mut creation),
+                )?;
             } else {
                 full_result = projected;
             }
         }
         "array_sum" | "array_avg" | "array_cum_sum" | "array_difference" => {
-            let item = full_list_item(value(0)?)?;
-            let largeint = name == "array_sum" && item.logical_type == ValueLogicalType::LargeInt;
+            let item =
+                full_list_item_with_creation(value(0)?, work, borrow_creator(&mut creation))?;
+            let largeint = name == "array_sum" && item.logical_type() == ValueLogicalType::LargeInt;
             if !largeint
-                && (item.logical_type != ValueLogicalType::Physical
-                    || matches!(item.data_type, DataType::FixedSizeBinary(_)))
+                && (item.logical_type() != ValueLogicalType::Physical
+                    || matches!(item.data_type(), DataType::FixedSizeBinary(_)))
             {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             }
             if largeint {
-                full_result.logical_type = ValueLogicalType::LargeInt;
+                full_result = dynamic_value(
+                    full_result.data_type().clone(),
+                    full_result.nullable(),
+                    ValueLogicalType::LargeInt,
+                    work,
+                    borrow_creator(&mut creation),
+                )?;
             }
         }
         "variant_get" | "try_variant_get" => {
-            if value(0)?.logical_type != ValueLogicalType::Variant
-                && value(0)?.data_type != DataType::Null
+            if value(0)?.logical_type() != ValueLogicalType::Variant
+                && value(0)?.data_type() != &DataType::Null
             {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             }
-            if value(1)?.logical_type != ValueLogicalType::Physical
+            if value(1)?.logical_type() != ValueLogicalType::Physical
                 || (request.arguments.len() == 3
-                    && value(2)?.logical_type != ValueLogicalType::Physical)
+                    && value(2)?.logical_type() != ValueLogicalType::Physical)
             {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             }
             if request.arguments.len() == 2 {
-                full_result.logical_type = ValueLogicalType::Variant;
+                full_result = dynamic_value(
+                    full_result.data_type().clone(),
+                    full_result.nullable(),
+                    ValueLogicalType::Variant,
+                    work,
+                    borrow_creator(&mut creation),
+                )?;
             }
         }
-        "md5sum_numeric" | "xx_hash3_128" => full_result.logical_type = ValueLogicalType::LargeInt,
+        "md5sum_numeric" | "xx_hash3_128" => {
+            full_result = dynamic_value(
+                full_result.data_type().clone(),
+                full_result.nullable(),
+                ValueLogicalType::LargeInt,
+                work,
+                borrow_creator(&mut creation),
+            )?;
+        }
         "array_generate" => {
-            let values = dynamic_values(request, work)?;
+            let values =
+                dynamic_values_with_creation(request, work, borrow_creator(&mut creation))?;
             if !observed_all(
                 values.into_iter(),
-                |ty| ty.logical_type == ValueLogicalType::Physical,
+                |ty| ty.logical_type() == ValueLogicalType::Physical,
                 work,
             )? {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             }
         }
         _ => {}
     }
-    full_result.nullable = nullable;
+    full_result = dynamic_nullable(&full_result, nullable, work, borrow_creator(&mut creation))?;
     binding_control::value_type(&full_result, work)?;
     Ok(full_result)
 }
@@ -2434,21 +3075,30 @@ fn self_array_subfield(function_id: &FunctionId) -> bool {
 }
 
 impl BuiltinDynamicScalarResolver {
-    fn bind_selection_observed(
+    fn bind_selection_with_creation<H>(
         &self,
         request: FunctionBindingRequest<'_>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    ) -> Result<FunctionBindingSelection, FunctionBindingCreationFailure<H>> {
         if !matches!(self.canonical_name.as_ref(), "round" | "truncate") {
             request_types_with_constants(request, work)?;
         }
         if request.logical_argument_count != request.arguments.len() {
-            return Err(FunctionBindingError::NoMatchingOverload);
+            return Err(FunctionBindingError::NoMatchingOverload.into());
         }
-        let result =
-            bind_dynamic_scalar_result(&self.function_id, &self.canonical_name, request, work)?;
+        let result = bind_dynamic_scalar_result_with_creation(
+            &self.function_id,
+            &self.canonical_name,
+            request,
+            work,
+            borrow_creator(&mut creation),
+        )?;
         let argument_types = if self.function_id.as_str() == "builtin.scalar/__array_literal/v1" {
-            let item = full_list_item(&result)?;
+            let item = full_list_item_with_creation(&result, work, borrow_creator(&mut creation))?;
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.collected_vec::<FunctionArgumentType>(request.arguments.len())
+            })?;
             request
                 .arguments
                 .iter()
@@ -2457,82 +3107,102 @@ impl BuiltinDynamicScalarResolver {
                         value_type: source, ..
                     } = argument
                     else {
-                        return Err(FunctionBindingError::NoMatchingOverload);
+                        return Err(FunctionBindingError::NoMatchingOverload.into());
                     };
-                    let target = FunctionValueType {
-                        nullable: source.nullable,
-                        ..item.clone()
-                    };
+                    let target = dynamic_nullable(
+                        &item.clone(),
+                        source.nullable(),
+                        work,
+                        borrow_creator(&mut creation),
+                    )?;
                     work.step()?;
-                    super::value_conversion::conversion_intermediate_type(source, &target)?;
+                    with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                        super::value_conversion::conversion_intermediate_type_with_construction(
+                            source, &target, cx,
+                        )
+                        .map_err(super::scalar_construction::binding_owner_failure)
+                    })?;
                     work.step()?;
                     Ok(FunctionArgumentType::Value(target))
                 })
-                .collect::<Result<Vec<_>, FunctionBindingError>>()?
+                .collect::<Result<Vec<_>, FunctionBindingCreationFailure<H>>>()?
         } else {
-            binding_control::argument_types(request, work)?.into_vec()
+            let original = binding_control::argument_types_with_creation(
+                request,
+                work,
+                borrow_creator(&mut creation),
+            )?;
+            // The original owning iterator cheaply clones each immutable type;
+            // only its new Vec and subsequent actual guarded publisher are new.
+            // TypedFactIntoIter is ExactSizeIterator, not TrustedLen. The
+            // original default Vec collector also requests MIN_NON_ZERO_CAP
+            // for small nonempty input. Reuse the sole bounded push upper.
+            with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+                cx.collected_vec::<FunctionArgumentType>(original.len())
+            })?;
+            original.into_iter().collect::<Vec<_>>()
         };
+        let argument_types = with_binding_creation(borrow_creator(&mut creation), work, |cx| {
+            cx.publish_arguments(argument_types)
+        })?;
         Ok(FunctionBindingSelection {
             overload: self.overload.clone(),
-            argument_types: argument_types.into(),
+            argument_types,
             result_type: FunctionResultType::Scalar(result),
             aggregate: None,
         })
     }
-}
-
-impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
-    fn resolve(
+    fn resolve_with_creation<H>(
         &self,
         request: FunctionBindingRequest<'_>,
+        creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
         control: &dyn PureCompileControl,
-    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        binding_control::scope(control, |work| self.bind_selection_observed(request, work))
-    }
-
-    fn select_at_overload_observed(
-        &self,
-        overload: &FunctionOverloadId,
-        request: FunctionBindingRequest<'_>,
-        control: &dyn PureCompileControl,
-    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
-        binding_control::scope(control, |work| {
-            if overload != &self.overload {
-                return Err(FunctionBindingError::UnknownOverload(overload.clone()));
-            }
-            self.bind_selection_observed(request, work)
+    ) -> Result<FunctionBindingSelection, FunctionBindingCreationFailure<H>> {
+        binding_control::created_scope(control, |work| {
+            self.bind_selection_with_creation(request, work, creation)
         })
     }
-
-    fn validate_selected(
+    pub(crate) fn validate_selected_with_creator_in<H>(
         &self,
         selected: &FunctionBindingSelection,
         request: FunctionBindingRequest<'_>,
+        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
         control: &dyn PureCompileControl,
-    ) -> Result<(), FunctionBindingError> {
-        binding_control::scope(control, |work| {
+    ) -> Result<(), FunctionBindingCreationFailure<H>> {
+        self.validate_selected_with_creation(selected, request, Some(creation), control)
+    }
+    fn validate_selected_with_creation<H>(
+        &self,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingCreationFailure<H>> {
+        binding_control::created_scope(control, |work| {
             request_types_with_constants(request, work)?;
             if request.logical_argument_count != request.arguments.len() {
-                return Err(FunctionBindingError::NoMatchingOverload);
+                return Err(FunctionBindingError::NoMatchingOverload.into());
             }
             if selected.overload != self.overload {
-                return Err(FunctionBindingError::UnknownOverload(
-                    selected.overload.clone(),
-                ));
+                return Err(
+                    FunctionBindingError::UnknownOverload(selected.overload.clone()).into(),
+                );
             }
             let request = if self.function_id.as_str() == "builtin.scalar/__array_literal/v1"
                 && request.arguments.is_empty()
             {
                 let FunctionResultType::Scalar(result) = &selected.result_type else {
-                    return Err(FunctionBindingError::NoMatchingOverload);
+                    return Err(FunctionBindingError::NoMatchingOverload.into());
                 };
                 if let Some(expected) = request.expected_result_type
                     && !binding_control::exact_type(expected, result, work)?
                 {
                     return Err(FunctionBindingError::InvalidBinding(
                         "selected empty array differs from its explicit result constraint".into(),
-                    ));
+                    )
+                    .into());
                 }
+                // This is the existing explicit empty-array declaration rule.
                 FunctionBindingRequest {
                     expected_result_type: Some(result),
                     ..request
@@ -2541,15 +3211,52 @@ impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
                 request
             };
             work.flush()?;
-            let expected = self.resolve(request, work.control())?;
+            let expected =
+                self.resolve_with_creation(request, borrow_creator(&mut creation), work.control())?;
             if binding_control::same_selection(selected, &expected, work)? {
                 Ok(())
             } else {
                 Err(FunctionBindingError::InvalidBinding(
                     "selected dynamic scalar binding differs from its declared overload".into(),
-                ))
+                )
+                .into())
             }
         })
+    }
+}
+impl FunctionBindingResolver for BuiltinDynamicScalarResolver {
+    fn resolve(
+        &self,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        self.resolve_with_creation::<std::convert::Infallible>(request, None, control)
+            .map_err(FunctionBindingCreationFailure::into_pure)
+    }
+    fn select_at_overload_observed(
+        &self,
+        overload: &FunctionOverloadId,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        binding_control::created_scope(control, |work| {
+            if overload != &self.overload {
+                return Err(FunctionBindingError::UnknownOverload(overload.clone()).into());
+            }
+            self.bind_selection_with_creation::<std::convert::Infallible>(request, work, None)
+        })
+        .map_err(FunctionBindingCreationFailure::into_pure)
+    }
+    fn validate_selected(
+        &self,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        self.validate_selected_with_creation::<std::convert::Infallible>(
+            selected, request, None, control,
+        )
+        .map_err(FunctionBindingCreationFailure::into_pure)
     }
 }
 
@@ -2907,11 +3614,12 @@ pub fn contribute_builtin_functions(
             name if super::xx_hash3_128_owner::operation(name) => {
                 super::xx_hash3_128_owner::definition(name, declaration, resolver)?
             }
-            _ => FunctionDefinition::try_new_bound(
+            _ => FunctionDefinition::bound_with_owner(
                 name,
                 FunctionVisibility::Public,
                 declaration,
-                Arc::new(resolver),
+                crate::FunctionBindingResolverOwner::dynamic_scalar(Arc::new(resolver)),
+                None,
             )?,
         };
         builder.register(definition)?;
@@ -3126,11 +3834,12 @@ pub fn contribute_builtin_functions(
             name if super::numeric_unary_owner::operation(name).is_some() => {
                 super::numeric_unary_owner::definition(name, declaration, resolver)?
             }
-            _ => FunctionDefinition::try_new_bound(
+            _ => FunctionDefinition::bound_with_owner(
                 &name,
                 FunctionVisibility::Public,
                 declaration,
-                Arc::new(resolver),
+                crate::FunctionBindingResolverOwner::fixed_scalar(Arc::new(resolver)),
+                None,
             )?,
         };
         builder.register(definition)?;
@@ -3397,12 +4106,12 @@ pub fn contribute_builtin_functions(
             )?)?;
             continue;
         }
-        builder.register(FunctionDefinition::try_new_bound_aggregate(
+        builder.register(FunctionDefinition::bound_with_owner(
             declaration.name,
             FunctionVisibility::Public,
             binding_declaration,
-            Arc::clone(&resolver) as Arc<dyn crate::FunctionBindingResolver>,
-            resolver as Arc<dyn crate::AggregateSignatureResolver>,
+            crate::FunctionBindingResolverOwner::borrowed_aggregate(Arc::clone(&resolver)),
+            Some(resolver as Arc<dyn crate::AggregateSignatureResolver>),
         )?)?;
     }
     let unnest_declaration = FunctionBindingDeclaration::try_new(
@@ -3562,7 +4271,7 @@ mod tests {
         constant: Option<crate::ConstantValue>,
     ) -> FunctionArgument {
         FunctionArgument::Value {
-            value_type: FunctionValueType::new(data_type, nullable),
+            value_type: FunctionValueType::from_legacy_declared_projection(data_type, nullable),
             constant,
         }
     }
@@ -3611,8 +4320,11 @@ mod tests {
             for nullable in [false, true] {
                 let arguments = [value_argument(data_type.clone(), nullable, None)];
                 let selected = resolve_exact_scalar(&catalog, "positive", &arguments);
-                assert_eq!(scalar_result(&selected).data_type, DataType::Float64);
-                assert!(scalar_result(&selected).nullable);
+                assert_eq!(
+                    scalar_result(&selected).data_type().clone(),
+                    DataType::Float64
+                );
+                assert!(scalar_result(&selected).nullable());
             }
         }
         for data_type in [
@@ -3625,13 +4337,16 @@ mod tests {
             for nullable in [false, true] {
                 let arguments = [value_argument(data_type.clone(), nullable, None)];
                 let selected = resolve_exact_scalar(&catalog, "positive", &arguments);
-                assert_eq!(scalar_result(&selected).data_type, DataType::Float64);
-                assert_eq!(scalar_result(&selected).nullable, nullable);
+                assert_eq!(
+                    scalar_result(&selected).data_type().clone(),
+                    DataType::Float64
+                );
+                assert_eq!(scalar_result(&selected).nullable(), nullable);
             }
         }
         let float = [value_argument(DataType::Float64, false, None)];
-        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "abs", &float)).nullable);
-        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "sign", &float)).nullable);
+        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "abs", &float)).nullable());
+        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "sign", &float)).nullable());
     }
 
     #[test]
@@ -3639,19 +4354,21 @@ mod tests {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
         let nonnull = [value_argument(DataType::Int64, false, None)];
         let nullable = [value_argument(DataType::Int64, true, None)];
-        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "abs", &nonnull)).nullable);
-        assert!(scalar_result(&resolve_exact_scalar(&catalog, "abs", &nullable)).nullable);
+        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "abs", &nonnull)).nullable());
+        assert!(scalar_result(&resolve_exact_scalar(&catalog, "abs", &nullable)).nullable());
 
         let coalesce = [
             value_argument(DataType::Int64, true, None),
             value_argument(DataType::Int64, false, None),
         ];
-        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "coalesce", &coalesce)).nullable);
+        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "coalesce", &coalesce)).nullable());
         let all_nullable = [
             value_argument(DataType::Int64, true, None),
             value_argument(DataType::Int64, true, None),
         ];
-        assert!(scalar_result(&resolve_exact_scalar(&catalog, "coalesce", &all_nullable)).nullable);
+        assert!(
+            scalar_result(&resolve_exact_scalar(&catalog, "coalesce", &all_nullable)).nullable()
+        );
 
         let count = catalog
             .resolve_bound_user(
@@ -3677,8 +4394,8 @@ mod tests {
                 crate::binding_test_control(),
             )
             .expect("sum binding");
-        assert!(!scalar_result(&count).nullable);
-        assert!(scalar_result(&sum).nullable);
+        assert!(!scalar_result(&count).nullable());
+        assert!(scalar_result(&sum).nullable());
     }
 
     #[test]
@@ -3699,7 +4416,7 @@ mod tests {
             value_argument(DataType::Boolean, true, None),
         ];
         let named = resolve_exact_scalar(&catalog, "named_struct", &named);
-        let DataType::Struct(fields) = &scalar_result(&named).data_type else {
+        let DataType::Struct(fields) = &scalar_result(&named).data_type() else {
             panic!("named_struct must bind a struct result")
         };
         assert_eq!(fields[0].name(), "left");
@@ -3720,7 +4437,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            scalar_result(&rounded).data_type,
+            scalar_result(&rounded).data_type().clone(),
             DataType::Decimal128(38, 2)
         );
 
@@ -3749,7 +4466,7 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(scalar_result(&variant).data_type, DataType::Int64);
+        assert_eq!(scalar_result(&variant).data_type().clone(), DataType::Int64);
     }
 
     #[test]
@@ -3759,15 +4476,15 @@ mod tests {
             Box::new(DataType::UInt8),
             Box::new(DataType::Decimal128(18, 6)),
         );
-        // An encoded Decimal uses ROUND's cast path, not its outer Decimal
-        // branch. TRUNCATE's NumericArrayView does not decode that carrier.
+        // Binding follows the decoded value domain. Actual encoded arrays need
+        // explicit BE hydration before these Plain runtime implementations.
         let cases = [
             (DataType::UInt64, true, false, DataType::Int64),
             (DataType::Float16, true, false, DataType::Int64),
             (DataType::Boolean, true, false, DataType::Int64),
             (DataType::Utf8, true, false, DataType::Int64),
             (DataType::Decimal256(76, 6), true, false, DataType::Int64),
-            (encoded, true, false, DataType::Int64),
+            (encoded, true, true, DataType::Decimal128(38, 6)),
             (DataType::Date32, false, false, DataType::Int64),
             (DataType::Float32, true, true, DataType::Int64),
             (DataType::Null, true, true, DataType::Int64),
@@ -3799,14 +4516,13 @@ mod tests {
                 let binding = result.unwrap();
                 assert_eq!(
                     scalar_result(&binding),
-                    &FunctionValueType::new(expected.clone(), true)
+                    &FunctionValueType::from_legacy_declared_projection(expected.clone(), true)
                 );
                 assert_eq!(
                     binding.selected.argument_types.as_ref(),
-                    &[FunctionArgumentType::Value(FunctionValueType::new(
-                        source.clone(),
-                        true,
-                    ))]
+                    &[FunctionArgumentType::Value(
+                        FunctionValueType::from_legacy_declared_projection(source.clone(), true,)
+                    )]
                 );
                 catalog
                     .validate_bound(&binding, request, crate::binding_test_control())
@@ -3865,7 +4581,6 @@ mod tests {
 
     #[test]
     fn rounding_catalogue_checks_shared_carrier_grammar_before_cast_authoring() {
-        let catalog = build_builtin_engine_function_catalog().unwrap();
         let field = |ty, nullable| Arc::new(arrow_schema::Field::new("v", ty, nullable));
         let invalid_sources = [
             DataType::Decimal128(0, 0),
@@ -3893,21 +4608,14 @@ mod tests {
             ),
         ];
         for source in invalid_sources {
-            let arguments = [value_argument(source, true, None)];
-            let result = catalog.resolve_bound_user(
-                "round",
-                FunctionKind::Scalar,
-                FunctionBindingRequest {
-                    expected_result_type: None,
-                    arguments: &arguments,
-                    logical_argument_count: 1,
-                },
-                crate::binding_test_control(),
+            assert!(
+                FunctionValueType::try_from_legacy_declared_projection(
+                    source,
+                    true,
+                    ValueLogicalType::Physical
+                )
+                .is_err()
             );
-            assert!(matches!(
-                result,
-                Err(FunctionBindingError::InvalidBinding(_))
-            ));
         }
     }
 
@@ -3951,14 +4659,16 @@ mod tests {
             .expect("exact installed table binding");
         assert_eq!(
             binding.selected.argument_types.as_ref(),
-            &[FunctionArgumentType::Value(FunctionValueType::new(
-                list, false
-            ))]
+            &[FunctionArgumentType::Value(
+                FunctionValueType::from_legacy_declared_projection(list, false)
+            )]
         );
         assert_eq!(
             binding.selected.result_type,
             FunctionResultType::Relation(
-                vec![FunctionValueType::new(DataType::Int64, true)].into_boxed_slice()
+                novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                    vec![FunctionValueType::new(DataType::Int64, true)].into_boxed_slice()
+                )
             )
         );
     }
@@ -4249,15 +4959,15 @@ mod tests {
                     )
                     .unwrap()
                 } else {
-                    FunctionValueType::new(input.clone(), nullable)
+                    FunctionValueType::from_legacy_declared_projection(input.clone(), nullable)
                 };
                 let arguments = [FunctionArgument::Value {
                     value_type: source_type.clone(),
                     constant: None,
                 }];
                 let binding = resolve_exact_scalar(&catalog, "abs", &arguments);
-                assert_eq!(scalar_result(&binding).data_type, output);
-                assert_eq!(scalar_result(&binding).nullable, nullable);
+                assert_eq!(scalar_result(&binding).data_type().clone(), output);
+                assert_eq!(scalar_result(&binding).nullable(), nullable);
                 assert_eq!(
                     binding.selected.argument_types.as_ref(),
                     &[FunctionArgumentType::Value(source_type)]
@@ -4299,8 +5009,9 @@ mod tests {
         ] {
             let arguments = [value_argument(input.clone(), true, None)];
             let mut binding = resolve_exact_scalar(&catalog, "abs", &arguments);
-            binding.selected.result_type =
-                FunctionResultType::Scalar(FunctionValueType::new(input, true));
+            binding.selected.result_type = FunctionResultType::Scalar(
+                FunctionValueType::from_legacy_declared_projection(input, true),
+            );
             assert!(
                 catalog
                     .validate_bound(
@@ -4471,7 +5182,7 @@ mod tests {
                         .map(FunctionArgument::argument_type)
                         .collect::<Vec<_>>()
                 );
-                assert_eq!(scalar_result(&bound).data_type, DataType::Binary);
+                assert_eq!(scalar_result(&bound).data_type().clone(), DataType::Binary);
                 assert_eq!(
                     bound.semantics.intrinsic_row_error,
                     FunctionIntrinsicRowError::NoRowError
@@ -4586,7 +5297,7 @@ mod tests {
                     "entries",
                     DataType::Struct(
                         vec![
-                            Arc::new(arrow_schema::Field::new("key", DataType::Int64, true)),
+                            Arc::new(arrow_schema::Field::new("key", DataType::Int64, false)),
                             Arc::new(arrow_schema::Field::new("value", DataType::Int64, true)),
                         ]
                         .into(),
@@ -4827,7 +5538,10 @@ mod tests {
                 let bound = resolve_exact_scalar(&catalog, name, &arguments);
                 assert_eq!(
                     bound.selected.result_type,
-                    FunctionResultType::Scalar(FunctionValueType::new(list(output), true))
+                    FunctionResultType::Scalar(FunctionValueType::from_legacy_declared_projection(
+                        list(output),
+                        true
+                    ))
                 );
                 catalog
                     .validate_bound(
@@ -5044,94 +5758,10 @@ mod tests {
                 crate::binding_test_control(),
             )
             .unwrap();
-        assert_eq!(scalar_result(&bound).data_type, list(list(DataType::Int64)));
-    }
-}
-
-#[cfg(test)]
-mod logical_argument_identity_tests {
-    use super::same_argument_up_to_nested_nullability;
-    use crate::{FunctionArgumentType, FunctionValueType};
-    use arrow_schema::{DataType, Field};
-    use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
-    use std::sync::Arc;
-
-    fn value(ty: FunctionValueType) -> FunctionArgumentType {
-        FunctionArgumentType::Value(ty)
-    }
-    fn list(nullable: bool, logical: Option<&str>, decorated: bool) -> FunctionArgumentType {
-        let mut metadata = std::collections::HashMap::new();
-        if let Some(logical) = logical {
-            metadata.insert(NR_LOGICAL_TYPE_KEY.to_string(), logical.to_string());
-        }
-        if decorated {
-            metadata.insert("iceberg.field.id".to_string(), "27".to_string());
-        }
-        value(FunctionValueType::new(
-            DataType::List(Arc::new(
-                Field::new("item", DataType::Utf8, nullable).with_metadata(metadata),
-            )),
-            false,
-        ))
-    }
-    #[test]
-    fn aggregate_argument_nullability_allowance_keeps_root_logical_identity() {
-        for (carrier, logical) in [
-            (DataType::Utf8, ValueLogicalType::Json),
-            (DataType::LargeBinary, ValueLogicalType::Variant),
-            (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
-            (DataType::Binary, ValueLogicalType::Hll),
-        ] {
-            let physical = value(FunctionValueType::new(carrier.clone(), false));
-            let semantic =
-                value(FunctionValueType::try_with_logical_type(carrier, false, logical).unwrap());
-            assert!(!same_argument_up_to_nested_nullability((
-                &physical, &semantic
-            )));
-            assert!(!same_argument_up_to_nested_nullability((
-                &semantic, &physical
-            )));
-            assert!(same_argument_up_to_nested_nullability((
-                &semantic, &semantic
-            )));
-        }
-        let integer = value(
-            FunctionValueType::try_with_logical_type(
-                DataType::FixedSizeBinary(16),
-                false,
-                ValueLogicalType::LargeInt,
-            )
-            .unwrap(),
+        assert_eq!(
+            scalar_result(&bound).data_type().clone(),
+            list(list(DataType::Int64))
         );
-        let uuid = value(
-            FunctionValueType::try_with_logical_type(
-                DataType::FixedSizeBinary(16),
-                false,
-                ValueLogicalType::Uuid,
-            )
-            .unwrap(),
-        );
-        assert!(!same_argument_up_to_nested_nullability((&integer, &uuid)));
-    }
-    #[test]
-    fn aggregate_argument_nullability_allowance_keeps_nested_json_and_provider_rules() {
-        let json = list(false, Some("json"), false);
-        let nullable_json = list(true, Some("json"), true);
-        let physical = list(true, None, false);
-        assert!(same_argument_up_to_nested_nullability((
-            &json,
-            &nullable_json
-        )));
-        assert!(same_argument_up_to_nested_nullability((
-            &nullable_json,
-            &json
-        )));
-        assert!(!same_argument_up_to_nested_nullability((&json, &physical)));
-        assert!(!same_argument_up_to_nested_nullability((&physical, &json)));
-        let unknown = list(false, Some("not_a_declared_logical_type"), false);
-        assert!(!same_argument_up_to_nested_nullability((
-            &unknown, &unknown
-        )));
     }
 }
 
@@ -5159,29 +5789,26 @@ fn dynamic_values<'a>(
     request: FunctionBindingRequest<'a>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<&'a FunctionValueType>, FunctionBindingError> {
+    dynamic_values_with_creation::<std::convert::Infallible>(request, work, None)
+        .map_err(FunctionBindingCreationFailure::into_pure)
+}
+fn dynamic_values_with_creation<'a, H>(
+    request: FunctionBindingRequest<'a>,
+    work: &mut CompileCheckpoints<'_>,
+    creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<Vec<&'a FunctionValueType>, FunctionBindingCreationFailure<H>> {
+    with_binding_creation(creation, work, |cx| {
+        cx.array::<&FunctionValueType>(request.arguments.len())
+    })?;
     let mut result = Vec::with_capacity(request.arguments.len());
     for argument in request.arguments {
         work.step()?;
         match argument {
             FunctionArgument::Value { value_type, .. } => result.push(value_type),
-            _ => return Err(FunctionBindingError::NoMatchingOverload),
+            _ => return Err(FunctionBindingError::NoMatchingOverload.into()),
         }
     }
     Ok(result)
-}
-
-fn nested_arguments_match(
-    left: &[FunctionArgumentType],
-    right: &[FunctionArgumentType],
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<bool, FunctionBindingError> {
-    for pair in left.iter().zip(right) {
-        work.step()?;
-        if !same_argument_up_to_nested_nullability(pair) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 fn observed_all<T>(
@@ -5529,3 +6156,357 @@ pub fn array_projection_diagnostic_private_test_catalog() -> EngineFunctionCatal
         .unwrap();
     builder.seal().unwrap()
 }
+
+#[cfg(test)]
+mod aggregate_recipe_tests {
+    use super::*;
+    use novarocks_type_contract::{CompileControlError, CompilePhase, ValueKind};
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    fn value(ty: FunctionValueType) -> FunctionArgument {
+        FunctionArgument::Value {
+            value_type: ty,
+            constant: None,
+        }
+    }
+    #[test]
+    fn ordered_array_state_and_topk_preserve_complete_nominal_argument_children() {
+        let json =
+            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+                .unwrap();
+        let args = [
+            value(json.clone()),
+            value(FunctionValueType::new(DataType::Int64, false)),
+        ];
+        let request = FunctionBindingRequest {
+            arguments: &args,
+            logical_argument_count: 1,
+            expected_result_type: None,
+        };
+        let resolver = BuiltinAggregateResolver {
+            declaration: AggregateDeclaration::exact("array_agg", 1, "fixture"),
+        };
+        let selected = resolver.resolve(request, &Control).unwrap();
+        resolver
+            .validate_selected(&selected, request, &Control)
+            .unwrap();
+        let state = &selected.aggregate.as_ref().unwrap().intermediate_type;
+        let ValueKind::Struct(fields) = state.value_type().kind() else {
+            panic!("ordered state is a struct");
+        };
+        assert_eq!(fields[0].name(), "c0");
+        let ValueKind::List(item) = fields[0].value_type().kind() else {
+            panic!("each order channel is a list");
+        };
+        assert_eq!(item.domain(), Some(ValueLogicalType::Json));
+        assert!(item.nullable());
+        let source = declared_list(&json, false).unwrap();
+        let args = [value(source)];
+        let request = FunctionBindingRequest {
+            arguments: &args,
+            logical_argument_count: 1,
+            expected_result_type: None,
+        };
+        let resolver = BuiltinAggregateResolver {
+            declaration: AggregateDeclaration::ranged("approx_top_k", 1, 3, "fixture"),
+        };
+        let selected = resolver.resolve(request, &Control).unwrap();
+        resolver
+            .validate_selected(&selected, request, &Control)
+            .unwrap();
+        let FunctionResultType::Scalar(output) = &selected.result_type else {
+            panic!("scalar result");
+        };
+        let ValueKind::List(row) = output.value_type().kind() else {
+            panic!("list result");
+        };
+        let ValueKind::Struct(fields) = row.kind() else {
+            panic!("ranked row");
+        };
+        let ValueKind::List(item) = fields[0].value_type().kind() else {
+            panic!("complete list argument");
+        };
+        assert_eq!(item.domain(), Some(ValueLogicalType::Json));
+    }
+    #[test]
+    fn aggregate_replay_rejects_nominal_and_nested_nullability_drift() {
+        let json =
+            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+                .unwrap();
+        let args = [
+            value(json.clone()),
+            value(FunctionValueType::new(DataType::Int64, false)),
+        ];
+        let request = FunctionBindingRequest {
+            arguments: &args,
+            logical_argument_count: 1,
+            expected_result_type: None,
+        };
+        let resolver = BuiltinAggregateResolver {
+            declaration: AggregateDeclaration::exact("array_agg", 1, "fixture"),
+        };
+        let mut selected = resolver.resolve(request, &Control).unwrap();
+        resolver
+            .validate_selected(&selected, request, &Control)
+            .unwrap();
+        let erased = [
+            value(FunctionValueType::new(DataType::Utf8, true)),
+            value(FunctionValueType::new(DataType::Int64, false)),
+        ];
+        let drift = FunctionBindingRequest {
+            arguments: &erased,
+            logical_argument_count: 1,
+            expected_result_type: None,
+        };
+        let other = resolver.resolve(drift, &Control).unwrap();
+        selected.aggregate.as_mut().unwrap().intermediate_type =
+            other.aggregate.unwrap().intermediate_type;
+        assert!(
+            resolver
+                .validate_selected(&selected, request, &Control)
+                .is_err()
+        );
+        let output = FunctionValueType::try_from_value(
+            novarocks_type_contract::ValueTypeRef::try_new(
+                ValueKind::List(json.with_nullable(false).unwrap().value_type().clone()),
+                true,
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+            novarocks_type_contract::ValueLayout::try_new(
+                &DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    false,
+                ))),
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut selected = resolver.resolve(request, &Control).unwrap();
+        selected.result_type = FunctionResultType::Scalar(output);
+        assert!(
+            resolver
+                .validate_selected(&selected, request, &Control)
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod explicit_domain_owner_regression_tests {
+    use super::*;
+    fn value(ty: DataType) -> FunctionArgument {
+        FunctionArgument::Value {
+            value_type: FunctionValueType::new(ty, true),
+            constant: None,
+        }
+    }
+    fn resolve(
+        catalog: &EngineFunctionCatalog,
+        name: &str,
+        kind: FunctionKind,
+        arguments: &[FunctionArgument],
+    ) -> ResolvedFunctionBinding {
+        catalog
+            .resolve_bound_user(
+                name,
+                kind,
+                FunctionBindingRequest {
+                    arguments,
+                    logical_argument_count: arguments.len(),
+                    expected_result_type: None,
+                },
+                crate::binding_test_control(),
+            )
+            .unwrap()
+    }
+    #[test]
+    fn installed_binary_producers_author_complete_domains_and_keep_count_results_plain() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        for (name, args, domain) in [
+            (
+                "sub_bitmap",
+                vec![
+                    value(DataType::Binary),
+                    value(DataType::Int64),
+                    value(DataType::Int64),
+                ],
+                ValueLogicalType::Bitmap,
+            ),
+            (
+                "bitmap_subset_limit",
+                vec![
+                    value(DataType::Binary),
+                    value(DataType::Int64),
+                    value(DataType::Int64),
+                ],
+                ValueLogicalType::Bitmap,
+            ),
+            (
+                "bitmap_subset_in_range",
+                vec![
+                    value(DataType::Binary),
+                    value(DataType::Int64),
+                    value(DataType::Int64),
+                ],
+                ValueLogicalType::Bitmap,
+            ),
+            (
+                "percentile_hash",
+                vec![value(DataType::Float64)],
+                ValueLogicalType::Percentile,
+            ),
+            ("percentile_empty", vec![], ValueLogicalType::Percentile),
+        ] {
+            let bound = resolve(&catalog, name, FunctionKind::Scalar, &args);
+            let FunctionResultType::Scalar(result) = &bound.selected.result_type else {
+                panic!("scalar");
+            };
+            assert_eq!(result.logical_type(), domain, "{name}");
+            assert_eq!(result.data_type(), &DataType::Binary, "{name}");
+            catalog
+                .validate_bound(
+                    &bound,
+                    FunctionBindingRequest {
+                        arguments: &args,
+                        logical_argument_count: args.len(),
+                        expected_result_type: None,
+                    },
+                    crate::binding_test_control(),
+                )
+                .unwrap();
+            if name == "percentile_hash" {
+                assert!(
+                    super::super::percentile_hash_selected::original_native_profile(
+                        &bound.selected,
+                        1
+                    )
+                );
+                let mut changed = bound.selected.clone();
+                changed.result_type =
+                    FunctionResultType::Scalar(FunctionValueType::new(DataType::Binary, true));
+                assert!(
+                    !super::super::percentile_hash_selected::original_native_profile(&changed, 1)
+                );
+            }
+        }
+        let args = [value(DataType::Binary)];
+        let bound = resolve(&catalog, "percentile_union", FunctionKind::Aggregate, &args);
+        let FunctionResultType::Scalar(result) = &bound.selected.result_type else {
+            panic!("aggregate scalar");
+        };
+        assert_eq!(result.logical_type(), ValueLogicalType::Percentile);
+        assert_eq!(
+            bound
+                .selected
+                .aggregate
+                .as_ref()
+                .unwrap()
+                .intermediate_type
+                .logical_type(),
+            ValueLogicalType::Percentile
+        );
+        catalog
+            .validate_bound(
+                &bound,
+                FunctionBindingRequest {
+                    arguments: &args,
+                    logical_argument_count: 1,
+                    expected_result_type: None,
+                },
+                crate::binding_test_control(),
+            )
+            .unwrap();
+        let count = resolve(
+            &catalog,
+            "bitmap_union_count",
+            FunctionKind::Aggregate,
+            &args,
+        );
+        let FunctionResultType::Scalar(result) = &count.selected.result_type else {
+            panic!("count");
+        };
+        assert_eq!(result.logical_type(), ValueLogicalType::Physical);
+        assert_eq!(result.data_type(), &DataType::Int64);
+        assert_eq!(
+            count
+                .selected
+                .aggregate
+                .as_ref()
+                .unwrap()
+                .intermediate_type
+                .logical_type(),
+            ValueLogicalType::Bitmap
+        );
+    }
+    #[test]
+    fn actual_scalar_catalog_replay_refuses_child_null_drift_in_both_directions() {
+        let catalog = build_builtin_engine_function_catalog().unwrap();
+        for nullable in [false, true] {
+            let list = |item_null| {
+                FunctionValueType::new(
+                    DataType::List(Arc::new(arrow_schema::Field::new(
+                        "item",
+                        DataType::Int64,
+                        item_null,
+                    ))),
+                    false,
+                )
+            };
+            let args = [
+                FunctionArgument::Value {
+                    value_type: list(nullable),
+                    constant: None,
+                },
+                FunctionArgument::Value {
+                    value_type: list(false),
+                    constant: None,
+                },
+            ];
+            let bound = resolve(&catalog, "array_sortby", FunctionKind::Scalar, &args);
+            catalog
+                .validate_bound(
+                    &bound,
+                    FunctionBindingRequest {
+                        arguments: &args,
+                        logical_argument_count: 2,
+                        expected_result_type: None,
+                    },
+                    crate::binding_test_control(),
+                )
+                .unwrap();
+            let mut changed = bound.clone();
+            let mut declarations = changed.selected.argument_types.as_slice().to_vec();
+            declarations[0] = FunctionArgumentType::Value(list(!nullable));
+            changed.selected.argument_types =
+                novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                    declarations.into_boxed_slice(),
+                );
+            assert_eq!(bound.selected.result_type, changed.selected.result_type);
+            assert!(
+                catalog
+                    .validate_bound(
+                        &changed,
+                        FunctionBindingRequest {
+                            arguments: &args,
+                            logical_argument_count: 2,
+                            expected_result_type: None
+                        },
+                        crate::binding_test_control()
+                    )
+                    .is_err(),
+                "nullable={nullable}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "scalar_type_recipe_tests.rs"]
+mod scalar_type_recipe_tests;

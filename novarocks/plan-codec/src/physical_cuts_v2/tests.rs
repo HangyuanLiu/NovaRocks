@@ -732,7 +732,7 @@ fn independent_container_layout_and_all_seven_exact_under_envelopes() {
     }
 }
 #[test]
-fn dictionary_occurrence_copies_keep_nested_fields_and_count_two_owned_boxes() {
+fn normalized_occurrence_copies_share_complete_binding_and_count_only_cut_containers() {
     use std::{collections::HashMap, sync::Arc};
     let c = Control::default();
     let field = Arc::new(
@@ -742,7 +742,7 @@ fn dictionary_occurrence_copies_keep_nested_fields_and_count_two_owned_boxes() {
     let full = FunctionValueType::new(
         DataType::Dictionary(
             Box::new(DataType::Int8),
-            Box::new(DataType::Struct(vec![field].into())),
+            Box::new(DataType::Struct(vec![Arc::clone(&field)].into())),
         ),
         true,
     );
@@ -777,21 +777,18 @@ fn dictionary_occurrence_copies_keep_nested_fields_and_count_two_owned_boxes() {
     assert_eq!(out, source);
     let expected = 2
         * (Layout::array::<p::InboundFragmentCut>(1).unwrap().size()
-            + Layout::array::<p::CutImport>(1).unwrap().size())
-        + 2 * Layout::new::<DataType>().size();
-    assert_eq!(facts.allocation_requests_upper_bound, 6);
+            + Layout::array::<p::CutImport>(1).unwrap().size());
+    assert_eq!(facts.allocation_requests_upper_bound, 4);
     assert_eq!(facts.allocation_request_bytes_upper_bound, expected);
-    let DataType::Dictionary(_, a) = &out.inbound[0].imports[0].source.ty.data_type else {
-        panic!("dictionary lost")
+    let actual = &out.inbound[0].imports[0].source.ty;
+    let original = decoded.value_type(u32::MAX).unwrap();
+    assert!(std::ptr::eq(actual.data_type(), original.data_type()));
+    let DataType::Struct(fields) = actual.data_type() else {
+        panic!("normalized Struct")
     };
-    let DataType::Dictionary(_, b) = &decoded.value_type(u32::MAX).unwrap().data_type else {
-        panic!("root dictionary lost")
-    };
-    let (DataType::Struct(a), DataType::Struct(b)) = (a.as_ref(), b.as_ref()) else {
-        panic!("nested fields lost")
-    };
-    assert!(Arc::ptr_eq(&a[0], &b[0]));
-    assert_eq!(a[0].metadata()["tag"], "exact");
+    assert_eq!(fields[0].name(), "雪");
+    assert_eq!(fields[0].metadata().capacity(), 0);
+    assert_eq!(field.metadata()["tag"], "exact");
 }
 
 #[test]

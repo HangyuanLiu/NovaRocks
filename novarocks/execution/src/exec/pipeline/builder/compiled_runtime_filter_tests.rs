@@ -368,7 +368,254 @@ fn requirement(binding_id: u32) -> BindingRequirement {
 }
 
 fn membership(data_type: &DataType, null_semantics: FilterNullSemantics) -> StaticFilterContract {
-    StaticFilterContract::membership(data_type, null_semantics).expect("membership contract")
+    // These fixtures declare nullable scalar keys before any row is evaluated.
+    let declared = FunctionValueType::new(data_type.clone(), true);
+    StaticFilterContract::membership(&declared, null_semantics).expect("membership contract")
+}
+
+// Independent installed declaration: this author precedes the LocalProgram
+// projection and never derives expected types from an operator's request.
+fn declared_membership_contract(
+    declared: FunctionValueType,
+    semantics: execution::RuntimeFilterNullSemantics,
+) -> execution::RuntimeFilterExecutionContract {
+    let canonical = novarocks_local_program::FilterMembershipSchema::try_new(
+        declared.data_type(),
+        semantics.canonical(),
+    )
+    .unwrap();
+    execution::RuntimeFilterExecutionContract::Membership(
+        execution::RuntimeFilterMembershipSchema::from_canonical_value_type(canonical, declared)
+            .expect("independent complete membership declaration"),
+    )
+}
+
+/// Exercise the actual default-plan freeze with an independently authored
+/// input. The returned static contract is the graph's original binding, not
+/// one rebuilt from a runtime request or an Arrow field.
+fn freeze_installed_consumer(
+    declared: &FunctionValueType,
+    installed: &execution::RuntimeFilterConsumerContract,
+) -> StaticFilterConsumer {
+    use crate::exec::node::runtime_filter::RuntimeFilterConsumerNode;
+    use crate::exec::node::values::ValuesNode;
+    use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
+
+    let column: arrow::array::ArrayRef = match declared.data_type() {
+        DataType::Int64 => Arc::new(arrow::array::Int64Array::from(vec![1])),
+        DataType::Utf8 => Arc::new(arrow::array::StringArray::from(vec!["{}"])),
+        other => panic!("this fixture has no declared payload for {other:?}"),
+    };
+    let chunk = crate::exec::chunk::typed_fixture::columns(
+        &["key"],
+        &[SlotId::new(1)],
+        std::slice::from_ref(declared),
+        vec![column],
+        1,
+    );
+    let mut arena = ExprArena::default();
+    let key = arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), declared.clone());
+    let plan = ExecPlan {
+        arena,
+        root: ExecNode {
+            kind: ExecNodeKind::RuntimeFilterConsumer(RuntimeFilterConsumerNode::new(
+                ExecNode {
+                    kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 1 }),
+                },
+                2,
+                vec![RuntimeFilterConsumerBinding::new(key, installed.clone())],
+            )),
+        },
+    };
+    let profile = crate::exec::chunk::typed_fixture::profile(
+        &plan,
+        std::num::NonZeroUsize::new(1).unwrap(),
+        None,
+    );
+    let (graph, _bindings) = crate::exec::chunk::typed_fixture::lower(
+        plan,
+        profile,
+        vec![],
+        novarocks_local_program::StaticSinkProgram::Noop,
+    );
+    let ProgramNodeKind::RuntimeFilterConsumer { bindings, .. } =
+        graph.nodes()[graph.root().index()].kind()
+    else {
+        panic!("the original consumer is frozen into the LocalProgram graph");
+    };
+    assert_eq!(bindings.len(), 1);
+    bindings[0].consumer.clone()
+}
+
+#[test]
+fn frozen_filters_keep_complete_installed_types_and_owned_canonical_storage() {
+    use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
+    use execution::contribution::{
+        RuntimeOrderContract, RuntimeOrderKey, RuntimeOrderNullOrder, RuntimeOrderSortDirection,
+    };
+    use novarocks_local_program::{FilterMembershipSchema, FilterMembershipSchemaError};
+
+    // JSON and text share the same artifact bytes, but the original declared
+    // domain and root NULL guarantee must survive every freeze and thaw.
+    for nullable in [false, true] {
+        let declared = FunctionValueType::try_with_logical_type(
+            DataType::Utf8,
+            nullable,
+            novarocks_type_contract::ValueLogicalType::Json,
+        )
+        .unwrap();
+        let source = crate::exec::chunk::typed_fixture::columns(
+            &["key"],
+            &[SlotId::new(1)],
+            std::slice::from_ref(&declared),
+            vec![Arc::new(arrow::array::StringArray::from(vec!["{}"]))],
+            1,
+        );
+        let tracker =
+            crate::runtime::mem_tracker::MemTracker::new_root("frozen RF canonical owner");
+        let state = RuntimeState::default();
+        let factory = try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker.clone(),
+            state.error_state(),
+        )
+        .unwrap();
+        let factory_weak = Arc::downgrade(&factory);
+        let owner = factory
+            .begin_typed_construction(source.chunk_schema())
+            .unwrap();
+        let canonical =
+            FilterMembershipSchema::try_new_with_storage_observed::<FilterMembershipSchemaError>(
+                declared.data_type(),
+                FilterNullSemantics::NeverMatches,
+                owner.storage_lifetime(),
+                |layout| {
+                    owner.request(layout).expect("actual canonical creator");
+                    Ok(())
+                },
+                |units| {
+                    owner
+                        .observe(
+                            0,
+                            &[],
+                            crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
+                                units,
+                            },
+                        )
+                        .expect("original canonical construction control");
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let original_backing = canonical.canonical_bytes().as_ptr();
+        let installed = execution::RuntimeFilterConsumerContract::membership_blocking(
+            execution::RuntimeFilterBindingId::new(7),
+            execution::RuntimeFilterChannelId::new(7),
+            execution::RuntimeFilterExecutionContract::Membership(
+                execution::RuntimeFilterMembershipSchema::from_canonical_value_type(
+                    canonical,
+                    declared.clone(),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let frozen = freeze_installed_consumer(&declared, &installed);
+        let StaticFilterContract::Membership {
+            canonical,
+            value_type,
+        } = frozen.contract()
+        else {
+            panic!("the frozen membership keeps its two original authors");
+        };
+        assert_eq!(value_type, &declared);
+        assert_eq!(canonical.canonical_bytes().as_ptr(), original_backing);
+        let runtime = super::runtime_filter_consumer_contract(&frozen).unwrap();
+        assert_eq!(runtime, installed, "the installed contract remains exact");
+        let execution::RuntimeFilterExecutionContract::Membership(schema) = runtime.contract()
+        else {
+            unreachable!()
+        };
+        assert_eq!(schema.value_type(), Some(&declared));
+        assert_eq!(schema.canonical_bytes().as_ptr(), original_backing);
+        assert_ne!(
+            runtime.contract(),
+            &declared_membership_contract(
+                FunctionValueType::new(DataType::Utf8, nullable),
+                execution::RuntimeFilterNullSemantics::NeverMatches,
+            ),
+            "physical artifact equality cannot erase JSON",
+        );
+        drop((installed, frozen, owner, source, factory, state, declared));
+        assert!(factory_weak.upgrade().is_none());
+        let retained = tracker.current();
+        assert!(
+            retained > 0,
+            "the remaining runtime contract owns its canonical backing"
+        );
+        let last = runtime.clone();
+        assert_eq!(
+            tracker.current(),
+            retained,
+            "contract cloning shares the original backing"
+        );
+        drop(runtime);
+        assert_eq!(tracker.current(), retained);
+        let execution::RuntimeFilterExecutionContract::Membership(schema) = last.contract() else {
+            unreachable!()
+        };
+        assert_eq!(schema.canonical_bytes().as_ptr(), original_backing);
+        drop(last);
+        assert_eq!(
+            tracker.current(),
+            0,
+            "the final canonical holder releases its finite owner"
+        );
+    }
+
+    // Fixed original v1 vector: one ascending Int64 key, NULLs first. The
+    // existing strict ordered constructor verifies these bytes and digests.
+    const COMPARATOR: [u8; 32] = [
+        158, 44, 110, 71, 60, 4, 201, 17, 60, 183, 191, 230, 197, 165, 217, 97, 252, 8, 107, 193,
+        30, 11, 64, 71, 100, 226, 118, 121, 250, 188, 138, 254,
+    ];
+    const ORDER: [u8; 32] = [
+        96, 52, 127, 179, 84, 179, 212, 155, 42, 163, 147, 170, 172, 113, 186, 152, 247, 217, 123,
+        253, 151, 126, 100, 10, 137, 217, 226, 211, 239, 1, 50, 184,
+    ];
+    for nullable in [false, true] {
+        let declared = FunctionValueType::new(DataType::Int64, nullable);
+        let order = RuntimeOrderContract::from_fragment_contract(
+            [RuntimeOrderKey::with_value_type(
+                declared.clone(),
+                RuntimeOrderSortDirection::Ascending,
+                RuntimeOrderNullOrder::First,
+            )],
+            COMPARATOR,
+            ORDER,
+        )
+        .unwrap();
+        let installed = execution::RuntimeFilterConsumerContract::ordered_live(
+            execution::RuntimeFilterBindingId::new(12),
+            execution::RuntimeFilterChannelId::new(12),
+            execution::RuntimeFilterLateApplyGranularity::Batch,
+            execution::RuntimeFilterExecutionContract::Ordered(Arc::new(order)),
+        )
+        .unwrap();
+        let frozen = freeze_installed_consumer(&declared, &installed);
+        let StaticFilterContract::Ordered { keys, .. } = frozen.contract() else {
+            panic!("the frozen ordered key keeps its full declaration");
+        };
+        assert_eq!(keys[0].value_type, declared);
+        let runtime = super::runtime_filter_consumer_contract(&frozen).unwrap();
+        assert_eq!(runtime, installed);
+        let execution::RuntimeFilterExecutionContract::Ordered(order) = runtime.contract() else {
+            unreachable!()
+        };
+        assert_eq!(order.keys()[0].value_type(), Some(&declared));
+        assert_eq!(order.comparator_digest(), COMPARATOR);
+        assert_eq!(order.digest(), ORDER);
+    }
 }
 
 fn blocking_consumer(binding_id: u32) -> StaticFilterConsumer {
@@ -698,6 +945,7 @@ struct FakeSession {
     producers: BTreeMap<u32, Arc<RecordingProducer>>,
     subscribed: Mutex<Vec<execution::RuntimeFilterConsumerContract>>,
     opened: Mutex<Vec<execution::RuntimeFilterProducerOpenRequest>>,
+    installed_producers: BTreeMap<u32, execution::RuntimeFilterProducerContract>,
 }
 
 impl FakeSession {
@@ -730,6 +978,17 @@ impl execution::RuntimeFilterSession for FakeSession {
         execution::RuntimeFilterBindOutcome<execution::RuntimeFilterProducerHandle>,
         execution::RuntimeFilterContractViolation,
     > {
+        if let Some(installed) = self
+            .installed_producers
+            .get(&request.contract().binding_id().get())
+        {
+            if request.contract() != installed {
+                return Err(execution::RuntimeFilterContractViolation::new(
+                    execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                    "producer contract differs from the independently installed complete declaration",
+                ));
+            }
+        }
         let producer = self
             .producers
             .get(&request.contract().binding_id().get())
@@ -817,7 +1076,9 @@ fn state(
             None,
             None,
             None,
-            None,
+            Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                "compiled runtime filter tests",
+            )),
             Some(crate::runtime::execution_runtime::test_execution_runtime()),
         )
         .with_runtime_filter_session(
@@ -1060,11 +1321,13 @@ fn a_compiled_scan_gate_waits_exactly_as_long_as_the_v1_scan_gate() {
             execution::RuntimeFilterBindingId::new(7),
             execution::RuntimeFilterChannelId::new(7),
             execution::RuntimeFilterExecutionContract::Membership(
-                execution::RuntimeFilterMembershipSchema::new(
-                    &DataType::Int64,
+                match declared_membership_contract(
+                    FunctionValueType::new(DataType::Int64, true),
                     execution::RuntimeFilterNullSemantics::NeverMatches,
-                )
-                .unwrap(),
+                ) {
+                    execution::RuntimeFilterExecutionContract::Membership(schema) => schema,
+                    _ => unreachable!(),
+                },
             ),
         )
         .unwrap();
@@ -1116,7 +1379,7 @@ fn compiled_scan_runtime_filter_shapes_outside_m1_are_refused_by_name() {
         },
         StaticFilterContract::Ordered {
             keys: Arc::from([FilterOrderKey {
-                data_type: DataType::Int64,
+                value_type: FunctionValueType::new(DataType::Int64, true),
                 direction: FilterSortDirection::Ascending,
                 null_order: FilterNullOrder::First,
             }]),
@@ -1168,24 +1431,19 @@ fn compiled_scan_runtime_filter_shapes_outside_m1_are_refused_by_name() {
         "{message}"
     );
 
-    // A membership digest that is not the canonical schema's.
-    let forged = StaticFilterConsumer::try_new(
-        7,
-        7,
-        FilterConsumerActivation::BlockingSnapshot,
-        StaticFilterContract::Membership {
-            data_type: DataType::Int64,
-            null_semantics: FilterNullSemantics::NeverMatches,
-            digest: [9; 32],
-        },
-        FilterReduction::SetUnion,
+    // A forged digest is refused by the immutable canonical schema author.
+    // It cannot be represented as an otherwise valid static contract anymore.
+    let canonical = novarocks_local_program::FilterMembershipSchema::try_new(
+        &DataType::Int64,
+        FilterNullSemantics::NeverMatches,
     )
     .unwrap();
-    let program = scan_with_consumers(1, vec![(forged, V0_OUTPUT)]).unwrap();
-    let message = scan_refusal(&program, session());
-    assert!(
-        message.contains("local program membership filter digest mismatch"),
-        "{message}"
+    assert_eq!(
+        novarocks_local_program::FilterMembershipSchema::from_canonical(
+            canonical.canonical_bytes(),
+            [9; 32],
+        ),
+        Err(novarocks_local_program::FilterMembershipSchemaError::DigestMismatch),
     );
     assert!(subscription.records().is_empty());
 }
@@ -1436,13 +1694,26 @@ fn a_compiled_hash_join_publishes_the_exact_membership_of_its_build_keys() {
     ] {
         let base = single_join(null_safe);
         let producer = membership_producer(11, null_semantics);
-        let StaticFilterContract::Membership { digest, .. } = producer.contract().clone() else {
+        let StaticFilterContract::Membership { canonical, .. } = producer.contract().clone() else {
             unreachable!()
         };
         let program = join_with_producers(&base, vec![(0, producer)])
             .expect("the join producer program builds");
         let recording = Arc::new(RecordingProducer::default());
-        let session = FakeSession::producers(&[(11, &recording)]);
+        let installed = execution::RuntimeFilterProducerContract::membership(
+            execution::RuntimeFilterBindingId::new(11),
+            execution::RuntimeFilterChannelId::new(11),
+            declared_membership_contract(
+                FunctionValueType::new(DataType::Int64, true),
+                execution::RuntimeFilterNullSemantics::from_canonical(null_semantics),
+            ),
+        )
+        .unwrap();
+        let session = Arc::new(FakeSession {
+            producers: BTreeMap::from([(11, Arc::clone(&recording))]),
+            installed_producers: BTreeMap::from([(11, installed)]),
+            ..FakeSession::default()
+        });
         let rows = run_join(&program, Arc::clone(&session))
             .unwrap_or_else(|error| panic!("null-safe {null_safe}: the join runs: {error}"));
         assert_eq!(
@@ -1451,7 +1722,7 @@ fn a_compiled_hash_join_publishes_the_exact_membership_of_its_build_keys() {
             "null-safe {null_safe}: a producer does not change the join"
         );
         let events = std::mem::take(&mut *recording.events.lock().unwrap());
-        let (values, contains_null, close) = published_membership(&events, digest);
+        let (values, contains_null, close) = published_membership(&events, canonical.digest());
         assert_eq!(values, build_keys, "null-safe {null_safe}");
         assert!(
             contains_null,
@@ -1557,7 +1828,7 @@ fn compiled_hash_join_producer_shapes_outside_m1_are_refused_by_name() {
                 FilterProducerKind::TopKSummary,
                 StaticFilterContract::Ordered {
                     keys: Arc::from([FilterOrderKey {
-                        data_type: DataType::Int64,
+                        value_type: FunctionValueType::new(DataType::Int64, true),
                         direction: FilterSortDirection::Ascending,
                         null_order: FilterNullOrder::First,
                     }]),
@@ -1712,7 +1983,7 @@ fn join_under_consumer_node(program: &LocalProgram) -> Result<Arc<LocalProgram>,
             definitions: vec![(
                 StaticExprNode::new(
                     StaticExprKind::SlotId(output.slots()[0]),
-                    key_type.data_type.clone(),
+                    key_type.data_type().clone(),
                     None,
                 ),
                 key_type,

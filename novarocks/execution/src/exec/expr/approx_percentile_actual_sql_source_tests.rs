@@ -278,7 +278,7 @@ fn check_actual_approx(mode: novarocks_sql::compiler::SqlPhysicalEmissionMode) {
                     else {
                         panic!("actual rate")
                     };
-                    let expected = if matches!(rate.data_type, DataType::List(_)) {
+                    let expected = if matches!(rate.data_type(), DataType::List(_)) {
                         DataType::List(Arc::new(Field::new("item", DataType::Float64, true)))
                     } else {
                         DataType::Float64
@@ -292,7 +292,10 @@ fn check_actual_approx(mode: novarocks_sql::compiler::SqlPhysicalEmissionMode) {
                         FunctionValueType::new(DataType::Binary, true)
                     );
                     assert!(
-                        matches!(rate.data_type, DataType::Decimal128(..) | DataType::List(_)),
+                        matches!(
+                            rate.data_type(),
+                            DataType::Decimal128(..) | DataType::List(_)
+                        ),
                         "native statements original authored rates"
                     );
                     eprintln!(

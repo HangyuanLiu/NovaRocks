@@ -196,11 +196,11 @@ fn legacy_by_empty_and_all_null_key_keep_nullable_binding_and_binary_null_state(
         let FunctionResultType::Scalar(out) = bound.selected.result_type else {
             panic!("scalar")
         };
-        assert_eq!(out.data_type, DataType::Int64);
-        assert!(out.nullable);
+        assert_eq!(out.data_type().clone(), DataType::Int64);
+        assert!(out.nullable());
         let state = &bound.selected.aggregate.unwrap().intermediate_type;
-        assert_eq!(state.data_type, DataType::Binary);
-        assert!(state.nullable);
+        assert_eq!(state.data_type().clone(), DataType::Binary);
+        assert!(state.nullable());
     }
 }
 #[test]

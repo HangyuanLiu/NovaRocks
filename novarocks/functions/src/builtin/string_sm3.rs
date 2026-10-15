@@ -83,8 +83,8 @@ pub(super) fn evaluate_string_sm3<'a>(
         let FunctionArgumentType::Value(source) = &types[0] else {
             return Err(invalid("sm3 requires a value argument"));
         };
-        let exact =
-            source.logical_type == ValueLogicalType::Physical && source.data_type == DataType::Utf8;
+        let exact = source.logical_type() == ValueLogicalType::Physical
+            && source.data_type() == &DataType::Utf8;
         work.step()?;
         if !exact {
             return Err(invalid(
@@ -92,9 +92,9 @@ pub(super) fn evaluate_string_sm3<'a>(
             ));
         }
         let target = input.contract().result_type();
-        if target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
+        if target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Utf8
+            || !target.nullable()
         {
             return Err(invalid(
                 "sm3 differs from its exact installed result profile",
@@ -115,7 +115,7 @@ pub(super) fn evaluate_string_sm3<'a>(
                 return Err(internal("sm3 selected argument row is out of bounds"));
             }
             if strings.is_null(row) {
-                if !source.nullable {
+                if !source.nullable() {
                     return Err(internal("sm3 non-null argument contains selected SQL NULL"));
                 }
                 Ok(None)
@@ -181,7 +181,7 @@ pub(super) fn evaluate_string_sm3<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

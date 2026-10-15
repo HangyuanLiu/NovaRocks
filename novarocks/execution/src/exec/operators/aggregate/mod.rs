@@ -56,7 +56,11 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use novarocks_types::SlotId;
 
 use crate::exec::hash_table::key_builder::build_group_key_views;
+#[cfg(test)]
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
+use crate::exec::hash_table::key_column::{
+    AggregateOutputCreation, create_local_partial_aggregate_schema, validate_typed_aggregate_output,
+};
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
@@ -471,6 +475,7 @@ pub struct AggregateProcessorFactory {
     functions: Vec<AggFunction>,
     kernels: agg::AggKernelSet,
     output_intermediate: bool,
+    local_partial_output: bool,
     direct_input: bool,
     output_chunk_schema: ChunkSchemaRef,
     runtime_filter_execution: AggregateRuntimeFilterExecution,
@@ -587,6 +592,7 @@ impl AggregateProcessorFactory {
             functions,
             kernels,
             output_intermediate,
+            local_partial_output: false,
             direct_input,
             output_chunk_schema,
             runtime_filter_execution: AggregateRuntimeFilterExecution { topn_producers },
@@ -596,6 +602,13 @@ impl AggregateProcessorFactory {
             #[cfg(test)]
             fail_output_construction: false,
         })
+    }
+
+    /// Only the pipeline's inserted update/partial occurrence changes phase.
+    /// Its original final port remains the author checked during preparation.
+    pub(crate) fn with_local_partial_output(mut self) -> Self {
+        self.local_partial_output = true;
+        self
     }
 
     #[cfg(test)]
@@ -643,6 +656,7 @@ impl OperatorFactory for AggregateProcessorFactory {
             state_ptrs: AggregateStatePointers::new(),
             kernels: Some(self.kernels.clone()),
             output_intermediate: self.output_intermediate,
+            local_partial_output: self.local_partial_output,
             direct_input: self.direct_input,
             initialized: false,
             data_initialized: false,
@@ -650,6 +664,7 @@ impl OperatorFactory for AggregateProcessorFactory {
             finishing: false,
             finalized: false,
             finished: false,
+            construction: None,
             output_schema: None,
             output_chunk_schema: Arc::clone(&self.output_chunk_schema),
             observed_group_key_nullable: vec![false; self.group_by.len()],
@@ -694,6 +709,7 @@ struct AggregateProcessorOperator {
     state_ptrs: AggregateStatePointers,
     kernels: Option<agg::AggKernelSet>,
     output_intermediate: bool,
+    local_partial_output: bool,
     direct_input: bool,
     initialized: bool,
     data_initialized: bool,
@@ -701,6 +717,7 @@ struct AggregateProcessorOperator {
     finishing: bool,
     finalized: bool,
     finished: bool,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     output_schema: Option<SchemaRef>,
     output_chunk_schema: ChunkSchemaRef,
     observed_group_key_nullable: Vec<bool>,
@@ -725,6 +742,16 @@ struct AggregateProcessorOperator {
 }
 
 impl Operator for AggregateProcessorOperator {
+    fn creates_typed_storage(&self) -> bool {
+        self.output_chunk_schema.is_typed()
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.construction = Some(factory);
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -773,11 +800,48 @@ impl Operator for AggregateProcessorOperator {
             self.fail_final_domain();
             return Err(error.into());
         }
-        let result = self.init_from_plan();
+        let result: ExecutionResult<()> = (|| {
+            if self.output_chunk_schema.is_typed() {
+                let factory = self
+                    .construction
+                    .as_ref()
+                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+                let kernels = self
+                    .kernels
+                    .as_ref()
+                    .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
+                if self.local_partial_output {
+                    if !self.output_intermediate || self.direct_input {
+                        return Err(
+                            "local partial aggregate is not an update/state occurrence".into()
+                        );
+                    }
+                    self.output_chunk_schema = create_local_partial_aggregate_schema(
+                        &self.output_chunk_schema,
+                        &self.arena,
+                        &self.group_by,
+                        &kernels.entries,
+                        factory.as_ref(),
+                    )?;
+                    self.local_partial_output = false;
+                }
+                validate_typed_aggregate_output(
+                    &self.output_chunk_schema,
+                    &self.arena,
+                    &self.group_by,
+                    &kernels.entries,
+                    self.output_intermediate,
+                    |units| factory.observe_input_work(units),
+                )?;
+            }
+
+            self.init_from_plan()?;
+            Ok(())
+        })();
         if result.is_err() {
             self.fail_final_domain();
         }
-        Ok(result?)
+        result
     }
 
     fn bind_runtime_state(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
@@ -837,23 +901,46 @@ impl AggregateProcessorOperator {
     }
 
     fn rebuild_output_schema(&mut self, group_key_nullable: Option<&[bool]>) -> Result<(), String> {
-        let kernels = self
-            .kernels
-            .as_ref()
-            .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
-        let key_columns = self
-            .key_table
-            .as_ref()
-            .map(|table| table.key_columns())
-            .unwrap_or(&[]);
-        self.output_schema = Some(build_output_schema_from_kernels(
-            key_columns,
-            &kernels.entries,
-            self.output_intermediate,
-            &self.output_chunk_schema,
-            group_key_nullable,
-        )?);
-        Ok(())
+        if self.output_chunk_schema.is_typed() {
+            if let Some(actual) = group_key_nullable {
+                for (index, has_nulls) in actual.iter().enumerate() {
+                    let slot = self
+                        .output_chunk_schema
+                        .slots()
+                        .get(index)
+                        .ok_or("aggregate group output declaration is absent")?;
+                    if *has_nulls && !slot.nullable() {
+                        return Err("aggregate required group output contains NULL".into());
+                    }
+                }
+            }
+            self.output_schema = Some(self.output_chunk_schema.arrow_schema_ref());
+            return Ok(());
+        }
+        #[cfg(not(test))]
+        {
+            Err("aggregate output requires its complete value bindings".into())
+        }
+        #[cfg(test)]
+        {
+            let kernels = self
+                .kernels
+                .as_ref()
+                .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
+            let key_columns = self
+                .key_table
+                .as_ref()
+                .map(|table| table.key_columns())
+                .unwrap_or(&[]);
+            self.output_schema = Some(build_output_schema_from_kernels(
+                key_columns,
+                &kernels.entries,
+                self.output_intermediate,
+                &self.output_chunk_schema,
+                group_key_nullable,
+            )?);
+            Ok(())
+        }
     }
 
     fn try_submit_native_topn_bound(&mut self) -> Result<(), String> {
@@ -1131,13 +1218,13 @@ impl AggregateProcessorOperator {
         Ok(None)
     }
 
-    fn finish(&mut self) -> Result<Option<Chunk>, String> {
+    fn finish(&mut self) -> ExecutionResult<Option<Chunk>> {
         if self.finished {
             return Ok(None);
         }
 
         if !self.initialized {
-            return Err("aggregate operator not prepared".to_string());
+            return Err("aggregate operator not prepared".into());
         }
 
         if !self.group_by.is_empty() {
@@ -1165,7 +1252,7 @@ impl AggregateProcessorOperator {
         if self.group_states.is_empty() {
             if self.group_by.is_empty() {
                 self.ensure_scalar_group().map_err(|e| e.to_string())?;
-            } else {
+            } else if !self.output_chunk_schema.is_typed() {
                 let schema = self
                     .output_schema
                     .clone()
@@ -1188,6 +1275,27 @@ impl AggregateProcessorOperator {
             .as_ref()
             .map(|table| table.key_columns().len())
             .unwrap_or(0);
+        let output_creation = if self.output_chunk_schema.is_typed() {
+            if key_count != self.group_by.len() {
+                return Err(
+                    "aggregate actual group channel count differs from its declaration".into(),
+                );
+            }
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+            Some(AggregateOutputCreation::begin(
+                &self.output_chunk_schema,
+                &self.arena,
+                &self.group_by,
+                &kernels.entries,
+                self.output_intermediate,
+                factory.as_ref(),
+            )?)
+        } else {
+            None
+        };
         let mut arrays = Vec::with_capacity(key_count + kernels.entries.len());
         if let Some(table) = self.key_table.as_ref() {
             for col in table.key_columns() {
@@ -1200,6 +1308,9 @@ impl AggregateProcessorOperator {
                 &self.group_states,
                 || kernel.build_array(&self.group_states, self.output_intermediate),
             )?);
+        }
+        if let Some(creation) = output_creation {
+            return Ok(Some(creation.finish(arrays, self.group_states.len())?));
         }
         let schema = align_schema_with_arrays(&schema, &arrays, "aggregate finalize output")?;
 
@@ -1216,6 +1327,12 @@ impl AggregateProcessorOperator {
 }
 
 impl ProcessorOperator for AggregateProcessorOperator {
+    fn input_construction_factory(
+        &self,
+    ) -> Option<&dyn crate::exec::pipeline::operator::InputConstructionFactory> {
+        self.construction.as_deref()
+    }
+
     fn need_input(&self) -> bool {
         !self.finishing && !self.finished && self.pending_output.is_none()
     }
@@ -1824,6 +1941,7 @@ fn aggregate_topn_test_operator(
             },
         },
         output_intermediate: false,
+        local_partial_output: false,
         direct_input: false,
         output_chunk_schema: Arc::new(ChunkSchema::empty()),
         runtime_filter_execution: AggregateRuntimeFilterExecution { topn_producers },

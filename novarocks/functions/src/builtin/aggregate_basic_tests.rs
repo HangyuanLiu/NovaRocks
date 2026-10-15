@@ -701,7 +701,10 @@ fn basic_window_every_numeric_overload_and_alias_has_independent_values() {
         ] {
             let f = Fixture::new(
                 name,
-                FunctionValueType::new(input.data_type().clone(), false),
+                FunctionValueType::from_legacy_declared_projection(
+                    input.data_type().clone(),
+                    false,
+                ),
                 DecimalOverflowPolicy::OutputNull,
             );
             let result = run_window(&f.window(), input, &frames).unwrap();
@@ -722,8 +725,14 @@ fn basic_window_every_numeric_overload_and_alias_has_independent_values() {
                 let f = Fixture::new_multi(
                     name,
                     &[
-                        FunctionValueType::new(x.data_type().clone(), false),
-                        FunctionValueType::new(y.data_type().clone(), false),
+                        FunctionValueType::from_legacy_declared_projection(
+                            x.data_type().clone(),
+                            false,
+                        ),
+                        FunctionValueType::from_legacy_declared_projection(
+                            y.data_type().clone(),
+                            false,
+                        ),
                     ],
                     DecimalOverflowPolicy::OutputNull,
                 );
@@ -756,7 +765,7 @@ fn basic_window_every_numeric_overload_and_alias_has_independent_values() {
     );
     let f = Fixture::new(
         "avg",
-        FunctionValueType::new(values.data_type().clone(), false),
+        FunctionValueType::from_legacy_declared_projection(values.data_type().clone(), false),
         DecimalOverflowPolicy::OutputNull,
     );
     let out = run_window(&f.window(), &values, &frames).unwrap();
@@ -780,7 +789,7 @@ fn basic_window_every_numeric_overload_and_alias_has_independent_values() {
     );
     let f = Fixture::new(
         "avg",
-        FunctionValueType::new(values.data_type().clone(), false),
+        FunctionValueType::from_legacy_declared_projection(values.data_type().clone(), false),
         DecimalOverflowPolicy::OutputNull,
     );
     let out = run_window(&f.window(), &values, &frames).unwrap();

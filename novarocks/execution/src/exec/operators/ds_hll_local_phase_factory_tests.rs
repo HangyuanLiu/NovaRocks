@@ -141,6 +141,20 @@ fn factory(
     )
     .unwrap()
 }
+fn prepared_schema(
+    factory: &CompiledAggregateProcessorFactory,
+    tracker: Arc<MemTracker>,
+) -> ChunkSchemaRef {
+    let creator = aggregate_fixture::runtime_construction_factory(tracker, factory.error.clone());
+    prepare_aggregate_schema(
+        creator.as_ref(),
+        &factory.output_layout,
+        factory.groups,
+        &factory.calls,
+        factory.output_role,
+    )
+    .expect("actual aggregate declaration schema creator")
+}
 fn run(
     factory: &CompiledAggregateProcessorFactory,
     input: &[Chunk],
@@ -148,7 +162,12 @@ fn run(
 ) -> Chunk {
     let state = RuntimeState::default();
     let mut operator = factory.create(2, 0);
+    operator.set_construction_factory(aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        factory.error.clone(),
+    ));
     operator.set_mem_tracker(tracker);
+    operator.prepare().expect("prepare actual aggregate schema");
     let processor = operator.as_processor_mut().unwrap();
     for chunk in input {
         processor.push_chunk(&state, chunk.clone()).unwrap();
@@ -187,7 +206,7 @@ fn ds_hll_local_phase_before_real_factories_100k() {
         );
         println!(
             "DS_PHASE PURE_RAW estimate={}",
-            raw.batch
+            raw.record_batch()
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
@@ -197,19 +216,19 @@ fn ds_hll_local_phase_before_real_factories_100k() {
         let stages = program(true);
         let source = input(&stages);
         let partial = factory(&stages, P::Partial);
-        let first = Chunk::new_like(source.batch.slice(0, 50_000), &source);
-        let second = Chunk::new_like(source.batch.slice(50_000, 50_000), &source);
+        let first = Chunk::new_like(source.record_batch().slice(0, 50_000), &source);
+        let second = Chunk::new_like(source.record_batch().slice(50_000, 50_000), &source);
         let left = run(&partial, &[first], tracker.clone());
         let right = run(&partial, &[second], tracker.clone());
         let left_flags = left
-            .batch
+            .record_batch()
             .column(0)
             .as_any()
             .downcast_ref::<BinaryArray>()
             .unwrap()
             .value(0)[5];
         let right_flags = right
-            .batch
+            .record_batch()
             .column(0)
             .as_any()
             .downcast_ref::<BinaryArray>()
@@ -225,7 +244,7 @@ fn ds_hll_local_phase_before_real_factories_100k() {
             println!(
                 "DS_PHASE PURE_TWO reverse={reverse} estimate={} left_flags={left_flags} right_flags={right_flags}",
                 result
-                    .batch
+                    .record_batch()
                     .column(0)
                     .as_any()
                     .downcast_ref::<Int64Array>()

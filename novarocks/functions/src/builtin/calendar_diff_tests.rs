@@ -420,7 +420,9 @@ fn calendar_diff_all_six_profiles_preserve_calendar_day_oracles_nullable_and_pol
                 for mask in 0..4 {
                     let mut types = [source.clone(), source.clone()];
                     for (index, ty) in types.iter_mut().enumerate() {
-                        ty.nullable = mask & (1 << index) != 0;
+                        *ty = ty
+                            .with_nullable(mask & (1 << index) != 0)
+                            .expect("valid function nullability declaration");
                     }
                     let prepared = prepared_for_test_with_policy(name, &types, policy).unwrap();
                     assert_eq!(prepared.contract().result_type(), &result_type());
@@ -490,7 +492,7 @@ fn calendar_diff_independent_original_compact_scalar_slice_and_cv_addresses_are_
         let scalar = left.slice(1, 1);
         let compact = SelectedValues::try_new(
             selection,
-            &source.data_type,
+            source.data_type(),
             right.slice(0, 2),
             Box::default(),
         )
@@ -759,7 +761,7 @@ fn calendar_diff_every_actual_compile_callback_preserves_three_causes_success_an
                 &good
             )
             .is_ok(),
-            source.data_type == DataType::Utf8
+            source.data_type() == &DataType::Utf8
         );
         let trace = good.trace.lock().unwrap().clone();
         assert!(!trace.is_empty());

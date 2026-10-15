@@ -246,7 +246,7 @@ fn unixtime_prepare_names_missing_local_author_declared_raw_errors_and_original_
         assert!(
             prepared_for_test(
                 &[
-                    FunctionValueType::new(source, true),
+                    FunctionValueType::from_legacy_declared_projection(source, true),
                     constant.value_type().clone()
                 ],
                 &[None, Some(constant.clone())],

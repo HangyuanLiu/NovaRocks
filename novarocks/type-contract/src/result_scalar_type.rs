@@ -18,10 +18,106 @@
 //! Frozen scalar semantic facts compared with canonical Native storage.
 //! This check does not infer logical Json/Variant/opaque identity from Arrow.
 //! The frozen schema supplies that authority; runtime owners separately verify
-//! actual logical metadata and pay every accepted carrier's complete backing.
+//! actual encoded carriers and their original backing policy separately.
 
 use arrow_schema::{DataType as D, Field, TimeUnit as U};
 use novarocks_result_contract::{ScalarField, ScalarTimestampUnit as T, ScalarValueType as S};
+
+/// Complete frozen scalar identity and accurate canonical value layout.
+/// Source metadata is not an execution semantic author. This borrowed check
+/// constructs no projected fields, schemas, strings, or allocation grants.
+pub fn scalar_field_matches_binding(
+    field: &ScalarField,
+    binding: &crate::TypedValueBinding,
+) -> bool {
+    scalar_field_matches_binding_observed(field, binding, &mut || {
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .unwrap_or(false)
+}
+
+/// Preserve the original comparison observer's first refusal without tail work.
+pub fn scalar_field_matches_binding_observed<E>(
+    field: &ScalarField,
+    binding: &crate::TypedValueBinding,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    if !semantics_match(field, binding.value_type(), observe)? {
+        return Ok(false);
+    }
+    // The unchanged storage grammar is a bounded borrowed operation. Control
+    // surrounds it; its internal comparisons do not claim cooperative work.
+    observe()?;
+    let matches = scalar_field_matches_storage(field, binding.data_type(), binding.nullable());
+    observe()?;
+    Ok(matches)
+}
+
+fn semantics_match<E>(
+    field: &ScalarField,
+    value: &crate::ValueTypeRef,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    use crate::{ValueKind, ValueLogicalType as V};
+    use novarocks_result_contract::ScalarOpaqueType as O;
+    observe()?;
+    if field.nullable != value.nullable() {
+        return Ok(false);
+    }
+    Ok(match (&field.value_type, value.kind()) {
+        (S::List(expected), ValueKind::List(actual)) => semantics_match(expected, actual, observe)?,
+        (
+            S::Map { key, value },
+            ValueKind::Map {
+                key: actual_key,
+                value: actual_value,
+            },
+        ) => {
+            semantics_match(key, actual_key, observe)?
+                && semantics_match(value, actual_value, observe)?
+        }
+        (S::Struct(expected), ValueKind::Struct(actual)) if expected.len() == actual.len() => {
+            for (expected, actual) in expected.iter().zip(actual) {
+                observe()?;
+                if expected.name.len() != actual.name().len() {
+                    return Ok(false);
+                }
+                for (left, right) in expected.name.bytes().zip(actual.name().bytes()) {
+                    observe()?;
+                    if left != right {
+                        return Ok(false);
+                    }
+                }
+                if !semantics_match(&expected.field, actual.value_type(), observe)? {
+                    return Ok(false);
+                }
+            }
+            true
+        }
+        (S::Json, ValueKind::Nominal(V::Json))
+        | (S::Variant, ValueKind::Nominal(V::Variant))
+        | (S::LargeInt, ValueKind::Nominal(V::LargeInt))
+        | (S::Opaque(O::Hll), ValueKind::Nominal(V::Hll))
+        | (S::Opaque(O::Bitmap), ValueKind::Nominal(V::Bitmap))
+        | (S::Opaque(O::Object), ValueKind::Nominal(V::Object))
+        | (S::Opaque(O::Percentile), ValueKind::Nominal(V::Percentile))
+        | (S::String, ValueKind::String)
+        | (S::Binary, ValueKind::Binary) => true,
+        (
+            S::Null
+            | S::Boolean
+            | S::SignedInteger(_)
+            | S::Float32
+            | S::Float64
+            | S::Date
+            | S::TimeMicros
+            | S::Decimal { .. }
+            | S::Timestamp { .. },
+            ValueKind::Scalar(_),
+        ) => true,
+        _ => false,
+    })
+}
 
 pub fn scalar_field_matches_storage(field: &ScalarField, carrier: &D, nullable: bool) -> bool {
     field.nullable == nullable && matches_storage(&field.value_type, carrier)
@@ -90,5 +186,97 @@ fn matches_storage(field: &S, carrier: &D) -> bool {
                 })
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+    use crate::{
+        FunctionValueType, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        ValueTypeStorageLifetime as Hold,
+    };
+    use std::sync::Arc;
+
+    fn list(json: bool, child_nullable: bool) -> FunctionValueType {
+        let child = ValueTypeRef::try_new(
+            if json {
+                ValueKind::Nominal(ValueLogicalType::Json)
+            } else {
+                ValueKind::String
+            },
+            child_nullable,
+            Hold::pure(),
+        )
+        .unwrap();
+        let value = ValueTypeRef::try_new(ValueKind::List(child), false, Hold::pure()).unwrap();
+        let layout = D::List(Arc::new(Field::new("item", D::Utf8, child_nullable)));
+        FunctionValueType::try_from_value(
+            value,
+            ValueLayout::try_new(&layout, Hold::pure()).unwrap(),
+        )
+        .unwrap()
+    }
+    fn scalar() -> ScalarField {
+        ScalarField {
+            nullable: false,
+            value_type: S::List(Box::new(ScalarField {
+                nullable: true,
+                value_type: S::Json,
+            })),
+        }
+    }
+
+    #[test]
+    fn scalar_binding_rejects_same_carrier_nested_domain_drift_and_accepts_independent_equal_authors()
+     {
+        let json = list(true, true);
+        let text = list(false, true);
+        assert_eq!(json.data_type(), text.data_type());
+        assert!(
+            scalar_field_matches_storage(&scalar(), text.data_type(), text.nullable()),
+            "carrier alone cannot establish child identity"
+        );
+        assert!(!scalar_field_matches_binding(
+            &scalar(),
+            text.typed_binding()
+        ));
+        let independent = list(true, true);
+        assert!(!json.value_type().shares_storage(independent.value_type()));
+        assert!(
+            !json
+                .typed_binding()
+                .layout()
+                .shares_storage(independent.typed_binding().layout())
+        );
+        assert!(scalar_field_matches_binding(
+            &scalar(),
+            json.typed_binding()
+        ));
+        assert!(scalar_field_matches_binding(
+            &scalar(),
+            independent.typed_binding()
+        ));
+        assert!(
+            !scalar_field_matches_binding(&scalar(), list(true, false).typed_binding()),
+            "child NULL promises stay exact"
+        );
+    }
+
+    #[test]
+    fn borrowed_scalar_binding_observer_preserves_first_original_refusal_without_tail() {
+        #[derive(Debug, PartialEq)]
+        enum Stop {
+            Original(u32),
+        }
+        let value = list(true, true);
+        let mut visits = 0;
+        let result =
+            scalar_field_matches_binding_observed(&scalar(), value.typed_binding(), &mut || {
+                visits += 1;
+                Err(Stop::Original(73))
+            });
+        assert_eq!(result, Err(Stop::Original(73)));
+        assert_eq!(visits, 1);
     }
 }

@@ -152,12 +152,16 @@ fn original_unknown_zone_deepest_error_retains_entire_long_string() {
         args[0],
         DataType::Timestamp(TimeUnit::Microsecond, Some(zone.clone().into())),
     );
-    // The feature-selected Arrow parser authors the complete source error.
+    // The locked Arrow parser owns this feature-dependent source diagnostic.
+    // Independently obtain its complete error, then require exact propagation.
     let expected = zone
         .parse::<arrow::array::timezone::Tz>()
         .unwrap_err()
         .to_string();
-    assert!(expected.contains(&zone));
+    assert!(
+        expected.contains(&zone),
+        "the entire original zone is retained"
+    );
     assert!(expected.len() > 512);
     assert_eq!(
         crate::exec::expr::function::date::parse_from_cast_source(&arena, cast, &chunk)

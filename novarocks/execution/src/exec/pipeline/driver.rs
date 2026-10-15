@@ -34,9 +34,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use super::operator::{
-    BlockedReason, DictionaryCarrierStats, DriverBlockDeadline, FinishWatch, Operator,
-    ProcessorOperator, RootPreparedPull, dictionary_carrier_stats, forward_observable,
-    hydrate_for_downstream,
+    BlockedReason, DictionaryCarrierStats, DriverBlockDeadline, FinishWatch,
+    InputConstructionFactory, Operator, ProcessorOperator, RootPreparedPull,
+    dictionary_carrier_stats, forward_observable, hydrate_for_downstream_with_factory,
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
@@ -248,6 +248,7 @@ pub struct PipelineDriver {
     operator_finishing_set: Vec<bool>,
     operator_mem_trackers: Vec<Option<Arc<MemTracker>>>,
     edge_mem_trackers: Vec<Option<Arc<MemTracker>>>,
+    input_construction_factories: Option<Vec<Option<Arc<dyn InputConstructionFactory>>>>,
 }
 
 /// Fragment-owned services bound before operator preparation.
@@ -259,6 +260,7 @@ pub(crate) struct PipelineDriverBindings {
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     event_sink: Arc<dyn FragmentEventSink>,
     prebound_operator_mem_trackers: Option<Vec<Option<Arc<MemTracker>>>>,
+    input_construction_factories: Option<Vec<Option<Arc<dyn InputConstructionFactory>>>>,
 }
 
 impl PipelineDriverBindings {
@@ -270,6 +272,7 @@ impl PipelineDriverBindings {
             event_sink,
             prebound_operator_mem_trackers,
             query_memory: None,
+            input_construction_factories: None,
         }
     }
     pub(crate) fn with_query_memory(
@@ -277,6 +280,13 @@ impl PipelineDriverBindings {
         binding: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     ) -> Self {
         self.query_memory = binding;
+        self
+    }
+    pub(crate) fn with_input_construction_factories(
+        mut self,
+        factories: Vec<Option<Arc<dyn InputConstructionFactory>>>,
+    ) -> Self {
+        self.input_construction_factories = Some(factories);
         self
     }
     #[allow(
@@ -369,9 +379,17 @@ impl PipelineDriver {
             query_memory,
             event_sink,
             prebound_operator_mem_trackers,
+            input_construction_factories,
         } = bindings;
         let mut operators = operators;
         let operator_count = operators.len();
+        if let Some(factories) = &input_construction_factories {
+            assert_eq!(
+                factories.len(),
+                operator_count,
+                "prebound input construction factory count"
+            );
+        }
         let edge_count = operator_count.saturating_sub(1);
         let driver_total_time = profiler.as_ref().map(|p| p.add_timer("DriverTotalTime"));
         let driver_blocked_time = profiler.as_ref().map(|p| p.add_timer("DriverBlockedTime"));
@@ -514,6 +532,7 @@ impl PipelineDriver {
             operator_counters,
             runtime_state,
             query_memory,
+            input_construction_factories,
             fragment_instance_id,
             event_sink,
             state: DriverState::Ready,
@@ -1504,7 +1523,16 @@ impl PipelineDriver {
                 let chunk = if original_input {
                     chunk
                 } else {
-                    hydrate_for_downstream(&chunk, downstream_ref)?
+                    // Typed input uses the installed BE-local consumer's exact
+                    // path capabilities and actual construction owner. This
+                    // never authorizes descendants from a root-slot fast path.
+                    let factory = downstream_ref.input_construction_factory().or_else(|| {
+                        self.input_construction_factories
+                            .as_ref()
+                            .and_then(|factories| factories.get(downstream_idx))
+                            .and_then(|factory| factory.as_deref())
+                    });
+                    hydrate_for_downstream_with_factory(&chunk, downstream_ref, factory)?
                 };
                 (chunk, stats, original_input)
             };
@@ -3204,5 +3232,452 @@ mod terminal_signal_tests {
         assert_eq!(driver.process(Duration::ZERO), DriverState::Failed(first));
         assert_eq!(failure_count.load(Ordering::SeqCst), 1);
         assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
+    }
+    mod typed_construction_driver_tests {
+        use super::*;
+        use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+        use crate::exec::pipeline::driver::PipelineDriverBindings;
+        use crate::exec::pipeline::operator::input_construction::{
+            InputConstructionFactory, InputConstructionProfile,
+            try_runtime_input_construction_factory,
+        };
+        use crate::runtime::fragment::{ExecutionFailure, PipelineOperation};
+        use crate::runtime::mem_tracker::MemTracker;
+        use crate::runtime::runtime_state::RuntimeErrorState;
+        use arrow::array::{
+            Array, ArrayData, ArrayRef, DictionaryArray, Int32Array, LargeStringArray, ListArray,
+            StringArray,
+        };
+        use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
+        use arrow::datatypes::{Field, Int32Type};
+        use novarocks_type_contract::{
+            TypedValueBinding, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+            ValueTypeStorageLifetime,
+        };
+        use novarocks_types::SlotId;
+
+        struct RetainingSink {
+            received: Arc<Mutex<Option<Chunk>>>,
+            keep_encoding: bool,
+            original_input: bool,
+        }
+        impl Operator for RetainingSink {
+            fn name(&self) -> &str {
+                "RetainingTypedSink"
+            }
+            fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+                Some(self)
+            }
+            fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+                Some(self)
+            }
+        }
+        impl ProcessorOperator for RetainingSink {
+            fn need_input(&self) -> bool {
+                true
+            }
+            fn has_output(&self) -> bool {
+                false
+            }
+            fn accepts_encoded_column(&self, _: SlotId, _: &arrow::datatypes::DataType) -> bool {
+                self.keep_encoding
+            }
+            fn takes_original_input(&self) -> bool {
+                self.original_input
+            }
+            fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+                *self.received.lock().unwrap() = Some(chunk);
+                Ok(())
+            }
+            fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+                Ok(None)
+            }
+            fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
+                Ok(())
+            }
+        }
+        fn source() -> Chunk {
+            let storage = ValueTypeStorageLifetime::pure();
+            let array: ArrayRef = Arc::new(
+                [Some("{}"), None, Some("{}")]
+                    .into_iter()
+                    .collect::<DictionaryArray<Int32Type>>(),
+            );
+            let value = ValueTypeRef::try_new(
+                ValueKind::Nominal(ValueLogicalType::Json),
+                true,
+                storage.clone(),
+            )
+            .unwrap();
+            let binding = TypedValueBinding::try_new(
+                value,
+                ValueLayout::try_new(array.data_type(), storage.clone()).unwrap(),
+            )
+            .unwrap();
+            let slot = ChunkSlotSchema::try_new_typed(
+                SlotId::new(1),
+                Arc::new(Field::new("payload", array.data_type().clone(), true)),
+                binding,
+                None,
+                storage.clone(),
+            )
+            .unwrap();
+            Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+                Arc::new(ChunkSchema::try_new_typed(vec![slot], storage.clone()).unwrap()),
+                vec![array],
+                3,
+                storage,
+                |_| Ok(()),
+            )
+            .unwrap()
+        }
+        fn required_list_source(offset: usize, len: usize) -> Result<Chunk, String> {
+            // A NULL value deliberately retains nonempty payload bytes. The
+            // typed source admits only its active parent/offset-visible rows.
+            let values = ArrayData::builder(arrow::datatypes::DataType::Utf8)
+                .len(2)
+                .buffers(vec![
+                    Buffer::from_slice_ref([0i32, 4, 10]),
+                    Buffer::from(b"keptshadow".as_slice()),
+                ])
+                .nulls(Some(NullBuffer::from(vec![true, false])))
+                .build()
+                .unwrap();
+            let dictionary: ArrayRef = Arc::new(
+                DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(vec![1, 0, 1]),
+                    Arc::new(StringArray::from(values)),
+                )
+                .unwrap(),
+            );
+            let data = ArrayData::builder(arrow::datatypes::DataType::List(Arc::new(Field::new(
+                "item",
+                dictionary.data_type().clone(),
+                false,
+            ))))
+            .len(3)
+            .buffers(vec![
+                OffsetBuffer::new(vec![0i32, 1, 2, 3].into())
+                    .inner()
+                    .inner()
+                    .clone(),
+            ])
+            .child_data(vec![dictionary.to_data()])
+            .nulls(Some(NullBuffer::from(vec![false, true, true])))
+            .build()
+            .unwrap();
+            data.validate_full().unwrap();
+            let array: ArrayRef = Arc::new(ListArray::from(data));
+            let array = array.slice(offset, len);
+            let storage = ValueTypeStorageLifetime::pure();
+            let binding = TypedValueBinding::try_new(
+                ValueTypeRef::try_new(
+                    ValueKind::List(
+                        ValueTypeRef::try_new(ValueKind::String, false, storage.clone()).unwrap(),
+                    ),
+                    true,
+                    storage.clone(),
+                )
+                .unwrap(),
+                ValueLayout::try_new(array.data_type(), storage.clone()).unwrap(),
+            )
+            .unwrap();
+            let slot = ChunkSlotSchema::try_new_typed(
+                SlotId::new(1),
+                Arc::new(Field::new("payload", array.data_type().clone(), true)),
+                binding,
+                None,
+                storage.clone(),
+            )
+            .unwrap();
+            Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+                Arc::new(ChunkSchema::try_new_typed(vec![slot], storage.clone()).unwrap()),
+                vec![array],
+                len,
+                storage,
+                |_| Ok(()),
+            )
+        }
+        fn require_plain_list_at_actual_driver(offset: usize, len: usize) {
+            let tracker = MemTracker::new_root("required inactive dictionary driver");
+            let factory = factory(&tracker, Arc::new(RuntimeErrorState::default()));
+            let received = Arc::new(Mutex::new(None));
+            let source = required_list_source(offset, len).unwrap();
+            let mut driver = driver(
+                RetainingSink {
+                    received: received.clone(),
+                    keep_encoding: false,
+                    original_input: false,
+                },
+                Some(factory),
+            );
+            driver.edge_chunks[0] = Some(source.clone());
+            let mut progress = false;
+            // Desired plain/dictionary equivalence: inactive NULLs are not a
+            // reason to reject an already validated immutable typed source.
+            driver.drive_push_edges(&mut progress).unwrap();
+            assert!(progress);
+            let output = received.lock().unwrap().take().unwrap();
+            let list = output.columns()[0]
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            assert_eq!(list.len(), source.len());
+            assert_eq!(list.values().data_type(), &arrow::datatypes::DataType::Utf8);
+            let arrow::datatypes::DataType::List(item) = list.data_type() else {
+                unreachable!()
+            };
+            assert!(!item.is_nullable());
+            for row in 0..list.len() {
+                assert_eq!(list.is_null(row), source.columns()[0].is_null(row));
+                if !list.is_null(row) {
+                    assert_eq!(
+                        list.value(row)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .value(0),
+                        "kept"
+                    );
+                }
+            }
+            drop(driver);
+            drop(output);
+            assert_eq!(tracker.current(), 0);
+        }
+        #[test]
+        fn required_dictionary_list_parent_null_remains_hydratable_at_actual_driver() {
+            require_plain_list_at_actual_driver(0, 2);
+        }
+        #[test]
+        fn required_dictionary_list_unreachable_slice_rows_remain_hydratable_at_actual_driver() {
+            require_plain_list_at_actual_driver(1, 1);
+        }
+        #[test]
+        fn locked_string_dictionary_decode_discards_nonempty_null_payload_ranges() {
+            let source = required_list_source(0, 2).unwrap();
+            let list = source.columns()[0]
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let dictionary = list
+                .values()
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int32Type>>()
+                .unwrap();
+            let values = dictionary
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert!(values.is_null(1));
+            assert_eq!(values.value_offsets(), &[0, 4, 10]);
+            assert_eq!(values.value(1), "shadow");
+            let decoded =
+                arrow::compute::cast(dictionary, &arrow::datatypes::DataType::Utf8).unwrap();
+            let decoded = decoded.as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(decoded.value_offsets(), &[0, 0, 4, 4]);
+            assert!(decoded.is_null(0));
+            assert!(decoded.is_null(2));
+            assert_eq!(decoded.value(0), "");
+            assert_eq!(decoded.value(1), "kept");
+            assert_eq!(decoded.value(2), "");
+            let large_values = arrow::compute::cast(
+                dictionary.values().as_ref(),
+                &arrow::datatypes::DataType::LargeUtf8,
+            )
+            .unwrap();
+            let large_values_array = large_values
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .unwrap();
+            assert!(large_values_array.is_null(1));
+            assert_eq!(large_values_array.value_offsets(), &[0i64, 4, 10]);
+            assert_eq!(large_values_array.value(1), "shadow");
+            let large_dictionary =
+                DictionaryArray::<Int32Type>::try_new(dictionary.keys().clone(), large_values)
+                    .unwrap();
+            let decoded =
+                arrow::compute::cast(&large_dictionary, &arrow::datatypes::DataType::LargeUtf8)
+                    .unwrap();
+            let decoded = decoded.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            assert_eq!(decoded.value_offsets(), &[0i64, 0, 4, 4]);
+            assert!(decoded.is_null(0));
+            assert!(decoded.is_null(2));
+            assert_eq!(decoded.value(0), "");
+            assert_eq!(decoded.value(1), "kept");
+            assert_eq!(decoded.value(2), "");
+        }
+        #[test]
+        fn required_dictionary_active_null_is_rejected_before_driver_hydration() {
+            let failure = required_list_source(2, 1).unwrap_err();
+            assert!(failure.contains("unmasked logical null"));
+        }
+        fn factory(
+            tracker: &Arc<MemTracker>,
+            error: Arc<RuntimeErrorState>,
+        ) -> Arc<dyn InputConstructionFactory> {
+            try_runtime_input_construction_factory(
+                InputConstructionProfile {
+                    max_requests: 2048,
+                    max_request_bytes: i64::MAX as usize,
+                    max_opaque_requests: 2048,
+                    max_opaque_bytes: i64::MAX as usize,
+                    max_work: usize::MAX,
+                    max_depth: 64,
+                },
+                tracker.clone(),
+                error,
+            )
+            .unwrap()
+        }
+        fn driver(
+            sink: RetainingSink,
+            factory: Option<Arc<dyn InputConstructionFactory>>,
+        ) -> PipelineDriver {
+            PipelineDriver::new_with_event_sink(
+                49,
+                vec![
+                    Box::new(RetainingSink {
+                        received: Arc::new(Mutex::new(None)),
+                        keep_encoding: false,
+                        original_input: false,
+                    }),
+                    Box::new(sink),
+                ],
+                None,
+                vec![],
+                Arc::new(RuntimeState::default()),
+                None,
+                PipelineDriverBindings::new(
+                    Arc::new(crate::runtime::fragment::io::NoopFragmentEventSink),
+                    None,
+                )
+                .with_input_construction_factories(vec![None, factory]),
+            )
+        }
+        #[test]
+        fn driver_binding_decodes_and_retains_creator_charge_after_driver_and_factory_drop() {
+            let tracker = MemTracker::new_root("typed driver construction");
+            let error = Arc::new(RuntimeErrorState::default());
+            let error_weak = Arc::downgrade(&error);
+            let factory = factory(&tracker, error);
+            let initial = tracker.current();
+            let received = Arc::new(Mutex::new(None));
+            let source = source();
+            let mut driver = driver(
+                RetainingSink {
+                    received: received.clone(),
+                    keep_encoding: false,
+                    original_input: false,
+                },
+                Some(factory),
+            );
+            driver.edge_chunks[0] = Some(source.clone());
+            let mut progress = false;
+            driver.drive_push_edges(&mut progress).unwrap();
+            assert!(progress);
+            assert!(driver.edge_chunks[0].is_none());
+            assert!(tracker.current() > initial);
+            let retained = received.lock().unwrap().take().unwrap();
+            assert_eq!(
+                retained.record_batch().column(0).data_type(),
+                &arrow::datatypes::DataType::Utf8
+            );
+            assert_eq!(retained.record_batch().column(0).null_count(), 1);
+            assert_eq!(
+                retained.chunk_schema().slots()[0]
+                    .field_schema()
+                    .logical_type(),
+                Some(ValueLogicalType::Json)
+            );
+            assert!(matches!(
+                source.record_batch().column(0).data_type(),
+                arrow::datatypes::DataType::Dictionary(_, _)
+            ));
+            let clone = retained.clone();
+            let scope = driver.input_construction_factories.as_ref().unwrap()[1]
+                .as_ref()
+                .unwrap()
+                .begin_input_construction(&retained)
+                .unwrap();
+            let slice = retained
+                .slice_typed_observed(1, 2, scope.storage_lifetime(), |step| {
+                    scope.observe(0, &[], step)
+                })
+                .unwrap();
+            assert_eq!(slice.len(), 2);
+            assert!(slice.record_batch().column(0).is_null(0));
+            drop(scope);
+            drop(driver);
+            assert!(error_weak.upgrade().is_none());
+            assert!(tracker.current() > 0);
+            drop(retained);
+            assert!(tracker.current() > 0);
+            drop(clone);
+            assert!(tracker.current() > 0);
+            drop(slice);
+            assert_eq!(tracker.current(), 0);
+        }
+        #[test]
+        fn driver_preserves_original_construction_cancellation_cause_and_context() {
+            let tracker = MemTracker::new_root("typed driver cancellation");
+            let error = Arc::new(RuntimeErrorState::default());
+            let factory = factory(&tracker, error.clone());
+            let received = Arc::new(Mutex::new(None));
+            let mut driver = driver(
+                RetainingSink {
+                    received: received.clone(),
+                    keep_encoding: false,
+                    original_input: false,
+                },
+                Some(factory),
+            );
+            let original: ExecutionFailure =
+                novarocks_functions::KernelFailure::DeadlineExceeded.into();
+            let original = original.at_operator(7, PipelineOperation::Admission);
+            error.set_error(original.clone());
+            driver.edge_chunks[0] = Some(source());
+            let mut progress = false;
+            assert_eq!(
+                driver.drive_push_edges(&mut progress).unwrap_err(),
+                original
+            );
+            assert!(!progress);
+            assert!(received.lock().unwrap().is_none());
+            drop(driver);
+            assert_eq!(tracker.current(), 0);
+        }
+        #[test]
+        fn driver_shares_accepted_and_original_input_without_new_scope_or_owner() {
+            for (keep_encoding, original_input) in [(true, false), (false, true)] {
+                let tracker = MemTracker::new_root("typed driver sharing");
+                let received = Arc::new(Mutex::new(None));
+                let factory = factory(&tracker, Arc::new(RuntimeErrorState::default()));
+                let initial = tracker.current();
+                let source = source();
+                let mut driver = driver(
+                    RetainingSink {
+                        received: received.clone(),
+                        keep_encoding,
+                        original_input,
+                    },
+                    Some(factory),
+                );
+                driver.edge_chunks[0] = Some(source.clone());
+                let mut progress = false;
+                driver.drive_push_edges(&mut progress).unwrap();
+                assert!(progress);
+                assert_eq!(tracker.current(), initial);
+                let retained = received.lock().unwrap().take().unwrap();
+                assert!(Arc::ptr_eq(
+                    source.record_batch().column(0),
+                    retained.record_batch().column(0)
+                ));
+                drop(driver);
+                assert_eq!(tracker.current(), 0);
+                drop(retained);
+            }
+        }
     }
 }

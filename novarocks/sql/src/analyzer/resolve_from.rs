@@ -716,12 +716,12 @@ impl<'a> super::AnalyzerContext<'a> {
         for (idx, expr) in array_exprs.iter().enumerate() {
             self.check_control()?;
             let typed = self.analyze_expr(expr, outer_scope)?;
-            if !matches!(&typed.value_type.data_type, DataType::List(_)) {
+            if !matches!(&typed.value_type.data_type(), DataType::List(_)) {
                 return Err(AnalyzeError::invalid_argument(
                     format!(
                         "UNNEST argument {} must be ARRAY, got {:?}",
                         idx + 1,
-                        typed.value_type.data_type
+                        typed.value_type.data_type()
                     ),
                     expr.span(),
                 ));

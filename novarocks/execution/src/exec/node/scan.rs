@@ -30,7 +30,9 @@ use novarocks_spi::connector::read_stack::ConnectorPollBudget;
 /// `Poll::Pending` registers the context's waker and is never end of
 /// stream; neither is an empty chunk. `Ready(None)` means no more chunks.
 /// After an error the driver polls the stream no more.
-pub trait ScanChunkStream: Stream<Item = Result<Chunk, String>> + Send {
+pub trait ScanChunkStream:
+    Stream<Item = crate::runtime::fragment::ExecutionResult<Chunk>> + Send
+{
     /// Ends delivery and asks every operation of the scan to stop, before
     /// returning. The future resolves once they all exited, with the first
     /// real error; it only observes, so dropping it changes nothing.
@@ -49,7 +51,8 @@ pub trait ScanStreamSource: Send + Sync {
         &self,
         budget: ConnectorPollBudget,
         profile: Option<RuntimeProfile>,
-    ) -> Result<ScanOutputStream, String>;
+        construction: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) -> crate::runtime::fragment::ExecutionResult<ScanOutputStream>;
 }
 
 /// One bound scan: the stream its driver polls, and the hooks through which
@@ -302,8 +305,9 @@ impl ScanStreamSource for UnusedScanStream {
         &self,
         _budget: ConnectorPollBudget,
         _profile: Option<RuntimeProfile>,
-    ) -> Result<ScanOutputStream, String> {
-        Err("this test scan is never run".to_string())
+        _construction: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) -> crate::runtime::fragment::ExecutionResult<ScanOutputStream> {
+        Err("this test scan is never run".to_string().into())
     }
 }
 

@@ -197,7 +197,9 @@ fn local_aggregate_intermediate_type(call: &ScalarAggregateSpec) -> FunctionValu
         .intermediate_type
         .clone();
     // Preserve the existing phase-output root nullability widening.
-    value_type.nullable = true;
+    value_type = value_type
+        .with_nullable(true)
+        .expect("validated root NULL contract");
     value_type
 }
 
@@ -312,7 +314,7 @@ mod tests {
         AggregateCall {
             name: "count".to_string(),
             distinct,
-            result_type: DataType::Int64,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             output_column_id: ColumnId::new_for_test(3),
             source: crate::binding::AggregateArgumentSource::uncertified(
                 vec![col_ref(2, "v")],
@@ -372,10 +374,7 @@ mod tests {
                     .unwrap_or_else(|| OutputColumn {
                         column_id: aggregate.output_column_id,
                         name: aggregate.name.clone(),
-                        value_type: novarocks_type_contract::FunctionValueType::new(
-                            aggregate.result_type.clone(),
-                            true,
-                        ),
+                        value_type: aggregate.result_type.clone(),
 
                         is_internal: false,
                     });
@@ -517,7 +516,7 @@ mod tests {
         assert!(
             materialize(&memo.scalars, global.group_by[0])
                 .value_type
-                .nullable
+                .nullable()
         );
         assert_eq!(out[0].children.len(), 1);
         let local_group_id = out[0].children[0];
@@ -700,7 +699,10 @@ mod tests {
         AggregateCall {
             name: "avg".to_string(),
             distinct: false,
-            result_type: arrow::datatypes::DataType::Float64,
+            result_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Float64,
+                true,
+            ),
             output_column_id: ColumnId::new_for_test(3),
             source: crate::binding::AggregateArgumentSource::uncertified(
                 vec![col_ref(2, "v")],
@@ -773,7 +775,7 @@ mod tests {
             let mut state = crate::functions::aggregate_selection(&resolved)
                 .intermediate_type
                 .clone();
-            state.nullable = true;
+            state = state.with_nullable(true).unwrap();
             let input = OutputColumn {
                 column_id: ColumnId(2),
                 name: "v".into(),
@@ -803,7 +805,7 @@ mod tests {
             let call = AggregateCall {
                 name: name.into(),
                 distinct: false,
-                result_type: result.data_type.clone(),
+                result_type: result.clone(),
                 output_column_id: output.column_id,
                 source: crate::binding::AggregateArgumentSource::uncertified(
                     vec![typed(&input)],
@@ -907,10 +909,14 @@ mod tests {
         assert_eq!(
             local.output_layout.aggregate_columns[0]
                 .value_type
-                .data_type,
+                .data_type()
+                .clone(),
             DataType::Utf8
         );
-        assert_eq!(local.output_columns[1].value_type.data_type, DataType::Utf8);
+        assert_eq!(
+            local.output_columns[1].value_type.data_type().clone(),
+            DataType::Utf8
+        );
     }
 
     #[test]

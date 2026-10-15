@@ -94,10 +94,12 @@ impl Fixture {
             function: FunctionId::try_new("fixture/call-footer").unwrap(),
             selected: Arc::new(FunctionBindingSelection {
                 overload: FunctionOverloadId::try_new("fixture/call-footer/i64").unwrap(),
-                argument_types: arguments
-                    .iter()
-                    .map(FunctionArgument::argument_type)
-                    .collect(),
+                argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                    arguments
+                        .iter()
+                        .map(FunctionArgument::argument_type)
+                        .collect::<Box<[_]>>(),
+                ),
                 result_type: FunctionResultType::Scalar(value),
                 aggregate: None,
             }),
@@ -332,7 +334,9 @@ fn admitted_refinement_headers_still_require_call_kind_and_result_shape() {
             });
         } else {
             selected.result_type = FunctionResultType::Relation(
-                vec![FunctionValueType::new(DataType::Int64, false)].into_boxed_slice(),
+                novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                    vec![FunctionValueType::new(DataType::Int64, false)].into_boxed_slice(),
+                ),
             );
         }
         let input = fixture.input();

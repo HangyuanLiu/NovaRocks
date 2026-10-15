@@ -58,7 +58,7 @@ fn value(ty: FunctionValueType) -> FunctionArgument {
     }
 }
 fn physical(dt: DataType, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(dt, nullable)
+    FunctionValueType::from_legacy_declared_projection(dt, nullable)
 }
 fn logical(dt: DataType, nullable: bool, domain: ValueLogicalType) -> FunctionValueType {
     FunctionValueType::try_with_logical_type(dt, nullable, domain).unwrap()
@@ -306,11 +306,13 @@ fn exact_conversion_old_validation_still_refuses_signature_drift_before_pair_wal
         )
         .unwrap();
     let mut wrong_argument = selected.clone();
-    wrong_argument.argument_types = vec![FunctionArgumentType::Value(physical(
-        DataType::Int32,
-        false,
-    ))]
-    .into_boxed_slice();
+    wrong_argument.argument_types = novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+        vec![FunctionArgumentType::Value(physical(
+            DataType::Int32,
+            false,
+        ))]
+        .into_boxed_slice(),
+    );
     let mut wrong_result = selected.clone();
     wrong_result.result_type = FunctionResultType::Scalar(logical(
         DataType::FixedSizeBinary(16),
@@ -379,14 +381,26 @@ fn exact_conversion_json_preserves_nested_annotations_and_field_identity() {
     let catalog = catalog();
     let arguments = [value(source)];
     selected(&catalog, JSON_TEXT, &arguments, &target, &control()).unwrap();
-    let DataType::Struct(fields) = &target.data_type else {
+    let DataType::Struct(fields) = target.data_type() else {
         unreachable!()
     };
+    let decorated = physical(
+        DataType::Struct(
+            vec![
+                Arc::new(
+                    fields[0]
+                        .as_ref()
+                        .clone()
+                        .with_metadata([("provider-id".to_owned(), "changed".to_owned())].into()),
+                ),
+                fields[1].clone(),
+            ]
+            .into(),
+        ),
+        true,
+    );
+    assert!(selected(&catalog, JSON_TEXT, &arguments, &decorated, &control()).is_ok());
     for changed in [
-        fields[0]
-            .as_ref()
-            .clone()
-            .with_metadata([("provider-id".to_owned(), "changed".to_owned())].into()),
         fields[0].as_ref().clone().with_name("foreign"),
         fields[0].as_ref().clone().with_nullable(false),
     ] {

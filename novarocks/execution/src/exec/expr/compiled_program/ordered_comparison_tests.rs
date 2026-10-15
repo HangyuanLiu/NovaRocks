@@ -266,8 +266,8 @@ fn assert_recipe(program: &LocalProgram, truth: bool, op: ComparisonOperator, ty
         .comparison_recipe(ProgramComparisonSite::Binary(occurrence))
         .unwrap();
     assert_eq!(recipe.operator(), op);
-    assert_eq!(recipe.left_type().data_type, ty);
-    assert_eq!(recipe.right_type().data_type, ty);
+    assert_eq!(recipe.left_type().data_type().clone(), ty);
+    assert_eq!(recipe.right_type().data_type().clone(), ty);
     let flow = &snapshot.flows()[&site.arena()];
     let invocation = &flow.uses()[&occurrence.use_id];
     assert_eq!(
@@ -688,7 +688,7 @@ fn ordered_largeint_is_signed_i128_while_same_fixed16_physical_and_uuid_keep_byt
                 .evaluate(&input, Selection::all(6), &Control)
                 .unwrap();
             let relations =
-                if domain.logical_type == novarocks_type_contract::ValueLogicalType::LargeInt {
+                if domain.logical_type() == novarocks_type_contract::ValueLogicalType::LargeInt {
                     [Some(-1), Some(-1), Some(-1), Some(1), Some(1), None]
                 } else {
                     // Big-endian raw bytes order ff/80 after 00 and 7f before 80.

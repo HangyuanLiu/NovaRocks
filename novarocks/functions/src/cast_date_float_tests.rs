@@ -59,7 +59,7 @@ fn prepare(target: DataType, nullable: bool) -> PreparedCastRecipe {
     PreparedCastRecipe::try_new(
         CastOperation::Carrier,
         &FunctionValueType::new(DataType::Date32, nullable),
-        &FunctionValueType::new(target, nullable),
+        &FunctionValueType::from_legacy_declared_projection(target, nullable),
         DecimalOverflowPolicy::ReportError,
         true,
         &Control::default(),
@@ -79,7 +79,10 @@ fn date_float_exact_profiles_nullability_effects_and_nominal_admission() {
                         let result = PreparedCastRecipe::try_new(
                             CastOperation::Carrier,
                             &FunctionValueType::new(DataType::Date32, source_nullable),
-                            &FunctionValueType::new(target.clone(), result_nullable),
+                            &FunctionValueType::from_legacy_declared_projection(
+                                target.clone(),
+                                result_nullable,
+                            ),
                             policy,
                             allow,
                             &Control::default(),
@@ -95,7 +98,10 @@ fn date_float_exact_profiles_nullability_effects_and_nominal_admission() {
                         );
                         assert_eq!(
                             r.result_type(),
-                            &FunctionValueType::new(target.clone(), result_nullable)
+                            &FunctionValueType::from_legacy_declared_projection(
+                                target.clone(),
+                                result_nullable
+                            )
                         );
                         assert_eq!(r.policy(), policy);
                         assert_eq!(r.allow_throw_exception(), allow);
@@ -125,7 +131,7 @@ fn date_float_exact_profiles_nullability_effects_and_nominal_admission() {
             PreparedCastRecipe::try_new(
                 CastOperation::Carrier,
                 &largeint,
-                &FunctionValueType::new(target.clone(), false),
+                &FunctionValueType::from_legacy_declared_projection(target.clone(), false),
                 DecimalOverflowPolicy::ReportError,
                 true,
                 &Control::default()
@@ -137,7 +143,7 @@ fn date_float_exact_profiles_nullability_effects_and_nominal_admission() {
                 PreparedCastRecipe::try_new(
                     operation,
                     &FunctionValueType::new(DataType::Date32, false),
-                    &FunctionValueType::new(target.clone(), false),
+                    &FunctionValueType::from_legacy_declared_projection(target.clone(), false),
                     DecimalOverflowPolicy::ReportError,
                     true,
                     &Control::default()

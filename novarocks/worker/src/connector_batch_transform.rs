@@ -24,8 +24,13 @@
 /// query lifecycle capability. Typed scan decoding resolves those exclusively
 /// through its query-leased `CatalogHandle` runtime.
 pub trait ConnectorBatchTransform: Send + Sync {
+    /// Actual frozen page-channel order, independently held from final output.
+    fn read_schema(&self) -> &novarocks_execution::exec::chunk::ChunkSchemaRef;
     fn transform(
         &self,
-        batch: arrow::record_batch::RecordBatch,
-    ) -> Result<arrow::record_batch::RecordBatch, String>;
+        chunk: novarocks_execution::exec::chunk::Chunk,
+        factory: &dyn novarocks_execution::exec::pipeline::operator::InputConstructionFactory,
+    ) -> novarocks_execution::runtime::fragment::ExecutionResult<
+        novarocks_execution::exec::chunk::Chunk,
+    >;
 }

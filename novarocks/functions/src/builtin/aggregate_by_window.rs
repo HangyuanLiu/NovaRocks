@@ -391,7 +391,7 @@ impl TrackedByWindow {
                         work.step()?;
                     }
                     let resources = ScalarOutputResources::from_tracked(
-                        &self.contract.result_type().data_type,
+                        self.contract.result_type().data_type(),
                         state.value.as_ref(),
                         &mut ScalarWork::new(Some(work)),
                     )
@@ -434,7 +434,7 @@ impl TrackedByWindow {
                 work.step()?;
             }
             let resources = ScalarOutputResources::from_owned(
-                &self.contract.result_type().data_type,
+                self.contract.result_type().data_type(),
                 output_values.values(),
                 &mut ScalarWork::new(Some(work)),
             )
@@ -450,12 +450,12 @@ impl TrackedByWindow {
                         // The original analytic author skips scalar assembly for an
                         // empty output and returns this exact null Arrow carrier.
                         Ok(arrow_array::new_null_array(
-                            &self.contract.result_type().data_type,
+                            self.contract.result_type().data_type(),
                             0,
                         ))
                     } else {
                         scalar::build_scalar_array(
-                            &self.contract.result_type().data_type,
+                            self.contract.result_type().data_type(),
                             values,
                             scalar_work,
                         )
@@ -584,7 +584,7 @@ impl WindowKernelPartition for ByPartition<'_> {
                     work.step()?;
                 }
                 let resources = ScalarOutputResources::from_owned(
-                    &self.owner.contract.result_type().data_type,
+                    self.owner.contract.result_type().data_type(),
                     staging.values(),
                     &mut ScalarWork::new(Some(work)),
                 )
@@ -597,7 +597,7 @@ impl WindowKernelPartition for ByPartition<'_> {
                     work,
                     |scalar_work| {
                         scalar::build_scalar_array(
-                            &self.owner.contract.result_type().data_type,
+                            self.owner.contract.result_type().data_type(),
                             values,
                             scalar_work,
                         )
@@ -618,7 +618,7 @@ impl WindowKernelPartition for ByPartition<'_> {
             };
             SelectedValues::try_new(
                 selection,
-                &self.owner.contract.result_type().data_type,
+                self.owner.contract.result_type().data_type(),
                 values,
                 Box::default(),
             )

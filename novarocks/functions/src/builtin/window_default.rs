@@ -73,35 +73,35 @@ impl DefaultValueRecipe {
         let result = (|| {
             validate_type_observed(source, &mut work)?;
             validate_type_observed(target, &mut work)?;
-            let supported_target = target.nullable
-                && (numeric(&target.data_type) || target.data_type == DataType::Utf8);
+            let supported_target = target.nullable()
+                && (numeric(target.data_type()) || target.data_type() == &DataType::Utf8);
             work.step().map_err(compile_failure)?;
             if !supported_target {
                 return Err(invalid(
                     "window default requires an implemented nullable result domain",
                 ));
             }
-            let physical = source.logical_type == ValueLogicalType::Physical
-                && target.logical_type == ValueLogicalType::Physical;
+            let physical = source.logical_type() == ValueLogicalType::Physical
+                && target.logical_type() == ValueLogicalType::Physical;
             let numeric_recipe = NumericDefaultRecipe::try_new(source, target, &mut work)?;
             let conversion = if let Some(recipe) = numeric_recipe {
                 Conversion::Numeric(recipe)
-            } else if source.data_type == target.data_type
-                && source.logical_type == target.logical_type
+            } else if source.data_type() == target.data_type()
+                && source.logical_type() == target.logical_type()
             {
                 Conversion::Identity
-            } else if source.data_type == DataType::Null
-                && source.logical_type == ValueLogicalType::Physical
+            } else if source.data_type() == &DataType::Null
+                && source.logical_type() == ValueLogicalType::Physical
             {
                 Conversion::Null
             } else if physical
-                && source.data_type == DataType::Utf8
-                && target.data_type == DataType::Int64
+                && source.data_type() == &DataType::Utf8
+                && target.data_type() == &DataType::Int64
             {
                 Conversion::Parse
             } else if physical
-                && source.data_type == DataType::Int64
-                && target.data_type == DataType::Utf8
+                && source.data_type() == &DataType::Int64
+                && target.data_type() == &DataType::Utf8
             {
                 Conversion::Format
             } else {
@@ -145,15 +145,18 @@ impl DefaultValueRecipe {
         if let Conversion::Numeric(recipe) = &self.conversion {
             return recipe.retained_upper_bound(rows);
         }
-        if numeric(&self.target.data_type) {
-            return NumericDefaultRecipe::retained_target_upper_bound(&self.target.data_type, rows);
+        if numeric(self.target.data_type()) {
+            return NumericDefaultRecipe::retained_target_upper_bound(
+                self.target.data_type(),
+                rows,
+            );
         }
         let bitmap = round64(
             rows.checked_add(7)
                 .ok_or(KernelFailure::ResourceExhausted)?
                 / 8,
         )?;
-        let (header, values, offsets, nulls) = match &self.target.data_type {
+        let (header, values, offsets, nulls) = match self.target.data_type() {
             DataType::Utf8 => {
                 let offsets = rows
                     .checked_add(1)
@@ -212,7 +215,7 @@ impl DefaultValueRecipe {
             let class = if let Conversion::Numeric(recipe) = &self.conversion {
                 recipe.source_class(input.array().as_ref())
             } else {
-                match &self.source.data_type {
+                match self.source.data_type() {
                     DataType::Int8 => input.array().as_any().is::<Int8Array>(),
                     DataType::Int16 => input.array().as_any().is::<Int16Array>(),
                     DataType::Int32 => input.array().as_any().is::<Int32Array>(),
@@ -230,7 +233,7 @@ impl DefaultValueRecipe {
             if let Conversion::Numeric(recipe) = &self.conversion {
                 recipe.preflight_output(rows)?;
             } else {
-                output_layout(&self.target.data_type, rows, 0)?;
+                output_layout(self.target.data_type(), rows, 0)?;
             }
             if matches!(self.conversion, Conversion::Format) {
                 let array = input
@@ -248,7 +251,7 @@ impl DefaultValueRecipe {
                     }
                     work.step()?;
                 }
-                output_layout(&self.target.data_type, rows, bytes)?;
+                output_layout(self.target.data_type(), rows, bytes)?;
                 formatter_capacities(rows, bytes)?;
             }
             // Gather only complete logical D rows. Scalar and selected CV values
@@ -288,7 +291,7 @@ impl DefaultValueRecipe {
             // parse/formatter work is opaque, with original before/after checks;
             // no fictional byte prescan claims internal 256-unit cooperation.
             work.flush()?;
-            let converted = arrow_cast::cast(gathered.as_ref(), &self.target.data_type);
+            let converted = arrow_cast::cast(gathered.as_ref(), self.target.data_type());
             work.flush()?;
             let converted =
                 converted.map_err(|_| invalid("window default safe Arrow conversion failed"))?;

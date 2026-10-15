@@ -154,10 +154,10 @@ fn caller_request_receiver_retains_original_none_null_lambda_constraint_and_spar
     for (actual, id) in parameter_types.iter().zip([u32::MAX, 42, 8, 0]) {
         assert_eq!(actual, t.value_type(id).unwrap());
     }
-    let DataType::Struct(actual) = &parameter_types[0].data_type else {
+    let DataType::Struct(actual) = &parameter_types[0].data_type() else {
         panic!("nested source carrier lost")
     };
-    let DataType::Struct(original) = &t.value_type(u32::MAX).unwrap().data_type else {
+    let DataType::Struct(original) = &t.value_type(u32::MAX).unwrap().data_type() else {
         panic!("source fixture lost")
     };
     assert!(Arc::ptr_eq(&actual[0], &original[0]));
@@ -191,16 +191,18 @@ fn caller_request_receiver_final_facts_replay_all_six_axes_and_dictionary_layout
     let final_facts = *snapshots.last().unwrap();
     assert_eq!(final_facts.definition_count, 1);
     assert_eq!(final_facts.type_reference_count, 8);
-    // One index/output Vec, argument Vec->Box, Lambda Vec->Box and the
-    // direct Dictionary's two Boxes. Nested Fields share their Arc owners.
-    assert_eq!(final_facts.allocation_requests_upper_bound, 8);
+    // One index/output Vec, argument Vec->Box, Lambda Vec->Box and its
+    // guarded collection Arc. The normalized FVT owners are cheap clones.
+    assert_eq!(final_facts.allocation_requests_upper_bound, 7);
     let expected = Layout::array::<PhysicalCallDefinition>(1).unwrap().size()
         + Layout::array::<(PhysicalCallDefinition, PhysicalCallRequest)>(1)
             .unwrap()
             .size()
         + 2 * Layout::array::<StaticFunctionArgument>(3).unwrap().size()
         + 2 * Layout::array::<FunctionValueType>(4).unwrap().size()
-        + 2 * Layout::new::<DataType>().size();
+        + novarocks_type_contract::FunctionParameterTypes::storage_allocation_layout()
+            .unwrap()
+            .size();
     assert_eq!(final_facts.request_bytes_upper_bound, expected);
     assert_eq!(
         final_facts.coexisting_source_and_request_bytes_upper_bound,
@@ -271,8 +273,8 @@ fn caller_request_receiver_root_and_captured_dictionary_numeric_refusal_precedes
             assert_eq!(*c.trace.lock().unwrap(), vec![(CompilePhase::Decode, 0)]);
         }
     }
-    // At the captured root, independent exact geometry knows two extra
-    // Dictionary Boxes before the original clone's first completed step.
+    // Captured execution bindings share both immutable owners. A zero new
+    // allocation cap permits the clone; the real pending control still wins.
     for cause in CAUSES {
         let c = Control {
             stop: Some((1, cause)),
@@ -303,12 +305,23 @@ fn caller_request_receiver_root_and_captured_dictionary_numeric_refusal_precedes
             peak_work: 0,
         };
         let mut l = limits();
-        l.max_request_bytes = 2 * Layout::new::<DataType>().size() - 1;
+        l.max_request_bytes = 0;
         assert!(matches!(
-            model.value(&t, 42, l, &mut Some(&mut |_| Ok(())), &mut work),
-            Err(E::Control(CompileControlError::ResourceExhausted))
+            model.value(
+                CallRequestTypeOwner::Package(&t),
+                42,
+                l.into(),
+                &mut Some(&mut |_| Ok(())),
+                &mut work
+            ),
+            Err(E::Control(actual)) if actual == cause
         ));
-        assert_eq!(*c.trace.lock().unwrap(), vec![(CompilePhase::Decode, 0)]);
+        assert_eq!(model.facts.allocation_requests_upper_bound, 0);
+        assert_eq!(model.facts.request_bytes_upper_bound, 0);
+        assert_eq!(
+            *c.trace.lock().unwrap(),
+            vec![(CompilePhase::Decode, 0), (CompilePhase::Decode, 256)]
+        );
     }
 }
 

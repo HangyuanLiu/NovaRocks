@@ -432,14 +432,14 @@ fn relation_namespace_data_metadata_independent_expected_wire_and_full_type_rece
         let source_child = ts.value_type(42).unwrap();
         let output = &decoded.relation(0)?.unwrap().schema()[2].ty;
         if let (DataType::Struct(a), DataType::Struct(b)) =
-            (&source_child.data_type, &output.data_type)
+            (&source_child.data_type(), &output.data_type())
         {
             assert!(Arc::ptr_eq(&a[0], &b[0]));
         } else {
             panic!("actual Struct carrier lost");
         }
         assert_eq!(
-            decoded.relation(0)?.unwrap().schema()[0].ty.logical_type,
+            decoded.relation(0)?.unwrap().schema()[0].ty.logical_type(),
             ValueLogicalType::Json
         );
         assert!(encoded.retained_invoice_floor()? > SOURCE);
@@ -480,19 +480,23 @@ fn relation_namespace_source_association_full_fvt_and_presence_never_guess_or_re
             Err(Error::InvalidShape("relation value type ID is unknown"))
         ));
         // Same carrier alone cannot bind a different nullable/root domain or
-        // nested metadata definition from another lawful TypeTable emission.
+        // nested semantic definition from another lawful TypeTable emission.
         for which in 0..3 {
             let mut alternate = fixture().1;
             match which {
-                0 => alternate[0].1.nullable = false,
-                1 => alternate[0].1.logical_type = ValueLogicalType::Physical,
+                0 => alternate[0].1 = alternate[0].1.with_nullable(false).unwrap(),
+                1 => {
+                    alternate[0].1 = FunctionValueType::new(
+                        alternate[0].1.data_type().clone(),
+                        alternate[0].1.nullable(),
+                    )
+                }
                 _ => {
-                    alternate[2].1.data_type = DataType::Struct(
-                        vec![Arc::new(
-                            Field::new("item", DataType::Int64, false)
-                                .with_metadata([("unknown".into(), "different".into())].into()),
-                        )]
-                        .into(),
+                    alternate[2].1 = FunctionValueType::new(
+                        DataType::Struct(
+                            vec![Arc::new(Field::new("different", DataType::Int64, false))].into(),
+                        ),
+                        alternate[2].1.nullable(),
                     )
                 }
             }
@@ -621,19 +625,17 @@ fn relation_namespace_all_nine_caps_dictionary_clone_requests_and_alias_safe_sou
                 Err(Error::InvalidShape(_))
             ));
         }
-        // Dictionary root clones allocate exactly two DataType Boxes; nested
-        // metadata in the Struct's shared FieldRef creates no new Field backing.
+        // All validated type roots share immutable binding handles; no source
+        // encoding Boxes or Field metadata are copied into the value namespace.
         let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode).unwrap();
         let f = physical_type_v2::preflight_value_type_clone(
             ts.value_type(u32::MAX).unwrap(),
             &mut work,
         )
         .unwrap();
-        assert_eq!(f.allocation_requests_upper_bound(), 2);
-        assert_eq!(
-            f.allocation_request_bytes_upper_bound(),
-            2 * size_of::<DataType>()
-        );
+        assert_eq!(f.allocation_requests_upper_bound(), 0);
+        assert_eq!(f.allocation_request_bytes_upper_bound(), 0);
+        assert_eq!(f.work_upper_bound(), 2);
         work.finish().unwrap();
         assert!(bytes::<p::RelationField>(usize::MAX).is_err());
         assert!(own_work(usize::MAX, 1, 1, 1, 1, 1).is_err());
@@ -830,26 +832,23 @@ fn check_original_owned_backing_floor(dictionary: bool) {
         let p::Relation::Metadata(metadata) = &relation else {
             unreachable!()
         };
-        // Independently enumerate the actual original structural owners while
-        // deliberately omitting the two DataType Boxes in each root FVT. The
-        // old floor admitted this invoice even though those Boxes coexist.
-        let without_dictionary_boxes = size_of::<p::Relation>()
+        // Normalized value bindings borrow immutable backing; dictionary
+        // boxes belong to source encoding and are absent from this declaration.
+        // The independent structural floor still refuses an omitted byte.
+        let structural_floor = size_of::<p::Relation>()
             + std::mem::size_of_val(relation.schema())
             + std::mem::size_of_val(relation.predicate_guarantees())
             + std::mem::size_of_val(&*metadata.provided_properties.ordering)
             + metadata.kind.as_str().len()
             + metadata.coverage_evidence.len();
-        assert!(reads.retained_invoice_floor().unwrap() < without_dictionary_boxes);
+        assert_eq!(minimum, structural_floor);
         assert!(matches!(
-            encode_relations(&inputs, &reads, &types, without_dictionary_boxes, limits()),
+            encode_relations(&inputs, &reads, &types, structural_floor - 1, limits()),
             Err(Error::InvalidShape(
                 "relation source invoice omits original backing"
             ))
         ));
-        assert_eq!(
-            minimum - without_dictionary_boxes,
-            relation.schema().len() * 2 * size_of::<DataType>()
-        );
+        assert_eq!(relation.schema()[0].ty.data_type(), &DataType::Utf8);
     }
     // This tests only the necessary floor. It does not attest a complete host
     // invoice for all shared backing. Two IDs must not charge the same owned
@@ -885,8 +884,7 @@ fn relation_namespace_original_owned_backing_floor_rejects_omission_without_alia
 }
 
 #[test]
-fn relation_namespace_original_dictionary_boxes_are_required_without_output_clone_or_alias_charge()
-{
+fn relation_namespace_normalized_type_keeps_original_structural_floor_without_alias_charge() {
     check_original_owned_backing_floor(true);
 }
 

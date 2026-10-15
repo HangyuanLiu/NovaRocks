@@ -143,7 +143,7 @@ fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
                     normal_type.clone(),
                     ExprKind::Cast {
                         expr: source_expr,
-                        target: normal_type.data_type.clone(),
+                        target: normal_type.data_type().clone(),
                         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                         allow_throw_exception: allow_parameter(),
                     },
@@ -166,7 +166,7 @@ fn program(fixture: Fixture, dtype: DataType) -> Arc<LocalProgram> {
                     normal_type.clone(),
                     ExprKind::Cast {
                         expr: source_expr,
-                        target: normal_type.data_type.clone(),
+                        target: normal_type.data_type().clone(),
                         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                         allow_throw_exception: allow_parameter(),
                     },

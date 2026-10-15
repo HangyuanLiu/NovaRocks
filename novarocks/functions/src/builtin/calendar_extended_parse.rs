@@ -220,10 +220,10 @@ pub(super) fn evaluate_calendar_parse<'a>(
         let arguments = input.arguments();
         let types = input.types;
         let target = input.target;
-        if target.logical_type != ValueLogicalType::Physical
-            || (target.data_type != DataType::Date32
+        if target.logical_type() != ValueLogicalType::Physical
+            || (target.data_type() != &DataType::Date32
                 && !(input.legacy && op == CalendarParseOp::StrToDate))
-            || !target.nullable
+            || !target.nullable()
         {
             return Err(invalid(
                 "calendar constructor requires its nullable Physical Date32 result",
@@ -246,8 +246,8 @@ pub(super) fn evaluate_calendar_parse<'a>(
             let FunctionArgumentType::Value(source) = ty else {
                 return Err(invalid("calendar constructor requires value arguments"));
             };
-            if source.logical_type != ValueLogicalType::Physical
-                || &source.data_type != argument.array().data_type()
+            if source.logical_type() != ValueLogicalType::Physical
+                || source.data_type() != argument.array().data_type()
             {
                 return Err(invalid(
                     "calendar constructor argument differs from selected profile",
@@ -313,7 +313,7 @@ pub(super) fn evaluate_calendar_parse<'a>(
                     return Err(internal("calendar constructor selected row out of bounds"));
                 }
                 let is_null = argument.array().is_null(rows[index]);
-                if is_null && !sources[index].nullable {
+                if is_null && !sources[index].nullable() {
                     return Err(internal(
                         "calendar constructor non-null source contains SQL NULL",
                     ));
@@ -392,7 +392,8 @@ pub(super) fn evaluate_calendar_parse<'a>(
             work.flush()?;
             for value in values {
                 projected.push(value.and_then(|date| {
-                    super::calendar_extended::timestamp_value_for_type(date, &target.data_type).ok()
+                    super::calendar_extended::timestamp_value_for_type(date, target.data_type())
+                        .ok()
                 }));
                 work.step()?;
             }
@@ -457,17 +458,17 @@ fn evaluate_from_days<'a>(
             return Err(invalid("from_days requires one exact integer argument"));
         };
         let target = input.target;
-        if source.logical_type != ValueLogicalType::Physical
-            || target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Date32
-            || !target.nullable
-            || argument.array().data_type() != &source.data_type
+        if source.logical_type() != ValueLogicalType::Physical
+            || target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Date32
+            || !target.nullable()
+            || argument.array().data_type() != source.data_type()
         {
             return Err(invalid(
                 "from_days differs from its exact installed profile",
             ));
         }
-        let narrow = if source.data_type == DataType::Int32 {
+        let narrow = if source.data_type() == &DataType::Int32 {
             Some(
                 argument
                     .array()
@@ -480,7 +481,7 @@ fn evaluate_from_days<'a>(
         } else {
             None
         };
-        let wide = if source.data_type == DataType::Int64 {
+        let wide = if source.data_type() == &DataType::Int64 {
             Some(
                 argument
                     .array()
@@ -512,7 +513,7 @@ fn evaluate_from_days<'a>(
                 return Err(internal("from_days selected row out of bounds"));
             }
             let is_null = argument.array().is_null(row);
-            if is_null && !source.nullable {
+            if is_null && !source.nullable() {
                 return Err(internal(
                     "from_days non-null source contains selected SQL NULL",
                 ));
@@ -538,7 +539,7 @@ fn evaluate_from_days<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

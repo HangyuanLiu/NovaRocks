@@ -29,6 +29,67 @@ use arrow_buffer::{NullBuffer, OffsetBuffer};
 use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use std::sync::Arc;
 const ROWS: usize = 513;
+// Explicit pure fixture authors. Container roles are representation-only;
+// complete nominal children remain in the immutable value declaration.
+pub(super) fn execution_list_field(item: &FunctionValueType) -> Arc<Field> {
+    Arc::new(Field::new(
+        "item",
+        item.data_type().clone(),
+        item.nullable(),
+    ))
+}
+pub(super) fn declared_list(item: &FunctionValueType, nullable: bool) -> FunctionValueType {
+    use novarocks_type_contract::{ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime};
+    FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(
+            ValueKind::List(item.value_type().clone()),
+            nullable,
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+        ValueLayout::try_new(
+            &DataType::List(execution_list_field(item)),
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+pub(super) fn declared_struct(
+    fields: &[(&str, FunctionValueType)],
+    nullable: bool,
+) -> FunctionValueType {
+    use novarocks_type_contract::{
+        ValueField, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    let value_fields = fields
+        .iter()
+        .map(|(name, ty)| {
+            ValueField::new(
+                *name,
+                ty.value_type().clone(),
+                ValueTypeStorageLifetime::pure(),
+            )
+        })
+        .collect();
+    let layout = DataType::Struct(
+        fields
+            .iter()
+            .map(|(name, ty)| Arc::new(Field::new(*name, ty.data_type().clone(), ty.nullable())))
+            .collect::<Vec<_>>()
+            .into(),
+    );
+    FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(
+            ValueKind::Struct(value_fields),
+            nullable,
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+        ValueLayout::try_new(&layout, ValueTypeStorageLifetime::pure()).unwrap(),
+    )
+    .unwrap()
+}
 fn flat_profiles() -> Vec<FunctionValueType> {
     let mut p = vec![
         DataType::Null,
@@ -110,11 +171,11 @@ fn flat_profiles() -> Vec<FunctionValueType> {
     p
 }
 fn values(t: &FunctionValueType, rows: usize, seed: u64) -> ArrayRef {
-    if t.data_type == DataType::FixedSizeBinary(16) {
+    if *t.data_type() == DataType::FixedSizeBinary(16) {
         return novarocks_types::largeint::array_from_i128(
             &(0..rows)
                 .map(|r| {
-                    if t.nullable && r % 7 == 0 {
+                    if t.nullable() && r % 7 == 0 {
                         None
                     } else {
                         Some([i128::MIN, i128::MAX, -1, 0, 1][r % 5])
@@ -124,8 +185,8 @@ fn values(t: &FunctionValueType, rows: usize, seed: u64) -> ArrayRef {
         )
         .unwrap();
     }
-    if t.logical_type != ValueLogicalType::Physical {
-        let physical = FunctionValueType::new(t.data_type.clone(), t.nullable);
+    if t.logical_type() != ValueLogicalType::Physical {
+        let physical = FunctionValueType::new(t.data_type().clone(), t.nullable());
         return InputGenerator::new(seed).column(&physical, rows, &InputProfile::default());
     }
     InputGenerator::new(seed).column(t, rows, &InputProfile::default())
@@ -139,7 +200,7 @@ fn nested() -> Vec<(FunctionValueType, ArrayRef)> {
             FunctionValueType::try_with_logical_type(DataType::FixedSizeBinary(16), true, logical)
                 .unwrap()
         };
-        let field = Arc::new(item.try_to_field("item").unwrap());
+        let field = execution_list_field(&item);
         let a: ArrayRef = Arc::new(ListArray::new(
             field,
             OffsetBuffer::new(
@@ -153,14 +214,18 @@ fn nested() -> Vec<(FunctionValueType, ArrayRef)> {
                 (0..ROWS).map(|r| r % 11 != 0).collect::<Vec<_>>(),
             )),
         ));
-        result.push((FunctionValueType::new(a.data_type().clone(), true), a));
+        result.push((declared_list(&item, true), a));
     }
-    let fs = vec![
-        Arc::new(Field::new("x", DataType::Int32, true)),
-        Arc::new(Field::new("y", DataType::Utf8, true)),
+    let named = [
+        ("x", FunctionValueType::new(DataType::Int32, true)),
+        ("y", FunctionValueType::new(DataType::Utf8, true)),
     ];
+    let declared = declared_struct(&named, true);
+    let DataType::Struct(fs) = declared.data_type() else {
+        panic!("declared Struct")
+    };
     let a: ArrayRef = Arc::new(StructArray::new(
-        fs.into(),
+        fs.clone(),
         vec![
             values(&FunctionValueType::new(DataType::Int32, true), ROWS, 43),
             values(&FunctionValueType::new(DataType::Utf8, true), ROWS, 44),
@@ -169,13 +234,13 @@ fn nested() -> Vec<(FunctionValueType, ArrayRef)> {
             (0..ROWS).map(|r| r % 13 != 0).collect::<Vec<_>>(),
         )),
     ));
-    result.push((FunctionValueType::new(a.data_type().clone(), true), a));
+    result.push((declared, a));
     result
 }
 
 fn list(item: &FunctionValueType, values: ArrayRef, rows: usize, nullable: bool) -> ArrayRef {
     Arc::new(ListArray::new(
-        Arc::new(item.try_to_field("item").unwrap()),
+        execution_list_field(&item),
         OffsetBuffer::new(
             (0..=rows)
                 .map(|r| (r * 2) as i32)
@@ -194,9 +259,11 @@ fn check(
     target_nullable: bool,
 ) {
     let a = list(item, children, ROWS, list_nullable);
-    let list_type = FunctionValueType::new(a.data_type().clone(), list_nullable);
+    let list_type = declared_list(item, list_nullable);
     let mut target_type = item.clone();
-    target_type.nullable = target_nullable;
+    target_type = target_type
+        .with_nullable(target_nullable)
+        .expect("valid test root nullability");
     let s = assert_scalar_matches_v1(
         ScalarDiffSpec::new("array_append")
             .typed_column(list_type, a)
@@ -206,23 +273,25 @@ fn check(
     );
     assert_eq!(s.attributed_row_errors, 0);
     assert_eq!(s.legacy_batch_errors, 0);
-    let DataType::List(field) = &s.result_type.data_type else {
+    let DataType::List(field) = &s.result_type.data_type() else {
         panic!("append result must be List")
     };
-    let expected = FunctionValueType::try_from_field(field).unwrap();
-    assert_eq!(expected.logical_type, item.logical_type);
-    assert_eq!(expected.data_type, item.data_type);
+    let expected = s.result_type.child_at(0).unwrap();
+    assert_eq!(expected.logical_type(), item.logical_type());
+    assert_eq!(expected.data_type(), item.data_type());
 }
 #[test]
 fn pure_differential_array_append_all_flat_and_logical_domains_independent_root_nullability() {
     for item in flat_profiles() {
         for list_nullable in [false, true] {
             for target_nullable in [false, true] {
-                if item.data_type == DataType::Null && !target_nullable {
+                if *item.data_type() == DataType::Null && !target_nullable {
                     continue;
                 }
                 let mut target_type = item.clone();
-                target_type.nullable = target_nullable;
+                target_type = target_type
+                    .with_nullable(target_nullable)
+                    .expect("valid test root nullability");
                 check(
                     &item,
                     values(&item, ROWS * 2, 923),
@@ -242,7 +311,7 @@ fn pure_differential_array_append_nested_children_and_sliced_offsets() {
         let a = list(&item, children, ROWS, true);
         let s = assert_scalar_matches_v1(
             ScalarDiffSpec::new("array_append")
-                .column(a.slice(1, ROWS - 1))
+                .typed_column(declared_list(&item, true), a.slice(1, ROWS - 1))
                 .typed_column(item, base.slice(1, ROWS - 1))
                 .sparse_selections(7, 925),
         );
@@ -253,19 +322,19 @@ fn pure_differential_array_append_nested_children_and_sliced_offsets() {
 fn pure_differential_array_append_empty_chunks_empty_parents_and_null_parents() {
     for item in flat_profiles() {
         for rows in [0, ROWS] {
-            let dtype = DataType::List(Arc::new(item.try_to_field("item").unwrap()));
+            let dtype = DataType::List(execution_list_field(&item));
             let empty: ArrayRef = Arc::new(ListArray::new(
-                Arc::new(item.try_to_field("item").unwrap()),
+                execution_list_field(&item),
                 OffsetBuffer::new(vec![0; rows + 1].into()),
-                new_empty_array(&item.data_type),
+                new_empty_array(&item.data_type()),
                 None,
             ));
             let null = new_null_array(&dtype, rows);
-            let targets = new_null_array(&item.data_type, rows);
-            for a in [empty, null] {
+            let targets = new_null_array(&item.data_type(), rows);
+            for (a, root_nullable) in [(empty, false), (null, true)] {
                 let s = assert_scalar_matches_v1(
                     ScalarDiffSpec::new("array_append")
-                        .column(a)
+                        .typed_column(declared_list(&item, root_nullable), a)
                         .typed_column(item.clone(), targets.clone())
                         .sparse_selections(7, 926),
                 );
@@ -280,7 +349,7 @@ fn pure_differential_array_append_constant_list_and_target_are_real_original_dom
         let child = values(&item, ROWS * 2, 927);
         let a = list(&item, child, ROWS, true);
         let t = values(&item, ROWS, 928);
-        let list_type = FunctionValueType::new(a.data_type().clone(), true);
+        let list_type = declared_list(&item, true);
         for mask in 1..4 {
             let mut spec = ScalarDiffSpec::new("array_append")
                 .constant_rows(ROWS)

@@ -38,8 +38,8 @@ use novarocks_physical_plan::{
 };
 use novarocks_plan_codec::{
     PhysicalV1PrivateFacts, PhysicalV1ScanColumn, PhysicalV1ScanFact, PhysicalV1WriteFact,
-    SealedWriteTargets, encode_physical_plan_v1, physical_v1_scan_runtime_filters,
-    physical_v1_scan_source_seal_digest,
+    SealedWriteTargets, encode_physical_plan_typed_pure_with_fragment_preparation,
+    physical_v1_scan_runtime_filters, physical_v1_scan_source_seal_digest,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::connector_read::{
@@ -189,6 +189,7 @@ pub(crate) fn encode_completed_plan(
             functions,
             write_targets,
             root_allow_throw_exception,
+            statement_constant_policy,
             control,
         ),
         StaticPlanCarrier::CompiledPackage(carrier) => encode_completed_packages(
@@ -215,18 +216,44 @@ fn encode_completed_plan_tree(
     functions: &EngineFunctionCatalog,
     write_targets: Option<&WriteTargetFacts<'_>>,
     root_allow_throw_exception: bool,
+    statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
-    // Legacy materialization is opaque work here. Entry and exit observation
-    // do not claim that its internal operations are cooperatively bounded.
     (|| -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
         let semantic_candidate = paired.candidate().clone();
         let (candidate, reads) = paired.into_parts();
         let plan = candidate.plan();
         let (encodings, capabilities) = split_frozen_reads(reads);
         let facts = physical_v1_private_facts(plan, &encodings, write_targets)?;
-        let encoded =
-            encode_physical_plan_v1(plan, functions, &facts, root_allow_throw_exception, control)?;
+        // The FE author carries complete owner-local type tables. Its original
+        // compile control observes construction; it acquires no memory grant.
+        // Both native carriers borrow the same original SQL occurrence
+        // author. Selected signatures never manufacture context or effects.
+        let semantics = semantic_candidate
+            .author_native_writer_preparation(statement_constant_policy, control)
+            .map_err(|error| match error {
+                novarocks_sql::compiler::PackageSemanticsError::Control(error) => {
+                    novarocks_plan_codec::PhysicalEncodeError::Control(error)
+                }
+                error => novarocks_plan_codec::PhysicalEncodeError::Invalid(error.to_string()),
+            })?;
+        let calls = |id| {
+            semantics
+                .get(&id)
+                .map(|source| (source.fragment(), source.calls()))
+        };
+        let fragment_source = Some(novarocks_plan_codec::NativeFragmentPreparationSource {
+            writer_calls: &calls,
+            parameters: plan.parameters(),
+        });
+        let encoded = encode_physical_plan_typed_pure_with_fragment_preparation(
+            plan,
+            functions,
+            &facts,
+            root_allow_throw_exception,
+            control,
+            fragment_source,
+        )?;
         let access = attempt_access_for_completed_plan(plan, capabilities)?;
         let scans = completed_plan_scan_facts(plan, &encodings)?;
         let provenance = mint_native_encoding_provenance();
@@ -449,15 +476,17 @@ pub(crate) fn completed_plan_submission_facts(
     let (fragments, stream_edge_sources) =
         completed_plan_submission_fragments(plan, plan.result_port())?;
     let mut cte_consumers = BTreeMap::<u32, Vec<CteMulticastConsumer>>::new();
-    for consumer in novarocks_plan_codec::physical_v1_cte_consumers(plan, control)? {
-        cte_consumers.entry(consumer.cte_id).or_default().push((
-            consumer.target_fragment_id,
-            consumer.target_exchange_node_id,
-            consumer.output_partition,
-            consumer.output_slot_ids,
-            consumer.receive_producer_column_ids,
-        ));
+    for (_, consumer) in novarocks_plan_codec::physical_typed_cte_consumer_views(encoded, control)?
+    {
+        cte_consumers
+            .entry(consumer.cte_id)
+            .or_default()
+            .push(CteMulticastConsumer {
+                fragment_id: consumer.target_fragment_id,
+                exchange_node_id: consumer.target_exchange_node_id,
+            });
     }
+
     let router_edges =
         encoded
             .edges
@@ -586,9 +615,7 @@ fn completed_fragment_output_columns(
                 .iter()
                 .map(|field| PlanOutputColumn {
                     name: field.alias.as_deref().unwrap_or(&field.name).to_string(),
-                    data_type: field.ty.data_type.clone(),
-                    nullable: field.ty.nullable,
-                    domain: field.domain,
+                    ty: field.ty.clone(),
                 })
                 .collect()
         })
@@ -923,7 +950,13 @@ fn physical_v1_private_facts(
                     // has no alias to carry: an alias is a name a statement
                     // used, and no reader resolves anything by it.
                     alias: None,
-                    table: table_def(encoding, source)?,
+                    table_name: encoding.identity.table.as_str().into(),
+                    table_source: plan::ScanSource {
+                        kind: Some(plan::scan_source::Kind::TypedConnectorRead(
+                            source.as_proto().clone(),
+                        )),
+                    },
+                    table_columns: frozen_table_columns(encoding),
                     columns: scan_columns(encoding, provider_outputs)?,
                 },
             );
@@ -1053,48 +1086,21 @@ fn scan_source(
         .map_err(|error| error.to_string())
 }
 
-fn table_def(
-    encoding: &FrozenReadEncoding,
-    source: ConnectorTableScanSource,
-) -> Result<plan::TableDef, String> {
-    Ok(plan::TableDef {
-        name: encoding.identity.table.clone(),
-        columns: encoding
-            .columns
-            .iter()
-            .map(|(_, column)| column_def(column))
-            .collect::<Result<Vec<_>, String>>()?,
-        // Row-lineage metadata columns are an Iceberg read shape the completion
-        // contract states as ordinary projected columns, so there is no second
-        // list to fill here.
-        iceberg_row_lineage_metadata_columns: Vec::new(),
-        source: Some(plan::ScanSource {
-            kind: Some(plan::scan_source::Kind::TypedConnectorRead(
-                source.as_proto().clone(),
-            )),
-        }),
-    })
-}
-
-fn column_def(
-    column: &novarocks_sql::compiler::ProviderReadColumnNeed,
-) -> Result<plan::ColumnDef, String> {
-    Ok(plan::ColumnDef {
-        name: column.name().to_string(),
-        data_type: Some(
-            novarocks_plan_codec::encode_native_type(&novarocks_types::undecorated_nested_type(
-                &column.engine_type().data_type,
-            ))
-            .map_err(|error| error.to_string())?,
-        ),
-        nullable: column.engine_type().nullable,
-        // No decoder consumes this deprecated field, and a write default
-        // reaches execution through the provider schema instead.
-        write_default_json: None,
-        // The completion contract states a column's engine type outright, so
-        // there is no Arrow representation left to disambiguate.
-        logical_type: None,
-    })
+/// Borrow each frozen provider column's complete declaration until the
+/// fragment encoder binds it into that fragment's actual type namespace.
+fn frozen_table_columns(encoding: &FrozenReadEncoding) -> Box<[PhysicalV1ScanColumn]> {
+    encoding
+        .columns
+        .iter()
+        .map(|(reference, column)| PhysicalV1ScanColumn {
+            column: reference.clone(),
+            name: column.name().into(),
+            ty: column.engine_type().clone(),
+            connector_type: column.connector_type(),
+            // Iceberg lineage fields are ordinary explicitly projected read fields.
+            internal: false,
+        })
+        .collect()
 }
 
 /// Each column the scan produces, in the order the plan produces them.
@@ -1116,13 +1122,9 @@ fn scan_columns(
             Ok(PhysicalV1ScanColumn {
                 column: reference.clone(),
                 name: column.name().into(),
-                // The plan states a column's type without the provider's own
-                // decoration on its nested fields, and this fact stands beside
-                // the plan's values.
-                ty: novarocks_physical_plan::ValueType::new(
-                    novarocks_types::undecorated_nested_type(&column.engine_type().data_type),
-                    column.engine_type().nullable,
-                ),
+                // Preserve the complete source-authored engine declaration;
+                // provider attributes remain with the separate frozen source.
+                ty: column.engine_type().clone(),
                 connector_type: column.connector_type(),
                 // A scan produces relation columns; `internal` marks a writer
                 // relation value, which a read never carries.
@@ -1153,6 +1155,132 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn native_writer_loan_rejects_foreign_fragment_even_with_the_exact_same_site() {
+        use novarocks_sql::compiler::{
+            SqlPhysicalEmissionMode, author_native_writer_preparation, writer_state_source_for_test,
+        };
+
+        // Reuse the real writer-statistics planner, branch router and checked
+        // request journal. Neither the calls nor their sites are test-built.
+        let mut catalog = novarocks_functions::EngineFunctionCatalogBuilder::new();
+        catalog
+            .register(
+                novarocks_connector_iceberg_functions::iceberg_theta_registration()
+                    .unwrap()
+                    .definition()
+                    .clone(),
+            )
+            .unwrap();
+        let functions = Arc::new(catalog.seal_bound().unwrap());
+        let owner = writer_state_source_for_test(
+            novarocks_connector_iceberg_functions::ICEBERG_THETA_AGGREGATE_NAME,
+            &[1, 1],
+            &[false, false],
+            functions.clone(),
+            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
+        );
+        let control = SqlCompileControl::unbounded();
+        let sources = author_native_writer_preparation(
+            &owner,
+            crate::application::test_constant_policy(),
+            &control,
+        )
+        .expect("the actual checked Writer source authors its receipts");
+        assert!(sources.len() >= 2, "real distributed writer fragments");
+        let (&target, target_source) = sources
+            .iter()
+            .find(|(_, source)| !source.calls().is_empty())
+            .expect("an actual Writer site");
+        let (&foreign, foreign_source) = sources
+            .iter()
+            .find(|(id, source)| **id != target && !source.calls().is_empty())
+            .expect("a second actual Writer fragment");
+        assert_eq!(foreign_source.fragment(), foreign);
+        let site = *target_source.calls().keys().next().unwrap();
+        assert_eq!(target_source.fragment(), target);
+        assert_eq!(target_source.calls()[&site].site, site);
+
+        // These are the exact private wire projections of the same original
+        // provider handles and target names, not new semantic declarations.
+        let mut facts = FrontendPhysicalV1Facts {
+            by_node: BTreeMap::new(),
+            by_target: BTreeMap::new(),
+        };
+        for fragment in owner.plan().fragments().values() {
+            for node in fragment.nodes().values() {
+                if let NodeKind::TableWriter { target } = &node.kind {
+                    facts.by_target.insert(
+                        target.write_target_ordinal,
+                        PhysicalV1WriteFact {
+                            handle: novarocks_proto_models::connector_write::ConnectorWriterHandle {
+                                provider_payload: Some(
+                                    novarocks_proto_codec::connector_common::encode_connector_payload_message(
+                                        &target.handle,
+                                    ),
+                                ),
+                            },
+                            field_names: target
+                                .target_fields
+                                .iter()
+                                .map(|field| (field.token.to_bytes(), field.provider_name.clone()))
+                                .collect(),
+                        },
+                    );
+                }
+            }
+        }
+        let lawful = |id| {
+            sources
+                .get(&id)
+                .map(|source| (source.fragment(), source.calls()))
+        };
+        encode_physical_plan_typed_pure_with_fragment_preparation(
+            owner.plan(),
+            &functions,
+            &facts,
+            false,
+            &control,
+            Some(novarocks_plan_codec::NativeFragmentPreparationSource {
+                writer_calls: &lawful,
+                parameters: owner.plan().parameters(),
+            }),
+        )
+        .expect("each actual source remains in its own fragment");
+
+        let foreign_loan = |id| {
+            sources.get(&id).map(|source| {
+                let namespace = if id == target {
+                    foreign
+                } else {
+                    source.fragment()
+                };
+                (namespace, source.calls())
+            })
+        };
+        // In particular, no missing or different call site explains rejection:
+        // the foreign loan still contains the exact original Writer receipt.
+        let (namespace, calls) = foreign_loan(target).unwrap();
+        assert_eq!(namespace, foreign);
+        assert_eq!(calls[&site], target_source.calls()[&site]);
+        let refused = encode_physical_plan_typed_pure_with_fragment_preparation(
+            owner.plan(),
+            &functions,
+            &facts,
+            false,
+            &control,
+            Some(novarocks_plan_codec::NativeFragmentPreparationSource {
+                writer_calls: &foreign_loan,
+                parameters: owner.plan().parameters(),
+            }),
+        );
+        assert!(matches!(
+            refused,
+            Err(novarocks_plan_codec::PhysicalEncodeError::Invalid(message))
+                if message == "writer preparation borrows a different fragment owner"
+        ));
+    }
 
     struct NoFacts;
 
@@ -1512,6 +1640,283 @@ mod tests {
                 assert_eq!(decoded.fragment().dop_domain(), fragment.dop_domain());
             }
         }
+    }
+
+    #[test]
+    fn plan_tree_original_percentile_empty_keeps_complete_request_without_candidate_gate() {
+        use novarocks_proto_models::{expr, plan};
+        use novarocks_type_contract::{
+            CompileCheckpoints, CompilePhase, ValueKind, ValueLogicalType,
+        };
+        use prost::Message;
+        fn visit<'a>(
+            value: &'a expr::Expr,
+            calls: &mut Vec<(&'a expr::Expr, &'a expr::FunctionCall)>,
+        ) {
+            if let Some(expr::expr::Kind::FunctionCall(call)) = &value.kind {
+                calls.push((value, call));
+                for arg in &call.args {
+                    visit(arg, calls);
+                }
+            }
+        }
+        fn node<'a>(
+            value: &'a plan::DistributedNode,
+            calls: &mut Vec<(&'a expr::Expr, &'a expr::FunctionCall)>,
+        ) {
+            if let Some(plan::distributed_node::Payload::Physical(value)) = &value.payload {
+                if let Some(plan::plan_node::Kind::Project(project)) = &value.kind {
+                    for item in &project.items {
+                        if let Some(value) = &item.expr {
+                            visit(value, calls);
+                        }
+                    }
+                }
+            }
+            for child in &value.children {
+                node(child, calls);
+            }
+        }
+        let sql =
+            "SELECT HEX(CAST(percentile_empty() AS VARBINARY)) AS raw, percentile_empty() AS p";
+        let (source, encoded) = encode_with(sql, &StaticPlanCarrier::PlanTree);
+        let encoded = encoded.expect("existing default percentile_empty must not acquire a Candidate pure implementation gate");
+        let control = SqlCompileControl::unbounded();
+        let mut originals = 0;
+        let mut conversions = 0;
+        for id in encoded.native.fragment_ids() {
+            let frozen = novarocks_proto_models::novarocks::FrozenFragment::decode(
+                encoded.native.get(id).unwrap().content().bytes().clone(),
+            )
+            .unwrap();
+            let fragment = frozen.plan.expect("modern native tree");
+            assert!(frozen.package.is_empty());
+            let requests = fragment
+                .original_call_requests
+                .as_ref()
+                .expect("mandatory true original request namespace");
+            let table = fragment
+                .execution_types
+                .as_ref()
+                .expect("complete execution namespace");
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+            let types = novarocks_plan_codec::execution_type_table::decode_execution_type_table_observed(
+                table,
+                novarocks_plan_codec::execution_type_table::ExecutionTypeTableLimits::for_validated_root_count(table.value_bindings.len()).unwrap(),
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                &mut |_| Ok::<_, novarocks_plan_codec::host_projection_v2::AdmissionRefusal<std::convert::Infallible>>(()),
+                &mut work,
+            ).unwrap();
+            let mut calls = Vec::new();
+            node(fragment.root.as_ref().unwrap(), &mut calls);
+            for output in &fragment.output_exprs {
+                visit(output, &mut calls);
+            }
+            for (expression, call) in calls {
+                let binding = call
+                    .frozen_binding
+                    .as_ref()
+                    .expect("actual original selection");
+                assert_eq!(binding.id, expression.original_definition_id.unwrap());
+                let request = requests
+                    .entries
+                    .iter()
+                    .find(|request| request.request_id == call.original_request_id)
+                    .expect("actual definition's source request");
+                assert_eq!(request.definition.as_ref().unwrap().kind, Some(novarocks_proto_models::call_request::call_request_definition::Kind::ExpressionDefinitionId(binding.id)));
+                if call.function_name == "percentile_empty" {
+                    originals += 1;
+                    assert!(
+                        binding.arguments.is_empty()
+                            && request.arguments.is_empty()
+                            && call.args.is_empty()
+                    );
+                    assert_eq!(request.logical_argument_count, Some(0));
+                    let Some(novarocks_proto_models::physical_package_v2::function_binding_definition::Result::ScalarValueTypeId(value_id)) = &binding.result else { panic!("actual scalar result") };
+                    let result = types.get_observed(*value_id, &mut work).unwrap().unwrap();
+                    assert!(matches!(
+                        result.value_type().kind(),
+                        ValueKind::Nominal(ValueLogicalType::Percentile)
+                    ));
+                    let original = source.fragments()
+                        [&novarocks_physical_plan::FragmentId::new(id)]
+                        .call_requests()
+                        .entries()
+                        .get(
+                            &novarocks_physical_plan::PhysicalCallDefinition::Expression(
+                                novarocks_physical_plan::ExprId::new(binding.id),
+                            ),
+                        )
+                        .expect("same completed plan's sole original source");
+                    assert_eq!(
+                        request.expected_result_value_type_id.is_some(),
+                        original.expected_result_type.is_some(),
+                        "optional target presence comes from the original request, not the selected result"
+                    );
+                    if let (Some(target_id), Some(original)) = (
+                        request.expected_result_value_type_id,
+                        original.expected_result_type.as_ref(),
+                    ) {
+                        let target = types.get_observed(target_id, &mut work).unwrap().unwrap();
+                        assert!(
+                            target
+                                .exactly_equals_checked_observed(original, || work.step())
+                                .unwrap()
+                        );
+                    }
+                }
+                if call.function_name == "value_domain_conversion" {
+                    conversions += 1;
+                }
+            }
+            work.finish().unwrap();
+        }
+        assert!(
+            originals > 0,
+            "do not replace the original public producer with another function or folded fixture"
+        );
+        assert!(
+            conversions > 0,
+            "the genuine opaque-to-binary occurrence remains on the public path"
+        );
+    }
+
+    #[test]
+    fn plan_tree_freezes_nominal_conversion_with_original_target_and_control() {
+        use novarocks_proto_models::{expr, physical_package_v2 as binding, plan};
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+        use prost::Message;
+
+        fn expressions<'a>(node: &'a plan::DistributedNode, out: &mut Vec<&'a expr::Expr>) {
+            if let Some(plan::distributed_node::Payload::Physical(physical)) = &node.payload {
+                match &physical.kind {
+                    Some(plan::plan_node::Kind::Project(project)) => {
+                        out.extend(project.items.iter().map(|item| item.expr.as_ref().unwrap()));
+                    }
+                    Some(plan::plan_node::Kind::Values(values)) => {
+                        out.extend(values.rows.iter().flat_map(|row| &row.values));
+                    }
+                    _ => {}
+                }
+            }
+            for child in &node.children {
+                expressions(child, out);
+            }
+        }
+        fn calls<'a>(
+            expression: &'a expr::Expr,
+            out: &mut Vec<(&'a expr::Expr, &'a expr::FunctionCall)>,
+        ) {
+            if let Some(expr::expr::Kind::FunctionCall(call)) = &expression.kind {
+                out.push((expression, call));
+                for argument in &call.args {
+                    calls(argument, out);
+                }
+            }
+        }
+
+        let sql = "SELECT PARSE_JSON('{\"k\":1}') AS j, [PARSE_JSON('{\"k\":1}'), NULL] AS json_items, CAST([PARSE_JSON('{\"k\":1}'), NULL] AS ARRAY<VARCHAR>) AS text_items";
+        let (_, encoded) = encode_with(sql, &StaticPlanCarrier::PlanTree);
+        let encoded = encoded.expect("original nominal query encodes");
+        let control = SqlCompileControl::unbounded();
+        let mut conversions = 0;
+        for id in encoded.native.fragment_ids() {
+            let artifact = encoded.native.get(id).unwrap();
+            let frozen = novarocks_proto_models::novarocks::FrozenFragment::decode(
+                artifact.content().bytes().clone(),
+            )
+            .unwrap();
+            let fragment = frozen.plan.unwrap();
+            assert!(fragment.execution_types.is_some());
+            assert!(fragment.original_call_requests.is_some());
+            let table = fragment.execution_types.as_ref().unwrap();
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+            // Inspection is an explicit pure role; it authorizes no BE allocation.
+            let decoded = novarocks_plan_codec::execution_type_table::decode_execution_type_table_observed(
+                table,
+                novarocks_plan_codec::execution_type_table::ExecutionTypeTableLimits::for_validated_root_count(table.value_bindings.len()).unwrap(),
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                &mut |_| Ok::<_, novarocks_plan_codec::host_projection_v2::AdmissionRefusal<std::convert::Infallible>>(()),
+                &mut work,
+            ).unwrap();
+            let mut roots = Vec::new();
+            expressions(fragment.root.as_ref().unwrap(), &mut roots);
+            roots.extend(fragment.output_exprs.iter());
+            let mut scalar_calls = Vec::new();
+            for root in roots {
+                calls(root, &mut scalar_calls);
+            }
+            for (expression, call) in scalar_calls {
+                let selected = call
+                    .frozen_binding
+                    .as_ref()
+                    .expect("every named scalar keeps its exact selection");
+                let definition = expression
+                    .original_definition_id
+                    .expect("original expression definition");
+                assert_eq!(selected.id, definition);
+                let request = fragment
+                    .original_call_requests
+                    .as_ref()
+                    .unwrap()
+                    .entries
+                    .iter()
+                    .find(|request| request.request_id == call.original_request_id)
+                    .unwrap();
+                assert_eq!(request.definition.as_ref().unwrap().kind,
+                    Some(novarocks_proto_models::call_request::call_request_definition::Kind::ExpressionDefinitionId(definition)));
+                if call.function_name == "value_domain_conversion" {
+                    let Some(binding::function_binding_definition::Result::ScalarValueTypeId(
+                        target,
+                    )) = &selected.result
+                    else {
+                        panic!("scalar result")
+                    };
+                    let Some(binding::function_argument_type::Kind::ValueTypeId(source)) =
+                        &selected.arguments[0].kind
+                    else {
+                        panic!("value argument")
+                    };
+                    let expected = request
+                        .expected_result_value_type_id
+                        .expect("the original conversion request keeps its complete target");
+                    // Execution type IDs name actual source occurrences, not
+                    // semantic interning. Request and selected result objects
+                    // have distinct addresses while retaining the same FVT.
+                    let expected = decoded.get_observed(expected, &mut work).unwrap().unwrap();
+                    let selected_target =
+                        decoded.get_observed(*target, &mut work).unwrap().unwrap();
+                    assert!(
+                        expected
+                            .exactly_equals_checked_observed(selected_target, || work.step())
+                            .unwrap(),
+                        "original target and frozen selection differ in full semantic type, layout or child/root NULL"
+                    );
+                    assert_ne!(
+                        source, target,
+                        "nominal conversion has distinct complete declarations"
+                    );
+                    let source = decoded.get_observed(*source, &mut work).unwrap().unwrap();
+                    let target = decoded.get_observed(*target, &mut work).unwrap().unwrap();
+                    assert_eq!(
+                        source.data_type(),
+                        target.data_type(),
+                        "the conversion preserves its installed physical carrier"
+                    );
+                    assert_ne!(
+                        source.value_type(),
+                        target.value_type(),
+                        "JSON and Text remain distinct full semantic declarations"
+                    );
+                    conversions += 1;
+                }
+            }
+            work.finish().unwrap();
+        }
+        assert!(
+            conversions > 0,
+            "the genuine query retains its nominal converter"
+        );
     }
 
     /// One plan frozen into either carrier states the same Frontend facts,
@@ -1901,6 +2306,8 @@ mod tests {
                     FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope),
                 )
                 .unwrap();
+            let freezes_before_refusal =
+                crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
             let first_failure = CompletedTailControl {
                 encode_checkpoints: AtomicUsize::new(0),
                 tail_at: Some(encode_checkpoints - 1),
@@ -1919,7 +2326,16 @@ mod tests {
                 ),
                 Err(novarocks_plan_codec::PhysicalEncodeError::Control(actual)) if actual == error,
             ));
-            assert_eq!(first_failure.encode_checkpoints.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                first_failure.encode_checkpoints.load(Ordering::SeqCst),
+                1,
+                "the first Validate refusal preserves the original Encode entry without a footer",
+            );
+            assert_eq!(
+                crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread(),
+                freezes_before_refusal,
+                "the first Validate refusal precedes any native fragment freezing",
+            );
         }
     }
 
@@ -2133,7 +2549,7 @@ mod tests {
 
     #[test]
     fn m07_completed_result_occurrences_supply_exact_attempt_domains() {
-        use novarocks_physical_plan::ResultValueDomain as D;
+        use novarocks_type_contract::ValueLogicalType as D;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2151,9 +2567,9 @@ mod tests {
         assert_eq!(
             outputs
                 .iter()
-                .map(|column| column.domain)
+                .map(|column| column.logical_type())
                 .collect::<Vec<_>>(),
-            vec![D::Hll, D::Bitmap, D::Percentile, D::Json, D::Plain]
+            vec![D::Hll, D::Bitmap, D::Percentile, D::Json, D::Physical]
         );
         assert_eq!(
             outputs
@@ -2163,11 +2579,9 @@ mod tests {
             vec!["h", "b", "p", "j", "raw"]
         );
         for (output, original) in outputs.iter().zip(result.fields.iter()) {
-            assert_eq!(output.data_type, original.ty.data_type);
-            assert_eq!(output.nullable, original.ty.nullable);
-            output.validate_domain().unwrap();
+            assert_eq!(output.ty, original.ty);
         }
-        assert_eq!(outputs[4].logical_type().unwrap(), None);
+        assert_eq!(outputs[4].logical_type(), D::Physical);
     }
 
     fn request() -> SqlFinalPlanCompileRequest {

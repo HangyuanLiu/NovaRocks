@@ -201,6 +201,7 @@ pub(crate) fn prepare_physical_window_occurrence_observed(
         .map_err(ExpressionOccurrenceError::function)?;
     work.flush()?;
     let frozen = FrozenPhysicalCall {
+        materialized_writer_input: None,
         regexp_count_pattern_source: None,
         to_base64_byte_source: None,
         temporal_source: None,

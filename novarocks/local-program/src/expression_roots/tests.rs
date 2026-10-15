@@ -127,11 +127,11 @@ fn metadata_source_program(
             7,
             8,
             FilterProducerKind::Membership,
-            StaticFilterContract::Membership {
-                data_type: DataType::Int64,
-                null_semantics: FilterNullSemantics::NeverMatches,
-                digest: [1; 32],
-            },
+            StaticFilterContract::membership(
+                &novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                FilterNullSemantics::NeverMatches,
+            )
+            .unwrap(),
             FilterReduction::SetUnion,
         )
         .unwrap();
@@ -171,7 +171,10 @@ fn metadata_source_program(
             FilterProducerKind::OrderedBound,
             StaticFilterContract::Ordered {
                 keys: Arc::from([FilterOrderKey {
-                    data_type: DataType::Int64,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                     direction: FilterSortDirection::Ascending,
                     null_order: FilterNullOrder::Last,
                 }]),
@@ -285,6 +288,7 @@ fn scoped_program(shared: bool) -> LocalProgramGraph {
                 },
                 writer_multiplex_layout: layout.clone(),
                 partial_aggregates: vec![],
+                partial_preparation: None,
             },
             layout.clone(),
         ),
@@ -474,6 +478,7 @@ fn finish_program(constants: Vec<Vec<UnpivotConstant>>) -> LocalProgramGraph {
                     writer_multiplex_layout: layout.clone(),
                     root_result_layout: layout.clone(),
                     final_aggregates: WriterFinalAggregatePlan {
+                        prepared: None,
                         calls: vec![],
                         unpivot: Some(unpivot),
                     },
@@ -688,4 +693,153 @@ fn non_expression_constants_and_zero_expression_nodes_still_observe_work() {
             assert_eq!(*control.work.lock().unwrap(), [0, 256]);
         }
     }
+}
+
+// The supplied owner is lifetime-only. Its observer records actual public
+// requests and locked opaque operation bounds, without manufacturing a grant.
+struct CreationHold(Arc<std::sync::atomic::AtomicUsize>);
+impl novarocks_type_contract::ValueTypeStorageHold for CreationHold {}
+impl Drop for CreationHold {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CreationEvent {
+    Layout(usize, usize),
+    Opaque(usize),
+}
+#[derive(Debug, Eq, PartialEq)]
+struct CallerRefusal {
+    operation: usize,
+    original: u64,
+}
+fn creation_storage(drops: &Arc<std::sync::atomic::AtomicUsize>) -> ValueTypeStorageLifetime {
+    ValueTypeStorageLifetime::held(Arc::new(CreationHold(drops.clone())))
+}
+
+#[test]
+fn root_creation_keeps_actual_tables_to_last_independent_map_reference() {
+    let program = metadata_source_program(false, false).unwrap();
+    let expected = ProgramExpressionRoots::collect(&program, &Control::default()).unwrap();
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let layouts = events.clone();
+    let mut request = move |layout: std::alloc::Layout| -> Result<(), CallerRefusal> {
+        layouts
+            .lock()
+            .unwrap()
+            .push(CreationEvent::Layout(layout.size(), layout.align()));
+        Ok(())
+    };
+    let opaque = events.clone();
+    let mut quote = move |bytes| -> Result<(), CallerRefusal> {
+        opaque.lock().unwrap().push(CreationEvent::Opaque(bytes));
+        Ok(())
+    };
+    let mut creation = ValueSchemaCreation::new(creation_storage(&drops), &mut request, &mut quote);
+    let roots = ProgramExpressionRoots::collect_with_creator_in(
+        &program,
+        &mut creation,
+        &Control::default(),
+    )
+    .unwrap();
+    assert_eq!(roots.sites(), expected.sites());
+    assert!(Arc::ptr_eq(
+        &roots.arenas()[&ProgramExpressionArena::Main],
+        program.expressions()
+    ));
+    let late_map = roots.sites.clone();
+    drop(roots);
+    drop(program);
+    drop(creation);
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(!late_map.is_empty());
+    assert_eq!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, CreationEvent::Layout(..)))
+            .count(),
+        2
+    );
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, CreationEvent::Opaque(bytes) if *bytes > 0))
+    );
+    drop(late_map);
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+#[test]
+fn each_root_before_construction_refusal_returns_original_caller_without_tail() {
+    let program = metadata_source_program(false, false).unwrap();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let run = |fail_at: Option<usize>| {
+        observed.lock().unwrap().clear();
+        let layout_events = observed.clone();
+        let mut request = move |layout: std::alloc::Layout| {
+            let mut events = layout_events.lock().unwrap();
+            let ordinal = events.len();
+            events.push(CreationEvent::Layout(layout.size(), layout.align()));
+            if fail_at == Some(ordinal) {
+                Err(CallerRefusal {
+                    operation: ordinal,
+                    original: 0xabc,
+                })
+            } else {
+                Ok(())
+            }
+        };
+        let opaque_events = observed.clone();
+        let mut opaque = move |bytes| {
+            let mut events = opaque_events.lock().unwrap();
+            let ordinal = events.len();
+            events.push(CreationEvent::Opaque(bytes));
+            if fail_at == Some(ordinal) {
+                Err(CallerRefusal {
+                    operation: ordinal,
+                    original: 0xabc,
+                })
+            } else {
+                Ok(())
+            }
+        };
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut creation =
+            ValueSchemaCreation::new(creation_storage(&drops), &mut request, &mut opaque);
+        ProgramExpressionRoots::collect_with_creator_in(
+            &program,
+            &mut creation,
+            &Control::default(),
+        )
+    };
+    let complete = run(None).unwrap();
+    drop(complete);
+    let original = observed.lock().unwrap().clone();
+    for operation in 0..original.len() {
+        assert!(
+            matches!(run(Some(operation)), Err(ProgramCreationFailure::Creator(CallerRefusal {operation: at, original: 0xabc})) if at == operation)
+        );
+        assert_eq!(*observed.lock().unwrap(), original[..=operation]);
+    }
+    let control = Control {
+        failure: Some(CompileControlError::Cancelled),
+        ..Control::default()
+    };
+    let mut request =
+        |_| -> Result<(), CallerRefusal> { panic!("request after entry cancellation") };
+    let mut opaque =
+        |_| -> Result<(), CallerRefusal> { panic!("opaque request after entry cancellation") };
+    let mut creation =
+        ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+    assert!(matches!(
+        ProgramExpressionRoots::collect_with_creator_in(&program, &mut creation, &control),
+        Err(ProgramCreationFailure::Control(
+            CompileControlError::Cancelled
+        ))
+    ));
 }

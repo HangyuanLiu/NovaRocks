@@ -123,7 +123,9 @@ fn scalar(
         FunctionId::try_new("owner/exact").unwrap(),
         FunctionOverloadId::try_new("owner/selected").unwrap(),
         kind,
-        arguments.into_boxed_slice(),
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+            arguments.into_boxed_slice(),
+        ),
         result,
     )
 }
@@ -153,7 +155,9 @@ fn workflow(
     let aggregate = scalar(
         FunctionKind::Aggregate,
         vec![FunctionArgumentType::Lambda {
-            parameter_types: Box::from([v[0].1.clone(), v[2].1.clone()]),
+            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                Box::from([v[0].1.clone(), v[2].1.clone()]),
+            ),
             result_type: v[1].1.clone(),
         }],
         v[0].1.clone(),
@@ -162,8 +166,13 @@ fn workflow(
     let table = BoundTableFunction::from_exact_signature(
         FunctionId::try_new("owner/table").unwrap(),
         FunctionOverloadId::try_new("owner/table-selected").unwrap(),
-        Box::from([FunctionArgumentType::Value(v[0].1.clone())]),
-        Box::from([v[0].1.clone(), v[1].1.clone()]),
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::from([
+            FunctionArgumentType::Value(v[0].1.clone()),
+        ])),
+        novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(Box::from([
+            v[0].1.clone(),
+            v[1].1.clone(),
+        ])),
     );
     let scalar_args = [ArgumentTypeIds::Value(u32::MAX)];
     let lambda_params = [0, u32::MAX];
@@ -379,13 +388,10 @@ fn known_header_index_and_clone_requests_win_before_pending_control() {
             model.facts.type_reference_count = 1;
             let mut observed_parent = false;
             let mut parent = |facts: &BindingProjectionFacts| {
-                if facts.allocation_requests_upper_bound != 0 {
+                if facts.type_reference_count == 1 {
                     observed_parent = true;
-                    assert_eq!(facts.allocation_requests_upper_bound, 2);
-                    assert_eq!(
-                        facts.request_bytes_upper_bound,
-                        2 * Layout::new::<DataType>().size()
-                    );
+                    assert_eq!(facts.allocation_requests_upper_bound, 0);
+                    assert_eq!(facts.request_bytes_upper_bound, 0);
                     return Err(CompileControlError::ResourceExhausted);
                 }
                 Ok(())
@@ -420,20 +426,26 @@ fn known_header_index_and_clone_requests_win_before_pending_control() {
         }
     }
     c.arm(None);
-    // Two output requests, two argument requests and two identity boxes are
-    // known before lookup. This actual Dictionary adds exactly two boxes.
+    // Root Vec/Box, argument Vec/Box/holder, and two identity Box/Arc
+    // pairs are known before lookup. The normalized type clone allocates zero.
     let base_bytes = 2 * Layout::array::<(u32, MaterializedFunctionBinding)>(1)
         .unwrap()
         .size()
         + 2 * Layout::array::<FunctionArgumentType>(1).unwrap().size()
         + f.function_id.as_str().len()
         + f.overload.as_str().len();
-    let expected_bytes = base_bytes + 2 * Layout::new::<DataType>().size();
+    let expected_bytes = base_bytes
+        + novarocks_type_contract::FunctionArgumentTypes::storage_allocation_layout()
+            .unwrap()
+            .size()
+        + FunctionId::storage_allocation_layout().unwrap().size()
+        + FunctionOverloadId::storage_allocation_layout()
+            .unwrap()
+            .size();
     let mut capture_at = None;
     let mut work = CompileCheckpoints::try_new(original, CompilePhase::Validate).unwrap();
     let mut observe = |facts: &BindingProjectionFacts| {
-        if facts.allocation_requests_upper_bound == 8 {
-            assert_eq!(facts.type_reference_count, 2);
+        if facts.allocation_requests_upper_bound == 9 {
             assert_eq!(facts.request_bytes_upper_bound, expected_bytes);
             capture_at.get_or_insert(c.trace().len());
         }
@@ -449,7 +461,7 @@ fn known_header_index_and_clone_requests_win_before_pending_control() {
     .unwrap();
     work.finish().unwrap();
     let baseline = c.trace();
-    let capture_at = capture_at.expect("actual Dictionary request capture");
+    let capture_at = capture_at.expect("actual guarded backing request capture");
     assert!(capture_at < baseline.len());
     for stop in
         std::iter::once(None).chain(CAUSES.into_iter().map(|cause| Some((capture_at, cause))))
@@ -458,10 +470,10 @@ fn known_header_index_and_clone_requests_win_before_pending_control() {
         let mut work = CompileCheckpoints::try_new(original, CompilePhase::Validate).unwrap();
         let mut rejected = None;
         let mut parent = |facts: &BindingProjectionFacts| {
-            // Keep the original parent request cap at the six real containers.
-            if facts.allocation_requests_upper_bound > 6 {
-                assert_eq!(facts.allocation_requests_upper_bound, 8);
-                assert_eq!(facts.type_reference_count, 2);
+            // Refuse the first actual backing/holder prefix, before further
+            // work or an ordinary footer can publish a later cause.
+            if facts.allocation_requests_upper_bound > 8 {
+                assert_eq!(facts.allocation_requests_upper_bound, 9);
                 assert_eq!(facts.request_bytes_upper_bound, expected_bytes);
                 rejected = Some(c.trace().len());
                 Err(CompileControlError::ResourceExhausted)
@@ -507,8 +519,10 @@ fn known_header_index_and_clone_requests_win_before_pending_control() {
         &mut work,
     )
     .unwrap();
-    // Own Vec+Box output/args, two ID boxes, and sole Dictionary's two boxes.
-    assert_eq!(token.facts().allocation_requests_upper_bound, 8);
+    // Output Vec+Box (2), argument Vec+Box+holder (3), and two ID
+    // Box+Arc pairs (4). The normalized FVT clone has no new allocation.
+    assert_eq!(token.facts().allocation_requests_upper_bound, 2 + 3 + 4);
+    assert_eq!(token.facts().request_bytes_upper_bound, expected_bytes);
 }
 #[test]
 fn same_resource_author_exact_replay_underbounds_and_foreign_control_are_explicit() {

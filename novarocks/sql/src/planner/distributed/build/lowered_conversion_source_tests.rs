@@ -84,7 +84,7 @@ fn cast(input: TypedExpr, target: ValueType, decimal: DecimalOverflowPolicy) -> 
     TypedExpr {
         kind: ExprKind::Cast {
             expr: Box::new(input),
-            target: target.data_type.clone(),
+            target: target.data_type().clone(),
             decimal_overflow_policy: decimal,
         },
         value_type: target,
@@ -94,8 +94,8 @@ fn project(expression: TypedExpr) -> PhysicalPlanNode {
     let mut output = column(
         71,
         "converted",
-        expression.value_type.data_type.clone(),
-        expression.value_type.nullable,
+        expression.value_type.data_type().clone(),
+        expression.value_type.nullable(),
     );
     output.value_type = expression.value_type.clone();
     PhysicalPlanNode {

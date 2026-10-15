@@ -344,10 +344,17 @@ impl PreparedAggregateKernel for CountDistinctKernel {
     }
 }
 fn nested_supported(
+    semantic: &novarocks_type_contract::ValueTypeRef,
     ty: &DataType,
     work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<bool, KernelFailure> {
     work.step().map_err(compile_failure)?;
+    if semantic
+        .domain()
+        .is_some_and(|domain| domain != novarocks_type_contract::ValueLogicalType::LargeInt)
+    {
+        return Ok(false);
+    }
     Ok(match ty {
         DataType::Null
         | DataType::Boolean
@@ -365,19 +372,16 @@ fn nested_supported(
         | DataType::Decimal128(..)
         | DataType::Decimal256(..)
         | DataType::FixedSizeBinary(16) => true,
-        DataType::List(item) => nested_supported(item.data_type(), work)?,
+        DataType::List(item) => match semantic.child_type_at(0) {
+            Some(child) => nested_supported(child, item.data_type(), work)?,
+            None => false,
+        },
         DataType::Struct(fields) => {
-            for field in fields {
-                let identity = novarocks_type_contract::field_logical_type(field)
-                    .map_err(|error| invalid(&error.to_string()))?;
-                if !matches!(
-                    identity,
-                    novarocks_type_contract::ValueLogicalType::Physical
-                        | novarocks_type_contract::ValueLogicalType::LargeInt
-                ) {
+            for (index, field) in fields.iter().enumerate() {
+                let Some(child) = semantic.child_type_at(index) else {
                     return Ok(false);
-                }
-                if !nested_supported(field.data_type(), work)? {
+                };
+                if !nested_supported(child, field.data_type(), work)? {
                     return Ok(false);
                 }
             }
@@ -387,7 +391,18 @@ fn nested_supported(
             let DataType::Struct(fields) = entries.data_type() else {
                 return Ok(false);
             };
-            fields.len() == 2 && nested_supported(entries.data_type(), work)?
+            if fields.len() != 2 {
+                return Ok(false);
+            }
+            for (index, field) in fields.iter().enumerate() {
+                let Some(child) = semantic.child_type_at(index) else {
+                    return Ok(false);
+                };
+                if !nested_supported(child, field.data_type(), work)? {
+                    return Ok(false);
+                }
+            }
+            true
         }
         _ => false,
     })
@@ -406,19 +421,19 @@ pub(super) fn validate_contract(
         let FunctionArgumentType::Value(source) = source else {
             return Err(invalid("COUNT DISTINCT requires canonical value arguments"));
         };
-        if source.logical_type != ValueLogicalType::Physical
+        if source.logical_type() != ValueLogicalType::Physical
             && !(tuple
-                && source.logical_type == ValueLogicalType::LargeInt
-                && matches!(source.data_type, DataType::FixedSizeBinary(16)))
+                && source.logical_type() == ValueLogicalType::LargeInt
+                && matches!(source.data_type(), DataType::FixedSizeBinary(16)))
         {
             return Err(invalid(
                 "COUNT DISTINCT source has an unsupported logical identity",
             ));
         }
         let supported = if tuple {
-            nested_supported(&source.data_type, work)?
+            nested_supported(source.value_type(), source.data_type(), work)?
         } else {
-            match &source.data_type {
+            match source.data_type() {
                 DataType::Null
                 | DataType::Int8
                 | DataType::Int16
@@ -436,7 +451,9 @@ pub(super) fn validate_contract(
                     work.step().map_err(compile_failure)?;
                     true
                 }
-                ty @ (DataType::List(_) | DataType::Struct(_)) => nested_supported(ty, work)?,
+                ty @ (DataType::List(_) | DataType::Struct(_)) => {
+                    nested_supported(source.value_type(), ty, work)?
+                }
                 _ => false,
             }
         };
@@ -450,11 +467,11 @@ pub(super) fn validate_contract(
     let FunctionResultType::Scalar(output) = &selected.result_type else {
         return Err(invalid("COUNT DISTINCT requires a scalar result"));
     };
-    if output.logical_type != ValueLogicalType::Physical
-        || output.nullable
-        || output.data_type != DataType::Int64
-        || contract.intermediate_type().logical_type != ValueLogicalType::Physical
-        || contract.intermediate_type().data_type != DataType::Binary
+    if output.logical_type() != ValueLogicalType::Physical
+        || output.nullable()
+        || output.data_type() != &DataType::Int64
+        || contract.intermediate_type().logical_type() != ValueLogicalType::Physical
+        || contract.intermediate_type().data_type() != &DataType::Binary
     {
         return Err(invalid(
             "COUNT DISTINCT result or intermediate domain differs from its owner",

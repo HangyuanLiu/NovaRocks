@@ -33,6 +33,8 @@ pub(crate) fn lower_unary_op(
     arena: &mut ExprArena,
     input_layout: &NativeExpressionInputLayout,
     data_type: DataType,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<ExprId, super::NativeExpressionDecodeError> {
     let op = expr::UnaryOp::try_from(unary.op).map_err(|_| {
         super::NativeExpressionDecodeError::invalid_enum(
@@ -45,6 +47,7 @@ pub(crate) fn lower_unary_op(
         path.clone().field("operand"),
         arena,
         input_layout,
+        type_decoder,
     )?;
     match op {
         expr::UnaryOp::Unspecified => Err(super::NativeExpressionDecodeError::invalid_enum(

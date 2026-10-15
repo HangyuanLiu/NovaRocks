@@ -117,10 +117,10 @@ fn array_literal_real_empty_and_homogeneous_profiles_have_exact_effects() {
     ] {
         let p = prepared_for_test("__array_literal", &sources).unwrap();
         assert!(matches!(
-            p.contract().result_type().data_type,
+            p.contract().result_type().data_type(),
             DataType::List(_)
         ));
-        assert!(!p.contract().result_type().nullable);
+        assert!(!p.contract().result_type().nullable());
         assert_eq!(
             p.contract().effects().null_behavior,
             FunctionNullBehavior::CalledOnNull

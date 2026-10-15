@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 
-use arrow::datatypes::SchemaRef;
+use novarocks_connector_contract::ConnectorReadExecutionSchema;
 
 use crate::catalog_application::query_bindings::{
     QueryFrozenCohortRead, QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey,
@@ -49,7 +49,7 @@ use novarocks_sql::planning::query_execution::{
 pub(crate) fn admit_table_execute_scan_binding(
     bindings: &QueryTableBindingStore,
     identity: &FrozenConnectorScanIdentity,
-    input_schema: &SchemaRef,
+    input_schema: &ConnectorReadExecutionSchema,
     read: QueryRewriteGroupRead,
 ) -> Result<SqlTableBindingId, String> {
     bindings.resolve_or_insert_with_id(table_execute_binding_key(identity), |binding| {
@@ -57,7 +57,7 @@ pub(crate) fn admit_table_execute_scan_binding(
         Ok(QueryTableBinding {
             resolved: table_execute_resolved_analyzer_table(
                 identity,
-                input_schema.clone(),
+                super::distributed_rewrite::connector_execution_columns(input_schema)?,
                 binding,
             ),
             statistics_pin: None,
@@ -76,10 +76,14 @@ pub(crate) fn admit_table_execute_scan_binding(
 /// Build the minimal physical scan carrier for one procedure cohort read.
 pub(crate) fn table_execute_scan_physical_plan(
     identity: &FrozenConnectorScanIdentity,
-    input_schema: &SchemaRef,
+    input_schema: &ConnectorReadExecutionSchema,
     binding: SqlTableBindingId,
-) -> FrozenConnectorScanPlan {
-    build_table_execute_scan_plan(identity, input_schema, binding)
+) -> Result<FrozenConnectorScanPlan, String> {
+    build_table_execute_scan_plan(
+        identity,
+        &super::distributed_rewrite::connector_execution_columns(input_schema)?,
+        binding,
+    )
 }
 
 fn table_execute_binding_key(identity: &FrozenConnectorScanIdentity) -> QueryTableBindingKey {

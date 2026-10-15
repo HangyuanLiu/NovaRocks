@@ -243,7 +243,7 @@ impl Fixture {
         let carrier_i64 = types
             .carriers
             .iter()
-            .find(|(_, value)| **value == DataType::Int64)
+            .find(|(_, value)| value.value == DataType::Int64)
             .map(|(id, _)| *id)
             .unwrap();
         let lambda_arg = wire::FunctionArgumentType {
@@ -272,7 +272,9 @@ impl Fixture {
             }),
             logical_argument_count: 1,
             state_format: "actual-state/v1".into(),
-            state_argument_contract: wire::AggregateStateArgumentContract::ExactSignature as i32,
+            state_argument_contract:
+                novarocks_proto_models::common::AggregateStateArgumentContract::ExactSignature
+                    as i32,
             intermediate_value_type_id: Some(1),
         }];
         let values = [(0, 0), (1, 7), (2, 10)]
@@ -734,7 +736,7 @@ fn receiving_expressions_cover_all_seventeen_kinds_and_original_sparse_correspon
         // Frozen expected nullable=true accepts this actual nonnullable Value
         // shape. Domain/fits proof remains with the original Fragment author.
         assert_eq!(functions.as_wire()[0].arguments[0], arg(1));
-        assert!(!fixture.types.value_type(0).unwrap().nullable);
+        assert!(!fixture.types.value_type(0).unwrap().nullable());
         let foreign = zero.clone();
         assert!(matches!(
             token.source_id(&foreign),
@@ -842,16 +844,19 @@ fn receiving_constants_preserve_selected_ordinal_and_require_exact_nested_source
         }));
         assert!(run(&fixture, &[bad], SOURCE, limits(), &Control::default()).is_err());
     }
-    // A separate, valid received root differs only in nested metadata.
+    // A separate, valid received root differs in actual child nullability.
     let mut changed = Fixture::new();
-    let DataType::Struct(fields) = &changed.types.value_type(7).unwrap().data_type else {
+    let DataType::Struct(fields) = &changed.types.value_type(7).unwrap().data_type() else {
         panic!("nested source");
     };
     let wrong = FunctionValueType::new(
         DataType::Struct(
-            vec![Arc::new(fields[0].as_ref().clone().with_metadata(
-                [("unknown.child".into(), "different".into())].into(),
-            ))]
+            vec![Arc::new(
+                fields[0]
+                    .as_ref()
+                    .clone()
+                    .with_nullable(!fields[0].is_nullable()),
+            )]
             .into(),
         ),
         true,
@@ -1167,7 +1172,7 @@ fn receiving_cast_and_all_arithmetic_parameter_references_are_not_defaults() {
         .carriers
         .iter()
         .find(|(_, carrier)| {
-            **carrier == DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None)
+            carrier.value == DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None)
         })
         .map(|(id, _)| *id)
         .unwrap();

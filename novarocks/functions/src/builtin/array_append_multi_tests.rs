@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual ARRAY_APPEND invocation must preflight complete backing before construction.
+//! Raw Arrow copying primitives are tested independently of installed Plain
+//! ARRAY_APPEND input capability. Lower primitive support is not engine support.
 use super::*;
 use crate::builtin::array_append_core::{
     AppendFailure, AppendOutputFacts, ArrayAppendInputs, append_observed_guarded,
@@ -39,6 +40,58 @@ fn null_parent(value: ArrayRef) -> ArrayRef {
         Some(NullBuffer::from(vec![false])),
     ))
 }
+fn primitive_append(
+    a: ArrayRef,
+    target: ArrayRef,
+    selection: Selection<'_>,
+    control: &dyn KernelEvaluationControl,
+) -> Result<ArrayRef, KernelFailure> {
+    control.checkpoint(0)?;
+    let map = |error| match error {
+        AppendFailure::Control(error) => error,
+        AppendFailure::Data(message) => invalid(&message),
+    };
+    let inputs =
+        ArrayAppendInputs::new(a, target, AppendOutputFacts::OriginalInputList, &mut |_| {
+            control.checkpoint(1)
+        })
+        .map_err(map)?;
+    let mut plan = Vec::new();
+    inputs
+        .extensions_observed(
+            selection,
+            |_, row| Ok(inputs.legacy_rows(row)),
+            |source, start, len| {
+                plan.push(crate::selected_copy::ExtendSegment {
+                    source,
+                    start,
+                    len,
+                    repeats: 1,
+                    nulls: 0,
+                });
+                Ok(())
+            },
+            &mut |_| control.checkpoint(1),
+        )
+        .map_err(map)?;
+    append_observed_guarded(
+        &inputs,
+        selection,
+        |_, row| Ok(inputs.legacy_rows(row)),
+        |inputs| {
+            crate::selected_copy::preflight_extend_multi(
+                &inputs.constructor_sources(),
+                &plan,
+                0,
+                |_| control.checkpoint(1),
+            )
+            .map_err(copy_error)
+        },
+        |_, _, _, _| Ok(()),
+        &mut |_| control.checkpoint(1),
+    )
+    .map_err(map)
+}
 #[test]
 fn append_multi_constructor_full_dictionary_domain_is_refused_even_when_parent_skips_every_extend()
 {
@@ -55,10 +108,10 @@ fn append_multi_constructor_full_dictionary_domain_is_refused_even_when_parent_s
     ];
     let mut k = ScalarEvaluationInstance::instantiate(p).unwrap();
     let control = Control::default();
-    assert_eq!(
-        k.evaluate(Selection::all(1), &args, &control).unwrap_err(),
-        KernelFailure::ResourceExhausted
-    );
+    assert!(matches!(
+        k.evaluate(Selection::all(1), &args, &control),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
     assert!(!control.trace.lock().unwrap().is_empty());
     let after = Control::default();
     assert_eq!(
@@ -68,7 +121,7 @@ fn append_multi_constructor_full_dictionary_domain_is_refused_even_when_parent_s
     assert!(after.trace.lock().unwrap().is_empty());
 }
 #[test]
-fn append_multi_view_backing_remapping_and_dictionary_domains_preserve_original_real_output() {
+fn arrow_primitive_view_backing_remapping_and_dictionary_domains_preserve_real_output() {
     let children: ArrayRef = Arc::new(StringViewArray::from(vec![
         Some("original-child-long-view"),
         None,
@@ -78,20 +131,8 @@ fn append_multi_view_backing_remapping_and_dictionary_domains_preserve_original_
         Some("original-target-long-view"),
         Some("short"),
     ]));
-    let p = prepared(
-        &[source(&a), source(&target)],
-        crate::binding_test_control(),
-    )
-    .unwrap();
-    let args = [
-        EvaluatedArgument::Column(&a),
-        EvaluatedArgument::Column(&target),
-    ];
-    let out = ScalarEvaluationInstance::instantiate(p)
-        .unwrap()
-        .evaluate(Selection::all(2), &args, &Control::default())
-        .unwrap();
-    let out = out.values().as_any().downcast_ref::<ListArray>().unwrap();
+    let out = primitive_append(a, target, Selection::all(2), &Control::default()).unwrap();
+    let out = out.as_any().downcast_ref::<ListArray>().unwrap();
     assert_eq!(out.value_offsets(), &[0, 2, 4]);
     assert_eq!(
         out.values()
@@ -111,20 +152,8 @@ fn append_multi_view_backing_remapping_and_dictionary_domains_preserve_original_
     let child = dictionary("first", 3);
     let a = list(child, vec![0, 1]);
     let target = dictionary("second", 2);
-    let p = prepared(
-        &[source(&a), source(&target)],
-        crate::binding_test_control(),
-    )
-    .unwrap();
-    let args = [
-        EvaluatedArgument::Column(&a),
-        EvaluatedArgument::Column(&target),
-    ];
-    let out = ScalarEvaluationInstance::instantiate(p)
-        .unwrap()
-        .evaluate(Selection::all(1), &args, &Control::default())
-        .unwrap();
-    let out = out.values().as_any().downcast_ref::<ListArray>().unwrap();
+    let out = primitive_append(a, target, Selection::all(1), &Control::default()).unwrap();
+    let out = out.as_any().downcast_ref::<ListArray>().unwrap();
     let values = out
         .values()
         .as_any()
@@ -245,8 +274,7 @@ fn append_multi_constructor_guard_refusal_precedes_original_dictionary_panic_wit
     }
 }
 #[test]
-fn append_multi_every_actual_view_and_dictionary_callback_preserves_seven_causes_and_failed_latch()
-{
+fn arrow_primitive_every_actual_view_and_dictionary_callback_preserves_seven_causes() {
     let dictionaries = list(dictionary("first", 3), vec![0, 1]);
     let dictionary_target = dictionary("second", 2);
     let views = list(
@@ -269,10 +297,7 @@ fn append_multi_every_actual_view_and_dictionary_callback_preserves_seven_causes
             EvaluatedArgument::Column(&target),
         ];
         let good = Control::default();
-        ScalarEvaluationInstance::instantiate(p.clone())
-            .unwrap()
-            .evaluate(Selection::all(1), &args, &good)
-            .unwrap();
+        primitive_append(a.clone(), target.clone(), Selection::all(1), &good).unwrap();
         let trace = good.trace.lock().unwrap().clone();
         for at in 0..trace.len() {
             for cause in [
@@ -288,19 +313,31 @@ fn append_multi_every_actual_view_and_dictionary_callback_preserves_seven_causes
                     trace: Mutex::new(vec![]),
                     refusal: Some((at, cause.clone())),
                 };
-                let mut k = ScalarEvaluationInstance::instantiate(p.clone()).unwrap();
                 assert_eq!(
-                    k.evaluate(Selection::all(1), &args, &control).unwrap_err(),
+                    primitive_append(a.clone(), target.clone(), Selection::all(1), &control)
+                        .unwrap_err(),
                     cause
                 );
                 assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
-                let after = Control::default();
-                assert_eq!(
-                    k.evaluate(Selection::all(1), &args, &after).unwrap_err(),
-                    KernelFailure::InstanceFailed
-                );
-                assert!(after.trace.lock().unwrap().is_empty());
             }
         }
+        // Dictionary requires an installed access fact. Views remain lower
+        // primitive coverage; their engine admission belongs to Chunk ingress.
+        if !matches!(target.data_type(), DataType::Dictionary(_, _)) {
+            continue;
+        }
+        let mut kernel = ScalarEvaluationInstance::instantiate(p).unwrap();
+        assert!(matches!(
+            kernel.evaluate(Selection::all(1), &args, &Control::default()),
+            Err(KernelFailure::InvalidProgram(_))
+        ));
+        let after = Control::default();
+        assert_eq!(
+            kernel
+                .evaluate(Selection::all(1), &args, &after)
+                .unwrap_err(),
+            KernelFailure::InstanceFailed
+        );
+        assert!(after.trace.lock().unwrap().is_empty());
     }
 }

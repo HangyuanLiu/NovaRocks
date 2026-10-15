@@ -596,9 +596,9 @@ fn boolean_literal_value(
                         "Boolean constant source differs from its frozen scalar type".into(),
                     ));
                 }
-                let physical_boolean = value.value_type().logical_type
+                let physical_boolean = value.value_type().logical_type()
                     == ValueLogicalType::Physical
-                    && value.value_type().data_type == DataType::Boolean;
+                    && *value.value_type().data_type() == DataType::Boolean;
                 work.step()?;
                 if !physical_boolean {
                     return Ok(None);
@@ -1118,7 +1118,10 @@ mod intrinsic_error_consumer_tests {
                 ),
                 volatility,
             },
-            novarocks_type_contract::FunctionValueType::new(output.data_type, output.nullable),
+            novarocks_type_contract::FunctionValueType::new(
+                output.data_type().clone(),
+                output.nullable(),
+            ),
         )
     }
 

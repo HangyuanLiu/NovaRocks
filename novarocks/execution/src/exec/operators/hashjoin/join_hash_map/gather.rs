@@ -23,9 +23,383 @@ use arrow::compute::take;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use crate::exec::chunk::Chunk;
 use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
+use crate::exec::chunk::{ArrayNormalizationStep, Chunk, ChunkSchema, ChunkSchemaRef};
+use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner};
+use crate::runtime::fragment::ExecutionFailure;
 use crate::runtime::profile::clamp_u128_to_i64;
+use novarocks_type_contract::ValueTypeStorageLifetime;
+
+#[derive(Debug)]
+pub(crate) enum JoinGatherError {
+    Source(String),
+    Construction(ConstructionFailure),
+    Kernel(novarocks_functions::KernelFailure),
+}
+impl From<String> for JoinGatherError {
+    fn from(value: String) -> Self {
+        Self::Source(value)
+    }
+}
+impl From<ConstructionFailure> for JoinGatherError {
+    fn from(value: ConstructionFailure) -> Self {
+        Self::Construction(value)
+    }
+}
+impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for JoinGatherError
+{
+    fn from(cause: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::Construction(ConstructionFailure::Resource(cause))
+    }
+}
+impl JoinGatherError {
+    pub(crate) fn into_execution(self) -> ExecutionFailure {
+        match self {
+            Self::Source(cause) => cause.into(),
+            Self::Construction(cause) => cause.into(),
+            Self::Kernel(cause) => cause.into(),
+        }
+    }
+    fn into_legacy(self) -> String {
+        match self {
+            Self::Source(message) => message,
+            Self::Construction(cause) => cause.to_string(),
+            Self::Kernel(cause) => cause.to_string(),
+        }
+    }
+}
+
+/// One owned batch and its actual declaration/header/source custody. This
+/// stack carrier allocates no holder and exposes no bare owning batch escape.
+/// Take/filter payload allocation is outside this wrapper's construction facts.
+#[derive(Debug)]
+pub(crate) struct TypedJoinBatch {
+    batch: RecordBatch,
+    schema: ChunkSchemaRef,
+    storage: ValueTypeStorageLifetime,
+}
+impl TypedJoinBatch {
+    pub(crate) fn record_batch(&self) -> &RecordBatch {
+        &self.batch
+    }
+    pub(crate) fn num_rows(&self) -> usize {
+        self.batch.num_rows()
+    }
+    pub(crate) fn filter(
+        self,
+        mask: &arrow::array::BooleanArray,
+        owner: &dyn InputConstructionOwner,
+    ) -> Result<Self, JoinGatherError> {
+        preflight_filter_columns(owner, self.batch.num_columns())?;
+        let storage = owner
+            .storage_lifetime()
+            .retaining_observed(&self.storage, |layout| owner.request(layout))?;
+        let batch = arrow::compute::filter_record_batch(&self.batch, mask)
+            .map_err(|cause| cause.to_string())?;
+        Ok(Self {
+            batch,
+            schema: self.schema,
+            storage,
+        })
+    }
+    pub(crate) fn republish(
+        self,
+        schema: ChunkSchemaRef,
+        owner: &dyn InputConstructionOwner,
+    ) -> Result<Self, JoinGatherError> {
+        validate_projection(&self.schema, &schema, owner)?;
+        let storage = owner
+            .storage_lifetime()
+            .retaining_observed(&self.storage, |layout| owner.request(layout))?;
+        let (_, columns, rows) = self.batch.into_parts();
+        let batch = strict_record_batch(&schema, columns, rows)?;
+        Ok(Self {
+            batch,
+            schema,
+            storage,
+        })
+    }
+    pub(crate) fn into_chunk(
+        self,
+        owner: &dyn InputConstructionOwner,
+    ) -> Result<Chunk, JoinGatherError> {
+        Chunk::try_new_typed_record_batch_owned_observed::<JoinGatherError, _, _>(
+            self.batch,
+            self.schema,
+            self.storage,
+            owner.storage_lifetime(),
+            |layout| owner.request(layout).map_err(Into::into),
+            |step| owner.observe(0, &[], step).map_err(Into::into),
+        )
+        .map_err(Into::into)
+    }
+}
+
+fn work(owner: &dyn InputConstructionOwner, units: usize) -> Result<(), JoinGatherError> {
+    owner
+        .observe(
+            0,
+            &[],
+            ArrayNormalizationStep::InspectConstructionWork { units },
+        )
+        .map_err(Into::into)
+}
+fn request_array<T>(
+    owner: &dyn InputConstructionOwner,
+    count: usize,
+) -> Result<(), JoinGatherError> {
+    let layout = std::alloc::Layout::array::<T>(count).map_err(|_| {
+        ConstructionFailure::Resource(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        )
+    })?;
+    if layout.size() != 0 {
+        owner.request(layout)?;
+    }
+    Ok(())
+}
+fn strict_record_batch(
+    schema: &ChunkSchemaRef,
+    columns: Vec<ArrayRef>,
+    rows: usize,
+) -> Result<RecordBatch, JoinGatherError> {
+    // Arrow validates the declared exact carrier/required NULL law. No Field
+    // retag or array-derived widening is a semantic author on this path.
+    RecordBatch::try_new_with_options(
+        schema.arrow_schema_ref(),
+        columns,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(rows)),
+    )
+    .map_err(|cause| JoinGatherError::Source(cause.to_string()))
+}
+fn validate_projection(
+    source: &ChunkSchema,
+    target: &ChunkSchema,
+    owner: &dyn InputConstructionOwner,
+) -> Result<(), JoinGatherError> {
+    if !source.is_typed() || !target.is_typed() || source.slots().len() != target.slots().len() {
+        return Err(
+            "typed join projection has no exact complete channel declaration"
+                .to_owned()
+                .into(),
+        );
+    }
+    for (source, target) in source.slots().iter().zip(target.slots()) {
+        work(owner, 1)?;
+        if source.nullable() && !target.nullable()
+            || !source
+                .typed_binding()
+                .borrowed()
+                .same_physical_binding_ignoring_root_nullability_observed(
+                    target.typed_binding().borrowed(),
+                    || work(owner, 1),
+                )?
+        {
+            return Err("typed join projection changes its complete value binding"
+                .to_owned()
+                .into());
+        }
+    }
+    Ok(())
+}
+/// Scope roots read child occurrences under their original slot identities.
+/// The checked local join publisher instead declares a fresh canonical slot
+/// namespace, ordered by probe/build ordinal. Neither role changes values.
+#[derive(Clone, Copy)]
+enum JoinSourceRole {
+    Scope,
+    CanonicalOutput,
+}
+
+fn validate_source(
+    source: &Chunk,
+    target: &ChunkSchema,
+    offset: usize,
+    role: JoinSourceRole,
+    owner: &dyn InputConstructionOwner,
+) -> Result<(), JoinGatherError> {
+    if !source.chunk_schema().is_typed()
+        || !target.is_typed()
+        || offset
+            .checked_add(source.chunk_schema().slots().len())
+            .is_none_or(|end| end > target.slots().len())
+    {
+        return Err("typed join source has no complete declared channel range"
+            .to_owned()
+            .into());
+    }
+    for (source, target) in source
+        .chunk_schema()
+        .slots()
+        .iter()
+        .zip(&target.slots()[offset..])
+    {
+        work(owner, 1)?;
+        if matches!(role, JoinSourceRole::Scope) && source.slot_id() != target.slot_id()
+            || source.nullable() && !target.nullable()
+            || !source
+                .typed_binding()
+                .borrowed()
+                .same_physical_binding_ignoring_root_nullability_observed(
+                    target.typed_binding().borrowed(),
+                    || work(owner, 1),
+                )?
+        {
+            return Err("typed join source differs from its complete declaration"
+                .to_owned()
+                .into());
+        }
+    }
+    Ok(())
+}
+fn preflight_filter_columns(
+    owner: &dyn InputConstructionOwner,
+    columns: usize,
+) -> Result<(), JoinGatherError> {
+    work(owner, columns)?;
+    // Arrow 58.4 FilterPredicate::filter_record_batch collects Result<Vec<_>>.
+    // Rust 1.98 GenericShunt has lower size_hint 0; nonempty Arc items use the
+    // Vec minimum capacity 4 and geometric doubling. This opaque upper covers
+    // only that column vector, excluding FilterBuilder and array payload.
+    if columns != 0 {
+        let capacity = columns
+            .checked_next_power_of_two()
+            .ok_or(ConstructionFailure::Resource(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            ))?
+            .max(4);
+        let bytes = std::alloc::Layout::array::<ArrayRef>(capacity)
+            .map_err(|_| {
+                ConstructionFailure::Resource(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        )
+            })?
+            .size();
+        owner.observe_opaque_upper_bound(bytes)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn filter_probe_typed(
+    probe: &Chunk,
+    mask: &arrow::array::BooleanArray,
+    schema: ChunkSchemaRef,
+    owner: &dyn InputConstructionOwner,
+) -> Result<TypedJoinBatch, JoinGatherError> {
+    if probe.record_batch().num_columns() != schema.slots().len() {
+        return Err("typed join filter channel count differs from declaration"
+            .to_owned()
+            .into());
+    }
+    validate_source(probe, &schema, 0, JoinSourceRole::CanonicalOutput, owner)?;
+    let storage = probe.source_storage_lifetime_observed(owner.storage_lifetime(), |layout| {
+        owner.request(layout)
+    })?;
+    preflight_filter_columns(owner, probe.record_batch().num_columns())?;
+    let batch = arrow::compute::filter_record_batch(probe.record_batch(), mask)
+        .map_err(|cause| cause.to_string())?;
+    let (_, columns, rows) = batch.into_parts();
+    let batch = strict_record_batch(&schema, columns, rows)?;
+    Ok(TypedJoinBatch {
+        batch,
+        schema,
+        storage,
+    })
+}
+
+trait GatherAuthor {
+    type Batch;
+    fn columns(&self, count: usize) -> Result<(), JoinGatherError>;
+    fn indexes(&self, indexes: &[u32]) -> Result<ArrayRef, JoinGatherError>;
+    fn batches(&self, count: usize) -> Result<Vec<Self::Batch>, JoinGatherError>;
+    fn finish(
+        &self,
+        columns: Vec<ArrayRef>,
+        rows: usize,
+        context: &str,
+    ) -> Result<Self::Batch, JoinGatherError>;
+}
+struct LegacyGather<'a>(&'a SchemaRef);
+impl GatherAuthor for LegacyGather<'_> {
+    type Batch = RecordBatch;
+    fn columns(&self, _: usize) -> Result<(), JoinGatherError> {
+        Ok(())
+    }
+    fn indexes(&self, indexes: &[u32]) -> Result<ArrayRef, JoinGatherError> {
+        Ok(Arc::new(UInt32Array::from(indexes.to_vec())))
+    }
+    fn batches(&self, _: usize) -> Result<Vec<RecordBatch>, JoinGatherError> {
+        Ok(Vec::new())
+    }
+    fn finish(
+        &self,
+        columns: Vec<ArrayRef>,
+        _: usize,
+        context: &str,
+    ) -> Result<RecordBatch, JoinGatherError> {
+        build_output_record_batch(self.0, columns, context).map_err(Into::into)
+    }
+}
+struct TypedGather<'a> {
+    schema: &'a ChunkSchemaRef,
+    owner: &'a dyn InputConstructionOwner,
+    scratch: &'a dyn InputConstructionOwner,
+    control: &'a dyn novarocks_functions::KernelEvaluationControl,
+    storage: ValueTypeStorageLifetime,
+}
+impl GatherAuthor for TypedGather<'_> {
+    type Batch = TypedJoinBatch;
+    fn columns(&self, count: usize) -> Result<(), JoinGatherError> {
+        request_array::<ArrayRef>(self.owner, count)
+    }
+    fn indexes(&self, indexes: &[u32]) -> Result<ArrayRef, JoinGatherError> {
+        use novarocks_functions::selected_copy::{CopyConstructionError, CopyError};
+        request_array::<u32>(self.scratch, indexes.len())?;
+        let storage = self.scratch.storage_lifetime();
+        let mut request = |layout| self.scratch.request(layout);
+        let mut opaque = |bytes| self.scratch.observe_opaque_upper_bound(bytes);
+        let mut creation =
+            novarocks_type_contract::ValueSchemaCreation::new(storage, &mut request, &mut opaque);
+        novarocks_functions::selected_copy::preflight_primitive_vec_adoption_construction(
+            &mut creation,
+            self.control,
+        )
+        .map_err(|cause| match cause {
+            CopyConstructionError::Creator(cause) => JoinGatherError::Construction(cause),
+            CopyConstructionError::Resource(cause) => {
+                JoinGatherError::Construction(ConstructionFailure::Resource(cause))
+            }
+            CopyConstructionError::Copy(CopyError::Control(cause)) => {
+                JoinGatherError::Kernel(cause)
+            }
+            CopyConstructionError::Copy(other) => JoinGatherError::Source(other.to_string()),
+        })?;
+        self.scratch.request(
+            novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::new::<UInt32Array>(),
+            )?,
+        )?;
+        Ok(Arc::new(UInt32Array::from(indexes.to_vec())))
+    }
+    fn batches(&self, count: usize) -> Result<Vec<TypedJoinBatch>, JoinGatherError> {
+        request_array::<TypedJoinBatch>(self.owner, count)?;
+        Ok(Vec::with_capacity(count))
+    }
+    fn finish(
+        &self,
+        columns: Vec<ArrayRef>,
+        rows: usize,
+        _: &str,
+    ) -> Result<TypedJoinBatch, JoinGatherError> {
+        let batch = strict_record_batch(self.schema, columns, rows)?;
+        Ok(TypedJoinBatch {
+            batch,
+            schema: self.schema.clone(),
+            storage: self.storage.clone(),
+        })
+    }
+}
 
 pub(crate) const MAX_JOIN_OUTPUT_ROWS_PER_BATCH: usize = 16 * 1024;
 
@@ -36,8 +410,8 @@ pub(crate) struct GatherTimings {
 }
 
 #[derive(Debug)]
-pub(crate) struct GatherBatches {
-    pub(crate) batches: Vec<RecordBatch>,
+pub(crate) struct GatherBatches<B = RecordBatch> {
+    pub(crate) batches: Vec<B>,
     pub(crate) timings: GatherTimings,
 }
 
@@ -136,32 +510,49 @@ pub(crate) fn gather_join_batch(
     right_indices: &[u32],
     output_schema: &SchemaRef,
 ) -> Result<Option<RecordBatch>, String> {
+    gather_join_batch_in(
+        left,
+        right,
+        left_indices,
+        right_indices,
+        &LegacyGather(output_schema),
+    )
+    .map_err(JoinGatherError::into_legacy)
+}
+
+fn gather_join_batch_in<A: GatherAuthor>(
+    left: &Chunk,
+    right: &Chunk,
+    left_indices: &[u32],
+    right_indices: &[u32],
+    author: &A,
+) -> Result<Option<A::Batch>, JoinGatherError> {
     if left_indices.len() != right_indices.len() {
         return Err(format!(
             "join index length mismatch: left={} right={}",
             left_indices.len(),
             right_indices.len()
-        ));
+        )
+        .into());
     }
     if left_indices.is_empty() || right_indices.is_empty() {
         return Ok(None);
     }
-    let left_idx_array = UInt32Array::from(left_indices.to_vec());
-    let right_idx_array = UInt32Array::from(right_indices.to_vec());
-    let left_idx_ref = Arc::new(left_idx_array) as ArrayRef;
-    let right_idx_ref = Arc::new(right_idx_array) as ArrayRef;
-
-    let mut columns = Vec::with_capacity(left.batch.num_columns() + right.batch.num_columns());
-    for col in left.batch.columns() {
+    let left_idx_ref = author.indexes(left_indices)?;
+    let right_idx_ref = author.indexes(right_indices)?;
+    let count = left.record_batch().num_columns() + right.record_batch().num_columns();
+    author.columns(count)?;
+    let mut columns = Vec::with_capacity(count);
+    for col in left.record_batch().columns() {
         let taken = take(col.as_ref(), &left_idx_ref, None).map_err(|e| e.to_string())?;
         columns.push(taken);
     }
-    for col in right.batch.columns() {
+    for col in right.record_batch().columns() {
         let taken = take(col.as_ref(), &right_idx_ref, None).map_err(|e| e.to_string())?;
         columns.push(taken);
     }
 
-    let batch = build_output_record_batch(output_schema, columns, "join output")?;
+    let batch = author.finish(columns, left_indices.len(), "join output")?;
     Ok(Some(batch))
 }
 
@@ -214,12 +605,34 @@ pub(crate) fn gather_probe_build_batches(
     probe_is_left: bool,
     all_match_one: bool,
 ) -> Result<GatherBatches, String> {
+    gather_probe_build_batches_in(
+        probe,
+        build,
+        probe_indices,
+        build_indices,
+        probe_is_left,
+        all_match_one,
+        &LegacyGather(output_schema),
+    )
+    .map_err(JoinGatherError::into_legacy)
+}
+
+fn gather_probe_build_batches_in<A: GatherAuthor>(
+    probe: &Chunk,
+    build: &Chunk,
+    probe_indices: &[u32],
+    build_indices: &[u32],
+    probe_is_left: bool,
+    all_match_one: bool,
+    author: &A,
+) -> Result<GatherBatches<A::Batch>, JoinGatherError> {
     if probe_indices.len() != build_indices.len() {
         return Err(format!(
             "join index length mismatch: probe={} build={}",
             probe_indices.len(),
             build_indices.len()
-        ));
+        )
+        .into());
     }
     if probe_indices.is_empty() {
         return Ok(GatherBatches {
@@ -234,37 +647,39 @@ pub(crate) fn gather_probe_build_batches(
                 return Err(format!(
                     "ALL_MATCH_ONE probe index mismatch: row={} probe_row={}",
                     row, probe_row
-                ));
+                )
+                .into());
             }
         }
     }
 
-    let mut batches = Vec::new();
+    let mut batches =
+        author.batches(probe_indices.len().div_ceil(MAX_JOIN_OUTPUT_ROWS_PER_BATCH))?;
     let mut timings = GatherTimings::default();
     let mut offset = 0usize;
     while offset < probe_indices.len() {
         let end = (offset + MAX_JOIN_OUTPUT_ROWS_PER_BATCH).min(probe_indices.len());
         let row_count = end - offset;
-        let build_idx_array = UInt32Array::from(build_indices[offset..end].to_vec());
-        let build_idx_ref = Arc::new(build_idx_array) as ArrayRef;
-        let mut columns = Vec::with_capacity(probe.batch.num_columns() + build.batch.num_columns());
+        let build_idx_ref = author.indexes(&build_indices[offset..end])?;
+        let count = probe.record_batch().num_columns() + build.record_batch().num_columns();
+        author.columns(count)?;
+        let mut columns = Vec::with_capacity(count);
         let take_probe_columns = |columns: &mut Vec<ArrayRef>,
                                   timings: &mut GatherTimings|
-         -> Result<(), String> {
+         -> Result<(), JoinGatherError> {
             if all_match_one {
-                if probe.batch.num_columns() > 0 {
+                if probe.record_batch().num_columns() > 0 {
                     let start = std::time::Instant::now();
-                    for col in probe.batch.columns() {
+                    for col in probe.record_batch().columns() {
                         columns.push(col.slice(offset, row_count));
                     }
                     timings.add_probe(start);
                 }
             } else {
-                let probe_idx_array = UInt32Array::from(probe_indices[offset..end].to_vec());
-                let probe_idx_ref = Arc::new(probe_idx_array) as ArrayRef;
-                if probe.batch.num_columns() > 0 {
+                let probe_idx_ref = author.indexes(&probe_indices[offset..end])?;
+                if probe.record_batch().num_columns() > 0 {
                     let start = std::time::Instant::now();
-                    for col in probe.batch.columns() {
+                    for col in probe.record_batch().columns() {
                         columns.push(
                             take(col.as_ref(), &probe_idx_ref, None).map_err(|e| e.to_string())?,
                         );
@@ -276,10 +691,10 @@ pub(crate) fn gather_probe_build_batches(
         };
         let take_build_columns = |columns: &mut Vec<ArrayRef>,
                                   timings: &mut GatherTimings|
-         -> Result<(), String> {
-            if build.batch.num_columns() > 0 {
+         -> Result<(), JoinGatherError> {
+            if build.record_batch().num_columns() > 0 {
                 let start = std::time::Instant::now();
-                for col in build.batch.columns() {
+                for col in build.record_batch().columns() {
                     columns
                         .push(take(col.as_ref(), &build_idx_ref, None).map_err(|e| e.to_string())?);
                 }
@@ -295,11 +710,7 @@ pub(crate) fn gather_probe_build_batches(
             take_build_columns(&mut columns, &mut timings)?;
             take_probe_columns(&mut columns, &mut timings)?;
         }
-        batches.push(build_output_record_batch(
-            output_schema,
-            columns,
-            "join all-match-one output",
-        )?);
+        batches.push(author.finish(columns, row_count, "join all-match-one output")?);
         offset = end;
     }
     Ok(GatherBatches { batches, timings })
@@ -311,15 +722,30 @@ pub(crate) fn gather_left_with_null_right(
     right_schema: &SchemaRef,
     output_schema: &SchemaRef,
 ) -> Result<Option<RecordBatch>, String> {
+    gather_left_with_null_right_in(
+        left,
+        left_indices,
+        right_schema,
+        &LegacyGather(output_schema),
+    )
+    .map_err(JoinGatherError::into_legacy)
+}
+
+fn gather_left_with_null_right_in<A: GatherAuthor>(
+    left: &Chunk,
+    left_indices: &[u32],
+    right_schema: &SchemaRef,
+    author: &A,
+) -> Result<Option<A::Batch>, JoinGatherError> {
     if left_indices.is_empty() {
         return Ok(None);
     }
     let len = left_indices.len();
-    let left_idx_array = UInt32Array::from(left_indices.to_vec());
-    let left_idx_ref = Arc::new(left_idx_array) as ArrayRef;
-
-    let mut columns = Vec::with_capacity(left.batch.num_columns() + right_schema.fields().len());
-    for col in left.batch.columns() {
+    let left_idx_ref = author.indexes(left_indices)?;
+    let count = left.record_batch().num_columns() + right_schema.fields().len();
+    author.columns(count)?;
+    let mut columns = Vec::with_capacity(count);
+    for col in left.record_batch().columns() {
         let taken = take(col.as_ref(), &left_idx_ref, None).map_err(|e| e.to_string())?;
         columns.push(taken);
     }
@@ -327,8 +753,146 @@ pub(crate) fn gather_left_with_null_right(
         columns.push(new_null_array(field.data_type(), len));
     }
 
-    let batch = build_output_record_batch(output_schema, columns, "join left outer output")?;
+    let batch = author.finish(columns, len, "join left outer output")?;
     Ok(Some(batch))
+}
+
+fn typed_pair_author<'a>(
+    left: &Chunk,
+    right: &Chunk,
+    schema: &'a ChunkSchemaRef,
+    owner: &'a dyn InputConstructionOwner,
+    scratch: &'a dyn InputConstructionOwner,
+    control: &'a dyn novarocks_functions::KernelEvaluationControl,
+) -> Result<TypedGather<'a>, JoinGatherError> {
+    if left.record_batch().num_columns() + right.record_batch().num_columns()
+        != schema.slots().len()
+    {
+        return Err("typed join pair channel count differs from declaration"
+            .to_owned()
+            .into());
+    }
+    validate_source(left, schema, 0, JoinSourceRole::Scope, owner)?;
+    validate_source(
+        right,
+        schema,
+        left.record_batch().num_columns(),
+        JoinSourceRole::Scope,
+        owner,
+    )?;
+    let storage = left.source_storage_lifetime_observed(owner.storage_lifetime(), |layout| {
+        owner.request(layout)
+    })?;
+    let storage =
+        right.source_storage_lifetime_observed(storage, |layout| owner.request(layout))?;
+    Ok(TypedGather {
+        schema,
+        owner,
+        scratch,
+        control,
+        storage,
+    })
+}
+
+pub(crate) fn gather_join_batch_typed(
+    left: &Chunk,
+    right: &Chunk,
+    left_indices: &[u32],
+    right_indices: &[u32],
+    schema: &ChunkSchemaRef,
+    owner: &dyn InputConstructionOwner,
+    scratch: &dyn InputConstructionOwner,
+    control: &dyn novarocks_functions::KernelEvaluationControl,
+) -> Result<Option<TypedJoinBatch>, JoinGatherError> {
+    let author = typed_pair_author(left, right, schema, owner, scratch, control)?;
+    gather_join_batch_in(left, right, left_indices, right_indices, &author)
+}
+
+pub(crate) fn gather_probe_build_batches_typed(
+    probe: &Chunk,
+    build: &Chunk,
+    probe_indices: &[u32],
+    build_indices: &[u32],
+    schema: &ChunkSchemaRef,
+    probe_is_left: bool,
+    all_match_one: bool,
+    owner: &dyn InputConstructionOwner,
+    scratch: &dyn InputConstructionOwner,
+    control: &dyn novarocks_functions::KernelEvaluationControl,
+) -> Result<GatherBatches<TypedJoinBatch>, JoinGatherError> {
+    let (left, right) = if probe_is_left {
+        (probe, build)
+    } else {
+        (build, probe)
+    };
+    let author = typed_pair_author(left, right, schema, owner, scratch, control)?;
+    gather_probe_build_batches_in(
+        probe,
+        build,
+        probe_indices,
+        build_indices,
+        probe_is_left,
+        all_match_one,
+        &author,
+    )
+}
+
+pub(crate) fn gather_left_with_null_right_typed(
+    left: &Chunk,
+    left_indices: &[u32],
+    right: &ChunkSchemaRef,
+    schema: &ChunkSchemaRef,
+    owner: &dyn InputConstructionOwner,
+    scratch: &dyn InputConstructionOwner,
+    control: &dyn novarocks_functions::KernelEvaluationControl,
+) -> Result<Option<TypedJoinBatch>, JoinGatherError> {
+    if left.record_batch().num_columns() + right.slots().len() != schema.slots().len()
+        || !right.is_typed()
+    {
+        return Err("typed outer join channel count differs from declaration"
+            .to_owned()
+            .into());
+    }
+    validate_source(left, schema, 0, JoinSourceRole::CanonicalOutput, owner)?;
+    for (source, target) in right
+        .slots()
+        .iter()
+        .zip(&schema.slots()[left.record_batch().num_columns()..])
+    {
+        // Canonical output slots are intentionally fresh; this producer maps
+        // right occurrences by their checked ordinal, preserving the complete
+        // child semantics/layout and its explicitly frozen NULL extension.
+        if !target.nullable()
+            || !source
+                .typed_binding()
+                .borrowed()
+                .same_physical_binding_ignoring_root_nullability_observed(
+                    target.typed_binding().borrowed(),
+                    || work(owner, 1),
+                )?
+        {
+            return Err(
+                "typed outer join NULL extension differs from its complete declaration"
+                    .to_owned()
+                    .into(),
+            );
+        }
+    }
+    let storage = left.source_storage_lifetime_observed(owner.storage_lifetime(), |layout| {
+        owner.request(layout)
+    })?;
+    // new_null_array borrows the prepared right layout. Retain precisely that
+    // schema, whose slots already carry its finite creation responsibility.
+    let storage =
+        storage.retaining_observed(&right.storage_lifetime(), |layout| owner.request(layout))?;
+    let author = TypedGather {
+        schema,
+        owner,
+        scratch,
+        control,
+        storage,
+    };
+    gather_left_with_null_right_in(left, left_indices, &right.arrow_schema_ref(), &author)
 }
 
 pub(crate) fn gather_null_left_with_right(
@@ -344,11 +908,12 @@ pub(crate) fn gather_null_left_with_right(
     let right_idx_array = UInt32Array::from(right_indices.to_vec());
     let right_idx_ref = Arc::new(right_idx_array) as ArrayRef;
 
-    let mut columns = Vec::with_capacity(left_schema.fields().len() + right.batch.num_columns());
+    let mut columns =
+        Vec::with_capacity(left_schema.fields().len() + right.record_batch().num_columns());
     for field in left_schema.fields().iter() {
         columns.push(new_null_array(field.data_type(), len));
     }
-    for col in right.batch.columns() {
+    for col in right.record_batch().columns() {
         let taken = take(col.as_ref(), &right_idx_ref, None).map_err(|e| e.to_string())?;
         columns.push(taken);
     }

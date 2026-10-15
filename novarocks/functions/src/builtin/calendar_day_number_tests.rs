@@ -368,7 +368,9 @@ fn calendar_day_number_three_profiles_preserve_hand_oracles_nullable_and_policy(
                 ]
             );
             let mut nonnull = source.clone();
-            nonnull.nullable = false;
+            nonnull = nonnull
+                .with_nullable(false)
+                .expect("valid function nullability declaration");
             let prepared = prepared_for_test_with_policy("to_days", &[nonnull], policy).unwrap();
             assert_eq!(prepared.contract().result_type(), &result_type());
             let mut kernel = ScalarEvaluationInstance::instantiate(prepared).unwrap();
@@ -437,7 +439,7 @@ fn calendar_day_number_selected_cv_scalar_compact_slice_and_batch_addresses_are_
         let scalar = array.slice(2, 1);
         let compact = SelectedValues::try_new(
             selection,
-            &source.data_type,
+            source.data_type(),
             array.slice(0, 3),
             Box::default(),
         )
@@ -666,7 +668,7 @@ fn calendar_day_number_every_compile_callback_preserves_three_primary_causes_and
                 &good
             )
             .is_ok(),
-            source.data_type == DataType::Utf8
+            source.data_type() == &DataType::Utf8
         );
         let trace = good.trace.lock().unwrap().clone();
         assert!(!trace.is_empty());

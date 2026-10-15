@@ -36,9 +36,9 @@ use novarocks_spi::connector::{
     ConnectorStagedCreatePublishRequest, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningRequest, ConnectorStagedWriteProof,
     ConnectorUnanchoredCtasCleanupLease, ConnectorWriteAdmissionPurpose,
-    ConnectorWriteFieldRequest, ConnectorWriteInputRequest, ConnectorWriteIntent,
-    ConnectorWriteLease, CreatePolicy, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome, LakePublicationId,
+    ConnectorWriteInputRequest, ConnectorWriteIntent, ConnectorWriteLease, CreatePolicy,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    LakePublicationId,
 };
 use novarocks_user_error::UserError;
 
@@ -906,7 +906,7 @@ struct CorePreparedStandardCtasSource {
     query_options: Option<QueryOptions>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     attempt_reservation: Mutex<Option<crate::query_execution::completion::QueryAttemptReservation>>,
-    output_schema: arrow::datatypes::SchemaRef,
+    source_columns: Vec<novarocks_sql::planning::dml::DmlSourceColumn>,
     output_columns: Vec<ConnectorColumnDefinition>,
     target_session: Arc<Mutex<Option<Arc<CoreStandardCtasTargetSession>>>>,
     target_prepare_started: AtomicBool,
@@ -1004,7 +1004,7 @@ trait CtasWriteTarget: Send + Sync {
     fn begin_write_session(
         &self,
         host: &novarocks_catalog_application::ConnectorControlHost,
-        output_schema: &arrow::datatypes::SchemaRef,
+        source_columns: &[novarocks_sql::planning::dml::DmlSourceColumn],
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, CtasFailure>;
 
@@ -1023,7 +1023,7 @@ impl CtasWriteTarget for CoreStandardCtasTargetSession {
     fn begin_write_session(
         &self,
         host: &novarocks_catalog_application::ConnectorControlHost,
-        output_schema: &arrow::datatypes::SchemaRef,
+        source_columns: &[novarocks_sql::planning::dml::DmlSourceColumn],
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, CtasFailure>
     {
@@ -1062,11 +1062,10 @@ impl CtasWriteTarget for CoreStandardCtasTargetSession {
             intent: ConnectorWriteIntent::Append,
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
             input: ConnectorWriteInputRequest::Data {
-                fields: output_schema
-                    .fields()
-                    .iter()
-                    .map(|field| ConnectorWriteFieldRequest::new(field.as_ref().clone()))
-                    .collect(),
+                fields: crate::query_execution::dml::iceberg_ctas::source_columns_to_write_fields(
+                    source_columns,
+                )
+                .map_err(connector_failure)?,
             },
             base: None,
             flavor:
@@ -1672,15 +1671,15 @@ impl CtasEngine for DmlExecutionKernel {
                 .map(|column| {
                     arrow::datatypes::Field::new(
                         &column.name,
-                        column.data_type.clone(),
-                        column.nullable,
+                        column.value_type.data_type().clone(),
+                        column.value_type.nullable(),
                     )
                 })
                 .collect::<Vec<_>>(),
         ));
         let table_columns =
-            crate::query_execution::dml::iceberg_ctas::arrow_schema_to_table_column_defs(
-                output_schema.as_ref(),
+            crate::query_execution::dml::iceberg_ctas::source_columns_to_table_column_defs(
+                &source_columns,
             )
             .map_err(internal_failure)?;
         let output_columns = table_columns
@@ -1739,7 +1738,7 @@ impl CtasEngine for DmlExecutionKernel {
                 query_options: request.query_options,
                 connector_context,
                 attempt_reservation: Mutex::new(Some(attempt_reservation)),
-                output_schema,
+                source_columns,
                 output_columns,
                 target_session: Arc::new(Mutex::new(None)),
                 target_prepare_started: AtomicBool::new(false),
@@ -1898,7 +1897,7 @@ impl CtasEngine for DmlExecutionKernel {
         // the writer recipes that plan's writer node carries.
         let session = target.begin_write_session(
             self.typed_connector_control(),
-            &source.output_schema,
+            &source.source_columns,
             source.connector_context.clone(),
         )?;
         let planned = source
@@ -2171,7 +2170,7 @@ mod tests {
         fn begin_write_session(
             &self,
             _host: &novarocks_catalog_application::ConnectorControlHost,
-            _output_schema: &arrow::datatypes::SchemaRef,
+            _source_columns: &[novarocks_sql::planning::dml::DmlSourceColumn],
             _context: novarocks_spi::connector::ConnectorRequestContext,
         ) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, CtasFailure>
         {

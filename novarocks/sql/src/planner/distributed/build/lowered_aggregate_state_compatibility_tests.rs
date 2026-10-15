@@ -17,9 +17,15 @@
 
 use super::lowered_partial_aggregate_canonical_tests::{chain, entry};
 use super::*;
+use crate::planner::distributed::build::physical_aggregate_requests::author_physical_aggregate_merge_request_observed;
 
 fn repeated_chain(name: &str, ty: ValueType) -> PhysicalPlanNode {
-    let mut input = column(7, "original_nonnullable", ty.data_type.clone(), ty.nullable);
+    let mut input = column(
+        7,
+        "original_nonnullable",
+        ty.data_type().clone(),
+        ty.nullable(),
+    );
     input.value_type = ty;
     // The source channel exists even for nested carriers without a fabricated
     // runtime literal; these tests verify the actual structural source owner.
@@ -62,14 +68,27 @@ fn assert_actual_root_widening(owner: &SqlAuthoredPhysicalPlan, original: &Value
     assert_eq!(captured, original);
     assert!(cv.is_none());
     let mut actual = original.clone();
-    actual.nullable = true;
+    actual = actual.with_nullable(true).unwrap();
     assert_eq!(value(&canonical.request().arguments[0]).0, &actual);
     assert!(value(&canonical.request().arguments[0]).1.is_none());
     assert_eq!(
         value(&final_entry.captured().request().arguments[0]).0,
         original
     );
-    assert!(final_entry.canonical().is_none());
+    let final_canonical = final_entry.canonical().unwrap();
+    assert!(final_canonical.belongs_to(final_entry.captured()));
+    assert!(!Arc::ptr_eq(final_canonical, canonical));
+    assert_eq!(
+        final_canonical.selected().argument_types.as_ref(),
+        final_entry
+            .source()
+            .binding
+            .function
+            .argument_types
+            .as_ref()
+    );
+    assert_eq!(value(&final_canonical.request().arguments[0]).0, &actual);
+    assert!(value(&final_canonical.request().arguments[0]).1.is_none());
     assert_eq!(
         canonical.selected().argument_types.as_ref(),
         partial.source().binding.function.argument_types.as_ref()
@@ -81,12 +100,9 @@ fn assert_actual_root_widening(owner: &SqlAuthoredPhysicalPlan, original: &Value
             .selected
             .argument_types
             .as_ref(),
-        final_entry
-            .source()
-            .binding
-            .function
-            .argument_types
-            .as_ref()
+        &[novarocks_functions::FunctionArgumentType::Value(
+            original.clone()
+        )]
     );
     assert!(canonical.belongs_to(partial.captured()));
     assert!(
@@ -122,6 +138,16 @@ fn assert_actual_root_widening(owner: &SqlAuthoredPhysicalPlan, original: &Value
     let control = Control::default();
     let mut work =
         CompileCheckpoints::try_new(&control, CompilePhase::FunctionSpecialization).unwrap();
+    let merge = author_physical_aggregate_merge_request_observed(&final_entry, &mut work).unwrap();
+    assert!(Arc::ptr_eq(merge.selected(), final_canonical.selected()));
+    assert!(std::ptr::eq(
+        merge.request().arguments,
+        final_canonical.request().arguments
+    ));
+    assert!(std::ptr::eq(merge.source(), final_entry.source()));
+    assert_eq!(value(&merge.request().arguments[0]).0, &actual);
+    assert!(value(&merge.request().arguments[0]).1.is_none());
+    assert_eq!(merge.request().logical_argument_count, 1);
     let mut producers = 0;
     let mut streams = 0;
     final_entry
@@ -186,8 +212,16 @@ fn nested_type(child_nullable: bool, origin: &str) -> ValueType {
     ValueType::new(
         DataType::Struct(
             vec![Arc::new(
-                Field::new("中国", DataType::Utf8, child_nullable)
-                    .with_metadata([("provider-origin".into(), origin.into())].into()),
+                Field::new(
+                    if origin == "foreign" {
+                        "different_child"
+                    } else {
+                        "中国"
+                    },
+                    DataType::Utf8,
+                    child_nullable,
+                )
+                .with_metadata([("provider-origin".into(), origin.into())].into()),
             )]
             .into(),
         ),
@@ -209,7 +243,7 @@ fn state_compat_min_preserves_nested_metadata_and_nominal_json_beyond_root_nulla
         assert_actual_root_widening(&owner, &original);
         let final_entry = entry(&owner, false);
         let mut state = original.clone();
-        state.nullable = true;
+        state = state.with_nullable(true).unwrap();
         assert_eq!(final_entry.source().binding.intermediate_type, state);
         assert_eq!(final_entry.source().binding.function.result_type, state);
     }
@@ -219,8 +253,8 @@ fn replace_final_logical_source(plan: &mut PhysicalPlanNode, ty: ValueType) {
     let mut input = column(
         7,
         "independent_final_logical_source",
-        ty.data_type.clone(),
-        ty.nullable,
+        ty.data_type().clone(),
+        ty.nullable(),
     );
     input.value_type = ty;
     let replacement = aggregate(
@@ -292,17 +326,14 @@ fn mutate_final_binding(
     );
 }
 fn require_sequence_refusal(source: &PhysicalPlanNode) {
-    let Err(ContractLoweringError::Validation(errors)) = authored(source, &Control::default())
-    else {
-        panic!("actual mismatched state/result metadata must refuse")
-    };
     assert!(
-        errors
-            .errors()
-            .iter()
-            .any(|error| error.path().starts_with("aggregate_sequences[")
-                && error.message()
-                    == "aggregate state paths do not reduce exactly into their matching final")
+        matches!(
+            authored(source, &Control::default()),
+            Err(ContractLoweringError::InvalidAggregate {
+                detail: "aggregate original binding differs from its installed logical request"
+            })
+        ),
+        "actual mismatched state/result metadata must refuse before reselection"
     );
 }
 
@@ -338,7 +369,8 @@ fn state_compat_stateformat_result_logical_count_phase_and_orphan_remain_exact()
         unreachable!()
     };
     let output = column(92, "final_result", DataType::Utf8, true);
-    spec.aggregates[0].result_type = DataType::Utf8;
+    spec.aggregates[0].result_type =
+        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true);
     spec.output_layout = AggregateOutputLayout::new(vec![], vec![output.clone()]);
     spec.output_columns = vec![output.clone()];
     result.output_columns = vec![output];
@@ -426,14 +458,14 @@ fn state_compat_actual_repeat_lowerer_and_stateformat_refusal_keep_every_origina
         if positive {
             assert_actual_root_widening(&result.unwrap(), &ValueType::new(DataType::Int64, false));
         } else {
-            let Err(ContractLoweringError::Validation(errors)) = result else {
-                panic!("exact malformed state format refusal")
-            };
             assert!(
-                errors
-                    .errors()
-                    .iter()
-                    .any(|error| error.path().starts_with("aggregate_sequences["))
+                matches!(
+                    result,
+                    Err(ContractLoweringError::InvalidAggregate {
+                        detail: "aggregate original binding differs from its installed logical request"
+                    })
+                ),
+                "exact original state format refuses before current-signature publication"
             );
         }
         let expected = baseline.trace.into_inner().unwrap();

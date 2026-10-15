@@ -221,7 +221,7 @@ fn original_full_lambda_and_nested_typed_null_retain_fields_and_nominal_types() 
     let pool = ConstantPool::try_new(
         Arc::new(nested.try_to_field("request.null").unwrap()),
         nested.clone(),
-        new_null_array(&nested.data_type, 2).to_data(),
+        new_null_array(&nested.data_type(), 2).to_data(),
         policy(),
         PHASE,
         &Control::default(),
@@ -230,7 +230,10 @@ fn original_full_lambda_and_nested_typed_null_retain_fields_and_nominal_types() 
     let pools = pools(&pool);
     let source = request(vec![
         StaticFunctionArgument::Lambda {
-            parameter_types: Box::from([nested.clone(), large.clone()]),
+            parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                nested.clone(),
+                large.clone(),
+            ])),
             result_type: nested.clone(),
         },
         value(nested.clone(), Some(reference(u32::MAX, 1))),
@@ -246,10 +249,14 @@ fn original_full_lambda_and_nested_typed_null_retain_fields_and_nominal_types() 
     };
     assert_eq!(&**parameter_types, &[nested.clone(), large]);
     assert_eq!(result_type, &nested);
-    let DataType::Struct(fields) = &parameter_types[0].data_type else {
+    let DataType::Struct(fields) = &parameter_types[0].data_type() else {
         panic!("nested parameter");
     };
-    assert!(Arc::ptr_eq(&fields[0], &field));
+    let DataType::Struct(original_fields) = nested.data_type() else {
+        panic!("original typed Struct");
+    };
+    assert!(Arc::ptr_eq(&fields[0], &original_fields[0]));
+    assert!(fields[0].metadata().is_empty());
     let FunctionArgument::Value {
         constant: Some(value),
         ..
@@ -309,7 +316,9 @@ fn original_small_success_ordinary_tail_and_structural_extent_preserve_primary_c
     ));
     assert_eq!(*control.trace.lock().unwrap(), vec![(PHASE, 0)]);
     source.arguments = Box::from([StaticFunctionArgument::Lambda {
-        parameter_types: vec![integer(); MAX_CALL_EFFECT_ARGUMENTS + 1].into_boxed_slice(),
+        parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+            vec![integer(); MAX_CALL_EFFECT_ARGUMENTS + 1].into_boxed_slice(),
+        ),
         result_type: integer(),
     }]);
     source.logical_argument_count = 1;

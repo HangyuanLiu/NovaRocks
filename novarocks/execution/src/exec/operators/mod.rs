@@ -102,7 +102,9 @@ pub use project_processor::ProjectProcessorFactory;
 #[cfg(test)]
 pub(crate) use project_processor::materialize_project_output;
 pub use repeat_processor::RepeatProcessorFactory;
-pub(crate) use repeat_processor::repeat_output_chunk_schema;
+pub(crate) use repeat_processor::{
+    repeat_output_chunk_schema, repeat_output_chunk_schema_observed,
+};
 pub use result_buffer_sink::ResultBufferSinkFactory;
 #[cfg(test)]
 pub(crate) use result_sink::{ResultSinkFactory, ResultSinkHandle};

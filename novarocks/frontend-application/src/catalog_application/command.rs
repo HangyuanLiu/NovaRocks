@@ -22,6 +22,7 @@
 //! outside catalog DDL, while every recognized statement either executes or
 //! returns its parser/admission error.
 
+use crate::connector::schema_creation::FrontendSchemaLoad;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorInstanceId};
 use novarocks_types::naming::normalize_identifier;
 use std::sync::Arc;
@@ -637,7 +638,7 @@ fn execute_show_create_table(
     let loaded = lease
         .binding()
         .metadata()
-        .load_table(novarocks_spi::connector::ConnectorTableRequest {
+        .load_frontend_table(novarocks_spi::connector::ConnectorTableRequest {
             table: identity.clone(),
             resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
             context: connector_context.clone(),

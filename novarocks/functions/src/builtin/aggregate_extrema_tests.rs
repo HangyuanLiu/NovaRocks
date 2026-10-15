@@ -76,7 +76,7 @@ fn context() -> ExpressionEffectContext {
     }
 }
 fn ty(nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(arrow_schema::DataType::Int64, nullable)
+    FunctionValueType::from_legacy_declared_projection(arrow_schema::DataType::Int64, nullable)
 }
 struct Fixture {
     catalog: PureEngineFunctionCatalog,
@@ -318,7 +318,7 @@ fn aggregate_extrema_installed_fresh_frozen_all_phases_exact_full_types_and_poli
         ] {
             for source in types
                 .iter()
-                .map(|dt| FunctionValueType::new(dt.clone(), false))
+                .map(|dt| FunctionValueType::from_legacy_declared_projection(dt.clone(), false))
                 .chain([FunctionValueType::try_with_logical_type(
                     DataType::FixedSizeBinary(16),
                     true,
@@ -378,7 +378,9 @@ fn aggregate_extrema_installed_fresh_frozen_all_phases_exact_full_types_and_poli
                             format!("novarocks/{name}/state-v1")
                         );
                         let mut expected = source.clone();
-                        expected.nullable = true;
+                        expected = expected
+                            .with_nullable(true)
+                            .expect("valid function nullability declaration");
                         assert_eq!(handle.contract().intermediate_type(), &expected);
                         assert_eq!(handle.contract().final_type(), &expected);
                     }
@@ -398,7 +400,10 @@ fn aggregate_extrema_independent_fixed_width_and_signed_largeint_oracles() {
             for (name, expected) in [("min", $min), ("max", $max)] {
                 let fixture = Fixture::new(
                     name,
-                    FunctionValueType::new(source.data_type().clone(), true),
+                    FunctionValueType::from_legacy_declared_projection(
+                        source.data_type().clone(),
+                        true,
+                    ),
                     DecimalOverflowPolicy::ReportError,
                 );
                 let kernel = fixture.kernel(AggregateKernelPhase::Single);
@@ -486,7 +491,7 @@ fn aggregate_extrema_independent_fixed_width_and_signed_largeint_oracles() {
         for (name, expected) in [("min", i64::MIN), ("max", i64::MAX)] {
             let kernel = Fixture::new(
                 name,
-                FunctionValueType::new(ty.clone(), true),
+                FunctionValueType::from_legacy_declared_projection(ty.clone(), true),
                 DecimalOverflowPolicy::OutputNull,
             )
             .kernel(AggregateKernelPhase::Single);
@@ -543,7 +548,10 @@ fn aggregate_extrema_independent_fixed_width_and_signed_largeint_oracles() {
         for (name, expected) in [("min", -12345), ("max", 54321)] {
             let kernel = Fixture::new(
                 name,
-                FunctionValueType::new(source.data_type().clone(), true),
+                FunctionValueType::from_legacy_declared_projection(
+                    source.data_type().clone(),
+                    true,
+                ),
                 DecimalOverflowPolicy::ReportError,
             )
             .kernel(AggregateKernelPhase::Single);
@@ -1124,7 +1132,7 @@ fn aggregate_extrema_complete_source_binding_stale_domains_and_metadata_refuse()
                 ValueLogicalType::Uuid,
             )
             .unwrap(),
-            FunctionValueType::new(
+            FunctionValueType::from_legacy_declared_projection(
                 DataType::List(Arc::new(
                     Field::new("item", DataType::Int64, true)
                         .with_metadata([("opaque".into(), "source".into())].into()),

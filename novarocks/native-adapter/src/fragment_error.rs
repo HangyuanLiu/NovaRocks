@@ -20,6 +20,8 @@
 use std::error::Error;
 use std::fmt;
 
+pub use crate::native_type_construction::NativeTypeConstructionError;
+
 use novarocks_proto_codec::{FieldPath, FieldPathSegment, ProtocolError, ProtocolErrorKind};
 
 /// Typed error used by nested native-protobuf leaf decoders before the owning
@@ -29,6 +31,7 @@ pub struct NativeFragmentLeafDecodeError {
     kind: ProtocolErrorKind,
     relative_path: Vec<FieldPathSegment>,
     detail: String,
+    construction: Option<NativeTypeConstructionError>,
 }
 
 impl NativeFragmentLeafDecodeError {
@@ -37,6 +40,7 @@ impl NativeFragmentLeafDecodeError {
             kind,
             relative_path: Vec::new(),
             detail: detail.to_string(),
+            construction: None,
         }
     }
 
@@ -49,6 +53,7 @@ impl NativeFragmentLeafDecodeError {
             kind,
             relative_path: vec![FieldPathSegment::Field(field)],
             detail: detail.to_string(),
+            construction: None,
         }
     }
 
@@ -73,6 +78,9 @@ impl NativeFragmentLeafDecodeError {
     }
 
     pub fn into_native(self, path: FieldPath) -> NativeFragmentDecodeError {
+        if let Some(error) = self.construction {
+            return error.into();
+        }
         NativeFragmentDecodeError::protocol_error(
             path.append_segments(self.relative_path),
             self.kind,
@@ -88,7 +96,10 @@ impl NativeFragmentLeafDecodeError {
 
 impl fmt::Display for NativeFragmentLeafDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.detail.fmt(f)
+        match &self.construction {
+            Some(error) => error.fmt(f),
+            None => self.detail.fmt(f),
+        }
     }
 }
 
@@ -115,9 +126,26 @@ pub enum NativeFragmentDecodeError {
     Protocol(ProtocolError),
     Plan(novarocks_execution::exec::fragment::error::ExecPlanBuildError),
     Binding(novarocks_execution::exec::fragment::error::FragmentBindingError),
+    Construction(NativeTypeConstructionError),
+    Specialization(novarocks_functions::FunctionSpecializationFailure),
 }
 
 impl NativeFragmentDecodeError {
+    pub fn specialization_cause(
+        &self,
+    ) -> Option<&novarocks_functions::FunctionSpecializationFailure> {
+        match self {
+            Self::Specialization(error) => Some(error),
+            _ => None,
+        }
+    }
+    pub fn construction_cause(&self) -> Option<&NativeTypeConstructionError> {
+        match self {
+            Self::Construction(error) => Some(error),
+            _ => None,
+        }
+    }
+
     /// Whether the rendered error contains a diagnostic substring.
     pub fn contains(&self, pattern: &str) -> bool {
         self.to_string().contains(pattern)
@@ -126,7 +154,9 @@ impl NativeFragmentDecodeError {
     pub fn protocol(&self) -> Option<&ProtocolError> {
         match self {
             Self::Protocol(error) => Some(error),
-            Self::Plan(_) | Self::Binding(_) => None,
+            Self::Plan(_) | Self::Binding(_) | Self::Construction(_) | Self::Specialization(_) => {
+                None
+            }
         }
     }
 
@@ -161,7 +191,11 @@ impl NativeFragmentDecodeError {
         result.map_err(|error| error.into_native_at(path))
     }
 
-    fn protocol_error(path: FieldPath, kind: ProtocolErrorKind, detail: impl fmt::Display) -> Self {
+    pub(crate) fn protocol_error(
+        path: FieldPath,
+        kind: ProtocolErrorKind,
+        detail: impl fmt::Display,
+    ) -> Self {
         Self::Protocol(ProtocolError::new(path, kind, detail.to_string()))
     }
 }
@@ -172,6 +206,8 @@ impl fmt::Display for NativeFragmentDecodeError {
             Self::Protocol(error) => error.fmt(f),
             Self::Plan(error) => error.fmt(f),
             Self::Binding(error) => error.fmt(f),
+            Self::Construction(error) => error.fmt(f),
+            Self::Specialization(error) => error.fmt(f),
         }
     }
 }
@@ -182,6 +218,8 @@ impl Error for NativeFragmentDecodeError {
             Self::Protocol(error) => Some(error),
             Self::Plan(error) => Some(error),
             Self::Binding(error) => Some(error),
+            Self::Construction(error) => Some(error),
+            Self::Specialization(error) => Some(error),
         }
     }
 }
@@ -205,5 +243,75 @@ impl From<novarocks_execution::exec::fragment::error::FragmentBindingError>
 {
     fn from(error: novarocks_execution::exec::fragment::error::FragmentBindingError) -> Self {
         Self::Binding(error)
+    }
+}
+
+impl From<NativeTypeConstructionError> for NativeFragmentDecodeError {
+    fn from(error: NativeTypeConstructionError) -> Self {
+        Self::Construction(error)
+    }
+}
+
+impl From<String> for NativeFragmentDecodeError {
+    fn from(error: String) -> Self {
+        Self::invalid_value(FieldPath::root("plan_fragment"), error)
+    }
+}
+
+impl NativeFragmentErrorAtPath for NativeFragmentDecodeError {
+    fn into_native_at(self, _: FieldPath) -> NativeFragmentDecodeError {
+        self
+    }
+}
+
+impl From<NativeFragmentDecodeError> for NativeFragmentLeafDecodeError {
+    fn from(error: NativeFragmentDecodeError) -> Self {
+        match error {
+            NativeFragmentDecodeError::Construction(error) => Self {
+                kind: ProtocolErrorKind::InvalidValue,
+                relative_path: Vec::new(),
+                detail: String::new(),
+                construction: Some(error),
+            },
+            error => Self::at_collection(ProtocolErrorKind::InvalidValue, error),
+        }
+    }
+}
+
+impl From<novarocks_type_contract::ValueTypeError> for NativeFragmentDecodeError {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::invalid_value(FieldPath::root("type"), error)
+    }
+}
+
+impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for NativeFragmentDecodeError
+{
+    fn from(error: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        NativeTypeConstructionError::Resource(error).into()
+    }
+}
+impl From<novarocks_local_program::FilterMembershipSchemaError> for NativeFragmentDecodeError {
+    fn from(error: novarocks_local_program::FilterMembershipSchemaError) -> Self {
+        match error {
+            novarocks_local_program::FilterMembershipSchemaError::Resource(error) => error.into(),
+            error => {
+                Self::invalid_value(FieldPath::root("runtime_filter").field("membership"), error)
+            }
+        }
+    }
+}
+
+impl From<novarocks_functions::FunctionSpecializationFailure> for NativeFragmentDecodeError {
+    fn from(error: novarocks_functions::FunctionSpecializationFailure) -> Self {
+        Self::Specialization(error)
+    }
+}
+impl From<novarocks_local_program::PreparedWriterCallsError> for NativeFragmentDecodeError {
+    fn from(error: novarocks_local_program::PreparedWriterCallsError) -> Self {
+        Self::inconsistent(
+            FieldPath::root("plan_fragment").field("writer_preparation"),
+            error,
+        )
     }
 }

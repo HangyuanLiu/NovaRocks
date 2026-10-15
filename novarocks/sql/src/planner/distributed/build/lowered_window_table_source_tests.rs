@@ -210,10 +210,7 @@ fn emitted(
     value
 }
 pub(in crate::planner::distributed::build) fn list_value(ordinal: u32) -> TypedExpr {
-    let field = Arc::new(
-        arrow::datatypes::Field::new("original.element", DataType::Int64, true)
-            .with_metadata(HashMap::from([("source.child".into(), "kept".into())])),
-    );
+    let field = Arc::new(arrow::datatypes::Field::new("item", DataType::Int64, true));
     let array = ListArray::new(
         field,
         OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 3, 3])),
@@ -254,11 +251,14 @@ pub(in crate::planner::distributed::build) fn table_fixture(
         let mut output = column(
             81 + ordinal as u32,
             "item",
-            result.data_type.clone(),
-            result.nullable || left,
+            result.data_type().clone(),
+            result.nullable() || left,
         );
         output.value_type = result.clone();
-        output.value_type.nullable |= left;
+        output.value_type = output
+            .value_type
+            .with_nullable(output.value_type.nullable() || (left))
+            .unwrap();
         outputs.push(output);
     }
     let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
@@ -305,8 +305,8 @@ pub(in crate::planner::distributed::build) fn window_fixture(
     let mut output = column(
         2,
         "window_result",
-        result.data_type.clone(),
-        result.nullable,
+        result.data_type().clone(),
+        result.nullable(),
     );
     output.value_type = result.clone();
     let window = WindowExpr {
@@ -327,7 +327,7 @@ pub(in crate::planner::distributed::build) fn window_fixture(
             start: WindowBound::Preceding(2),
             end: WindowBound::CurrentRow,
         }),
-        result_type: result.data_type.clone(),
+        result_type: result.data_type().clone(),
         output_name: output.name.clone(),
         output_column_id: output.column_id,
         ignore_nulls: false,
@@ -570,11 +570,11 @@ fn table_journal_selected_list_ordinal_and_left_whole_relation_keep_full_source(
             actual.pool().field_ref(),
             captured.pool().field_ref()
         ));
-        let DataType::List(field) = &captured.value_type().data_type else {
+        let DataType::List(field) = &captured.value_type().data_type() else {
             unreachable!()
         };
-        assert_eq!(field.name(), "original.element");
-        assert_eq!(field.metadata()["source.child"], "kept");
+        assert_eq!(field.name(), "item");
+        assert!(field.metadata().is_empty());
         assert_eq!(
             actual
                 .is_null_observed(CompilePhase::Validate, &Control::default())
@@ -813,12 +813,13 @@ fn aggregate_window_argument_limit_refuses_before_any_channel_emission() {
     };
     let (mut source, original) = window_fixture(vec![integer(7)], vec![key.clone()]);
     let mut resolved = original.resolved().clone();
-    resolved.selected.argument_types =
+    resolved.selected.argument_types = novarocks_type_contract::TypedFactSlice::from_pure_boxed(
         vec![
             FunctionArgumentType::Value(ValueType::new(DataType::Int64, false));
             novarocks_functions::MAX_CALL_EFFECT_ARGUMENTS + 1
         ]
-        .into_boxed_slice();
+        .into_boxed_slice(),
+    );
     let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
     let PhysicalPlanKind::Window(payload) = &mut source.kind else {
         unreachable!()

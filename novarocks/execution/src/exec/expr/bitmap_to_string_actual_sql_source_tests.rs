@@ -245,12 +245,12 @@ fn bitmap_to_string_actual_original_required_sql_full_signature_source() {
                 panic!("original source channel");
             };
             assert_eq!(actual, selected);
-            assert_eq!(selected.data_type, DataType::Binary);
+            assert_eq!(selected.data_type().clone(), DataType::Binary);
             assert_eq!(
-                selected.logical_type,
-                novarocks_type_contract::ValueLogicalType::Physical
+                selected.logical_type(),
+                novarocks_type_contract::ValueLogicalType::Bitmap
             );
-            assert_eq!(node.ty.data_type, DataType::Utf8);
+            assert_eq!(node.ty.data_type().clone(), DataType::Utf8);
             eprintln!(
                 "BITMAP_TO_STRING actual original source fragment={:?} id={id:?} function={function:?} request={request:?} argument={:?} output={:?}",
                 fragment.id(),

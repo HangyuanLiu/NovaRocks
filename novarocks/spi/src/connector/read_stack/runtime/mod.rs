@@ -649,11 +649,16 @@ pub trait ConnectorReadMetadata: Send + Sync {
         _session: &ConnectorSession,
         _table: &ConnectorReadTableHandle,
         _columns: &[ConnectorReadColumnHandle],
-    ) -> Result<super::ConnectorReadPublicSchema, ConnectorError> {
+        _creation: &mut super::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        super::ConnectorReadPublicSchema,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         Err(ConnectorError::new(
             crate::connector::ConnectorErrorKind::Unsupported,
             "connector read generation does not publish a public read schema",
-        ))
+        )
+        .into())
     }
 
     /// Offer a provider an ordered list of pushdowns and learn what it takes on.

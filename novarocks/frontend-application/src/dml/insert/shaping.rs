@@ -23,7 +23,8 @@ use novarocks_types::naming::normalize_identifier;
 use novarocks_types::schema::{ColumnDef, ColumnDefault, validate_column_default};
 
 use super::command::{literal_query, plain_function};
-use crate::query_execution::dml::iceberg_writer::arrow_data_type_to_sql_type_name;
+use crate::query_execution::dml::iceberg_writer::value_type_to_sql_type_name;
+use novarocks_type_contract::FunctionValueType;
 
 /// Type direct row sources before their VALUES/UNION common-type analysis.
 /// General query sources keep the original output projection boundary.
@@ -33,6 +34,89 @@ pub(crate) fn shape_insert_source(
     source_columns: &[ColumnDef],
     write_columns: &[ColumnDef],
 ) -> Result<Option<ast::Query>, String> {
+    shape_insert_source_in(source, insert_columns, source_columns, write_columns, None)
+        .map(|source| source.map(|(query, _)| query))
+}
+
+/// Preserve constants from every leaf of the original eligible source.
+/// Other expressions and the SELECT/UNION structure retain their old body.
+pub(crate) fn shape_insert_source_with_constants(
+    source: &ast::Query,
+    insert_columns: &[String],
+    source_columns: &[ColumnDef],
+    write_columns: &[ColumnDef],
+    policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<
+    Option<(
+        ast::Query,
+        Option<novarocks_sql::compiler::SqlExpressionConstants>,
+    )>,
+    String,
+> {
+    shape_insert_source_in(
+        source,
+        insert_columns,
+        source_columns,
+        write_columns,
+        Some((policy, control)),
+    )
+}
+
+struct ConstantSource<'a> {
+    capture: Option<(
+        novarocks_functions::ConstantPolicy,
+        &'a dyn novarocks_type_contract::PureCompileControl,
+    )>,
+    path: Vec<novarocks_sql::compiler::SqlConstantQueryStep>,
+    constants: Vec<novarocks_sql::compiler::SqlExpressionConstant>,
+}
+impl ConstantSource<'_> {
+    fn push(&mut self, step: novarocks_sql::compiler::SqlConstantQueryStep) {
+        if self.capture.is_some() {
+            self.path.push(step);
+        }
+    }
+    fn pop(&mut self) {
+        if self.capture.is_some() {
+            self.path.pop();
+        }
+    }
+    fn publish(
+        &mut self,
+        authored: Option<Vec<Option<novarocks_functions::ConstantValue>>>,
+        site: impl Fn(usize) -> novarocks_sql::compiler::SqlConstantExpressionSite,
+    ) {
+        if let Some(authored) = authored {
+            for (column, value) in authored.into_iter().enumerate() {
+                if let Some(value) = value {
+                    self.constants
+                        .push(novarocks_sql::compiler::SqlExpressionConstant::new(
+                            self.path.clone(),
+                            site(column),
+                            value,
+                        ));
+                }
+            }
+        }
+    }
+}
+fn shape_insert_source_in(
+    source: &ast::Query,
+    insert_columns: &[String],
+    source_columns: &[ColumnDef],
+    write_columns: &[ColumnDef],
+    capture: Option<(
+        novarocks_functions::ConstantPolicy,
+        &dyn novarocks_type_contract::PureCompileControl,
+    )>,
+) -> Result<
+    Option<(
+        ast::Query,
+        Option<novarocks_sql::compiler::SqlExpressionConstants>,
+    )>,
+    String,
+> {
     let uncontrolled_values = matches!(source.body.as_ref(), ast::SetExpr::Values(_))
         && source.with.is_none()
         && source.order_by.is_empty()
@@ -52,8 +136,20 @@ pub(crate) fn shape_insert_source(
         insert_columns.len()
     };
     let mut query = source.clone();
-    shape_body(&mut query.body, &mapping, width, write_columns)?;
-    Ok(Some(query))
+    let mut constants = ConstantSource {
+        capture,
+        path: Vec::new(),
+        constants: Vec::new(),
+    };
+    shape_body(
+        &mut query.body,
+        &mapping,
+        width,
+        write_columns,
+        &mut constants,
+    )?;
+    let constants = (!constants.constants.is_empty()).then(|| constants.constants.into());
+    Ok(Some((query, constants)))
 }
 
 fn query_with_body(body: ast::SetExpr) -> ast::Query {
@@ -120,11 +216,20 @@ fn shape_body(
     mapping: &[Option<usize>],
     width: usize,
     columns: &[ColumnDef],
+    constants: &mut ConstantSource<'_>,
 ) -> Result<(), String> {
     match body {
         ast::SetExpr::Values(values) => {
-            for row in &mut values.rows {
-                *row = shape_row(row, mapping, width, columns)?;
+            for (row_index, row) in values.rows.iter_mut().enumerate() {
+                let (syntax, authored) =
+                    shape_row_in(row, mapping, width, columns, constants.capture)?;
+                *row = syntax;
+                constants.publish(authored, |column| {
+                    novarocks_sql::compiler::SqlConstantExpressionSite::ValuesCell {
+                        row: row_index,
+                        column,
+                    }
+                });
             }
         }
         ast::SetExpr::Select(select) => {
@@ -137,7 +242,8 @@ fn shape_body(
                     _ => Err("INSERT literal SELECT source only supports expressions".to_string()),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let expressions = shape_row(&row, mapping, width, columns)?;
+            let (expressions, authored) =
+                shape_row_in(&row, mapping, width, columns, constants.capture)?;
             // The eligible source projections are self-contained constants. Keep
             // the original SELECT as the row-producing relation so HAVING aliases,
             // filters and DISTINCT observe source types before sink conversion.
@@ -158,34 +264,90 @@ fn shape_body(
                 return Err("INSERT literal projection expected query".into());
             };
             *body = ast::SetExpr::Query(Box::new(query.clone()));
+            // Bind the expression in the FINAL parsed target wrapper, not a
+            // pointer or ordinal from the original pre-print SELECT.
+            constants.push(novarocks_sql::compiler::SqlConstantQueryStep::NestedQuery);
+            if let Some(authored) = authored.as_ref() {
+                for (column, value) in authored.iter().enumerate() {
+                    let (Some(value), Some(source_column)) = (value, mapping[column]) else {
+                        continue;
+                    };
+                    let Some(expression_path) = explicit_variant_source_path(&row[source_column])
+                    else {
+                        continue;
+                    };
+                    // This original source cast and the outer target are two
+                    // real expressions. Both borrow the same encoded value;
+                    // ordinary inner parse_json retains its Json declaration.
+                    let mut path = constants.path.clone();
+                    path.push(
+                        novarocks_sql::compiler::SqlConstantQueryStep::SelectFromDerived {
+                            from: 0,
+                        },
+                    );
+                    constants.constants.push(
+                        novarocks_sql::compiler::SqlExpressionConstant::new(
+                            path,
+                            novarocks_sql::compiler::SqlConstantExpressionSite::SelectProjection {
+                                column: source_column,
+                            },
+                            value.clone(),
+                        )
+                        .with_expression_path(expression_path),
+                    );
+                }
+            }
+            constants.publish(authored, |column| {
+                novarocks_sql::compiler::SqlConstantExpressionSite::SelectProjection { column }
+            });
+            constants.pop();
         }
-        ast::SetExpr::Query(query) => shape_body(&mut query.body, mapping, width, columns)?,
+        ast::SetExpr::Query(query) => {
+            constants.push(novarocks_sql::compiler::SqlConstantQueryStep::NestedQuery);
+            shape_body(&mut query.body, mapping, width, columns, constants)?;
+            constants.pop();
+        }
         ast::SetExpr::SetOperation(operation) => {
             if !matches!(operation.operator, ast::SetOperator::Union)
                 || !matches!(operation.quantifier, ast::SetQuantifier::All)
             {
                 return Err("INSERT literal source requires UNION ALL".to_string());
             }
-            shape_body(&mut operation.left, mapping, width, columns)?;
-            shape_body(&mut operation.right, mapping, width, columns)?;
+            constants.push(novarocks_sql::compiler::SqlConstantQueryStep::UnionLeft);
+            shape_body(&mut operation.left, mapping, width, columns, constants)?;
+            constants.pop();
+            constants.push(novarocks_sql::compiler::SqlConstantQueryStep::UnionRight);
+            shape_body(&mut operation.right, mapping, width, columns, constants)?;
+            constants.pop();
         }
     }
     Ok(())
 }
 
-fn shape_row(
+fn shape_row_in(
     row: &[ast::Expr],
     mapping: &[Option<usize>],
     width: usize,
     columns: &[ColumnDef],
-) -> Result<Vec<ast::Expr>, String> {
+    capture: Option<(
+        novarocks_functions::ConstantPolicy,
+        &dyn novarocks_type_contract::PureCompileControl,
+    )>,
+) -> Result<
+    (
+        Vec<ast::Expr>,
+        Option<Vec<Option<novarocks_functions::ConstantValue>>>,
+    ),
+    String,
+> {
     if row.len() != width {
         return Err(format!(
             "insert column count mismatch: expected {width} values for column list, got {}",
             row.len()
         ));
     }
-    mapping
+    let mut constants = capture.map(|_| Vec::with_capacity(columns.len()));
+    let syntax = mapping
         .iter()
         .zip(columns)
         .map(|(index, column)| {
@@ -193,9 +355,59 @@ fn shape_row(
                 Some(index) => row[*index].clone(),
                 None => omitted_insert_expr(column)?,
             };
-            constrain_literal(expr, &column.data_type)
+            let target = column
+                .declared_value_type()
+                .map_err(|error| error.to_string())?;
+            let capture_variant = capture.is_some()
+                && target.logical_type() == novarocks_type_contract::ValueLogicalType::Variant;
+            let mut encoded = None;
+            let syntax = if capture_variant {
+                constrain_literal_in(expr, &target, Some(&mut encoded))?
+            } else {
+                constrain_literal(expr, &target)?
+            };
+            let value = match (encoded, capture) {
+                (Some(bytes), Some((policy, control))) => {
+                    Some(variant_constant_value(&bytes, target, policy, control)?)
+                }
+                _ => None,
+            };
+            if let Some(constants) = constants.as_mut() {
+                constants.push(value);
+            }
+            Ok(syntax)
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((syntax, constants))
+}
+
+fn variant_constant_value(
+    bytes: &[u8],
+    target: novarocks_type_contract::FunctionValueType,
+    policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<novarocks_functions::ConstantValue, String> {
+    use novarocks_type_contract::CompilePhase;
+    // JSON null is an encoded non-NULL Variant value; SQL NULL stays on the
+    // original syntax path and is never inferred from payload contents.
+    let value_type = target
+        .with_nullable(false)
+        .map_err(|error| error.to_string())?;
+    let field = std::sync::Arc::new(arrow::datatypes::Field::new(
+        "",
+        value_type.data_type().clone(),
+        false,
+    ));
+    let value = novarocks_functions::ConstantValue::from_binary(
+        field,
+        value_type,
+        bytes,
+        policy,
+        CompilePhase::Validate,
+        control,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(value)
 }
 
 /// Preserve a default's exact coefficient and bytes, including recursive values.
@@ -216,22 +428,44 @@ pub(crate) fn omitted_insert_expr(column: &ColumnDef) -> Result<ast::Expr, Strin
     }
 }
 
-fn constrain_literal(mut expr: ast::Expr, target: &DataType) -> Result<ast::Expr, String> {
+fn is_variant_cast(cast: &ast::CastExpr) -> bool {
+    printer::print_object_name(&cast.data_type.name).eq_ignore_ascii_case("variant")
+}
+fn explicit_variant_source_path(
+    mut expr: &ast::Expr,
+) -> Option<Vec<novarocks_sql::compiler::SqlConstantExpressionStep>> {
+    let mut path = Vec::new();
+    while let ast::Expr::Nested(nested) = expr {
+        path.push(novarocks_sql::compiler::SqlConstantExpressionStep::Nested);
+        expr = &nested.expression;
+    }
+    matches!(expr, ast::Expr::Cast(cast) if is_variant_cast(cast)).then_some(path)
+}
+
+fn constrain_literal(expr: ast::Expr, target: &FunctionValueType) -> Result<ast::Expr, String> {
+    constrain_literal_in(expr, target, None)
+}
+fn constrain_literal_in(
+    mut expr: ast::Expr,
+    target: &FunctionValueType,
+    mut encoded: Option<&mut Option<Vec<u8>>>,
+) -> Result<ast::Expr, String> {
     match &mut expr {
         // Explicit CAST is a semantic boundary. Only its own VARIANT declaration
         // authorizes the existing constant JSON representation conversion.
         ast::Expr::Cast(cast) => {
-            if printer::print_object_name(&cast.data_type.name).eq_ignore_ascii_case("variant")
-                && let Some(encoded) = constant_variant(&cast.expr)?
+            if is_variant_cast(cast)
+                && let Some(syntax) = constant_variant_in(&cast.expr, encoded.as_deref_mut())?
             {
-                *cast.expr = encoded;
+                *cast.expr = syntax;
             }
         }
         ast::Expr::Nested(nested) => {
-            *nested.expression = constrain_literal((*nested.expression).clone(), target)?;
+            *nested.expression =
+                constrain_literal_in((*nested.expression).clone(), target, encoded.as_deref_mut())?;
         }
         ast::Expr::Literal(value) => {
-            if matches!(target, DataType::Binary | DataType::LargeBinary)
+            if matches!(target.data_type(), DataType::Binary | DataType::LargeBinary)
                 && let ast::LiteralKind::String(text) = &value.kind
             {
                 value.kind = ast::LiteralKind::HexString(hex::encode_upper(
@@ -240,69 +474,80 @@ fn constrain_literal(mut expr: ast::Expr, target: &DataType) -> Result<ast::Expr
             }
         }
         ast::Expr::Array(array) if array.element_type.is_none() => {
-            if let DataType::List(field) = target {
+            if matches!(target.data_type(), DataType::List(_)) {
+                let item = target_child(target, 0)?;
                 for element in &mut array.elements {
-                    *element = constrain_literal(element.clone(), field.data_type())?;
+                    *element = constrain_literal(element.clone(), &item)?;
                 }
             }
         }
         ast::Expr::Map(map) => {
-            if let Some((key, value)) = map_types(target) {
+            if map_types(target.data_type()).is_some() {
+                let key = target_child(target, 0)?;
+                let value = target_child(target, 1)?;
                 for entry in &mut map.entries {
-                    entry.key = constrain_literal(entry.key.clone(), key)?;
-                    entry.value = constrain_literal(entry.value.clone(), value)?;
+                    entry.key = constrain_literal(entry.key.clone(), &key)?;
+                    entry.value = constrain_literal(entry.value.clone(), &value)?;
                 }
             }
         }
         ast::Expr::Tuple(tuple) => {
-            if let DataType::Struct(fields) = target
+            if let DataType::Struct(fields) = target.data_type()
                 && fields.len() == tuple.expressions.len()
             {
-                for (value, field) in tuple.expressions.iter_mut().zip(fields) {
-                    *value = constrain_literal(value.clone(), field.data_type())?;
+                for (index, value) in tuple.expressions.iter_mut().enumerate() {
+                    *value = constrain_literal(value.clone(), &target_child(target, index)?)?;
                 }
             }
         }
         ast::Expr::Struct(structure) => {
-            if let DataType::Struct(fields) = target
+            if let DataType::Struct(fields) = target.data_type()
                 && fields.len() == structure.fields.len()
             {
-                for (value, field) in structure.fields.iter_mut().zip(fields) {
-                    value.value = constrain_literal(value.value.clone(), field.data_type())?;
+                for (index, value) in structure.fields.iter_mut().enumerate() {
+                    value.value =
+                        constrain_literal(value.value.clone(), &target_child(target, index)?)?;
                 }
             }
         }
         ast::Expr::FunctionCall(function) if plain_function(function) => {
             let name = printer::print_object_name(&function.name).to_ascii_lowercase();
-            match (name.as_str(), target) {
-                ("array", DataType::List(field)) => {
+            match (name.as_str(), target.data_type()) {
+                ("array", DataType::List(_)) => {
+                    let item = target_child(target, 0)?;
                     for value in &mut function.arguments {
-                        *value = constrain_literal(value.clone(), field.data_type())?;
+                        *value = constrain_literal(value.clone(), &item)?;
                     }
                 }
                 ("row", DataType::Struct(fields)) if fields.len() == function.arguments.len() => {
-                    for (value, field) in function.arguments.iter_mut().zip(fields) {
-                        *value = constrain_literal(value.clone(), field.data_type())?;
+                    for (index, value) in function.arguments.iter_mut().enumerate() {
+                        *value = constrain_literal(value.clone(), &target_child(target, index)?)?;
                     }
                 }
                 ("named_struct", DataType::Struct(fields))
                     if fields.len() * 2 == function.arguments.len() =>
                 {
-                    for (pair, field) in function.arguments.chunks_exact_mut(2).zip(fields) {
-                        pair[1] = constrain_literal(pair[1].clone(), field.data_type())?;
+                    for (index, pair) in function.arguments.chunks_exact_mut(2).enumerate() {
+                        pair[1] =
+                            constrain_literal(pair[1].clone(), &target_child(target, index)?)?;
                     }
                 }
                 ("map", DataType::Map(..)) => {
-                    if let Some((key, value)) = map_types(target) {
+                    if map_types(target.data_type()).is_some() {
+                        let key = target_child(target, 0)?;
+                        let value = target_child(target, 1)?;
                         for pair in function.arguments.chunks_exact_mut(2) {
-                            pair[0] = constrain_literal(pair[0].clone(), key)?;
-                            pair[1] = constrain_literal(pair[1].clone(), value)?;
+                            pair[0] = constrain_literal(pair[0].clone(), &key)?;
+                            pair[1] = constrain_literal(pair[1].clone(), &value)?;
                         }
                     }
                 }
-                ("parse_json", DataType::LargeBinary) => {
-                    if let Some(encoded) = constant_variant(&expr)? {
-                        expr = encoded;
+                ("parse_json", DataType::LargeBinary)
+                    if target.logical_type()
+                        == novarocks_type_contract::ValueLogicalType::Variant =>
+                {
+                    if let Some(syntax) = constant_variant_in(&expr, encoded.as_deref_mut())? {
+                        expr = syntax;
                     }
                 }
                 _ => {}
@@ -311,6 +556,12 @@ fn constrain_literal(mut expr: ast::Expr, target: &DataType) -> Result<ast::Expr
         _ => {}
     }
     cast_expr(expr, target)
+}
+
+fn target_child(target: &FunctionValueType, index: usize) -> Result<FunctionValueType, String> {
+    target
+        .child_at(index)
+        .ok_or_else(|| "INSERT target lacks its declared semantic child".to_string())
 }
 
 fn map_types(target: &DataType) -> Option<(&DataType, &DataType)> {
@@ -323,9 +574,28 @@ fn map_types(target: &DataType) -> Option<(&DataType, &DataType)> {
     (fields.len() == 2).then(|| (fields[0].data_type(), fields[1].data_type()))
 }
 
-fn constant_variant(expr: &ast::Expr) -> Result<Option<ast::Expr>, String> {
+fn constant_variant_in(
+    expr: &ast::Expr,
+    encoded: Option<&mut Option<Vec<u8>>>,
+) -> Result<Option<ast::Expr>, String> {
+    let Some(bytes) = constant_variant_bytes(expr)? else {
+        return Ok(None);
+    };
+    let syntax = variant_bytes_expr(&bytes, expr.span());
+    if let Some(encoded) = encoded {
+        *encoded = Some(bytes);
+    }
+    Ok(Some(syntax))
+}
+fn variant_bytes_expr(bytes: &[u8], span: Span) -> ast::Expr {
+    ast::Expr::Literal(ast::Literal {
+        kind: ast::LiteralKind::HexString(hex::encode_upper(bytes)),
+        span,
+    })
+}
+fn constant_variant_bytes(expr: &ast::Expr) -> Result<Option<Vec<u8>>, String> {
     if let ast::Expr::Nested(nested) = expr {
-        return constant_variant(&nested.expression);
+        return constant_variant_bytes(&nested.expression);
     }
     let ast::Expr::FunctionCall(function) = expr else {
         return Ok(None);
@@ -361,16 +631,13 @@ fn constant_variant(expr: &ast::Expr) -> Result<Option<ast::Expr>, String> {
     };
     let bytes = novarocks_types::value::variant_encode::encode_json_text_to_variant_bytes(text)
         .map_err(|error| format!("parse_json failed: {error}"))?;
-    Ok(Some(ast::Expr::Literal(ast::Literal {
-        kind: ast::LiteralKind::HexString(hex::encode_upper(bytes)),
-        span: expr.span(),
-    })))
+    Ok(Some(bytes))
 }
 
-fn cast_expr(expr: ast::Expr, target: &DataType) -> Result<ast::Expr, String> {
+fn cast_expr(expr: ast::Expr, target: &FunctionValueType) -> Result<ast::Expr, String> {
     let sql = format!(
         "SELECT CAST(NULL AS {})",
-        arrow_data_type_to_sql_type_name(target)?
+        value_type_to_sql_type_name(target)?
     );
     let statements =
         novarocks_parser::parse(&sql).map_err(|error| format!("INSERT target type: {error}"))?;

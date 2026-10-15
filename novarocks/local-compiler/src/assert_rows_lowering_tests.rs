@@ -201,7 +201,11 @@ fn fixture(shape: Shape, downstream: bool) -> Result<Fixture, Box<dyn std::error
     let nested = FunctionValueType::new(DataType::List(field), true);
     let pool_id = ConstantPoolId::new(u32::MAX);
     let pool = ConstantPool::try_new(
-        Arc::new(nested.try_to_field("original-pool").unwrap()),
+        Arc::new(Field::new(
+            "original-pool",
+            list.data_type().clone(),
+            nested.nullable(),
+        )),
         nested.clone(),
         list.to_data(),
         options().constants,
@@ -505,8 +509,20 @@ fn assert_rows_complete_keyed_preserves_order_duplicate_occurrences_full_source_
     let DataType::List(field) = node.output_layout().schema().field(2).data_type() else {
         panic!("original nested source");
     };
-    assert_eq!(field.name(), "original-child");
-    assert_eq!(field.metadata().get("source-key").unwrap(), "kept-λ");
+    assert_eq!(field.name(), "item");
+    assert!(field.metadata().is_empty());
+    let source_pool = source
+        .package
+        .constants()
+        .entries()
+        .values()
+        .next()
+        .unwrap();
+    let DataType::List(source_field) = source_pool.field_ref().data_type() else {
+        panic!("original source List");
+    };
+    assert_eq!(source_field.name(), "original-child");
+    assert_eq!(source_field.metadata().get("source-key").unwrap(), "kept-λ");
     assert!(field.is_nullable());
     for ordinal in 0..4 {
         let site = ProgramChannelSite::Layout {

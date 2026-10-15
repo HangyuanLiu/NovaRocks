@@ -59,20 +59,6 @@ fn legacy_analytic_count_original_star_expr_and_empty_frames() {
     assert!(values(compute_count(&[], &empty, 0).unwrap()).is_empty());
 }
 #[test]
-fn legacy_analytic_count_original_bare_null_and_dictionary_root_nulls() {
-    let ctx = PartitionWindowContext::new(&[(0, 5)], &[], None).unwrap();
-    let bare: ArrayRef = Arc::new(NullArray::new(5));
-    assert_eq!(values(compute_count(&[bare], &ctx, 5).unwrap()), [5; 5]);
-    let dict: ArrayRef = Arc::new(
-        DictionaryArray::<Int8Type>::try_new(
-            Int8Array::from(vec![Some(0), Some(1), None, Some(1), Some(0)]),
-            Arc::new(StringArray::from(vec![Some("ok"), None])),
-        )
-        .unwrap(),
-    );
-    assert_eq!(values(compute_count(&[dict], &ctx, 5).unwrap()), [4; 5]);
-}
-#[test]
 fn legacy_analytic_count_original_frame_errors_stay_whole_and_exact() {
     let ctx = PartitionWindowContext {
         partitions: vec![(0, 1)],
@@ -83,4 +69,64 @@ fn legacy_analytic_count_original_frame_errors_stay_whole_and_exact() {
         compute_count(&[], &ctx, 1).unwrap_err(),
         "window partition index out of range: 0"
     );
+}
+
+// Original frame and independent SQL logical NULL oracle. The retired physical
+// bitmap-only expectation is preserved in the external failure evidence.
+#[test]
+fn legacy_analytic_count_original_logical_null_full_frame_zero_and_two() {
+    use novarocks_type_contract::FunctionValueType;
+    let null_source = FunctionValueType::new(DataType::Null, true);
+    let string_source = FunctionValueType::new(DataType::Utf8, true);
+    let result = FunctionValueType::new(DataType::Int64, false);
+    let ctx = PartitionWindowContext::new(&[(0, 5)], &[], None).unwrap();
+    assert_eq!(ctx.frames(0).unwrap(), &[(0, 5); 5]);
+    let check = |source: ArrayRef, expected: [i64; 5]| {
+        let output = compute_count(&[source], &ctx, 5).unwrap();
+        assert_eq!(output.data_type(), result.data_type());
+        assert!(!result.nullable());
+        assert_eq!(output.null_count(), 0);
+        assert_eq!(values(output), expected);
+    };
+    let bare: ArrayRef = Arc::new(NullArray::new(5));
+    assert_eq!(bare.data_type(), null_source.data_type());
+    let bare_nulls = bare
+        .logical_nulls()
+        .expect("SQL NULL carrier denotes all five logical NULLs");
+    assert_eq!(bare_nulls.null_count(), 5);
+    check(bare, [0; 5]);
+    let dictionary: ArrayRef = Arc::new(
+        DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![Some(0), Some(1), None, Some(1), Some(0)]),
+            Arc::new(StringArray::from(vec![Some("ok"), None])),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        dictionary.data_type(),
+        &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
+    );
+    // The two value-NULL keys plus the absent key are all logical SQL NULL.
+    // This source is an original raw owner profile, not new engine admission.
+    assert_eq!(dictionary.null_count(), 1);
+    let logical = dictionary.logical_nulls().unwrap();
+    assert_eq!(logical.null_count(), 3);
+    assert_eq!(
+        (0..5).map(|row| !logical.is_null(row)).collect::<Vec<_>>(),
+        [true, false, false, false, true]
+    );
+    let plain: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("ok"),
+        None,
+        None,
+        None,
+        Some("ok"),
+    ]));
+    assert_eq!(plain.data_type(), string_source.data_type());
+    assert!(string_source.nullable());
+    assert_eq!(plain.logical_nulls().unwrap().null_count(), 3);
+    check(dictionary, [2; 5]);
+    check(plain, [2; 5]);
+    // No value is a different original COUNT(*) contract: all five rows count.
+    assert_eq!(values(compute_count(&[], &ctx, 5).unwrap()), [5; 5]);
 }

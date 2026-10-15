@@ -1,0 +1,104 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.call_request;
+
+import "physical_semantics_v2.proto";
+
+// Original immutable request facts shared by explicit plan owners. References
+// resolve only in the caller-declared type, field and constant namespaces.
+// Definition requests retain original binding inputs independently of runtime
+// occurrences and selected signatures. The outer Fragment owns their identity.
+message FragmentCallRequests { repeated OriginalCallRequest entries = 1; }
+
+message OriginalCallRequest {
+  CallRequestDefinition definition = 1;
+  repeated OriginalFunctionArgument arguments = 2;
+  optional uint32 logical_argument_count = 3; // Required; zero is valid.
+  optional uint32 expected_result_value_type_id = 4; // Absent retains None.
+  SourceConstantPolicy constant_policy = 5; // Required source data, not a grant.
+  optional uint32 request_id = 6; // PlanTree owner identity; presence required, zero is valid.
+}
+
+message CallRequestDefinition {
+  oneof kind {
+    uint32 expression_definition_id = 1; // ExprId, never ExpressionUseId.
+    // Only relational variants are legal; ExpressionUseId must be refused.
+    novarocks.physical_semantics_v2.CallSite relational = 2;
+  }
+}
+
+message OriginalFunctionArgument {
+  oneof kind {
+    OriginalValueArgument value = 1;
+    LambdaArgumentType lambda = 2;
+  }
+}
+
+message OriginalValueArgument {
+  optional uint32 value_type_id = 1; // Required complete FVT; zero/MAX are valid.
+  // Absent is nonconstant; a present reference to a NULL row remains Some.
+  ConstantReference constant = 2;
+}
+
+// Every field requires presence; all numeric zero values are preserved. These
+// original sender facts cannot replace receiving limits or memory admission.
+message SourceConstantPolicy {
+  optional uint64 max_rows = 1;
+  optional uint64 max_array_nodes = 2;
+  optional uint64 max_logical_elements = 3;
+  optional uint64 max_retained_buffer_bytes = 4;
+  optional uint32 max_type_depth = 5;
+  optional uint64 max_type_nodes = 6;
+  optional uint32 max_dictionary_depth = 7;
+  optional uint64 max_metadata_bytes = 8;
+  optional uint64 max_library_validation_work = 9;
+  optional uint64 max_library_validation_bytes = 10;
+}
+
+// Constants of one exact value type share one pool. Each pool is a standard
+// Arrow IPC stream with exactly one column and one RecordBatch, including EOS.
+// The referenced complete field fixes root schema attributes; value_type_id
+// independently fixes SQL logical identity/nullability. They must agree with
+// the actual IPC schema. No stream is created per small scalar literal.
+// Decode uses Arrow validation and separately bounds message/field/dictionary/
+// metadata/depth, row count, logical elements, expanded bytes and total work.
+// Encoded length or a sender's declaration cannot substitute for those bounds.
+message IpcConstantPool {
+  uint32 id = 1;
+  optional uint32 value_type_id = 2;
+  optional uint32 source_field_id = 3;
+  IpcCompression compression = 4;
+  bytes arrow_ipc = 5;
+}
+
+enum IpcCompression {
+  IPC_COMPRESSION_UNSPECIFIED = 0;
+  IPC_COMPRESSION_UNCOMPRESSED = 1;
+}
+
+message ConstantReference {
+  optional uint32 pool_id = 1;
+  uint32 row_ordinal = 2;
+}
+
+message LambdaArgumentType {
+  repeated uint32 parameter_value_type_ids = 1;
+  optional uint32 result_value_type_id = 2;
+}

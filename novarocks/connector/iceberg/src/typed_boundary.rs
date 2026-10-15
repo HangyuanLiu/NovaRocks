@@ -102,7 +102,7 @@ use crate::typed_read::{
     IcebergTableExecuteProcedureHandle, IcebergTableHandle, IcebergTableHandleParams,
     REWRITE_POSITION_DELETE_OUTPUT_COLUMNS, ROW_LINEAGE_METADATA_COLUMNS, TrinoManifestFile,
     bounds_row_type, change_op_column_handle, derived_row_type_json, files_relation_schema_json,
-    partition_row_type, plan_change_window_splits, system_relation_columns, system_relation_schema,
+    partition_row_type, plan_change_window_splits, system_relation_columns,
 };
 #[cfg(test)]
 use novarocks_spi::connector::read_stack::{
@@ -950,7 +950,11 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             .into_iter()
             .chain(ROW_LINEAGE_METADATA_COLUMNS.into_iter())
         {
-            let Ok(signed) = source.signed_schema.field_with_name(metadata.column_name()) else {
+            let Ok(signed) = source
+                .signed_source
+                .scan_schema()
+                .field_with_name(metadata.column_name())
+            else {
                 if ALWAYS_BOUND_METADATA_COLUMNS.contains(&metadata) {
                     return Err(corrupt(
                         "Iceberg COW signed source lost an identity metadata field",
@@ -1231,23 +1235,34 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         &self,
         _session: &ConnectorSession,
         table: &crate::typed_read::IcebergRuntimeRelation,
-        columns: &[IcebergColumnHandle],
-    ) -> Result<ConnectorReadPublicSchema, ConnectorError> {
+        columns: &[&IcebergColumnHandle],
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorReadPublicSchema,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         match table {
-            // A metadata relation's columns come from its system schema, which
-            // the reference does not carry: author it from the same pinned
-            // metadata, verified against the reference, its columns were bound
-            // from.
             crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) => {
+                creation.work(1)?;
                 let metadata = self.system_relation_metadata(reference)?;
-                let system = system_relation_schema(
+                creation.work(1)?;
+                let count = metadata.partition_specs_iter().len();
+                let mut specs = creation.reserve(count)?;
+                for spec in metadata.partition_specs_iter() {
+                    creation.work(1)?;
+                    specs.push(spec.as_ref());
+                }
+                // The schema author borrows exact specs from the loaded metadata;
+                // no service or metadata authority is retained in public facts.
+                system_public_read_schema(
                     reference.system_table_type(),
+                    columns,
                     metadata.current_schema(),
-                    &partition_specs_of(&metadata),
-                )?;
-                system_public_read_schema(reference.system_table_type(), columns, &system)
+                    &specs,
+                    creation,
+                )
             }
-            relation => public_read_schema(relation, columns),
+            relation => public_read_schema(relation, columns, creation),
         }
     }
 
@@ -2264,7 +2279,13 @@ fn pinned_table_handle_with_schema_and_domain(
     .with_scalar_integer_domains(crate::scalar_integer_domain::of_schema(
         &schema,
         &crate::scalar_integer_domain::metadata_declarations(metadata)?,
-    )?)
+    )?)?
+    .with_nominal_declarations(
+        crate::schema_mapping::nominal_declaration::restrict_to_schema(
+            &schema,
+            &crate::schema_mapping::nominal_declaration::from_metadata(metadata)?,
+        )?,
+    )
 }
 
 /// Freeze one worker-visible change-window relation handle.
@@ -2365,7 +2386,13 @@ fn pinned_change_window_handle(
         to_read_domain: crate::read_snapshot::mint_read_domain(metadata, to, &to_schema)
             .map_err(corrupt)?,
         partition_spec_jsons,
-    })
+    })?
+    .with_nominal_declarations(
+        crate::schema_mapping::nominal_declaration::restrict_to_schema(
+            &to_schema,
+            &crate::schema_mapping::nominal_declaration::from_metadata(metadata)?,
+        )?,
+    )
     .map(Some)
 }
 
@@ -3545,6 +3572,32 @@ mod public_read_schema_tests {
 
     use super::*;
 
+    fn with_creation<T>(
+        run: impl FnOnce(
+            &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> T,
+    ) -> T {
+        let mut request = |_: std::alloc::Layout| Ok(());
+        let mut work = |_: usize| Ok(());
+        let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
+        run(&mut creation)
+    }
+    fn public_read_schema(
+        relation: &crate::typed_read::IcebergRuntimeRelation,
+        columns: &[IcebergColumnHandle],
+    ) -> Result<
+        ConnectorReadPublicSchema,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        let columns: Vec<_> = columns.iter().collect();
+        with_creation(|creation| {
+            crate::typed_read::codec::public_read_schema(relation, &columns, creation)
+        })
+    }
     fn installed_adapter(
         runtime: &tokio::runtime::Runtime,
         warehouse: &tempfile::TempDir,
@@ -3609,22 +3662,27 @@ mod public_read_schema_tests {
             .into_iter()
             .map(|column| adapter.wrap_column(column))
             .collect::<Vec<_>>();
-        let published =
-            ConnectorReadMetadata::read_public_schema(&adapter, &session(), &table, &columns)
-                .expect("published schema");
+        let published = with_creation(|creation| {
+            ConnectorReadMetadata::read_public_schema(
+                &adapter,
+                &session(),
+                &table,
+                &columns,
+                creation,
+            )
+        })
+        .expect("published schema");
         assert_eq!(published, expected);
-        assert_eq!(
+        assert!(
             published
                 .schema()
                 .fields()
                 .iter()
-                .map(|field| (
-                    field.name().as_str(),
-                    field.metadata()[PARQUET_FIELD_ID_META_KEY].as_str()
-                ))
-                .collect::<Vec<_>>(),
-            [("id", "1"), ("id", "1")]
+                .all(|field| field.metadata().is_empty())
         );
+        let facts = published.source_schema_facts().unwrap();
+        assert_eq!(facts.field_fact(&[0]).unwrap().field_id(), Some(1));
+        assert_eq!(facts.field_fact(&[1]).unwrap().field_id(), Some(1));
     }
 
     /// A hidden metadata column is planned with the field the table metadata
@@ -3686,14 +3744,19 @@ mod public_read_schema_tests {
         let table = adapter.wrap_table(crate::typed_read::IcebergRuntimeRelation::TableFunction(
             function,
         ));
-        let error = ConnectorReadMetadata::read_public_schema(
-            &adapter,
-            &session(),
-            &table,
-            &[adapter.wrap_column(column)],
-        )
+        let error = with_creation(|creation| {
+            ConnectorReadMetadata::read_public_schema(
+                &adapter,
+                &session(),
+                &table,
+                &[adapter.wrap_column(column)],
+                creation,
+            )
+        })
         .expect_err("a table-function relation has no public read schema");
-        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert!(
+            matches!(error,novarocks_connector_contract::PureProviderCompileError::Provider(cause) if cause.kind()==ConnectorErrorKind::Unsupported)
+        );
     }
 }
 

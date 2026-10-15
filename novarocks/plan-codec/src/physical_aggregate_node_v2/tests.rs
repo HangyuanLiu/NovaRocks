@@ -220,7 +220,9 @@ fn aggregate(phase: p::AggregatePhase) -> p::AggregateBinding {
             FunctionId::try_new("test/f").unwrap(),
             FunctionOverloadId::try_new("test/o").unwrap(),
             FunctionKind::Aggregate,
-            Box::from([FunctionArgumentType::Value(dictionary())]),
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                FunctionArgumentType::Value(dictionary()),
+            ])),
             nested(),
         ),
         phase,
@@ -454,7 +456,7 @@ impl Fixture {
                             parameter_types, ..
                         } => parameter_types
                             .iter()
-                            .map(|ty| match &ty.data_type {
+                            .map(|ty| match &ty.data_type() {
                                 DataType::Struct(_) => 2,
                                 DataType::Int64 => 0,
                                 _ => panic!("fixture has an unauthored Lambda parameter type"),
@@ -623,8 +625,9 @@ fn aggregate_complete_payload_has_independent_wire_and_owned_oracles() {
                 .all(|c| c.binding.function.legacy_metadata.is_none())
         );
         // Same outer original decoded Field Arc survives each observed FVT copy.
-        if let DataType::Struct(fields) = &calls[0].binding.function.result_type.data_type {
-            if let DataType::Struct(original) = &a.definitions()[0].1.function.result_type.data_type
+        if let DataType::Struct(fields) = &calls[0].binding.function.result_type.data_type() {
+            if let DataType::Struct(original) =
+                &a.definitions()[0].1.function.result_type.data_type()
             {
                 assert!(Arc::ptr_eq(&fields[0], &original[0]));
             } else {
@@ -653,16 +656,17 @@ fn aggregate_all_phases_grouping_and_intentional_source_aliases_preserve_identit
         calls(&mut n)[0].binding.phase = phase;
         if phase == p::AggregatePhase::Single {
             for call in calls(&mut n).iter_mut() {
-                call.binding.function.argument_types = Box::from([
-                    FunctionArgumentType::Value(dictionary()),
-                    FunctionArgumentType::Lambda {
-                        parameter_types: Box::from([
-                            nested(),
-                            FunctionValueType::new(DataType::Int64, true),
-                        ]),
-                        result_type: nominal(),
-                    },
-                ]);
+                call.binding.function.argument_types =
+                    novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                        FunctionArgumentType::Value(dictionary()),
+                        FunctionArgumentType::Lambda {
+                            parameter_types:
+                                novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from(
+                                    [nested(), FunctionValueType::new(DataType::Int64, true)],
+                                )),
+                            result_type: nominal(),
+                        },
+                    ]));
             }
         }
         if let p::NodeKind::Aggregate { grouping, .. } = &mut n.kind {
@@ -709,18 +713,13 @@ fn aggregate_allocations_have_independent_layout_and_inline_binding_oracle() {
                 + layout::<p::AggregateCall>(2)
                 + layout::<p::ExprId>(3)
                 + layout::<p::SortExpr>(2));
-        // Each call: 2 argument-array requests, 3 bounded identity strings,
-        // 4 Dictionary-owned Boxes (argument and intermediate occurrences).
-        let copy = 2 * layout::<FunctionArgumentType>(1)
-            + 6
-            + 6
-            + 8
-            + 2 * (layout::<DataType>(1) + layout::<DataType>(1));
-        assert_eq!(rf.allocation_requests_upper_bound, 14 + 2 * 9);
-        assert_eq!(rf.allocation_request_bytes_upper_bound, root + 2 * copy);
+        // Each inline call shares its immutable signature and state identity.
+        // The seven real output collections each have Vec/Box upper requests.
+        assert_eq!(rf.allocation_requests_upper_bound, 14);
+        assert_eq!(rf.allocation_request_bytes_upper_bound, root);
         assert_eq!(
             rf.coexisting_source_and_request_bytes_upper_bound,
-            SOURCE + root + 2 * copy
+            SOURCE + root
         );
         assert_eq!(rf.value_reference_count, 8);
         assert_eq!(sf.value_reference_count, 8);
@@ -960,15 +959,19 @@ fn aggregate_real_signature_and_lambda_collections_obey_tighter_parent_before_wa
     for lambda in [false, true] {
         let mut n = node();
         calls(&mut n)[0].binding.function.argument_types = if lambda {
-            Box::from([
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
                 FunctionArgumentType::Value(dictionary()),
                 FunctionArgumentType::Lambda {
-                    parameter_types: vec![nested(); 320].into_boxed_slice(),
+                    parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        vec![nested(); 320].into_boxed_slice(),
+                    ),
                     result_type: nominal(),
                 },
-            ])
+            ]))
         } else {
-            vec![FunctionArgumentType::Value(dictionary()); 320].into_boxed_slice()
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                vec![FunctionArgumentType::Value(dictionary()); 320].into_boxed_slice(),
+            )
         };
         let c = Control::default();
         Fixture::new().with(&n,&c,|_,_,d,a|{
@@ -1028,7 +1031,7 @@ fn aggregate_real_signature_and_lambda_collections_obey_tighter_parent_before_wa
     }
 }
 #[test]
-fn aggregate_known_dictionary_pair_requests_precede_post_delegate_three_causes() {
+fn aggregate_known_root_collection_requests_precede_shared_signature_work() {
     let n = node();
     let c = Control::default();
     Fixture::new().with(&n, &c, |_, _, d, a| {
@@ -1044,32 +1047,26 @@ fn aggregate_known_dictionary_pair_requests_precede_post_delegate_three_causes()
         let prepared = prepare_aggregate_node_decode(&wire, d, a, SOURCE, limits()).unwrap();
         let facts = *prepared.facts();
         let success = c.trace();
-        // Only input/required-input/calls Vec-to-Box arrays remain: six root
-        // requests. Two inline signatures contribute nine requests each.
-        assert_eq!(facts.allocation_requests_upper_bound, 6 + 2 * 9);
+        // Only the three real input/required-input/calls collections remain.
+        // Dictionary encoding on a source never creates boxes in a logical
+        // function signature; each inline signature shares its original owner.
+        assert_eq!(facts.allocation_requests_upper_bound, 6);
         let root = 2
             * (layout::<p::NodeId>(1)
                 + layout::<p::PhysicalProperties>(1)
                 + layout::<p::AggregateCall>(2));
-        let child = 2 * layout::<FunctionArgumentType>(1) + 6 + 6 + 8 + 4 * layout::<DataType>(1);
-        assert_eq!(facts.allocation_request_bytes_upper_bound, root + 2 * child);
-        // Last root is the final call's Dictionary intermediate. The sole
-        // clone preflight performs five steps, followed by one completed step
-        // on success. Final type/outer-call + Node seven gates + output refs
-        // then form the last ordinary footer (18); no allocation has begun.
-        assert_eq!(success[success.len() - 2].1, 6);
-        assert_eq!(success[success.len() - 1].1, 18);
-        let prefix = &success[..success.len() - 2];
+        assert_eq!(facts.allocation_request_bytes_upper_bound, root);
+        let prefix = &success[..1];
         for axis in 0..3 {
             let mut l = limits();
             match axis {
-                0 => l.node.max_allocation_requests = 23,
-                1 => l.node.max_allocation_request_bytes = root + 2 * child - 1,
-                2 => l.node.max_coexisting_source_and_request_bytes = SOURCE + root + 2 * child - 1,
+                0 => l.node.max_allocation_requests = 5,
+                1 => l.node.max_allocation_request_bytes = root - 1,
+                2 => l.node.max_coexisting_source_and_request_bytes = SOURCE + root - 1,
                 _ => unreachable!(),
             }
             for cause in CAUSES {
-                c.arm(Some((prefix.len(), cause)));
+                c.arm(Some((1, cause)));
                 assert!(matches!(
                     prepare_aggregate_node_decode(&wire, d, a, SOURCE, l),
                     Err(Error::Control(CompileControlError::ResourceExhausted))
@@ -1077,7 +1074,7 @@ fn aggregate_known_dictionary_pair_requests_precede_post_delegate_three_causes()
                 assert_eq!(
                     c.trace(),
                     prefix,
-                    "known two-Box Layout must precede its post-check"
+                    "root collection refusal precedes namespace work"
                 );
             }
         }
@@ -1801,15 +1798,19 @@ fn aggregate_caller_owned_actual320_signatures_and_lambda_copy_preserve_source_p
     for lambda in [false, true] {
         let mut n = node();
         calls(&mut n)[0].binding.function.argument_types = if lambda {
-            Box::from([
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
                 FunctionArgumentType::Value(dictionary()),
                 FunctionArgumentType::Lambda {
-                    parameter_types: vec![nested(); 320].into_boxed_slice(),
+                    parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        vec![nested(); 320].into_boxed_slice(),
+                    ),
                     result_type: nominal(),
                 },
-            ])
+            ]))
         } else {
-            vec![FunctionArgumentType::Value(dictionary()); 320].into_boxed_slice()
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                vec![FunctionArgumentType::Value(dictionary()); 320].into_boxed_slice(),
+            )
         };
         let c = Control::default();
         Fixture::new().with(&n, &c, |_, _, d, a| {

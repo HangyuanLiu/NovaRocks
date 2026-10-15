@@ -494,10 +494,21 @@ pub(super) fn signed_input<E>(
             .map_err(|_| Failure::CapacityChanged)?;
             hasher.update([u8::from(field.field().is_nullable())]);
             let token = ConnectorWriteFieldToken::from_bytes(hasher.finalize().into());
-            output.push(ConnectorWriteFieldBinding::new(
-                token,
-                field.field().clone(),
-            ));
+            output.push(
+                ConnectorWriteFieldBinding::try_new_typed(
+                    token,
+                    field.field().clone(),
+                    field
+                        .execution_type()
+                        .ok_or_else(|| {
+                            Failure::Provider(super::invalid(
+                                "Iceberg session field has no frozen complete declaration",
+                            ))
+                        })?
+                        .clone(),
+                )
+                .map_err(Failure::Provider)?,
+            );
         }
         Ok(output)
     };
@@ -539,4 +550,200 @@ pub(super) fn signed_input<E>(
         retained_upper: retained,
         _original: guard,
     })
+}
+
+#[cfg(test)]
+mod signed_input_type_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_spi::connector::{
+        ConnectorPayloadRetentionGuard, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
+    };
+    use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Primary {
+        Stopped,
+        Limit,
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Event {
+        Active,
+        Total(u64),
+    }
+    struct Scope {
+        stopped: bool,
+        limit: u64,
+        events: RefCell<Vec<Event>>,
+        guard: ConnectorPayloadRetentionGuard,
+    }
+    impl Scope {
+        fn new(limit: u64, stopped: bool) -> Self {
+            Self {
+                stopped,
+                limit,
+                events: RefCell::new(Vec::new()),
+                guard: ConnectorPayloadRetentionGuard::new(()),
+            }
+        }
+    }
+    // Exercise the original call's finite operation checker, not a new grant.
+    impl OriginalScope<Primary> for Scope {
+        fn check_active(&self) -> Result<(), Primary> {
+            self.events.borrow_mut().push(Event::Active);
+            if self.stopped {
+                Err(Primary::Stopped)
+            } else {
+                Ok(())
+            }
+        }
+        fn check_total(&self, total: u64) -> Result<(), Primary> {
+            self.events.borrow_mut().push(Event::Total(total));
+            if total > self.limit {
+                Err(Primary::Limit)
+            } else {
+                Ok(())
+            }
+        }
+        fn original_guard(&self) -> ConnectorPayloadRetentionGuard {
+            self.guard.clone()
+        }
+    }
+    fn facts() -> IcebergWriteTableFacts {
+        IcebergWriteTableFacts::try_new(
+            "original-table".into(),
+            "db".into(),
+            "t".into(),
+            "s3://warehouse/db/t".into(),
+            "s3://warehouse/db/t/data".into(),
+            "main".into(),
+            Some(1),
+            1,
+            0,
+            0,
+            3,
+        )
+        .expect("original table generation")
+    }
+    fn field(name: &str, logical: ValueLogicalType, nullable: bool) -> ConnectorWriteFieldRequest {
+        let ty = FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            nullable,
+            logical,
+        )
+        .expect("independent complete declaration");
+        ConnectorWriteFieldRequest::try_new_typed(
+            Field::new(name, DataType::FixedSizeBinary(16), nullable).with_metadata(
+                [("provider.attribute".to_owned(), "opaque".to_owned())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ty,
+        )
+        .expect("source and complete declaration agree")
+    }
+    #[test]
+    fn cow_signer_preserves_complete_request_types_and_original_role_tokens() {
+        let data = field("v", ValueLogicalType::LargeInt, false);
+        let identity = field("id", ValueLogicalType::Uuid, true);
+        let requests = [
+            ConnectorWriteInputRequest::Data {
+                fields: vec![data.clone()],
+            },
+            ConnectorWriteInputRequest::RowLineage {
+                data_fields: vec![data.clone()],
+                row_identity_fields: vec![identity.clone()],
+            },
+            ConnectorWriteInputRequest::PositionDelete {
+                identity_fields: vec![identity.clone()],
+                partition_source_fields: vec![data.clone()],
+            },
+            ConnectorWriteInputRequest::DeletionVector {
+                identity_fields: vec![identity.clone()],
+                partition_source_fields: vec![data.clone()],
+            },
+            ConnectorWriteInputRequest::EqualityDelete {
+                equality_fields: vec![data.clone()],
+            },
+        ];
+        for request in &requests {
+            let scope = Scope::new(65_536, false);
+            let actual = signed_input(&facts(), request, 17, &scope).expect("bounded COW signer");
+            let ordinary =
+                super::super::sign_input_shape(&facts(), request).expect("original signer");
+            assert_eq!(actual.shape(), &ordinary);
+            for binding in actual.shape().fields_iter() {
+                let expected = if binding.field().name() == "v" {
+                    &data
+                } else {
+                    &identity
+                };
+                assert_eq!(binding.execution_type(), expected.execution_type());
+                assert_eq!(binding.field(), expected.field());
+                assert_eq!(binding.field().metadata()["provider.attribute"], "opaque");
+                assert_eq!(
+                    binding.execution_type().unwrap().data_type(),
+                    &DataType::FixedSizeBinary(16)
+                );
+            }
+            assert!(
+                scope
+                    .events
+                    .borrow()
+                    .iter()
+                    .any(|event| matches!(event, Event::Total(total) if *total <= 65_536))
+            );
+        }
+    }
+    #[test]
+    fn cow_signer_rejects_missing_complete_declaration_instead_of_reauthoring_carrier() {
+        let request = ConnectorWriteInputRequest::Data {
+            fields: vec![ConnectorWriteFieldRequest::new(Field::new(
+                "v",
+                DataType::FixedSizeBinary(16),
+                false,
+            ))],
+        };
+        let scope = Scope::new(65_536, false);
+        let failure = signed_input(&facts(), &request, 0, &scope)
+            .err()
+            .expect("missing source declaration");
+        match failure {
+            Failure::Provider(error) => {
+                assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+                assert_eq!(
+                    error.message(),
+                    "Iceberg session field has no frozen complete declaration"
+                );
+            }
+            other => panic!("unexpected failure: {other:?}"),
+        }
+    }
+    #[test]
+    fn cow_signer_preserves_first_original_stop_and_limit_without_callback_tail() {
+        let request = ConnectorWriteInputRequest::Data {
+            fields: vec![field("v", ValueLogicalType::LargeInt, false)],
+        };
+        let stopped = Scope::new(65_536, true);
+        assert!(matches!(
+            signed_input(&facts(), &request, 0, &stopped),
+            Err(Failure::Original(Primary::Stopped))
+        ));
+        assert_eq!(*stopped.events.borrow(), [Event::Active]);
+        let limited = Scope::new(1, false);
+        assert!(matches!(
+            signed_input(&facts(), &request, 0, &limited),
+            Err(Failure::Original(Primary::Limit))
+        ));
+        let events = limited.events.borrow();
+        assert!(matches!(events.last(), Some(Event::Total(total)) if *total > 1));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Total(_)))
+                .count(),
+            1
+        );
+    }
 }

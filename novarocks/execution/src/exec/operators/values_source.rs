@@ -42,6 +42,13 @@ pub struct ValuesSourceFactory {
 }
 
 impl ValuesSourceFactory {
+    pub(crate) fn new_typed(
+        values: novarocks_local_program::StaticValues,
+        node_id: i32,
+    ) -> Result<typed_values_source::TypedValuesSourceFactory, String> {
+        typed_values_source::TypedValuesSourceFactory::try_new(values, node_id)
+    }
+
     pub fn new(chunk: Chunk, node_id: i32) -> Self {
         let name = if node_id >= 0 {
             format!("ValuesSource (id={node_id})")
@@ -137,3 +144,6 @@ impl ProcessorOperator for ValuesSourceOperator {
         Ok(())
     }
 }
+
+#[path = "typed_values_source.rs"]
+mod typed_values_source;

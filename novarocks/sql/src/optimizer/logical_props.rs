@@ -337,7 +337,7 @@ pub(crate) fn make_eq_literal_predicate(
         },
         novarocks_type_contract::FunctionValueType::new(
             DataType::Boolean,
-            column.value_type.nullable || arena.nullable(literal),
+            column.value_type.nullable() || arena.nullable(literal),
         ),
         control,
     )
@@ -815,12 +815,13 @@ mod tests {
         nullable: bool,
         metadata: &str,
     ) -> (ScalarArena, ScalarId, novarocks_functions::ConstantValue) {
-        let ty = novarocks_type_contract::FunctionValueType {
-            data_type: array.data_type().clone(),
+        let ty = novarocks_type_contract::FunctionValueType::try_from_legacy_declared_projection(
+            array.data_type().clone(),
             nullable,
-            logical_type: logical,
-        };
-        let field = arrow::datatypes::Field::new("selected", ty.data_type.clone(), nullable)
+            logical,
+        )
+        .expect("valid temporary legacy value projection");
+        let field = arrow::datatypes::Field::new("selected", ty.data_type().clone(), nullable)
             .with_metadata(HashMap::from([("provider".into(), metadata.into())]));
         let value = novarocks_functions::ConstantPool::try_new(
             std::sync::Arc::new(field),
@@ -922,31 +923,26 @@ mod tests {
             )
             .unwrap()
         );
-        for (other_arena, other_id, _) in [
-            cv_node(
+        for (other_nullable, other_fact, expected_equal) in
+            [(true, "same", false), (false, "different", true)]
+        {
+            let (other_arena, other_id, _) = cv_node(
                 Arc::new(Int64Array::from(vec![7])),
                 0,
                 ValueLogicalType::Physical,
-                true,
-                "same",
-            ),
-            cv_node(
-                Arc::new(Int64Array::from(vec![7])),
-                0,
-                ValueLogicalType::Physical,
-                false,
-                "different",
-            ),
-        ] {
-            assert!(
-                !literal_equal_observed(
+                other_nullable,
+                other_fact,
+            );
+            assert_eq!(
+                literal_equal_observed(
                     &left,
                     l,
                     &other_arena,
                     other_id,
                     crate::optimizer::test_optimizer_control()
                 )
-                .unwrap()
+                .unwrap(),
+                expected_equal
             );
         }
         let (text, text_id, _) = cv_node(

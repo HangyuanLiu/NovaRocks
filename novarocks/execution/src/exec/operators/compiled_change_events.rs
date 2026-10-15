@@ -45,9 +45,11 @@ use novarocks_local_program::{
 use super::compiled_expression::{
     RuntimeKernelControl, evaluate_all, evaluate_selected, instances,
 };
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{
+    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
@@ -69,7 +71,7 @@ pub struct CompiledChangeEventProcessorFactory {
     sites: Vec<ProgramExpressionRootSite>,
     events: Arc<[EventPlan]>,
     effect_ordinal: usize,
-    output: ChunkSchemaRef,
+    output_layout: novarocks_local_program::StaticLayout,
     error: Arc<RuntimeErrorState>,
 }
 
@@ -142,7 +144,35 @@ impl CompiledChangeEventProcessorFactory {
                         assignment.output_slot_id
                     )));
                 }
-                if assignment.expr.is_some() {
+                if let Some(expression) = assignment.expr {
+                    if layout.is_typed() {
+                        let Some(novarocks_functions::FunctionArgumentType::Value(source)) =
+                            program.checked().channels().expressions().definition_type(
+                                novarocks_local_program::ProgramExpressionArena::Main,
+                                expression,
+                            )
+                        else {
+                            return Err(invalid(
+                                "has an assignment without a complete value declaration".into(),
+                            ));
+                        };
+                        let target = layout.value_binding_at(ordinal).ok_or_else(|| {
+                            invalid("has an output without a complete value binding".into())
+                        })?;
+                        if (source.nullable() && !target.nullable())
+                            || !source
+                                .typed_binding()
+                                .borrowed()
+                                .same_physical_binding_ignoring_root_nullability_observed(
+                                    target.borrowed(),
+                                    || Ok::<(), String>(()),
+                                )?
+                        {
+                            return Err(invalid(format!(
+                                "event {event_ordinal} assignment differs from its complete output binding"
+                            )));
+                        }
+                    }
                     let assignment_index = u32::try_from(assignment_ordinal)
                         .map_err(|_| invalid("has too many assignments".to_string()))?;
                     sites.push(ProgramExpressionRootSite::Node {
@@ -161,14 +191,14 @@ impl CompiledChangeEventProcessorFactory {
                 assigned,
             });
         }
-        let output = ChunkSchema::from_compiled_layout(layout)?;
+        let output_layout = layout.clone();
         Ok(Self {
             name: format!("COMPILED_CHANGE_EVENT_EXPAND (node={at})"),
             program,
             sites,
             events: Arc::from(plans),
             effect_ordinal,
-            output,
+            output_layout,
             error,
         })
     }
@@ -186,12 +216,15 @@ impl OperatorFactory for CompiledChangeEventProcessorFactory {
             sites: self.sites.clone(),
             events: Arc::clone(&self.events),
             effect_ordinal: self.effect_ordinal,
-            output: Arc::clone(&self.output),
+            output_layout: self.output_layout.clone(),
+            output: None,
+            construction: None,
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             instances: None,
             pending: VecDeque::new(),
             finishing: false,
             finished: false,
+            failed: false,
         })
     }
 }
@@ -202,12 +235,15 @@ struct CompiledChangeEventProcessor {
     sites: Vec<ProgramExpressionRootSite>,
     events: Arc<[EventPlan]>,
     effect_ordinal: usize,
-    output: ChunkSchemaRef,
+    output_layout: novarocks_local_program::StaticLayout,
+    output: Option<ChunkSchemaRef>,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
     control: RuntimeKernelControl,
     instances: Option<Vec<CompiledExpressionInstance>>,
     pending: VecDeque<Chunk>,
     finishing: bool,
     finished: bool,
+    failed: bool,
 }
 
 fn failure(message: String) -> ExecutionFailure {
@@ -215,7 +251,18 @@ fn failure(message: String) -> ExecutionFailure {
 }
 
 impl CompiledChangeEventProcessor {
+    fn alive(&self) -> ExecutionResult<()> {
+        if self.failed {
+            Err(novarocks_functions::KernelFailure::InstanceFailed.into())
+        } else {
+            Ok(())
+        }
+    }
     fn expand(&mut self, input: &RecordBatch) -> ExecutionResult<()> {
+        let output = self
+            .output
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
         instances(
             &mut self.instances,
             &self.program,
@@ -223,7 +270,7 @@ impl CompiledChangeEventProcessor {
             &self.control,
         )?;
         let instances = self.instances.as_mut().expect("instances were created");
-        let schema = self.output.arrow_schema_ref();
+        let schema = output.arrow_schema_ref();
         for (event_ordinal, event) in self.events.iter().enumerate() {
             let rows: Vec<usize> = match event.predicate {
                 Some(root) => {
@@ -247,6 +294,18 @@ impl CompiledChangeEventProcessor {
             if rows.is_empty() {
                 continue;
             }
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?;
+            let owner = factory.begin_typed_construction(output)?;
+            owner.observe(
+                0,
+                &[],
+                crate::exec::chunk::ArrayNormalizationStep::CreateChunkColumns {
+                    channels: schema.fields().len(),
+                },
+            )?;
             let mut columns = Vec::<ArrayRef>::with_capacity(schema.fields().len());
             for (ordinal, field) in schema.fields().iter().enumerate() {
                 let column = if ordinal == self.effect_ordinal {
@@ -273,21 +332,52 @@ impl CompiledChangeEventProcessor {
                 };
                 columns.push(column);
             }
-            let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(|error| {
-                failure(format!(
-                    "compiled change-event event {event_ordinal} output: {error}"
-                ))
-            })?;
-            self.pending.push_back(Chunk::try_new_with_chunk_schema(
-                batch,
-                Arc::clone(&self.output),
-            )?);
+            self.pending
+                .push_back(Chunk::try_new_typed_with_columns_owned_observed::<
+                    ConstructionFailure,
+                    _,
+                >(
+                    Arc::clone(output),
+                    columns,
+                    rows.len(),
+                    owner.storage_lifetime(),
+                    |step| owner.observe(0, &[], step),
+                )?);
         }
         Ok(())
     }
 }
 
 impl Operator for CompiledChangeEventProcessor {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.construction = Some(factory);
+    }
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        self.alive()?;
+        if self.output.is_some() {
+            return Ok(());
+        }
+        let result = (|| -> ExecutionResult<ChunkSchemaRef> {
+            let factory = self
+                .construction
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?;
+            Ok(factory.create_compiled_chunk_schema(&self.output_layout)?)
+        })();
+        match result {
+            Ok(output) => {
+                self.output = Some(output);
+                Ok(())
+            }
+            Err(cause) => {
+                self.failed = true;
+                Err(cause)
+            }
+        }
+    }
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.control.bind_runtime_memory(state);
         Ok(())
@@ -299,7 +389,12 @@ impl Operator for CompiledChangeEventProcessor {
         &self.name
     }
     fn is_finished(&self) -> bool {
-        self.finished
+        self.failed || self.finished
+    }
+    fn cancel(&mut self) {
+        self.failed = true;
+        self.pending.clear();
+        self.instances = None;
     }
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
         Some(self)
@@ -311,12 +406,16 @@ impl Operator for CompiledChangeEventProcessor {
 
 impl ProcessorOperator for CompiledChangeEventProcessor {
     fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.pending.is_empty()
+        !self.failed && !self.finishing && !self.finished && self.pending.is_empty()
     }
     fn has_output(&self) -> bool {
-        !self.pending.is_empty()
+        !self.failed && !self.pending.is_empty()
     }
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+        self.alive()?;
+        self.output
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
         if !self.pending.is_empty() {
             return Err(
                 "compiled change-event expand received input while output is pending".into(),
@@ -325,9 +424,18 @@ impl ProcessorOperator for CompiledChangeEventProcessor {
         if chunk.is_empty() {
             return Ok(());
         }
-        self.expand(&chunk.batch)
+        match self.expand(chunk.record_batch()) {
+            Ok(()) => Ok(()),
+            Err(cause) => {
+                self.failed = true;
+                self.pending.clear();
+                self.instances = None;
+                Err(cause)
+            }
+        }
     }
     fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+        self.alive()?;
         let output = self.pending.pop_front();
         if self.finishing && self.pending.is_empty() {
             self.finished = true;
@@ -335,6 +443,7 @@ impl ProcessorOperator for CompiledChangeEventProcessor {
         Ok(output)
     }
     fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+        self.alive()?;
         self.finishing = true;
         if self.pending.is_empty() {
             self.finished = true;

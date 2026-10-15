@@ -1015,7 +1015,10 @@ mod tests {
                     ),
                     volatility,
                 },
-                novarocks_type_contract::FunctionValueType::new(output.data_type, output.nullable),
+                novarocks_type_contract::FunctionValueType::new(
+                    output.data_type().clone(),
+                    output.nullable(),
+                ),
             );
             let Operator::LogicalProject(proj) = &mut project.op else {
                 unreachable!()

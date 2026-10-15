@@ -364,10 +364,9 @@ impl<'a> AnalyzerContext<'a> {
         let output_column = OutputColumn {
             column_id: output_id,
             name: output_name.clone(),
-            value_type: novarocks_type_contract::FunctionValueType {
-                nullable: true,
-                ..inner_out.value_type.clone()
-            },
+            value_type: (inner_out.value_type.clone())
+                .with_nullable(true)
+                .expect("valid value root nullability transform"),
 
             is_internal: true,
         };
@@ -382,10 +381,9 @@ impl<'a> AnalyzerContext<'a> {
                 qualifier: None,
                 column: output_name.clone(),
             },
-            value_type: novarocks_type_contract::FunctionValueType {
-                nullable: true,
-                ..inner_out.value_type.clone()
-            },
+            value_type: (inner_out.value_type.clone())
+                .with_nullable(true)
+                .expect("valid value root nullability transform"),
         };
         Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &replacement);
         Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &replacement);
@@ -478,8 +476,8 @@ impl<'a> AnalyzerContext<'a> {
                 let lhs = self.analyze_expr(in_expr, scope)?;
                 let inner_col = &resolved_sub.output_columns[0];
                 if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
-                    &lhs.value_type.data_type,
-                    &inner_col.value_type.data_type,
+                    &lhs.value_type.data_type(),
+                    &inner_col.value_type.data_type(),
                 ) {
                     let op_sym = match &sq_info.kind {
                         SubqueryKind::InSubquery { negated: true } => "NOT IN",
@@ -850,10 +848,9 @@ impl<'a> AnalyzerContext<'a> {
                         qualifier: None,
                         column: sub_first_col.name.clone(),
                     },
-                    value_type: novarocks_type_contract::FunctionValueType {
-                        nullable: true,
-                        ..sub_first_col.value_type.clone()
-                    },
+                    value_type: (sub_first_col.value_type.clone())
+                        .with_nullable(true)
+                        .expect("valid value root nullability transform"),
                 }),
                 negated: !negated,
             },
@@ -934,10 +931,9 @@ impl<'a> AnalyzerContext<'a> {
                         qualifier: None,
                         column: indicator.name.clone(),
                     },
-                    value_type: novarocks_type_contract::FunctionValueType {
-                        nullable: true,
-                        ..indicator.value_type.clone()
-                    },
+                    value_type: (indicator.value_type.clone())
+                        .with_nullable(true)
+                        .expect("valid value root nullability transform"),
                 }),
                 negated: !negated,
             },
@@ -1127,7 +1123,7 @@ impl<'a> AnalyzerContext<'a> {
             match_col_id,
             novarocks_type_contract::FunctionValueType::new(indicator_dtype.clone(), true),
         );
-        let null_marker = if sub_col.value_type.nullable {
+        let null_marker = if sub_col.value_type.nullable() {
             Some(self.build_value_form_marker_relation(
                 scope,
                 source_sub.clone(),
@@ -1139,7 +1135,7 @@ impl<'a> AnalyzerContext<'a> {
         } else {
             None
         };
-        let nonempty_marker = if lhs_typed.value_type.nullable {
+        let nonempty_marker = if lhs_typed.value_type.nullable() {
             Some(self.build_value_form_marker_relation(
                 scope,
                 source_sub,
@@ -1164,10 +1160,9 @@ impl<'a> AnalyzerContext<'a> {
                         qualifier: Some(sq_alias.clone()),
                         column: sub_col.name.clone(),
                     },
-                    value_type: novarocks_type_contract::FunctionValueType {
-                        nullable: true,
-                        ..sub_col.value_type.clone()
-                    },
+                    value_type: (sub_col.value_type.clone())
+                        .with_nullable(true)
+                        .expect("valid value root nullability transform"),
                 }),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
@@ -1200,7 +1195,7 @@ impl<'a> AnalyzerContext<'a> {
         let nullable_result = null_exists.is_some() || nonempty_exists.is_some();
         let mut when_then = Vec::new();
         when_then.push((match_exists, bool_literal(!negated)));
-        if lhs_typed.value_type.nullable {
+        if lhs_typed.value_type.nullable() {
             let lhs_null_unknown = match nonempty_exists {
                 Some(any_exists) => TypedExpr {
                     value_type: novarocks_type_contract::FunctionValueType::new(
@@ -1563,17 +1558,17 @@ impl<'a> AnalyzerContext<'a> {
                     };
                     let mut outer_expr = maybe_unqualify_col(&pred.outer_col, same_bare_name);
                     if original_left_is_inner
-                        && outer_expr.value_type.data_type != pred.inner_col.value_type.data_type
+                        && outer_expr.value_type.data_type()
+                            != pred.inner_col.value_type.data_type()
                     {
                         outer_expr = TypedExpr {
-                            value_type: novarocks_type_contract::FunctionValueType {
-                                nullable: outer_expr.value_type.nullable,
-                                ..pred.inner_col.value_type.clone()
-                            },
+                            value_type: (pred.inner_col.value_type.clone())
+                                .with_nullable(outer_expr.value_type.nullable())
+                                .expect("valid value root nullability transform"),
 
                             kind: ExprKind::Cast {
                                 expr: Box::new(outer_expr),
-                                target: pred.inner_col.value_type.data_type.clone(),
+                                target: pred.inner_col.value_type.data_type().clone(),
                                 decimal_overflow_policy:
                                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
@@ -1813,8 +1808,8 @@ impl<'a> AnalyzerContext<'a> {
         {
             self.check_control()?;
             if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
-                &lhs_i.value_type.data_type,
-                &sub_col.value_type.data_type,
+                &lhs_i.value_type.data_type(),
+                &sub_col.value_type.data_type(),
             ) {
                 let op_sym = if negated { "NOT IN" } else { "IN" };
                 return Err(AnalyzeError::type_mismatch(
@@ -1888,7 +1883,7 @@ impl<'a> AnalyzerContext<'a> {
 
         if value_form
             && matches!(
-                lhs_typed.value_type.data_type,
+                lhs_typed.value_type.data_type(),
                 DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
             )
         {
@@ -2008,7 +2003,7 @@ impl<'a> AnalyzerContext<'a> {
                 super::helpers::with_nullability(sub_output_col.value_type.clone(), true),
             );
 
-            let null_marker = if sub_output_col.value_type.nullable {
+            let null_marker = if sub_output_col.value_type.nullable() {
                 Some(self.build_value_form_marker_relation(
                     scope,
                     resolved_sub.clone(),
@@ -2020,7 +2015,7 @@ impl<'a> AnalyzerContext<'a> {
             } else {
                 None
             };
-            let nonempty_marker = if lhs_typed.value_type.nullable {
+            let nonempty_marker = if lhs_typed.value_type.nullable() {
                 Some(self.build_value_form_marker_relation(
                     scope,
                     resolved_sub.clone(),
@@ -2043,10 +2038,9 @@ impl<'a> AnalyzerContext<'a> {
             modified_sub.output_columns.push(OutputColumn {
                 column_id: in_match_col_id,
                 name: match_col_name.clone(),
-                value_type: novarocks_type_contract::FunctionValueType {
-                    nullable: true,
-                    ..sub_output_col.value_type.clone()
-                },
+                value_type: (sub_output_col.value_type.clone())
+                    .with_nullable(true)
+                    .expect("valid value root nullability transform"),
 
                 is_internal: false,
             });
@@ -2111,17 +2105,16 @@ impl<'a> AnalyzerContext<'a> {
                         qualifier: None,
                         column: match_col_name,
                     },
-                    value_type: novarocks_type_contract::FunctionValueType {
-                        nullable: true,
-                        ..sub_output_col.value_type.clone()
-                    },
+                    value_type: (sub_output_col.value_type.clone())
+                        .with_nullable(true)
+                        .expect("valid value root nullability transform"),
                 },
                 true,
             );
             let nullable_result = null_exists.is_some() || nonempty_exists.is_some();
             let mut when_then = Vec::new();
             when_then.push((match_exists, bool_literal(!negated)));
-            if lhs_typed.value_type.nullable {
+            if lhs_typed.value_type.nullable() {
                 let lhs_null_unknown = match nonempty_exists {
                     Some(any_exists) => TypedExpr {
                         value_type: novarocks_type_contract::FunctionValueType::new(
@@ -2174,7 +2167,9 @@ impl<'a> AnalyzerContext<'a> {
             let either_nullable = lhs_typed_list
                 .iter()
                 .zip(resolved_sub.output_columns.iter())
-                .any(|(lhs_i, sub_col)| lhs_i.value_type.nullable || sub_col.value_type.nullable);
+                .any(|(lhs_i, sub_col)| {
+                    lhs_i.value_type.nullable() || sub_col.value_type.nullable()
+                });
             let join_type = if negated {
                 if either_nullable {
                     JoinKind::NullAwareLeftAnti
@@ -2260,10 +2255,9 @@ impl<'a> AnalyzerContext<'a> {
         let collection_output = OutputColumn {
             column_id,
             name: name.clone(),
-            value_type: novarocks_type_contract::FunctionValueType {
-                nullable: true,
-                ..result.clone()
-            },
+            value_type: (result.clone())
+                .with_nullable(true)
+                .expect("valid value root nullability transform"),
 
             is_internal: true,
         };
@@ -2296,8 +2290,8 @@ impl<'a> AnalyzerContext<'a> {
             value_type: param.value_type.clone(),
         };
         let (probe, item) = match novarocks_types::comparison_common_type(
-            &probe.value_type.data_type,
-            &item.value_type.data_type,
+            &probe.value_type.data_type(),
+            &item.value_type.data_type(),
         )
         .map_err(|message| AnalyzeError::type_mismatch(message, span))?
         {
@@ -2329,10 +2323,9 @@ impl<'a> AnalyzerContext<'a> {
                 qualifier: None,
                 column: name.clone(),
             },
-            value_type: novarocks_type_contract::FunctionValueType {
-                nullable: collection_output.value_type.nullable,
-                ..result.clone()
-            },
+            value_type: (result.clone())
+                .with_nullable(collection_output.value_type.nullable())
+                .expect("valid value root nullability transform"),
         };
         let length = resolved_scalar_call_at(
             self.function_catalog,
@@ -2387,7 +2380,10 @@ impl<'a> AnalyzerContext<'a> {
         let source_outputs = source.output_columns.clone();
         let mut inner_output = collection_output.clone();
         inner_output.column_id = self.alloc_column_id(Some(alias), name.clone(), result.clone());
-        inner_output.value_type.nullable = result.nullable;
+        inner_output.value_type = inner_output
+            .value_type
+            .with_nullable(result.nullable())
+            .expect("validated root NULL contract");
         let query = ResolvedQuery {
             body: QueryBody::Select(ResolvedSelect {
                 from: Some(Relation::Subquery {
@@ -2493,7 +2489,7 @@ impl<'a> AnalyzerContext<'a> {
         // the join type carries the null-aware anti behavior and evaluates
         // residual correlation predicates against matching/null-key build
         // rows.
-        let either_nullable = lhs_typed.value_type.nullable || rhs_expr.value_type.nullable;
+        let either_nullable = lhs_typed.value_type.nullable() || rhs_expr.value_type.nullable();
         let key_cond = TypedExpr {
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
 
@@ -2506,7 +2502,7 @@ impl<'a> AnalyzerContext<'a> {
         };
         let sub_filter = sub_filter
             .map(|filter| -> Result<TypedExpr, AnalyzeError> {
-                if negated && either_nullable && filter.value_type.nullable {
+                if negated && either_nullable && filter.value_type.nullable() {
                     let args = vec![
                         filter,
                         TypedExpr {
@@ -2654,7 +2650,10 @@ impl<'a> AnalyzerContext<'a> {
 
             let scalar_output_id = modified_sub.output_columns[0].column_id;
             let scalar_output_name = modified_sub.output_columns[0].name.clone();
-            let scalar_data_type = modified_sub.output_columns[0].value_type.data_type.clone();
+            let scalar_data_type = modified_sub.output_columns[0]
+                .value_type
+                .data_type()
+                .clone();
             let scalar_nullable = true;
 
             let output_columns = modified_sub.output_columns.clone();
@@ -2761,6 +2760,7 @@ impl<'a> AnalyzerContext<'a> {
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
         let child_ctx = AnalyzerContext {
+            materialized_values: self.materialized_values,
             control: self.control,
             constant_policy: self.constant_policy,
             catalog: self.catalog,
@@ -3261,11 +3261,11 @@ pub(super) struct CorrelationPred {
 /// boolean cast so values like `"true"` keep their predicate meaning.
 pub(crate) fn coerce_where_to_bool(expr: TypedExpr) -> TypedExpr {
     use arrow::datatypes::DataType;
-    if matches!(expr.value_type.data_type, DataType::Boolean) {
+    if matches!(expr.value_type.data_type(), DataType::Boolean) {
         return expr;
     }
-    let nullable = expr.value_type.nullable;
-    if matches!(expr.value_type.data_type, DataType::Utf8) {
+    let nullable = expr.value_type.nullable();
+    if matches!(expr.value_type.data_type(), DataType::Utf8) {
         return TypedExpr {
             value_type: novarocks_type_contract::FunctionValueType::new(
                 DataType::Boolean,
@@ -3300,8 +3300,8 @@ fn qualify_inner_shadowing_column_refs(
     inner_scope: &AnalyzerScope,
     outer_scope: &AnalyzerScope,
 ) -> TypedExpr {
-    let data_type = expr.value_type.data_type.clone();
-    let nullable = expr.value_type.nullable;
+    let data_type = expr.value_type.data_type().clone();
+    let nullable = expr.value_type.nullable();
     match expr.kind {
         ExprKind::ColumnRef {
             column_id,
@@ -4985,17 +4985,17 @@ fn recompute_case_result_type(
     let mut result_type = DataType::Null;
     for (_, then_expr) in when_then {
         if result_type == DataType::Null {
-            result_type = then_expr.value_type.data_type.clone();
+            result_type = then_expr.value_type.data_type().clone();
         } else {
             result_type =
-                novarocks_types::wider_type(&result_type, &then_expr.value_type.data_type);
+                novarocks_types::wider_type(&result_type, &then_expr.value_type.data_type());
         }
     }
     if let Some(expr) = else_expr {
         if result_type == DataType::Null {
-            result_type = expr.value_type.data_type.clone();
+            result_type = expr.value_type.data_type().clone();
         } else {
-            result_type = novarocks_types::wider_type(&result_type, &expr.value_type.data_type);
+            result_type = novarocks_types::wider_type(&result_type, &expr.value_type.data_type());
         }
     }
     if result_type == DataType::Null {
@@ -5006,7 +5006,7 @@ fn recompute_case_result_type(
 }
 
 fn cast_case_branch_if_needed(expr: TypedExpr, target: &DataType) -> TypedExpr {
-    if &expr.value_type.data_type != target && expr.value_type.data_type != DataType::Null {
+    if expr.value_type.data_type() != target && *expr.value_type.data_type() != DataType::Null {
         TypedExpr {
             kind: ExprKind::Cast {
                 expr: Box::new(expr),
@@ -5674,8 +5674,8 @@ mod tests {
             coerced.kind,
             ExprKind::BinaryOp { op: BinOp::Ne, .. }
         ));
-        assert_eq!(coerced.value_type.data_type, DataType::Boolean);
-        assert!(coerced.value_type.nullable);
+        assert_eq!(coerced.value_type.data_type().clone(), DataType::Boolean);
+        assert!(coerced.value_type.nullable());
     }
 
     #[test]
@@ -5698,8 +5698,8 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(coerced.value_type.data_type, DataType::Boolean);
-        assert!(coerced.value_type.nullable);
+        assert_eq!(coerced.value_type.data_type().clone(), DataType::Boolean);
+        assert!(coerced.value_type.nullable());
     }
 
     #[test]
@@ -5749,13 +5749,13 @@ mod tests {
         );
 
         assert!(marker.limit.is_none());
-        assert!(marker.output_columns[0].value_type.nullable);
+        assert!(marker.output_columns[0].value_type.nullable());
         let QueryBody::Select(select) = marker.body else {
             panic!("expected marker SELECT");
         };
         assert!(select.has_aggregation);
         assert_eq!(select.group_by.len(), 0);
-        assert!(select.projection[0].expr.value_type.nullable);
+        assert!(select.projection[0].expr.value_type.nullable());
         let ExprKind::AggregateCall { name, args, .. } = &select.projection[0].expr.kind else {
             panic!("expected aggregate marker expression");
         };

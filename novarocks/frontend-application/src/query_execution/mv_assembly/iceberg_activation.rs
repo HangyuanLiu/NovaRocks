@@ -235,11 +235,7 @@ pub(crate) fn begin_first_refresh_connector_write_session(
     // publication opened anywhere but main.
     let target_ref = "main";
     let input = ConnectorWriteInputRequest::Data {
-        fields: prepared
-            .write_input_fields()
-            .iter()
-            .map(|field| novarocks_spi::connector::ConnectorWriteFieldRequest::new(field.clone()))
-            .collect(),
+        fields: prepared.write_input_fields().to_vec(),
     };
     let base = publication_write_base(
         exact_lease,
@@ -316,11 +312,7 @@ pub(crate) fn begin_metadata_only_connector_write_session(
     let target_ref = "main";
     let intent = novarocks_spi::connector::ConnectorWriteIntent::Append;
     let input = ConnectorWriteInputRequest::Data {
-        fields: prepared
-            .write_input_fields()
-            .iter()
-            .map(|field| novarocks_spi::connector::ConnectorWriteFieldRequest::new(field.clone()))
-            .collect(),
+        fields: prepared.write_input_fields().to_vec(),
     };
     let base = publication_write_base(
         exact_lease,
@@ -367,7 +359,7 @@ pub(crate) fn begin_metadata_only_connector_write_session(
 /// difference decides whether the single commit is a publication.
 fn incremental_publication_write_input(
     mode: MvIncrementalWriteMode,
-    target_write_fields: &[arrow::datatypes::Field],
+    target_write_fields: &[novarocks_spi::connector::ConnectorWriteFieldRequest],
 ) -> Result<
     (
         novarocks_spi::connector::ConnectorWriteIntent,
@@ -387,12 +379,14 @@ fn incremental_publication_write_input(
         return Err("MV incremental write has no target write fields".to_string());
     }
     let field = |name: &str, data_type: arrow::datatypes::DataType, nullable: bool| {
-        ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(name, data_type, nullable))
+        let declared = novarocks_type_contract::FunctionValueType::new(data_type.clone(), nullable);
+        ConnectorWriteFieldRequest::try_new_typed(
+            arrow::datatypes::Field::new(name, data_type, nullable),
+            declared,
+        )
+        .map_err(|error| error.to_string())
     };
-    let mut data_fields = target_write_fields
-        .iter()
-        .map(|target_field| ConnectorWriteFieldRequest::new(target_field.clone()))
-        .collect::<Vec<_>>();
+    let mut data_fields = target_write_fields.to_vec();
     Ok(match mode {
         MvIncrementalWriteMode::FastAppend => (
             novarocks_spi::connector::ConnectorWriteIntent::Append,
@@ -410,12 +404,12 @@ fn incremental_publication_write_input(
                 ICEBERG_ROW_ID_COL,
                 arrow::datatypes::DataType::Int64,
                 true,
-            ));
+            )?);
             data_fields.push(field(
                 ICEBERG_LAST_UPDATED_SEQ_COL,
                 arrow::datatypes::DataType::Int64,
                 true,
-            ));
+            )?);
             (
                 novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
                 ConnectorWriteInputRequest::RowLineage {
@@ -425,12 +419,12 @@ fn incremental_publication_write_input(
                             ICEBERG_FILE_PATH_COL,
                             arrow::datatypes::DataType::Utf8,
                             false,
-                        ),
+                        )?,
                         field(
                             ICEBERG_ROW_POS_COL,
                             arrow::datatypes::DataType::Int64,
                             false,
-                        ),
+                        )?,
                     ],
                 },
                 ConnectorManagedPublicationShape::RowMutation,
@@ -472,7 +466,7 @@ pub(crate) fn begin_incremental_connector_write_session(
     target_table: &novarocks_spi::connector::ConnectorTableHandle,
     publication_intent: &MvRefreshPublicationIntent,
     mode: MvIncrementalWriteMode,
-    target_write_fields: &[arrow::datatypes::Field],
+    target_write_fields: &[novarocks_spi::connector::ConnectorWriteFieldRequest],
     connector_context: ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
     planning_lease: &ConnectorControlPlanningLease,
@@ -623,17 +617,28 @@ mod tests {
         ConnectorWriteInputRequest, MvIncrementalWriteMode, incremental_publication_write_input,
     };
 
-    fn target_write_fields() -> Vec<Field> {
-        vec![
-            Field::new("k1", DataType::Int64, false),
-            Field::new("v1", DataType::Utf8, true),
-        ]
+    fn target_write_fields() -> Vec<novarocks_spi::connector::ConnectorWriteFieldRequest> {
+        [("k1", DataType::Int64, false), ("v1", DataType::Utf8, true)]
+            .into_iter()
+            .map(|(name, data_type, nullable)| {
+                novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                    Field::new(name, data_type.clone(), nullable),
+                    novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+                )
+                .expect("explicit target declaration")
+            })
+            .collect()
     }
 
     fn field_names(fields: &[novarocks_spi::connector::ConnectorWriteFieldRequest]) -> Vec<String> {
         fields
             .iter()
-            .map(|field| field.field().name().to_string())
+            .map(|field| {
+                let declared = field.execution_type().expect("complete write declaration");
+                assert_eq!(declared.data_type(), field.field().data_type());
+                assert_eq!(declared.nullable(), field.field().is_nullable());
+                field.field().name().to_string()
+            })
             .collect()
     }
 

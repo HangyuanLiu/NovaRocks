@@ -323,10 +323,32 @@ fn column() -> common::OutputColumn {
 
 fn bigint() -> common::TypeDesc {
     common::TypeDesc {
-        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-            r#type: common::PrimitiveType::Bigint as i32,
-            ..Default::default()
-        })),
+        value_binding_id: Some(0),
+    }
+}
+
+// The original fixture declares v BIGINT NOT NULL. All its columns and literals
+// reference this fragment-owned complete type; no first-batch inference exists.
+fn bigint_table() -> plan::ExecutionTypeTable {
+    use novarocks_proto_models::{arrow_type as a, value_type as v};
+    plan::ExecutionTypeTable {
+        logical_types: vec![v::LogicalTypeDefinition {
+            id: Some(0),
+            nullable: false,
+            kind: Some(v::logical_type_definition::Kind::Scalar(v::ScalarValue {
+                kind: v::ScalarKind::Int64 as i32,
+                ..Default::default()
+            })),
+        }],
+        value_bindings: vec![plan::ExecutionValueBinding {
+            id: Some(0),
+            logical_type_id: Some(0),
+            value_layout: Some(a::ArrowPhysicalType {
+                kind: Some(a::arrow_physical_type::Kind::Primitive(
+                    a::ArrowPrimitiveType::Int64 as i32,
+                )),
+            }),
+        }],
     }
 }
 
@@ -347,6 +369,7 @@ fn receiver(
     };
     let (mut frozen, mut metadata) = carriers(&base)?;
     let fragment = frozen.plan.as_mut().expect("fixture plan");
+    fragment.execution_types = Some(bigint_table());
     fragment.output_columns = vec![column()];
     let Some(plan::distributed_node::Payload::Exchange(exchange)) = fragment
         .root
@@ -397,6 +420,7 @@ fn producer(
         ..Default::default()
     };
     let fragment = frozen.plan.as_mut().expect("fixture plan");
+    fragment.execution_types = Some(bigint_table());
     fragment.fragment_id = 2;
     fragment.output_columns = vec![column()];
     fragment
@@ -423,6 +447,7 @@ fn producer(
                 .iter()
                 .map(|value| plan::ExprList {
                     values: vec![expr::Expr {
+                        original_definition_id: None,
                         r#type: Some(bigint()),
                         nullable: false,
                         kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
@@ -529,12 +554,29 @@ fn fetch_rows(
         );
         sequence += 1;
         if !response.result_arrow_ipc.is_empty() {
-            let chunks = novarocks_execution::runtime::exchange::decode_root_result_chunks(
-                &response.result_arrow_ipc,
-                None,
-            )
-            .map_err(anyhow::Error::msg)?;
+            // Decode the public NRX1 result envelope independently of the
+            // execution implementation, then use the standard Arrow client.
+            let wire = response.result_arrow_ipc.as_ref();
+            ensure!(
+                wire.len() >= 14 && &wire[..4] == b"NRX1",
+                "B result envelope is missing"
+            );
+            ensure!(
+                wire[4] == 1 && wire[5] == 1,
+                "B result envelope version or flags differ"
+            );
+            ensure!(
+                u32::from_le_bytes(wire[6..10].try_into()?) == 1,
+                "B returned another schema"
+            );
+            ensure!(
+                u32::from_le_bytes(wire[10..14].try_into()?) == 1,
+                "B result slot differs"
+            );
+            let chunks =
+                arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(&wire[14..]), None)?;
             for chunk in chunks {
+                let chunk = chunk?;
                 ensure!(chunk.columns().len() == 1, "B returned another schema");
                 let values = chunk.columns()[0]
                     .as_any()

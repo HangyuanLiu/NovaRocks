@@ -240,7 +240,9 @@ fn aggregate(phase: p::AggregatePhase) -> p::AggregateBinding {
             FunctionId::try_new("test/f").unwrap(),
             FunctionOverloadId::try_new("test/o").unwrap(),
             FunctionKind::Aggregate,
-            Box::from([FunctionArgumentType::Value(dictionary())]),
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                FunctionArgumentType::Value(dictionary()),
+            ])),
             nested(),
         ),
         phase,
@@ -476,7 +478,7 @@ impl Ids {
                 1
             } else if *t == nominal() {
                 3
-            } else if t.nullable {
+            } else if t.nullable() {
                 0
             } else {
                 4
@@ -777,7 +779,7 @@ impl Fixture {
                             parameter_types, ..
                         } => parameter_types
                             .iter()
-                            .map(|ty| match &ty.data_type {
+                            .map(|ty| match &ty.data_type() {
                                 DataType::Struct(_) => 2,
                                 DataType::Int64 => 0,
                                 _ => panic!("fixture has an unauthored Lambda parameter type"),
@@ -1184,13 +1186,14 @@ fn table_write_inline_aggregate_copies_preserve_four_phases_lambda_dictionary_an
         let t = target(&mut n);
         t.partial_aggregates[0].binding.phase = phase;
         t.partial_aggregates[0].binding.function.argument_types =
-            Box::from([FunctionArgumentType::Lambda {
-                parameter_types: Box::from([
-                    nested(),
-                    FunctionValueType::new(DataType::Int64, true),
-                ]),
-                result_type: nominal(),
-            }]);
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                FunctionArgumentType::Lambda {
+                    parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        Box::from([nested(), FunctionValueType::new(DataType::Int64, true)]),
+                    ),
+                    result_type: nominal(),
+                },
+            ]));
         let ids = Ids::new(&n);
         f.with(&n, &c, |v, e, r, a| {
             c.arm(None);
@@ -1206,19 +1209,20 @@ fn table_write_inline_aggregate_copies_preserve_four_phases_lambda_dictionary_an
             assert_eq!(b.phase, phase);
             assert!(b.function.legacy_metadata.is_none());
             let original = &a.definitions().iter().find(|(id, _)| *id == 0).unwrap().1;
+            assert_eq!(b.intermediate_type, original.intermediate_type);
+            assert_eq!(b.intermediate_type.data_type(), &DataType::Utf8);
+            assert!(
+                b.intermediate_type
+                    .value_type()
+                    .shares_storage(original.intermediate_type.value_type())
+            );
+            assert!(std::ptr::eq(
+                b.intermediate_type.data_type(),
+                original.intermediate_type.data_type()
+            ));
             match (
-                &original.intermediate_type.data_type,
-                &b.intermediate_type.data_type,
-            ) {
-                (DataType::Dictionary(ok, ov), DataType::Dictionary(k, v)) => {
-                    assert!(!std::ptr::eq(&**ok, &**k));
-                    assert!(!std::ptr::eq(&**ov, &**v));
-                }
-                _ => panic!(),
-            };
-            match (
-                &original.function.result_type.data_type,
-                &b.function.result_type.data_type,
+                &original.function.result_type.data_type(),
+                &b.function.result_type.data_type(),
             ) {
                 (DataType::Struct(o), DataType::Struct(actual)) => {
                     assert!(Arc::ptr_eq(&o[0], &actual[0]))

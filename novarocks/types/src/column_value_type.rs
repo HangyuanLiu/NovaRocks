@@ -15,16 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Value domains authored by the catalog's explicit column declaration.
+//! Catalog declaration authoring, independent of execution annotations.
 
 use crate::schema::{ColumnDef, SqlType};
-use arrow_schema::{DataType, Field, Fields};
+use crate::{
+    ExecutionColumnTypeError, execution_value_type_from_declaration, sql_type_from_execution_value,
+    validate_execution_declaration_observed,
+};
+use arrow_schema::DataType;
 use novarocks_type_contract::{
-    FunctionValueType, MAX_VALUE_TYPE_DEPTH, MAX_VALUE_TYPE_NODES, NR_LOGICAL_TYPE_KEY,
-    ValueLogicalType, ValueTypeError, field_logical_type, validate_nested_logical_types_observed,
+    FunctionValueType, ValueLogicalType, ValueTypeError, ValueTypeStorageLifetime,
+    validate_arrow_layout_structure_observed,
 };
 use std::fmt;
-use std::sync::Arc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ColumnValueTypeError {
@@ -38,12 +41,26 @@ impl From<ValueTypeError> for ColumnValueTypeError {
         Self::Type(error)
     }
 }
+impl From<ExecutionColumnTypeError> for ColumnValueTypeError {
+    fn from(error: ExecutionColumnTypeError) -> Self {
+        match error {
+            ExecutionColumnTypeError::DeclarationMismatch => Self::DeclarationMismatch,
+            ExecutionColumnTypeError::Type(error) => Self::Type(error.into()),
+            ExecutionColumnTypeError::UnrepresentableValue(reason) => {
+                Self::Type(ValueTypeError::InvalidType(reason))
+            }
+            ExecutionColumnTypeError::UnrepresentableCarrier(carrier) => {
+                Self::UnrepresentableCarrier(carrier)
+            }
+        }
+    }
+}
 impl fmt::Display for ColumnValueTypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Type(error) => error.fmt(f),
             Self::DeclarationMismatch => {
-                f.write_str("column logical declaration conflicts with its Arrow field")
+                f.write_str("column declaration conflicts with its execution value layout")
             }
             Self::UnrepresentableCarrier(carrier) => {
                 write!(f, "column schema cannot represent the {carrier:?} carrier")
@@ -57,118 +74,26 @@ impl fmt::Display for ColumnValueTypeError {
 }
 impl std::error::Error for ColumnValueTypeError {}
 
-/// Project an authored value domain into a SQL column declaration. The full
-/// Arrow layout remains in the source value type; this never infers a logical
-/// identity from a binary or text carrier.
 pub fn sql_type_from_value_type(
     value: &FunctionValueType,
 ) -> Result<SqlType, ColumnValueTypeError> {
-    value.validate()?;
-    sql_declaration(&value.data_type, value.logical_type)
-}
-fn sql_declaration(
-    data_type: &DataType,
-    domain: ValueLogicalType,
-) -> Result<SqlType, ColumnValueTypeError> {
-    Ok(match domain {
-        ValueLogicalType::Json => SqlType::Json,
-        ValueLogicalType::Variant => SqlType::Variant,
-        ValueLogicalType::Hll => SqlType::Hll,
-        ValueLogicalType::Bitmap => SqlType::Bitmap,
-        ValueLogicalType::LargeInt => SqlType::LargeInt,
-        ValueLogicalType::Uuid => SqlType::Uuid,
-        ValueLogicalType::Physical => match data_type {
-            DataType::Boolean => SqlType::Boolean,
-            DataType::Int8 => SqlType::TinyInt,
-            DataType::Int16 => SqlType::SmallInt,
-            DataType::Int32 => SqlType::Int,
-            DataType::Int64 => SqlType::BigInt,
-            DataType::Float32 => SqlType::Float,
-            DataType::Float64 => SqlType::Double,
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => SqlType::String,
-            DataType::Binary
-            | DataType::LargeBinary
-            | DataType::BinaryView
-            | DataType::FixedSizeBinary(_) => SqlType::Binary,
-            DataType::Date32 => SqlType::Date,
-            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, _) => SqlType::DateTimeNs,
-            DataType::Timestamp(_, _) => SqlType::DateTime,
-            DataType::Time64(_) => SqlType::Time,
-            DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
-                SqlType::Decimal {
-                    precision: *precision,
-                    scale: *scale,
-                }
-            }
-            DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _) => {
-                SqlType::Array(Box::new(sql_field_declaration(item)?))
-            }
-            DataType::Struct(fields) => SqlType::Struct(
-                fields
-                    .iter()
-                    .map(|field| Ok((field.name().clone(), sql_field_declaration(field)?)))
-                    .collect::<Result<_, ColumnValueTypeError>>()?,
-            ),
-            DataType::Map(entries, _) => {
-                let DataType::Struct(fields) = entries.data_type() else {
-                    return Err(ColumnValueTypeError::DeclarationMismatch);
-                };
-                if fields.len() != 2 {
-                    return Err(ColumnValueTypeError::DeclarationMismatch);
-                }
-                SqlType::Map(
-                    Box::new(sql_field_declaration(&fields[0])?),
-                    Box::new(sql_field_declaration(&fields[1])?),
-                )
-            }
-            data_type => {
-                return Err(ColumnValueTypeError::UnrepresentableCarrier(
-                    data_type.clone(),
-                ));
-            }
-        },
-        domain => return Err(ColumnValueTypeError::UnrepresentableRootDomain(domain)),
-    })
-}
-fn sql_field_declaration(field: &Field) -> Result<SqlType, ColumnValueTypeError> {
-    sql_declaration(field.data_type(), field_logical_type(field)?)
-}
-
-fn root(declaration: &SqlType) -> ValueLogicalType {
-    match declaration {
-        SqlType::Json => ValueLogicalType::Json,
-        SqlType::Variant => ValueLogicalType::Variant,
-        SqlType::Hll => ValueLogicalType::Hll,
-        SqlType::Bitmap => ValueLogicalType::Bitmap,
-        SqlType::LargeInt => ValueLogicalType::LargeInt,
-        SqlType::Uuid => ValueLogicalType::Uuid,
-        _ => ValueLogicalType::Physical,
-    }
+    sql_type_from_execution_value(value.typed_binding()).map_err(Into::into)
 }
 
 impl ColumnDef {
-    /// Freeze an already-authored value domain into the catalog schema model.
-    /// Unsupported schema domains fail instead of becoming a plain carrier.
+    /// Persist the complete recursive declaration, including nominal children.
+    /// Catalog facts own their ordinary schema representation independently;
+    /// runtime frozen ports retain the original complete FunctionValueType.
     pub fn from_value_type(
         name: String,
         value_type: FunctionValueType,
         write_default: Option<crate::schema::ColumnDefault>,
     ) -> Result<Self, ColumnValueTypeError> {
-        value_type.validate()?;
-        let logical_type = match value_type.logical_type {
-            ValueLogicalType::Physical => None,
-            ValueLogicalType::Json => Some(SqlType::Json),
-            ValueLogicalType::Variant => Some(SqlType::Variant),
-            ValueLogicalType::Hll => Some(SqlType::Hll),
-            ValueLogicalType::Bitmap => Some(SqlType::Bitmap),
-            ValueLogicalType::LargeInt => Some(SqlType::LargeInt),
-            ValueLogicalType::Uuid => Some(SqlType::Uuid),
-            domain => return Err(ColumnValueTypeError::UnrepresentableRootDomain(domain)),
-        };
+        let logical_type = Some(sql_type_from_value_type(&value_type)?);
         Ok(Self {
             name,
-            data_type: value_type.data_type,
-            nullable: value_type.nullable,
+            data_type: value_type.data_type().clone(),
+            nullable: value_type.nullable(),
             logical_type,
             write_default,
         })
@@ -178,165 +103,89 @@ impl ColumnDef {
         self.declared_value_type_observed(|| Ok(()))
     }
 
-    /// The original caller observes each actual source node and field. An
-    /// absent declaration keeps the Arrow domain, never a guessed carrier tag.
+    /// Read the explicit SQL declaration and borrowed carrier NULL/layout facts.
+    /// This is a catalog authoring boundary. Nested Arrow annotations contribute
+    /// no domains; an absent declaration explicitly authors ordinary values.
     pub fn declared_value_type_observed<E: From<ColumnValueTypeError> + From<ValueTypeError>>(
         &self,
         mut observe: impl FnMut() -> Result<(), E>,
     ) -> Result<FunctionValueType, E> {
-        validate_nested_logical_types_observed(&self.data_type, &mut observe)?;
-        // Bound the declaration itself before recursive copying. It can be
-        // larger than the Arrow source when the two shapes disagree.
-        let mut pending = Vec::new();
-        if let Some(declaration) = &self.logical_type {
-            pending.push((declaration, 1usize));
-        }
-        let mut count = 0usize;
-        while let Some((declaration, depth)) = pending.pop() {
-            observe()?;
-            count += 1;
-            if depth > MAX_VALUE_TYPE_DEPTH || count > MAX_VALUE_TYPE_NODES {
-                return Err(E::from(ColumnValueTypeError::Type(
-                    if depth > MAX_VALUE_TYPE_DEPTH {
-                        ValueTypeError::TooDeep
-                    } else {
-                        ValueTypeError::TooManyNodes
-                    },
-                )));
-            }
-            match declaration {
-                SqlType::Array(item) => pending.push((item, depth + 1)),
-                SqlType::Map(key, value) => {
-                    pending.push((value, depth + 1));
-                    pending.push((key, depth + 1));
-                }
-                SqlType::Struct(fields) => {
-                    for (_, item) in fields.iter().rev() {
-                        observe()?;
-                        pending.push((item, depth + 1));
-                    }
-                }
-                _ => {}
-            }
-        }
+        validate_arrow_layout_structure_observed(&self.data_type, |_| observe())?;
         let value = match &self.logical_type {
-            None => FunctionValueType::new(self.data_type.clone(), self.nullable),
-            Some(declaration) => FunctionValueType {
-                data_type: project(&self.data_type, declaration, &mut observe)?,
-                nullable: self.nullable,
-                logical_type: root(declaration),
-            },
-        };
-        observe()?;
-        value
-            .logical_type
-            .validate_carrier(&value.data_type)
+            None => FunctionValueType::try_with_logical_type(
+                self.data_type.clone(),
+                self.nullable,
+                ValueLogicalType::Physical,
+            )
             .map_err(ColumnValueTypeError::from)
-            .map_err(E::from)?;
-        validate_nested_logical_types_observed(&value.data_type, &mut observe)?;
+            .map_err(E::from)?,
+            Some(declaration) => {
+                validate_execution_declaration_observed(declaration, || {
+                    observe().map_err(DeclarationWalkError::Caller)
+                })
+                .map_err(|error| match error {
+                    DeclarationWalkError::Caller(error) => error,
+                    DeclarationWalkError::Source(error) => {
+                        E::from(ColumnValueTypeError::from(error))
+                    }
+                })?;
+                observe()?;
+                let binding = execution_value_type_from_declaration(
+                    declaration,
+                    &self.data_type,
+                    self.nullable,
+                    ValueTypeStorageLifetime::pure(),
+                )
+                .map_err(ColumnValueTypeError::from)
+                .map_err(E::from)?;
+                FunctionValueType::try_from_typed_binding(binding)
+                    .map_err(ColumnValueTypeError::from)
+                    .map_err(E::from)?
+            }
+        };
+        // Retained construction work remains under this caller's observation.
+        novarocks_type_contract::visit_value_type_observed(value.value_type(), |_| observe())?;
         observe()?;
         Ok(value)
     }
 }
 
-fn project<E: From<ColumnValueTypeError> + From<ValueTypeError>>(
-    source: &DataType,
-    declaration: &SqlType,
-    observe: &mut impl FnMut() -> Result<(), E>,
-) -> Result<DataType, E> {
-    observe()?;
-    root(declaration)
-        .validate_carrier(source)
-        .map_err(ColumnValueTypeError::from)
-        .map_err(E::from)?;
-    let mismatch = || E::from(ColumnValueTypeError::DeclarationMismatch);
-    Ok(match (source, declaration) {
-        (DataType::List(item), SqlType::Array(declaration)) => {
-            DataType::List(project_field(item, declaration, observe)?)
-        }
-        (DataType::LargeList(item), SqlType::Array(declaration)) => {
-            DataType::LargeList(project_field(item, declaration, observe)?)
-        }
-        (DataType::FixedSizeList(item, size), SqlType::Array(declaration)) => {
-            DataType::FixedSizeList(project_field(item, declaration, observe)?, *size)
-        }
-        (DataType::Map(entries, sorted), SqlType::Map(key, value)) => {
-            let DataType::Struct(fields) = entries.data_type() else {
-                return Err(mismatch());
-            };
-            if fields.len() != 2 {
-                return Err(mismatch());
-            }
-            let fields = Fields::from(vec![
-                project_field(&fields[0], key, observe)?,
-                project_field(&fields[1], value, observe)?,
-            ]);
-            DataType::Map(
-                Arc::new(
-                    entries
-                        .as_ref()
-                        .clone()
-                        .with_data_type(DataType::Struct(fields)),
-                ),
-                *sorted,
-            )
-        }
-        (DataType::Struct(fields), SqlType::Struct(declarations)) => {
-            if fields.len() != declarations.len() {
-                return Err(mismatch());
-            }
-            let mut projected = Vec::with_capacity(fields.len());
-            for (field, (name, declaration)) in fields.iter().zip(declarations) {
-                observe()?;
-                if field.name() != name {
-                    return Err(mismatch());
-                }
-                projected.push(project_field(field, declaration, observe)?);
-            }
-            DataType::Struct(Fields::from(projected))
-        }
-        (_, SqlType::Array(_) | SqlType::Map(_, _) | SqlType::Struct(_)) => return Err(mismatch()),
-        (
-            DataType::List(_)
-            | DataType::LargeList(_)
-            | DataType::FixedSizeList(_, _)
-            | DataType::Map(_, _)
-            | DataType::Struct(_),
-            _,
-        ) => return Err(mismatch()),
-        _ => source.clone(),
-    })
+enum DeclarationWalkError<E> {
+    Caller(E),
+    Source(ExecutionColumnTypeError),
 }
-fn project_field<E: From<ColumnValueTypeError> + From<ValueTypeError>>(
-    source: &Field,
-    declaration: &SqlType,
-    observe: &mut impl FnMut() -> Result<(), E>,
-) -> Result<Arc<Field>, E> {
-    observe()?;
-    let expected = root(declaration);
-    let actual = field_logical_type(source)
-        .map_err(ColumnValueTypeError::from)
-        .map_err(E::from)?;
-    if source.metadata().contains_key(NR_LOGICAL_TYPE_KEY) && actual != expected {
-        return Err(E::from(ColumnValueTypeError::DeclarationMismatch));
+impl<E> From<ExecutionColumnTypeError> for DeclarationWalkError<E> {
+    fn from(error: ExecutionColumnTypeError) -> Self {
+        Self::Source(error)
     }
-    let data_type = project(source.data_type(), declaration, observe)?;
-    let mut metadata = source.metadata().clone();
-    if let Some(tag) = expected.metadata_value() {
-        metadata.insert(NR_LOGICAL_TYPE_KEY.to_owned(), tag.to_owned());
-    }
-    observe()?;
-    Ok(Arc::new(
-        source
-            .clone()
-            .with_data_type(data_type)
-            .with_metadata(metadata),
-    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::Field;
+    use novarocks_type_contract::NR_LOGICAL_TYPE_KEY;
+    use std::sync::Arc;
+    #[test]
+    fn unrepresentable_scalar_retains_exact_carrier_class_at_nested_occurrences() {
+        for carrier in [DataType::Null, DataType::UInt64] {
+            let value = FunctionValueType::new(carrier.clone(), true);
+            assert_eq!(
+                sql_type_from_value_type(&value),
+                Err(ColumnValueTypeError::UnrepresentableCarrier(
+                    carrier.clone()
+                ))
+            );
+            let nested = FunctionValueType::new(
+                DataType::List(Arc::new(Field::new("item", carrier.clone(), true))),
+                false,
+            );
+            assert_eq!(
+                sql_type_from_value_type(&nested),
+                Err(ColumnValueTypeError::UnrepresentableCarrier(carrier))
+            );
+        }
+    }
     fn column(data_type: DataType, declaration: Option<SqlType>) -> ColumnDef {
         ColumnDef {
             name: "source".into(),
@@ -367,8 +216,8 @@ mod tests {
             let declared = column(carrier, Some(declaration))
                 .declared_value_type()
                 .unwrap();
-            assert_eq!(physical.logical_type, ValueLogicalType::Physical);
-            assert_eq!(declared.logical_type, expected);
+            assert_eq!(physical.logical_type(), ValueLogicalType::Physical);
+            assert_eq!(declared.logical_type(), expected);
             assert_ne!(physical, declared);
         }
         assert!(
@@ -388,11 +237,9 @@ mod tests {
             (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
             (DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
         ] {
-            let original = FunctionValueType {
-                data_type: carrier,
-                nullable: false,
-                logical_type: domain,
-            };
+            let original =
+                FunctionValueType::try_from_legacy_declared_projection(carrier, false, domain)
+                    .expect("valid temporary legacy value projection");
             let frozen =
                 ColumnDef::from_value_type("value".into(), original.clone(), None).unwrap();
             assert_eq!(frozen.declared_value_type().unwrap(), original);
@@ -404,20 +251,24 @@ mod tests {
             ]
             .into(),
         );
-        let original = FunctionValueType::new(DataType::LargeList(Arc::new(child)), true);
+        let original = FunctionValueType::from_legacy_declared_projection(
+            DataType::LargeList(Arc::new(child)),
+            true,
+        );
         let frozen = ColumnDef::from_value_type("nested".into(), original.clone(), None).unwrap();
         assert_eq!(frozen.declared_value_type().unwrap(), original);
-        let uuid = FunctionValueType {
-            data_type: DataType::FixedSizeBinary(16),
-            nullable: false,
-            logical_type: ValueLogicalType::Uuid,
-        };
+        let uuid = FunctionValueType::try_from_legacy_declared_projection(
+            DataType::FixedSizeBinary(16),
+            false,
+            ValueLogicalType::Uuid,
+        )
+        .expect("valid temporary legacy value projection");
         let column = ColumnDef::from_value_type("uuid".into(), uuid.clone(), None).unwrap();
         assert_eq!(column.logical_type, Some(SqlType::Uuid));
         assert_eq!(column.declared_value_type().unwrap(), uuid);
     }
     #[test]
-    fn declared_children_preserve_source_shape_and_provider_facts() {
+    fn declared_children_separate_semantics_layout_and_provider_facts() {
         let item = Field::new("provider_element", DataType::Utf8, false)
             .with_metadata([("provider.id".into(), "37".into())].into());
         let source = column(
@@ -425,38 +276,45 @@ mod tests {
             Some(SqlType::Array(Box::new(SqlType::Json))),
         );
         let ty = source.declared_value_type().unwrap();
-        let DataType::LargeList(item) = ty.data_type else {
-            panic!("source layout changed");
+        let DataType::LargeList(item) = ty.data_type() else {
+            panic!("layout changed");
         };
-        assert_eq!(item.name(), "provider_element");
+        assert_eq!(item.name(), "item");
         assert!(!item.is_nullable());
-        assert_eq!(item.metadata()["provider.id"], "37");
-        assert_eq!(field_logical_type(&item).unwrap(), ValueLogicalType::Json);
-        assert_eq!(ty.logical_type, ValueLogicalType::Physical);
+        assert!(item.metadata().is_empty());
+        assert_eq!(
+            ty.value_type().child_type_at(0).unwrap().domain(),
+            Some(ValueLogicalType::Json)
+        );
+        let DataType::LargeList(original) = &source.data_type else {
+            panic!("source changed");
+        };
+        assert_eq!(original.name(), "provider_element");
+        assert_eq!(original.metadata()["provider.id"], "37");
     }
     #[test]
-    fn existing_nested_domain_conflicts_and_unknown_tags_are_rejected() {
+    fn execution_domains_do_not_come_from_nested_annotations() {
         for tag in ["json", "not_a_domain"] {
-            let item = Field::new("item", DataType::Utf8, true)
+            let item = Field::new("provider_item", DataType::Utf8, true)
                 .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), tag.into())].into());
-            assert!(
-                column(
-                    DataType::List(Arc::new(item)),
-                    Some(SqlType::Array(Box::new(SqlType::String)))
-                )
-                .declared_value_type()
-                .is_err()
-            );
-        }
-        let item = Field::new("item", DataType::Utf8, true)
-            .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "json".into())].into());
-        let ty = column(DataType::List(Arc::new(item)), None)
+            let explicit = column(
+                DataType::List(Arc::new(item.clone())),
+                Some(SqlType::Array(Box::new(SqlType::String))),
+            )
             .declared_value_type()
             .unwrap();
-        let DataType::List(item) = ty.data_type else {
-            panic!("source layout changed")
-        };
-        assert_eq!(field_logical_type(&item).unwrap(), ValueLogicalType::Json);
+            let absent = column(DataType::List(Arc::new(item)), None)
+                .declared_value_type()
+                .unwrap();
+            for ty in [explicit, absent] {
+                assert_eq!(ty.value_type().child_type_at(0).unwrap().domain(), None);
+                let DataType::List(item) = ty.data_type() else {
+                    panic!("layout changed");
+                };
+                assert!(item.metadata().is_empty());
+                assert_eq!(item.name(), "item");
+            }
+        }
     }
     #[test]
     fn malformed_declaration_shapes_fail_before_a_value_is_returned() {

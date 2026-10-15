@@ -955,10 +955,9 @@ fn coalesce_zero(
 ) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     let zero = arena.intern_observed(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Int(0))),
-        novarocks_type_contract::FunctionValueType {
-            nullable: false,
-            ..output.value_type.clone()
-        },
+        (output.value_type.clone())
+            .with_nullable(false)
+            .expect("valid value root nullability transform"),
         control,
     )?;
     let args = vec![value, zero];
@@ -1237,7 +1236,7 @@ mod tests {
         AggregateCall {
             name: "sum".to_string(),
             distinct: false,
-            result_type: DataType::Int64,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             output_column_id: out.column_id,
             source: crate::binding::AggregateArgumentSource::uncertified(
                 vec![col_ref(arg)],
@@ -1251,7 +1250,7 @@ mod tests {
         AggregateCall {
             name: "count".to_string(),
             distinct: false,
-            result_type: DataType::Int64,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             output_column_id: out.column_id,
             source: crate::binding::AggregateArgumentSource::uncertified(
                 vec![],
@@ -2265,7 +2264,7 @@ mod tests {
         let candidate_for = |plan: &LogicalPlanNode| {
             let (mv, mv_scalars) = spjg_descriptor_for_test(plan);
             let mut target_table = iceberg_table("cat", "ns", "cnt_mv", &["a", "c"]);
-            target_table.columns[1].nullable = count_type.nullable;
+            target_table.columns[1].nullable = count_type.nullable();
             MvRewriteCandidate {
                 mv_name: "cnt_mv".to_string(),
                 mv,

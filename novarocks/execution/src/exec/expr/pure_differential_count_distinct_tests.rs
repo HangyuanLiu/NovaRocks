@@ -35,9 +35,12 @@ fn check(values: ArrayRef, nullable: bool) {
     );
     assert_eq!(summary.matched_failures, 0);
     assert_eq!(summary.null_results, 0);
-    assert_eq!(summary.result_type.data_type, DataType::Int64);
-    assert!(!summary.result_type.nullable);
-    assert_eq!(summary.pure_state_type.data_type, DataType::Binary);
+    assert_eq!(summary.result_type.data_type().clone(), DataType::Int64);
+    assert!(!summary.result_type.nullable());
+    assert_eq!(
+        summary.pure_state_type.data_type().clone(),
+        DataType::Binary
+    );
 }
 #[test]
 fn pure_differential_count_distinct_high_cardinality_duplicates_nulls_and_grouped_phases() {

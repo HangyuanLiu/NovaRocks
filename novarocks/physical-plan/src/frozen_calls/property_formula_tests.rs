@@ -235,8 +235,12 @@ fn table_fixture() -> Fixture {
             function: BoundTableFunction {
                 function_id: selected.function_id,
                 overload: selected.overload,
-                argument_types: Box::default(),
-                result_types: Box::from([integer()]),
+                argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    Box::default(),
+                ),
+                result_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from(
+                    [integer()],
+                )),
                 legacy_metadata: Some(crate::LegacyBindingMetadata {
                     volatility: selected.legacy_metadata.as_ref().unwrap().volatility,
                     argument_evaluation: selected
@@ -273,6 +277,7 @@ fn table_fixture() -> Fixture {
         fragment,
         uses,
         calls: vec![FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,

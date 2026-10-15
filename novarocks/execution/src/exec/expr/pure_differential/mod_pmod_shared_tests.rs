@@ -86,8 +86,8 @@ fn check(spec: ScalarDiffSpec) {
     );
     assert_eq!(s.legacy_batch_errors, 0);
     assert_eq!(s.attributed_row_errors, 0);
-    assert!(s.result_type.nullable);
-    assert_eq!(s.result_type.data_type, DataType::Float64);
+    assert!(s.result_type.nullable());
+    assert_eq!(s.result_type.data_type().clone(), DataType::Float64);
 }
 #[test]
 fn pure_differential_mod_pmod_all72_profiles_full_values_and_each_nullability_pair() {

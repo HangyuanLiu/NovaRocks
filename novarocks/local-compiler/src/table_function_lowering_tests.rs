@@ -418,7 +418,7 @@ fn fixture(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Fixture {
             Out::Key => TableFunctionOutput::PassThrough(key.expect("pass-through needs an input")),
             Out::Result(result) => {
                 let mut ty = results[*result as usize].clone();
-                ty.nullable |= shape.left_outer;
+                ty = ty.with_nullable(ty.nullable() || shape.left_outer).unwrap();
                 let value = builder
                     .add_value(
                         ty,
@@ -625,6 +625,7 @@ fn package(
         &fragment,
         &root_uses,
         vec![FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
@@ -787,7 +788,7 @@ fn table_function_lowers_to_an_argument_project_and_a_local_table_function() {
     assert_eq!(fn_result_slots.len(), 1);
     assert!(*fn_result_required);
     assert!(!*is_left_join);
-    assert_eq!(param_types, &[list_type().data_type]);
+    assert_eq!(param_types, &[list_type().data_type().clone()]);
     assert_eq!(ret_types, &[DataType::Int64]);
     assert_eq!(
         output_slot_sources,

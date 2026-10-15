@@ -52,6 +52,25 @@ pub(super) fn scope<T>(
     result
 }
 
+pub(super) fn created_scope<T, H>(
+    control: &dyn PureCompileControl,
+    body: impl FnOnce(
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<T, crate::FunctionBindingCreationFailure<H>>,
+) -> Result<T, crate::FunctionBindingCreationFailure<H>> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let result = body(&mut work);
+    if matches!(
+        &result,
+        Err(crate::FunctionBindingCreationFailure::Creator(_)
+            | crate::FunctionBindingCreationFailure::Resource(_)
+            | crate::FunctionBindingCreationFailure::Binding(FunctionBindingError::Control(_)))
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
 pub(super) fn value_type(
     value: &FunctionValueType,
     work: &mut CompileCheckpoints<'_>,
@@ -88,33 +107,132 @@ pub(super) fn request_types(
     Ok(())
 }
 
-pub(super) fn scalar_types(
-    request: FunctionBindingRequest<'_>,
+/// A closed, constant-size view of complete scalar argument declarations.
+/// The request arm is published only after the original ordered Lambda gate.
+#[derive(Clone, Copy)]
+pub(super) struct ScalarTypes<'a>(ScalarTypeSource<'a>);
+#[derive(Clone, Copy)]
+enum ScalarTypeSource<'a> {
+    Values(&'a [FunctionValueType]),
+    Arguments(&'a [FunctionArgument]),
+}
+impl<'a> ScalarTypes<'a> {
+    pub(super) fn from_values(values: &'a [FunctionValueType]) -> Self {
+        Self(ScalarTypeSource::Values(values))
+    }
+    pub(super) fn len(self) -> usize {
+        match self.0 {
+            ScalarTypeSource::Values(values) => values.len(),
+            ScalarTypeSource::Arguments(arguments) => arguments.len(),
+        }
+    }
+    pub(super) fn get(self, index: usize) -> Option<&'a FunctionValueType> {
+        match self.0 {
+            ScalarTypeSource::Values(values) => values.get(index),
+            ScalarTypeSource::Arguments(arguments) => arguments.get(index).map(|argument| {
+                let FunctionArgument::Value { value_type, .. } = argument else {
+                    unreachable!("scalar request view passed the ordered Lambda gate")
+                };
+                value_type
+            }),
+        }
+    }
+    pub(super) fn iter(self) -> impl Clone + ExactSizeIterator<Item = &'a FunctionValueType> {
+        (0..self.len()).map(move |index| self.get(index).expect("scalar argument ordinal"))
+    }
+}
+
+/// Carrier projections borrow the same source; they do not clone DataType
+/// trees, allocate an index, or change the consumer's domain rules.
+#[derive(Clone, Copy)]
+pub(super) struct ScalarCarriers<'a>(ScalarCarrierSource<'a>);
+#[derive(Clone, Copy)]
+enum ScalarCarrierSource<'a> {
+    Values(ScalarTypes<'a>),
+    DataTypes(&'a [arrow_schema::DataType]),
+}
+impl<'a> ScalarCarriers<'a> {
+    pub(super) fn from_values(values: ScalarTypes<'a>) -> Self {
+        Self(ScalarCarrierSource::Values(values))
+    }
+    pub(super) fn from_data_types(types: &'a [arrow_schema::DataType]) -> Self {
+        Self(ScalarCarrierSource::DataTypes(types))
+    }
+    pub(super) fn len(self) -> usize {
+        match self.0 {
+            ScalarCarrierSource::Values(values) => values.len(),
+            ScalarCarrierSource::DataTypes(types) => types.len(),
+        }
+    }
+    pub(super) fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+    pub(super) fn get(self, index: usize) -> Option<&'a arrow_schema::DataType> {
+        match self.0 {
+            ScalarCarrierSource::Values(values) => {
+                values.get(index).map(FunctionValueType::data_type)
+            }
+            ScalarCarrierSource::DataTypes(types) => types.get(index),
+        }
+    }
+    pub(super) fn first(self) -> Option<&'a arrow_schema::DataType> {
+        self.get(0)
+    }
+    pub(super) fn iter(self) -> impl Clone + ExactSizeIterator<Item = &'a arrow_schema::DataType> {
+        (0..self.len()).map(move |index| self.get(index).expect("scalar carrier ordinal"))
+    }
+}
+impl std::ops::Index<usize> for ScalarCarriers<'_> {
+    type Output = arrow_schema::DataType;
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("scalar carrier ordinal")
+    }
+}
+
+pub(super) fn scalar_types<'a>(
+    request: FunctionBindingRequest<'a>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<FunctionValueType>, FunctionBindingError> {
-    let mut types = Vec::with_capacity(request.arguments.len());
+) -> Result<ScalarTypes<'a>, FunctionBindingError> {
     for argument in request.arguments {
         work.step()?;
         match argument {
-            FunctionArgument::Value { value_type, .. } => types.push(value_type.clone()),
+            FunctionArgument::Value { .. } => {}
             FunctionArgument::Lambda { .. } => {
                 return Err(FunctionBindingError::NoMatchingOverload);
             }
         }
     }
-    Ok(types)
+    Ok(ScalarTypes(ScalarTypeSource::Arguments(request.arguments)))
 }
 
 pub(super) fn argument_types(
     request: FunctionBindingRequest<'_>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<Box<[FunctionArgumentType]>, FunctionBindingError> {
+) -> Result<novarocks_type_contract::FunctionArgumentTypes, FunctionBindingError> {
+    argument_types_with_creation::<std::convert::Infallible>(request, work, None)
+        .map_err(crate::FunctionBindingCreationFailure::into_pure)
+}
+pub(super) fn argument_types_with_creation<H>(
+    request: FunctionBindingRequest<'_>,
+    work: &mut CompileCheckpoints<'_>,
+    mut creation: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+) -> Result<novarocks_type_contract::FunctionArgumentTypes, crate::FunctionBindingCreationFailure<H>>
+{
+    super::scalar_construction::with_binding_creation(
+        super::scalar_construction::borrow_creator(&mut creation),
+        work,
+        |cx| cx.array::<FunctionArgumentType>(request.arguments.len()),
+    )?;
     let mut result = Vec::with_capacity(request.arguments.len());
     for argument in request.arguments {
         work.step()?;
         result.push(argument.argument_type());
     }
-    Ok(result.into_boxed_slice())
+    super::scalar_construction::with_binding_creation(
+        super::scalar_construction::borrow_creator(&mut creation),
+        work,
+        |cx| cx.publish_arguments(result),
+    )
 }
 
 pub(super) fn exact_type(

@@ -120,10 +120,10 @@ pub(super) fn generated(ty: &FunctionValueType, n: usize) -> ArrayRef {
     use super::pure_differential::generate::{InputGenerator, InputProfile};
     // Physical FixedSizeBinary(16) has the same concrete carrier as the admitted
     // LARGEINT author. Equality does not reinterpret or normalize its bytes.
-    let generated_ty = if ty.data_type == DataType::FixedSizeBinary(16) {
+    let generated_ty = if *ty.data_type() == DataType::FixedSizeBinary(16) {
         FunctionValueType::try_with_logical_type(
-            ty.data_type.clone(),
-            ty.nullable,
+            ty.data_type().clone(),
+            ty.nullable(),
             ValueLogicalType::LargeInt,
         )
         .unwrap()
@@ -207,7 +207,7 @@ fn field_original_every_registered_flat_carrier_equal_self_preserves_meta() {
             let out = indices(raw(&[a.clone(), a.clone(), a.clone()]).unwrap());
             let expected = (0..a.len())
                 .map(|r| {
-                    if ty.data_type == DataType::Null || a.is_null(r) {
+                    if *ty.data_type() == DataType::Null || a.is_null(r) {
                         0
                     } else if let Some(f) = a.as_any().downcast_ref::<Float32Array>() {
                         i32::from(!f.value(r).is_nan())
@@ -250,21 +250,6 @@ fn field_original_arity_before_children_and_match_does_not_skip_tail() {
     assert_eq!(call(&arena, &args, &chunk).unwrap_err(), "invalid ExprId");
 }
 #[test]
-fn field_original_complete_mismatch_data_precedes_later_child_and_is_not_truncated() {
-    let zone = "unknown-long-zone".repeat(80);
-    let a: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![7]).with_timezone(zone));
-    let b: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![7]));
-    let expected = format!(
-        "field frozen argument mismatch: {:?}/1 vs {:?}/1",
-        a.data_type(),
-        b.data_type()
-    );
-    assert!(expected.len() > 512);
-    let (arena, mut args, chunk) = setup(&[a, b]);
-    args.push(ExprId(usize::MAX));
-    assert_eq!(call(&arena, &args, &chunk).unwrap_err(), expected);
-}
-#[test]
 fn field_original_pool_nonzero_ordinal_broadcast_preserves_first_candidate() {
     use super::pure_differential::constant_policy;
     struct Control;
@@ -297,4 +282,37 @@ fn field_original_pool_nonzero_ordinal_broadcast_preserves_first_candidate() {
         indices(call(&arena, &[first, args[0]], &chunk).unwrap()),
         vec![0, 1, 1, 0]
     );
+}
+
+#[test]
+fn field_original_complete_mismatch_data_precedes_later_child_and_is_not_truncated_layout_boundary_and_complete_diagnostic()
+ {
+    // Keep the original oversized input as a real construction refusal.
+    let oversized = DataType::Timestamp(
+        TimeUnit::Microsecond,
+        Some(("unknown-long-zone".repeat(80)).into()),
+    );
+    assert_eq!(
+        novarocks_type_contract::ValueLayout::try_new(
+            &oversized,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap_err(),
+        novarocks_type_contract::ExecutionValueTypeError::Invalid(
+            "value layout timezone exceeds the byte limit"
+        ),
+    );
+
+    let zone = "unknown-long-zone".repeat(60);
+    let a: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![7]).with_timezone(zone));
+    let b: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![7]));
+    let expected = format!(
+        "field frozen argument mismatch: {:?}/1 vs {:?}/1",
+        a.data_type(),
+        b.data_type()
+    );
+    assert!(expected.len() > 512);
+    let (arena, mut args, chunk) = setup(&[a, b]);
+    args.push(ExprId(usize::MAX));
+    assert_eq!(call(&arena, &args, &chunk).unwrap_err(), expected);
 }

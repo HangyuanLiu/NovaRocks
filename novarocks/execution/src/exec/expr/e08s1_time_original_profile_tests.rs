@@ -103,7 +103,9 @@ fn e08s1_time_original_profile_actual_roundtrip_loans_and_original_no_added_vali
         let FunctionResultType::Scalar(out) = &mut stale.selected.result_type else {
             unreachable!()
         };
-        out.nullable = false;
+        *out = out
+            .with_nullable(false)
+            .expect("valid test root nullability");
         original
             .admit_bound_lifecycle_observed(&stale, PureCallLifecycle::Scalar, &control)
             .unwrap();
@@ -128,11 +130,11 @@ fn e08s1_time_original_profile_all_six_declared_domains_nullable_axes_borrow_ori
                     unreachable!()
                 };
                 assert!(
-                    out.nullable,
+                    out.nullable(),
                     "original type author permits successful NULL for both families"
                 );
                 assert_eq!(
-                    out.data_type,
+                    out.data_type().clone(),
                     if name == "time_to_sec" {
                         DataType::Int64
                     } else {

@@ -27,8 +27,12 @@ use novarocks_execution::exec::expr::agg::{
 use novarocks_execution::exec::node::{ExecNodeKind, ExecPlanBuilder};
 use novarocks_execution::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use novarocks_execution::exec::pipeline::executor::execute_native_plan_with_pipeline;
-use novarocks_execution::exec::pipeline::operator::{Operator, ProcessorOperator};
-use novarocks_execution::exec::pipeline::operator_factory::OperatorFactory;
+use novarocks_execution::runtime::fragment::io::{
+    ExchangeFrame, ExchangeFrameTransmitter, ExchangeTransmitRejection, FragmentIoError,
+    FragmentResultSession, FragmentResultWriter, NoopFragmentEventSink, ResultAbort,
+    ResultWriteCredit, ResultWriteSpec, RootInputAdmission, RootInputAuthority, RootInputPermit,
+    RootProducerState, RootResultSession, RootResultWriteSpec,
+};
 use novarocks_execution::runtime::runtime_state::RuntimeState;
 use novarocks_execution::runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_physical_plan::{
@@ -52,8 +56,63 @@ use novarocks_spi::connector::{
 use novarocks_types::SlotId;
 
 use crate::fragment_decode_context::NativePlanDecodeContext;
-use crate::fragment_plan_decode::decode_node;
-use novarocks_native_adapter::fragment_sink::decode_fragment_sink_program;
+/// Exercise the same complete namespace and original-source decoders as task
+/// ingress with an actual BE tracker. Returned nodes/fields retain only their
+/// independently constructed immutable responsibilities.
+fn with_fragment_types<T>(
+    source: &plan::PlanFragment,
+    operation: impl FnOnce(
+        &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
+    ) -> Result<T, crate::fragment_error::NativeFragmentDecodeError>,
+) -> Result<T, crate::fragment_error::NativeFragmentDecodeError> {
+    let tracker =
+        novarocks_execution::runtime::mem_tracker::MemTracker::new_root("native roundtrip fixture");
+    let creation = crate::native_type_construction::NativeTypeConstruction::try_with_control(
+        tracker,
+        compile_control(),
+    )?;
+    let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
+    let mut resources = crate::fragment_type_decode::NativeDecodeResources::try_new(&creation)?;
+    resources.bind_function_catalog(&catalog);
+    let types = crate::fragment_type_decode::decode_fragment_type_owner(source, &mut resources)?;
+    let original =
+        crate::fragment_original_sources::decode_original_requests(source, &types, &mut resources)?;
+    let mut decoder = crate::fragment_type_decode::NativeTypeDecoder::Strong {
+        types: &types.execution,
+        original_requests: Some(original.as_ref()),
+        resources: &mut resources,
+    };
+    let result = operation(&mut decoder)?;
+    drop(decoder);
+    resources.finish()?;
+    Ok(result)
+}
+
+fn decode_node(
+    source: &plan::PlanFragment,
+    node: &plan::DistributedNode,
+    arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
+) -> Result<
+    crate::fragment_plan_decode::DecodedNode,
+    crate::fragment_error::NativeFragmentDecodeError,
+> {
+    with_fragment_types(source, |decoder| {
+        crate::fragment_plan_decode::decode_node_with_types(node, arena, ctx, decoder)
+    })
+}
+
+fn decode_typed_sink_program(
+    source: &plan::PlanFragment,
+    layout: &novarocks_execution::exec::chunk::SlotLayout,
+) -> Result<
+    novarocks_execution::exec::fragment::sink::FragmentSinkProgram,
+    crate::fragment_error::NativeFragmentDecodeError,
+> {
+    with_fragment_types(source, |decoder| {
+        crate::fragment_sink::decode_fragment_sink_program(source, layout, decoder)
+    })
+}
 
 fn compile_control() -> &'static dyn novarocks_type_contract::PureCompileControl {
     struct Control;
@@ -412,88 +471,317 @@ fn finish_result_plan_with_scalar_proof(
     plan_builder.finish_observed(compile_control()).unwrap()
 }
 
-#[derive(Clone, Default)]
-struct TestResultHandle(Arc<Mutex<Vec<Chunk>>>);
+// Test-side Arrow inspection runs on one dedicated consumer. Drivers publish
+// only their admitted input; the permit survives until that input really exits.
+#[derive(Default)]
+struct RoundtripResultState {
+    input: Option<(Chunk, RootInputPermit)>,
+    rows: Vec<Vec<Option<i64>>>,
+    finishing: bool,
+    aborted: bool,
+    exited: bool,
+    failure: Option<String>,
+}
 
-struct TestResultSinkFactory(TestResultHandle);
+struct RoundtripRootSession {
+    spec: RootResultWriteSpec,
+    authority: RootInputAuthority,
+    tracker: Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
+    state: Arc<(Mutex<RoundtripResultState>, std::sync::Condvar)>,
+    consumer: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
 
-impl OperatorFactory for TestResultSinkFactory {
-    fn name(&self) -> &str {
-        "TEST_RESULT_SINK"
+fn roundtrip_credit(
+    tracker: &Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
+    bytes: usize,
+) -> ResultWriteCredit {
+    let charge = i64::try_from(bytes).expect("fixture root credit is representable");
+    if let Err(error) = tracker.consume_and_check_limit_typed(charge) {
+        tracker.release(charge);
+        panic!("fixture root input admission failed: {error}");
     }
+    let tracker = tracker.clone();
+    ResultWriteCredit::new(bytes, move |released| {
+        tracker.release(i64::try_from(released).expect("admitted root credit extent"));
+    })
+}
 
-    fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(TestResultSink {
-            handle: self.0.clone(),
-            finished: false,
+impl RoundtripRootSession {
+    fn new(
+        spec: RootResultWriteSpec,
+        output_slots: Vec<SlotId>,
+        tracker: Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
+    ) -> Arc<Self> {
+        let initial = Arc::new(roundtrip_credit(
+            &tracker,
+            RootInputAuthority::initial_backing_bytes(),
+        ));
+        let authority = RootInputAuthority::try_new_retained(&spec, initial)
+            .expect("admitted fixture root issuer");
+        let state = Arc::new((
+            Mutex::new(RoundtripResultState::default()),
+            std::sync::Condvar::new(),
+        ));
+        let consumer_state = state.clone();
+        let observable = authority.observable();
+        let consumer = std::thread::spawn(move || {
+            loop {
+                let input = {
+                    let (state, ready) = &*consumer_state;
+                    let mut guard = state.lock().unwrap();
+                    while guard.input.is_none() && !guard.finishing && !guard.aborted {
+                        guard = ready.wait(guard).unwrap();
+                    }
+                    if let Some(input) = guard.input.take() {
+                        Some(input)
+                    } else {
+                        guard.exited = true;
+                        None
+                    }
+                };
+                let Some((chunk, permit)) = input else {
+                    observable.notify_observers();
+                    break;
+                };
+                let inspected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut rows = Vec::new();
+                    for row in 0..chunk.len() {
+                        rows.push(
+                            output_slots
+                                .iter()
+                                .map(|slot| {
+                                    let column = chunk
+                                        .column_by_slot_id(*slot)
+                                        .expect("original output slot");
+                                    let array = column
+                                        .as_any()
+                                        .downcast_ref::<Int64Array>()
+                                        .expect("original INT64 test output carrier");
+                                    (!array.is_null(row)).then(|| array.value(row))
+                                })
+                                .collect(),
+                        );
+                    }
+                    rows
+                }));
+                // Return the exact upstream position after the real Arrow
+                // input and every inspection borrow have gone away.
+                drop(chunk);
+                drop(permit);
+                let mut guard = consumer_state.0.lock().unwrap();
+                match inspected {
+                    Ok(rows) => guard.rows.extend(rows),
+                    Err(_) => {
+                        guard.failure = Some("fixture Arrow row inspection failed".into());
+                        guard.aborted = true;
+                    }
+                }
+                drop(guard);
+                observable.notify_observers();
+            }
+        });
+        Arc::new(Self {
+            spec,
+            authority,
+            tracker,
+            state,
+            consumer: Mutex::new(Some(consumer)),
         })
     }
 
-    fn is_sink(&self) -> bool {
-        true
+    fn finish_rows(&self) -> Vec<Vec<Option<i64>>> {
+        self.consumer
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .join()
+            .expect("the fixture consumer actually exited");
+        let mut state = self.state.0.lock().unwrap();
+        assert!(state.exited && state.finishing && !state.aborted);
+        assert!(state.failure.is_none(), "{:?}", state.failure);
+        assert!(state.input.is_none());
+        std::mem::take(&mut state.rows)
     }
 }
 
-struct TestResultSink {
-    handle: TestResultHandle,
-    finished: bool,
-}
-
-impl Operator for TestResultSink {
-    fn name(&self) -> &str {
-        "TEST_RESULT_SINK"
+impl RootResultSession for RoundtripRootSession {
+    fn spec(&self) -> &RootResultWriteSpec {
+        &self.spec
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn try_acquire_input(&self) -> Result<RootInputAdmission, FragmentIoError> {
+        if !self.authority.is_available() {
+            return Ok(RootInputAdmission::Blocked);
+        }
+        self.authority.try_acquire(roundtrip_credit(
+            &self.tracker,
+            self.authority.required_bytes(),
+        ))
     }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn writable_observable(&self) -> Arc<novarocks_execution::runtime::observable::Observable> {
+        self.authority.observable()
     }
-
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-}
-
-impl ProcessorOperator for TestResultSink {
-    fn need_input(&self) -> bool {
-        !self.finished
-    }
-
-    fn has_output(&self) -> bool {
-        false
-    }
-
-    fn push_chunk(
-        &mut self,
-        _state: &RuntimeState,
-        chunk: Chunk,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
-        self.handle.0.lock().unwrap().push(chunk);
+    fn submit_input(&self, chunk: Chunk, permit: RootInputPermit) -> Result<(), FragmentIoError> {
+        assert!(self.authority.owns(&permit));
+        let mut state = self.state.0.lock().unwrap();
+        assert!(!state.finishing && !state.aborted);
+        assert!(state.input.replace((chunk, permit)).is_none());
+        drop(state);
+        self.state.1.notify_one();
         Ok(())
     }
-
-    fn pull_chunk(
-        &mut self,
-        _state: &RuntimeState,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<Option<Chunk>> {
-        Ok(None)
-    }
-
-    fn set_finishing(
-        &mut self,
-        _state: &RuntimeState,
-    ) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
-        self.finished = true;
+    fn finish_input(&self) -> Result<(), FragmentIoError> {
+        self.state.0.lock().unwrap().finishing = true;
+        self.state.1.notify_one();
         Ok(())
+    }
+    fn producer_state(&self) -> RootProducerState {
+        let state = self.state.0.lock().unwrap();
+        if let Some(failure) = &state.failure {
+            RootProducerState::Failed(failure.clone())
+        } else if state.exited {
+            RootProducerState::ContextHeld
+        } else if state.finishing {
+            RootProducerState::Finishing
+        } else {
+            RootProducerState::Accepting
+        }
+    }
+    fn producer_exited(&self) -> bool {
+        self.state.0.lock().unwrap().exited
+    }
+    fn abort(&self, _: ResultAbort) {
+        self.state.0.lock().unwrap().aborted = true;
+        self.authority.close();
+        self.state.1.notify_one();
     }
 }
 
-fn encode_decode_execute(plan: &PhysicalPlan) -> (Vec<Chunk>, Vec<SlotId>, ExecNodeKind) {
+impl Drop for RoundtripRootSession {
+    fn drop(&mut self) {
+        self.state.0.lock().unwrap().aborted = true;
+        self.state.1.notify_one();
+        if let Some(consumer) = self.consumer.lock().unwrap().take() {
+            consumer.join().expect("fixture consumer shutdown");
+        }
+    }
+}
+
+struct RejectRoundtripLegacyIo;
+impl ExchangeFrameTransmitter for RejectRoundtripLegacyIo {
+    fn transmit(&self, _: ExchangeFrame) -> Result<(), ExchangeTransmitRejection> {
+        panic!("these local join fixtures have no exchange edge")
+    }
+}
+impl FragmentResultWriter for RejectRoundtripLegacyIo {
+    fn open(&self, _: ResultWriteSpec) -> Result<Arc<dyn FragmentResultSession>, FragmentIoError> {
+        panic!("the frozen root must use its exact bounded session")
+    }
+}
+
+fn lower_fixture_with_actual_creator(
+    plan: novarocks_execution::exec::node::ExecPlan,
+    sink: novarocks_local_program::StaticSinkProgram,
+) -> (
+    novarocks_local_program::LocalProgramGraph,
+    novarocks_execution::exec::node::LocalRuntimeBindings,
+) {
+    try_lower_fixture_with_actual_creator(plan, sink).unwrap()
+}
+
+fn try_lower_fixture_with_actual_creator(
+    plan: novarocks_execution::exec::node::ExecPlan,
+    sink: novarocks_local_program::StaticSinkProgram,
+) -> Result<
+    (
+        novarocks_local_program::LocalProgramGraph,
+        novarocks_execution::exec::node::LocalRuntimeBindings,
+    ),
+    novarocks_execution::exec::node::LocalProgramCreationFailure<
+        crate::native_type_construction::NativeTypeConstructionError,
+    >,
+> {
+    use novarocks_execution::exec::node::{ExternalSinkRequirement, LocalLayoutCreation};
+    let creation = crate::native_type_construction::NativeTypeConstruction::try_with_control(
+        novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+            "native roundtrip local program creator",
+        ),
+        compile_control(),
+    )
+    .map_err(novarocks_execution::exec::node::LocalProgramCreationFailure::Creator)?;
+    let scope = creation
+        .begin_scope()
+        .map_err(novarocks_execution::exec::node::LocalProgramCreationFailure::Creator)?;
+    let temporary = creation
+        .begin_scope()
+        .map_err(novarocks_execution::exec::node::LocalProgramCreationFailure::Creator)?;
+    let mut temporary_request = |layout| temporary.request_layout(layout);
+    let mut request = |layout| scope.request_layout(layout);
+    let mut port = LocalLayoutCreation::new(
+        scope.storage_lifetime(),
+        &mut request,
+        &mut temporary_request,
+        compile_control(),
+    );
+    let profile = plan.local_compile_profile_with_creator(
+        std::num::NonZeroUsize::new(1).unwrap(),
+        None,
+        &mut port,
+    )?;
+    plan.into_local_program_and_bindings_with_creator(
+        profile,
+        std::collections::BTreeMap::new(),
+        vec![ExternalSinkRequirement::Result],
+        sink,
+        port,
+    )
+}
+
+// These five fixtures test client row output, with an independently
+// declared signed INT64 presentation. Freeze that purpose at the FE plan
+// boundary before encoding; the backend never invents or replaces it.
+fn freeze_i64_fixture_client_rows(plan: PhysicalPlan) -> PhysicalPlan {
+    use novarocks_result_contract::{
+        ClientRenderSchema, FrozenRootOutput, NativeRenderType, RenderColumn, RenderField,
+        RenderPresentation, RootOutputContract, RootProfileId,
+    };
+    let result = plan.result_port().expect("fixture client result port");
+    let columns = result
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(ordinal, field)| {
+            assert_eq!(
+                field.ty,
+                ValueType::new(DataType::Int64, field.ty.nullable()),
+                "client INT64 fixture retains its full independently declared value type"
+            );
+            RenderColumn {
+                source_ordinal: u32::try_from(ordinal).expect("fixture result ordinal"),
+                source_slot: None,
+                name: field.name.to_string(),
+                field: RenderField {
+                    nullable: field.ty.nullable(),
+                    native_type: NativeRenderType::SignedInteger(64),
+                    presentation: RenderPresentation::ScalarText,
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let schema = ClientRenderSchema::try_new(columns, result.fields.len())
+        .expect("the fixture's explicit ordered client presentation");
+    plan.with_root_output(RootOutputContract::new(
+        RootProfileId::V1,
+        FrozenRootOutput::ClientRows(schema),
+    ))
+    .expect("the complete FE plan validates its frozen client purpose")
+}
+
+fn encode_decode_execute(
+    plan: &PhysicalPlan,
+) -> (Vec<Vec<Option<i64>>>, Vec<SlotId>, ExecNodeKind) {
     let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
-    let encoded = novarocks_plan_codec::encode_physical_plan_v1(
+    let encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
         plan,
         &catalog,
         &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
@@ -504,6 +792,7 @@ fn encode_decode_execute(plan: &PhysicalPlan) -> (Vec<Chunk>, Vec<SlotId>, ExecN
     let fragment = &encoded.fragments[0];
     let mut arena = ExprArena::default();
     let decoded = decode_node(
+        fragment,
         fragment.root.as_ref().unwrap(),
         &mut arena,
         &NativePlanDecodeContext::default(),
@@ -511,34 +800,105 @@ fn encode_decode_execute(plan: &PhysicalPlan) -> (Vec<Chunk>, Vec<SlotId>, ExecN
     .unwrap();
     let output_slots = decoded.layout.order().to_vec();
     let root_kind = decoded.node.kind.clone();
+    use novarocks_execution::exec::fragment::program::{
+        FragmentContractVersion, FragmentProgram, FragmentProgramOptions, RuntimeFilterContract,
+    };
+    use novarocks_execution::runtime::fragment::{
+        BackendNum, ExchangeInputAssignments, FragmentInstanceId, FragmentInstanceSpec,
+        FragmentOutcome, FragmentPrepareContext, FragmentRuntimeOptions, FragmentSinkAssignment,
+        FragmentSubmission, ScanAssignments, prepare_fragment,
+    };
+    use novarocks_execution::runtime::query_options::QueryOptions;
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId, UniqueId,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::num::NonZeroUsize;
+
+    let sink = decode_typed_sink_program(fragment, &decoded.layout)
+        .unwrap()
+        .into_static()
+        .unwrap();
+    let novarocks_local_program::StaticSinkProgram::RootResult(contract) = &sink else {
+        panic!("a complete result port freezes its root contract")
+    };
+    let contract = contract.clone();
     let exec_plan = ExecPlanBuilder::new(arena, decoded.node).finish().unwrap();
-    let handle = TestResultHandle::default();
-    execute_native_plan_with_pipeline(
-        exec_plan,
-        false,
-        Duration::from_millis(10),
-        Box::new(TestResultSinkFactory(handle.clone())),
-        ExchangeBindings::default(),
-        ScanBindings::default(),
+    let (local, bindings) = lower_fixture_with_actual_creator(exec_plan, sink);
+    let program = Arc::new(
+        FragmentProgram::try_new(
+            Arc::new(local),
+            FragmentProgramOptions::new(FragmentContractVersion::CURRENT),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            RuntimeFilterContract::new(BTreeSet::new(), BTreeSet::new()),
+        )
+        .unwrap(),
+    );
+    let query_id = QueryId::new(6301, 6302);
+    let backend = BackendProcessId::new_v7();
+    // Each fixture invocation owns a distinct fragment registration, including
+    // when the original join cases run concurrently in the native test binary.
+    let (high, low) = backend.as_uuid().as_u64_pair();
+    let finst_id = UniqueId::new(high as i64, low as i64);
+    let task = novarocks_execution_contract::TaskIdentity::new(
+        QueryExecutionId::new(query_id, AttemptId::new(1).unwrap()).unwrap(),
+        StageId::new(1).unwrap(),
+        TaskId::new(1).unwrap(),
+        backend,
+    );
+    let instance = FragmentInstanceSpec::new_native(
+        FragmentContractVersion::CURRENT,
+        query_id,
+        FragmentInstanceId::new(finst_id),
+        ScanAssignments::default(),
+        ExchangeInputAssignments::default(),
+        FragmentSinkAssignment::None,
+        FragmentRuntimeOptions::new(QueryOptions::default(), false),
+        NonZeroUsize::new(1).unwrap(),
+        BackendNum::try_new(1).unwrap(),
+    );
+    let submission = FragmentSubmission::try_new(program, bindings, instance).unwrap();
+    let tracker =
+        novarocks_execution::runtime::mem_tracker::MemTracker::new_root("roundtrip execution");
+    let session = RoundtripRootSession::new(
+        RootResultWriteSpec { task, contract },
+        output_slots.clone(),
+        tracker.clone(),
+    );
+    let context = FragmentPrepareContext::without_runtime_filter(
         None,
-        None,
-        1,
-        Arc::new(RuntimeState::new(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(test_execution_runtime()),
-        )),
-        None,
-        None,
-        None,
+        Some(tracker.clone()),
+        Arc::new(RejectRoundtripLegacyIo),
+        Arc::new(RejectRoundtripLegacyIo),
+        Arc::new(NoopFragmentEventSink),
     )
-    .unwrap();
-    let chunks = std::mem::take(&mut *handle.0.lock().unwrap());
-    (chunks, output_slots, root_kind)
+    .with_fragment_commit_port(Arc::new(
+        novarocks_worker::sink_commit::WorkerSinkCommitPort,
+    ))
+    .with_execution_runtime(test_execution_runtime())
+    .with_result_identity(task)
+    .with_root_result_session(session.clone());
+    let dormant = prepare_fragment(submission, context).expect("public typed fragment preparation");
+    let running = dormant.start();
+    let terminal = running.join();
+    assert_eq!(terminal.query_id(), query_id);
+    assert_eq!(terminal.fragment_instance_id(), finst_id);
+    assert_eq!(
+        terminal.outcome(),
+        &FragmentOutcome::Succeeded,
+        "{terminal:?}"
+    );
+    let rows = session.finish_rows();
+    assert!(session.producer_exited());
+    drop(running);
+    drop(session);
+    assert_eq!(
+        tracker.current(),
+        0,
+        "the actual root input and issuer grants exited"
+    );
+    (rows, output_slots, root_kind)
 }
 
 fn test_execution_runtime() -> Arc<ExecutionRuntime> {
@@ -1211,7 +1571,7 @@ fn physical_plan_finish_encode_decode_preserves_transparent_duplicate_layout() {
         .unwrap();
     let physical = plan_builder.finish_observed(compile_control()).unwrap();
     let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
-    let encoded = novarocks_plan_codec::encode_physical_plan_v1(
+    let encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
         &physical,
         &catalog,
         &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
@@ -1222,6 +1582,7 @@ fn physical_plan_finish_encode_decode_preserves_transparent_duplicate_layout() {
     let wire_fragment = &encoded.fragments[0];
     let mut arena = ExprArena::default();
     let decoded = decode_node(
+        wire_fragment,
         wire_fragment.root.as_ref().unwrap(),
         &mut arena,
         &NativePlanDecodeContext::default(),
@@ -1304,7 +1665,7 @@ fn physical_plan_finish_encode_decode_preserves_set_op_fresh_output_layout() {
         .unwrap();
     let physical = plan_builder.finish_observed(compile_control()).unwrap();
     let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
-    let encoded = novarocks_plan_codec::encode_physical_plan_v1(
+    let encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
         &physical,
         &catalog,
         &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
@@ -1315,6 +1676,7 @@ fn physical_plan_finish_encode_decode_preserves_set_op_fresh_output_layout() {
     let wire_fragment = &encoded.fragments[0];
     let mut arena = ExprArena::default();
     let decoded = decode_node(
+        wire_fragment,
         wire_fragment.root.as_ref().unwrap(),
         &mut arena,
         &NativePlanDecodeContext::default(),
@@ -1332,7 +1694,7 @@ fn physical_plan_finish_encode_decode_preserves_set_op_fresh_output_layout() {
 fn physical_plan_finish_encode_decode_preserves_duplicate_router_occurrences() {
     let (physical, facts) = finish_duplicate_router_plan();
     let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
-    let encoded = novarocks_plan_codec::encode_physical_plan_v1(
+    let encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
         &physical,
         &catalog,
         &facts,
@@ -1354,12 +1716,13 @@ fn physical_plan_finish_encode_decode_preserves_duplicate_router_occurrences() {
 
     let mut arena = ExprArena::default();
     let decoded_root = decode_node(
+        source,
         source.root.as_ref().unwrap(),
         &mut arena,
         &NativePlanDecodeContext::default(),
     )
     .unwrap();
-    let program = decode_fragment_sink_program(source, &decoded_root.layout).unwrap();
+    let program = decode_typed_sink_program(source, &decoded_root.layout).unwrap();
     let novarocks_execution::exec::fragment::sink::FragmentSinkProgram::SplitDataStream(split) =
         program
     else {
@@ -1373,22 +1736,14 @@ fn physical_plan_finish_encode_decode_preserves_duplicate_router_occurrences() {
     );
 }
 
-fn assert_i64_rows(chunks: &[Chunk], output_slots: &[SlotId], expected: &[Vec<Option<i64>>]) {
-    let mut actual: Vec<Vec<Option<i64>>> = Vec::new();
-    for chunk in chunks {
-        for row in 0..chunk.len() {
-            actual.push(
-                output_slots
-                    .iter()
-                    .map(|slot| {
-                        let column = chunk.column_by_slot_id(*slot).unwrap();
-                        let array = column.as_any().downcast_ref::<Int64Array>().unwrap();
-                        (!array.is_null(row)).then(|| array.value(row))
-                    })
-                    .collect(),
-            );
-        }
-    }
+fn assert_i64_rows(
+    actual: &[Vec<Option<i64>>],
+    output_slots: &[SlotId],
+    expected: &[Vec<Option<i64>>],
+) {
+    // The bounded consumer already checked each original slot/carrier while
+    // its input permit was live; retain the exact row/NULL/order oracle here.
+    assert!(actual.iter().all(|row| row.len() == output_slots.len()));
     assert_eq!(actual, expected);
 }
 
@@ -1402,6 +1757,7 @@ fn physical_plan_hash_join_reorder_executes_through_terminal_projection() {
         23,
         HashJoinFixtureOutput::ReorderedPair,
     );
+    let physical = freeze_i64_fixture_client_rows(physical);
     let (chunks, slots, root) = encode_decode_execute(&physical);
     let ExecNodeKind::Project(project) = root else {
         panic!("published HashJoin output must be a terminal projection")
@@ -1426,6 +1782,7 @@ fn physical_plan_hash_join_broadcast_projection_decodes_and_executes() {
         0,
         HashJoinFixtureOutput::ReorderedPair,
     );
+    let physical = freeze_i64_fixture_client_rows(physical);
     let (chunks, slots, root) = encode_decode_execute(&physical);
     let ExecNodeKind::Project(project) = root else {
         panic!("published HashJoin output must be a terminal projection")
@@ -1450,6 +1807,7 @@ fn physical_plan_left_outer_nullable_projection_executes_after_residual_scope() 
         23,
         HashJoinFixtureOutput::NullableRight,
     );
+    let physical = freeze_i64_fixture_client_rows(physical);
     let (chunks, slots, root) = encode_decode_execute(&physical);
     let ExecNodeKind::Project(project) = root else {
         panic!("published outer-join output must be a terminal projection")
@@ -1496,6 +1854,7 @@ fn physical_plan_hash_join_semi_anti_preserved_sides_execute_losslessly() {
     ] {
         let physical =
             finish_hash_join_plan(id, kind, JoinDistribution::Singleton, left, right, output);
+        let physical = freeze_i64_fixture_client_rows(physical);
         let (chunks, slots, root) = encode_decode_execute(&physical);
         let ExecNodeKind::Project(project) = root else {
             panic!("published semi/anti output must be a terminal projection")
@@ -1508,6 +1867,7 @@ fn physical_plan_hash_join_semi_anti_preserved_sides_execute_losslessly() {
 #[test]
 fn physical_plan_nest_loop_subset_executes_through_terminal_projection() {
     let physical = finish_nest_loop_projection_plan(98);
+    let physical = freeze_i64_fixture_client_rows(physical);
     let (chunks, slots, root) = encode_decode_execute(&physical);
     let ExecNodeKind::Project(project) = root else {
         panic!("published NestLoopJoin output must be a terminal projection")
@@ -1540,7 +1900,7 @@ fn root_output_contract_crosses_physical_wire_and_static_sink_without_guessing_s
             source_slot: None,
             name: field.name.to_string(),
             field: RenderField {
-                nullable: field.ty.nullable,
+                nullable: field.ty.nullable(),
                 native_type: NativeRenderType::SignedInteger(64),
                 presentation: RenderPresentation::ScalarText,
             },
@@ -1566,7 +1926,7 @@ fn root_output_contract_crosses_physical_wire_and_static_sink_without_guessing_s
         FrozenRootOutput::CountOnly,
         FrozenRootOutput::ScalarValue(
             ScalarSchema::try_new(ScalarField {
-                nullable: physical.result_port().unwrap().fields[0].ty.nullable,
+                nullable: physical.result_port().unwrap().fields[0].ty.nullable(),
                 value_type: ScalarValueType::SignedInteger(64),
             })
             .unwrap(),
@@ -1586,7 +1946,7 @@ fn root_output_contract_crosses_physical_wire_and_static_sink_without_guessing_s
                 ))
                 .is_err()
         );
-        let encoded = novarocks_plan_codec::encode_physical_plan_v1(
+        let encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
             &physical,
             &catalog,
             &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
@@ -1597,12 +1957,13 @@ fn root_output_contract_crosses_physical_wire_and_static_sink_without_guessing_s
         let mut fragment = encoded.fragments[0].clone();
         let mut arena = ExprArena::default();
         let decoded = decode_node(
+            &fragment,
             fragment.root.as_ref().unwrap(),
             &mut arena,
             &NativePlanDecodeContext::default(),
         )
         .unwrap();
-        let program = decode_fragment_sink_program(&fragment, &decoded.layout).unwrap();
+        let program = decode_typed_sink_program(&fragment, &decoded.layout).unwrap();
         let FragmentSinkProgram::RootResult(contract) = &program else {
             panic!("expected frozen root");
         };
@@ -1619,7 +1980,7 @@ fn root_output_contract_crosses_physical_wire_and_static_sink_without_guessing_s
             );
             assert_eq!(
                 schema.field().nullable,
-                physical.result_port().unwrap().fields[0].ty.nullable
+                physical.result_port().unwrap().fields[0].ty.nullable()
             );
         }
         let StaticSinkProgram::RootResult(retained) = program.into_static().unwrap() else {
@@ -1629,27 +1990,22 @@ fn root_output_contract_crosses_physical_wire_and_static_sink_without_guessing_s
         let prepare = |fragment: &plan::PlanFragment| {
             let mut arena = ExprArena::default();
             let decoded = decode_node(
+                fragment,
                 fragment.root.as_ref().unwrap(),
                 &mut arena,
                 &NativePlanDecodeContext::default(),
             )
             .unwrap();
-            let sink = decode_fragment_sink_program(fragment, &decoded.layout)
+            let sink = decode_typed_sink_program(fragment, &decoded.layout)
                 .unwrap()
                 .into_static()
                 .unwrap();
             let plan = ExecPlanBuilder::new(arena, decoded.node).finish().unwrap();
-            let profile = plan
-                .local_compile_profile(std::num::NonZeroUsize::new(1).unwrap(), None)
-                .unwrap();
-            plan.into_local_program_and_bindings(
-                profile,
-                std::collections::BTreeMap::new(),
-                vec![novarocks_execution::exec::node::ExternalSinkRequirement::Result],
-                sink,
-            )
+            try_lower_fixture_with_actual_creator(plan, sink)
         };
-        let (local, _) = prepare(&fragment).unwrap();
+        let (local, _) = prepare(&fragment).unwrap_or_else(|error| {
+            panic!("actual {kind:?} root contract lowering failed: {error:?}")
+        });
         let Some(StaticSinkProgram::RootResult(local_contract)) = local.sink() else {
             panic!("lowering lost the immutable root output contract");
         };
@@ -1685,7 +2041,7 @@ fn root_output_contract_crosses_physical_wire_and_static_sink_without_guessing_s
             && let Some(schema) = wire.client_schema.as_mut()
         {
             schema.columns[0].source_slot = Some(u32::MAX);
-            assert!(decode_fragment_sink_program(&fragment, &decoded.layout).is_err());
+            assert!(decode_typed_sink_program(&fragment, &decoded.layout).is_err());
         }
         if let Some(plan::data_sink::Kind::RootResult(wire)) =
             fragment.sink.as_ref().unwrap().kind.as_ref()
@@ -1716,7 +2072,7 @@ fn root_output_contract_crosses_physical_wire_and_static_sink_without_guessing_s
                 unreachable!()
             };
             wire.scalar_schema.as_mut().unwrap().source_slot = Some(u32::MAX);
-            assert!(decode_fragment_sink_program(&corrupt, &decoded.layout).is_err());
+            assert!(decode_typed_sink_program(&corrupt, &decoded.layout).is_err());
         }
     }
 }
@@ -1773,14 +2129,13 @@ fn fixture_plain_scalar_schema(ty: &ValueType) -> Option<novarocks_result_contra
     use novarocks_result_contract::{
         ScalarField, ScalarSchema, ScalarTimestampUnit as U, ScalarValueType as S,
     };
-    let value_type = match &ty.data_type {
+    let value_type = match ty.data_type() {
         DataType::Null => S::Null,
         DataType::Boolean => S::Boolean,
         DataType::Int8 => S::SignedInteger(8),
         DataType::Int16 => S::SignedInteger(16),
         DataType::Int32 => S::SignedInteger(32),
         DataType::Int64 => S::SignedInteger(64),
-        DataType::FixedSizeBinary(16) => S::LargeInt,
         DataType::Float32 => S::Float32,
         DataType::Float64 => S::Float64,
         DataType::Utf8 => S::String,
@@ -1788,7 +2143,7 @@ fn fixture_plain_scalar_schema(ty: &ValueType) -> Option<novarocks_result_contra
         DataType::Date32 => S::Date,
         DataType::Time64(TimeUnit::Microsecond) => S::TimeMicros,
         DataType::Decimal128(p, s) | DataType::Decimal256(p, s) if *s >= 0 => S::Decimal {
-            bits: if matches!(ty.data_type, DataType::Decimal128(..)) {
+            bits: if matches!(ty.data_type(), DataType::Decimal128(..)) {
                 128
             } else {
                 256
@@ -1809,7 +2164,7 @@ fn fixture_plain_scalar_schema(ty: &ValueType) -> Option<novarocks_result_contra
         _ => return None,
     };
     ScalarSchema::try_new(ScalarField {
-        nullable: ty.nullable,
+        nullable: ty.nullable(),
         value_type,
     })
     .ok()
@@ -1860,7 +2215,7 @@ fn scalar_local_program_rejects_naked_domain_without_wire_guard() {
         }))
         .unwrap();
     let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
-    let encoded = novarocks_plan_codec::encode_physical_plan_v1(
+    let encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
         &physical,
         &catalog,
         &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
@@ -1871,27 +2226,18 @@ fn scalar_local_program_rejects_naked_domain_without_wire_guard() {
     let fragment = &encoded.fragments[0];
     let mut arena = ExprArena::default();
     let decoded = decode_node(
+        fragment,
         fragment.root.as_ref().unwrap(),
         &mut arena,
         &NativePlanDecodeContext::default(),
     )
     .unwrap();
-    let sink = decode_fragment_sink_program(fragment, &decoded.layout)
+    let sink = decode_typed_sink_program(fragment, &decoded.layout)
         .unwrap()
         .into_static()
         .unwrap();
     let plan = ExecPlanBuilder::new(arena, decoded.node).finish().unwrap();
-    let profile = plan
-        .local_compile_profile(std::num::NonZeroUsize::new(1).unwrap(), None)
-        .unwrap();
-    let (local, _) = plan
-        .into_local_program_and_bindings(
-            profile,
-            std::collections::BTreeMap::new(),
-            vec![novarocks_execution::exec::node::ExternalSinkRequirement::Result],
-            sink,
-        )
-        .unwrap();
+    let (local, _) = lower_fixture_with_actual_creator(plan, sink);
     let rebuild = |sink| {
         LocalProgramGraph::try_new_with_sink(
             local.nodes().to_vec(),
@@ -2080,7 +2426,7 @@ fn scalar_native_sink_decode_requires_schema_only_for_exact_scalar_purpose_and_s
         }))
         .unwrap();
     let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
-    let encoded = novarocks_plan_codec::encode_physical_plan_v1(
+    let encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
         &physical,
         &catalog,
         &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
@@ -2091,12 +2437,13 @@ fn scalar_native_sink_decode_requires_schema_only_for_exact_scalar_purpose_and_s
     let fragment = &encoded.fragments[0];
     let mut arena = ExprArena::default();
     let decoded = decode_node(
+        fragment,
         fragment.root.as_ref().unwrap(),
         &mut arena,
         &NativePlanDecodeContext::default(),
     )
     .unwrap();
-    assert!(decode_fragment_sink_program(fragment, &decoded.layout).is_ok());
+    assert!(decode_typed_sink_program(fragment, &decoded.layout).is_ok());
     let mut missing = fragment.clone();
     let Some(plan::data_sink::Kind::RootResult(wire)) =
         missing.sink.as_mut().unwrap().kind.as_mut()
@@ -2105,7 +2452,7 @@ fn scalar_native_sink_decode_requires_schema_only_for_exact_scalar_purpose_and_s
     };
     wire.scalar_schema = None;
     assert!(
-        decode_fragment_sink_program(&missing, &decoded.layout).is_err(),
+        decode_typed_sink_program(&missing, &decoded.layout).is_err(),
         "naked ScalarValueV1 has no semantic schema"
     );
     for kind in [
@@ -2122,7 +2469,7 @@ fn scalar_native_sink_decode_requires_schema_only_for_exact_scalar_purpose_and_s
         };
         wire.output_kind = Some(novarocks_proto_codec::root_result::encode_kind(kind));
         assert!(
-            decode_fragment_sink_program(&wrong, &decoded.layout).is_err(),
+            decode_typed_sink_program(&wrong, &decoded.layout).is_err(),
             "extra scalar schema on {kind:?}"
         );
     }
@@ -2133,7 +2480,7 @@ fn scalar_native_sink_decode_requires_schema_only_for_exact_scalar_purpose_and_s
     };
     wire.client_schema = Some(Default::default());
     assert!(
-        decode_fragment_sink_program(&both, &decoded.layout).is_err(),
+        decode_typed_sink_program(&both, &decoded.layout).is_err(),
         "scalar must not also carry a client schema"
     );
     for slot in [None, Some(u32::MAX)] {
@@ -2145,7 +2492,7 @@ fn scalar_native_sink_decode_requires_schema_only_for_exact_scalar_purpose_and_s
         };
         wire.scalar_schema.as_mut().unwrap().source_slot = slot;
         assert!(
-            decode_fragment_sink_program(&wrong, &decoded.layout).is_err(),
+            decode_typed_sink_program(&wrong, &decoded.layout).is_err(),
             "scalar source slot {slot:?}"
         );
     }
@@ -2155,7 +2502,7 @@ fn scalar_native_sink_decode_requires_schema_only_for_exact_scalar_purpose_and_s
         SlotLayout::for_slots([slot, SlotId::new(slot.as_u32() ^ 1)]),
     ] {
         assert!(
-            decode_fragment_sink_program(fragment, &layout).is_err(),
+            decode_typed_sink_program(fragment, &layout).is_err(),
             "scalar input layout must have exactly one slot"
         );
     }
@@ -2245,7 +2592,7 @@ fn exact_domain_result_plan(
         .unwrap();
     let scalar_schema = scalar.map(|value_type| {
         novarocks_result_contract::ScalarSchema::try_new(novarocks_result_contract::ScalarField {
-            nullable: ty.nullable,
+            nullable: ty.nullable(),
             value_type,
         })
         .unwrap()
@@ -2273,13 +2620,14 @@ fn exact_domain_result_plan(
 }
 
 #[test]
-fn exact_root_domains_survive_wire_owned_field_chunk_and_local_program() {
+fn complete_root_domains_survive_wire_field_chunk_and_local_program() {
     use novarocks_physical_plan::ResultValueDomain as D;
     use novarocks_proto_models::common::PrimitiveType as P;
     use novarocks_result_contract::{
         FrozenRootOutput, RootOutputContract, RootProfileId, ScalarOpaqueType as O,
         ScalarValueType as S,
     };
+    use novarocks_type_contract::ValueLogicalType;
     use novarocks_types::logical::{LogicalType as L, logical_type_of_field};
     let cases = [
         (D::Plain, DataType::Utf8, S::String, P::Varchar, None),
@@ -2322,10 +2670,24 @@ fn exact_root_domains_survive_wire_owned_field_chunk_and_local_program() {
         ),
     ];
     let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
-    for (index, (domain, storage, scalar, primitive, logical)) in cases.into_iter().enumerate() {
+    for (index, (domain, storage, scalar, _primitive, _logical)) in cases.into_iter().enumerate() {
+        // The actual scalar fixture declaration authors its value independently
+        // of the requested root presentation and misleading output name.
+        let declared_domain = match &scalar {
+            S::String | S::Binary => ValueLogicalType::Physical,
+            S::Json => ValueLogicalType::Json,
+            S::Variant => ValueLogicalType::Variant,
+            S::Opaque(O::Hll) => ValueLogicalType::Hll,
+            S::Opaque(O::Bitmap) => ValueLogicalType::Bitmap,
+            S::Opaque(O::Object) => ValueLogicalType::Object,
+            S::Opaque(O::Percentile) => ValueLogicalType::Percentile,
+            _ => unreachable!("fixture declares these scalar domains"),
+        };
+        let declaration =
+            ValueType::try_with_logical_type(storage.clone(), false, declared_domain).unwrap();
         let physical = exact_domain_result_plan(
             150 + index as u32,
-            ValueType::new(storage.clone(), false),
+            declaration.clone(),
             domain,
             Some(scalar.clone()),
             false,
@@ -2343,7 +2705,7 @@ fn exact_root_domains_survive_wire_owned_field_chunk_and_local_program() {
                 FrozenRootOutput::ScalarValue(proof),
             ))
             .unwrap();
-        let encoded = novarocks_plan_codec::encode_physical_plan_v1(
+        let encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
             &physical,
             &catalog,
             &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
@@ -2355,49 +2717,38 @@ fn exact_root_domains_survive_wire_owned_field_chunk_and_local_program() {
         let column = &fragment.output_columns[0];
         assert_eq!(column.name, "state");
         let desc = column.r#type.as_ref().unwrap();
-        let novarocks_proto_models::common::type_desc::Kind::Scalar(wire_scalar) =
-            desc.kind.as_ref().unwrap()
-        else {
-            panic!("expected scalar wire type")
-        };
-        assert_eq!(wire_scalar.r#type, primitive as i32, "{domain:?}");
-        let owned = novarocks_plan_codec::native_type::decode_field_type_owned(
-            &column.name,
-            column.nullable,
-            desc,
-        )
-        .unwrap();
-        assert_eq!(owned.field().data_type(), &storage);
-        assert_eq!(logical_type_of_field(owned.field()), logical, "{domain:?}");
-        assert!(
-            owned
-                .metadata_origins()
-                .metadata_bytes_for(owned.field())
-                .is_some()
-        );
-        let output = crate::fragment_layout::decode_output_layout(
-            &fragment.output_columns,
-            novarocks_proto_codec::FieldPath::root("output_columns"),
-        )
+        assert!(desc.value_binding_id.is_some());
+        let output = with_fragment_types(fragment, |decoder| {
+            let value = decoder
+                .value_type(
+                    desc,
+                    novarocks_proto_codec::FieldPath::root("output").field("type"),
+                )?
+                .expect("complete binding");
+            assert_eq!(value, declaration);
+            decoder.output_layout(
+                &fragment.output_columns,
+                novarocks_proto_codec::FieldPath::root("output_columns"),
+            )
+        })
         .unwrap();
         let chunk_schema = output.chunk_schema();
         assert_eq!(
             chunk_schema.slots()[0].field_schema().logical_type(),
-            logical
+            declaration.value_type().domain()
         );
-        assert_eq!(
-            logical_type_of_field(chunk_schema.slots()[0].field()),
-            logical
-        );
-        assert!(chunk_schema.slots()[0].metadata_origins().is_some());
+        assert_eq!(chunk_schema.slots()[0].field().data_type(), &storage);
+        assert_eq!(chunk_schema.slots()[0].field().metadata().capacity(), 0);
+        assert_eq!(logical_type_of_field(chunk_schema.slots()[0].field()), None);
         let mut arena = ExprArena::default();
         let decoded = decode_node(
+            &fragment,
             fragment.root.as_ref().unwrap(),
             &mut arena,
             &NativePlanDecodeContext::default(),
         )
         .unwrap();
-        let sink = decode_fragment_sink_program(fragment, &decoded.layout)
+        let sink = decode_typed_sink_program(fragment, &decoded.layout)
             .unwrap()
             .into_static()
             .unwrap();
@@ -2439,24 +2790,18 @@ fn exact_root_domains_survive_wire_owned_field_chunk_and_local_program() {
         );
         assert!(scalar.encoded_len().is_some());
         let exec = ExecPlanBuilder::new(arena, decoded.node).finish().unwrap();
-        let profile = exec
-            .local_compile_profile(std::num::NonZeroUsize::new(1).unwrap(), None)
-            .unwrap();
-        let (local, _) = exec
-            .into_local_program_and_bindings(
-                profile,
-                std::collections::BTreeMap::new(),
-                vec![novarocks_execution::exec::node::ExternalSinkRequirement::Result],
-                sink,
-            )
-            .unwrap();
+        let (local, _) = lower_fixture_with_actual_creator(exec, sink);
         let layout = local.nodes()[local.root().index()].output_layout();
         assert_eq!(
+            layout.value_binding_at(0).unwrap(),
+            declaration.typed_binding()
+        );
+        assert_eq!(
             logical_type_of_field(&layout.schema().fields()[0]),
-            logical,
+            None,
             "{domain:?}"
         );
-        assert!(layout.field_metadata_origins().is_some());
+        assert_eq!(layout.schema().fields()[0].metadata().capacity(), 0);
     }
 }
 
@@ -2491,7 +2836,7 @@ fn exact_root_domain_refuses_inconsistent_storage_without_offset_adaptation() {
             exact_domain_result_plan(161, ValueType::new(storage, false), domain, None, false)
                 .unwrap();
         assert!(
-            novarocks_plan_codec::encode_physical_plan_v1(
+            novarocks_plan_codec::encode_physical_plan_typed_pure(
                 &physical,
                 &catalog,
                 &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
@@ -2507,17 +2852,18 @@ fn exact_root_domain_refuses_inconsistent_storage_without_offset_adaptation() {
 #[test]
 fn root_domain_does_not_flow_to_an_intermediate_by_name_or_shared_value() {
     use novarocks_physical_plan::ResultValueDomain as D;
-    use novarocks_proto_models::common::{PrimitiveType as P, type_desc};
+    use novarocks_type_contract::ValueLogicalType;
     let physical = exact_domain_result_plan(
         162,
-        ValueType::new(DataType::Binary, false),
+        ValueType::try_with_logical_type(DataType::Binary, false, ValueLogicalType::Bitmap)
+            .unwrap(),
         D::Bitmap,
         None,
         true,
     )
     .unwrap();
     let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
-    let encoded = novarocks_plan_codec::encode_physical_plan_v1(
+    let encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
         &physical,
         &catalog,
         &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
@@ -2534,19 +2880,43 @@ fn root_domain_does_not_flow_to_an_intermediate_by_name_or_shared_value() {
         };
         payload.output_columns.clone()
     };
-    let primitive = |column: &novarocks_proto_models::common::OutputColumn| {
-        let type_desc::Kind::Scalar(scalar) =
-            column.r#type.as_ref().unwrap().kind.as_ref().unwrap()
-        else {
-            panic!("expected scalar type")
-        };
-        scalar.r#type
-    };
-    assert_eq!(primitive(&fragment.output_columns[0]), P::Bitmap as i32);
-    assert_eq!(primitive(&physical_columns(root)[0]), P::Bitmap as i32);
-    assert_eq!(
-        primitive(&physical_columns(&root.children[0])[0]),
-        P::Varbinary as i32
+    for column in [
+        &fragment.output_columns[0],
+        &physical_columns(root)[0],
+        &physical_columns(&root.children[0])[0],
+    ] {
+        with_fragment_types(fragment, |decoder| {
+            let value = decoder
+                .value_type(
+                    column.r#type.as_ref().unwrap(),
+                    novarocks_proto_codec::FieldPath::root("column"),
+                )?
+                .unwrap();
+            assert_eq!(value.value_type().domain(), Some(ValueLogicalType::Bitmap));
+            assert_eq!(value.data_type(), &DataType::Binary);
+            Ok(())
+        })
+        .unwrap();
+    }
+    // The root presentation is independent of the declaration carried by every
+    // occurrence of this actual value, including its intermediate use.
+    let wrong = exact_domain_result_plan(
+        164,
+        ValueType::new(DataType::Binary, false),
+        D::Bitmap,
+        None,
+        true,
+    )
+    .unwrap();
+    assert!(
+        novarocks_plan_codec::encode_physical_plan_typed_pure(
+            &wrong,
+            &catalog,
+            &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
+            false,
+            compile_control()
+        )
+        .is_err()
     );
     assert_eq!(
         physical_columns(root)[0].column_id,
@@ -2557,11 +2927,12 @@ fn root_domain_does_not_flow_to_an_intermediate_by_name_or_shared_value() {
 #[test]
 fn exact_aggregate_root_occurrence_has_the_same_domain_in_its_own_dto() {
     use novarocks_physical_plan::{AggregateGrouping, ResultValueDomain};
-    use novarocks_proto_models::common::{PrimitiveType, type_desc};
+    use novarocks_type_contract::ValueLogicalType;
     let id = FragmentId::new(163);
     let mut builder = FragmentBuilder::new(id);
     let source = builder.reserve_node_id().unwrap();
-    let ty = ValueType::new(DataType::Binary, false);
+    let ty = ValueType::try_with_logical_type(DataType::Binary, false, ValueLogicalType::Bitmap)
+        .unwrap();
     let source_value = builder
         .add_value(
             ty.clone(),
@@ -2640,7 +3011,7 @@ fn exact_aggregate_root_occurrence_has_the_same_domain_in_its_own_dto() {
         .unwrap();
     let physical = builder.finish().unwrap();
     let catalog = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
-    let encoded = novarocks_plan_codec::encode_physical_plan_v1(
+    let encoded = novarocks_plan_codec::encode_physical_plan_typed_pure(
         &physical,
         &catalog,
         &novarocks_plan_codec::NoPhysicalV1PrivateFacts,
@@ -2655,35 +3026,51 @@ fn exact_aggregate_root_occurrence_has_the_same_domain_in_its_own_dto() {
     let plan::plan_node::Kind::HashAggregate(aggregate) = payload.kind.as_ref().unwrap() else {
         panic!("expected aggregate")
     };
-    let primitive = |column: &novarocks_proto_models::common::OutputColumn| {
-        let type_desc::Kind::Scalar(scalar) =
-            column.r#type.as_ref().unwrap().kind.as_ref().unwrap()
-        else {
-            panic!("expected scalar type")
-        };
-        scalar.r#type
-    };
-    assert_eq!(
-        primitive(&payload.output_columns[0]),
-        PrimitiveType::Bitmap as i32
-    );
-    assert_eq!(
-        primitive(&aggregate.output_layout.as_ref().unwrap().group_key_columns[0]),
-        PrimitiveType::Bitmap as i32
-    );
+    for column in [
+        &payload.output_columns[0],
+        &aggregate.output_layout.as_ref().unwrap().group_key_columns[0],
+    ] {
+        with_fragment_types(&encoded.fragments[0], |decoder| {
+            let value = decoder
+                .value_type(
+                    column.r#type.as_ref().unwrap(),
+                    novarocks_proto_codec::FieldPath::root("group"),
+                )?
+                .unwrap();
+            assert_eq!(value, physical.result_port().unwrap().fields[0].ty);
+            Ok(())
+        })
+        .unwrap();
+    }
     assert_eq!(
         aggregate.output_layout.as_ref().unwrap().group_key_columns[0].column_id,
         payload.output_columns[0].column_id
     );
     let mut arena = ExprArena::default();
-    let decoded = decode_node(root, &mut arena, &NativePlanDecodeContext::default()).unwrap();
+    let decoded = decode_node(
+        &encoded.fragments[0],
+        root,
+        &mut arena,
+        &NativePlanDecodeContext::default(),
+    )
+    .unwrap();
     let ExecNodeKind::Aggregate(aggregation) = &decoded.node.kind else {
         panic!("expected aggregation")
     };
     assert_eq!(
-        novarocks_types::logical::logical_type_of_field(
-            aggregation.output_chunk_schema.slots()[0].field()
-        ),
-        Some(novarocks_types::logical::LogicalType::Bitmap)
+        aggregation.output_chunk_schema.slots()[0]
+            .field_schema()
+            .logical_type(),
+        Some(ValueLogicalType::Bitmap)
+    );
+    assert_eq!(
+        aggregation.output_chunk_schema.slots()[0]
+            .field()
+            .metadata()
+            .capacity(),
+        0
     );
 }
+
+#[path = "physical_v1_roundtrip/default_scalar_tests.rs"]
+mod default_scalar_tests;

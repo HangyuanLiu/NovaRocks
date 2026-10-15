@@ -21,14 +21,23 @@
 mod tests {
     use arrow::datatypes::DataType;
 
-    use super::super::{NativePlanDecodeContext, decode_node};
+    use super::super::{DecodedNode, NativePlanDecodeContext};
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
-    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr, plan};
 
+    fn decode_node(
+        node: &plan::DistributedNode,
+        arena: &mut ExprArena,
+        context: &NativePlanDecodeContext,
+    ) -> Result<DecodedNode, crate::fragment_error::NativeFragmentDecodeError> {
+        crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+            super::super::decode_node_with_types(node, arena, context, decoder)
+        })
+    }
+
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
-        encode_type(data_type).expect("encode type")
+        crate::fragment_expression::fixture_sources::type_desc(data_type)
     }
 
     fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
@@ -42,19 +51,32 @@ mod tests {
     }
 
     fn int_literal(value: i64) -> expr::Expr {
+        let literal = expr::LiteralExpr {
+            value: Some(common::LiteralValue {
+                value: Some(common::literal_value::Value::IntValue(value)),
+            }),
+        };
         expr::Expr {
-            r#type: Some(type_desc(&DataType::Int64)),
+            original_definition_id: None,
+            r#type: Some(
+                crate::fragment_expression::fixture_sources::type_desc_with_nullable(
+                    &DataType::Int64,
+                    false,
+                ),
+            ),
             nullable: false,
-            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-                value: Some(common::LiteralValue {
-                    value: Some(common::literal_value::Value::IntValue(value)),
-                }),
-            })),
+            kind: Some(expr::expr::Kind::ConstantReference(
+                crate::fragment_expression::fixture_sources::constant_reference(
+                    &DataType::Int64,
+                    &literal,
+                ),
+            )),
         }
     }
 
     fn column_ref(column_id: u32, data_type: DataType) -> expr::Expr {
         expr::Expr {
+            original_definition_id: None,
             r#type: Some(type_desc(&data_type)),
             nullable: true,
             kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {

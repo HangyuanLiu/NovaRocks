@@ -325,13 +325,46 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
         vec![],
     )
     .unwrap();
-    let public = ConnectorReadPublicFacts::try_new(
-        source,
-        None,
-        public_schema(),
-        vec![ValueLogicalType::Physical; 2],
+    // Independent provider facts keep their original attributes; only complete
+    // declarations author the metadata-free execution schema.
+    let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("v0", DataType::Int64, false),
+        Field::new("v1", DataType::Int64, false),
+    ]));
+    let execution = ConnectorReadExecutionSchema::try_new(
+        schema.clone(),
+        vec![int64(), int64()].into_boxed_slice(),
+        storage.clone(),
     )
     .unwrap();
+    let original_source = public_schema();
+    let shape = ConnectorSourceSchemaShape::try_new(schema, storage.clone()).unwrap();
+    let source_fields = [0_u32, 1]
+        .into_iter()
+        .map(|ordinal| {
+            ConnectorSourceFieldFacts::try_new(
+                vec![ordinal].into_boxed_slice(),
+                Some((ordinal + 1) as i32),
+                None,
+                HashMap::from([("provider.field-id".into(), (ordinal + 1).to_string())]),
+                &[],
+                storage.clone(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let source_schema = ConnectorSourceSchemaFacts::try_new(
+        shape,
+        original_source.metadata().clone(),
+        source_fields,
+        storage.clone(),
+    )
+    .unwrap();
+    let public =
+        ConnectorReadPublicFacts::try_new_typed(source, None, execution, source_schema, storage)
+            .unwrap();
     let scans = BTreeMap::from([(
         ProviderReadOccurrenceId::new(0),
         FrozenConnectorRead::try_new(scan, public).unwrap(),
@@ -519,9 +552,8 @@ fn options(dop: usize) -> LocalCompileOptions {
     }
 }
 
-/// One chunk of `(v0, v1)` rows exactly as the provider page converter
-/// presents it: the compiled scan layout, provider names and metadata
-/// included.
+/// One chunk of `(v0, v1)` rows under the complete compiled execution layout.
+/// Provider attributes remain independent source facts, outside this batch.
 pub(crate) fn scan_chunk(program: &LocalProgram, v0: &[i64], v1: &[i64]) -> Chunk {
     let scan = program
         .scan_inputs()
@@ -529,16 +561,15 @@ pub(crate) fn scan_chunk(program: &LocalProgram, v0: &[i64], v1: &[i64]) -> Chun
         .next()
         .expect("the fixture has one scan");
     let layout = program.graph().nodes()[scan.index()].output_layout();
-    let schema = ChunkSchema::from_compiled_layout(layout).expect("scan chunk schema");
     let batch = RecordBatch::try_new(
-        schema.arrow_schema_ref(),
+        layout.schema().clone(),
         vec![
             Arc::new(Int64Array::from(v0.to_vec())) as ArrayRef,
             Arc::new(Int64Array::from(v1.to_vec())) as ArrayRef,
         ],
     )
     .expect("scan batch");
-    Chunk::try_new_with_chunk_schema(batch, schema).expect("scan chunk")
+    crate::exec::chunk::typed_fixture::chunk(batch, layout.slots(), &[int64(), int64()])
 }
 
 /// Every output row as `(b, a)` cells, in emission order.
@@ -546,7 +577,7 @@ pub(crate) fn rows(chunks: &[Chunk]) -> Vec<(i64, i64)> {
     let mut rows = Vec::new();
     for chunk in chunks {
         let column = |index: usize| {
-            chunk.batch.columns()[index]
+            chunk.record_batch().columns()[index]
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .expect("Int64 column")
@@ -614,7 +645,8 @@ impl ScanStreamSource for FixtureStreamSource {
         &self,
         _budget: ConnectorPollBudget,
         _profile: Option<RuntimeProfile>,
-    ) -> Result<ScanOutputStream, String> {
+        _construction: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) -> crate::runtime::fragment::ExecutionResult<ScanOutputStream> {
         self.claims.fetch_add(1, Ordering::AcqRel);
         let chunks = self
             .chunks
@@ -635,7 +667,7 @@ struct FixtureStream {
 }
 
 impl Stream for FixtureStream {
-    type Item = Result<Chunk, String>;
+    type Item = crate::runtime::fragment::ExecutionResult<Chunk>;
 
     fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();

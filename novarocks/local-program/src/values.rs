@@ -23,15 +23,17 @@
 //! occupies a placeholder in an Arrow array; its column keeps only its constant
 //! cells, in row order and exactly in the column's frozen carrier.
 
-use std::fmt;
 use std::sync::Arc;
+use std::{alloc::Layout, fmt};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, ValueSchemaCreation,
+    ValueTypeStorageLifetime,
 };
 
 use crate::{ProgramExprId, StaticLayout};
+use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
 
 /// The frozen descriptor is capped at 16 MiB by task-codec. Values have an
 /// independent cap because Arrow materialization can expand the wire input.
@@ -42,16 +44,103 @@ pub struct StaticValues {
     backing: ValuesBacking,
     layout: StaticLayout,
     retained_bytes: usize,
+    storage: ValueTypeStorageLifetime,
 }
 
 #[derive(Clone, Debug)]
 enum ValuesBacking {
-    Batch(Arc<RecordBatch>),
+    Batch(StaticValueBatch),
     Cells {
         rows: usize,
         constants: Arc<[ArrayRef]>,
         dynamic: Arc<[StaticValuesCell]>,
     },
+}
+
+/// Independently retained immutable Values batch. The holder contains only the
+/// batch, its exact declared layout and finite original/creating responsibility.
+/// Neither a program nor a query/context is retained; owned Arrow escape is
+/// deliberately absent.
+#[derive(Clone, Debug)]
+pub struct StaticValueBatch(Arc<StaticValueBatchBacking>);
+#[derive(Debug)]
+struct StaticValueBatchBacking {
+    batch: RecordBatch,
+    layout: StaticLayout,
+    storage: ValueTypeStorageLifetime,
+}
+impl StaticValueBatch {
+    pub fn record_batch(&self) -> &RecordBatch {
+        &self.0.batch
+    }
+    pub fn layout(&self) -> &StaticLayout {
+        &self.0.layout
+    }
+    pub fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+        self.0.storage.clone()
+    }
+}
+
+#[derive(Debug)]
+pub enum ValuesCreationFailure<H> {
+    Values(StaticValuesError),
+    Control(CompileControlError),
+    Creator(H),
+    Resource(LayoutResourceError),
+}
+impl<H> From<StaticValuesError> for ValuesCreationFailure<H> {
+    fn from(e: StaticValuesError) -> Self {
+        Self::Values(e)
+    }
+}
+impl<H> From<CompileControlError> for ValuesCreationFailure<H> {
+    fn from(e: CompileControlError) -> Self {
+        Self::Control(e)
+    }
+}
+impl<H> From<LayoutResourceError> for ValuesCreationFailure<H> {
+    fn from(e: LayoutResourceError) -> Self {
+        Self::Resource(e)
+    }
+}
+impl<H: fmt::Display> fmt::Display for ValuesCreationFailure<H> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Values(e) => e.fmt(f),
+            Self::Control(e) => e.fmt(f),
+            Self::Creator(e) => e.fmt(f),
+            Self::Resource(e) => write!(f, "Values construction geometry: {e:?}"),
+        }
+    }
+}
+impl<H: std::error::Error + 'static> std::error::Error for ValuesCreationFailure<H> {}
+fn request<H>(
+    creation: &mut ValueSchemaCreation<'_, H>,
+    work: &mut Option<&mut CompileCheckpoints<'_>>,
+    layout: Layout,
+) -> Result<(), ValuesCreationFailure<H>> {
+    if let Some(work) = work {
+        work.flush()?;
+    }
+    creation
+        .request_layout(layout)
+        .map_err(ValuesCreationFailure::Creator)
+}
+fn pure<T>(
+    operation: impl FnOnce(
+        &mut ValueSchemaCreation<'_, std::convert::Infallible>,
+    ) -> Result<T, ValuesCreationFailure<std::convert::Infallible>>,
+) -> Result<T, ValuesCompileError> {
+    let mut request = |_: Layout| Ok::<_, std::convert::Infallible>(());
+    let mut opaque = |_: usize| Ok::<_, std::convert::Infallible>(());
+    let mut creation =
+        ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+    operation(&mut creation).map_err(|error| match error {
+        ValuesCreationFailure::Values(e) => ValuesCompileError::Values(e),
+        ValuesCreationFailure::Control(e) => ValuesCompileError::Control(e),
+        ValuesCreationFailure::Resource(e) => ValuesCompileError::Resource(e),
+        ValuesCreationFailure::Creator(never) => match never {},
+    })
 }
 
 /// One dynamic cell position and the main-arena definition its
@@ -106,6 +195,7 @@ impl std::error::Error for StaticValuesError {}
 pub enum ValuesCompileError {
     Values(StaticValuesError),
     Control(CompileControlError),
+    Resource(LayoutResourceError),
 }
 impl From<StaticValuesError> for ValuesCompileError {
     fn from(error: StaticValuesError) -> Self {
@@ -122,6 +212,7 @@ impl fmt::Display for ValuesCompileError {
         match self {
             Self::Values(error) => error.fmt(formatter),
             Self::Control(error) => error.fmt(formatter),
+            Self::Resource(error) => write!(formatter, "Values construction geometry: {error:?}"),
         }
     }
 }
@@ -130,18 +221,72 @@ impl std::error::Error for ValuesCompileError {
         match self {
             Self::Values(error) => Some(error),
             Self::Control(error) => Some(error),
+            Self::Resource(_) => None,
         }
     }
 }
 
 impl StaticValues {
+    pub fn try_new_with_creator<H>(
+        batch: RecordBatch,
+        layout: StaticLayout,
+        source: ValueTypeStorageLifetime,
+        creation: &mut ValueSchemaCreation<'_, H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ValuesCreationFailure<H>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        let result = Self::try_new_core(batch, layout, source, creation, Some(&mut work));
+        if result.is_err() {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
+    pub fn try_new_with_cells_with_creator<H>(
+        rows: usize,
+        constants: Vec<ArrayRef>,
+        dynamic: Vec<StaticValuesCell>,
+        layout: StaticLayout,
+        source: ValueTypeStorageLifetime,
+        creation: &mut ValueSchemaCreation<'_, H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ValuesCreationFailure<H>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        let result = Self::try_new_cells_core(
+            rows, constants, dynamic, layout, source, creation, &mut work,
+        );
+        if result.is_err() {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
+    pub fn batch_projection(&self) -> Option<StaticValueBatch> {
+        match &self.backing {
+            ValuesBacking::Batch(batch) => Some(batch.clone()),
+            ValuesBacking::Cells { .. } => None,
+        }
+    }
+    pub fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+        self.storage.clone()
+    }
+
     pub fn try_new(batch: RecordBatch, layout: StaticLayout) -> Result<Self, StaticValuesError> {
-        match Self::try_new_core(batch, layout, None) {
+        match pure(|creation| {
+            Self::try_new_core(
+                batch,
+                layout,
+                ValueTypeStorageLifetime::pure(),
+                creation,
+                None,
+            )
+        }) {
             Ok(value) => Ok(value),
             Err(ValuesCompileError::Values(error)) => Err(error),
             Err(ValuesCompileError::Control(_)) => {
-                unreachable!("legacy values have no compile control")
+                unreachable!("pure values have no compile control")
             }
+            Err(ValuesCompileError::Resource(_)) => Err(StaticValuesError::TooManyBytes),
         }
     }
 
@@ -151,7 +296,15 @@ impl StaticValues {
         control: &dyn PureCompileControl,
     ) -> Result<Self, ValuesCompileError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-        let result = Self::try_new_core(batch, layout, Some(&mut work));
+        let result = pure(|creation| {
+            Self::try_new_core(
+                batch,
+                layout,
+                ValueTypeStorageLifetime::pure(),
+                creation,
+                Some(&mut work),
+            )
+        });
         if matches!(&result, Err(ValuesCompileError::Control(_))) {
             return result;
         }
@@ -159,11 +312,13 @@ impl StaticValues {
         result
     }
 
-    fn try_new_core(
+    fn try_new_core<H>(
         batch: RecordBatch,
         layout: StaticLayout,
+        source: ValueTypeStorageLifetime,
+        creation: &mut ValueSchemaCreation<'_, H>,
         mut work: Option<&mut CompileCheckpoints<'_>>,
-    ) -> Result<Self, ValuesCompileError> {
+    ) -> Result<Self, ValuesCreationFailure<H>> {
         // Arrow's existing schema equality and retained-size traversal remain
         // opaque. These observations neither change their admission semantics
         // nor claim an internal quantum, unique ownership, or a MEM grant.
@@ -194,10 +349,30 @@ impl StaticValues {
         if let Some(work) = &mut work {
             work.flush()?;
         }
+        let storage = creation
+            .storage_lifetime()
+            .retaining_observed::<ValuesCreationFailure<H>>(&source, |layout| {
+                request(creation, &mut work, layout)
+            })?;
+        let storage = storage.retaining_observed::<ValuesCreationFailure<H>>(
+            &layout.storage_lifetime(),
+            |layout| request(creation, &mut work, layout),
+        )?;
+        request(
+            creation,
+            &mut work,
+            arc_layout(Layout::new::<StaticValueBatchBacking>())?,
+        )?;
+        let backing = StaticValueBatch(Arc::new(StaticValueBatchBacking {
+            batch,
+            layout: layout.clone(),
+            storage: storage.clone(),
+        }));
         let result = Self {
-            backing: ValuesBacking::Batch(Arc::new(batch)),
+            backing: ValuesBacking::Batch(backing),
             layout,
             retained_bytes,
+            storage,
         };
         if let Some(work) = &mut work {
             work.flush()?;
@@ -218,7 +393,17 @@ impl StaticValues {
         control: &dyn PureCompileControl,
     ) -> Result<Self, ValuesCompileError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-        let result = Self::try_new_cells_core(rows, constants, dynamic, layout, &mut work);
+        let result = pure(|creation| {
+            Self::try_new_cells_core(
+                rows,
+                constants,
+                dynamic,
+                layout,
+                ValueTypeStorageLifetime::pure(),
+                creation,
+                &mut work,
+            )
+        });
         if matches!(&result, Err(ValuesCompileError::Control(_))) {
             return result;
         }
@@ -226,13 +411,15 @@ impl StaticValues {
         result
     }
 
-    fn try_new_cells_core(
+    fn try_new_cells_core<H>(
         rows: usize,
         constants: Vec<ArrayRef>,
         dynamic: Vec<StaticValuesCell>,
         layout: StaticLayout,
+        source: ValueTypeStorageLifetime,
+        creation: &mut ValueSchemaCreation<'_, H>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<Self, ValuesCompileError> {
+    ) -> Result<Self, ValuesCreationFailure<H>> {
         let fields = layout.schema().fields();
         work.step()?;
         if dynamic.is_empty() {
@@ -241,6 +428,13 @@ impl StaticValues {
         if constants.len() != fields.len() {
             return Err(StaticValuesError::ColumnCoverage.into());
         }
+        work.flush()?;
+        creation
+            .request_layout(
+                Layout::array::<usize>(fields.len())
+                    .map_err(|_| LayoutResourceError::Arithmetic)?,
+            )
+            .map_err(ValuesCreationFailure::Creator)?;
         let mut per_column = Vec::new();
         per_column
             .try_reserve_exact(fields.len())
@@ -287,6 +481,35 @@ impl StaticValues {
                 .ok_or(StaticValuesError::TooManyBytes)?;
         }
         work.flush()?;
+        let storage = creation
+            .storage_lifetime()
+            .retaining_observed::<ValuesCreationFailure<H>>(&source, |layout| {
+                work.flush()?;
+                creation
+                    .request_layout(layout)
+                    .map_err(ValuesCreationFailure::Creator)
+            })?;
+        let storage = storage.retaining_observed::<ValuesCreationFailure<H>>(
+            &layout.storage_lifetime(),
+            |layout| {
+                work.flush()?;
+                creation
+                    .request_layout(layout)
+                    .map_err(ValuesCreationFailure::Creator)
+            },
+        )?;
+        creation
+            .request_layout(arc_layout(
+                Layout::array::<ArrayRef>(constants.len())
+                    .map_err(|_| LayoutResourceError::Arithmetic)?,
+            )?)
+            .map_err(ValuesCreationFailure::Creator)?;
+        creation
+            .request_layout(arc_layout(
+                Layout::array::<StaticValuesCell>(dynamic.len())
+                    .map_err(|_| LayoutResourceError::Arithmetic)?,
+            )?)
+            .map_err(ValuesCreationFailure::Creator)?;
         Ok(Self {
             backing: ValuesBacking::Cells {
                 rows,
@@ -295,20 +518,21 @@ impl StaticValues {
             },
             layout,
             retained_bytes,
+            storage,
         })
     }
 
     /// The complete constant batch, present exactly when no cell is dynamic.
     pub fn batch(&self) -> Option<&RecordBatch> {
         match &self.backing {
-            ValuesBacking::Batch(batch) => Some(batch),
+            ValuesBacking::Batch(batch) => Some(batch.record_batch()),
             ValuesBacking::Cells { .. } => None,
         }
     }
 
     pub fn backing(&self) -> StaticValuesBacking<'_> {
         match &self.backing {
-            ValuesBacking::Batch(batch) => StaticValuesBacking::Batch(batch),
+            ValuesBacking::Batch(batch) => StaticValuesBacking::Batch(batch.record_batch()),
             ValuesBacking::Cells {
                 rows,
                 constants,
@@ -323,7 +547,7 @@ impl StaticValues {
 
     pub fn num_rows(&self) -> usize {
         match &self.backing {
-            ValuesBacking::Batch(batch) => batch.num_rows(),
+            ValuesBacking::Batch(batch) => batch.record_batch().num_rows(),
             ValuesBacking::Cells { rows, .. } => *rows,
         }
     }
@@ -352,6 +576,117 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use novarocks_types::SlotId;
 
+    struct UninterruptedControl;
+    impl PureCompileControl for UninterruptedControl {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    struct Hold(Arc<std::sync::atomic::AtomicUsize>);
+    impl novarocks_type_contract::ValueTypeStorageHold for Hold {}
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    fn batch_and_layout() -> (RecordBatch, StaticLayout) {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let layout = StaticLayout::try_new(schema, Arc::from([SlotId::new(7)])).unwrap();
+        (batch, layout)
+    }
+    #[test]
+    fn independent_values_batch_preserves_original_and_new_creation_until_last_reference() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let original_drops = Arc::new(AtomicUsize::new(0));
+        let new_drops = Arc::new(AtomicUsize::new(0));
+        let original = ValueTypeStorageLifetime::held(Arc::new(Hold(original_drops.clone())));
+        let mut request = |_: Layout| Ok::<_, std::convert::Infallible>(());
+        let mut opaque = |_: usize| Ok::<_, std::convert::Infallible>(());
+        let mut creation = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::held(Arc::new(Hold(new_drops.clone()))),
+            &mut request,
+            &mut opaque,
+        );
+        let (batch, layout) = batch_and_layout();
+        let values = StaticValues::try_new_with_creator(
+            batch,
+            layout,
+            original,
+            &mut creation,
+            &UninterruptedControl,
+        )
+        .unwrap();
+        let projection = values.batch_projection().unwrap();
+        let cloned = projection.clone();
+        let pointer = values
+            .batch()
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .as_ptr();
+        drop(values);
+        drop(creation);
+        drop(projection);
+        assert_eq!(original_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(new_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            cloned
+                .record_batch()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .as_ptr(),
+            pointer
+        );
+        drop(cloned);
+        assert_eq!(original_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(new_drops.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn values_creator_refusal_precedes_holder_and_tail_control() {
+        struct StopAfterRequest(std::sync::atomic::AtomicBool);
+        impl PureCompileControl for StopAfterRequest {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err(CompileControlError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        #[derive(Debug, Eq, PartialEq)]
+        struct Refusal(u32);
+        let control = StopAfterRequest(std::sync::atomic::AtomicBool::new(false));
+        let mut request = |_: Layout| {
+            control.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(Refusal(41))
+        };
+        let mut opaque = |_: usize| Ok::<_, Refusal>(());
+        let mut creation =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+        let (batch, layout) = batch_and_layout();
+        assert!(matches!(
+            StaticValues::try_new_with_creator(
+                batch,
+                layout,
+                ValueTypeStorageLifetime::pure(),
+                &mut creation,
+                &control
+            ),
+            Err(ValuesCreationFailure::Creator(Refusal(41)))
+        ));
+    }
+
     #[test]
     fn static_values_clone_shares_arrow_buffers_without_runtime_charge() {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
@@ -368,7 +703,7 @@ mod tests {
         else {
             panic!("constant values keep a batch")
         };
-        assert!(Arc::ptr_eq(left, right));
+        assert!(Arc::ptr_eq(&left.0, &right.0));
         assert_eq!(values.retained_bytes(), cloned.retained_bytes());
     }
 
@@ -418,12 +753,19 @@ mod tests {
         let layout = StaticLayout::try_new(schema, Arc::from([SlotId::new(7)])).unwrap();
         (batch, layout)
     }
+    // Entry, schema equality before/after, retained traversal before/after,
+    // one structural step, the actual independent batch-holder request before
+    // allocation, construction completion, and the caller's final boundary.
+    const BATCH_COMPILE_CHECKPOINTS: &[u32] = &[0, 0, 0, 0, 0, 1, 0, 0, 0];
+
     #[test]
     fn compile_values_observe_opaque_boundaries_preserving_backing_and_legacy_charge() {
         let (batch, layout) = input();
         let array = batch.column(0).clone();
         let schema = batch.schema();
         let legacy = StaticValues::try_new(batch.clone(), layout.clone()).unwrap();
+        let creator_batch = batch.clone();
+        let creator_layout = layout.clone();
         let control = Control::default();
         let actual = StaticValues::try_new_for_compile(batch, layout, &control).unwrap();
         assert!(Arc::ptr_eq(actual.batch().unwrap().column(0), &array));
@@ -432,7 +774,43 @@ mod tests {
         assert_eq!(actual.batch(), legacy.batch());
         assert!(actual.dynamic_cells().is_empty());
         assert_eq!(actual.num_rows(), 3);
-        assert_eq!(*control.calls.lock().unwrap(), vec![0, 0, 0, 0, 0, 1, 0, 0]);
+        assert_eq!(
+            control.calls.lock().unwrap().as_slice(),
+            BATCH_COMPILE_CHECKPOINTS
+        );
+
+        // This explicit pure creator exposes the new operation itself. It is
+        // not a grant: request observes the sole real Arc holder and the exact
+        // control prefix before that allocation. The pure wrapper above uses
+        // this same construction body and retains the original Arrow backing.
+        let observed = Control::default();
+        let mut requests = Vec::new();
+        let mut request = |layout: Layout| {
+            requests.push((layout, observed.calls.lock().unwrap().clone()));
+            Ok::<_, std::convert::Infallible>(())
+        };
+        let mut opaque = |_: usize| Ok::<_, std::convert::Infallible>(());
+        let mut creation =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+        let observed_values = StaticValues::try_new_with_creator(
+            creator_batch,
+            creator_layout,
+            ValueTypeStorageLifetime::pure(),
+            &mut creation,
+            &observed,
+        )
+        .unwrap();
+        assert_eq!(observed_values.batch(), actual.batch());
+        assert_eq!(
+            observed.calls.lock().unwrap().as_slice(),
+            BATCH_COMPILE_CHECKPOINTS
+        );
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].0,
+            arc_layout(Layout::new::<StaticValueBatchBacking>()).unwrap()
+        );
+        assert_eq!(requests[0].1.as_slice(), &BATCH_COMPILE_CHECKPOINTS[..7]);
     }
     #[test]
     fn compile_values_refuse_every_boundary_with_original_cause_and_no_recheck() {
@@ -442,7 +820,7 @@ mod tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            for call in 1..=8 {
+            for call in 1..=BATCH_COMPILE_CHECKPOINTS.len() {
                 let (batch, layout) = input();
                 let control = Control {
                     calls: Default::default(),

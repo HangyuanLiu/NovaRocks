@@ -172,13 +172,10 @@ pub(super) fn node_core<'a, H>(
         }
         _ => {
             let leaf = if let Some(capture) = capture.as_mut() {
-                geometry::inspect_span_core(
+                geometry::inspect_span_pure(
                     span.data,
                     span.start,
                     span.len,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
                     Some(&mut |leaf| {
                         let partial = Node {
                             span,
@@ -194,15 +191,10 @@ pub(super) fn node_core<'a, H>(
                     work,
                 )?
             } else {
-                geometry::inspect_span(
-                    span.data,
-                    span.start,
-                    span.len,
-                    usize::MAX,
-                    usize::MAX,
-                    usize::MAX,
-                    work,
-                )?
+                geometry::inspect_span_pure::<std::convert::Infallible>(
+                    span.data, span.start, span.len, None, work,
+                )
+                .map_err(ProjectionFailure::without_host)?
             };
             result.buffers = leaf.buffers;
             result.body_bytes = leaf.body_bytes;
@@ -349,12 +341,27 @@ pub(super) fn inspect_with_host_in<H>(
 pub(super) fn inspect_core<H>(
     data: &ArrayData,
     limits: RecursivePoolWriteLimits,
+    capture: Option<&mut GeometryCapture<'_, H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Geometry, HostError<H>> {
+    inspect_policy_core(data, Some(limits), capture, work)
+}
+pub(super) fn inspect_pure(
+    data: &ArrayData,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Geometry, TypeCodecError> {
+    inspect_policy_core::<std::convert::Infallible>(data, None, None, work)
+        .map_err(ProjectionFailure::without_host)
+}
+fn inspect_policy_core<H>(
+    data: &ArrayData,
+    receiving: Option<RecursivePoolWriteLimits>,
     mut capture: Option<&mut GeometryCapture<'_, H>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Geometry, HostError<H>> {
     let policy = crate::ipc_schema_v2::owner_admission::Policy(capture.is_some());
     let add = |a, b| policy.numeric(add(a, b));
-    if data.len() > limits.flat.max_rows {
+    if receiving.is_some_and(|limits| data.len() > limits.flat.max_rows) {
         return Err((if policy.0 {
             novarocks_type_contract::CompileControlError::ResourceExhausted.into()
         } else {
@@ -388,11 +395,12 @@ pub(super) fn inspect_core<H>(
         if let Some(work) = step.as_deref_mut() {
             work.step()?;
         }
-        if result.nodes > limits.max_field_nodes
-            || result.total_rows > limits.max_total_rows
-            || result.buffers > limits.flat.max_buffer_descriptors
-            || result.body_bytes > limits.flat.max_body_bytes
-            || i64::try_from(result.body_bytes).is_err()
+        if receiving.is_some_and(|limits| {
+            result.nodes > limits.max_field_nodes
+                || result.total_rows > limits.max_total_rows
+                || result.buffers > limits.flat.max_buffer_descriptors
+                || result.body_bytes > limits.flat.max_body_bytes
+        }) || i64::try_from(result.body_bytes).is_err()
             || u32::try_from(result.nodes).is_err()
             || u32::try_from(result.buffers).is_err()
         {

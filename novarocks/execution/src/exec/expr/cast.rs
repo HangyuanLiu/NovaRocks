@@ -908,8 +908,10 @@ fn cast_timestamp_to_utf8_array(
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-fn field_has_json_semantics(field_schema: Option<&ChunkFieldSchema>) -> bool {
-    field_schema.is_some_and(ChunkFieldSchema::json_semantic)
+fn field_has_json_semantics(field_schema: Option<&novarocks_type_contract::ValueTypeRef>) -> bool {
+    field_schema.is_some_and(|schema| {
+        schema.domain() == Some(novarocks_type_contract::ValueLogicalType::Json)
+    })
 }
 
 fn format_json_value_for_cast(value: &JsonValue, out: &mut String) -> Result<(), String> {
@@ -1017,7 +1019,7 @@ fn json_number_to_integral_string(value: &serde_json::Number) -> Option<String> 
 fn cast_json_values_to_list(
     values: &[Option<JsonValue>],
     target_field: Arc<Field>,
-    target_field_schema: Option<&ChunkFieldSchema>,
+    target_field_schema: Option<&novarocks_type_contract::ValueTypeRef>,
 ) -> Result<ArrayRef, String> {
     let mut flat_values = Vec::<Option<JsonValue>>::new();
     let mut offsets = Vec::with_capacity(values.len() + 1);
@@ -1050,7 +1052,7 @@ fn cast_json_values_to_list(
     let cast_values = cast_json_values_to_target(
         &flat_values,
         target_field.data_type(),
-        target_field_schema.and_then(ChunkFieldSchema::list_item),
+        target_field_schema.and_then(|schema| schema.child_type_at(0)),
     )?;
     let out = ListArray::new(
         target_field,
@@ -1064,7 +1066,7 @@ fn cast_json_values_to_list(
 fn cast_json_values_to_struct(
     values: &[Option<JsonValue>],
     target_fields: Fields,
-    target_field_schema: Option<&ChunkFieldSchema>,
+    target_field_schema: Option<&novarocks_type_contract::ValueTypeRef>,
 ) -> Result<ArrayRef, String> {
     let field_count = target_fields.len();
     let mut field_values = vec![Vec::<Option<JsonValue>>::with_capacity(values.len()); field_count];
@@ -1098,7 +1100,7 @@ fn cast_json_values_to_struct(
         casted_fields.push(cast_json_values_to_target(
             &field_values[idx],
             field.data_type(),
-            target_field_schema.and_then(|schema| schema.struct_child(idx)),
+            target_field_schema.and_then(|schema| schema.child_type_at(idx)),
         )?);
     }
     let out = StructArray::new(target_fields, casted_fields, struct_nulls.finish());
@@ -1109,7 +1111,7 @@ fn cast_json_values_to_map(
     values: &[Option<JsonValue>],
     entries_field: Arc<Field>,
     ordered: bool,
-    target_field_schema: Option<&ChunkFieldSchema>,
+    target_field_schema: Option<&novarocks_type_contract::ValueTypeRef>,
 ) -> Result<ArrayRef, String> {
     let DataType::Struct(entry_fields) = entries_field.data_type() else {
         return Err("CAST MAP target entries field must be STRUCT".to_string());
@@ -1154,7 +1156,7 @@ fn cast_json_values_to_map(
     let casted_values = cast_json_values_to_target(
         &value_values,
         value_field.data_type(),
-        target_field_schema.and_then(ChunkFieldSchema::map_value),
+        target_field_schema.and_then(|schema| schema.child_type_at(1)),
     )?;
     let entries = StructArray::new(entry_fields.clone(), vec![casted_keys, casted_values], None);
     let map = MapArray::new(
@@ -1170,7 +1172,7 @@ fn cast_json_values_to_map(
 fn cast_json_values_to_target(
     values: &[Option<JsonValue>],
     target_type: &DataType,
-    target_field_schema: Option<&ChunkFieldSchema>,
+    target_field_schema: Option<&novarocks_type_contract::ValueTypeRef>,
 ) -> Result<ArrayRef, String> {
     match target_type {
         DataType::Utf8 => {
@@ -1228,7 +1230,7 @@ fn cast_json_values_to_target(
 fn cast_utf8_json_to_target(
     array: &ArrayRef,
     target_type: &DataType,
-    target_field_schema: Option<&ChunkFieldSchema>,
+    target_field_schema: Option<&novarocks_type_contract::ValueTypeRef>,
 ) -> Result<ArrayRef, String> {
     let arr = array
         .as_any()
@@ -1459,7 +1461,7 @@ pub fn cast_with_special_rules(
 fn cast_with_special_rules_with_field_schema(
     array: &ArrayRef,
     target_type: &DataType,
-    target_field_schema: Option<&ChunkFieldSchema>,
+    target_field_schema: Option<&novarocks_type_contract::ValueTypeRef>,
 ) -> Result<ArrayRef, String> {
     if array.data_type() == target_type {
         return Ok(array.clone());
@@ -1693,18 +1695,28 @@ fn cast_with_special_rules_with_field_schema(
         {
             cast_largeint_binary_to_boolean(array)
         }
-        (DataType::Utf8, DataType::List(target_field)) => {
+        (DataType::Utf8, DataType::List(target_field))
+            if novarocks_type_contract::default_json_structure_carrier_cast_supported(
+                array.data_type(),
+                target_type,
+            ) =>
+        {
             if let Some(out) = try_cast_utf8_json_array_to_list(
                 array,
                 target_field.clone(),
-                target_field_schema.and_then(ChunkFieldSchema::list_item),
+                target_field_schema.and_then(|schema| schema.child_type_at(0)),
             )? {
                 Ok(out)
             } else {
                 cast(array.as_ref(), target_type).map_err(|e| e.to_string())
             }
         }
-        (DataType::Utf8, DataType::Struct(_)) | (DataType::Utf8, DataType::Map(_, _)) => {
+        (DataType::Utf8, DataType::Struct(_)) | (DataType::Utf8, DataType::Map(_, _))
+            if novarocks_type_contract::default_json_structure_carrier_cast_supported(
+                array.data_type(),
+                target_type,
+            ) =>
+        {
             cast_utf8_json_to_target(array, target_type, target_field_schema)
         }
         (DataType::List(source_field), DataType::Map(target_entries, ordered))
@@ -1717,7 +1729,7 @@ fn cast_with_special_rules_with_field_schema(
                 cast_with_special_rules_with_field_schema(
                     child,
                     target,
-                    target_field_schema.and_then(ChunkFieldSchema::list_item),
+                    target_field_schema.and_then(|schema| schema.child_type_at(0)),
                 )
             })
         }
@@ -1891,7 +1903,7 @@ fn cast_boolean_to_decimal256_array(
 fn try_cast_utf8_json_array_to_list(
     child_array: &ArrayRef,
     target_field: Arc<Field>,
-    target_field_schema: Option<&ChunkFieldSchema>,
+    target_field_schema: Option<&novarocks_type_contract::ValueTypeRef>,
 ) -> Result<Option<ArrayRef>, String> {
     let arr = child_array
         .as_any()
@@ -2604,7 +2616,9 @@ pub fn eval(
         .data_type(cast_expr)
         .ok_or_else(|| "CAST missing target data type".to_string())?
         .clone();
-    let target_field_schema = arena.field_schema(cast_expr);
+    let target_field_schema = arena
+        .field_schema(cast_expr)
+        .map(ChunkFieldSchema::value_type);
     let source_type = arena
         .data_type(child)
         .ok_or_else(|| "CAST missing source data type".to_string())?;

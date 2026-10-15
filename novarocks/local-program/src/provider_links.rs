@@ -25,7 +25,7 @@ use std::{collections::BTreeMap, fmt};
 use novarocks_connector_contract::{ConnectorReadPublicFacts, ConnectorWriteRecipe};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
-    ValueTypeError, arrow_data_types_exact, arrow_fields_exact, field_logical_type,
+    ValueTypeError, arrow_data_types_exact, arrow_fields_exact,
 };
 
 use crate::{
@@ -52,6 +52,12 @@ impl From<CompileControlError> for ProviderLinkError {
         Self::Control(error)
     }
 }
+impl From<novarocks_type_contract::ExecutionValueTypeError> for ProviderLinkError {
+    fn from(error: novarocks_type_contract::ExecutionValueTypeError) -> Self {
+        Self::ValueType(ValueTypeError::from(error))
+    }
+}
+
 impl From<ValueTypeError> for ProviderLinkError {
     fn from(error: ValueTypeError) -> Self {
         Self::ValueType(error)
@@ -133,44 +139,70 @@ fn validate_core(
                     let ordinal = ordinal_id(id, ordinal)?;
                     let expected = binding.field();
                     work.step()?;
-                    // Either side of a writer value may admit more nulls than
-                    // the other; whether one row can be written is the
-                    // target's answer (the physical writer law). A nullable
-                    // value feeding a non-null field is therefore a declared
-                    // row obligation the writer checks before any provider
-                    // I/O, and a non-null value feeding a nullable field needs
-                    // none. Only the top-level nullability is relaxed: name,
-                    // carrier, nested fields and metadata stay exact.
-                    work.flush()?;
-                    let declared = (expected.is_nullable() != actual.is_nullable())
-                        .then(|| expected.clone().with_nullable(actual.is_nullable()));
-                    work.flush()?;
-                    require_field(
-                        id,
-                        ordinal,
-                        declared.as_ref().unwrap_or(expected),
-                        actual,
-                        work,
-                    )?;
-                    let site = ProgramChannelSite::Layout {
-                        node: id,
-                        role: ProgramChannelLayoutRole::WriterProjection,
-                        ordinal,
-                    };
-                    let ty = channel(channels, site, work)?;
-                    // A writer Field is the signed root-domain authority. Do
-                    // not confer LargeInt/Uuid/etc. from its physical carrier.
-                    work.flush()?;
-                    let logical = field_logical_type(expected);
-                    work.flush()?;
-                    let logical = logical?;
-                    let root_matches =
-                        logical == ty.logical_type && actual.is_nullable() == ty.nullable;
-                    work.step()?;
-                    if !root_matches {
-                        return Err(ProviderLinkError::TypeMismatch(site));
+                    if !projection.layout.is_typed() {
+                        return Err(ProviderLinkError::TypeMismatch(
+                            ProgramChannelSite::Layout {
+                                node: id,
+                                role: ProgramChannelLayoutRole::WriterProjection,
+                                ordinal,
+                            },
+                        ));
                     }
-                    require_carrier(expected.data_type(), ty, site, work)?;
+                    {
+                        let site = ProgramChannelSite::Layout {
+                            node: id,
+                            role: ProgramChannelLayoutRole::WriterProjection,
+                            ordinal,
+                        };
+                        let ty = channel(channels, site, work)?;
+                        let signed = binding
+                            .execution_type()
+                            .ok_or(ProviderLinkError::TypeMismatch(site))?;
+                        // The complete provider-signed value contract owns
+                        // semantics. Format attributes remain in the recipe.
+                        // Only root NULL differs as a writer row obligation.
+                        if actual.is_nullable() != ty.nullable()
+                            || !signed.same_physical_binding_ignoring_root_nullability_observed(
+                                ty,
+                                || {
+                                    work.step()?;
+                                    Ok::<_, ProviderLinkError>(())
+                                },
+                            )?
+                        {
+                            return Err(ProviderLinkError::TypeMismatch(site));
+                        }
+                        work.step()?;
+                        if expected.name().len() != actual.name().len() {
+                            return Err(ProviderLinkError::FieldMismatch { node: id, ordinal });
+                        }
+                        for (expected, actual) in expected
+                            .name()
+                            .as_bytes()
+                            .chunks(1024)
+                            .zip(actual.name().as_bytes().chunks(1024))
+                        {
+                            for _ in expected {
+                                work.step()?;
+                            }
+                            if expected != actual {
+                                return Err(ProviderLinkError::FieldMismatch { node: id, ordinal });
+                            }
+                        }
+                        if !signed
+                            .typed_binding()
+                            .layout()
+                            .matches_projection_observed(actual.data_type(), |units| {
+                                for _ in 0..units {
+                                    work.step()?;
+                                }
+                                Ok::<_, ProviderLinkError>(())
+                            })?
+                        {
+                            return Err(ProviderLinkError::FieldMismatch { node: id, ordinal });
+                        }
+                        continue;
+                    }
                 }
             }
             _ => {}
@@ -268,7 +300,7 @@ fn require_carrier(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProviderLinkError> {
     work.flush()?;
-    let matches = arrow_data_types_exact(expected, &actual.data_type);
+    let matches = arrow_data_types_exact(expected, &actual.data_type());
     work.flush()?;
     if matches {
         Ok(())

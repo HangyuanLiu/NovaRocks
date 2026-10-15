@@ -44,7 +44,7 @@ fn integer(nullable: bool) -> FunctionValueType {
 fn slot(ordinal: usize, ty: &FunctionValueType) -> StaticExprNode {
     StaticExprNode::new(
         StaticExprKind::SlotId(SlotId::new(ordinal as u32 + 1)),
-        ty.data_type.clone(),
+        ty.data_type().clone(),
         None,
     )
 }
@@ -68,7 +68,7 @@ fn fixture(
             } else {
                 StaticExprKind::Eq(ProgramExprId::new(0), ProgramExprId::new(1))
             },
-            result.data_type.clone(),
+            result.data_type().clone(),
             None,
         ),
     ];
@@ -390,27 +390,27 @@ fn eq_ne_all_definitions_reject_nonboolean_output_root_domain_and_carrier_drift(
 
 #[allow(deprecated)]
 fn nested(id: i64, annotation: &str, nullable: bool, logical: bool) -> FunctionValueType {
-    let payload = Field::new("payload", DataType::Utf8, true).with_metadata(if logical {
-        HashMap::from([("nr_logical_type".into(), "json".into())])
-    } else {
-        HashMap::new()
-    });
-    FunctionValueType::new(
-        DataType::Struct(
-            vec![
-                Field::new_dict(
-                    "dictionary",
-                    DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
-                    nullable,
-                    id,
-                    true,
-                )
-                .with_metadata(HashMap::from([("annotation".into(), annotation.into())])),
-                payload,
-            ]
-            .into(),
-        ),
+    let source = DataType::Struct(
+        vec![
+            Field::new_dict(
+                "dictionary",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                nullable,
+                id,
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                "provider.annotation".into(),
+                annotation.into(),
+            )])),
+            Field::new("payload", DataType::Utf8, true),
+        ]
+        .into(),
+    );
+    crate::test_value_types::string_structure_from_source(
+        &[("dictionary", nullable, false), ("payload", true, logical)],
         false,
+        &source,
     )
 }
 #[test]
@@ -432,8 +432,6 @@ fn eq_ne_preserve_complete_nested_identity_without_importing_runtime_flat_capabi
                 .is_ok()
             );
             for changed in [
-                nested(0, "preserved", true, true),
-                nested(-91, "changed", true, true),
                 nested(-91, "preserved", false, true),
                 nested(-91, "preserved", true, false),
             ] {
@@ -448,6 +446,22 @@ fn eq_ne_preserve_complete_nested_identity_without_importing_runtime_flat_capabi
                     ),
                     Err(ProgramExpressionTypeError::TypeMismatch)
                 ));
+            }
+            for encoding_only in [
+                nested(0, "preserved", true, true),
+                nested(-91, "changed", true, true),
+            ] {
+                assert!(
+                    checked(
+                        ne,
+                        dead,
+                        exact.clone(),
+                        encoding_only,
+                        boolean(true),
+                        EvaluationDemand::Value
+                    )
+                    .is_ok()
+                );
             }
         }
     }
@@ -484,7 +498,10 @@ fn eq_ne_callable_inputs_reject_at_actual_scalar_type_author_even_when_definitio
             let mut types = vec![
                 FunctionArgumentType::Value(ty.clone()),
                 FunctionArgumentType::Lambda {
-                    parameter_types: Box::default(),
+                    parameter_types:
+                        novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                            Box::default(),
+                        ),
                     result_type: ty.clone(),
                 },
                 FunctionArgumentType::Value(ty),
@@ -632,17 +649,17 @@ fn dead_arithmetic_definitions_require_shared_full_types_and_nullable_result() {
     let left = FunctionValueType::new(DataType::Int8, false);
     let right = FunctionValueType::new(DataType::Int16, false);
     for op in [A::Add, A::Subtract, A::Multiply, A::Divide, A::Modulo] {
-        let mut expected =
+        let expected =
             novarocks_type_contract::arithmetic_result_value_type_with_op(&left, &right, op)
                 .unwrap();
-        expected.nullable = true;
+        let expected = expected.with_nullable(true).unwrap();
         for invalid in 0..4 {
             let mut l = left.clone();
             let mut result = expected.clone();
             match invalid {
                 0 => {}
-                1 => result.nullable = false,
-                2 => result.data_type = DataType::Int64,
+                1 => result = result.with_nullable(false).unwrap(),
+                2 => result = FunctionValueType::new(DataType::Int64, result.nullable()),
                 3 => l = FunctionValueType::new(DataType::FixedSizeBinary(16), false),
                 _ => unreachable!(),
             }
@@ -658,7 +675,7 @@ fn dead_arithmetic_definitions_require_shared_full_types_and_nullable_result() {
                             decimal_overflow_policy: P::ReportError,
                             allow_throw_exception: true,
                         },
-                        result.data_type.clone(),
+                        result.data_type().clone(),
                         None,
                     ),
                     slot(3, &boolean(false)),
@@ -747,7 +764,7 @@ fn dead_cast_definitions_preserve_exact_identity_and_successful_narrowing_null()
                         decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
                         allow_throw_exception: true,
                     },
-                    result.data_type.clone(),
+                    result.data_type().clone(),
                     None,
                 ),
                 slot(2, &boolean(false)),

@@ -831,6 +831,7 @@ fn register_all(
         instance,
         &ExchangeInputAssignments::new(assignments),
         Arc::clone(port),
+        Some(&crate::runtime::fragment::exchange::test_receiver_creation_factory()),
     )
     .expect("compiled receivers");
     for registration in registrations {
@@ -1302,7 +1303,9 @@ fn key_and_residual_row_errors_are_required_errors_of_their_own_roots() {
                 None,
                 None,
                 None,
-                None,
+                Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                    "compiled join tests",
+                )),
                 Some(crate::runtime::execution_runtime::test_execution_runtime()),
             )),
             Arc::new(NoopFragmentEventSink),
@@ -1386,4 +1389,538 @@ fn partitioned_join_runs_each_instance_over_its_colocated_partition() {
             }
         ));
     }
+}
+
+/// Direct preparation witnesses use the same genuine Physical package/compiler
+/// and installed build/probe factories as the existing relational oracle.
+fn schema_owner_join_operators(
+    nested: bool,
+) -> (
+    Arc<LocalProgram>,
+    Box<dyn crate::exec::pipeline::operator::Operator>,
+    Box<dyn crate::exec::pipeline::operator::Operator>,
+    crate::exec::chunk::Chunk,
+    Arc<crate::runtime::runtime_state::RuntimeErrorState>,
+) {
+    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::operators::compiled_nljoin::{
+        CompiledNlJoinPlan, CompiledNlJoinProbeProcessorFactory,
+    };
+    use crate::exec::operators::hashjoin::broadcast_join_shared::BroadcastJoinSharedState;
+    use crate::exec::operators::hashjoin::compiled_hash_join::{
+        CompiledHashJoinBuildSinkFactory, CompiledHashJoinPlan,
+        CompiledHashJoinProbeProcessorFactory,
+    };
+    use crate::exec::operators::{NlJoinBuildSinkFactory, NlJoinSharedState};
+    use crate::exec::pipeline::dependency::DependencyManager;
+    use crate::exec::pipeline::operator_factory::OperatorFactory;
+    let spec = if nested {
+        Spec::nested(JoinKind::LeftAnti, false)
+    } else {
+        Spec::hash(JoinKind::LeftAnti, false)
+    };
+    let mut packages = packages(&single_plan(spec, &LEFT_ROWS, &[]));
+    let program = compile(packages.remove(&SINGLE).unwrap(), 1, true);
+    let (ordinal, node) = program
+        .graph()
+        .nodes()
+        .iter()
+        .enumerate()
+        .find(|(_, node)| {
+            matches!(
+                node.kind(),
+                ProgramNodeKind::Join { .. } | ProgramNodeKind::NestedLoopJoin { .. }
+            )
+        })
+        .unwrap();
+    let left = match node.kind() {
+        ProgramNodeKind::Join { left, .. } | ProgramNodeKind::NestedLoopJoin { left, .. } => *left,
+        _ => unreachable!(),
+    };
+    let source = &program.graph().nodes()[left.index()];
+    let ProgramNodeKind::Values { values } = source.kind() else {
+        unreachable!()
+    };
+    let input = Chunk::new_with_chunk_schema(
+        values.batch().unwrap().clone(),
+        ChunkSchema::from_compiled_layout(source.output_layout()).unwrap(),
+    );
+    let error = Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default());
+    let node = novarocks_local_program::ProgramNodeId::new(ordinal);
+    let (probe, build): (
+        Box<dyn crate::exec::pipeline::operator::Operator>,
+        Box<dyn crate::exec::pipeline::operator::Operator>,
+    ) = if nested {
+        let plan = Arc::new(CompiledNlJoinPlan::try_new(&program, node).unwrap());
+        let state = Arc::new(NlJoinSharedState::new(17, 1, DependencyManager::default()));
+        (
+            CompiledNlJoinProbeProcessorFactory::new(
+                program.clone(),
+                plan,
+                state.clone(),
+                error.clone(),
+            )
+            .create(1, 0),
+            NlJoinBuildSinkFactory::new(state).create(1, 0),
+        )
+    } else {
+        let plan = Arc::new(CompiledHashJoinPlan::try_new(&program, node).unwrap());
+        let state = Arc::new(BroadcastJoinSharedState::new(
+            17,
+            DependencyManager::default(),
+            1,
+        ));
+        (
+            CompiledHashJoinProbeProcessorFactory::new(
+                program.clone(),
+                plan.clone(),
+                state.clone(),
+                error.clone(),
+            )
+            .create(1, 0),
+            CompiledHashJoinBuildSinkFactory::new(
+                program.clone(),
+                plan,
+                state,
+                error.clone(),
+                None,
+            )
+            .create(1, 0),
+        )
+    };
+    (program, probe, build, input, error)
+}
+
+#[test]
+fn compiled_join_schema_prepare_missing_owner_precedes_build_and_input() {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    for nested in [false, true] {
+        let (_, mut operator, _, input, _) = schema_owner_join_operators(nested);
+        let first = operator.prepare().unwrap_err();
+        assert!(matches!(
+            first.cause(),
+            ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
+        ));
+        assert_eq!(operator.prepare().unwrap_err(), first);
+        let processor = operator.as_processor_mut().unwrap();
+        assert_eq!(
+            processor
+                .push_chunk(&RuntimeState::default(), input)
+                .unwrap_err(),
+            first
+        );
+        assert_eq!(
+            processor
+                .set_finishing(&RuntimeState::default())
+                .unwrap_err(),
+            first
+        );
+        assert!(processor.is_finished());
+    }
+}
+
+#[test]
+fn compiled_join_schema_prepare_keeps_first_memory_refusal_and_rolls_back() {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use crate::runtime::mem_tracker::MemTracker;
+    for nested in [false, true] {
+        let (_, mut operator, _, input, error) = schema_owner_join_operators(nested);
+        let tracker = MemTracker::new_root("join first actual schema refusal");
+        operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+            tracker.clone(),
+            error,
+        ));
+        let installed = tracker.current();
+        assert!(installed > 0);
+        tracker.install_limit_once(installed + 1).unwrap();
+        let first = operator.prepare().unwrap_err();
+        assert!(matches!(
+            first.cause(),
+            ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
+        ));
+        assert_eq!(tracker.current(), installed);
+        assert_eq!(operator.prepare().unwrap_err(), first);
+        let processor = operator.as_processor_mut().unwrap();
+        assert_eq!(
+            processor
+                .push_chunk(&RuntimeState::default(), input)
+                .unwrap_err(),
+            first
+        );
+        assert_eq!(
+            processor
+                .set_finishing(&RuntimeState::default())
+                .unwrap_err(),
+            first
+        );
+        assert_eq!(tracker.current(), installed);
+        drop(operator);
+        assert_eq!(tracker.current(), 0);
+    }
+}
+
+#[test]
+fn compiled_join_schema_last_slot_keeps_creator_after_plan_and_operators_exit() {
+    use crate::runtime::mem_tracker::MemTracker;
+    for nested in [false, true] {
+        let (program, mut operator, mut build, input, error) = schema_owner_join_operators(nested);
+        let weak = Arc::downgrade(&program);
+        let tracker = MemTracker::new_root("join independent output schema creator");
+        let factory =
+            super::aggregate_fixture::runtime_construction_factory(tracker.clone(), error);
+        operator.set_construction_factory(factory.clone());
+        build.set_construction_factory(factory);
+        operator.set_mem_tracker(tracker.clone());
+        build.set_mem_tracker(tracker.clone());
+        operator.prepare().unwrap();
+        build.prepare().unwrap();
+        build
+            .as_processor_mut()
+            .unwrap()
+            .set_finishing(&RuntimeState::default())
+            .unwrap();
+        let processor = operator.as_processor_mut().unwrap();
+        processor
+            .push_chunk(&RuntimeState::default(), input)
+            .unwrap();
+        processor.set_finishing(&RuntimeState::default()).unwrap();
+        let output = processor
+            .pull_chunk(&RuntimeState::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sorted(int64_rows(std::slice::from_ref(&output))),
+            sorted(LEFT_ROWS.iter().map(|(k, x)| vec![*k, *x]).collect())
+        );
+        let schema = output.chunk_schema_ref();
+        let slot = schema.slots()[0].clone();
+        assert!(schema.is_typed());
+        drop(operator);
+        drop(build);
+        drop(program);
+        assert!(weak.upgrade().is_none());
+        drop(output);
+        assert!(tracker.current() > 0);
+        drop(schema);
+        assert!(tracker.current() > 0);
+        drop(slot);
+        assert_eq!(tracker.current(), 0);
+    }
+}
+
+/// These closed fixtures declare the complete nested value independently of
+/// Arrow's physical anonymous item Field. No metadata is a semantic author.
+fn join_nested_fixture_slot(
+    id: u32,
+    json: bool,
+    root_nullable: bool,
+    child_nullable: bool,
+) -> crate::exec::chunk::ChunkSlotSchema {
+    use arrow::datatypes::Field;
+    use novarocks_type_contract::{
+        TypedValueBinding, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
+    let storage = ValueTypeStorageLifetime::pure();
+    let child = ValueTypeRef::try_new(
+        if json {
+            ValueKind::Nominal(ValueLogicalType::Json)
+        } else {
+            ValueKind::String
+        },
+        child_nullable,
+        storage.clone(),
+    )
+    .unwrap();
+    let semantic =
+        ValueTypeRef::try_new(ValueKind::List(child), root_nullable, storage.clone()).unwrap();
+    let dtype = DataType::List(Arc::new(Field::new("item", DataType::Utf8, child_nullable)));
+    let binding = TypedValueBinding::try_new(
+        semantic,
+        ValueLayout::try_new(&dtype, storage.clone()).unwrap(),
+    )
+    .unwrap();
+    crate::exec::chunk::ChunkSlotSchema::try_new_typed(
+        novarocks_types::SlotId::new(id),
+        Arc::new(Field::new(format!("v{id}"), dtype, root_nullable)),
+        binding,
+        None,
+        storage,
+    )
+    .unwrap()
+}
+
+fn join_nested_fixture_source(id: u32, json: bool) -> crate::exec::chunk::Chunk {
+    use arrow::array::{ArrayRef, ListArray, StringArray};
+    use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow::datatypes::Field;
+    use novarocks_type_contract::ValueTypeStorageLifetime;
+    let schema = Arc::new(
+        crate::exec::chunk::ChunkSchema::try_new_typed(
+            vec![join_nested_fixture_slot(id, json, false, true)],
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+    );
+    let array: ArrayRef = Arc::new(ListArray::new(
+        Arc::new(Field::new("item", DataType::Utf8, true)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2])),
+        Arc::new(StringArray::from(vec![Some("1"), None])),
+        None,
+    ));
+    let batch =
+        arrow::record_batch::RecordBatch::try_new(schema.arrow_schema_ref(), vec![array]).unwrap();
+    crate::exec::chunk::Chunk::try_new_with_chunk_schema(batch, schema).unwrap()
+}
+
+#[test]
+fn compiled_join_gather_rejects_nested_domain_and_child_null_drift() {
+    use crate::exec::operators::hashjoin::{
+        JoinGatherError, gather_join_batch_typed, gather_probe_build_batches_typed,
+    };
+    use crate::runtime::mem_tracker::MemTracker;
+    use novarocks_type_contract::ValueTypeStorageLifetime;
+    let left = join_nested_fixture_source(901, true);
+    let right = join_nested_fixture_source(902, false);
+    let tracker = MemTracker::new_root("join complete nested binding refusal");
+    let factory = super::aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+    );
+    let control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(Arc::new(
+        crate::runtime::runtime_state::RuntimeErrorState::default(),
+    ));
+    for (left_id, json, child_nullable) in
+        [(901, false, true), (901, true, false), (903, true, true)]
+    {
+        let declared = Arc::new(
+            crate::exec::chunk::ChunkSchema::try_new_typed(
+                vec![
+                    join_nested_fixture_slot(left_id, json, false, child_nullable),
+                    join_nested_fixture_slot(902, false, false, true),
+                ],
+                ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+        );
+        let owner = factory.begin_typed_construction(&declared).unwrap();
+        let scratch = factory.begin_typed_construction(&declared).unwrap();
+        // Both real consumers use the same complete declaration author, before
+        // any take allocation or nullable repair can hide source drift.
+        assert!(matches!(
+            gather_join_batch_typed(
+                &left,
+                &right,
+                &[0],
+                &[0],
+                &declared,
+                owner.as_ref(),
+                scratch.as_ref(),
+                &control
+            ),
+            Err(JoinGatherError::Source(_))
+        ));
+        assert!(matches!(
+            gather_probe_build_batches_typed(
+                &left,
+                &right,
+                &[0],
+                &[0],
+                &declared,
+                true,
+                false,
+                owner.as_ref(),
+                scratch.as_ref(),
+                &control
+            ),
+            Err(JoinGatherError::Source(_))
+        ));
+    }
+    drop(factory);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn compiled_join_gather_null_extension_requires_declared_nullable_binding() {
+    use crate::exec::operators::hashjoin::{JoinGatherError, gather_left_with_null_right_typed};
+    use crate::runtime::mem_tracker::MemTracker;
+    use novarocks_type_contract::ValueTypeStorageLifetime;
+    let left = join_nested_fixture_source(901, true);
+    let right = join_nested_fixture_source(902, false);
+    let tracker = MemTracker::new_root("join declared outer NULL extension");
+    let factory = super::aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+    );
+    let control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(Arc::new(
+        crate::runtime::runtime_state::RuntimeErrorState::default(),
+    ));
+    let required = Arc::new(
+        crate::exec::chunk::ChunkSchema::try_new_typed(
+            vec![
+                join_nested_fixture_slot(901, true, false, true),
+                join_nested_fixture_slot(902, false, false, true),
+            ],
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+    );
+    let owner = factory.begin_typed_construction(&required).unwrap();
+    let scratch = factory.begin_typed_construction(&required).unwrap();
+    assert!(matches!(
+        gather_left_with_null_right_typed(
+            &left,
+            &[0],
+            &right.chunk_schema_ref(),
+            &required,
+            owner.as_ref(),
+            scratch.as_ref(),
+            &control
+        ),
+        Err(JoinGatherError::Source(_))
+    ));
+    drop(scratch);
+    drop(owner);
+    let nullable = Arc::new(
+        crate::exec::chunk::ChunkSchema::try_new_typed(
+            vec![
+                join_nested_fixture_slot(901, true, false, true),
+                join_nested_fixture_slot(902, false, true, true),
+            ],
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+    );
+    let owner = factory.begin_typed_construction(&nullable).unwrap();
+    let scratch = factory.begin_typed_construction(&nullable).unwrap();
+    let batch = gather_left_with_null_right_typed(
+        &left,
+        &[0],
+        &right.chunk_schema_ref(),
+        &nullable,
+        owner.as_ref(),
+        scratch.as_ref(),
+        &control,
+    )
+    .unwrap()
+    .unwrap();
+    let chunk = batch.into_chunk(owner.as_ref()).unwrap();
+    assert_eq!(chunk.record_batch().column(1).null_count(), 1);
+    assert!(chunk.chunk_schema().slots()[1].typed_binding().nullable());
+    assert_eq!(
+        chunk.chunk_schema().slots()[0].typed_binding().value_type(),
+        left.chunk_schema().slots()[0].typed_binding().value_type()
+    );
+    assert_eq!(
+        chunk.chunk_schema().slots()[1]
+            .typed_binding()
+            .value_type()
+            .child_type_at(0),
+        right.chunk_schema().slots()[0]
+            .typed_binding()
+            .value_type()
+            .child_type_at(0)
+    );
+    drop(scratch);
+    drop(owner);
+    drop(factory);
+    assert!(tracker.current() > 0);
+    drop(chunk);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn compiled_join_output_last_batch_ref_keeps_original_source_creator() {
+    use crate::exec::chunk::{ArrayNormalizationStep, Chunk};
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use crate::runtime::mem_tracker::MemTracker;
+    use novarocks_type_contract::ValueTypeStorageLifetime;
+    for nested in [false, true] {
+        let (program, mut operator, mut build, input, error) = schema_owner_join_operators(nested);
+        let weak = Arc::downgrade(&program);
+        let source_tracker = MemTracker::new_root("join input source construction");
+        let source_factory = super::aggregate_fixture::runtime_construction_factory(
+            source_tracker.clone(),
+            error.clone(),
+        );
+        let source_owner = source_factory
+            .begin_typed_construction(input.chunk_schema())
+            .unwrap();
+        // The fixture's source declaration/column Vec are explicitly pure. The
+        // actual independent input wrapper has its own original BE creator.
+        let input = Chunk::try_new_typed_record_batch_owned_observed::<ConstructionFailure, _, _>(
+            input.record_batch().clone(),
+            input.chunk_schema_ref(),
+            ValueTypeStorageLifetime::pure(),
+            source_owner.storage_lifetime(),
+            |layout| source_owner.request(layout),
+            |step: ArrayNormalizationStep<'_>| source_owner.observe(0, &[], step),
+        )
+        .unwrap();
+        drop(source_owner);
+        drop(source_factory);
+        assert!(source_tracker.current() > 0);
+        let tracker = MemTracker::new_root("join owned output construction");
+        let factory =
+            super::aggregate_fixture::runtime_construction_factory(tracker.clone(), error);
+        operator.set_construction_factory(factory.clone());
+        build.set_construction_factory(factory);
+        operator.set_mem_tracker(tracker.clone());
+        build.set_mem_tracker(tracker.clone());
+        operator.prepare().unwrap();
+        build.prepare().unwrap();
+        build
+            .as_processor_mut()
+            .unwrap()
+            .set_finishing(&RuntimeState::default())
+            .unwrap();
+        let processor = operator.as_processor_mut().unwrap();
+        processor
+            .push_chunk(&RuntimeState::default(), input)
+            .unwrap();
+        processor.set_finishing(&RuntimeState::default()).unwrap();
+        let output = processor
+            .pull_chunk(&RuntimeState::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sorted(int64_rows(std::slice::from_ref(&output))),
+            sorted(LEFT_ROWS.iter().map(|(k, x)| vec![*k, *x]).collect())
+        );
+        let projection = output.batch_projection();
+        drop(operator);
+        drop(build);
+        drop(program);
+        assert!(weak.upgrade().is_none());
+        drop(output);
+        assert!(source_tracker.current() > 0);
+        assert!(tracker.current() > 0);
+        drop(projection);
+        assert_eq!(source_tracker.current(), 0);
+        assert_eq!(tracker.current(), 0);
+    }
+}
+
+#[test]
+fn compiled_hash_build_prepare_missing_owner_preserves_input_and_first_cause() {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    let (_, probe, mut build, input, _) = schema_owner_join_operators(false);
+    let source = input.batch_projection();
+    let rows = int64_rows(std::slice::from_ref(&input));
+    let first = build.prepare().unwrap_err();
+    assert!(matches!(
+        first.cause(),
+        ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
+    ));
+    assert_eq!(build.prepare().unwrap_err(), first);
+    let sink = build.as_processor_mut().unwrap();
+    assert_eq!(
+        sink.push_chunk(&RuntimeState::default(), input)
+            .unwrap_err(),
+        first
+    );
+    assert!(sink.pull_chunk(&RuntimeState::default()).unwrap().is_none());
+    // This original view has no consumed rows or rewritten source declaration.
+    assert_eq!(int64_rows(&[source.into_chunk()]), rows);
+    drop(probe);
 }

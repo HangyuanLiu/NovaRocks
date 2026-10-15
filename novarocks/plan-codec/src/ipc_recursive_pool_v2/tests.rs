@@ -572,3 +572,44 @@ fn actual_recursive_writer_original_controls_stop_at_entry_quantum_and_publicati
 
 #[path = "owned_tests.rs"]
 mod owned_tests;
+
+#[test]
+fn pure_recursive_writer_without_invoice_matches_receiving_stream() {
+    let item = Arc::new(Field::new("item", DataType::Int32, true));
+    let array: ArrayRef = Arc::new(ListArray::new(
+        item,
+        OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 2, 3])),
+        Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])),
+        Some(NullBuffer::from(vec![true, false, true])),
+    ));
+    let field = Arc::new(Field::new("source", array.data_type().clone(), true));
+    let ty = FunctionValueType::new(array.data_type().clone(), true);
+    let pool = ConstantPool::try_new(
+        field,
+        ty,
+        array.to_data(),
+        policy(),
+        CompilePhase::Decode,
+        &Control::good(CompilePhase::Decode),
+    )
+    .unwrap();
+    assert!(pool.source_retained_bytes().is_none());
+    let control = Control::good(CompilePhase::Encode);
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    let pure = prepare_recursive_pool_write_pure_in(&pool, &mut work)
+        .unwrap()
+        .emit_in(&mut work)
+        .unwrap();
+    work.finish().unwrap();
+    let receiving = encode_recursive_pool(
+        &pool,
+        invoice(&pool),
+        limits(),
+        &Control::good(CompilePhase::Encode),
+    )
+    .unwrap();
+    assert_eq!(pure, receiving);
+    let mut reader = StreamReader::try_new(Cursor::new(pure), None).unwrap();
+    let batch = reader.next().unwrap().unwrap();
+    assert_eq!(batch.column(0).as_ref(), pool.array().as_ref());
+}

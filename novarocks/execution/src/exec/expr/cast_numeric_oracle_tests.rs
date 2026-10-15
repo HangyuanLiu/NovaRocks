@@ -154,7 +154,10 @@ fn compare_legacy_rows(
     let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
     let mut arena = ExprArena::default();
     arena.set_allow_throw_exception(allow);
-    let input = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), source_type.data_type);
+    let input = arena.push_typed(
+        ExprNode::SlotId(SlotId::new(1)),
+        source_type.data_type().clone(),
+    );
     let cast = arena.push_typed(ExprNode::Cast(input, policy), target.clone());
     let legacy = arena.eval(cast, &chunk).unwrap();
     assert_eq!(legacy.data_type(), &target);

@@ -46,7 +46,8 @@ mod signature_copy;
 pub use materialize::{
     MaterializedAggregateBindings, PreparedAggregateBindingsMaterialization,
     materialize_aggregate_bindings, materialize_aggregate_bindings_in,
-    prepare_aggregate_bindings_materialization, prepare_aggregate_bindings_materialization_in,
+    materialize_aggregate_bindings_with_creator_in, prepare_aggregate_bindings_materialization,
+    prepare_aggregate_bindings_materialization_in,
 };
 pub use read::{
     PreparedAggregateBindingHeaders, prepare_aggregate_binding_headers,
@@ -103,11 +104,23 @@ pub(crate) fn decode_state_interpretation(
     raw: &wire::AggregateStateInterpretation,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<novarocks_type_contract::AggregateStateInterpretation, BindingCodecError> {
+    decode_state_interpretation_created::<std::convert::Infallible>(
+        raw,
+        &mut crate::physical_binding_v2::creation::Construction { creator: None },
+        work,
+    )
+    .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+}
+pub(crate) fn decode_state_interpretation_created<H>(
+    raw: &wire::AggregateStateInterpretation,
+    construction: &mut crate::physical_binding_v2::creation::Construction<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    novarocks_type_contract::AggregateStateInterpretation,
+    crate::physical_binding_v2::creation::Failure<H>,
+> {
     validate_state_interpretation(raw, work)?;
-    work.flush()?;
-    let mut keys = Vec::new();
-    keys.try_reserve_exact(raw.order_keys.len())
-        .map_err(|_| CompileControlError::ResourceExhausted)?;
+    let mut keys = construction.reserve(raw.order_keys.len(), work)?;
     for key in &raw.order_keys {
         keys.push(novarocks_type_contract::AggregateStateOrderKey {
             ascending: key.ascending.expect("validated key"),
@@ -115,36 +128,38 @@ pub(crate) fn decode_state_interpretation(
         });
         work.step()?;
     }
-    work.flush()?;
     Ok(novarocks_type_contract::AggregateStateInterpretation {
         distinct: raw.distinct.expect("validated interpretation"),
-        order_keys: keys.into_boxed_slice(),
+        order_keys: {
+            let boxed = construction.boxed(keys, work)?;
+            construction.collection(boxed, work)?
+        },
     })
 }
 
 /// Projects the explicit state owner's contract, independently of function identity.
-pub(crate) fn encode_state_argument_contract(contract: AggregateStateArgumentContract) -> i32 {
+pub fn encode_state_argument_contract(contract: AggregateStateArgumentContract) -> i32 {
     match contract {
         AggregateStateArgumentContract::ExactSignature => {
-            wire::AggregateStateArgumentContract::ExactSignature as i32
+            novarocks_proto_models::common::AggregateStateArgumentContract::ExactSignature as i32
         }
         AggregateStateArgumentContract::ValueRootNullabilityIndependent => {
-            wire::AggregateStateArgumentContract::ValueRootNullabilityIndependent as i32
+            novarocks_proto_models::common::AggregateStateArgumentContract::ValueRootNullabilityIndependent as i32
         }
     }
 }
 
-pub(crate) fn decode_state_argument_contract(
+pub fn decode_state_argument_contract(
     contract: i32,
 ) -> Result<AggregateStateArgumentContract, BindingCodecError> {
-    match wire::AggregateStateArgumentContract::try_from(contract) {
-        Ok(wire::AggregateStateArgumentContract::ExactSignature) => {
+    match novarocks_proto_models::common::AggregateStateArgumentContract::try_from(contract) {
+        Ok(novarocks_proto_models::common::AggregateStateArgumentContract::ExactSignature) => {
             Ok(AggregateStateArgumentContract::ExactSignature)
         }
-        Ok(wire::AggregateStateArgumentContract::ValueRootNullabilityIndependent) => {
+        Ok(novarocks_proto_models::common::AggregateStateArgumentContract::ValueRootNullabilityIndependent) => {
             Ok(AggregateStateArgumentContract::ValueRootNullabilityIndependent)
         }
-        Ok(wire::AggregateStateArgumentContract::Unspecified) | Err(_) => Err(invalid(
+        Ok(novarocks_proto_models::common::AggregateStateArgumentContract::Unspecified) | Err(_) => Err(invalid(
             "aggregate header state argument contract is absent or unknown",
         )),
     }
@@ -568,6 +583,12 @@ fn preflight(
                     )?,
                 )?,
             )?,
+        )?,
+    )?;
+    let visible_wire_floor = add(
+        visible_wire_floor,
+        bytes::<novarocks_proto_models::value_type::LogicalTypeDefinition>(
+            table.logical_types.capacity(),
         )?,
     )?;
     let (value_roots, field_roots) = types.source_counts();

@@ -29,19 +29,20 @@
 
 use std::sync::Arc;
 
+use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner};
 use arrow::array::{Array, ArrayRef};
 use arrow::compute::kernels::interleave::interleave;
 use arrow::datatypes::Schema;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use novarocks_functions::{
     KernelDiagnostic, KernelEvaluationControl, KernelFailure, MAX_UNOBSERVED_KERNEL_WORK,
-    selected_copy::{self, CopyError},
+    selected_copy::{self, CopyConstructionError, CopyError},
 };
 use novarocks_local_program::{
     LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
     ProgramNodeKind, StaticValuesBacking,
 };
-use novarocks_type_contract::arrow_data_types_exact_observed;
+use novarocks_type_contract::{ValueSchemaCreation, arrow_data_types_exact_observed};
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
@@ -60,7 +61,6 @@ pub(crate) struct CompiledValuesSourceFactory {
     name: String,
     program: Arc<LocalProgram>,
     node: ProgramNodeId,
-    output: ChunkSchemaRef,
     error: Arc<RuntimeErrorState>,
 }
 
@@ -78,18 +78,13 @@ impl CompiledValuesSourceFactory {
         let ProgramNodeKind::Values { values } = graph_node.kind() else {
             return Err("compiled node is not a Values source".to_string());
         };
-        if values.dynamic_cells().is_empty() {
-            return Err(format!(
-                "compiled Values at local node {} has no dynamic cell",
-                node.index()
-            ));
+        if !values.layout().is_typed() {
+            return Err("compiled Values require their complete frozen layout".into());
         }
-        let output = ChunkSchema::from_compiled_layout(values.layout())?;
         Ok(Self {
             name: format!("COMPILED_VALUES (node={})", node.index()),
             program,
             node,
-            output,
             error,
         })
     }
@@ -105,7 +100,8 @@ impl OperatorFactory for CompiledValuesSourceFactory {
             name: self.name.clone(),
             program: Arc::clone(&self.program),
             node: self.node,
-            output: Arc::clone(&self.output),
+            output: None,
+            construction: None,
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             driver_id,
             emitted: false,
@@ -121,13 +117,51 @@ struct CompiledValuesSource {
     name: String,
     program: Arc<LocalProgram>,
     node: ProgramNodeId,
-    output: ChunkSchemaRef,
+    output: Option<ChunkSchemaRef>,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     control: RuntimeKernelControl,
     driver_id: i32,
     emitted: bool,
 }
 
 impl Operator for CompiledValuesSource {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.control.bind_construction_factory(factory.clone());
+        self.construction = Some(factory);
+    }
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        let ProgramNodeKind::Values { values } =
+            self.program.graph().nodes()[self.node.index()].kind()
+        else {
+            return Err(invalid("compiled Values node changed"));
+        };
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let owner = factory.begin_compiled_layout_construction(values.layout())?;
+        let output = ChunkSchema::from_compiled_layout_owned_observed::<ConstructionFailure>(
+            values.layout(),
+            owner.storage_lifetime(),
+            |layout| owner.request(layout),
+            |units| {
+                owner.observe(
+                    0,
+                    &[],
+                    crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork { units },
+                )
+            },
+        )?;
+        self.output = Some(output);
+        Ok(())
+    }
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.control.bind_runtime_memory(state);
         Ok(())
@@ -175,11 +209,46 @@ impl ProcessorOperator for CompiledValuesSource {
         if self.driver_id != 0 {
             return Ok(None);
         }
-        materialize(&self.program, self.node, &self.output, &self.control).map(Some)
+        let output = self
+            .output
+            .as_ref()
+            .ok_or_else(|| invalid("compiled Values source was not prepared"))?;
+        materialize(&self.program, self.node, output, &self.control).map(Some)
     }
 
     fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         Ok(())
+    }
+}
+
+fn reserve<T>(
+    count: usize,
+    owner: &dyn InputConstructionOwner,
+    work: &mut Work<'_>,
+) -> ExecutionResult<Vec<T>> {
+    let layout = std::alloc::Layout::array::<T>(count).map_err(|_| {
+        ConstructionFailure::Resource(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        )
+    })?;
+    work.flush()?;
+    owner.request(layout)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    work.flush()?;
+    Ok(values)
+}
+fn copy_failure(error: CopyConstructionError<ConstructionFailure>) -> ExecutionFailure {
+    match error {
+        CopyConstructionError::Creator(cause) => cause.into(),
+        CopyConstructionError::Resource(cause) => ConstructionFailure::Resource(cause).into(),
+        CopyConstructionError::Copy(CopyError::Control(cause)) => cause.into(),
+        CopyConstructionError::Copy(CopyError::Extent) => KernelFailure::ResourceExhausted.into(),
+        CopyConstructionError::Copy(CopyError::Invalid(_) | CopyError::Unsupported(_)) => {
+            invalid("Values column carrier lacks selected-copy preflight")
+        }
     }
 }
 
@@ -193,6 +262,27 @@ fn materialize(
     let ProgramNodeKind::Values { values } = program.graph().nodes()[node.index()].kind() else {
         return Err(invalid("compiled Values node changed"));
     };
+    let owner = control.construction_owner(output.as_ref())?;
+    let storage = owner
+        .storage_lifetime()
+        .retaining_observed::<crate::exec::pipeline::operator::ConstructionFailure>(
+            &values.storage_lifetime(),
+            |layout| owner.request(layout),
+        )?;
+    if let Some(projection) = values.batch_projection() {
+        owner.request(std::alloc::Layout::array::<ArrayRef>(projection.record_batch().num_columns()).map_err(|_|crate::exec::pipeline::operator::ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
+        let columns = projection.record_batch().columns().to_vec();
+        return Ok(Chunk::try_new_typed_with_columns_owned_observed::<
+            crate::exec::pipeline::operator::ConstructionFailure,
+            _,
+        >(
+            output.clone(),
+            columns,
+            projection.record_batch().num_rows(),
+            storage,
+            |step| owner.observe(0, &[], step),
+        )?);
+    }
     let StaticValuesBacking::Cells {
         rows,
         constants,
@@ -203,6 +293,13 @@ fn materialize(
     };
     let schema = values.layout().schema();
     let mut work = Work::new(control);
+    work.flush()?;
+    owner.request(
+        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            Schema,
+        >())
+        .map_err(ConstructionFailure::Resource)?,
+    )?;
     let empty = RecordBatch::try_new_with_options(
         Arc::new(Schema::empty()),
         Vec::new(),
@@ -210,7 +307,7 @@ fn materialize(
     )
     .map_err(|error| ExecutionFailure::from(format!("compiled Values empty port: {error}")))?;
     // Row-major: the first failing cell is the one v1 would have reported.
-    let mut evaluated = Vec::with_capacity(dynamic.len());
+    let mut evaluated = reserve(dynamic.len(), owner.as_ref(), &mut work)?;
     for cell in dynamic {
         let site = ProgramExpressionRootSite::Node {
             node,
@@ -243,12 +340,26 @@ fn materialize(
         evaluated.push(value);
         work.step()?;
     }
-    let mut columns = Vec::with_capacity(constants.len());
+    let mut columns = reserve(constants.len(), owner.as_ref(), &mut work)?;
     for (ordinal, (constant, field)) in constants.iter().zip(schema.fields()).enumerate() {
         // `sources[0]` holds this column's constant cells in row order; each
         // evaluated cell of the column follows as its own one-row source.
-        let mut sources: Vec<ArrayRef> = vec![Arc::clone(constant)];
-        let mut dynamic_rows = Vec::new();
+        let mut count = 0usize;
+        for cell in dynamic {
+            if cell.column as usize == ordinal {
+                count += 1;
+            }
+            work.step()?;
+        }
+        let mut sources: Vec<ArrayRef> = reserve(
+            count
+                .checked_add(1)
+                .ok_or(KernelFailure::ResourceExhausted)?,
+            owner.as_ref(),
+            &mut work,
+        )?;
+        sources.push(Arc::clone(constant));
+        let mut dynamic_rows = reserve(count, owner.as_ref(), &mut work)?;
         for (cell, value) in dynamic.iter().zip(&evaluated) {
             if cell.column as usize == ordinal {
                 dynamic_rows.push(cell.row as usize);
@@ -260,7 +371,7 @@ fn materialize(
             columns.push(Arc::clone(constant));
             continue;
         }
-        let mut choices = Vec::with_capacity(rows);
+        let mut choices = reserve(rows, owner.as_ref(), &mut work)?;
         let mut next_constant = 0usize;
         let mut next_dynamic = 0usize;
         for row in 0..rows {
@@ -276,38 +387,36 @@ fn materialize(
         if next_constant != constant.len() || next_dynamic != dynamic_rows.len() {
             return Err(invalid("Values cell sources do not cover their column"));
         }
-        selected_copy::preflight_guarded_interleave(
+        let mut request = |layout| owner.request(layout);
+        let mut opaque = |bytes| owner.observe_opaque_upper_bound(bytes);
+        let mut creation = ValueSchemaCreation::new(storage.clone(), &mut request, &mut opaque);
+        work.flush()?;
+        selected_copy::preflight_interleave_construction(
             field.data_type(),
             &sources,
             &choices,
-            |boundary| work.observe(boundary),
+            &mut creation,
+            control,
         )
-        .map_err(|error| match error {
-            CopyError::Control(failure) => ExecutionFailure::from(failure),
-            CopyError::Extent => KernelFailure::ResourceExhausted.into(),
-            CopyError::Invalid(_) | CopyError::Unsupported(_) => {
-                invalid("Values column carrier lacks selected-copy preflight")
-            }
-        })?;
+        .map_err(copy_failure)?;
+        let mut borrowed: Vec<&dyn Array> = reserve(sources.len(), owner.as_ref(), &mut work)?;
+        for source in &sources {
+            borrowed.push(source.as_ref());
+            work.step()?;
+        }
         work.flush()?;
-        let borrowed = sources
-            .iter()
-            .map(AsRef::as_ref)
-            .collect::<Vec<&dyn Array>>();
         let column = interleave(&borrowed, &choices)
             .map_err(|error| ExecutionFailure::from(format!("compiled Values column: {error}")))?;
         work.flush()?;
         columns.push(column);
     }
-    // The frozen layout schema checks every column's carrier and nullability.
-    let batch = RecordBatch::try_new_with_options(
-        Arc::clone(schema),
-        columns,
-        &RecordBatchOptions::new().with_row_count(Some(rows)),
-    )
-    .map_err(|error| ExecutionFailure::from(format!("compiled Values output: {error}")))?;
     work.flush()?;
-    Ok(Chunk::try_new_with_chunk_schema(batch, Arc::clone(output))?)
+    Ok(Chunk::try_new_typed_with_columns_owned_observed::<
+        crate::exec::pipeline::operator::ConstructionFailure,
+        _,
+    >(output.clone(), columns, rows, storage, |step| {
+        owner.observe(0, &[], step)
+    })?)
 }
 
 /// Bounded observation of this source's own assembly work.

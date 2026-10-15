@@ -56,8 +56,9 @@ pub(crate) fn snapshot_token(target_snapshot_id: Option<i64>) -> String {
 pub(crate) fn exact_requested_write_fields(
     metadata: &TableMetadata,
     requested: &[ConnectorWriteFieldRequest],
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
-    exact_requested_write_fields_at_schema(metadata, metadata.current_schema(), requested)
+    exact_requested_write_fields_at_schema(metadata, metadata.current_schema(), requested, creation)
 }
 
 /// Resolve write fields against an already-frozen Iceberg schema.
@@ -65,13 +66,36 @@ pub(crate) fn exact_requested_write_fields_at_schema(
     metadata: &TableMetadata,
     iceberg_schema: &Schema,
     requested: &[ConnectorWriteFieldRequest],
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
+    let execution =
+        crate::schema_mapping::catalog_value::table(metadata, iceberg_schema, &[], creation)
+            .map_err(crate::metadata::metadata_creation_error)?;
+    exact_requested_write_fields_from_declaration(
+        metadata,
+        iceberg_schema,
+        requested,
+        &execution,
+        creation,
+    )
+}
+
+/// Borrow an already-authored provider declaration at the same frozen schema.
+/// Source fields still come from the original format projection.
+pub(crate) fn exact_requested_write_fields_from_declaration(
+    metadata: &TableMetadata,
+    iceberg_schema: &Schema,
+    requested: &[ConnectorWriteFieldRequest],
+    execution: &novarocks_connector_contract::ConnectorReadExecutionSchema,
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
     let arrow_schema = crate::scalar_integer_domain::metadata_sql_schema(metadata, iceberg_schema)?;
     requested
         .iter()
         .map(|request| {
+            creation.work(1).map_err(crate::metadata::metadata_creation_error)?;
             let requested_name = request.field().name();
-            let (ordinal, iceberg_field) = iceberg_schema
+            let (ordinal, _iceberg_field) = iceberg_schema
                 .as_struct()
                 .fields()
                 .iter()
@@ -83,15 +107,99 @@ pub(crate) fn exact_requested_write_fields_at_schema(
                     ))
                 })?;
             let arrow_field = arrow_schema.field(ordinal);
-            novarocks_type_contract::FunctionValueType::try_from_field(arrow_field).map_err(|error| {
-                invalid_write_activation(format!("invalid frozen Iceberg write field `{}`: {error}", iceberg_field.name))
+            // The original source Field and the complete declaration have
+            // independent owners. Only this catalog author establishes domains.
+            let value = execution.bindings().get(ordinal).ok_or_else(|| {
+                invalid_write_activation("frozen writer execution declaration is absent")
             })?;
-            // Preserve the exact provider field, including nested domains,
-            // dictionary identity and annotations; requested fields select
-            // names and never author the target's logical type.
-            Ok(ConnectorWriteFieldRequest::new(arrow_field.clone()))
+            creation.work(0).map_err(crate::metadata::metadata_creation_error)?;
+            ConnectorWriteFieldRequest::try_new_typed(arrow_field.clone(), value.clone())
         })
         .collect()
+}
+
+enum WriteValueFailure {
+    Control(novarocks_type_contract::CompileControlError),
+    Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+}
+impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for WriteValueFailure
+{
+    fn from(value: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::Resource(value)
+    }
+}
+impl WriteValueFailure {
+    fn into_error(self) -> ConnectorError {
+        match self {
+            Self::Control(cause) => crate::metadata::metadata_creation_error(
+                novarocks_connector_contract::PureProviderCompileError::Control(cause),
+            ),
+            Self::Resource(cause) => ConnectorError::new(
+                if matches!(cause, novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel) {
+                    novarocks_spi::connector::ConnectorErrorKind::Internal
+                } else { novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted },
+                format!("writer value root construction failed: {cause:?}"),
+            ),
+        }
+    }
+}
+
+pub(crate) fn writer_value_with_nullable(
+    value: &novarocks_type_contract::FunctionValueType,
+    nullable: bool,
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<novarocks_type_contract::FunctionValueType, ConnectorError> {
+    if value.nullable() == nullable {
+        return Ok(value.clone());
+    }
+    let storage = creation.storage();
+    let (request, work) = creation.observers();
+    value
+        .with_nullable_observed(
+            nullable,
+            storage,
+            |layout| request(layout).map_err(WriteValueFailure::Control),
+            |units| work(units).map_err(WriteValueFailure::Control),
+        )
+        .map_err(WriteValueFailure::into_error)
+}
+
+/// Metadata roles are authored by the existing provider declaration, not the
+/// SQL proposal's carrier or attributes. Original proposal fields stay intact.
+pub(crate) fn exact_metadata_write_fields(
+    _metadata: &TableMetadata,
+    fields: &[ConnectorWriteFieldRequest],
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
+    let mut authored = creation
+        .reserve(fields.len())
+        .map_err(crate::metadata::metadata_creation_error)?;
+    for field in fields {
+        creation
+            .work(1)
+            .map_err(crate::metadata::metadata_creation_error)?;
+        let role = crate::typed_read::ALWAYS_BOUND_METADATA_COLUMNS
+            .into_iter()
+            .chain(crate::typed_read::ROW_LINEAGE_METADATA_COLUMNS)
+            .find(|role| {
+                role.column_name()
+                    .eq_ignore_ascii_case(field.field().name())
+            })
+            .ok_or_else(|| {
+                invalid_write_activation("writer identity field has no provider metadata role")
+            })?;
+        let value = crate::schema_mapping::catalog_value::metadata_column(role, creation)
+            .map_err(crate::metadata::metadata_creation_error)?;
+        // Keep the original source Field and its requested root NULL obligation;
+        // the static role does not validate or borrow unrelated table data.
+        let value = writer_value_with_nullable(&value, field.field().is_nullable(), creation)?;
+        authored.push(ConnectorWriteFieldRequest::try_new_typed(
+            field.field().clone(),
+            value,
+        )?);
+    }
+    Ok(authored)
 }
 
 /// Resolve the exact schema owned by a previously resolved write base.
@@ -139,6 +247,16 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field};
     use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+    fn context() -> novarocks_spi::connector::ConnectorRequestContext {
+        novarocks_spi::connector::ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .expect("original fixture request context")
+    }
 
     fn metadata(properties: HashMap<String, String>) -> TableMetadata {
         let fields = [
@@ -214,8 +332,10 @@ mod tests {
                 ))
             })
             .collect::<Vec<_>>();
-        let fields =
-            exact_requested_write_fields(&metadata, &requests).expect("exact write fields");
+        let fields = crate::metadata::with_pure_schema_creation(&context(), |creation| {
+            exact_requested_write_fields(&metadata, &requests, creation)
+        })
+        .expect("exact write fields");
         let authored =
             crate::scalar_integer_domain::metadata_sql_schema(&metadata, metadata.current_schema())
                 .expect("provider schema");
@@ -224,7 +344,10 @@ mod tests {
             assert_eq!(request.field(), authored.field(ordinal));
             assert_eq!(request.field().name(), name);
             assert_eq!(
-                FunctionValueType::try_from_field(request.field()).expect("exact frozen type"),
+                request
+                    .execution_type()
+                    .expect("provider complete declaration")
+                    .clone(),
                 FunctionValueType::try_with_logical_type(carrier, true, domain)
                     .expect("expected provider type")
             );
@@ -243,9 +366,28 @@ mod tests {
                 domain.to_string(),
             )]));
             let request = ConnectorWriteFieldRequest::new(Field::new(name, DataType::Null, true));
-            let error = exact_requested_write_fields(&metadata, &[request])
-                .expect_err("a conflicting provider declaration cannot be silently erased");
+            let error = crate::metadata::with_pure_schema_creation(&context(), |creation| {
+                exact_requested_write_fields(&metadata, &[request], creation)
+            })
+            .expect_err("a conflicting provider declaration cannot be silently erased");
             assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
         }
+    }
+    #[test]
+    fn cancelled_writer_type_author_refuses_before_the_operation() {
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        stop.request_stop();
+        let context = novarocks_spi::connector::ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            stop.view(),
+            1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+        let error = crate::metadata::with_pure_schema_creation::<()>(&context, |_| {
+            panic!("no constructor tail after cancellation")
+        })
+        .expect_err("original cancellation is observed first");
+        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
     }
 }

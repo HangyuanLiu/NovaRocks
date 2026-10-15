@@ -129,12 +129,15 @@ fn ieee_zlib_vectors_preserve_utf8_nul_and_unsigned_bit31_results() {
                 .unwrap();
         let mut kernel = ScalarEvaluationInstance::instantiate(prepared).unwrap();
         assert_eq!(kernel.contract().decimal_overflow_policy(), policy);
-        assert_eq!(kernel.contract().result_type().data_type, DataType::Int64);
         assert_eq!(
-            kernel.contract().result_type().logical_type,
+            kernel.contract().result_type().data_type().clone(),
+            DataType::Int64
+        );
+        assert_eq!(
+            kernel.contract().result_type().logical_type(),
             ValueLogicalType::Physical
         );
-        assert!(kernel.contract().result_type().nullable);
+        assert!(kernel.contract().result_type().nullable());
         let args = [EvaluatedArgument::Column(&input)];
         let result = kernel
             .evaluate(Selection::all(FIXTURES.len()), &args, &Control::default())

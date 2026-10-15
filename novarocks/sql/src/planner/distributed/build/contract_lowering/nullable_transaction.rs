@@ -97,7 +97,9 @@ impl ContractLoweringVisitor<'_> {
                 let mut target = final_target.clone();
                 self.work.step()?;
                 self.work.flush()?;
-                target.nullable |= value_type.nullable;
+                target = target
+                    .with_nullable(target.nullable() || (value_type.nullable()))
+                    .expect("validated root NULL contract");
                 novarocks_functions::builtin::value_conversion::conversion_intermediate_type(
                     value_type, &target,
                 )
@@ -265,10 +267,8 @@ impl ContractLoweringVisitor<'_> {
         let mut revised = function.clone();
         revised.argument_types = selected
             .argument_types
-            .iter()
-            .map(full_source_argument)
-            .collect();
-        revised.result_types = results.iter().map(full_source_type).collect();
+            .clone_observed(|| self.work.step())?;
+        revised.result_types = results.clone_observed(|| self.work.step())?;
         revised.overload = selected.overload.clone();
         self.work.flush()?;
         let changed = *function != revised;
@@ -397,13 +397,13 @@ impl ContractLoweringVisitor<'_> {
                         }
                         let input = &self.construction_expression(fragment, *expr)?.ty;
                         let mut revised = old.ty.clone();
-                        revised.nullable |= input.nullable
+                        revised = revised.with_nullable(revised.nullable() || (input.nullable()
                             || novarocks_functions::carrier_cast_can_produce_null_with_policy(
-                                &input.data_type,
+                                &input.data_type(),
                                 target,
                                 *decimal_overflow_policy,
                                 self.root_allow_throw_exception,
-                            );
+                            ))).expect("validated root NULL contract");
                         revised
                     }
                     ContractExprKind::Value(value) if dependency_changed => published_value_type(
@@ -420,14 +420,21 @@ impl ContractLoweringVisitor<'_> {
                         let mut revised = old.ty.clone();
                         for operand in operands {
                             self.work.step()?;
-                            revised.nullable |=
-                                self.construction_expression(fragment, operand)?.ty.nullable;
+                            revised = revised
+                                .with_nullable(
+                                    revised.nullable()
+                                        || (self
+                                            .construction_expression(fragment, operand)?
+                                            .ty
+                                            .nullable()),
+                                )
+                                .expect("validated root NULL contract");
                         }
                         revised
                     }
                     _ => old.ty.clone(),
                 };
-                if revised.nullable != old.ty.nullable {
+                if revised.nullable() != old.ty.nullable() {
                     self.fragments
                         .get_mut(&fragment)
                         .expect("checked above")
@@ -488,7 +495,7 @@ impl ContractLoweringVisitor<'_> {
                     &dirty_expressions,
                     &dirty_values,
                 )?;
-                if old.ty.nullable != revised.nullable {
+                if old.ty.nullable() != revised.nullable() {
                     self.fragments
                         .get_mut(&fragment)
                         .expect("checked above")
@@ -548,10 +555,34 @@ impl ContractLoweringVisitor<'_> {
             });
             self.work.step()?;
         }
-        let scalar_schema = match (&original.scalar_schema, fields.as_slice()) {
-            (Some(schema), [field]) => Some(schema.clone().with_nullability(field.ty.nullable)),
-            _ => original.scalar_schema.clone(),
-        };
+        let scalar_schema =
+            match (&original.scalar_schema, fields.as_slice()) {
+                (Some(schema), [result]) => {
+                    self.work.flush()?;
+                    let mut field = schema.field().clone();
+                    field.nullable = result.ty.nullable();
+                    if !result.domain.matches_scalar(&field.value_type)
+                    || !novarocks_type_contract::result_scalar_type::scalar_field_matches_storage(
+                        &field,
+                        result.ty.data_type(),
+                        result.ty.nullable(),
+                    )
+                {
+                    return Err(invalid("computed result differs from its captured scalar shape"));
+                }
+                    self.work.step()?;
+                    Some(
+                        novarocks_result_contract::ScalarSchema::try_new(field)
+                            .map_err(|_| invalid("computed scalar schema is invalid"))?,
+                    )
+                }
+                (Some(_), _) => {
+                    return Err(invalid(
+                        "computed scalar result changed its occurrence count",
+                    ));
+                }
+                (None, _) => None,
+            };
         Ok(ResultPort {
             scalar_schema,
             fragment: original.fragment,
@@ -877,6 +908,47 @@ impl ContractLoweringVisitor<'_> {
             if entry.phase != old_binding.phase {
                 return Err(invalid("aggregate rebind changes original source phase"));
             }
+            if !update && entry.canonical.is_none() {
+                // Validate the consumer's ORIGINAL contract before current NULL
+                // facts can select a different signature. The merge keeps its
+                // own capture; a fresh selection cannot repair malformed input.
+                let request = captured.request();
+                let original_selected = self.select_canonical_operational_request(
+                    captured.binding(),
+                    request.logical_argument_count,
+                    request.arguments,
+                )?;
+                let order_count = request
+                    .arguments
+                    .len()
+                    .checked_sub(request.logical_argument_count)
+                    .ok_or_else(|| {
+                        invalid("aggregate original request has an invalid logical prefix")
+                    })?;
+                let original_binding = lower_captured_aggregate_binding(
+                    captured.binding(),
+                    request.logical_argument_count,
+                    order_count,
+                    &captured.binding().resolved().selected,
+                    entry.phase,
+                    &mut self.work,
+                )?;
+                match super::super::physical_aggregate_requests::selected_binding_correspondence_observed(
+                    captured,
+                    &original_selected,
+                    request.logical_argument_count,
+                    &original_binding,
+                    &mut self.work,
+                ) {
+                    Ok(()) => {}
+                    Err(super::super::physical_aggregate_requests::PhysicalAggregateRequestError::Control(cause)) => {
+                        return Err(ContractLoweringError::Control(cause));
+                    }
+                    Err(_) => return Err(invalid(
+                        "aggregate original binding differs from its installed logical request",
+                    )),
+                }
+            }
             let (arguments, constraint, selected) = if update {
                 let previous = self.current_fragment;
                 self.current_fragment = fragment;
@@ -974,13 +1046,17 @@ impl ContractLoweringVisitor<'_> {
                         {
                             self.work.flush()?;
                             let mut root = b.clone();
-                            root.nullable = a.nullable;
+                            root = root
+                                .with_nullable(a.nullable())
+                                .expect("validated root NULL contract");
                             let same_domain = a
                                 .exactly_equals_observed::<ContractLoweringError>(&root, || {
                                     self.work.step().map_err(ContractLoweringError::from)
                                 })?;
                             if same_domain {
-                                a.nullable |= b.nullable;
+                                *a = a
+                                    .with_nullable(a.nullable() || (b.nullable()))
+                                    .expect("validated root NULL contract");
                             }
                         }
                     }
@@ -1076,7 +1152,9 @@ impl ContractLoweringVisitor<'_> {
             ValueOrigin::NullExtended { of, .. } => {
                 revised =
                     published_value_type(&value.ty, &self.construction_value(fragment, of)?.ty);
-                revised.nullable = true;
+                revised = revised
+                    .with_nullable(true)
+                    .expect("validated root NULL contract");
             }
             ValueOrigin::ExchangeImport { edge, source_value } => {
                 let sender = self
@@ -1169,8 +1247,15 @@ impl ContractLoweringVisitor<'_> {
                                 invalid("VALUES row differs from its original output width")
                             })?;
                             if dirty_expressions.contains(&(fragment, expr)) {
-                                revised.nullable |=
-                                    self.construction_expression(fragment, expr)?.ty.nullable;
+                                revised = revised
+                                    .with_nullable(
+                                        revised.nullable()
+                                            || (self
+                                                .construction_expression(fragment, expr)?
+                                                .ty
+                                                .nullable()),
+                                    )
+                                    .expect("validated root NULL contract");
                             }
                         }
                     }
@@ -1181,8 +1266,15 @@ impl ContractLoweringVisitor<'_> {
                                 invalid("set mapping differs from its original output width")
                             })?;
                             if dirty_values.contains(&(fragment, input)) {
-                                revised.nullable |=
-                                    self.construction_value(fragment, input)?.ty.nullable;
+                                revised = revised
+                                    .with_nullable(
+                                        revised.nullable()
+                                            || (self
+                                                .construction_value(fragment, input)?
+                                                .ty
+                                                .nullable()),
+                                    )
+                                    .expect("validated root NULL contract");
                             }
                         }
                     }
@@ -1218,7 +1310,9 @@ impl ContractLoweringVisitor<'_> {
                                         invalid("table relation result ordinal is absent")
                                     })?;
                                 revised = published_value_type(&value.ty, result);
-                                revised.nullable |= *left_outer;
+                                revised = revised
+                                    .with_nullable(revised.nullable() || (*left_outer))
+                                    .expect("validated root NULL contract");
                             }
                         }
                     }
@@ -1226,10 +1320,15 @@ impl ContractLoweringVisitor<'_> {
                         if value.id == spec.value_output {
                             for mapping in spec.mappings.iter() {
                                 self.work.step()?;
-                                revised.nullable |= self
-                                    .construction_value(fragment, mapping.input)?
-                                    .ty
-                                    .nullable;
+                                revised = revised
+                                    .with_nullable(
+                                        revised.nullable()
+                                            || (self
+                                                .construction_value(fragment, mapping.input)?
+                                                .ty
+                                                .nullable()),
+                                    )
+                                    .expect("validated root NULL contract");
                             }
                         } else if let Some((input, _)) = spec
                             .passthrough
@@ -1255,10 +1354,15 @@ impl ContractLoweringVisitor<'_> {
                                 {
                                     self.work.step()?;
                                     if dirty_expressions.contains(&(fragment, *expr)) {
-                                        revised.nullable |= self
-                                            .construction_expression(fragment, *expr)?
-                                            .ty
-                                            .nullable;
+                                        revised = revised
+                                            .with_nullable(
+                                                revised.nullable()
+                                                    || (self
+                                                        .construction_expression(fragment, *expr)?
+                                                        .ty
+                                                        .nullable()),
+                                            )
+                                            .expect("validated root NULL contract");
                                     }
                                 }
                             }
@@ -1277,10 +1381,17 @@ impl ContractLoweringVisitor<'_> {
                                     if *output == value.id {
                                         if let Some(expr) = expr {
                                             if dirty_expressions.contains(&(fragment, *expr)) {
-                                                revised.nullable |= self
-                                                    .construction_expression(fragment, *expr)?
-                                                    .ty
-                                                    .nullable;
+                                                revised = revised
+                                                    .with_nullable(
+                                                        revised.nullable()
+                                                            || (self
+                                                                .construction_expression(
+                                                                    fragment, *expr,
+                                                                )?
+                                                                .ty
+                                                                .nullable()),
+                                                    )
+                                                    .expect("validated root NULL contract");
                                             }
                                         }
                                     }
@@ -1299,7 +1410,9 @@ impl ContractLoweringVisitor<'_> {
                                 &value.ty,
                                 &self.construction_value(fragment, *input)?.ty,
                             );
-                            revised.nullable = true;
+                            revised = revised
+                                .with_nullable(true)
+                                .expect("validated root NULL contract");
                         }
                     }
                     NodeKind::GenerateSeries { .. } => {}
@@ -1351,10 +1464,15 @@ impl ContractLoweringVisitor<'_> {
                             if value.id == unpivot.value_output {
                                 for mapping in unpivot.mappings.iter() {
                                     self.work.step()?;
-                                    revised.nullable |= self
-                                        .construction_value(fragment, mapping.input)?
-                                        .ty
-                                        .nullable;
+                                    revised = revised
+                                        .with_nullable(
+                                            revised.nullable()
+                                                || (self
+                                                    .construction_value(fragment, mapping.input)?
+                                                    .ty
+                                                    .nullable()),
+                                        )
+                                        .expect("validated root NULL contract");
                                 }
                             }
                             if let Some(literal_ordinal) = unpivot
@@ -1371,10 +1489,17 @@ impl ContractLoweringVisitor<'_> {
                                     {
                                         self.work.step()?;
                                         if dirty_expressions.contains(&(fragment, *expr)) {
-                                            revised.nullable |= self
-                                                .construction_expression(fragment, *expr)?
-                                                .ty
-                                                .nullable;
+                                            revised = revised
+                                                .with_nullable(
+                                                    revised.nullable()
+                                                        || (self
+                                                            .construction_expression(
+                                                                fragment, *expr,
+                                                            )?
+                                                            .ty
+                                                            .nullable()),
+                                                )
+                                                .expect("validated root NULL contract");
                                         }
                                     }
                                 }
@@ -1421,7 +1546,7 @@ impl ContractLoweringVisitor<'_> {
                             })?
                             .ty
                             .clone();
-                        if field.ty.nullable != revised.nullable {
+                        if field.ty.nullable() != revised.nullable() {
                             self.work.flush()?;
                             fields
                                 .try_reserve(1)

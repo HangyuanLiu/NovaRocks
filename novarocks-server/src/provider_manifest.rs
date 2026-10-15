@@ -592,8 +592,15 @@ mod tests {
         }])
         .expect("contract-only sealing must not invoke factories");
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        #[cfg(feature = "test-controls")]
+        let test_slots = crate::provider_test_slots::ProviderTestSlots::default();
         let error = manifest
-            .compose_control_factories(&NovaRocksConfig::default(), runtime.handle().clone())
+            .compose_control_factories(
+                &NovaRocksConfig::default(),
+                runtime.handle().clone(),
+                #[cfg(feature = "test-controls")]
+                &test_slots,
+            )
             .err()
             .expect("identity drift must fail")
             .to_string();
@@ -615,8 +622,15 @@ mod tests {
         assert_eq!(EXECUTION_BUILDS.load(Ordering::Acquire), 0);
 
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        #[cfg(feature = "test-controls")]
+        let test_slots = crate::provider_test_slots::ProviderTestSlots::default();
         manifest
-            .compose_control_factories(&NovaRocksConfig::default(), runtime.handle().clone())
+            .compose_control_factories(
+                &NovaRocksConfig::default(),
+                runtime.handle().clone(),
+                #[cfg(feature = "test-controls")]
+                &test_slots,
+            )
             .expect("FE projection");
         assert_eq!(CONTROL_BUILDS.load(Ordering::Acquire), 1);
         assert_eq!(EXECUTION_BUILDS.load(Ordering::Acquire), 0);
@@ -626,6 +640,8 @@ mod tests {
     fn native_carriers_and_both_role_projections_share_one_manifest() {
         let manifest = ServerProviderManifest::seal().expect("server provider manifest");
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        #[cfg(feature = "test-controls")]
+        let test_slots = crate::provider_test_slots::ProviderTestSlots::default();
         let config = NovaRocksConfig::default();
         let contract_ids = manifest
             .contracts()
@@ -640,7 +656,12 @@ mod tests {
                 .map(|carrier| carrier.provider_id().to_string())
                 .collect::<Vec<_>>();
         let control_ids = manifest
-            .compose_control_factories(&config, runtime.handle().clone())
+            .compose_control_factories(
+                &config,
+                runtime.handle().clone(),
+                #[cfg(feature = "test-controls")]
+                &test_slots,
+            )
             .expect("FE projection")
             .into_iter()
             .map(|factory| factory.provider_id().as_str().to_owned())
@@ -648,7 +669,13 @@ mod tests {
         let scan_io =
             crate::scan_io::ScanIoRuntime::start(&config.runtime).expect("scan I/O runtime");
         let execution_ids = manifest
-            .compose_execution_factories(&config, runtime.handle().clone(), &scan_io.services())
+            .compose_execution_factories(
+                &config,
+                runtime.handle().clone(),
+                &scan_io.services(),
+                #[cfg(feature = "test-controls")]
+                &test_slots,
+            )
             .expect("BE projection")
             .into_iter()
             .map(|factory| factory.provider_id().as_str().to_owned())

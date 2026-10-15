@@ -108,6 +108,13 @@ fn by_window_compiled_function_major_error_order_across_partitions() {
     let tracker = MemTracker::new_root("original function-major BY probe");
     tracker.install_limit_once(64 * 1024 * 1024).unwrap();
     operator.set_mem_tracker(tracker.clone());
+    operator.set_construction_factory(
+        super::super::aggregate_fixture::runtime_construction_factory(
+            tracker.clone(),
+            Arc::new(RuntimeErrorState::default()),
+        ),
+    );
+    operator.prepare().unwrap();
     let processor = operator.as_processor_mut().unwrap();
     let state = RuntimeState::default();
     let first = match processor.push_chunk(

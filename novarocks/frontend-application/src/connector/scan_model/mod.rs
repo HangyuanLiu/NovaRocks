@@ -48,6 +48,7 @@
 //! prune, and Core must keep its residual), and everything else is answered
 //! `Unsupported`. The fixture never answers `Exact`, because it never filters.
 
+use crate::connector::schema_creation::FrontendSchemaLoad;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -418,6 +419,59 @@ pub(crate) fn fixture_read_schema_for_table(table: &str) -> SchemaRef {
     fixture_read_schema()
 }
 
+/// The closed fixture provider publishes its own complete scalar declarations.
+fn fixture_read_value_types_for_table(
+    table: &str,
+) -> Vec<novarocks_type_contract::FunctionValueType> {
+    use novarocks_type_contract::FunctionValueType;
+    let declarations = if table == "mv_branch_target" {
+        vec![
+            (DataType::Int32, false),
+            (DataType::Utf8, false),
+            (DataType::Int64, false),
+            (DataType::Utf8, false),
+            (DataType::Int64, false),
+            (DataType::Int64, false),
+            (DataType::Int64, true),
+        ]
+    } else if matches!(table, "l" | "r" | "mv") {
+        vec![
+            (DataType::Int64, false),
+            (DataType::Int64, true),
+            (DataType::Utf8, false),
+            (DataType::Utf8, false),
+            (DataType::Int64, false),
+            (DataType::Int64, false),
+            (DataType::Int64, true),
+        ]
+    } else if table == FIXTURE_HIDDEN_KEY_TABLE {
+        vec![
+            (DataType::Int32, false),
+            (DataType::Utf8, true),
+            (DataType::Utf8, false),
+            (DataType::Utf8, false),
+            (DataType::Int64, false),
+        ]
+    } else {
+        vec![
+            (DataType::Int32, false),
+            (DataType::Utf8, true),
+            (DataType::LargeBinary, false),
+            (DataType::Binary, true),
+            (DataType::Utf8, true),
+            (DataType::Utf8, false),
+            (DataType::Utf8, false),
+            (DataType::Int64, false),
+            (DataType::Int64, false),
+            (DataType::Int64, true),
+        ]
+    };
+    declarations
+        .into_iter()
+        .map(|(carrier, nullable)| FunctionValueType::new(carrier, nullable))
+        .collect()
+}
+
 fn fixture_columns(table: &str) -> Vec<FieldDef> {
     fixture_read_schema_for_table(table)
         .fields()
@@ -666,12 +720,17 @@ impl ConnectorMetadata for Fixture {
     fn load_table(
         &self,
         request: ConnectorTableRequest,
-    ) -> Result<ConnectorTableMetadata, ConnectorError> {
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         if request.table.instance_id != self.instance_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "read fixture received a table for another connector",
-            ));
+            )
+            .into());
         }
         let table = request.table.table.as_ref();
         let payload = TablePayload {
@@ -682,22 +741,28 @@ impl ConnectorMetadata for Fixture {
             prepared_files: self.files_for_table(table).cloned().unwrap_or_default(),
             explicit_files: None,
         };
-        Ok(ConnectorTableMetadata {
-            identity: request.table.clone(),
-            schema: fixture_read_schema_for_table(table),
-            planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
-            definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
-            version: None,
-            statistics_data_version: None,
-            table: ConnectorTableHandle::try_new(
+        Ok(crate::connector::schema_creation::declared_test_metadata_with_creation(novarocks_spi::connector::ConnectorTableMetadataHeader { identity: request.table.clone(),
+planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::try_new(
+                &fixture_read_schema_for_table(table),
+                (0..fixture_read_value_types_for_table(table).len()).map(|ordinal|
+                    novarocks_spi::connector::ConnectorTableColumnPlanningFact::new(ordinal as u32,
+                        if table == FIXTURE_HIDDEN_KEY_TABLE && ordinal == 2 {
+                            novarocks_spi::connector::ConnectorTableColumnVisibility::Hidden
+                        } else { novarocks_spi::connector::ConnectorTableColumnVisibility::Sql },
+                        novarocks_spi::connector::ConnectorTableColumnSemanticKind::None,
+                        novarocks_spi::connector::ConnectorTableColumnRole::Ordinary)).collect(),
+                vec![], vec![], vec![], &request.context)?,
+definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
+version: None,
+statistics_data_version: None,
+table: ConnectorTableHandle::try_new(
                 self.instance_id.clone(),
                 encode_payload(
                     &payload,
                     "table handle",
                     request.context.max_handle_payload_bytes(),
                 )?,
-            )?,
-        })
+            )? }, fixture_read_schema_for_table(table), fixture_read_value_types_for_table(table), creation)?)
     }
 }
 
@@ -908,7 +973,7 @@ mod tests {
         lease
             .binding()
             .metadata()
-            .load_table(ConnectorTableRequest {
+            .load_frontend_table(ConnectorTableRequest {
                 table: ConnectorTableIdentity {
                     instance_id: ConnectorInstanceId::parse(CATALOG).expect("instance ID"),
                     namespace: Arc::from("db"),
@@ -1328,18 +1393,15 @@ mod tests {
         let metadata = load(&lease, FIXTURE_HIDDEN_KEY_TABLE);
 
         assert_eq!(
-            metadata.schema.field(2).name(),
+            metadata.schema().field(2).name(),
             FIXTURE_HIDDEN_KEY_COLUMN,
             "a hidden column keeps its frozen schema ordinal"
         );
         assert!(
-            !crate::connector::sql_columns_from_connector_schema(
-                &metadata.schema,
-                &metadata.planning_facts,
-            )
-            .expect("SQL schema columns")
-            .iter()
-            .any(|column| column.name == FIXTURE_HIDDEN_KEY_COLUMN),
+            !crate::connector::application::sql_columns_from_connector_metadata(&metadata)
+                .expect("SQL schema columns")
+                .iter()
+                .any(|column| column.name == FIXTURE_HIDDEN_KEY_COLUMN),
             "a hidden column must not reach SQL"
         );
     }

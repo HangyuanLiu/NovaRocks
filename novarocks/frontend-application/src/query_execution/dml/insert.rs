@@ -487,7 +487,7 @@ fn insert_columns_from_connector_metadata(
 ) -> Vec<ColumnDef> {
     let column_facts = metadata.planning_facts.column_facts();
     metadata
-        .schema
+        .schema()
         .fields()
         .iter()
         .enumerate()

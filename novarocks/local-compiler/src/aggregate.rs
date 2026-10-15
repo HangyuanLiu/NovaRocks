@@ -28,7 +28,6 @@
 use crate::{
     assert_rows::reserve_vec, expressions::ExpressionLoweringError, lowering::FragmentCompileError,
 };
-use arrow_schema::{Field, Schema};
 use novarocks_functions::{
     AggregateBindingSelection, AggregateKernelPhase, AggregateOverloadIdentity,
     AggregatePreparationOptions, CallEffectInput, FunctionBindingSelection, FunctionResultType,
@@ -71,47 +70,54 @@ pub(crate) struct LoweredAggregate {
 /// Lower one Aggregate whose output is its group values followed by one value
 /// per call, in call order. Function ORDER channels follow logical arguments
 /// and retain their original state interpretation across merge phases.
-pub(crate) fn lower_aggregate(
+pub(crate) fn lower_aggregate_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     input: ProgramNodeId,
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     slots: &[SlotId],
     control: &dyn PureCompileControl,
-) -> Result<LoweredAggregate, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<LoweredAggregate, crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(package, node, input, expressions, slots, &mut work);
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    let result = lower_core_with_creation(
+        package,
+        node,
+        input,
+        expressions,
+        slots,
+        &mut work,
+        creation,
+    );
+    crate::creation::finish_attempt(result, work)
 }
 
-fn lower_core(
+fn lower_core_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     input: ProgramNodeId,
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     slots: &[SlotId],
     work: &mut CompileCheckpoints<'_>,
-) -> Result<LoweredAggregate, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<LoweredAggregate, crate::FragmentCreationError<H>> {
     let NodeKind::Aggregate {
         group_by,
         calls,
         grouping,
     } = &node.kind
     else {
-        return Err(FragmentCompileError::Invalid("Aggregate kind differs"));
+        return Err((FragmentCompileError::Invalid("Aggregate kind differs")).into());
     };
     let width = group_by
         .len()
         .checked_add(calls.len())
         .ok_or(FragmentCompileError::Invalid("aggregate width exhausted"))?;
     if node.inputs.len() != 1 || node.output.columns.len() != width || slots.len() != width {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "aggregate input, output or channel width differs",
-        ));
+        ))
+        .into());
     }
     // The output is exactly the group values followed by the call outputs.
     let expected = group_by
@@ -121,9 +127,10 @@ fn lower_core(
     for (actual, expected) in node.output.columns.iter().zip(expected) {
         work.step()?;
         if *actual != expected {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "aggregate output is not its group values followed by its call outputs",
-            ));
+            ))
+            .into());
         }
     }
     let values = package.fragment().values();
@@ -140,13 +147,14 @@ fn lower_core(
         work.flush()?;
         let same = definition
             .ty
-            .exactly_equals_observed::<FragmentCompileError>(&output.ty, || {
+            .exactly_equals_observed::<crate::FragmentCreationError<H>>(&output.ty, || {
                 work.step().map_err(Into::into)
             })?;
         if !same {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "group value type differs from its definition",
-            ));
+            ))
+            .into());
         }
         keys.push(
             *expressions
@@ -165,37 +173,28 @@ fn lower_core(
         let phase = call.binding.phase;
         if finalizing.replace(phase.produces_final_result()) == Some(!phase.produces_final_result())
         {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "aggregate mixes finalizing and non-finalizing calls",
-            ));
+            ))
+            .into());
         }
         merging &= !phase.consumes_logical_arguments();
-        functions.push(lower_call(node, call, expressions, work)?);
+        functions.push(lower_call(node, call, expressions, work, creation)?);
         work.step()?;
     }
     // A finalizing call requires a complete grouping. A node without calls
     // finalizes exactly when its groups are complete.
     let need_finalize = finalizing.unwrap_or(*grouping == AggregateGrouping::Complete);
     if need_finalize && *grouping != AggregateGrouping::Complete {
-        return Err(FragmentCompileError::Invalid(
-            "finalizing aggregate has a partial grouping",
-        ));
+        return Err(
+            (FragmentCompileError::Invalid("finalizing aggregate has a partial grouping")).into(),
+        );
     }
     let result = package
         .result()
         .filter(|result| result.output.columns == node.output.columns);
-    let mut fields: Vec<Field> = Vec::new();
-    if package.original_metadata_namespace().is_none() {
-        reserve_vec(&mut fields, width, work)?;
-    }
-    let mut original_fields = match package.original_metadata_namespace() {
-        Some(_) => {
-            let mut original_fields = Vec::new();
-            reserve_vec(&mut original_fields, width, work)?;
-            Some(original_fields)
-        }
-        None => None,
-    };
+    let mut typed_layout =
+        crate::typed_layout::TypedLayoutBuilder::new_with_creation(width, work, creation)?;
     for (ordinal, value) in node.output.columns.iter().enumerate() {
         let ty = &values
             .get(value)
@@ -214,38 +213,26 @@ fn lower_core(
                     .ok_or(FragmentCompileError::Invalid(
                         "missing aggregate result label",
                     ))?;
-                field.alias.as_deref().unwrap_or(&field.name).to_owned()
+                crate::typed_layout::copy_name_with_creation(
+                    field.alias.as_deref().unwrap_or(&field.name),
+                    work,
+                    creation,
+                )?
             }
-            None => format!("local_aggregate_{}_{}", node.id.get(), ordinal),
+            None => crate::typed_layout::local_name_with_creation(
+                "local_aggregate",
+                node.id.get(),
+                ordinal,
+                work,
+                creation,
+            )?,
         };
         work.flush()?;
-        if let Some(original_fields) = original_fields.as_mut() {
-            let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(ty, name);
-            work.flush()?;
-            original_fields.push(field?);
-        } else {
-            let field = ty.try_to_field(name);
-            work.flush()?;
-            fields.push(field?);
-        }
+        typed_layout.push_with_creation(ty, name, work, creation)?;
         work.step()?;
     }
     work.flush()?;
-    let layout = match (original_fields, package.original_metadata_namespace()) {
-        (Some(fields), Some(namespace)) => {
-            let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema();
-            StaticLayout::try_new_materialized_for_compile(
-                source,
-                Arc::from(slots),
-                work.control(),
-            )?
-        }
-        _ => StaticLayout::try_new_for_compile(
-            Arc::new(Schema::new(fields)),
-            Arc::from(slots),
-            work.control(),
-        )?,
-    };
+    let layout = typed_layout.finish_with_creation(slots, work, creation)?;
     work.flush()?;
     Ok(LoweredAggregate {
         kind: ProgramNodeKind::Aggregate {
@@ -269,18 +256,83 @@ fn lower_core(
     })
 }
 
-fn lower_call(
+/// Copy the full selection from its physical author's immutable declaration.
+/// No carrier/root-domain projection can author this retained selection.
+pub(crate) fn freeze_binding_with_creation<H>(
+    binding: &novarocks_physical_plan::AggregateBinding,
+    work: &mut CompileCheckpoints<'_>,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<Arc<novarocks_local_program::FrozenAggregateSelection>, crate::FragmentCreationError<H>>
+{
+    use novarocks_type_contract::owned_resources::layout::arc_layout;
+    let function = &binding.function;
+    if function.kind != FunctionKind::Aggregate {
+        return Err(FragmentCompileError::Invalid(
+            "frozen aggregate selection is not an aggregate",
+        )
+        .into());
+    }
+    // These entities are immutable guarded owners. Validate channel roles
+    // before sharing them; no label or argument backing is reconstructed.
+    let function_id = function.function_id.clone_observed(|| work.step())?;
+    let overload = function.overload.clone_observed(|| work.step())?;
+    for argument in &function.argument_types {
+        work.step()?;
+        if !matches!(argument, FunctionArgumentType::Value(_)) {
+            return Err(FragmentCompileError::Invalid("aggregate channel is not a value").into());
+        }
+    }
+    let argument_types = function.argument_types.clone_observed(|| work.step())?;
+    let result_type =
+        FunctionResultType::Scalar(function.result_type.clone_observed(|| work.step())?);
+    let intermediate_type = binding.intermediate_type.clone_observed(|| work.step())?;
+    let state_format = binding.state_format.clone_observed(|| work.step())?;
+    crate::creation::request(
+        arc_layout(std::alloc::Layout::new::<FunctionBindingSelection>())?,
+        creation,
+        work,
+    )?;
+    let selected = Arc::new(FunctionBindingSelection {
+        overload,
+        argument_types,
+        result_type,
+        aggregate: Some(AggregateBindingSelection {
+            state_argument_contract: binding.state_argument_contract,
+            intermediate_type,
+            state_format,
+        }),
+    });
+    let frozen = novarocks_local_program::FrozenAggregateSelection::try_new(
+        function_id,
+        selected,
+        binding.logical_argument_count as usize,
+        creation.storage_lifetime(),
+    )
+    .map_err(|error| FragmentCompileError::Owner {
+        phase: "frozen aggregate selection",
+        error: Box::new(error),
+    })?;
+    crate::creation::request(
+        novarocks_local_program::FrozenAggregateSelection::storage_allocation_layout()?,
+        creation,
+        work,
+    )?;
+    Ok(Arc::new(frozen))
+}
+
+fn lower_call<H>(
     node: &PhysicalNode,
     call: &AggregateCall,
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<StaticAggregateCall, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<StaticAggregateCall, crate::FragmentCreationError<H>> {
     let binding = &call.binding;
     let function = &binding.function;
     if function.kind != FunctionKind::Aggregate {
-        return Err(FragmentCompileError::Invalid(
-            "aggregate call binds a non-aggregate function",
-        ));
+        return Err(
+            FragmentCompileError::Invalid("aggregate call binds a non-aggregate function").into(),
+        );
     }
     let mut inputs = Vec::new();
     let input_count = call
@@ -309,12 +361,10 @@ fn lower_call(
     reserve_vec(&mut argument_types, function.argument_types.len(), work)?;
     for argument in function.argument_types.iter() {
         let FunctionArgumentType::Value(value) = argument else {
-            return Err(FragmentCompileError::Invalid(
-                "aggregate channel is not a value",
-            ));
+            return Err(FragmentCompileError::Invalid("aggregate channel is not a value").into());
         };
         work.flush()?;
-        argument_types.push(value.data_type.clone());
+        argument_types.push(value.data_type().clone());
         work.step()?;
     }
     let overload =
@@ -336,7 +386,9 @@ fn lower_call(
         nulls_first.push(key.null_ordering == novarocks_physical_plan::NullOrdering::First);
         work.step()?;
     }
+    let frozen = freeze_binding_with_creation(binding, work, creation)?;
     Ok(StaticAggregateCall {
+        frozen: Some(frozen),
         state_interpretation: binding
             .state_interpretation
             .as_ref()
@@ -356,8 +408,8 @@ fn lower_call(
         resolved: ResolvedAggregateSignature {
             overload,
             argument_types,
-            intermediate_type: binding.intermediate_type.data_type.clone(),
-            output_type: function.result_type.data_type.clone(),
+            intermediate_type: binding.intermediate_type.data_type().clone(),
+            output_type: function.result_type.data_type().clone(),
             state_format: binding.state_format.clone(),
         },
     })
@@ -367,14 +419,18 @@ fn lower_call(
 /// installed owner. `effects` holds the prepared effects of every expression
 /// occurrence, so each argument root contributes its actual effects; `nodes`
 /// names the local node each physical aggregate lowers to.
-pub(crate) fn prepare_aggregate_calls(
+pub(crate) fn prepare_aggregate_calls<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
     package: &FragmentPackage,
     functions: &PureEngineFunctionCatalog,
     effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     nodes: &BTreeMap<NodeId, ProgramNodeId>,
     tokens: &mut BTreeMap<ProgramCallSite, PureCallSpecialization>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), ExpressionLoweringError> {
+    creation: crate::expressions::CallCreation<'_, F>,
+) -> Result<(), crate::expressions::ExpressionCreationFailure<H>> {
     let mut prepared = 0usize;
     for node in package.fragment().nodes().values() {
         work.step()?;
@@ -388,7 +444,9 @@ pub(crate) fn prepare_aggregate_calls(
             let ordinal = u32::try_from(ordinal).map_err(|_| {
                 ExpressionLoweringError::Invalid("aggregate call ordinal exhausted")
             })?;
-            let token = prepare_call(package, functions, effects, node, ordinal, call, work)?;
+            let token = prepare_call(
+                package, functions, effects, node, ordinal, call, work, creation,
+            )?;
             if tokens
                 .insert(
                     ProgramCallSite::Aggregate {
@@ -401,7 +459,8 @@ pub(crate) fn prepare_aggregate_calls(
             {
                 return Err(ExpressionLoweringError::Invalid(
                     "aggregate call site is prepared twice",
-                ));
+                )
+                .into());
             }
             prepared += 1;
             work.step()?;
@@ -418,12 +477,13 @@ pub(crate) fn prepare_aggregate_calls(
     if frozen != prepared {
         return Err(ExpressionLoweringError::Invalid(
             "frozen aggregate calls differ from the actual aggregate calls",
-        ));
+        )
+        .into());
     }
     Ok(())
 }
 
-fn prepare_call(
+fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     functions: &PureEngineFunctionCatalog,
     effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
@@ -431,7 +491,8 @@ fn prepare_call(
     ordinal: u32,
     call: &AggregateCall,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<PureCallSpecialization, ExpressionLoweringError> {
+    creation: crate::expressions::CallCreation<'_, F>,
+) -> Result<PureCallSpecialization, crate::expressions::ExpressionCreationFailure<H>> {
     let site = PhysicalCallSite::Aggregate {
         node: node.id,
         call: ordinal,
@@ -441,7 +502,8 @@ fn prepare_call(
     if function.kind != FunctionKind::Aggregate {
         return Err(ExpressionLoweringError::Invalid(
             "aggregate call binds a non-aggregate function",
-        ));
+        )
+        .into());
     }
     let frozen = package
         .calls()
@@ -458,10 +520,11 @@ fn prepare_call(
     let source_request = source_request.ok_or(ExpressionLoweringError::Invalid(
         "missing original aggregate call request",
     ))?;
-    let request = crate::original_requests::materialize_call_request_observed(
+    let request = crate::original_requests::materialize_call_request_created(
         source_request,
         package.constants(),
         work,
+        creation,
     )?;
     work.flush()?;
     // The selection is the frozen binding itself, never a re-resolution.
@@ -476,12 +539,14 @@ fn prepare_call(
         }),
     });
     work.flush()?;
-    functions.metadata().validate_frozen_selection(
+    crate::expressions::validate_call_created(
+        functions.metadata(),
         &function.function_id,
         FunctionKind::Aggregate,
         selection.as_ref(),
         request.request(),
         work.control(),
+        creation,
     )?;
     work.flush()?;
     let phase = kernel_phase(binding.phase);
@@ -548,7 +613,8 @@ fn prepare_call(
         if !exact {
             return Err(ExpressionLoweringError::Invalid(
                 "aggregate argument root differs from its actual call argument",
-            ));
+            )
+            .into());
         }
         let summary = effects
             .get(&use_id)
@@ -590,12 +656,14 @@ fn prepare_call(
         let ([state], [context]) = (call.arguments.as_ref(), contexts.as_slice()) else {
             return Err(ExpressionLoweringError::Invalid(
                 "merging aggregate phase requires exactly one state argument",
-            ));
+            )
+            .into());
         };
         if call.distinct {
             return Err(ExpressionLoweringError::Invalid(
                 "merging aggregate phase repeats DISTINCT",
-            ));
+            )
+            .into());
         }
         let state_type = &package
             .fragment()
@@ -634,7 +702,8 @@ fn prepare_call(
         decimal_overflow_policy: frozen.decimal_overflow_policy,
         proof_scope: frozen.effects.proof_scope,
     };
-    let mut token = functions.prepare_frozen(
+    let mut token = crate::expressions::prepare_call_created(
+        functions,
         input,
         Arc::clone(&selection),
         &frozen.effects,
@@ -643,6 +712,7 @@ fn prepare_call(
             options,
         },
         work.control(),
+        creation,
     )?;
     work.flush()?;
     if matches!(&node.kind, NodeKind::Aggregate { calls, .. }

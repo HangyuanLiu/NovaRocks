@@ -67,7 +67,7 @@ impl NativeFragmentRequest {
     /// node membership and sink edge binding -- and they run before anything
     /// is prepared.
     #[allow(clippy::too_many_arguments)]
-    pub fn try_decode_task(
+    pub(crate) fn try_decode_task(
         execution_id: QueryExecutionId,
         fragment: plan::PlanFragment,
         instance: NativeFragmentInstanceInput,
@@ -82,6 +82,7 @@ impl NativeFragmentRequest {
         #[cfg(feature = "test-controls")] observation_controls: Option<
             Arc<crate::test_observation_controls::NativeObservationControls>,
         >,
+        type_creation: &crate::native_type_construction::NativeTypeConstruction,
     ) -> Result<Self, NativeFragmentIngressError> {
         let decoded = decode_fragment_submission(
             &fragment,
@@ -95,8 +96,9 @@ impl NativeFragmentRequest {
             test_controls,
             #[cfg(feature = "test-controls")]
             observation_controls,
+            type_creation,
         )
-        .map_err(NativeFragmentIngressError::new)?;
+        .map_err(NativeFragmentIngressError::from_decode)?;
         let (submission, backend_num) = decoded.into_parts();
         if execution_id.query_id().high() != submission.instance().query_id().high()
             || execution_id.query_id().low() != submission.instance().query_id().low()
@@ -235,10 +237,30 @@ mod tests {
             FragmentSinkKind::Noop,
         )
         .expect("project the task instance");
+        let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+            "native request fixture",
+        );
+        tracker.install_limit_once(1024 * 1024).unwrap();
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let creator = crate::native_type_construction::NativeTypeConstruction::try_new(
+            tracker,
+            stop.view(),
+            novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
+        )
+        .unwrap();
         let request = NativeFragmentRequest::try_decode_task(
             execution,
             plan::PlanFragment {
                 fragment_id: 7,
+                execution_types: Some(plan::ExecutionTypeTable::default()),
+                constant_source_fields: Some(
+                    crate::fragment_expression::fixture_sources::empty_source_fields(),
+                ),
+                original_call_requests: Some(
+                    novarocks_proto_models::call_request::FragmentCallRequests {
+                        entries: Vec::new(),
+                    },
+                ),
                 root: Some(plan::DistributedNode {
                     node_id: 10,
                     fragment_id: 7,
@@ -263,7 +285,7 @@ mod tests {
             },
             instance,
             descriptor.topology(),
-            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            stop.view(),
             Duration::from_secs(1),
             None,
             Arc::new(
@@ -274,6 +296,7 @@ mod tests {
             None,
             #[cfg(feature = "test-controls")]
             None,
+            &creator,
         )
         .expect("decode values request through backend ingress");
 

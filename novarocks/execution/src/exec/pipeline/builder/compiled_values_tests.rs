@@ -182,7 +182,9 @@ fn values_program(rows: &[Vec<Cell>]) -> Arc<LocalProgram> {
                         novarocks_type_contract::ArithmeticOperator::Add,
                     )
                     .unwrap();
-                    sum.nullable = true;
+                    sum = sum
+                        .with_nullable(true)
+                        .expect("valid test root nullability");
                     assert_eq!(sum, ty, "BIGINT + BIGINT fills the nullable BIGINT column");
                     let left = builder
                         .add_expression(
@@ -415,7 +417,9 @@ fn failure(program: &Arc<LocalProgram>) -> ExecutionFailure {
         None,
         None,
         None,
-        None,
+        Some(crate::runtime::mem_tracker::MemTracker::new_root(
+            "compiled values tests",
+        )),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ));
     let output = ResultSinkHandle::new();
@@ -472,7 +476,7 @@ fn values_cast_cells_run_through_a_projection_with_exact_values_and_nulls() {
     let chunks = run(&program);
     assert_eq!(int64_rows(&chunks), expected);
     for chunk in &chunks {
-        let schema = chunk.batch.schema();
+        let schema = chunk.record_batch().schema();
         assert!(schema.field(0).is_nullable());
         assert!(!schema.field(1).is_nullable());
     }

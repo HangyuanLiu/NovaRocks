@@ -68,15 +68,8 @@ fn policy() -> ConstantPolicy {
 fn cv(array: ArrayRef, ty: FunctionValueType, ordinal: u32) -> ConstantValue {
     ConstantPool::try_new(
         Arc::new(
-            ty.try_to_field("actual.source").unwrap().with_metadata(
-                ty.try_to_field("actual.source")
-                    .unwrap()
-                    .metadata()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .chain([("provider.fact".into(), "retained".into())])
-                    .collect(),
-            ),
+            Field::new("actual.source", array.data_type().clone(), ty.nullable())
+                .with_metadata([("provider.fact".into(), "retained".into())].into()),
         ),
         ty,
         array.to_data(),
@@ -177,7 +170,7 @@ fn actual_unpivot_cv_retains_selected_ordinal_backing_and_complete_source_field(
     assert_eq!(selected.try_utf8().unwrap(), Some("chosen"));
     let null = Fixture::new(text(vec![Some("unused"), None], 1));
     let node = null.construct(&Control::good()).unwrap();
-    assert!(node.output_columns[1].value_type.nullable);
+    assert!(node.output_columns[1].value_type.nullable());
     let UnpivotConstant::Scalar(expression) = &node.value_mappings[0].constants[0] else {
         panic!("scalar");
     };
@@ -189,7 +182,11 @@ fn actual_unpivot_cv_retains_selected_ordinal_backing_and_complete_source_field(
 #[test]
 fn actual_unpivot_cv_refuses_declared_source_and_output_domain_drift() {
     let mut mismatch = Fixture::new(text(vec![Some("chosen")], 0));
-    mismatch.scalar_mut().value_type.nullable = true;
+    mismatch.scalar_mut().value_type = mismatch
+        .scalar_mut()
+        .value_type
+        .with_nullable(true)
+        .unwrap();
     assert!(
         mismatch
             .construct(&Control::good())
@@ -203,7 +200,13 @@ fn actual_unpivot_cv_refuses_declared_source_and_output_domain_drift() {
     let json = cv(Arc::new(StringArray::from(vec!["{}"])), ty, 0);
     let mut nominal = Fixture::new(json);
     assert!(nominal.construct(&Control::good()).is_ok());
-    nominal.output[1].value_type.logical_type = ValueLogicalType::Physical;
+    nominal.output[1].value_type =
+        novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            nominal.output[1].value_type.data_type().clone(),
+            nominal.output[1].value_type.nullable(),
+            ValueLogicalType::Physical,
+        )
+        .unwrap();
     assert!(
         nominal
             .construct(&Control::good())
@@ -285,34 +288,48 @@ fn actual_unpivot_cv_controls_preserve_success_ordinary_tail_and_wide_type_quant
     let success = Fixture::new(text(vec![Some("prefix"), Some("chosen")], 1));
     check_callbacks(&success, true, false);
     let mut mismatch = Fixture::new(text(vec![Some("chosen")], 0));
-    mismatch.scalar_mut().value_type.nullable = true;
+    mismatch.scalar_mut().value_type = mismatch
+        .scalar_mut()
+        .value_type
+        .with_nullable(true)
+        .unwrap();
     check_callbacks(&mismatch, false, false);
     let mut output_mismatch = Fixture::new(text(vec![Some("chosen")], 0));
     output_mismatch.output[1].value_type = FunctionValueType::new(DataType::Int64, false);
     check_callbacks(&output_mismatch, false, false);
-    let metadata = (0..320)
-        .map(|index| (format!("provider.{index:03}"), "kept".into()))
-        .collect::<HashMap<_, _>>();
-    let fields = Fields::from(vec![Arc::new(
-        Field::new("child", DataType::Utf8, false).with_metadata(metadata),
-    )]);
-    let array = StructArray::new(
-        fields.clone(),
-        vec![Arc::new(StringArray::from(vec!["prefix", "chosen"]))],
-        None,
+    let fields = Fields::from(
+        (0..320)
+            .map(|index| {
+                Arc::new(
+                    Field::new(format!("child_{index}"), DataType::Utf8, false)
+                        .with_metadata([("provider.attribute".into(), "kept".into())].into()),
+                )
+            })
+            .collect::<Vec<_>>(),
     );
-    let wide = Fixture::new(cv(
+    let columns: Vec<ArrayRef> = (0..320)
+        .map(|_| Arc::new(StringArray::from(vec!["prefix", "chosen"])) as ArrayRef)
+        .collect();
+    let array = StructArray::new(fields.clone(), columns, None);
+    let mut wide = Fixture::new(cv(
         Arc::new(array),
-        FunctionValueType::new(DataType::Struct(fields), false),
+        FunctionValueType::new(DataType::Struct(fields.clone()), false),
         1,
     ));
+    wide.scalar_mut().value_type = FunctionValueType::new(DataType::Struct(fields.clone()), false);
+    wide.output[1].value_type = FunctionValueType::new(DataType::Struct(fields), false);
     check_callbacks(&wide, true, true);
     let mut drift = wide;
-    let DataType::Struct(fields) = &drift.output[1].value_type.data_type else {
+    let DataType::Struct(fields) = &drift.output[1].value_type.data_type() else {
         panic!("struct");
     };
     let changed = fields[0].as_ref().clone().with_metadata(HashMap::new());
-    drift.output[1].value_type.data_type = DataType::Struct(Fields::from(vec![Arc::new(changed)]));
+    drift.output[1].value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+        DataType::Struct(Fields::from(vec![Arc::new(changed)])),
+        drift.output[1].value_type.nullable(),
+        drift.output[1].value_type.logical_type(),
+    )
+    .unwrap();
     assert!(
         drift
             .construct(&Control::good())
@@ -361,21 +378,30 @@ fn actual_unpivot_passthrough_and_value_outputs_preserve_complete_domains_and_nu
         node.output_columns.last_mut().unwrap().value_type = wrong;
         check_relation_callbacks(&node, &input, false);
         node.output_columns.last_mut().unwrap().value_type = source.clone();
-        node.output_columns.last_mut().unwrap().value_type.nullable = true;
+        node.output_columns.last_mut().unwrap().value_type = node
+            .output_columns
+            .last_mut()
+            .unwrap()
+            .value_type
+            .with_nullable(true)
+            .unwrap();
         check_relation_callbacks(&node, &input, false);
 
         let mut node = original.clone();
         let mut input = fixture.input.clone();
         input[0].value_type = source.clone();
         let mut nullable_source = source;
-        nullable_source.nullable = true;
+        nullable_source = nullable_source.with_nullable(true).unwrap();
         input.push(column(8, "nullable.input", nullable_source.clone()));
         let mut second = node.value_mappings[0].clone();
         second.input_value_column_id = ColumnId(8);
         node.value_mappings.push(second);
         node.output_columns[0].value_type = nullable_source;
         check_relation_callbacks(&node, &input, true);
-        node.output_columns[0].value_type.nullable = false;
+        node.output_columns[0].value_type = node.output_columns[0]
+            .value_type
+            .with_nullable(false)
+            .unwrap();
         check_relation_callbacks(&node, &input, false);
     }
 
@@ -386,14 +412,20 @@ fn actual_unpivot_passthrough_and_value_outputs_preserve_complete_domains_and_nu
     let mut node = original.clone();
     node.output_columns[0].value_type = ty;
     check_relation_callbacks(&node, &input, true);
-    for changed in [
-        dictionary_field(8, true, true),
-        dictionary_field(7, false, true),
-        dictionary_field(7, true, false),
+    for (changed, compatible) in [
+        (dictionary_field(8, true, true), true),
+        (dictionary_field(7, false, true), true),
+        (dictionary_field(7, true, false), true),
+        (dictionary_field(7, true, true).with_nullable(false), false),
     ] {
-        node.output_columns[0].value_type.data_type =
-            DataType::Struct(Fields::from(vec![Arc::new(changed)]));
-        check_relation_callbacks(&node, &input, false);
+        node.output_columns[0].value_type =
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                DataType::Struct(Fields::from(vec![Arc::new(changed)])),
+                node.output_columns[0].value_type.nullable(),
+                node.output_columns[0].value_type.logical_type(),
+            )
+            .unwrap();
+        check_relation_callbacks(&node, &input, compatible);
     }
 }
 

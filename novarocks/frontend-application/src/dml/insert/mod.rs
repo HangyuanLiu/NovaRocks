@@ -35,7 +35,9 @@ use crate::dml::service::DmlService;
 use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 
 pub use command::convert_insert_command;
-pub(crate) use shaping::{omitted_insert_expr, shape_insert_source};
+pub(crate) use shaping::{
+    omitted_insert_expr, shape_insert_source, shape_insert_source_with_constants,
+};
 
 use self::iceberg::{IcebergInsertWriteExecutor, write_transaction_spec};
 
@@ -200,3 +202,6 @@ fn validate_target(target_ref: &InsertTargetRef) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod variant_constants_tests;

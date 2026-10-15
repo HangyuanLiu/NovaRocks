@@ -25,7 +25,7 @@ use super::type_sources::{
     PackageTypeChannel, PackageTypeOccurrence, PackageTypeOwner, PackageTypeSource,
     PackageTypeSourceSink, visit_package_type_sources_admitted_in,
 };
-use crate::physical_type_v2::WriterTypeSource;
+use crate::physical_type_v2::{BorrowedFieldTypeRoot, WriterTypeSource};
 use arrow::datatypes::Field;
 use novarocks_connector_contract::ConnectorWriteRecipeDraft;
 use novarocks_physical_plan as p;
@@ -469,6 +469,7 @@ impl<'source, 'control, 'parent> TypeViewBudget<'source, 'control, 'parent> {
 pub(crate) enum TypeRootReference {
     Value(u32),
     Field(u32),
+    SourceField(u32),
     /// A Cast borrows only its target carrier. Its ID is the previously
     /// captured expression Value root; the original Cast validator owns equality.
     CastCarrier {
@@ -495,7 +496,9 @@ pub(crate) struct PackageTypeViews<'source> {
     collection_floor: TypeViewFacts,
     occurrences: Vec<TypeOccurrenceRow<'source>>,
     values: Vec<(u32, &'source p::ValueType)>,
-    fields: Vec<(u32, &'source Arc<Field>)>,
+    fields: Vec<BorrowedFieldTypeRoot<'source>>,
+    source_fields: Vec<(u32, &'source Arc<Field>)>,
+    writer_value_ids: Vec<u32>,
     writer_field_ids: Vec<u32>,
     writer_roots: Vec<WriterRoots<'source>>,
 }
@@ -506,8 +509,31 @@ impl<'source> PackageTypeViews<'source> {
     pub(crate) fn values(&self) -> &[(u32, &'source p::ValueType)] {
         &self.values
     }
-    pub(crate) fn fields(&self) -> &[(u32, &'source Arc<Field>)] {
+    pub(crate) fn fields(&self) -> &[BorrowedFieldTypeRoot<'source>] {
         &self.fields
+    }
+    pub(crate) fn source_fields(&self) -> &[(u32, &'source Arc<Field>)] {
+        &self.source_fields
+    }
+    pub(crate) fn source_field_root_for_in(
+        &self,
+        occurrence: PackageTypeOccurrence,
+        original: &Arc<Field>,
+        budget: &mut TypeViewBudget<'source, '_, '_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<u32, TypeViewError> {
+        self.root_for_in(occurrence, budget, work, |row| {
+            match (row.root, row.source) {
+                (TypeRootReference::SourceField(id), PackageTypeSource::SourceField(field))
+                    if std::ptr::eq(field, original) =>
+                {
+                    Ok(id)
+                }
+                _ => Err(TypeViewError::InvalidSource(
+                    "source field occurrence differs from its original source owner",
+                )),
+            }
+        })
     }
     pub(crate) fn check_package_in(
         &self,
@@ -561,9 +587,16 @@ impl<'source> PackageTypeViews<'source> {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<u32, TypeViewError> {
         self.root_for_in(occurrence, budget, work, |row| {
-            let (TypeRootReference::Field(id), PackageTypeSource::StrictField(original)) =
-                (row.root, row.source)
-            else {
+            let original = match row.source {
+                PackageTypeSource::StrictField(field)
+                | PackageTypeSource::ExecutionField { field, .. } => field,
+                _ => {
+                    return Err(TypeViewError::InvalidSource(
+                        "type occurrence is not a Field root",
+                    ));
+                }
+            };
+            let TypeRootReference::Field(id) = row.root else {
                 return Err(TypeViewError::InvalidSource(
                     "type occurrence is not a strict Field root",
                 ));
@@ -647,7 +680,11 @@ impl<'source> PackageTypeViews<'source> {
             };
             work.step()?;
             budget.reserve(&mut sources, work)?;
-            sources.push(WriterTypeSource::new(recipe, &self.writer_field_ids[range]));
+            sources.push(WriterTypeSource::new_with_value_ids(
+                recipe,
+                &self.writer_field_ids[range.clone()],
+                &self.writer_value_ids[range],
+            ));
             work.step()?;
         }
         budget.before_steps(1)?;
@@ -679,6 +716,11 @@ impl<'source> PackageTypeSourceSink<'source, TypeViewError> for Capture<'source,
         self.budget.facts.occurrence_count = row_growth.next_len;
         let root;
         match source {
+            PackageTypeSource::MissingReadSchema => {
+                return Err(TypeViewError::InvalidSource(
+                    "frozen read must provide complete execution schema and independent source facts",
+                ));
+            }
             PackageTypeSource::Value(value) => {
                 let request = growth::push_growth(&self.views.values)?;
                 root = TypeRootReference::Value(id(self.views.values.len())?);
@@ -691,7 +733,55 @@ impl<'source> PackageTypeSourceSink<'source, TypeViewError> for Capture<'source,
                     .values
                     .push((id(self.views.values.len())?, value));
             }
-            PackageTypeSource::StrictField(field) => {
+            PackageTypeSource::SourceField(field) => {
+                let request = growth::push_growth(&self.views.source_fields)?;
+                self.budget.request(request)?;
+                self.budget.facts.field_root_count = add(self.budget.facts.field_root_count, 1)?;
+                let field_id = id(self.next_field_id)?;
+                root = TypeRootReference::SourceField(field_id);
+                self.budget.before_steps(2)?;
+                self.budget.reserve(&mut self.views.occurrences, work)?;
+                self.budget.reserve(&mut self.views.source_fields, work)?;
+                self.views.source_fields.push((field_id, field));
+                self.next_field_id = add(self.next_field_id, 1)?;
+            }
+            PackageTypeSource::StrictField(field)
+            | PackageTypeSource::ExecutionField { field, .. } => {
+                let value_type_id =
+                    match source {
+                        PackageTypeSource::ExecutionField { value, .. } => {
+                            let previous = self.views.occurrences.last().ok_or(
+                                TypeViewError::InvalidSource(
+                                    "execution field has no preceding Value root",
+                                ),
+                            )?;
+                            let (
+                                TypeRootReference::Value(value_id),
+                                PackageTypeSource::Value(original),
+                            ) = (previous.root, previous.source)
+                            else {
+                                return Err(TypeViewError::InvalidSource(
+                                    "execution field Value root is absent",
+                                ));
+                            };
+                            let PackageTypeChannel::Field(ordinal) = occurrence.channel else {
+                                return Err(TypeViewError::InvalidSource(
+                                    "execution field has no occurrence ordinal",
+                                ));
+                            };
+                            if previous.occurrence.owner != occurrence.owner
+                                || previous.occurrence.channel
+                                    != PackageTypeChannel::ScanExecutionValue(ordinal)
+                                || !std::ptr::eq(original, value)
+                            {
+                                return Err(TypeViewError::InvalidSource(
+                                    "execution field uses another Value occurrence",
+                                ));
+                            }
+                            Some(value_id)
+                        }
+                        _ => None,
+                    };
                 let request = growth::push_growth(&self.views.fields)?;
                 let field_id = id(self.next_field_id)?;
                 root = TypeRootReference::Field(field_id);
@@ -700,7 +790,11 @@ impl<'source> PackageTypeSourceSink<'source, TypeViewError> for Capture<'source,
                 self.budget.before_steps(2)?;
                 self.budget.reserve(&mut self.views.occurrences, work)?;
                 self.budget.reserve(&mut self.views.fields, work)?;
-                self.views.fields.push((field_id, field));
+                self.views.fields.push(BorrowedFieldTypeRoot {
+                    id: field_id,
+                    field,
+                    value_type_id,
+                });
                 self.next_field_id = add(self.next_field_id, 1)?;
             }
             PackageTypeSource::Carrier(_) => {
@@ -731,14 +825,27 @@ impl<'source> PackageTypeSourceSink<'source, TypeViewError> for Capture<'source,
                 self.budget.before_steps(2)?;
                 self.budget.reserve(&mut self.views.occurrences, work)?;
             }
-            PackageTypeSource::WriterField { recipe, .. } => {
+            PackageTypeSource::WriterField {
+                recipe, binding, ..
+            } => {
                 let PackageTypeOwner::Recipe(node) = occurrence.owner else {
                     return Err(TypeViewError::InvalidSource(
                         "writer field has no original recipe owner",
                     ));
                 };
                 let field_id = id(self.next_field_id)?;
-                root = TypeRootReference::Field(field_id);
+                root = TypeRootReference::SourceField(field_id);
+                let execution = binding
+                    .execution_type()
+                    .ok_or(TypeViewError::InvalidSource(
+                        "writer source lacks its frozen complete execution binding",
+                    ))?;
+                let value_id = id(self.views.values.len())?;
+                self.budget
+                    .request(growth::push_growth(&self.views.values)?)?;
+                self.budget
+                    .request(growth::push_growth(&self.views.writer_value_ids)?)?;
+                self.budget.facts.value_root_count = add(self.budget.facts.value_root_count, 1)?;
                 let is_new = self
                     .views
                     .writer_roots
@@ -754,10 +861,15 @@ impl<'source> PackageTypeSourceSink<'source, TypeViewError> for Capture<'source,
                 // The full checked writes map includes empty shapes as well;
                 // reserve its original namespace cardinality once, no guessed count.
                 self.budget.facts.writer_recipe_count = self.views.package.writes().len();
-                self.budget.before_steps(4)?;
+                self.budget.before_steps(6)?;
                 self.budget.reserve(&mut self.views.occurrences, work)?;
                 self.budget
                     .reserve(&mut self.views.writer_field_ids, work)?;
+                self.budget.reserve(&mut self.views.values, work)?;
+                self.budget
+                    .reserve(&mut self.views.writer_value_ids, work)?;
+                self.views.values.push((value_id, execution));
+                self.views.writer_value_ids.push(value_id);
                 if is_new {
                     self.budget.reserve(&mut self.views.writer_roots, work)?;
                     let begin = self.views.writer_field_ids.len();
@@ -813,6 +925,8 @@ pub(crate) fn collect_package_type_views_in<'source>(
         occurrences: Vec::new(),
         values: Vec::new(),
         fields: Vec::new(),
+        source_fields: Vec::new(),
+        writer_value_ids: Vec::new(),
         writer_field_ids: Vec::new(),
         writer_roots: Vec::new(),
     };
@@ -831,7 +945,7 @@ pub(crate) fn collect_package_type_views_in<'source>(
 mod tests {
     use super::*;
     use crate::physical_type_v2::{
-        PackageTypeProjectionLimits, encode_borrowed_type_table_writer_sources_in,
+        PackageTypeProjectionLimits, encode_borrowed_type_namespaces_sources_in,
     };
     use arrow::datatypes::DataType;
     use novarocks_connector_contract as c;
@@ -905,13 +1019,20 @@ mod tests {
             binding,
             payload,
             c::ConnectorWriteInputShape::Data {
-                fields: vec![c::ConnectorWriteFieldBinding::new(
-                    c::ConnectorWriteFieldToken::from_bytes([1; 32]),
-                    Field::new("v", DataType::Int64, false).with_metadata(HashMap::from([
-                        ("large".into(), "雪".repeat(6826) + "ab"),
-                        ("embedded".into(), "a\0b".into()),
-                    ])),
-                )],
+                fields: vec![
+                    c::ConnectorWriteFieldBinding::new(
+                        c::ConnectorWriteFieldToken::from_bytes([1; 32]),
+                        Field::new("v", DataType::Int64, false).with_metadata(HashMap::from([
+                            ("large".into(), "雪".repeat(6826) + "ab"),
+                            ("embedded".into(), "a\0b".into()),
+                        ])),
+                    )
+                    .with_execution_type(novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ))
+                    .expect("explicit BIGINT writer declaration"),
+                ],
             },
         )
         .unwrap();
@@ -1348,7 +1469,7 @@ mod tests {
                 views.fields().len(),
                 writers.len()
             ),
-            (24, 23, 0, 1)
+            (24, 24, 0, 1)
         );
         assert_eq!(
             (
@@ -1356,11 +1477,12 @@ mod tests {
                 budget.facts().value_root_count,
                 budget.facts().field_root_count
             ),
-            (24, 23, 1)
+            (24, 24, 1)
         );
-        let encoded = encode_borrowed_type_table_writer_sources_in(
+        let encoded = encode_borrowed_type_namespaces_sources_in(
             views.values(),
             views.fields(),
+            views.source_fields(),
             &writers,
             SOURCE,
             PackageTypeProjectionLimits {
@@ -1381,7 +1503,7 @@ mod tests {
                 encoded.as_wire().value_types.len(),
                 encoded.as_wire().fields.len()
             ),
-            (23, 1)
+            (24, 0)
         );
         for row in views.occurrences() {
             match (row.root, row.source) {
@@ -1391,10 +1513,13 @@ mod tests {
                         original
                     ));
                 }
-                (TypeRootReference::Field(id), PackageTypeSource::WriterField { binding, .. }) => {
+                (
+                    TypeRootReference::SourceField(id),
+                    PackageTypeSource::WriterField { binding, .. },
+                ) => {
                     assert!(std::ptr::eq(
                         encoded
-                            .field_source_observed(id, &mut work)
+                            .source_field_source_observed(id, &mut work)
                             .unwrap()
                             .unwrap(),
                         binding.field()
@@ -1403,8 +1528,27 @@ mod tests {
                 _ => panic!("unexpected root in original Data fixture"),
             }
         }
+        for (value_id, binding) in views.writer_value_ids.iter().zip(
+            package
+                .writes()
+                .values()
+                .flat_map(|recipe| recipe.input().fields_iter()),
+        ) {
+            assert!(std::ptr::eq(
+                encoded
+                    .value_type_observed(*value_id, &mut work)
+                    .unwrap()
+                    .unwrap(),
+                binding
+                    .execution_type()
+                    .expect("original complete writer declaration"),
+            ));
+        }
+        let source_wire = encoded
+            .as_source_wire()
+            .expect("independent writer Source facts");
         assert_eq!(
-            encoded.as_wire().fields[0].metadata[1].value.len(),
+            source_wire.field_facts[0].metadata[1].value.len(),
             20 * 1024
         );
         work.finish().unwrap();

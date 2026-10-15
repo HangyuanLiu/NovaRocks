@@ -68,7 +68,7 @@ impl KernelEvaluationControl for Control {
     }
 }
 fn ty(data_type: DataType, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(data_type, nullable)
+    FunctionValueType::from_legacy_declared_projection(data_type, nullable)
 }
 fn recipe(left: &ArrayRef, right: &ArrayRef) -> PreparedComparisonRecipe {
     PreparedComparisonRecipe::try_new(
@@ -564,7 +564,6 @@ fn unsupported_domains_and_bad_selected_addresses_refuse_before_null_short_circu
     for data_type in [
         DataType::Utf8View,
         DataType::BinaryView,
-        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
         DataType::List(Arc::new(arrow_schema::Field::new(
             "item",
             DataType::Utf8,
@@ -582,6 +581,21 @@ fn unsupported_domains_and_bad_selected_addresses_refuse_before_null_short_circu
             Err(ComparisonPrepareError::Unsupported)
         );
     }
+    // Encoding is not value identity. The semantic recipe is reusable after
+    // a concrete BE consumer has explicitly normalized its actual carrier.
+    let encoded_projection = ty(
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    );
+    assert!(
+        PreparedComparisonRecipe::try_new(
+            ComparisonOperator::Eq,
+            &encoded_projection,
+            &encoded_projection,
+            &CompileControl::default()
+        )
+        .is_ok()
+    );
     assert_eq!(
         PreparedComparisonRecipe::try_new(
             ComparisonOperator::Eq,
@@ -793,7 +807,7 @@ fn compile_boundaries_preserve_original_causes_and_full_temporal_identity() {
         DataType::Timestamp(TimeUnit::Microsecond, Some(zone)),
         false,
     );
-    let expected = ty(source.data_type.clone(), true);
+    let expected = ty(source.data_type().clone(), true);
     let success = CompileControl::default();
     let prepared =
         PreparedComparisonRecipe::try_new(ComparisonOperator::Eq, &source, &expected, &success)

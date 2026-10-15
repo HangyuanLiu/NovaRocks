@@ -25,7 +25,7 @@ use crate::physical_package_v2::type_views::{
     TypeViewBudget, TypeViewFacts, TypeViewLimits, collect_package_type_views_in,
 };
 use crate::physical_type_v2::{
-    PackageTypeProjectionLimits, encode_borrowed_type_table_writer_sources_in,
+    PackageTypeProjectionLimits, encode_borrowed_type_table_associated_sources_in,
 };
 use arrow::datatypes::DataType;
 use novarocks_physical_plan as p;
@@ -90,7 +90,7 @@ fn function(kind: FunctionKind, args: Box<[FunctionArgumentType]>) -> p::BoundFu
         FunctionId::try_new("fixture/binding-source").unwrap(),
         FunctionOverloadId::try_new("fixture/selected-v1").unwrap(),
         kind,
-        args,
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(args),
         int(),
     )
 }
@@ -187,7 +187,10 @@ fn package() -> p::FragmentPackage {
                     function: function(
                         FunctionKind::Scalar,
                         Box::from([FunctionArgumentType::Lambda {
-                            parameter_types: Box::from([dictionary(), int()]),
+                            parameter_types:
+                                novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                                    Box::from([dictionary(), int()]),
+                                ),
                             result_type: int(),
                         }]),
                     ),
@@ -312,8 +315,11 @@ fn package() -> p::FragmentPackage {
                 function: p::BoundTableFunction::from_exact_signature(
                     FunctionId::try_new("fixture/table-source").unwrap(),
                     FunctionOverloadId::try_new("fixture/table-v1").unwrap(),
-                    Box::default(),
-                    Box::from([int(), dictionary()]),
+                    novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::default()),
+                    novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(Box::from([
+                        int(),
+                        dictionary(),
+                    ])),
                 ),
                 arguments: Box::default(),
                 outputs: Box::from([
@@ -360,7 +366,10 @@ fn package() -> p::FragmentPackage {
                 (
                     p::PhysicalCallDefinition::Expression(scalar),
                     request(Box::from([p::StaticFunctionArgument::Lambda {
-                        parameter_types: Box::from([dictionary(), int()]),
+                        parameter_types:
+                            novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                                Box::from([dictionary(), int()]),
+                            ),
                         result_type: int(),
                     }])),
                 ),
@@ -461,6 +470,7 @@ fn package() -> p::FragmentPackage {
         .map(|id| {
             let ctx = context(id, 0);
             p::FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -490,6 +500,7 @@ fn package() -> p::FragmentPackage {
     ] {
         let ctx = context(use_id, 0);
         claims.push(p::FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
@@ -751,7 +762,7 @@ fn project(
         let writers = views.writer_sources_in(&mut budget, &mut work)?;
         assert!(writers.is_empty());
         let mut type_prior = None;
-        let encoded = encode_borrowed_type_table_writer_sources_in(
+        let encoded = encode_borrowed_type_table_associated_sources_in(
             views.values(),
             views.fields(),
             &writers,
@@ -1342,6 +1353,7 @@ fn wide_package() -> p::FragmentPackage {
         &fragment,
         &uses,
         vec![p::FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,

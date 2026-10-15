@@ -2216,14 +2216,12 @@ fn table_function_fragment(
                     }),
                     function_id: FunctionId::try_new("builtin/test_relation/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("i64-to-i64-utf8").unwrap(),
-                    argument_types: Box::from([FunctionArgumentType::Value(ty(
-                        DataType::Int64,
-                        false,
-                    ))]),
-                    result_types: Box::from([
-                        ty(DataType::Int64, false),
-                        ty(DataType::Utf8, false),
-                    ]),
+                    argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        Box::from([FunctionArgumentType::Value(ty(DataType::Int64, false))]),
+                    ),
+                    result_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        Box::from([ty(DataType::Int64, false), ty(DataType::Utf8, false)]),
+                    ),
                 },
                 arguments: Box::from([argument]),
                 outputs: Box::from([
@@ -2317,7 +2315,9 @@ fn table_function_binding_cannot_be_published_as_a_scalar_call() {
                     function_id: FunctionId::try_new("builtin/test_relation/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("disguised-scalar").unwrap(),
                     kind: FunctionKind::Table,
-                    argument_types: Box::default(),
+                    argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        Box::default(),
+                    ),
                     result_type: value_type.clone(),
                 },
                 args: Box::default(),
@@ -2402,12 +2402,16 @@ fn higher_order_function_fragment(
         | HigherOrderFixture::ReusedAsExpressionChild
         | HigherOrderFixture::ReusedAsValueArgument
         | HigherOrderFixture::LambdaOperatorRoot => FunctionArgumentType::Lambda {
-            parameter_types: Box::from([parameter_type.clone()]),
+            parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                parameter_type.clone(),
+            ])),
             result_type: parameter_type.clone(),
         },
         HigherOrderFixture::ScalarBinding => FunctionArgumentType::Value(parameter_type.clone()),
         HigherOrderFixture::ParameterTypeDrift => FunctionArgumentType::Lambda {
-            parameter_types: Box::from([ty(DataType::Utf8, false)]),
+            parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                ty(DataType::Utf8, false),
+            ])),
             result_type: parameter_type.clone(),
         },
     };
@@ -2440,7 +2444,9 @@ fn higher_order_function_fragment(
                     function_id: FunctionId::try_new("builtin/test_higher_order/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("lambda-i64-to-i64").unwrap(),
                     kind: FunctionKind::Scalar,
-                    argument_types,
+                    argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        argument_types,
+                    ),
                     result_type: parameter_type.clone(),
                 },
                 args: arguments,
@@ -3034,12 +3040,14 @@ fn grouped_writer_fragment_with_sources(
                 overload: FunctionOverloadId::try_new("i64-to-binary").unwrap(),
                 kind: FunctionKind::Aggregate,
                 argument_types: if matches!(fixture, GroupedWriterFixture::MultiArgumentBinding) {
-                    Box::from([
+                    novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
                         FunctionArgumentType::Value(ty(DataType::Int64, true)),
                         FunctionArgumentType::Value(ty(DataType::Int64, true)),
-                    ])
+                    ]))
                 } else {
-                    Box::from([FunctionArgumentType::Value(ty(DataType::Int64, true))])
+                    novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                        FunctionArgumentType::Value(ty(DataType::Int64, true)),
+                    ]))
                 },
                 result_type: ty(DataType::Binary, true),
             },
@@ -3277,8 +3285,8 @@ fn writer_grouped_unpivot_keeps_target_local_mappings_for_a_shared_aggregate_cha
     );
     assert_eq!(unpivot.mappings[0].input, unpivot.mappings[1].input);
     assert_ne!(unpivot.mappings[0].constants, unpivot.mappings[1].constants);
-    assert!(fragment.values()[&unpivot.passthrough_output].ty.nullable);
-    assert!(!fragment.values()[&unpivot.grouping_output].ty.nullable);
+    assert!(fragment.values()[&unpivot.passthrough_output].ty.nullable());
+    assert!(!fragment.values()[&unpivot.grouping_output].ty.nullable());
 
     let control = GroupedConstantControl;
     let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
@@ -3301,7 +3309,7 @@ fn writer_grouped_unpivot_keeps_target_local_mappings_for_a_shared_aggregate_cha
         assert_eq!(view.len(), 1);
         assert_eq!(view.item_observed(0, &mut work).unwrap(), Some(expected));
         assert_eq!(selected.ordinal(), u32::try_from(target + 1).unwrap());
-        assert!(!selected.value_type().nullable);
+        assert!(!selected.value_type().nullable());
         let UnpivotConstant::Utf8Map(reference) = unpivot.mappings[target].constants[2] else {
             panic!("selected map source");
         };
@@ -3635,11 +3643,18 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
         bindings.push((*site, id));
     }
     let flow = ExpressionControlFlow::try_new(
-        vec![ExpressionEvaluationDomain {
-            id: domain,
-            parent: None,
-            guard: None,
-        }],
+        vec![
+            ExpressionEvaluationDomain {
+                id: domain,
+                parent: None,
+                guard: None,
+            },
+            ExpressionEvaluationDomain {
+                id: EvaluationDomainId::new(1),
+                parent: None,
+                guard: None,
+            },
+        ],
         invocations,
         fragment.expressions(),
         CompilePhase::Validate,
@@ -3655,6 +3670,11 @@ fn package_parameter_closure_includes_writer_final_state_calls() {
         call: 0,
     };
     let call = FrozenPhysicalCall {
+        materialized_writer_input: Some(ExpressionEffectContext {
+            use_id: ExpressionUseId::new(u32::MAX - 1),
+            domain: EvaluationDomainId::new(1),
+            demand: novarocks_type_contract::EvaluationDemand::Value,
+        }),
         regexp_count_pattern_source: None,
         to_base64_byte_source: None,
         temporal_source: None,

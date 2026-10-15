@@ -89,10 +89,14 @@ fn recipe(binding: ConnectorWriteBinding, handle: &'static [u8]) -> ConnectorWri
         binding,
         payload,
         ConnectorWriteInputShape::Data {
-            fields: vec![ConnectorWriteFieldBinding::new(
-                ConnectorWriteFieldToken::from_bytes([1; 32]),
-                Field::new("c1", DataType::Int64, false),
-            )],
+            fields: vec![
+                ConnectorWriteFieldBinding::try_new_typed(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    Field::new("c1", DataType::Int64, false),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                )
+                .unwrap(),
+            ],
         },
     )
     .unwrap();
