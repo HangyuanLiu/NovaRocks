@@ -342,12 +342,16 @@ impl ManagementEntrance {
         lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
     ) -> Result<SlotChangeConvergence, novarocks_spi::connector::ConnectorError> {
-        self.resolve_slot_changes(&request.target, &request.object_id, |evidence| {
-            lease.resolve_keyed_commit(request.clone(), evidence)
-        })
+        self.resolve_slot_changes(
+            &request.catalog_handle,
+            &request.target,
+            &request.object_id,
+            |evidence| lease.resolve_keyed_commit(request.clone(), evidence),
+        )
     }
     pub(super) fn resolve_slot_changes(
         &self,
+        catalog: &CatalogHandle,
         table: &ConnectorTableIdentity,
         object_id: &novarocks_spi::connector::ConnectorTableObjectId,
         mut resolve: impl FnMut(
@@ -361,7 +365,10 @@ impl ManagementEntrance {
         let pending = {
             let states = lock(&self.inner.state);
             match states.get(table) {
-                Some(state) if state.target.object_id() == object_id => {
+                Some(state)
+                    if state.target.catalog() == catalog
+                        && state.target.object_id() == object_id =>
+                {
                     state.pending_slot_changes.clone()
                 }
                 Some(_) => {
@@ -383,7 +390,8 @@ impl ManagementEntrance {
             let Some(state) = states.get_mut(table) else {
                 continue;
             };
-            if state.target.object_id() != object_id
+            if state.target.catalog() != catalog
+                || state.target.object_id() != object_id
                 || state.pending_slot_changes.get(&effect) != Some(&evidence)
             {
                 continue;
@@ -842,6 +850,18 @@ impl ManagementEntrance {
         let mut view = lease
             .observe_keyed_documents(request.clone())
             .map_err(MvDocumentError::KeyedStorage)?;
+        // A foreign target observation cannot reconcile this target's pending
+        // evidence. The exact target is checked again after provider I/O.
+        {
+            let states = lock(&self.inner.state);
+            let Some(current) = states.get(&view.table) else {
+                return Ok(false);
+            };
+            if current.target.catalog() != &catalog || current.target.object_id() != &view.object_id
+            {
+                return Ok(false);
+            }
+        }
         let convergence = self.resolve_pending_slot_changes(lease, request.clone())?;
         if convergence.reinstall_current_projection {
             view = lease

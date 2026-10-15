@@ -3099,11 +3099,64 @@ fn slot_change_unknown_remains_manageable_until_a_terminal_conclusion() {
             MvManagementPhase::Manageable
         );
         drop(entrance.acquire(request(), || false).unwrap());
+        for foreign in [
+            ManagedMvTarget::try_new(
+                catalog(2),
+                target.table().clone(),
+                target.object_id().clone(),
+            )
+            .unwrap(),
+            ManagedMvTarget::try_new(
+                target.catalog().clone(),
+                target.table().clone(),
+                object(b"another-object"),
+            )
+            .unwrap(),
+        ] {
+            assert!(!observe_keyed_management_mismatch(
+                &entrance,
+                &foreign,
+                "deployment-a",
+                "inc-b",
+                2,
+            ));
+            let mut resolver_called = false;
+            let error = entrance
+                .resolve_slot_changes(
+                    foreign.catalog(),
+                    foreign.table(),
+                    foreign.object_id(),
+                    |_| {
+                        resolver_called = true;
+                        Ok(conclusion.clone())
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest
+            );
+            assert!(
+                !resolver_called,
+                "foreign target evidence must not reach the provider"
+            );
+            assert_eq!(entrance.pending_slot_changes(target.table()), 1);
+            assert_eq!(entrance.latest_slot_change_conclusion(target.table()), None);
+            assert_eq!(
+                entrance.management_phase(target.table()),
+                MvManagementPhase::Manageable
+            );
+        }
         let result = entrance
-            .resolve_slot_changes(target.table(), target.object_id(), |actual| {
-                assert_eq!(actual, evidence);
-                Ok(conclusion.clone())
-            })
+            .resolve_slot_changes(
+                target.catalog(),
+                target.table(),
+                target.object_id(),
+                |actual| {
+                    assert_eq!(actual, evidence);
+                    Ok(conclusion.clone())
+                },
+            )
             .unwrap();
         if conclusion == CommitConclusion::StillUnknown {
             assert_eq!(entrance.pending_slot_changes(target.table()), 1);
