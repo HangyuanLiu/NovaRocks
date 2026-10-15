@@ -5,6 +5,9 @@ domain: [frontend-mv, provider-spi]
 status: active
 supersedes: [ADR-0112]
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0178
+    scope: "Document storage and attachment rules: inline semantic versions, binding documents, slots and snapshot records; lake authority and domain ownership remain unchanged"
 date: 2026-09-21
 provenance:
   - "discussion: 2026-09-08 MV storage contract and persistence design, accepted revision 7"

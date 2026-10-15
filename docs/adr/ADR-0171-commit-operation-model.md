@@ -5,6 +5,9 @@ domain: [provider-spi]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0178
+    scope: "Request-shape table for document storage: marker-only MetadataOnly, zero-file SnapshotProducing slot changes and all-observed-ref expiry; immutable operations, dependency validation and artifact ownership remain unchanged"
 partially-supersedes:
   - id: ADR-0118
     scope: "Internal reuse of vendored transaction/action preparation; late TableCommit carrier conversion remains allowed"
