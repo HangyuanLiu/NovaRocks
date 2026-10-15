@@ -21,9 +21,7 @@ use std::str::FromStr;
 use novarocks_spi::connector::LakePublicationId;
 use uuid::Uuid;
 
-use crate::commit::existing_commit::{ExistingCommitError, existing_table_commit};
-use crate::iceberg::spec::{Snapshot, SnapshotReference, SnapshotRetention, TableMetadata};
-use crate::iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
+use crate::iceberg::spec::Snapshot;
 
 pub const MV_PUBLICATION_ID_PROP: &str = "novarocks.mv.publication_id";
 pub const MV_PUBLICATION_STAGING_REF_PREFIX: &str = "__novarocks_mv_publication_";
@@ -54,18 +52,6 @@ pub fn snapshot_matches_publication_marker(
         == Some(marker.publication_id)
 }
 
-fn ensure_staging_ref_is_branch(
-    staging_branch: &str,
-    staging_ref: &SnapshotReference,
-) -> Result<(), String> {
-    if staging_ref.is_branch() {
-        return Ok(());
-    }
-    Err(format!(
-        "iceberg mv publish: staging ref {staging_branch} is a tag, expected branch"
-    ))
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MvRefreshPublishPlan {
     pub namespace: String,
@@ -75,11 +61,6 @@ pub struct MvRefreshPublishPlan {
     pub expected_main_snapshot_id: Option<i64>,
     pub staging_snapshot_id: i64,
     pub marker: MvPublicationSnapshotMarker,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MvRefreshPublishOutcome {
-    pub published_snapshot_id: i64,
 }
 
 impl MvRefreshPublishPlan {
@@ -135,111 +116,6 @@ impl MvRefreshPublishPlan {
     }
 }
 
-pub async fn publish_staging_branch_to_main(
-    catalog: &dyn Catalog,
-    loaded: &crate::iceberg::table::Table,
-    plan: &MvRefreshPublishPlan,
-) -> Result<MvRefreshPublishOutcome, String> {
-    let expected_staging_branch = format!(
-        "{MV_PUBLICATION_STAGING_REF_PREFIX}{}",
-        plan.marker.publication_id
-    );
-    if plan.staging_branch != expected_staging_branch {
-        return Err(
-            "iceberg mv publish: staging ref does not match the exact publication identity"
-                .to_string(),
-        );
-    }
-    let ident = TableIdent::from_strs([plan.namespace.as_str(), plan.table.as_str()])
-        .map_err(|e| format!("iceberg mv publish: invalid table identifier: {e}"))?;
-    if loaded.identifier() != &ident {
-        return Err(
-            "iceberg mv publish: request-scoped table identity does not match publish plan"
-                .to_string(),
-        );
-    }
-    let metadata = loaded.metadata();
-    let main_snapshot = metadata
-        .current_snapshot()
-        .map(|snapshot| snapshot.snapshot_id());
-    if main_snapshot != plan.expected_main_snapshot_id {
-        return Err(format!(
-            "iceberg mv publish: main snapshot mismatch for {}.{}: expected {:?}, current {:?}",
-            plan.namespace, plan.table, plan.expected_main_snapshot_id, main_snapshot
-        ));
-    }
-    let staging_ref = metadata.refs().get(&plan.staging_branch).ok_or_else(|| {
-        format!(
-            "iceberg mv publish: staging branch {} does not exist",
-            plan.staging_branch
-        )
-    })?;
-    ensure_staging_ref_is_branch(&plan.staging_branch, staging_ref)?;
-    if staging_ref.snapshot_id != plan.staging_snapshot_id {
-        return Err(format!(
-            "iceberg mv publish: staging branch {} points to {}, expected {}",
-            plan.staging_branch, staging_ref.snapshot_id, plan.staging_snapshot_id
-        ));
-    }
-    let staging_snapshot = metadata
-        .snapshot_by_id(plan.staging_snapshot_id)
-        .ok_or_else(|| {
-            format!(
-                "iceberg mv publish: staging snapshot {} not found",
-                plan.staging_snapshot_id
-            )
-        })?;
-    if !snapshot_matches_publication_marker(staging_snapshot, &plan.marker) {
-        return Err(format!(
-            "iceberg mv publish: staging snapshot {} marker mismatch",
-            plan.staging_snapshot_id
-        ));
-    }
-    let commit = build_publish_commit(ident, metadata, plan)
-        .map_err(|error| format!("iceberg mv publish: {error}"))?;
-    catalog
-        .update_table(commit)
-        .await
-        .map_err(|e| format!("iceberg mv publish: commit failed: {e}"))?;
-    Ok(MvRefreshPublishOutcome {
-        published_snapshot_id: plan.staging_snapshot_id,
-    })
-}
-
-/// The plan's frozen target UUID must name the loaded incarnation the publish
-/// was validated against; the commit entry refuses it otherwise.
-fn build_publish_commit(
-    ident: TableIdent,
-    metadata: &TableMetadata,
-    plan: &MvRefreshPublishPlan,
-) -> Result<TableCommit, ExistingCommitError> {
-    existing_table_commit(
-        ident,
-        metadata,
-        vec![
-            TableRequirement::UuidMatch {
-                uuid: plan.target_table_uuid,
-            },
-            TableRequirement::RefSnapshotIdMatch {
-                r#ref: "main".to_string(),
-                snapshot_id: plan.expected_main_snapshot_id,
-            },
-            TableRequirement::RefSnapshotIdMatch {
-                r#ref: plan.staging_branch.clone(),
-                snapshot_id: Some(plan.staging_snapshot_id),
-            },
-        ],
-        vec![TableUpdate::SetSnapshotRef {
-            ref_name: "main".to_string(),
-            reference: crate::ref_snapshot::moved_reference(
-                metadata.refs().get("main"),
-                plan.staging_snapshot_id,
-                true,
-            ),
-        }],
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -250,6 +126,8 @@ mod tests {
         FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, SortOrder,
         Summary, TableMetadataBuilder, Type,
     };
+    use crate::iceberg::spec::{SnapshotReference, SnapshotRetention, TableMetadata};
+    use crate::iceberg::{TableIdent, TableRequirement};
 
     fn metadata_with_uuid(uuid: Uuid) -> TableMetadata {
         let schema = Schema::builder()
@@ -293,51 +171,99 @@ mod tests {
         }
     }
 
-    #[test]
-    fn publish_commit_uses_uuid_main_and_staging_cas_only() {
-        let plan = plan();
-        let mut commit = build_publish_commit(
-            TableIdent::from_strs(["db", "mv"]).unwrap(),
-            &metadata_with_uuid(plan.target_table_uuid),
-            &plan,
-        )
-        .expect("publish commit");
-        let requirements = commit.take_requirements();
-        assert_eq!(requirements.len(), 3);
-        assert!(requirements.contains(&TableRequirement::UuidMatch {
-            uuid: plan.target_table_uuid,
-        }));
-        assert!(
-            requirements.contains(&TableRequirement::RefSnapshotIdMatch {
-                r#ref: "main".to_string(),
-                snapshot_id: Some(100),
-            })
-        );
-        assert!(
-            requirements.contains(&TableRequirement::RefSnapshotIdMatch {
-                r#ref: plan.staging_branch.clone(),
-                snapshot_id: Some(300),
-            })
-        );
+    fn loaded(plan: &MvRefreshPublishPlan, uuid: Uuid) -> crate::iceberg::table::Table {
+        let metadata = metadata_with_uuid(uuid);
+        let time = metadata.last_updated_ms();
+        let snapshot = |id, properties| {
+            Snapshot::builder()
+                .with_snapshot_id(id)
+                .with_sequence_number(id)
+                .with_timestamp_ms(time)
+                .with_manifest_list(format!("memory://snap-{id}.avro"))
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: properties,
+                })
+                .build()
+        };
+        let metadata = metadata
+            .into_builder(None)
+            .add_snapshot(snapshot(100, HashMap::new()))
+            .unwrap()
+            .add_snapshot(snapshot(
+                300,
+                plan.marker.to_summary_properties().into_iter().collect(),
+            ))
+            .unwrap()
+            .set_ref(
+                "main",
+                SnapshotReference::new(100, SnapshotRetention::branch(None, None, None)),
+            )
+            .unwrap()
+            .set_ref(
+                &plan.staging_branch,
+                SnapshotReference::new(300, SnapshotRetention::branch(None, None, None)),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        crate::iceberg::table::Table::builder()
+            .runtime(crate::iceberg::Runtime::try_current().unwrap())
+            .identifier(TableIdent::from_strs(["db", "mv"]).unwrap())
+            .metadata(metadata)
+            .file_io(crate::iceberg::io::FileIO::new_with_memory())
+            .build()
+            .unwrap()
     }
-
-    #[test]
-    fn publish_commit_refuses_a_plan_frozen_for_another_incarnation() {
+    #[tokio::test]
+    async fn publish_commit_uses_uuid_main_and_staging_cas_only() {
         let plan = plan();
-        let loaded = Uuid::from_u128(0x5678);
-        let error = build_publish_commit(
-            TableIdent::from_strs(["db", "mv"]).unwrap(),
-            &metadata_with_uuid(loaded),
-            &plan,
-        )
-        .expect_err("plan UUID differs from the loaded table");
-
+        let change = plan
+            .prepare(&loaded(&plan, plan.target_table_uuid))
+            .unwrap();
         assert_eq!(
-            error,
-            ExistingCommitError::ConflictingTableUuid {
-                base: loaded,
-                asserted: plan.target_table_uuid,
-            }
+            change.requirements,
+            vec![
+                TableRequirement::UuidMatch {
+                    uuid: plan.target_table_uuid
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: plan.staging_branch.clone(),
+                    snapshot_id: Some(300)
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "main".into(),
+                    snapshot_id: Some(100)
+                }
+            ]
+        );
+        let [
+            crate::iceberg::TableUpdate::SetSnapshotRef {
+                ref_name,
+                reference,
+            },
+        ] = change.updates.as_slice()
+        else {
+            panic!("one main update")
+        };
+        assert_eq!(ref_name, "main");
+        assert_eq!(reference.snapshot_id, 300);
+    }
+    #[tokio::test]
+    async fn publish_commit_refuses_a_plan_frozen_for_another_incarnation() {
+        let plan = plan();
+        let error = plan
+            .prepare(&loaded(&plan, Uuid::from_u128(0x5678)))
+            .err()
+            .expect("preparation must refuse");
+        assert_eq!(
+            error.kind(),
+            novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest
+        );
+        assert_eq!(
+            error.message(),
+            "MV publication target table incarnation changed"
         );
     }
 

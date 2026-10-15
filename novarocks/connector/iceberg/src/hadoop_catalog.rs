@@ -1594,61 +1594,73 @@ impl Catalog for HadoopFileSystemCatalog {
     /// Apply a table commit (requirements + updates) and write a new versioned
     /// metadata file.
     ///
-    /// This method bypasses `TableCommit::apply()` which internally calls
-    /// `MetadataLocation::from_str()`. That function rejects the Hadoop
-    /// `vN.metadata.json` naming convention, so we manually apply requirements
-    /// and updates here.
-    async fn update_table(&self, mut commit: TableCommit) -> Result<Table> {
-        let ident = commit.identifier().clone();
-
-        // Load the current metadata.
-        let current_table = self.load_table(&ident).await?;
-        let current_metadata_location = current_table
-            .metadata_location()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "no metadata location for table: {}",
-                        Self::table_key(&ident)
-                    ),
-                )
-            })?
-            .to_string();
-        let current_metadata = current_table.metadata();
-
-        // Check all requirements against the current metadata.
-        for requirement in commit.take_requirements() {
-            requirement.check(Some(current_metadata))?;
+    /// Production publication uses the prepared journal mechanism. The SDK
+    /// implementation below is confined to independent legacy test setup;
+    /// its Hadoop metadata paths cannot use `TableCommit::apply()`.
+    async fn update_table(&self, commit: TableCommit) -> Result<Table> {
+        #[cfg(not(test))]
+        {
+            let _ = commit;
+            Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Catalog mutation must use its prepared publication journal",
+            ))
         }
+        #[cfg(test)]
+        {
+            let mut commit = commit;
 
-        // Apply all updates to produce new metadata.
-        let mut builder = current_metadata
-            .clone()
-            .into_builder(Some(current_metadata_location));
-        for update in commit.take_updates() {
-            builder = update.apply(builder)?;
+            let ident = commit.identifier().clone();
+
+            // Load the current metadata.
+            let current_table = self.load_table(&ident).await?;
+            let current_metadata_location = current_table
+                .metadata_location()
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "no metadata location for table: {}",
+                            Self::table_key(&ident)
+                        ),
+                    )
+                })?
+                .to_string();
+            let current_metadata = current_table.metadata();
+
+            // Check all requirements against the current metadata.
+            for requirement in commit.take_requirements() {
+                requirement.check(Some(current_metadata))?;
+            }
+
+            // Apply all updates to produce new metadata.
+            let mut builder = current_metadata
+                .clone()
+                .into_builder(Some(current_metadata_location));
+            for update in commit.take_updates() {
+                builder = update.apply(builder)?;
+            }
+            let new_metadata = builder.build()?.metadata;
+
+            // Determine the next version number.
+            let table_location = current_metadata.location().to_string();
+            let current_version = self.read_version_hint(&table_location).await;
+            let next_version = current_version + 1;
+
+            // Write the new metadata and update version-hint.text.
+            let new_metadata_location = self
+                .write_metadata(&table_location, &new_metadata, next_version)
+                .await?;
+
+            // Update the in-memory registry.
+            let key = Self::table_key(&ident);
+            self.tables
+                .lock()
+                .await
+                .insert(key, new_metadata_location.clone());
+
+            self.build_table(ident, new_metadata, new_metadata_location)
         }
-        let new_metadata = builder.build()?.metadata;
-
-        // Determine the next version number.
-        let table_location = current_metadata.location().to_string();
-        let current_version = self.read_version_hint(&table_location).await;
-        let next_version = current_version + 1;
-
-        // Write the new metadata and update version-hint.text.
-        let new_metadata_location = self
-            .write_metadata(&table_location, &new_metadata, next_version)
-            .await?;
-
-        // Update the in-memory registry.
-        let key = Self::table_key(&ident);
-        self.tables
-            .lock()
-            .await
-            .insert(key, new_metadata_location.clone());
-
-        self.build_table(ident, new_metadata, new_metadata_location)
     }
 }
 

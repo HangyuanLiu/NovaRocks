@@ -312,18 +312,19 @@ async fn every_stage_equals_canonical_prefix_and_whole_request() {
             .requirements()
             .contains(&TableRequirement::DefaultSpecIdMatch { default_spec_id: 0 })
     );
-    let table = crate::iceberg::table::Table::builder()
-        .runtime(crate::iceberg::Runtime::try_current().expect("test runtime"))
-        .identifier(intent.target().ident.clone())
-        .metadata(base.clone())
-        .file_io(writer.io.clone())
-        .metadata_location(
-            "s3://bucket/table/metadata/00000-00000000-0000-0000-0000-000000000001.metadata.json",
-        )
-        .build()
-        .unwrap();
-    let applied = request.into_table_commit().apply(table).unwrap();
-    assert_eq!(staged, facts(applied.metadata()));
+    // Independently replay SDK format primitives, without the staging replay
+    // helper or a terminal SDK Catalog publication object.
+    for requirement in request.requirements() {
+        requirement.check(Some(&base)).unwrap();
+    }
+    let mut applied = base.into_builder(Some(
+        "s3://bucket/table/metadata/00000-00000000-0000-0000-0000-000000000001.metadata.json"
+            .into(),
+    ));
+    for update in request.updates() {
+        applied = update.clone().apply(applied).unwrap();
+    }
+    assert_eq!(staged, facts(&applied.build().unwrap().metadata));
 }
 
 struct AppendObserver {

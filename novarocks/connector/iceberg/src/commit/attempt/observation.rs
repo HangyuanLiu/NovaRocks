@@ -705,6 +705,7 @@ impl<R: Clone + Send + Sync + 'static> PublicationJournal<R> {
     }
     /// Only the frozen request's positive probe may append proof. Unknown's
     /// original observation remains stored, including after this succeeds.
+    #[cfg(test)]
     pub(crate) fn append_positive_proof(
         &self,
         key: Uuid,

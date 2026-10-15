@@ -538,7 +538,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::commit::attempt::{self, OwnerPublisher, RetryPolicy, TransitionalPublisher};
+    use crate::commit::attempt::{self, RetryPolicy};
     use crate::commit::model::{
         AddedContent, Dependency, FileChanges, IcebergCleanupReport, IsolationLevel,
         OperationIntent, OperationIntentParts, OperationToken, PublicationOutcome, RequestShape,
@@ -592,10 +592,7 @@ mod tests {
         );
         let catalog: Arc<dyn Catalog> = concrete.clone();
         let owner =
-            crate::catalog::factory::NovaRocksCatalogFactory::adopt_recording_hadoop_for_test(
-                concrete,
-                catalog.clone(),
-            );
+            crate::catalog::factory::NovaRocksCatalogFactory::adopt_hadoop_for_test(concrete);
         let namespace = NamespaceIdent::new("db".to_string());
         catalog
             .create_namespace(&namespace, HashMap::new())
@@ -688,38 +685,63 @@ mod tests {
             token,
         })
         .unwrap();
-        let publisher = OwnerPublisher {
-            operation: token,
-            marker: None,
-            target: TransitionalPublisher {
+        let recovery_preflight: crate::commit::attempt::RecoveryPreflight =
+            Arc::new(|request, operation| {
+                let facts = crate::commit::recovery::FrozenPublicationFacts::from_request(
+                    request, operation,
+                )?;
+                facts.validate(operation.token())?;
+                let encoded = serde_json::to_vec(&facts).map_err(|error| {
+                    crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::Unexpected,
+                        "Encode test publication recovery failed",
+                    )
+                    .with_source(error)
+                })?;
+                if encoded.len() > MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES {
+                    return Err(crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::DataInvalid,
+                        "Test publication recovery exceeds evidence capacity",
+                    ));
+                }
+                Ok(())
+            });
+        let generation = novarocks_spi::connector::ProviderBindingEpoch::from_bytes([0x66; 16]);
+        fixture
+            .owner
+            .bind_publication_generation(generation)
+            .unwrap();
+        let evidence = novarocks_spi::connector::ExternalMutationEvidence::try_new(
+            2,
+            novarocks_spi::connector::ConnectorInstanceDescriptor {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .unwrap(),
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(
+                    "overwrite-fixture",
+                )
+                .unwrap(),
+            },
+            generation,
+            novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(token.to_bytes()),
+            "append_fixture",
+            bytes::Bytes::from_static(b"{}"),
+        )
+        .unwrap();
+        let journal = crate::commit::attempt::observation::PublicationJournal::new(token);
+        let preflight_journal = journal.clone();
+        let publisher = journal.observe_prepared(Arc::new(
+            crate::commit::attempt::prepared::CatalogPublisher {
                 catalog_operation: crate::catalog::admission::CatalogOperation::Overwrite,
-                catalog: fixture.owner.clone(),
+                catalog: Arc::clone(&fixture.owner),
                 ident: fixture.table_ident.clone(),
                 target_ref: target_ref.to_string(),
-                evidence: crate::catalog::error::CatalogCommitEvidence::for_target("db.t")
-                    .with_target_uuid(table.metadata().uuid().to_string()),
-                recovery_preflight: Arc::new(|request, operation| {
-                    let facts = crate::commit::recovery::FrozenPublicationFacts::from_request(
-                        request, operation,
-                    )?;
-                    facts.validate(operation.token())?;
-                    let encoded = serde_json::to_vec(&facts).map_err(|error| {
-                        crate::iceberg::Error::new(
-                            crate::iceberg::ErrorKind::Unexpected,
-                            "Encode test publication recovery failed",
-                        )
-                        .with_source(error)
-                    })?;
-                    if encoded.len() > MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES {
-                        return Err(crate::iceberg::Error::new(
-                            crate::iceberg::ErrorKind::DataInvalid,
-                            "Test publication recovery exceeds evidence capacity",
-                        ));
-                    }
-                    Ok(())
+                operation: token,
+                recovery_preflight: Arc::new(move |request, operation| {
+                    recovery_preflight(request, operation)?;
+                    preflight_journal.record(evidence.clone(), (), request)
                 }),
             },
-        };
+        ));
         let report = attempt::run(
             &operation,
             &intent,
@@ -938,9 +960,19 @@ mod tests {
                 expected_table_uuid: Some(seeded.metadata().uuid()),
             },
         };
-        super::super::ref_action::execute_ref_action(fixture.catalog.as_ref(), &seeded, &plan)
-            .await
-            .expect("create dev branch");
+        let outcome = crate::catalog::admission_test_support::publish_ref_change(
+            Arc::clone(&fixture.owner),
+            &seeded,
+            plan.prepare(&seeded).unwrap(),
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                novarocks_spi::connector::ExternalMutationOutcome::KnownCommitted { .. }
+            ),
+            "{outcome:?}"
+        );
         let branched = fixture
             .catalog
             .load_table(&fixture.table_ident)

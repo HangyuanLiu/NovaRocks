@@ -325,6 +325,7 @@ pub(crate) fn uncommitted_failure_kind(
     error: &crate::iceberg::Error,
 ) -> ConnectorMutationFailureKind {
     use crate::iceberg::ErrorKind;
+    #[cfg(test)]
     if let Some(evidence) = crate::rest_protocol::adapter::rest_evidence(error)
         && let Some(failure) = evidence.failure()
     {

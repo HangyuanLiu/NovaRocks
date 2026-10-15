@@ -30,6 +30,7 @@ use novarocks_spi::connector::{
 #[cfg(test)]
 use super::CatalogDropTableReceipt;
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
+#[cfg(test)]
 use super::delegate::CatalogDelegate;
 use super::error::CatalogOutcome;
 #[cfg(test)]
@@ -47,6 +48,7 @@ use super::{
 };
 use crate::catalog_runtime::RestAccessDelegationMode;
 use crate::loaded_table::{IcebergAccessDelegation, IcebergLoadedTable, parse_rest_delegation};
+#[cfg(test)]
 use crate::rest_protocol::adapter::RestTransitionalAdapter;
 use crate::rest_protocol::boundary::sanitize_upstream_error;
 use crate::rest_protocol::endpoints::RestEndpoints;
@@ -66,7 +68,11 @@ use crate::rest_protocol::evidence::{NotDispatchedCause, RestEvidence, StageVerd
 pub(super) struct NovaRocksRestCatalog {
     /// Delegates generic owner methods to the generation's one transitional
     /// adapter, whose mutation failures carry typed evidence.
+    evidence_policy: super::publication::CatalogEvidencePolicy,
+    listing: Arc<super::listing_admission::ListingAdmission>,
+    #[cfg(test)]
     delegate: CatalogDelegate,
+    #[cfg(test)]
     adapter: Arc<RestTransitionalAdapter>,
     /// NovaRocks requests sharing the upstream client's one session (L27).
     endpoints: Arc<RestEndpoints>,
@@ -79,7 +85,7 @@ impl NovaRocksRestCatalog {
         mut self,
         policy: super::publication::CatalogEvidencePolicy,
     ) -> Self {
-        self.delegate.evidence_policy = policy;
+        self.evidence_policy = policy;
         self
     }
 
@@ -88,9 +94,14 @@ impl NovaRocksRestCatalog {
         warehouse: Option<Arc<str>>,
         access_delegation: RestAccessDelegationMode,
     ) -> Self {
+        #[cfg(test)]
         let adapter = Arc::new(RestTransitionalAdapter::new(Arc::clone(&endpoints)));
         Self {
+            evidence_policy: Default::default(),
+            listing: Default::default(),
+            #[cfg(test)]
             delegate: CatalogDelegate::new(adapter.clone()),
+            #[cfg(test)]
             adapter,
             endpoints,
             warehouse,
@@ -310,7 +321,6 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 .into());
             };
             let exists = self
-                .delegate
                 .listing
                 .run(&preparation, self.namespace_exists(namespace.clone()))
                 .await?;
@@ -328,7 +338,6 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             };
             let namespace = CatalogNamespaceName::new(Arc::clone(&table.namespace));
             if !self
-                .delegate
                 .listing
                 .run(&preparation, self.namespace_exists(namespace))
                 .await?
@@ -543,17 +552,18 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     }
 
     fn evidence_policy(&self) -> super::publication::CatalogEvidencePolicy {
-        self.delegate.evidence_policy
+        self.evidence_policy
     }
 
     fn listing_admission(&self) -> Arc<super::listing_admission::ListingAdmission> {
-        Arc::clone(&self.delegate.listing)
+        Arc::clone(&self.listing)
     }
 
     fn implementation_name(&self) -> &'static str {
         "rest"
     }
 
+    #[cfg(test)]
     fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
         self.adapter.clone()
     }
@@ -643,10 +653,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 "external catalog listing requires an admitted request context",
             )
         })?;
-        self.delegate
-            .listing
-            .run(context, self.list_namespaces(bound))
-            .await
+        self.listing.run(context, self.list_namespaces(bound)).await
     }
 
     async fn list_tables_for_read(
@@ -661,8 +668,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 "external catalog listing requires an admitted request context",
             )
         })?;
-        self.delegate
-            .listing
+        self.listing
             .run(context, self.list_tables(namespace, bound))
             .await
     }
@@ -673,8 +679,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         context: novarocks_spi::connector::ConnectorRequestContext,
         bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
-        self.delegate
-            .listing
+        self.listing
             .run(&context, self.list_views(namespace, bound))
             .await
     }
@@ -698,8 +703,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 "Namespace existence requires an admitted request context",
             )
         })?;
-        self.delegate
-            .listing
+        self.listing
             .run(context, self.namespace_exists(namespace))
             .await
     }
@@ -818,8 +822,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         page_size: usize,
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<CatalogTablePage, ConnectorError> {
-        self.delegate
-            .listing
+        self.listing
             .run(
                 &context,
                 self.list_tables_page(namespace, page_token, page_size),
@@ -846,11 +849,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 "Table existence requires an admitted request context",
             )
         })?;
-        let exists = self
-            .delegate
-            .listing
-            .run(context, self.table_exists(table))
-            .await?;
+        let exists = self.listing.run(context, self.table_exists(table)).await?;
         context.check_active()?;
         Ok(exists)
     }
@@ -901,7 +900,6 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         context.check_active()?;
         let ident = super::delegate::table_ident(&table)?;
         let result = self
-            .delegate
             .listing
             .run(
                 context,
@@ -945,11 +943,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     ) -> Result<bool, ConnectorError> {
         use novarocks_spi::connector::ConnectorOperationControl;
         context.check_active()?;
-        let result = self
-            .delegate
-            .listing
-            .run(&context, self.view_exists(view))
-            .await?;
+        let result = self.listing.run(&context, self.view_exists(view)).await?;
         context.check_active()?;
         Ok(result)
     }
@@ -961,11 +955,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
         use novarocks_spi::connector::ConnectorOperationControl;
         context.check_active()?;
-        let result = self
-            .delegate
-            .listing
-            .run(&context, self.load_view(view))
-            .await?;
+        let result = self.listing.run(&context, self.load_view(view)).await?;
         context.check_active()?;
         Ok(result)
     }
@@ -1040,11 +1030,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 "Table load requires an admitted request context",
             )
         })?;
-        let loaded = self
-            .delegate
-            .listing
-            .run(context, self.load_table(table))
-            .await?;
+        let loaded = self.listing.run(context, self.load_table(table)).await?;
         context.check_active()?;
         Ok(loaded)
     }

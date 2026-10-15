@@ -50,9 +50,9 @@ No patches applied in the initial source commit.
 - Purpose: preserve the 0.9 `TableMetadata::refs()` read-only accessor.
 - Files: `src/spec/table_metadata.rs`.
 - Upstream status: no tracked upstream issue; rc.2 exposes only individual reference lookup.
-- Production dependency: NovaRocks commit dependency validation observes the authoritative branch/tag reference set.
+- Production dependency: NovaRocks dependency validation, ref preparation, complete branch/table/call retention policy and reclamation protection observe the authoritative full branch/tag reference set.
 - Exit: remove when upstream exposes the same complete reference-map accessor, or a reviewed consumer migration removes the need for it.
-- Coverage: existing connector commit dependency and ref tests; V2 standalone core check.
+- Coverage: connector dependency/ref tests, fixed retention graphs and actual reclamation root/freshness tests; V2 standalone core check.
 
 ## P7a — missing v3 next-row-id read compatibility
 
@@ -69,5 +69,5 @@ No patches applied in the initial source commit.
 - Files: `src/io/storage/{mod,local_fs,memory}.rs`, `src/io/file_io.rs`.
 - Upstream status: no tracked upstream issue; rc.2 has no directory-listing method.
 - Production dependency: Hadoop catalog namespace/table discovery; unsupported storage backends return FeatureUnsupported.
-- Exit: IRU-6a removes this patch after the catalog storage boundary owns directory discovery without the SDK extension.
+- Exit: IRU-6c migrates the Hadoop storage discovery protocol and removes this patch when its consumer no longer needs the SDK directory extension. IRU-6a retains the existing Hadoop protocol.
 - Coverage: existing connector Hadoop catalog discovery tests; V2 standalone core check. Old core has no dedicated directory-listing tests.

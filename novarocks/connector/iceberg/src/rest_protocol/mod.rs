@@ -22,6 +22,7 @@
 //!
 //! Design: ADR-0175 (docs/adr/ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md)
 
+#[cfg(test)]
 pub(crate) mod adapter;
 pub(crate) mod attempt;
 pub(crate) mod auth;

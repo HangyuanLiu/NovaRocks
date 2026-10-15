@@ -74,8 +74,10 @@ impl NovaRocksCatalogFactory {
                 ))
             }
             IcebergCatalogKind::Hive => Ok(Arc::new(
-                super::hive::NovaRocksHiveCatalog::adopt(Arc::clone(client.generic()))
-                    .with_evidence_policy(evidence_policy),
+                super::hive::NovaRocksHiveCatalog::adopt(Arc::clone(client.generic().ok_or_else(
+                    || "Hive Iceberg configuration produced no read client".to_string(),
+                )?))
+                .with_evidence_policy(evidence_policy),
             )),
         }
     }
@@ -93,16 +95,10 @@ impl NovaRocksCatalogFactory {
     }
 
     #[cfg(test)]
-    pub(crate) fn adopt_recording_hadoop_for_test(
+    pub(crate) fn adopt_hadoop_for_test(
         client: Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>,
-        vendored_client: Arc<dyn crate::iceberg::Catalog>,
     ) -> Arc<dyn NovaRocksCatalog> {
-        Arc::new(
-            super::hadoop::NovaRocksHadoopCatalog::new_with_vendored_client_for_test(
-                client,
-                vendored_client,
-            ),
-        )
+        Arc::new(super::hadoop::NovaRocksHadoopCatalog::new(client))
     }
 }
 

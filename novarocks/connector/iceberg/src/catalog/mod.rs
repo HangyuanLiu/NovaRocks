@@ -588,6 +588,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     /// instead would give two clients with separate in-memory state that
     /// disagree about the same lake — a dropped table still visible through the
     /// other handle, for instance.
+    #[cfg(test)]
     fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog>;
 
     /// The single-dispatch mechanism for one existing-table publication.
@@ -746,14 +747,13 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     /// metadata reads must use the supplied governor, never a cached FileIO.
     async fn load_commit_base(
         &self,
-        table: CatalogTableName,
+        _table: CatalogTableName,
         _file_io: crate::iceberg::io::FileIO,
     ) -> crate::iceberg::Result<CatalogCommitBase> {
-        let ident = delegate::table_ident(&table).map_err(|error| {
-            crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, error.to_string())
-                .with_source(error)
-        })?;
-        CatalogCommitBase::from_table(self.vendored_client().load_table(&ident).await?)
+        Err(crate::iceberg::Error::new(
+            crate::iceberg::ErrorKind::FeatureUnsupported,
+            "Catalog has no admitted commit-base loading mechanism",
+        ))
     }
 
     /// Whether the view exists.

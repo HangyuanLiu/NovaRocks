@@ -372,7 +372,11 @@ pub(super) fn record_observed_publication(
             ));
         }
     };
-    if let Err(error) = journal.append_positive_proof(descriptor.key, observation) {
+    if let Err(error) = journal.append_positive_proof_with_finalization(
+        descriptor.key,
+        observation,
+        ExternalMutationFinalization::Complete,
+    ) {
         if let committed @ ExternalMutationOutcome::KnownCommitted { .. } =
             journal.catalog_entry_outcome(entry)
         {

@@ -81,17 +81,6 @@ impl NovaRocksHadoopCatalog {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn new_with_vendored_client_for_test(
-        client: Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>,
-        vendored_client: Arc<dyn crate::iceberg::Catalog>,
-    ) -> Self {
-        Self {
-            delegate: CatalogDelegate::new(vendored_client),
-            client,
-        }
-    }
-
     /// The concrete client, for the conditional-create path that has no
     /// equivalent on the generic catalog trait.
     // Reached only by tests; production reaches the client through the dispatch.
@@ -404,6 +393,7 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         "hadoop"
     }
 
+    #[cfg(test)]
     fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
         Arc::clone(self.delegate.client())
     }

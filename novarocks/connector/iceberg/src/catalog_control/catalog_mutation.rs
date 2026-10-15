@@ -1182,116 +1182,6 @@ fn prepare_partition_change(
     })
 }
 
-#[cfg(test)]
-fn alter_partition_spec(
-    runtime: &IcebergMetadataContext,
-    table: &ConnectorTableIdentity,
-    add: &[ConnectorPartitionTransform],
-    drop: &[ConnectorPartitionTransform],
-    context: &ConnectorRequestContext,
-) -> Result<(), ConnectorError> {
-    if add.len() + drop.len() != 1 {
-        return Err(invalid(
-            "Iceberg partition mutation requires exactly one add or drop transform",
-        ));
-    }
-    let loaded = runtime
-        .load_table_for_request(&table.namespace, &table.table, context)
-        .map_err(unavailable)?;
-    let metadata = loaded.table.metadata();
-    let base_spec_id = metadata.default_partition_spec_id();
-    let schema = metadata.current_schema();
-    let current = metadata.default_partition_spec();
-    let mut fields = current
-        .fields()
-        .iter()
-        .cloned()
-        .map(Into::into)
-        .collect::<Vec<UnboundPartitionField>>();
-    if let Some(field) = add.first() {
-        let source_id = partition_source_id(schema, field).map_err(invalid)?;
-        validate_partition_transform(schema, source_id, field).map_err(invalid)?;
-        let transform = partition_transform(field);
-        if fields
-            .iter()
-            .any(|current| current.source_id == source_id && current.transform == transform)
-        {
-            return Err(already_exists("Iceberg partition transform already exists"));
-        }
-        fields.push(UnboundPartitionField {
-            source_id,
-            field_id: None,
-            name: partition_field_name(field),
-            transform,
-        });
-    } else if let Some(field) = drop.first() {
-        let source_id = partition_source_id(schema, field).map_err(invalid)?;
-        let transform = partition_transform(field);
-        let before = fields.len();
-        fields
-            .retain(|current| !(current.source_id == source_id && current.transform == transform));
-        if fields.len() == before {
-            return Err(not_found("Iceberg partition transform does not exist"));
-        }
-    }
-    let mut builder = UnboundPartitionSpecBuilder::new();
-    for field in fields {
-        builder = builder
-            .add_partition_fields([field])
-            .map_err(|error| invalid(format!("build evolved Iceberg partition spec: {error}")))?;
-    }
-    let build =
-        crate::iceberg::spec::TableMetadataBuilder::new_from_metadata(metadata.clone(), None)
-            .add_default_partition_spec(builder.build())
-            .map_err(|error| invalid(format!("bind evolved Iceberg partition spec: {error}")))?
-            .build()
-            .map_err(|error| {
-                invalid(format!("finalize evolved Iceberg partition spec: {error}"))
-            })?;
-    let new_spec_id = build.metadata.default_partition_spec_id();
-    if new_spec_id == base_spec_id {
-        return Err(invalid(
-            "Iceberg partition mutation did not change the default spec",
-        ));
-    }
-    let mut updates = build.changes;
-    if let Some(TableUpdate::AddSpec { spec }) = updates.first_mut() {
-        let committed_spec = build
-            .metadata
-            .partition_spec_by_id(new_spec_id)
-            .ok_or_else(|| internal("evolved Iceberg partition spec is absent"))?;
-        // The builder's update may retain unset IDs even though its resulting
-        // metadata has assigned them. REST requires a complete AddSpec payload.
-        *spec = committed_spec.as_ref().clone().into_unbound();
-    }
-    if !matches!(
-        updates.as_slice(),
-        [TableUpdate::SetDefaultSpec { .. }]
-            | [
-                TableUpdate::AddSpec { .. },
-                TableUpdate::SetDefaultSpec { .. }
-            ]
-    ) {
-        return Err(internal(
-            "evolved Iceberg partition spec has unexpected updates",
-        ));
-    }
-    let commit = crate::commit::existing_commit::existing_table_commit(
-        table_ident(table).map_err(invalid)?,
-        metadata,
-        vec![TableRequirement::DefaultSpecIdMatch {
-            default_spec_id: base_spec_id,
-        }],
-        updates,
-    )
-    .map_err(|error| internal(error.to_string()))?;
-    update_table(runtime, commit, "alter Iceberg partition spec")?;
-    runtime
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(())
-}
-
 fn partition_source_id(
     schema: &Schema,
     field: &ConnectorPartitionTransform,
@@ -1476,39 +1366,6 @@ fn validate_partition_transform(
     Ok(())
 }
 
-#[cfg(test)]
-fn alter_properties(
-    runtime: &IcebergMetadataContext,
-    table: &ConnectorTableIdentity,
-    changes: &[ConnectorPropertyChange],
-    authority: ConnectorPropertyAuthority,
-    context: &ConnectorRequestContext,
-) -> Result<(), ConnectorError> {
-    if changes.is_empty() {
-        return Err(invalid("Iceberg property mutation is empty"));
-    }
-    let loaded = runtime
-        .load_table_for_request(&table.namespace, &table.table, context)
-        .map_err(unavailable)?;
-    let metadata = loaded.table.metadata();
-    let updates = property_updates(metadata, changes, authority)?;
-    if updates.is_empty() {
-        return Ok(());
-    }
-    let commit = crate::commit::existing_commit::existing_table_commit(
-        table_ident(table).map_err(invalid)?,
-        metadata,
-        Vec::new(),
-        updates,
-    )
-    .map_err(|error| internal(error.to_string()))?;
-    update_table(runtime, commit, "alter Iceberg table properties")?;
-    runtime
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(())
-}
-
 fn property_updates(
     metadata: &crate::iceberg::spec::TableMetadata,
     changes: &[ConnectorPropertyChange],
@@ -1673,78 +1530,6 @@ fn prepare_schema_change(
         return Err(invalid("Iceberg column defaults require format-version 3"));
     }
     prepare_schema_updates(metadata, change)
-}
-
-#[cfg(test)]
-fn alter_schema(
-    runtime: &IcebergMetadataContext,
-    table: &ConnectorTableIdentity,
-    changes: &[ConnectorSchemaChange],
-    context: &ConnectorRequestContext,
-) -> Result<ExternalMutationEffect, ConnectorError> {
-    let [change] = changes else {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "Iceberg schema mutation requires exactly one change",
-        ));
-    };
-    let loaded = runtime
-        .load_table_for_request(&table.namespace, &table.table, context)
-        .map_err(unavailable)?;
-    let metadata = loaded.table.metadata();
-    // Reserved lineage columns are an engine contract rather than observed
-    // schema fields, so reject them before any lookup can report them absent.
-    reject_reserved_schema_change(change)?;
-    if let ConnectorSchemaChange::DropColumn { path } = change {
-        let dropped_id = find_field_id(metadata.current_schema().as_struct().fields(), path)?;
-        if metadata
-            .current_schema()
-            .identifier_field_ids()
-            .any(|id| id == dropped_id)
-        {
-            return Err(invalid("Iceberg identifier columns cannot be dropped"));
-        }
-        let physical = loaded.table.clone();
-        let read_control = context.clone();
-        let equality_delete_result = runtime.resources().catalog_runtime().block_on(async move {
-            crate::manifest::current_equality_delete_column_names_with_control(
-                &physical,
-                Some(&read_control as &dyn ConnectorOperationControl),
-            )
-            .await
-        });
-        validate_context(context)?;
-        let equality_delete_columns = equality_delete_result
-            .map_err(unavailable)?
-            .map_err(unavailable)?;
-        if path.segments.len() == 1
-            && equality_delete_columns
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(&path.segments[0]))
-        {
-            return Err(invalid(equality_delete_drop_block_message(
-                &path.segments[0],
-            )));
-        }
-    }
-    if let ConnectorSchemaChange::AddColumn { column, .. } = change
-        && column.default.as_ref().is_some_and(|value| {
-            !matches!(value, novarocks_spi::connector::ConnectorDefaultValue::Null)
-        })
-        && metadata.format_version() != FormatVersion::V3
-    {
-        return Err(invalid("Iceberg column defaults require format-version 3"));
-    }
-    let Some(commit) =
-        schema_change_commit(table_ident(table).map_err(invalid)?, metadata, change)?
-    else {
-        return Ok(ExternalMutationEffect::NoOp);
-    };
-    update_table(runtime, commit, "alter Iceberg schema")?;
-    runtime
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(ExternalMutationEffect::Applied)
 }
 
 /// The commit of one validated schema change against `metadata`, or `None`
@@ -2319,21 +2104,6 @@ fn table_ident(table: &ConnectorTableIdentity) -> Result<TableIdent, String> {
         normalize_identifier(&table.table)?.as_str(),
     ])
     .map_err(|error| format!("build Iceberg table identity: {error}"))
-}
-
-#[cfg(test)]
-fn update_table(
-    runtime: &IcebergMetadataContext,
-    commit: TableCommit,
-    action: &str,
-) -> Result<crate::iceberg::table::Table, ConnectorError> {
-    let catalog = runtime.novarocks_catalog().vendored_client();
-    runtime
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { catalog.update_table(commit).await })
-        .map_err(unavailable)?
-        .map_err(|error| map_iceberg_message(action, error))
 }
 
 fn execute_view_publication(
@@ -5831,14 +5601,14 @@ mod tests {
             .runtime()
             .load_table(&table.namespace, &table.table)
             .expect("load managed table fixture");
-        let runtime = Arc::clone(provider.runtime());
+        let fixture_provider = provider.clone();
         provider
             .runtime()
             .resources()
             .catalog_runtime()
             .block_on(async move {
                 crate::commit::run::append_snapshot_for_test(
-                    runtime,
+                    fixture_provider,
                     loaded.table,
                     Vec::new(),
                     "main".to_string(),
@@ -7509,13 +7279,32 @@ mod tests {
             },
         };
 
-        let error = alter_schema(provider.runtime(), &table, &[change], &context())
-            .expect_err("reserved field must not be resolved from table metadata");
+        let outcome = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: ConnectorProviderBindingKey {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    incarnation: provider.incarnation(),
+                },
+                operation: ConnectorCatalogMutationOperation::AlterSchema {
+                    table,
+                    changes: vec![change],
+                },
+                context: context(),
+            })
+            .expect("execute reserved-field refusal");
+        let ExternalMutationOutcome::KnownUncommitted {
+            failure: error,
+            cleanup: ExternalMutationFinalization::Complete,
+        } = outcome
+        else {
+            panic!("reserved-field request must be refused before dispatch: {outcome:?}");
+        };
 
-        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(error.kind(), ConnectorMutationFailureKind::Unsupported);
         assert_eq!(
             error.message(),
-            "Iceberg schema evolution cannot modify reserved column `_row_id`"
+            "Unsupported: Iceberg schema evolution cannot modify reserved column `_row_id`"
         );
     }
 
@@ -8433,46 +8222,58 @@ mod tests {
             original.table.metadata().last_column_id()
         );
 
-        alter_partition_spec(
-            provider.runtime(),
-            &table,
-            &[ConnectorPartitionTransform::Bucket {
-                column: "id".into(),
-                num_buckets: 4,
-            }],
-            &[],
-            &stale,
-        )
-        .expect_err("partition evolution must not land on the replacement");
-        alter_schema(
-            provider.runtime(),
-            &table,
-            &[ConnectorSchemaChange::AddColumn {
-                parent: ConnectorColumnPath { segments: vec![] },
-                column: ConnectorColumnDefinition {
-                    name: "extra".into(),
-                    data_type: ConnectorDataType::Int,
-                    nullable: true,
-                    aggregation: None,
-                    default: None,
-                },
-                position: ConnectorColumnPosition::Default,
-            }],
-            &stale,
-        )
-        .expect_err("schema evolution must not land on the replacement");
         let properties = vec![ConnectorPropertyChange::Set {
             key: "novarocks.mv.partition".into(),
             value: "stale".into(),
         }];
-        alter_properties(
-            provider.runtime(),
-            &table,
-            &properties,
-            ConnectorPropertyAuthority::EngineOwned,
-            &stale,
-        )
-        .expect_err("property mutation must not land on the replacement");
+        let operations = [
+            ConnectorCatalogMutationOperation::AlterPartitionSpec {
+                table: table.clone(),
+                add: vec![ConnectorPartitionTransform::Bucket {
+                    column: "id".into(),
+                    num_buckets: 4,
+                }],
+                drop: vec![],
+            },
+            ConnectorCatalogMutationOperation::AlterSchema {
+                table: table.clone(),
+                changes: vec![ConnectorSchemaChange::AddColumn {
+                    parent: ConnectorColumnPath { segments: vec![] },
+                    column: ConnectorColumnDefinition {
+                        name: "extra".into(),
+                        data_type: ConnectorDataType::Int,
+                        nullable: true,
+                        aggregation: None,
+                        default: None,
+                    },
+                    position: ConnectorColumnPosition::Default,
+                }],
+            },
+            ConnectorCatalogMutationOperation::AlterProperties {
+                table: table.clone(),
+                changes: properties.clone(),
+                authority: ConnectorPropertyAuthority::EngineOwned,
+                expected_committed_partitioning: None,
+            },
+        ];
+        for operation in operations {
+            let outcome = provider
+                .execute(ConnectorCatalogMutationRequest {
+                    operation_id: ConnectorMutationOperationId::new(),
+                    target: ConnectorProviderBindingKey {
+                        instance_id: provider.descriptor().instance_id.clone(),
+                        incarnation: provider.incarnation(),
+                    },
+                    operation,
+                    context: stale.clone(),
+                })
+                .expect("dispatch stale request through its provider");
+            assert!(
+                matches!(outcome,ExternalMutationOutcome::KnownUncommitted{ref failure,..}
+                if failure.kind()==ConnectorMutationFailureKind::Conflict),
+                "{outcome:?}"
+            );
+        }
         let expected = committed_partitioning_from_metadata(
             original.table.metadata(),
             original.table.metadata().default_partition_spec_id(),

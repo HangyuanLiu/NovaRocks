@@ -21,11 +21,7 @@
 //! snapshot — they emit only `SetSnapshotRef` / `RemoveSnapshotRef`
 //! `TableUpdate`s plus an `AssertRefSnapshotId` requirement.
 
-#![allow(dead_code)]
-
-use crate::commit::existing_commit::{ExistingCommitError, existing_table_commit};
-use crate::iceberg::spec::{SnapshotReference, SnapshotRetention, TableMetadata};
-use crate::iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
+use crate::iceberg::{TableIdent, TableRequirement, TableUpdate};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -199,93 +195,6 @@ pub fn lower_ref_action(
         table: table.to_string(),
         action,
     })
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum RefActionOutcome {
-    Committed,
-    NoOp,
-}
-
-/// Result of an internal cleanup-only ref retirement attempt.
-///
-/// `Abandoned` is deliberately non-error: every mismatch means the proof
-/// observed during candidate discovery has gone stale, so this GC pass leaks
-/// rather than guessing whether the ref is still NovaRocks-owned.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExactBranchDropOutcome {
-    Retired,
-    Abandoned,
-}
-
-fn build_exact_branch_drop_commit(
-    ident: TableIdent,
-    metadata: &TableMetadata,
-    name: &str,
-    expected_head_snapshot_id: i64,
-) -> Result<TableCommit, ExistingCommitError> {
-    // The pre-read is only candidate discovery. The frozen incarnation proof
-    // stays in the destructive commit so DROP/recreate abandons GC.
-    existing_table_commit(
-        ident,
-        metadata,
-        vec![TableRequirement::RefSnapshotIdMatch {
-            r#ref: name.to_string(),
-            snapshot_id: Some(expected_head_snapshot_id),
-        }],
-        vec![TableUpdate::RemoveSnapshotRef {
-            ref_name: name.to_string(),
-        }],
-    )
-}
-
-/// Drop one provider-owned branch only if its table incarnation and observed
-/// head are unchanged. This is intentionally separate from SQL `DROP BRANCH`:
-/// it has no `IF EXISTS` mode and never converts a missing or changed ref into
-/// a successful cleanup result. The caller owns the table load so request-scoped
-/// storage credentials cannot be bypassed by a second catalog load here.
-pub async fn drop_branch_if_exact(
-    catalog: &dyn Catalog,
-    loaded: &crate::iceberg::table::Table,
-    expected_table_uuid: &str,
-    name: &str,
-    expected_head_snapshot_id: i64,
-) -> Result<ExactBranchDropOutcome, String> {
-    let metadata = loaded.metadata();
-    if metadata.uuid().to_string() != expected_table_uuid {
-        return Ok(ExactBranchDropOutcome::Abandoned);
-    }
-    let Some(reference) = metadata.refs().get(name) else {
-        return Ok(ExactBranchDropOutcome::Abandoned);
-    };
-    if !reference.is_branch()
-        || reference.snapshot_id != expected_head_snapshot_id
-        || metadata.snapshot_by_id(expected_head_snapshot_id).is_none()
-    {
-        return Ok(ExactBranchDropOutcome::Abandoned);
-    }
-    let commit = build_exact_branch_drop_commit(
-        loaded.identifier().clone(),
-        metadata,
-        name,
-        expected_head_snapshot_id,
-    )
-    .map_err(|error| format!("iceberg cleanup ref: {error}"))?;
-    match catalog.update_table(commit).await {
-        Ok(_) => Ok(ExactBranchDropOutcome::Retired),
-        // A concurrently moved/deleted ref is a failed compare-and-swap proof,
-        // not a reason to retry a destructive action in this GC pass.
-        Err(error)
-            if matches!(
-                error.kind(),
-                crate::iceberg::ErrorKind::PreconditionFailed
-                    | crate::iceberg::ErrorKind::CatalogCommitConflicts
-            ) =>
-        {
-            Ok(ExactBranchDropOutcome::Abandoned)
-        }
-        Err(error) => Err(format!("iceberg cleanup ref: exact drop failed: {error}")),
-    }
 }
 
 impl RefActionPlan {
@@ -504,42 +413,19 @@ impl RefActionPlan {
     }
 }
 
-pub async fn execute_ref_action(
-    catalog: &dyn Catalog,
-    loaded: &crate::iceberg::table::Table,
-    plan: &RefActionPlan,
-) -> Result<RefActionOutcome, String> {
-    let change = plan.prepare(loaded).map_err(|error| error.to_string())?;
-    if change.updates.is_empty() {
-        return Ok(RefActionOutcome::NoOp);
-    }
-    let commit = existing_table_commit(
-        loaded.identifier().clone(),
-        loaded.metadata(),
-        change.requirements,
-        change.updates,
-    )
-    .map_err(|error| format!("iceberg ref: {error}"))?;
-    catalog
-        .update_table(commit)
-        .await
-        .map_err(|error| format!("iceberg ref: commit failed: {error}"))?;
-    Ok(RefActionOutcome::Committed)
-}
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::iceberg::spec::{
+        FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
+        SnapshotReference, SnapshotRetention, SortOrder, Summary, TableMetadata,
+        TableMetadataBuilder, Type,
+    };
+    use crate::iceberg::table::Table;
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use super::*;
-    use crate::commit::existing_commit::test_support::{LocalTable, local_table};
-    use crate::iceberg::spec::{
-        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
-        TableMetadataBuilder, Type,
-    };
-
-    fn metadata_with_uuid(uuid: Uuid) -> TableMetadata {
+    fn metadata() -> TableMetadata {
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::required(
                 1,
@@ -547,247 +433,294 @@ mod tests {
                 Type::Primitive(PrimitiveType::Long),
             ))])
             .build()
-            .expect("schema");
-        TableMetadataBuilder::new(
+            .unwrap();
+        let base = TableMetadataBuilder::new(
             schema,
             PartitionSpec::unpartition_spec(),
             SortOrder::unsorted_order(),
-            "memory://warehouse/db/orders".to_string(),
+            "memory://warehouse/db/t".into(),
             FormatVersion::V2,
             HashMap::new(),
         )
-        .expect("metadata builder")
-        .assign_uuid(uuid)
+        .unwrap()
+        .assign_uuid(Uuid::from_u128(7))
         .build()
-        .expect("metadata")
-        .metadata
+        .unwrap()
+        .metadata;
+        let time = base.last_updated_ms();
+        let snapshot = |id| {
+            Snapshot::builder()
+                .with_snapshot_id(id)
+                .with_sequence_number(id)
+                .with_timestamp_ms(time)
+                .with_manifest_list(format!("memory://snap-{id}.avro"))
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .build()
+        };
+        base.into_builder(None)
+            .add_snapshot(snapshot(7))
+            .unwrap()
+            .add_snapshot(snapshot(11))
+            .unwrap()
+            .set_ref(
+                "main",
+                SnapshotReference::new(7, SnapshotRetention::branch(None, None, None)),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata
     }
-
+    fn table(metadata: TableMetadata) -> Table {
+        Table::builder()
+            .runtime(crate::iceberg::Runtime::try_current().unwrap())
+            .identifier(TableIdent::from_strs(["db", "t"]).unwrap())
+            .file_io(crate::iceberg::io::FileIO::new_with_memory())
+            .metadata(metadata)
+            .build()
+            .unwrap()
+    }
     fn plan(action: RefAction) -> RefActionPlan {
         RefActionPlan {
-            catalog: "iceberg".to_string(),
-            namespace: "db".to_string(),
-            table: "t".to_string(),
+            catalog: "ice".into(),
+            namespace: "db".into(),
+            table: "t".into(),
             action,
         }
     }
-
-    /// Runs one action against a fresh load and returns the UUID assertions of
-    /// the dispatched commit together with the UUID of the metadata it used.
-    async fn run_action(fixture: &LocalTable, action: RefAction) -> (Vec<Uuid>, Uuid) {
-        let loaded = fixture.load().await;
-        let outcome = execute_ref_action(fixture.catalog.as_ref(), &loaded, &plan(action))
-            .await
-            .expect("execute ref action");
-        assert_eq!(outcome, RefActionOutcome::Committed);
-        (
-            fixture.catalog.take_single_commit_uuids(),
-            loaded.metadata().uuid(),
-        )
+    fn apply(table: &Table, change: crate::commit::staging::PreparedChange) -> TableMetadata {
+        for requirement in &change.requirements {
+            requirement.check(Some(table.metadata())).unwrap();
+        }
+        let mut builder = table.metadata().clone().into_builder(None);
+        for update in change.updates {
+            builder = update.apply(builder).unwrap();
+        }
+        builder.build().unwrap().metadata
     }
-
     #[tokio::test]
     async fn every_ref_action_freezes_the_uuid_of_the_metadata_it_used() {
-        let fixture = local_table().await;
-        let first = fixture.append("first").await;
-
+        let mut loaded = table(metadata());
         let create_branch = RefAction::CreateBranch {
-            name: "dev".to_string(),
-            snapshot_id: first,
+            name: "dev".into(),
+            snapshot_id: 7,
             replace: false,
             if_not_exists: false,
             expected_table_uuid: None,
         };
         let create_tag = RefAction::CreateTag {
-            name: "v1".to_string(),
-            snapshot_id: first,
+            name: "v1".into(),
+            snapshot_id: 7,
             replace: false,
             if_not_exists: false,
             expected_table_uuid: None,
         };
-        for action in [create_branch, create_tag] {
-            let (asserted, loaded) = run_action(&fixture, action).await;
-            assert_eq!(asserted, vec![loaded]);
-        }
-
-        let second = fixture.append("second").await;
         let fast_forward = RefAction::FastForwardBranch {
-            source_branch: "main".to_string(),
-            target_branch: "dev".to_string(),
-            source_snapshot_id: second,
-            expected_target_snapshot_id: Some(first),
+            source_branch: "main".into(),
+            target_branch: "dev".into(),
+            source_snapshot_id: 11,
+            expected_target_snapshot_id: Some(7),
         };
         let drop_tag = RefAction::DropTag {
-            name: "v1".to_string(),
+            name: "v1".into(),
             if_exists: false,
         };
         let drop_branch = RefAction::DropBranch {
-            name: "dev".to_string(),
+            name: "dev".into(),
             if_exists: false,
         };
-        for action in [fast_forward, drop_tag, drop_branch] {
-            let (asserted, loaded) = run_action(&fixture, action).await;
-            assert_eq!(asserted, vec![loaded]);
-        }
-
-        let refs = fixture.load().await.metadata().refs().clone();
-        assert_eq!(refs.keys().collect::<Vec<_>>(), vec!["main"]);
-    }
-
-    #[tokio::test]
-    async fn ref_create_with_another_incarnation_uuid_is_not_dispatched() {
-        let fixture = local_table().await;
-        let first = fixture.append("first").await;
-        let loaded = fixture.load().await;
-        let foreign = Uuid::new_v4();
-        assert_ne!(foreign, loaded.metadata().uuid());
-
-        let error = execute_ref_action(
-            fixture.catalog.as_ref(),
-            &loaded,
-            &plan(RefAction::CreateBranch {
-                name: "dev".to_string(),
-                snapshot_id: first,
-                replace: false,
-                if_not_exists: false,
-                expected_table_uuid: Some(foreign),
-            }),
-        )
-        .await
-        .expect_err("foreign incarnation UUID");
-
-        assert!(error.contains("table UUID"), "{error}");
-        assert!(fixture.catalog.commits().is_empty());
-    }
-
-    #[tokio::test]
-    async fn pure_ref_replacement_preserves_policy_and_exact_cas() {
-        let fixture = local_table().await;
-        let first = fixture.append("first").await;
-        let second = fixture.append("second").await;
-        let loaded = fixture.load().await;
-        for branch in [true, false] {
-            let mut value = serde_json::to_value(loaded.metadata()).unwrap();
-            value["refs"]["release"] = if branch {
-                serde_json::json!({"snapshot-id":first,"type":"branch","min-snapshots-to-keep":11,"max-snapshot-age-ms":12,"max-ref-age-ms":13})
-            } else {
-                serde_json::json!({"snapshot-id":first,"type":"tag","max-ref-age-ms":13})
-            };
-            let metadata: TableMetadata = serde_json::from_value(value).unwrap();
-            let expected = metadata.refs()["release"].retention.clone();
-            let table = crate::iceberg::table::Table::builder()
-                .runtime(crate::iceberg::Runtime::try_current().unwrap())
-                .identifier(loaded.identifier().clone())
-                .file_io(loaded.file_io().clone())
-                .metadata(metadata)
-                .build()
-                .unwrap();
-            let duplicate = if branch {
-                RefAction::CreateBranch {
-                    name: "release".into(),
-                    snapshot_id: second,
-                    replace: false,
-                    if_not_exists: false,
-                    expected_table_uuid: Some(table.metadata().uuid()),
-                }
-            } else {
-                RefAction::CreateTag {
-                    name: "release".into(),
-                    snapshot_id: second,
-                    replace: false,
-                    if_not_exists: false,
-                    expected_table_uuid: Some(table.metadata().uuid()),
-                }
-            };
-            let duplicate = plan(duplicate)
-                .prepare(&table)
-                .err()
-                .expect("duplicate ref");
-            assert_eq!(
-                duplicate.kind(),
-                novarocks_spi::connector::ConnectorMutationFailureKind::AlreadyExists
-            );
-            if branch {
-                let stale = plan(RefAction::FastForwardBranch {
-                    source_branch: "main".into(),
-                    target_branch: "release".into(),
-                    source_snapshot_id: second,
-                    expected_target_snapshot_id: Some(second),
-                })
-                .prepare(&table)
-                .err()
-                .expect("stale target head");
-                assert_eq!(
-                    stale.kind(),
-                    novarocks_spi::connector::ConnectorMutationFailureKind::Conflict
+        for (index, action) in [
+            create_branch,
+            create_tag,
+            fast_forward,
+            drop_tag,
+            drop_branch,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index == 2 {
+                loaded = table(
+                    loaded
+                        .metadata()
+                        .clone()
+                        .into_builder(None)
+                        .set_ref(
+                            "main",
+                            SnapshotReference::new(11, SnapshotRetention::branch(None, None, None)),
+                        )
+                        .unwrap()
+                        .build()
+                        .unwrap()
+                        .metadata,
                 );
             }
-            let action = if branch {
-                RefAction::CreateBranch {
-                    name: "release".into(),
-                    snapshot_id: second,
-                    replace: true,
-                    if_not_exists: false,
-                    expected_table_uuid: Some(table.metadata().uuid()),
-                }
-            } else {
-                RefAction::CreateTag {
-                    name: "release".into(),
-                    snapshot_id: second,
-                    replace: true,
-                    if_not_exists: false,
-                    expected_table_uuid: Some(table.metadata().uuid()),
-                }
-            };
-            let prepared = plan(action).prepare(&table).unwrap();
-            let [TableUpdate::SetSnapshotRef { reference, .. }] = prepared.updates.as_slice()
-            else {
-                panic!("one ref update");
-            };
-            assert_eq!(reference.retention, expected);
-            assert_eq!(reference.snapshot_id, second);
-            assert!(
-                prepared
-                    .requirements
-                    .contains(&TableRequirement::UuidMatch {
-                        uuid: table.metadata().uuid()
-                    })
-            );
-            assert!(
-                prepared
-                    .requirements
-                    .contains(&TableRequirement::RefSnapshotIdMatch {
-                        r#ref: "release".into(),
-                        snapshot_id: Some(first)
-                    })
-            );
+            let change = plan(action).prepare(&loaded).unwrap();
+            let uuids = change
+                .requirements
+                .iter()
+                .filter_map(|r| match r {
+                    TableRequirement::UuidMatch { uuid } => Some(*uuid),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(uuids, vec![Uuid::from_u128(7)]);
+            loaded = table(apply(&loaded, change));
         }
-        assert!(
-            fixture.catalog.commits().is_empty(),
-            "pure lowering must not dispatch"
-        );
-    }
-
-    #[test]
-    fn exact_branch_drop_commit_pins_table_incarnation_and_branch_head() {
-        let table_uuid = Uuid::new_v4();
-        let mut commit = build_exact_branch_drop_commit(
-            TableIdent::from_strs(["db", "orders"]).expect("valid table identifier"),
-            &metadata_with_uuid(table_uuid),
-            "__novarocks_mv_refresh",
-            42,
-        )
-        .expect("exact branch drop commit");
-
         assert_eq!(
-            commit.take_requirements(),
-            vec![
-                TableRequirement::UuidMatch { uuid: table_uuid },
-                TableRequirement::RefSnapshotIdMatch {
-                    r#ref: "__novarocks_mv_refresh".to_string(),
-                    snapshot_id: Some(42),
+            loaded
+                .metadata()
+                .refs()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["main"]
+        );
+        assert_eq!(loaded.metadata().current_snapshot_id(), Some(11));
+    }
+    #[tokio::test]
+    async fn ref_create_with_another_incarnation_uuid_is_not_dispatched() {
+        let loaded = table(metadata());
+        let error = plan(RefAction::CreateBranch {
+            name: "dev".into(),
+            snapshot_id: 7,
+            replace: false,
+            if_not_exists: false,
+            expected_table_uuid: Some(Uuid::from_u128(8)),
+        })
+        .prepare(&loaded)
+        .err()
+        .expect("preparation must refuse");
+        assert_eq!(
+            error.kind(),
+            novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest
+        );
+        assert!(error.message().contains("table UUID"));
+        assert!(!loaded.metadata().refs().contains_key("dev"));
+    }
+    #[tokio::test]
+    async fn pure_ref_replacement_preserves_policy_and_exact_cas() {
+        for branch in [true, false] {
+            let retention = if branch {
+                SnapshotRetention::branch(Some(11), Some(12), Some(13))
+            } else {
+                SnapshotRetention::Tag {
+                    max_ref_age_ms: Some(13),
+                }
+            };
+            let loaded = table(
+                metadata()
+                    .into_builder(None)
+                    .set_ref("release", SnapshotReference::new(7, retention.clone()))
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .metadata,
+            );
+            let action = |replace, if_not_exists| {
+                if branch {
+                    RefAction::CreateBranch {
+                        name: "release".into(),
+                        snapshot_id: 11,
+                        replace,
+                        if_not_exists,
+                        expected_table_uuid: Some(Uuid::from_u128(7)),
+                    }
+                } else {
+                    RefAction::CreateTag {
+                        name: "release".into(),
+                        snapshot_id: 11,
+                        replace,
+                        if_not_exists,
+                        expected_table_uuid: Some(Uuid::from_u128(7)),
+                    }
+                }
+            };
+            assert_eq!(
+                plan(action(false, false))
+                    .prepare(&loaded)
+                    .err()
+                    .expect("preparation must refuse")
+                    .kind(),
+                novarocks_spi::connector::ConnectorMutationFailureKind::AlreadyExists
+            );
+            assert!(
+                plan(action(false, true))
+                    .prepare(&loaded)
+                    .unwrap()
+                    .updates
+                    .is_empty()
+            );
+            let change = plan(action(true, false)).prepare(&loaded).unwrap();
+            assert_eq!(
+                change.requirements,
+                vec![
+                    TableRequirement::UuidMatch {
+                        uuid: Uuid::from_u128(7)
+                    },
+                    TableRequirement::RefSnapshotIdMatch {
+                        r#ref: "release".into(),
+                        snapshot_id: Some(7)
+                    }
+                ]
+            );
+            let [
+                TableUpdate::SetSnapshotRef {
+                    ref_name,
+                    reference,
                 },
+            ] = change.updates.as_slice()
+            else {
+                panic!("one ref update")
+            };
+            assert_eq!(ref_name, "release");
+            assert_eq!(reference.snapshot_id, 11);
+            assert_eq!(reference.retention, retention);
+        }
+    }
+    #[tokio::test]
+    async fn exact_branch_drop_commit_pins_table_incarnation_and_branch_head() {
+        let loaded = table(
+            metadata()
+                .into_builder(None)
+                .set_ref(
+                    "owned",
+                    SnapshotReference::new(7, SnapshotRetention::branch(None, None, None)),
+                )
+                .unwrap()
+                .build()
+                .unwrap()
+                .metadata,
+        );
+        let uuid = Uuid::from_u128(7).to_string();
+        let change = RefActionPlan::prepare_exact_drop(&loaded, &uuid, "owned", 7).unwrap();
+        assert_eq!(
+            change.requirements,
+            vec![
+                TableRequirement::UuidMatch {
+                    uuid: Uuid::from_u128(7)
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "owned".into(),
+                    snapshot_id: Some(7)
+                }
             ]
         );
+        assert_eq!(
+            change.updates,
+            vec![TableUpdate::RemoveSnapshotRef {
+                ref_name: "owned".into()
+            }]
+        );
+        for (uuid, name, head) in [
+            (Uuid::from_u128(8).to_string(), "owned", 7),
+            (uuid.clone(), "owned", 11),
+            (uuid, "missing", 7),
+        ] {
+            assert!(RefActionPlan::prepare_exact_drop(&loaded, &uuid, name, head).is_none());
+        }
     }
 }

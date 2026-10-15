@@ -272,6 +272,13 @@ impl NovaRocksCatalog for AdmittedCatalog {
     fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
         self.inner.vendored_client()
     }
+    async fn load_commit_base(
+        &self,
+        table: super::CatalogTableName,
+        file_io: crate::iceberg::io::FileIO,
+    ) -> crate::iceberg::Result<super::CatalogCommitBase> {
+        self.inner.load_commit_base(table, file_io).await
+    }
     fn listing_admission(&self) -> Arc<super::listing_admission::ListingAdmission> {
         self.inner.listing_admission()
     }
@@ -445,4 +452,122 @@ impl NovaRocksCatalog for AdmittedCatalog {
             .new_create_or_replace_table_transaction(_request)
             .await
     }
+}
+
+/// Fixture publication through the real prepared owner and sole journal. The
+/// caller supplies the immutable base and pure change; no SDK mutation is used.
+pub(crate) async fn publish_ref_change(
+    owner: Arc<dyn NovaRocksCatalog>,
+    table: &crate::iceberg::table::Table,
+    change: crate::commit::staging::PreparedChange,
+) -> novarocks_spi::connector::ExternalMutationOutcome<()> {
+    use crate::commit::model::{AttemptToken, OperationToken, RequestShape};
+    use bytes::Bytes;
+    use novarocks_spi::connector::*;
+    let id = ConnectorMutationOperationId::from_bytes(*uuid::Uuid::now_v7().as_bytes());
+    let token = OperationToken::from_mutation(id);
+    let generation = ProviderBindingEpoch::from_bytes([0x66; 16]);
+    owner.bind_publication_generation(generation).unwrap();
+    let context = ConnectorRequestContext::try_new(
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+        ConnectorStopOwner::new().view(),
+        64 * 1024,
+        1024 * 1024,
+    )
+    .unwrap();
+    let frozen = crate::commit::staging::freeze_existing_change(
+        table.identifier().clone(),
+        "main",
+        table.metadata(),
+        table
+            .metadata_location()
+            .expect("fixture authoritative metadata"),
+        RequestShape::RefRetention,
+        AttemptToken::new(token, 0),
+        change,
+        &context,
+    )
+    .unwrap();
+    let evidence = ExternalMutationEvidence::try_new(
+        2,
+        ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("frozen-fixture").unwrap(),
+        },
+        generation,
+        id,
+        "ref_action",
+        Bytes::from_static(b"{}"),
+    )
+    .unwrap();
+    let journal = crate::commit::attempt::observation::PublicationJournal::new(token);
+    journal.record(evidence, (), &frozen).unwrap();
+    let policy = owner.evidence_policy();
+    let entry = journal
+        .publish_once(
+            context,
+            policy,
+            move |descriptor, generation, preparation| async move {
+                owner
+                    .prepare_frozen_for_admission_test(
+                        frozen,
+                        CatalogOperation::CreateBranch,
+                        None,
+                        descriptor,
+                        generation,
+                        preparation,
+                    )
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+    journal.catalog_entry_outcome(entry)
+}
+
+/// Publish a fully frozen fixture through the real owner. Tests supply the
+/// original provider identity; the journal owns the only dispatch verdict.
+pub(crate) async fn publish_frozen(
+    owner: Arc<dyn NovaRocksCatalog>,
+    descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+    generation: novarocks_spi::connector::ProviderBindingEpoch,
+    request: crate::commit::model::FrozenRequest,
+    operation: CatalogOperation,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> super::error::CatalogOutcome<super::transaction::CommitProof> {
+    use novarocks_spi::connector::{ConnectorMutationOperationId, ExternalMutationEvidence};
+    owner.bind_publication_generation(generation).unwrap();
+    let token = request.artifacts().attempt().operation();
+    let evidence = ExternalMutationEvidence::try_new(
+        2,
+        descriptor,
+        generation,
+        ConnectorMutationOperationId::from_bytes(token.to_bytes()),
+        "fixture_publication",
+        bytes::Bytes::from_static(b"{}"),
+    )
+    .unwrap();
+    let journal = crate::commit::attempt::observation::PublicationJournal::new(token);
+    journal.record(evidence, (), &request).unwrap();
+    let policy = owner.evidence_policy();
+    let entry = journal
+        .publish_once(
+            context,
+            policy,
+            move |descriptor, generation, preparation| async move {
+                owner
+                    .prepare_frozen_for_admission_test(
+                        request,
+                        operation,
+                        None,
+                        descriptor,
+                        generation,
+                        preparation,
+                    )
+                    .await
+            },
+        )
+        .await
+        .unwrap();
+    journal.commit_outcome(entry)
 }

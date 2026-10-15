@@ -413,11 +413,30 @@ mod tests {
         assert_eq!(request.ref_snapshot_after("main"), Some(21));
         assert_eq!(request.ref_snapshot_after("other"), Some(99));
         assert_eq!(request.ref_snapshot_after("MAIN"), None);
-        let expected_updates = request.updates().to_vec();
-        let expected_requirements = request.requirements().to_vec();
-        let mut commit = request.into_table_commit();
-        assert_eq!(commit.take_updates(), expected_updates);
-        assert_eq!(commit.take_requirements(), expected_requirements);
+        assert_eq!(
+            request.identifier(),
+            &TableIdent::from_strs(["db", "table"]).unwrap()
+        );
+        assert_eq!(
+            request.updates(),
+            &[
+                set_ref("main", 20),
+                set_ref("other", 99),
+                set_ref("main", 21)
+            ]
+        );
+        assert_eq!(
+            request.requirements(),
+            &[
+                TableRequirement::UuidMatch {
+                    uuid: Uuid::from_u128(1)
+                },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "main".into(),
+                    snapshot_id: Some(10)
+                }
+            ]
+        );
     }
 
     #[test]
@@ -526,10 +545,12 @@ mod tests {
             serde_json::json!([{"type": "assert-create"}])
         );
         assert!(request.has_updates());
-        let expected_updates = request.updates().to_vec();
-        let mut commit = request.into_table_commit();
-        assert_eq!(commit.take_updates(), expected_updates);
-        assert_eq!(commit.take_requirements(), [TableRequirement::NotExist]);
+        assert_eq!(request.requirements(), [TableRequirement::NotExist]);
+        assert!(matches!(request.base(), BaseIdentity::Create { .. }));
+        assert_eq!(
+            request.to_rest_json().unwrap()["updates"],
+            serde_json::to_value(request.updates()).unwrap()
+        );
     }
     #[test]
     fn ref_retention_freezes_exact_ref_updates_and_only_the_maintenance_marker() {

@@ -183,6 +183,7 @@ pub(crate) struct MutationOutcome {
 impl RestEndpoints {
     /// Commit to an existing table, or publish a CTAS staged create
     /// (`assert-create`), as decided by `expect`.
+    #[cfg(test)]
     pub(crate) async fn commit_table(
         &self,
         mut commit: TableCommit,

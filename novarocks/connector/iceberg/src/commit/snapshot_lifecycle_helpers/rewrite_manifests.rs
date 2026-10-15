@@ -42,7 +42,9 @@ use crate::iceberg::spec::{
 };
 use crate::iceberg::{Catalog, TableIdent, TableRequirement, TableUpdate};
 
+#[cfg(test)]
 use crate::commit::commit_with_retry;
+#[cfg(test)]
 use crate::commit::existing_commit::existing_table_commit;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
