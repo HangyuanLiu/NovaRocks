@@ -381,6 +381,7 @@ fn source_for_arguments(
             site: PhysicalCallSite::Expression(context.use_id),
             context,
             effects: token.call_contract().effects().clone(),
+            materialized_writer_input: None,
             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
