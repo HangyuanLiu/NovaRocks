@@ -47,6 +47,8 @@ tracing.workspace = true
 uuid = { workspace = true, features = ["v7", "serde"] }
 
 [dev-dependencies]
+novarocks-connector-iceberg.workspace = true
+novarocks-fs.workspace = true
 arrow.workspace = true
 bytes.workspace = true
 novarocks-connector-starrocks.workspace = true

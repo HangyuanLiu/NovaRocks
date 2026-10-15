@@ -34,7 +34,7 @@ use crate::iceberg::spec::*;
 use crate::iceberg::{
     Error, ErrorKind, NamespaceIdent, Result, TableIdent, TableRequirement, TableUpdate,
 };
-use crate::iceberg_catalog_rest::{
+use crate::rest_protocol::wire::{
     CommitTableRequest, CommitTableResponse, CreateTableRequest, LoadTableResult,
 };
 use arrow::array::Int64Array;
@@ -1387,7 +1387,8 @@ async fn iru13a_java_rest_namespace_table_lifecycle_and_interleaved_reads() {
     let namespace = rest.namespace();
 
     // Upstream reads and NovaRocks requests share one session binding.
-    let upstream = endpoints.upstream().await.unwrap();
+    let upstream =
+        crate::rest_protocol::adapter::RestTransitionalAdapter::new(Arc::clone(endpoints));
     assert!(!upstream.namespace_exists(namespace).await.unwrap());
     rest.create_namespace().await;
     assert!(upstream.namespace_exists(namespace).await.unwrap());

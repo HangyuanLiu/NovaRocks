@@ -130,6 +130,17 @@ impl ConnectorControlRoleBindingFactory for StarRocksControlRoleBindingFactory {
         NormalizedCatalogProperties::try_new(properties).map_err(invalid_definition)
     }
 
+    fn open_catalog(
+        &self,
+        _identity: novarocks_spi::connector::CatalogScopeIdentity,
+    ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
+        Arc::new(self.clone())
+    }
+}
+
+impl novarocks_spi::connector::ProviderCatalogControlFactory
+    for StarRocksControlRoleBindingFactory
+{
     fn materialize(
         &self,
         properties: NormalizedCatalogProperties,
@@ -346,10 +357,18 @@ mod tests {
                 Some("metadata-blue"),
             ))
             .expect("normalize StarRocks properties");
-        let binding = futures::executor::block_on(factory.materialize(
-            normalized.clone(),
-            MaterializationContext::new(Instant::now() + Duration::from_secs(1)),
-        ))
+        let binding = futures::executor::block_on(
+            factory
+                .open_catalog(novarocks_spi::connector::CatalogScopeIdentity::new(
+                    ConnectorProviderId::parse("starrocks").expect("provider"),
+                    ConnectorInstanceId::parse("fixture").expect("instance"),
+                    Default::default(),
+                ))
+                .materialize(
+                    normalized.clone(),
+                    MaterializationContext::new(Instant::now() + Duration::from_secs(1)),
+                ),
+        )
         .expect("materialize local StarRocks control generation");
 
         assert_eq!(binding.properties(), &normalized);
@@ -379,15 +398,31 @@ mod tests {
             ))
             .expect("normalize green catalog");
 
-        let blue = futures::executor::block_on(factory.materialize(
-            blue,
-            MaterializationContext::new(Instant::now() + Duration::from_secs(1)),
-        ))
+        let blue = futures::executor::block_on(
+            factory
+                .open_catalog(novarocks_spi::connector::CatalogScopeIdentity::new(
+                    ConnectorProviderId::parse("starrocks").expect("provider"),
+                    ConnectorInstanceId::parse("fixture").expect("instance"),
+                    Default::default(),
+                ))
+                .materialize(
+                    blue,
+                    MaterializationContext::new(Instant::now() + Duration::from_secs(1)),
+                ),
+        )
         .expect("materialize blue catalog");
-        let green = futures::executor::block_on(factory.materialize(
-            green,
-            MaterializationContext::new(Instant::now() + Duration::from_secs(1)),
-        ))
+        let green = futures::executor::block_on(
+            factory
+                .open_catalog(novarocks_spi::connector::CatalogScopeIdentity::new(
+                    ConnectorProviderId::parse("starrocks").expect("provider"),
+                    ConnectorInstanceId::parse("fixture").expect("instance"),
+                    Default::default(),
+                ))
+                .materialize(
+                    green,
+                    MaterializationContext::new(Instant::now() + Duration::from_secs(1)),
+                ),
+        )
         .expect("materialize green catalog");
 
         assert_eq!(
@@ -431,10 +466,18 @@ mod tests {
                 Some("missing"),
             ))
             .expect("the definition is structurally valid");
-        let error = match futures::executor::block_on(factory.materialize(
-            unknown,
-            MaterializationContext::new(Instant::now() + Duration::from_secs(1)),
-        )) {
+        let error = match futures::executor::block_on(
+            factory
+                .open_catalog(novarocks_spi::connector::CatalogScopeIdentity::new(
+                    ConnectorProviderId::parse("starrocks").expect("provider"),
+                    ConnectorInstanceId::parse("fixture").expect("instance"),
+                    Default::default(),
+                ))
+                .materialize(
+                    unknown,
+                    MaterializationContext::new(Instant::now() + Duration::from_secs(1)),
+                ),
+        ) {
             Ok(_) => panic!("unconfigured local binding must fail closed"),
             Err(error) => error,
         };

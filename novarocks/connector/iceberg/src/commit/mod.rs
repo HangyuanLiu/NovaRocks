@@ -35,6 +35,7 @@ pub mod mv_provenance;
 pub mod mv_publication_fence;
 pub mod mv_refresh_ref;
 pub(crate) mod operation;
+pub(crate) mod publication_descriptor;
 pub(crate) mod overwrite;
 mod overwrite_partitions;
 pub mod position_delete_writer;

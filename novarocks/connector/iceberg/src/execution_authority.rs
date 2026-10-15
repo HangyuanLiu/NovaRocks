@@ -214,7 +214,7 @@ impl ExecutionNodeCredentialsEndpointRefresher {
             .cloned()
             .collect::<HashMap<_, _>>();
         properties.insert(
-            crate::iceberg_catalog_rest::REST_CATALOG_PROP_URI.to_string(),
+            crate::rest_protocol::wire::REST_CATALOG_PROP_URI.to_string(),
             uri,
         );
         Ok(properties)

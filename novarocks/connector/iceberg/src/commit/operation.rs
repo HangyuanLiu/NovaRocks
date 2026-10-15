@@ -149,6 +149,10 @@ impl IcebergCommitOperation {
         })
     }
 
+    pub(crate) fn request_context(&self) -> &ConnectorRequestContext {
+        &self.inner.request
+    }
+
     pub(crate) fn token(&self) -> OperationToken {
         self.inner.token
     }

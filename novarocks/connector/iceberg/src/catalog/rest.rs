@@ -316,18 +316,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         namespace: CatalogNamespaceName,
     ) -> Result<bool, ConnectorError> {
         let ident = super::delegate::namespace_ident(&namespace)?;
-        self.endpoints
-            .upstream()
-            .await
-            .map(|upstream| upstream as &dyn crate::iceberg::Catalog)?
-            .namespace_exists(&ident)
-            .await
-            .map_err(|error| {
-                super::error::map_read_error(&sanitize_upstream_error(
-                    &error,
-                    "namespace existence check",
-                ))
-            })
+        self.endpoints.namespace_exists(&ident).await
     }
 
     /// Request bounded REST pages, checking every response before retention
@@ -466,19 +455,22 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     ) -> Result<IcebergLoadedTable, ConnectorError> {
         let ident = super::delegate::table_ident(&table)?;
         match self.access_delegation {
-            RestAccessDelegationMode::Static => self
-                .endpoints
-                .upstream()
-                .await
-                .map(|upstream| upstream as &dyn crate::iceberg::Catalog)?
-                .load_table(&ident)
-                .await
-                .map(|table| {
-                    IcebergLoadedTable::new(table, IcebergAccessDelegation::static_binding())
-                })
-                .map_err(|error| {
+            RestAccessDelegationMode::Static => {
+                let (frozen, _) = self.endpoints.load_table(&ident, false).await?;
+                let file_io = self.endpoints.static_file_io().ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Internal,
+                        "static REST generation has no FileIO",
+                    )
+                })?;
+                let table = frozen.materialize(file_io).map_err(|error| {
                     super::error::map_read_error(&sanitize_upstream_error(&error, "table load"))
-                }),
+                })?;
+                Ok(IcebergLoadedTable::new(
+                    table,
+                    IcebergAccessDelegation::static_binding(),
+                ))
+            }
             RestAccessDelegationMode::Vended => {
                 let (frozen, delegation) = self.endpoints.load_table(&ident, true).await?;
                 let access_delegation = parse_rest_delegation(delegation)?;
@@ -649,7 +641,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             }
         };
         let table_ident = crate::iceberg::TableIdent::new(ident.clone(), creation.name.clone());
-        let request = crate::iceberg_catalog_rest::CreateTableRequest {
+        let request = crate::rest_protocol::wire::CreateTableRequest {
             name: creation.name,
             location: creation.location,
             schema: creation.schema,
@@ -676,7 +668,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         // failure is an unknown outcome (L19).
         let unknown = |message: &str| super::StagedCreateStart::CommitUnknown(message.to_string());
         let Some(response) = document.and_then(|document| {
-            serde_json::from_slice::<crate::iceberg_catalog_rest::LoadTableResult>(&document).ok()
+            serde_json::from_slice::<crate::rest_protocol::wire::LoadTableResult>(&document).ok()
         }) else {
             return unknown("REST stage-create response could not be decoded");
         };
@@ -849,7 +841,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
 
     async fn new_transaction(&self, request: TransactionRequest) -> CatalogTransactionStart {
         if let Err(reason) =
-            self.admit_operation(&CatalogOperation::Append, &request.target.clone().into())
+            self.admit_operation(&request.operation, &request.target.clone().into())
         {
             return CatalogTransactionStart::Unsupported(reason);
         }
@@ -1214,7 +1206,7 @@ mod tests {
             let (_upstream, endpoints) =
                 crate::catalog_runtime::build_vended_rest_generation_for_test(
                     HashMap::from([(
-                        crate::iceberg_catalog_rest::REST_CATALOG_PROP_URI.to_string(),
+                        crate::rest_protocol::wire::REST_CATALOG_PROP_URI.to_string(),
                         format!("http://{}", self.address),
                     )]),
                     None,

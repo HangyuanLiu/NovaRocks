@@ -20,9 +20,9 @@ Every file in this directory other than this one is byte-identical to that packa
 
 ## Dependency policy
 
-Retain upstream registry dependency versions and lints. The four Iceberg packages
-are patched together at version `0.11.0`; `iceberg-property-macro` is vendored
-without source patches. Do not vendor runtime/network/Arrow crates or add resource
-accounting hooks. This crate carries no source patches: NovaRocks extends the
-REST client only through the public `with_auth_manager` and `with_client` builder
-hooks (ADR-0175).
+Retain upstream registry dependency versions and lints. NovaRocks uses this
+unpatched package only as a connector dev-dependency for independent wire and
+interoperability comparison. It is deliberately absent from the root
+`[patch.crates-io]` and production normal/build dependency closure. The other
+Iceberg packages retain their documented patches. Do not modify this crate's
+source or add runtime/network/Arrow vendoring or resource accounting hooks.

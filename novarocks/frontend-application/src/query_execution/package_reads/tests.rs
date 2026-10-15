@@ -170,10 +170,18 @@ fn paimon_fixture() -> PaimonFixture {
         .normalize_and_validate(properties)
         .expect("Paimon catalog properties");
     let binding = runtime
-        .block_on(factory.materialize(
-            normalized,
-            MaterializationContext::new(Instant::now() + Duration::from_secs(60)),
-        ))
+        .block_on(
+            factory
+                .open_catalog(novarocks_spi::connector::CatalogScopeIdentity::new(
+                    ConnectorProviderId::parse("paimon").expect("provider"),
+                    ConnectorInstanceId::parse(CATALOG).expect("instance"),
+                    uuid::Uuid::now_v7(),
+                ))
+                .materialize(
+                    normalized,
+                    MaterializationContext::new(Instant::now() + Duration::from_secs(60)),
+                ),
+        )
         .expect("Paimon control role binding");
     host.register_role_binding(binding)
         .expect("publish the Paimon generation");
@@ -684,8 +692,11 @@ fn a_paimon_scan_still_freezes_into_the_plan_tree() {
         &StaticPlanCarrier::PlanTree,
     )
     .unwrap_or_else(|error| panic!("{SCAN_SQL}: the plan tree encodes: {error}"));
-    let packaged = encode(fixture.complete(SCAN_SQL, compiled_carrier()), &compiled_carrier())
-        .unwrap_or_else(|error| panic!("{SCAN_SQL}: the compiled carrier encodes: {error}"));
+    let packaged = encode(
+        fixture.complete(SCAN_SQL, compiled_carrier()),
+        &compiled_carrier(),
+    )
+    .unwrap_or_else(|error| panic!("{SCAN_SQL}: the compiled carrier encodes: {error}"));
     assert_eq!(tree.access.iter().count(), 1);
     let ([tree_scan], [packaged_scan]) = (tree.plan_facts.scans(), packaged.plan_facts.scans())
     else {

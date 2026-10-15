@@ -35,7 +35,7 @@ use uuid::Uuid;
 use crate::catalog::view_request::{ValidatedViewReplace, ViewCreate, ViewSchema};
 use crate::iceberg::spec::Schema;
 use crate::iceberg::{NamespaceIdent, TableCommit, TableIdent};
-use crate::iceberg_catalog_rest::{CommitTableRequest, CreateNamespaceRequest, CreateTableRequest};
+use crate::rest_protocol::wire::{CommitTableRequest, CreateNamespaceRequest, CreateTableRequest};
 use crate::rest_protocol::binding::SessionBinding;
 use crate::rest_protocol::endpoints::{RestEndpoints, VENDED_CREDENTIALS};
 use crate::rest_protocol::evidence::{
@@ -650,8 +650,8 @@ mod tests {
             .unwrap()
     }
 
-    fn create_request() -> crate::iceberg_catalog_rest::CreateTableRequest {
-        crate::iceberg_catalog_rest::CreateTableRequest {
+    fn create_request() -> crate::rest_protocol::wire::CreateTableRequest {
+        crate::rest_protocol::wire::CreateTableRequest {
             name: "t".to_string(),
             location: None,
             schema: schema(),
@@ -1230,7 +1230,7 @@ mod scratch_probe {
         );
         println!("evidence: {evidence:?}");
         let decoded =
-            serde_json::from_slice::<crate::iceberg_catalog_rest::LoadTableResult>(&bytes);
+            serde_json::from_slice::<crate::rest_protocol::wire::LoadTableResult>(&bytes);
         println!("decode ok: {}", decoded.is_ok());
     }
 }

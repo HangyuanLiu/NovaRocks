@@ -120,7 +120,8 @@ pub mod iceberg {
     pub use ::iceberg::*;
 }
 
-pub mod iceberg_catalog_rest {
+#[cfg(test)]
+pub(crate) mod iceberg_catalog_rest {
     pub use ::iceberg_catalog_rest::*;
 }
 

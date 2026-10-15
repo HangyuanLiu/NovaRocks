@@ -2321,6 +2321,7 @@ fn execute_application_document_update(
             Err(error) => return Ok(known_uncommitted(invalid(error))),
         };
     let transaction_request = TransactionRequest {
+        operation: crate::catalog::admission::CatalogOperation::UpdateDocuments,
         identity: TransactionIdentity::new(
             "application-document-update",
             request.operation_id.to_bytes(),

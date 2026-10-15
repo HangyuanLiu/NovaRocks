@@ -403,6 +403,7 @@ mod tests {
             .expect("catalog");
         let start = catalog
             .new_transaction(TransactionRequest {
+                operation: crate::catalog::admission::CatalogOperation::Append,
                 identity: TransactionIdentity::new("test", [2u8; 16]),
                 target: CatalogTableName::new("db", "t"),
                 target_ref: Arc::from("main"),

@@ -98,21 +98,52 @@ impl ConnectorControlRoleBindingFactory for IcebergControlRoleBindingFactory {
         NormalizedCatalogProperties::try_new(properties).map_err(invalid_definition)
     }
 
+    fn open_catalog(
+        &self,
+        identity: novarocks_spi::connector::CatalogScopeIdentity,
+    ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
+        Arc::new(IcebergCatalogControlFactory {
+            factory: self.clone(),
+            identity,
+            coordination: Arc::new(
+                crate::catalog::table_coordination::IcebergTableCoordination::default(),
+            ),
+        })
+    }
+}
+
+struct IcebergCatalogControlFactory {
+    factory: IcebergControlRoleBindingFactory,
+    identity: novarocks_spi::connector::CatalogScopeIdentity,
+    coordination: Arc<crate::catalog::table_coordination::IcebergTableCoordination>,
+}
+
+impl novarocks_spi::connector::ProviderCatalogControlFactory for IcebergCatalogControlFactory {
     fn materialize(
         &self,
         properties: NormalizedCatalogProperties,
         context: MaterializationContext,
     ) -> BoxFuture<'static, Result<ConnectorControlRoleBinding, ConnectorMaterializationError>>
     {
-        let resources = self.resources.clone();
+        let resources = self.factory.resources.clone();
+        let coordination = Arc::clone(&self.coordination);
+        let identity = self.identity.clone();
         #[cfg(feature = "mem-1-m07-hms-listing-observe")]
         let probe = self
+            .factory
             .hms_listing_slot
             .as_ref()
             .and_then(|slot| slot.active_probe());
-        let permits = Arc::clone(&self.blocking_materialization_permits);
+        let permits = Arc::clone(&self.factory.blocking_materialization_permits);
         Box::pin(async move {
             context.check_active()?;
+            if properties.as_catalog_properties().provider_id() != identity.provider_id()
+                || properties.handle().catalog_name() != identity.instance_id()
+            {
+                return Err(invalid_definition(
+                    "Iceberg catalog materializer received another logical catalog".to_string(),
+                ));
+            }
             // `JoinHandle` drop cannot stop `spawn_blocking`. Move this permit
             // into the closure so a timed-out attempt continues to occupy one
             // bounded slot until its actual blocking work exits; retries can
@@ -130,6 +161,7 @@ impl ConnectorControlRoleBindingFactory for IcebergControlRoleBindingFactory {
                 let _permit = permit;
                 materialize_control_blocking(
                     resources,
+                    coordination,
                     properties,
                     worker_context,
                     #[cfg(feature = "mem-1-m07-hms-listing-observe")]
@@ -152,6 +184,7 @@ impl ConnectorControlRoleBindingFactory for IcebergControlRoleBindingFactory {
 
 fn materialize_control_blocking(
     resources: IcebergMetadataResources,
+    coordination: Arc<crate::catalog::table_coordination::IcebergTableCoordination>,
     properties: NormalizedCatalogProperties,
     context: MaterializationContext,
     #[cfg(feature = "mem-1-m07-hms-listing-observe")] probe: Option<
@@ -169,25 +202,31 @@ fn materialize_control_blocking(
     let capture = Arc::clone(&captured_read);
     #[cfg(feature = "test-controls")]
     let observation_slot = resources.planning_binding().test_observation().cloned();
-    let factory = IcebergConnectorFactory::new(resources).with_read_control_installer(Arc::new(
-        move |_handle, metadata, splits, encoder, request_factory| {
-            let read =
-                ConnectorControlReadBinding::new(metadata, splits, Some(request_factory), encoder);
-            let mut slot = capture.lock().map_err(|_| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    "Iceberg role binding read capture lock was poisoned",
-                )
-            })?;
-            if slot.replace(read).is_some() {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    "Iceberg control generation installed more than one typed read group",
-                ));
-            }
-            Ok(Arc::new(RoleReadRegistrationLease))
-        },
-    ));
+    let factory = IcebergConnectorFactory::new(resources)
+        .with_table_coordination(coordination)
+        .with_read_control_installer(Arc::new(
+            move |_handle, metadata, splits, encoder, request_factory| {
+                let read = ConnectorControlReadBinding::new(
+                    metadata,
+                    splits,
+                    Some(request_factory),
+                    encoder,
+                );
+                let mut slot = capture.lock().map_err(|_| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Internal,
+                        "Iceberg role binding read capture lock was poisoned",
+                    )
+                })?;
+                if slot.replace(read).is_some() {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::Internal,
+                        "Iceberg control generation installed more than one typed read group",
+                    ));
+                }
+                Ok(Arc::new(RoleReadRegistrationLease))
+            },
+        ));
     let request = ConnectorControlFactoryRequest::try_new(
         factory.provider_id().clone(),
         catalog_properties.handle().catalog_name().clone(),
@@ -603,6 +642,11 @@ mod tests {
             .expect("normalize Iceberg properties");
 
         let binding = factory
+            .open_catalog(novarocks_spi::connector::CatalogScopeIdentity::new(
+                ConnectorProviderId::parse("iceberg").expect("provider"),
+                normalized.handle().catalog_name().clone(),
+                uuid::Uuid::now_v7(),
+            ))
             .materialize(
                 normalized.clone(),
                 MaterializationContext::new(

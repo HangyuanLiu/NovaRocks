@@ -175,6 +175,27 @@ pub enum IcebergWriteFlavor {
 }
 
 impl IcebergWriteFlavor {
+    /// Preserve the admitted operation family through catalog publication.
+    pub(crate) const fn catalog_operation(self) -> crate::catalog::admission::CatalogOperation {
+        use crate::catalog::admission::CatalogOperation;
+        match self {
+            Self::Append => CatalogOperation::Append,
+            Self::Overwrite | Self::PartitionOverwrite => CatalogOperation::Overwrite,
+            Self::RowMutationPositionDelete | Self::RowMutationDeletionVector => {
+                CatalogOperation::RowMutation
+            }
+            Self::EqualityDelete => CatalogOperation::RowDelta,
+            Self::RowMutationCopyOnWrite => CatalogOperation::CopyOnWrite,
+            Self::StagedCreate => CatalogOperation::CreateTable(
+                crate::catalog::CatalogCreateIntent::CreateTableAsSelect,
+            ),
+            Self::ManagedPublication => CatalogOperation::PublishDocuments,
+            Self::DistributedRewrite => CatalogOperation::RewriteDataFiles,
+            Self::DistributedRewritePositionDeletes => CatalogOperation::RewritePositionDeletes,
+            Self::TableMaintenance => CatalogOperation::Truncate,
+        }
+    }
+
     /// The single external commit op this flavor performs.
     ///
     /// The mapping is the one the provider already commits today: a

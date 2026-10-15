@@ -76,6 +76,7 @@ pub type IcebergReadControlInstaller = Arc<
 pub struct IcebergConnectorFactory {
     control_resources: IcebergMetadataResources,
     provider_id: ConnectorProviderId,
+    table_coordination: Arc<crate::catalog::table_coordination::IcebergTableCoordination>,
     read_control_installer: Option<IcebergReadControlInstaller>,
 }
 
@@ -85,8 +86,19 @@ impl IcebergConnectorFactory {
             control_resources,
             provider_id: ConnectorProviderId::parse(PROVIDER_ID)
                 .expect("static Iceberg provider ID is valid"),
+            table_coordination: Arc::new(
+                crate::catalog::table_coordination::IcebergTableCoordination::default(),
+            ),
             read_control_installer: None,
         }
+    }
+
+    pub(crate) fn with_table_coordination(
+        mut self,
+        coordination: Arc<crate::catalog::table_coordination::IcebergTableCoordination>,
+    ) -> Self {
+        self.table_coordination = coordination;
+        self
     }
 
     /// Register the composition root's fallible coordinator read-unit sink.
@@ -192,7 +204,11 @@ impl IcebergConnectorFactory {
         if let Some(control) = control {
             ConnectorOperationControl::check_active(control)?;
         }
-        let runtime = Arc::new(runtime.map_err(unavailable)?);
+        let runtime = Arc::new(
+            runtime
+                .map_err(unavailable)?
+                .with_table_coordination(Arc::clone(&self.table_coordination)),
+        );
         Ok(IcebergUnpublishedControl {
             runtime,
             durable_properties,
@@ -1208,5 +1224,77 @@ mod tests {
             creation.binding().staged_create().is_some(),
             "every Iceberg generation installs the staged-create adapter"
         );
+    }
+    #[test]
+    fn real_generations_share_explicit_coordination_but_keep_independent_catalog_clients() {
+        use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
+        use std::time::{Duration, Instant};
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let access = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let coordination =
+            Arc::new(crate::catalog::table_coordination::IcebergTableCoordination::default());
+        let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
+            access,
+            runtime.handle().clone(),
+        ))
+        .with_table_coordination(Arc::clone(&coordination));
+        let properties = vec![(
+            "iceberg.catalog.warehouse".to_string(),
+            warehouse.path().display().to_string(),
+        )];
+        let (first_creation, first) = factory
+            .create_control_with_runtime(factory_request(&factory, "ice", properties.clone()))
+            .unwrap();
+        let (second_creation, second) = factory
+            .create_control_with_runtime(factory_request(&factory, "ice", properties))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            first.table_coordination(),
+            second.table_coordination()
+        ));
+        assert!(!Arc::ptr_eq(
+            first.novarocks_catalog(),
+            second.novarocks_catalog()
+        ));
+        let first_client = first.novarocks_catalog().vendored_client();
+        let second_client = second.novarocks_catalog().vendored_client();
+        assert!(!Arc::ptr_eq(&first_client, &second_client));
+        let stop = ConnectorStopOwner::new();
+        let request = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(5),
+            stop.view(),
+            1024,
+            1024,
+        )
+        .unwrap();
+        let table = uuid::Uuid::now_v7();
+        runtime.block_on(async {
+            let holder = first
+                .table_coordination()
+                .acquire(table, &request)
+                .await
+                .unwrap();
+            let waiting = second.table_coordination().acquire(table, &request);
+            tokio::pin!(waiting);
+            assert!(futures::poll!(&mut waiting).is_pending());
+            let other = second
+                .table_coordination()
+                .acquire(uuid::Uuid::now_v7(), &request)
+                .await
+                .unwrap();
+            drop(other);
+            drop(first_creation);
+            drop(first);
+            drop(holder);
+            let granted = waiting.await.expect("G2 follows G1's completed holder");
+            drop(granted);
+        });
+        drop(second_creation);
     }
 }

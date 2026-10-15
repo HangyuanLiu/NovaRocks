@@ -571,7 +571,7 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
 
     async fn new_transaction(&self, request: TransactionRequest) -> CatalogTransactionStart {
         if let Err(reason) =
-            self.admit_operation(&CatalogOperation::Append, &request.target.clone().into())
+            self.admit_operation(&request.operation, &request.target.clone().into())
         {
             return CatalogTransactionStart::Unsupported(reason);
         }

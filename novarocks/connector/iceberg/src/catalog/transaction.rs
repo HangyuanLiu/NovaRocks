@@ -243,6 +243,7 @@ enum TransactionState {
 /// Inputs for a transaction against an existing table.
 #[derive(Clone, Debug)]
 pub(crate) struct TransactionRequest {
+    pub(crate) operation: super::admission::CatalogOperation,
     pub(crate) identity: TransactionIdentity,
     pub(crate) target: CatalogTableName,
     pub(crate) target_ref: Arc<str>,

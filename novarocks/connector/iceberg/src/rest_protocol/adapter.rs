@@ -18,8 +18,8 @@
 //! The transitional `iceberg::Catalog` the direct paths reach through
 //! `vendored_client()` until IRU-6a moves them onto the owner (L13).
 //!
-//! Reads follow the request split (L27): upstream through the generation's
-//! establishment gate and boundary, or NovaRocks requests. Every mutation is a
+//! All reads and mutations use the generation's provider-owned endpoints and
+//! single establishment gate. Every mutation is a
 //! NovaRocks request with D13 evidence, and its failure has exactly two error
 //! shapes: a received 409 keeps its dedicated kind, and anything else is an
 //! explicitly built `Unexpected`. Both carry the typed evidence as their
@@ -40,8 +40,8 @@ use crate::iceberg::{
     Catalog, Error, ErrorKind, Namespace, NamespaceIdent, Result, TableCommit, TableCreation,
     TableIdent, TableRequirement, TableUpdate,
 };
-use crate::iceberg_catalog_rest::{CommitTableResponse, CreateTableRequest, LoadTableResult};
-use crate::rest_protocol::boundary::sanitize_upstream_error;
+use crate::rest_protocol::wire::{CommitTableResponse, CreateTableRequest, LoadTableResult};
+
 use crate::rest_protocol::deferred::FrozenLoadTable;
 use crate::rest_protocol::endpoints::RestEndpoints;
 use crate::rest_protocol::evidence::{
@@ -113,14 +113,6 @@ impl fmt::Debug for RestTransitionalAdapter {
 impl RestTransitionalAdapter {
     pub(crate) fn new(endpoints: Arc<RestEndpoints>) -> Self {
         Self { endpoints }
-    }
-
-    async fn upstream(&self) -> Result<&dyn Catalog> {
-        self.endpoints
-            .upstream()
-            .await
-            .map(|upstream| upstream as &dyn Catalog)
-            .map_err(|error| Error::new(ErrorKind::Unexpected, error.message().to_string()))
     }
 
     /// Materialize a successful table response the way upstream did: with
@@ -242,6 +234,14 @@ fn not_dispatched(kind: ConnectorMutationFailureKind, cause: NotDispatchedCause)
     evidence_error(evidence, Conflict409::None, &text)
 }
 
+fn read_error(error: novarocks_spi::connector::ConnectorError) -> Error {
+    let kind = match error.kind() {
+        novarocks_spi::connector::ConnectorErrorKind::NotFound => ErrorKind::TableNotFound,
+        _ => ErrorKind::Unexpected,
+    };
+    Error::new(kind, error.message().to_string())
+}
+
 fn unsupported(operation: &str) -> Error {
     Error::new(
         ErrorKind::FeatureUnsupported,
@@ -255,11 +255,14 @@ impl Catalog for RestTransitionalAdapter {
         &self,
         parent: Option<&NamespaceIdent>,
     ) -> Result<Vec<NamespaceIdent>> {
-        self.upstream()
-            .await?
-            .list_namespaces(parent)
+        if parent.is_some() {
+            return Err(unsupported("nested namespace listing"));
+        }
+        self.endpoints
+            .list_namespaces_page(None, 1000)
             .await
-            .map_err(|error| sanitize_upstream_error(&error, "namespace listing"))
+            .map(|page| page.namespaces)
+            .map_err(read_error)
     }
 
     async fn create_namespace(
@@ -278,19 +281,17 @@ impl Catalog for RestTransitionalAdapter {
     }
 
     async fn get_namespace(&self, namespace: &NamespaceIdent) -> Result<Namespace> {
-        self.upstream()
-            .await?
-            .get_namespace(namespace)
+        self.endpoints
+            .load_namespace(namespace)
             .await
-            .map_err(|error| sanitize_upstream_error(&error, "namespace load"))
+            .map_err(read_error)
     }
 
     async fn namespace_exists(&self, namespace: &NamespaceIdent) -> Result<bool> {
-        self.upstream()
-            .await?
+        self.endpoints
             .namespace_exists(namespace)
             .await
-            .map_err(|error| sanitize_upstream_error(&error, "namespace existence check"))
+            .map_err(read_error)
     }
 
     async fn update_namespace(
@@ -310,11 +311,11 @@ impl Catalog for RestTransitionalAdapter {
     }
 
     async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
-        self.upstream()
-            .await?
-            .list_tables(namespace)
+        self.endpoints
+            .list_tables_page(namespace, None, 1000)
             .await
-            .map_err(|error| sanitize_upstream_error(&error, "table listing"))
+            .map(|page| page.identifiers)
+            .map_err(read_error)
     }
 
     async fn create_table(
@@ -346,11 +347,18 @@ impl Catalog for RestTransitionalAdapter {
     }
 
     async fn load_table(&self, table: &TableIdent) -> Result<Table> {
-        self.upstream()
-            .await?
-            .load_table(table)
+        let (frozen, _) = self
+            .endpoints
+            .load_table(table, false)
             .await
-            .map_err(|error| sanitize_upstream_error(&error, "table load"))
+            .map_err(read_error)?;
+        let file_io = self.endpoints.static_file_io().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "vended REST table requires delegated materialization",
+            )
+        })?;
+        frozen.materialize(file_io)
     }
 
     async fn drop_table(&self, table: &TableIdent) -> Result<()> {

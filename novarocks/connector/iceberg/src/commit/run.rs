@@ -123,6 +123,7 @@ pub(crate) async fn append_snapshot_for_test(
     let request = engine.freeze(&[])?;
     let publisher = OwnerPublisher {
         target: TransitionalPublisher {
+            catalog_operation: crate::catalog::admission::CatalogOperation::Append,
             catalog: std::sync::Arc::clone(runtime.novarocks_catalog()),
             ident: table.identifier().clone(),
             target_ref,

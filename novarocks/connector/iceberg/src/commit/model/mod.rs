@@ -42,8 +42,10 @@ pub use outcome::{
     RemainingArtifact,
 };
 pub use request::{
-    BaseIdentity, FrozenRequest, FrozenRequestParts, RequestShape, StagedCreateIdentity,
+    BaseIdentity, FrozenBaseFacts, FrozenRequest, FrozenRequestParts, RequestShape, StagedCreateIdentity,
 };
+
+pub(crate) use request::validate_ref_retention_update;
 
 fn invalid(message: impl Into<String>) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, message)

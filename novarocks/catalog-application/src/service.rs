@@ -118,11 +118,16 @@ struct ProjectionAttempt {
     >,
 }
 
+struct CatalogMaterializer {
+    identity: novarocks_spi::connector::CatalogScopeIdentity,
+    factory: Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory>,
+}
+
 struct MaterializationSubmission {
     entry: CatalogDesiredStateEntry,
     provider_id: ConnectorProviderId,
     properties: NormalizedCatalogProperties,
-    factory: Arc<dyn novarocks_spi::connector::ConnectorControlRoleBindingFactory>,
+    factory: Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory>,
     key: CatalogHandle,
     token: u64,
     context: MaterializationContext,
@@ -199,6 +204,8 @@ pub struct CatalogApplicationService {
     runtime_publisher: Arc<dyn CatalogRuntimePublisherSink>,
     runtime: Handle,
     projections: Mutex<BTreeMap<ConnectorInstanceId, LocalProjection>>,
+    /// Desired-entry lifetime, independent of current/retiring generations.
+    catalog_materializers: Mutex<BTreeMap<ConnectorInstanceId, CatalogMaterializer>>,
     complete_reachable_catalogs: Mutex<Option<BTreeSet<CatalogHandle>>>,
     next_generation: AtomicU64,
     scheduler: ProjectionScheduler,
@@ -218,6 +225,7 @@ impl CatalogApplicationService {
             runtime_publisher,
             runtime,
             projections: Mutex::new(BTreeMap::new()),
+            catalog_materializers: Mutex::new(BTreeMap::new()),
             complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
             scheduler: ProjectionScheduler::new(CatalogMaterializationConfig::default()),
@@ -256,6 +264,7 @@ impl CatalogApplicationService {
             runtime_publisher,
             runtime,
             projections: Mutex::new(BTreeMap::new()),
+            catalog_materializers: Mutex::new(BTreeMap::new()),
             complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
             scheduler: ProjectionScheduler::new(materialization_config),
@@ -694,11 +703,16 @@ impl CatalogApplicationService {
                     error.to_string(),
                 )
             })?;
+        let identity = novarocks_spi::connector::CatalogScopeIdentity::new(
+            provider_id.clone(),
+            instance_id.clone(),
+            attachment_id,
+        );
         let key = properties.handle().clone();
         let context =
             MaterializationContext::new(Instant::now() + self.scheduler.config.attempt_timeout);
         let token = self.scheduler.next_token.fetch_add(1, Ordering::Relaxed);
-        {
+        let factory = {
             let mut attempts = self.scheduler.attempts.lock().map_err(|_| {
                 CatalogApplicationError::new(
                     CatalogApplicationErrorKind::Internal,
@@ -728,7 +742,7 @@ impl CatalogApplicationService {
                                 if *installed_id == attachment_id
                         )
                     })
-                && self.control.observe_current_binding(&instance_id).is_ok()
+                && self.control.has_current_definition(&key).unwrap_or(false)
             {
                 return Ok((true, None));
             }
@@ -759,7 +773,26 @@ impl CatalogApplicationService {
                     completion_waiters: completion.into_iter().collect(),
                 },
             );
-        }
+            let mut owners = self.catalog_materializers.lock().map_err(|_| {
+                CatalogApplicationError::new(
+                    CatalogApplicationErrorKind::Internal,
+                    "catalog materialization owner lock is poisoned",
+                )
+            })?;
+            let owner = owners
+                .entry(instance_id.clone())
+                .or_insert_with(|| CatalogMaterializer {
+                    identity: identity.clone(),
+                    factory: factory.open_catalog(identity.clone()),
+                });
+            if owner.identity != identity {
+                *owner = CatalogMaterializer {
+                    identity: identity.clone(),
+                    factory: factory.open_catalog(identity),
+                };
+            }
+            Arc::clone(&owner.factory)
+        };
         self.mark_unavailable(
             &instance_id,
             attachment_id,
@@ -964,7 +997,14 @@ impl CatalogApplicationService {
                 })
             })
             .unwrap_or(false)
-            && self.control.observe_current_binding(&instance_id).is_ok();
+            && entry
+                .catalog_properties(mode)
+                .ok()
+                .is_some_and(|properties| {
+                    self.control
+                        .has_current_definition(properties.handle())
+                        .unwrap_or(false)
+                });
         if installed {
             return;
         }
@@ -1061,6 +1101,9 @@ impl CatalogApplicationService {
 
     fn retire_projection(&self, instance_id: &ConnectorInstanceId) {
         if let Ok(mut attempts) = self.scheduler.attempts.lock() {
+            if let Ok(mut owners) = self.catalog_materializers.lock() {
+                owners.remove(instance_id);
+            }
             attempts.retain(|_, attempt| {
                 if &attempt.instance_id == instance_id {
                     attempt.context.cancel();
@@ -1533,6 +1576,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct FailingRoleFactory {
         disposition: ConnectorMaterializationRetryDisposition,
         calls: Arc<AtomicUsize>,
@@ -1560,6 +1604,15 @@ mod tests {
             })
         }
 
+        fn open_catalog(
+            &self,
+            _identity: novarocks_spi::connector::CatalogScopeIdentity,
+        ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
+            Arc::new(self.clone())
+        }
+    }
+
+    impl novarocks_spi::connector::ProviderCatalogControlFactory for FailingRoleFactory {
         fn materialize(
             &self,
             _properties: NormalizedCatalogProperties,
@@ -1669,6 +1722,7 @@ mod tests {
     }
 
     /// Counts materializations and hands back a live control binding.
+    #[derive(Clone)]
     struct CountingRoleFactory {
         calls: Arc<AtomicUsize>,
     }
@@ -1695,6 +1749,15 @@ mod tests {
             })
         }
 
+        fn open_catalog(
+            &self,
+            _identity: novarocks_spi::connector::CatalogScopeIdentity,
+        ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
+            Arc::new(self.clone())
+        }
+    }
+
+    impl novarocks_spi::connector::ProviderCatalogControlFactory for CountingRoleFactory {
         fn materialize(
             &self,
             properties: NormalizedCatalogProperties,
@@ -2014,5 +2077,138 @@ mod tests {
                 .expect("local catalog definition");
         assert!(bindings.is_empty());
         assert_eq!(properties, vec![("type".to_string(), "local".to_string())]);
+    }
+    // Lifecycle integration uses the production Iceberg role factory and real
+    // generation leases. Local Hadoop construction performs no remote I/O;
+    // test-owned runtimes and warehouses are released after every lease exits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_owner_spans_real_iceberg_generations_and_freshness_outage() {
+        use novarocks_connector_iceberg::IcebergControlRoleBindingFactory;
+        use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
+        use novarocks_connector_iceberg::resources::IcebergMetadataResources;
+        use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let runtime = tokio::runtime::Handle::current();
+        let access = IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.clone())),
+        );
+        let factory = Arc::new(IcebergControlRoleBindingFactory::new(
+            IcebergMetadataResources::new(access, runtime.clone()),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        ));
+        let control = Arc::new(ConnectorControlHost::with_role_factories(vec![factory]).unwrap());
+        let port = Arc::new(CatalogApplicationService::unavailable(
+            Arc::clone(&control),
+            Arc::new(TestRuntimePublisher),
+            runtime,
+            Arc::new(TestReferenceReader),
+        ));
+        let instance = ConnectorInstanceId::parse("catalog.lifecycle").unwrap();
+        let identity = Uuid::now_v7();
+        let entry = |identity, credential_generation| {
+            CatalogDesiredStateEntry::new(
+                crate::CatalogSourceEntryIdentity::new(identity),
+                crate::CatalogLogicalConfig::try_new(
+                    instance.clone(),
+                    ConnectorProviderId::parse("iceberg").unwrap(),
+                    "Lifecycle",
+                    vec![(
+                        "iceberg.catalog.warehouse".to_string(),
+                        warehouse.path().display().to_string(),
+                    )],
+                    vec![
+                        CatalogCredentialBinding::try_new(
+                            CatalogCredentialPurpose::CatalogControl,
+                            CredentialConsumerRole::Frontend,
+                            CatalogCredentialMode::Static(
+                                StaticCredentialReference::try_new(
+                                    "control",
+                                    credential_generation,
+                                )
+                                .unwrap(),
+                            ),
+                        )
+                        .unwrap(),
+                    ],
+                    1,
+                )
+                .unwrap(),
+            )
+        };
+        let first_entry = entry(identity, "v1");
+        let mode = CatalogDesiredStateSourceMode::DynamicStateStore;
+        let (_, first_work) = port
+            .submit_materialization(first_entry.clone(), mode, None)
+            .unwrap();
+        let first_work = first_work.expect("G1 submission");
+        let scoped_owner = Arc::clone(&first_work.factory);
+        port.run_materialization(first_work).await;
+        let first = control.acquire_current(&instance).expect("real G1 lease");
+        let first_runtime = first.binding().control_runtime_id();
+        let first_properties = first.binding().catalog_properties().unwrap().clone();
+        assert_eq!(
+            first_properties.credential_bindings(),
+            first_entry.config().credential_bindings()
+        );
+
+        // A temporary loss of freshness retires G1, but does not retire the
+        // logical domain that G1's already-admitted operation still needs.
+        port.unpublish_all();
+        assert!(control.acquire_current(&instance).is_err());
+        let (_, second_work) = port
+            .submit_materialization(entry(identity, "v2"), mode, None)
+            .unwrap();
+        let second_work = second_work.expect("G2 submission");
+        assert!(Arc::ptr_eq(&scoped_owner, &second_work.factory));
+        assert_ne!(
+            first_properties,
+            *second_work.properties.as_catalog_properties()
+        );
+        port.run_materialization(second_work).await;
+        let second = control.acquire_current(&instance).expect("real G2 lease");
+        assert_ne!(first_runtime, second.binding().control_runtime_id());
+        assert_eq!(
+            first.binding().catalog_properties().unwrap(),
+            &first_properties
+        );
+        assert_ne!(
+            first
+                .binding()
+                .catalog_properties()
+                .unwrap()
+                .credential_bindings(),
+            second
+                .binding()
+                .catalog_properties()
+                .unwrap()
+                .credential_bindings()
+        );
+
+        // Configuration/credential replacement alone also changes the runtime
+        // while retaining the same catalog scope, without requiring an outage.
+        let (_, third_work) = port
+            .submit_materialization(entry(identity, "v3"), mode, None)
+            .unwrap();
+        let third_work = third_work.expect("changed definition requires G3");
+        assert!(Arc::ptr_eq(&scoped_owner, &third_work.factory));
+        port.run_materialization(third_work).await;
+        assert_eq!(first.binding().control_runtime_id(), first_runtime);
+
+        // A genuinely new attachment separates domains even with the same
+        // name and a still-live exact lease from the old attachment.
+        let (_, replacement) = port
+            .submit_materialization(entry(Uuid::now_v7(), "v3"), mode, None)
+            .unwrap();
+        let replacement = replacement.expect("new attachment");
+        assert!(!Arc::ptr_eq(&scoped_owner, &replacement.factory));
+        port.run_materialization(replacement).await;
+        drop(first);
+        drop(second);
+        port.retire_projection(&instance);
+        assert!(port.catalog_materializers.lock().unwrap().is_empty());
     }
 }

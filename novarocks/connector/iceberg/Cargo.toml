@@ -38,7 +38,6 @@ novarocks-failpoint = { workspace = true, optional = true }
 anyhow.workspace = true
 base64.workspace = true
 iceberg = "0.11.0"
-iceberg-catalog-rest = "0.11.0"
 iceberg-catalog-hms = "0.11.0"
 opendal = { workspace = true, features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native", "services-memory"] }
 arrow = { workspace = true, features = ["prettyprint", "ipc", "ipc_compression"] }
@@ -72,6 +71,7 @@ novarocks-types.workspace = true
 novarocks-type-contract.workspace = true
 
 [dev-dependencies]
+iceberg-catalog-rest = { path = "../../../vendor/iceberg-catalog-rest-0.11.0" }
 faststr = "0.2"
 hive_metastore = "0.2"
 tempfile.workspace = true

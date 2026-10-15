@@ -37,9 +37,6 @@ use serde::de::DeserializeOwned;
 use crate::iceberg::io::StorageFactory;
 use crate::iceberg::spec::ViewMetadata;
 use crate::iceberg::{NamespaceIdent, Runtime, TableIdent};
-use crate::iceberg_catalog_rest::{
-    ListNamespaceResponse, ListTablesResponse, LoadTableResult, RestCatalog,
-};
 use crate::rest_protocol::attempt::{AttemptFailure, SessionGate, ensure_session};
 use crate::rest_protocol::auth::RestAuthOwner;
 use crate::rest_protocol::binding::SessionBinding;
@@ -48,6 +45,9 @@ use crate::rest_protocol::evidence::DispatchStage;
 use crate::rest_protocol::http::{RequestContext, ResponseBody, RestRequest};
 use crate::rest_protocol::json::{JsonScanner, ViewSink};
 use crate::rest_protocol::minimal_view::{BackendAcquisitionSink, CredentialsSink};
+use crate::rest_protocol::wire::{
+    ListNamespaceResponse, ListTablesResponse, LoadTableResult, NamespaceResponse,
+};
 
 /// The value the client sends to ask for vended storage credentials.
 pub(crate) const VENDED_CREDENTIALS: HeaderValue = HeaderValue::from_static("vended-credentials");
@@ -64,9 +64,9 @@ struct LoadViewResult {
 
 /// One catalog generation's REST session authority and read endpoints.
 pub(crate) struct RestEndpoints {
-    upstream: Arc<RestCatalog>,
+    properties: Arc<std::collections::HashMap<String, String>>,
     owner: Arc<RestAuthOwner>,
-    gate: SessionGate,
+    gate: Arc<SessionGate>,
     runtime: Runtime,
     /// The static generation's storage factory; `None` in the vended mode,
     /// which never materializes with a catalog-global FileIO.
@@ -89,6 +89,17 @@ impl fmt::Debug for RestEndpoints {
     }
 }
 
+/// Typed conditional result; callers own the representation binding and may
+/// reuse only the exact complete metadata validated by this ETag.
+pub(crate) enum ConditionalTableLoad {
+    Complete {
+        table: FrozenLoadTable,
+        delegation: RestDelegation,
+        etag: Option<HeaderValue>,
+    },
+    NotModified,
+}
+
 /// Where a NovaRocks read ended.
 enum Answer {
     /// A success status with its unread body.
@@ -99,7 +110,7 @@ enum Answer {
 
 impl RestEndpoints {
     pub(crate) fn new(
-        upstream: Arc<RestCatalog>,
+        properties: Arc<std::collections::HashMap<String, String>>,
         owner: Arc<RestAuthOwner>,
         runtime: Runtime,
         storage_factory: Option<Arc<dyn StorageFactory>>,
@@ -107,14 +118,36 @@ impl RestEndpoints {
         vending_declared: bool,
     ) -> Self {
         Self {
-            upstream,
+            properties,
             owner,
-            gate: SessionGate::default(),
+            gate: Arc::new(SessionGate::default()),
             runtime,
             storage_factory,
             declared_routing_headers,
             vending_declared,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_gate(
+        properties: Arc<std::collections::HashMap<String, String>>,
+        owner: Arc<RestAuthOwner>,
+        runtime: Runtime,
+        storage_factory: Option<Arc<dyn StorageFactory>>,
+        declared_routing_headers: BTreeSet<String>,
+        vending_declared: bool,
+        gate: Arc<SessionGate>,
+    ) -> Self {
+        let mut endpoints = Self::new(
+            properties,
+            owner,
+            runtime,
+            storage_factory,
+            declared_routing_headers,
+            vending_declared,
+        );
+        endpoints.gate = gate;
+        endpoints
     }
 
     /// The binding of an already established session, without establishing
@@ -150,7 +183,7 @@ impl RestEndpoints {
     /// The establishment attempt's own result, for callers that classify a
     /// failed step (mutations: `NotWritten(Binding(step))`).
     pub(crate) async fn session(&self) -> Result<Arc<SessionBinding>, AttemptFailure> {
-        ensure_session(&self.owner, &self.gate, &self.upstream).await
+        ensure_session(&self.owner, &self.gate, &self.properties).await
     }
 
     /// The generation's session binding, establishing the session when needed
@@ -165,13 +198,6 @@ impl RestEndpoints {
                 ),
             )
         })
-    }
-
-    /// The upstream client, only after the session has been established
-    /// through this generation's gate, so upstream never initializes itself.
-    pub(crate) async fn upstream(&self) -> Result<&RestCatalog, ConnectorError> {
-        self.binding().await?;
-        Ok(&self.upstream)
     }
 
     pub(crate) fn owner(&self) -> &Arc<RestAuthOwner> {
@@ -244,34 +270,126 @@ impl RestEndpoints {
         }
     }
 
-    /// Load and freeze one table response. `delegated` sends the access
-    /// delegation header (L23): the vended load and every baseline re-read.
+    /// Complete metadata or a conditionally validated representation. A 304
+    /// never decodes a body or contributes storage credentials.
+    pub(crate) async fn load_table_conditional(
+        &self,
+        table: &TableIdent,
+        delegated: bool,
+        etag: Option<&HeaderValue>,
+    ) -> Result<ConditionalTableLoad, ConnectorError> {
+        const OPERATION: &str = "load table";
+        let binding = self.binding().await?;
+        let mut headers = binding.request_headers(delegated.then_some(VENDED_CREDENTIALS));
+        if let Some(etag) = etag {
+            headers.insert(reqwest::header::IF_NONE_MATCH, etag.clone());
+        }
+        self.owner
+            .authorize(&mut headers)
+            .await
+            .map_err(|_| unavailable("Iceberg REST load table failed: no catalog token".into()))?;
+        let (stage, body) = self
+            .owner
+            .http()
+            .send_once(
+                Ok(RestRequest::new(
+                    Method::GET,
+                    binding.table_url(table),
+                    headers,
+                )),
+                &[200, 304],
+                &RequestContext::for_read(),
+            )
+            .await;
+        match (stage, body) {
+            (DispatchStage::Status { code: 200, .. }, Some(body)) => {
+                let etag = body.header(reqwest::header::ETAG).cloned();
+                let response: LoadTableResult = decode_document(OPERATION, body).await?;
+                let (table, delegation) =
+                    FrozenLoadTable::from_response(table.clone(), response, self.runtime.clone());
+                Ok(ConditionalTableLoad::Complete {
+                    table,
+                    delegation,
+                    etag,
+                })
+            }
+            (DispatchStage::Status { code: 304, .. }, _) if etag.is_some() => {
+                Ok(ConditionalTableLoad::NotModified)
+            }
+            (DispatchStage::Status { code: 304, .. }, _) => Err(unavailable(
+                "Iceberg REST load table returned 304 without a conditional request".into(),
+            )),
+            (DispatchStage::Status { code: 404, .. }, _) => Err(not_found(OPERATION)),
+            (DispatchStage::Status { code, .. }, _) => Err(status_error(OPERATION, code)),
+            _ => Err(unavailable(
+                "Iceberg REST load table failed without a complete response".into(),
+            )),
+        }
+    }
+
     pub(crate) async fn load_table(
         &self,
         table: &TableIdent,
         delegated: bool,
     ) -> Result<(FrozenLoadTable, RestDelegation), ConnectorError> {
-        const OPERATION: &str = "load table";
+        match self.load_table_conditional(table, delegated, None).await? {
+            ConditionalTableLoad::Complete {
+                table, delegation, ..
+            } => Ok((table, delegation)),
+            ConditionalTableLoad::NotModified => unreachable!("unconditional load rejects 304"),
+        }
+    }
+
+    /// Namespace existence is a catalog fact and never requests storage authority.
+    pub(crate) async fn namespace_exists(
+        &self,
+        namespace: &NamespaceIdent,
+    ) -> Result<bool, ConnectorError> {
+        const OPERATION: &str = "check namespace existence";
         let binding = self.binding().await?;
-        let delegation = delegated.then_some(VENDED_CREDENTIALS);
+        if !binding.namespace_head_advertised() {
+            return match self.load_namespace(namespace).await {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == ConnectorErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
+        match self
+            .send(
+                OPERATION,
+                &binding,
+                Method::HEAD,
+                binding.namespace_url(namespace),
+                None,
+                &[200, 204],
+            )
+            .await?
+        {
+            Answer::Success { .. } => Ok(true),
+            Answer::Status(404) => Ok(false),
+            Answer::Status(code) => Err(status_error(OPERATION, code)),
+        }
+    }
+
+    pub(crate) async fn load_namespace(
+        &self,
+        namespace: &NamespaceIdent,
+    ) -> Result<crate::iceberg::Namespace, ConnectorError> {
+        const OPERATION: &str = "load namespace";
+        let binding = self.binding().await?;
         match self
             .get(
                 OPERATION,
                 &binding,
-                binding.table_url(table),
-                delegation,
-                &[200, 304],
+                binding.namespace_url(namespace),
+                None,
+                &[200],
             )
             .await?
         {
-            Answer::Success { body, .. } => {
-                let response: LoadTableResult = decode_document(OPERATION, body).await?;
-                Ok(FrozenLoadTable::from_response(
-                    table.clone(),
-                    response,
-                    self.runtime.clone(),
-                ))
-            }
+            Answer::Success { body, .. } => decode_document::<NamespaceResponse>(OPERATION, body)
+                .await
+                .map(Into::into),
             Answer::Status(404) => Err(not_found(OPERATION)),
             Answer::Status(code) => Err(status_error(OPERATION, code)),
         }
@@ -442,7 +560,7 @@ impl RestEndpoints {
             .send_once(
                 Ok(RestRequest::new(method, url, headers)),
                 success,
-                &RequestContext::default(),
+                &RequestContext::for_read(),
             )
             .await;
         match (stage, body) {
@@ -503,7 +621,7 @@ pub(crate) async fn acquire_routed(
                 headers,
             )),
             &[200],
-            &RequestContext::default(),
+            &RequestContext::for_read(),
         )
         .await;
     let body = match (stage, body) {
@@ -630,7 +748,7 @@ fn retryable(error: ConnectorError) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     //! NovaRocks read endpoints against a scripted server, through the real
-    //! upstream session: request split (L27), one session per generation (L2,
+    //! provider-owned session: request split (L27), one session per generation (L2,
     //! L28), the delegation header per call site (L23) and read error classes
     //! (L17). Each test owns its loopback server; Drop joins it.
     use std::collections::HashMap;
@@ -638,9 +756,9 @@ mod tests {
 
     use novarocks_spi::connector::ConnectorErrorKind;
 
-    use super::RestEndpoints;
+    use super::{ConditionalTableLoad, RestEndpoints};
     use crate::iceberg::{NamespaceIdent, TableIdent};
-    use crate::iceberg_catalog_rest::RestCatalog;
+    use crate::rest_protocol::adapter::RestTransitionalAdapter as RestCatalog;
     use crate::rest_protocol::test_server::{
         RecordedRequest, Reply, Script, TestServer, oauth2_identity,
     };
@@ -1024,7 +1142,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn one_session_serves_upstream_and_novarocks_requests_after_config_changes() {
+    async fn one_session_serves_namespace_and_table_reads_after_config_changes() {
         let server = TestServer::start(
             Script::new()
                 .on_sequence(
@@ -1053,13 +1171,8 @@ mod tests {
         let (_upstream, endpoints) = generation(&server, &[], None).await;
         let db = NamespaceIdent::new("db".to_string());
 
-        // Cold session: an upstream read and a NovaRocks read race.
-        let upstream_read = async {
-            let upstream = endpoints.upstream().await.expect("session");
-            crate::iceberg::Catalog::namespace_exists(upstream, &db)
-                .await
-                .expect("namespace")
-        };
+        // Cold session: namespace and table reads race through the same gate.
+        let upstream_read = async { endpoints.namespace_exists(&db).await.expect("namespace") };
         let probe_table = table("t");
         let (namespace, exists) = tokio::join!(upstream_read, endpoints.table_exists(&probe_table));
         assert!(namespace);
@@ -1069,12 +1182,7 @@ mod tests {
             .list_tables_page(&db, None, 5)
             .await
             .expect("tables");
-        let upstream = endpoints.upstream().await.expect("session");
-        assert!(
-            crate::iceberg::Catalog::namespace_exists(upstream, &db)
-                .await
-                .expect("namespace")
-        );
+        assert!(endpoints.namespace_exists(&db).await.expect("namespace"));
 
         assert_eq!(server.count("GET", "/v1/config"), 1);
         let paths: Vec<_> = non_session(server.requests())
@@ -1111,10 +1219,22 @@ mod tests {
             .load_table(&table("t"), true)
             .await
             .expect("NovaRocks load");
-        let upstream = endpoints.upstream().await.expect("session");
-        // Upstream materializes with a storage factory this generation does
-        // not have; only its request matters here.
-        let _ = crate::iceberg::Catalog::load_table(upstream, &table("t")).await;
+        // The independent SDK comparator is dev-only and owns its own
+        // handshake. It cannot participate in the production session.
+        use crate::iceberg::CatalogBuilder;
+        let upstream = crate::iceberg_catalog_rest::RestCatalogBuilder::default()
+            .with_client(endpoints.owner().http().reqwest_client().clone())
+            .load(
+                "independent-upstream",
+                HashMap::from([
+                    ("uri".to_string(), server.url()),
+                    ("header.x-tenant".to_string(), "t1".to_string()),
+                    ("token".to_string(), "fe-token".to_string()),
+                ]),
+            )
+            .await
+            .unwrap();
+        let _ = crate::iceberg::Catalog::load_table(&upstream, &table("t")).await;
 
         let loads = server.requests_to("GET", "/v1/namespaces/db/tables/t");
         assert_eq!(loads.len(), 2);
@@ -1135,5 +1255,107 @@ mod tests {
         }
         assert_eq!(loads[0].target, loads[1].target);
         assert_eq!(server.count("POST", "/v1/oauth/tokens"), 1);
+    }
+    #[tokio::test]
+    async fn conditional_load_preserves_raw_etag_and_304_has_no_document_or_credentials() {
+        let response = load_response(true);
+        let server = TestServer::start(
+            Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on_sequence(
+                    "GET",
+                    "/v1/namespaces/db/tables/t",
+                    vec![
+                        Reply::json(200, &response).with_header("etag", "W/\"opaque-value\""),
+                        Reply::bytes(304, b"invalid-json-with-credential-canary".to_vec()),
+                        Reply::status(304),
+                    ],
+                ),
+        );
+        let (_, endpoints) = generation(&server, &[], None).await;
+        let validator = match endpoints
+            .load_table_conditional(&table("t"), true, None)
+            .await
+            .unwrap()
+        {
+            ConditionalTableLoad::Complete {
+                etag: Some(etag), ..
+            } => etag,
+            _ => panic!("complete load retains the server ETag"),
+        };
+        assert_eq!(validator, "W/\"opaque-value\"");
+        assert!(matches!(
+            endpoints
+                .load_table_conditional(&table("t"), false, Some(&validator))
+                .await
+                .unwrap(),
+            ConditionalTableLoad::NotModified
+        ));
+        let loads = server.requests_to("GET", "/v1/namespaces/db/tables/t");
+        assert_eq!(loads.len(), 2);
+        assert_eq!(loads[0].header("if-none-match"), None);
+        assert_eq!(loads[1].header("if-none-match"), Some("W/\"opaque-value\""));
+        assert_eq!(loads[1].header("x-iceberg-access-delegation"), None);
+        assert_eq!(server.count("GET", "/v1/config"), 1);
+        assert!(
+            endpoints
+                .load_table(&table("t"), false)
+                .await
+                .unwrap_err()
+                .message()
+                .contains("304 without a conditional")
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_load_without_etag_is_usable_and_does_not_invent_a_validator() {
+        let server = TestServer::start(
+            Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on(
+                    "GET",
+                    "/v1/namespaces/db/tables/t",
+                    Reply::json(200, &load_response(false)),
+                ),
+        );
+        let (_, endpoints) = generation(&server, &[], None).await;
+        assert!(matches!(
+            endpoints
+                .load_table_conditional(&table("t"), false, None)
+                .await
+                .unwrap(),
+            ConditionalTableLoad::Complete { etag: None, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_optional_capability_keeps_reads_available_and_never_sends_a_key() {
+        use super::super::configuration::IdempotencyCapability;
+        for lifetime in [
+            serde_json::Value::Null,
+            serde_json::json!(7),
+            serde_json::json!("PT0S"),
+            serde_json::json!("invalid"),
+        ] {
+            let config = serde_json::json!({"defaults":{}, "overrides":{}, "idempotency-key-lifetime": lifetime});
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::json(200, &config))
+                    .on("GET", "/v1/namespaces/db/tables/t", Reply::status(404)),
+            );
+            let (_, endpoints) = generation(&server, &[], None).await;
+            assert!(!endpoints.table_exists(&table("t")).await.unwrap());
+            assert!(matches!(
+                endpoints.binding().await.unwrap().idempotency_capability(),
+                IdempotencyCapability::Invalid { .. }
+            ));
+            assert_eq!(server.count("GET", "/v1/config"), 1);
+            assert!(
+                server
+                    .requests()
+                    .iter()
+                    .all(|request| request.header("idempotency-key").is_none())
+            );
+        }
     }
 }

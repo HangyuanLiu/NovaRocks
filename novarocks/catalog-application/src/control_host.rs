@@ -186,6 +186,14 @@ impl ConnectorControlHost {
             })
     }
 
+    /// Check a desired execution definition without rebinding an admitted
+    /// caller. Configuration changes within one source entry require a new
+    /// generation even when the attachment identity has not changed.
+    pub fn has_current_definition(&self, handle: &CatalogHandle) -> Result<bool, ConnectorError> {
+        let generation = self.current_generation(handle.catalog_name())?;
+        Ok(generation.runtime().binding.execution_catalog_handle() == Some(handle))
+    }
+
     /// Every exact catalog handle still protected by this FE process.
     ///
     /// Retiring generations remain present until their last planning or effect

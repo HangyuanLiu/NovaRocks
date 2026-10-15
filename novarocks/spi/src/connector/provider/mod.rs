@@ -26,7 +26,7 @@ pub use definition::{
 };
 pub use registry::SealedProviderRegistry;
 pub use role::{
-    ProviderControlRoleFactory, ProviderExecutionRoleFactory, ProviderRoleDefinition,
-    SealedProviderRoleRegistry,
+    CatalogScopeIdentity, ProviderCatalogControlFactory, ProviderControlRoleFactory,
+    ProviderExecutionRoleFactory, ProviderRoleDefinition, SealedProviderRoleRegistry,
 };
 pub use types::{ProviderReadTypes, ProviderWriteTypes};

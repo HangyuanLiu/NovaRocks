@@ -262,6 +262,14 @@ impl RegisteredIcebergDataMutationBackend {
             },
         );
         let direct = TransitionalPublisher {
+            catalog_operation: match planned {
+                PlannedIcebergMutation::Truncate { .. } => {
+                    crate::catalog::admission::CatalogOperation::Truncate
+                }
+                PlannedIcebergMutation::RegisterExistingFiles { .. } => {
+                    crate::catalog::admission::CatalogOperation::RegisterFiles
+                }
+            },
             catalog: Arc::clone(self.runtime.novarocks_catalog()),
             ident: intent.target().ident.clone(),
             target_ref: intent.target_ref().into(),
@@ -932,6 +940,14 @@ mod tests {
         let publisher = journal.observe(Arc::new(CountedSourcePublisher {
             inner: MutationPublisher {
                 inner: TransitionalPublisher {
+                    catalog_operation: match planned {
+                        PlannedIcebergMutation::Truncate { .. } => {
+                            crate::catalog::admission::CatalogOperation::Truncate
+                        }
+                        PlannedIcebergMutation::RegisterExistingFiles { .. } => {
+                            crate::catalog::admission::CatalogOperation::RegisterFiles
+                        }
+                    },
                     catalog: runtime.novarocks_catalog().clone(),
                     ident: intent.target().ident.clone(),
                     target_ref: "main".into(),

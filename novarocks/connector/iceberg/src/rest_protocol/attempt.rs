@@ -32,8 +32,6 @@ use futures::future::{BoxFuture, FutureExt, Shared, WeakShared};
 use super::auth::RestAuthOwner;
 use super::binding::SessionBinding;
 use super::evidence::BindingFailure;
-use crate::iceberg::{Catalog, TableIdent};
-use crate::iceberg_catalog_rest::RestCatalog;
 
 /// Identity of one attempt of one [`AttemptCell`]; distinct for every attempt
 /// the cell starts.
@@ -201,43 +199,24 @@ pub(crate) type SessionGate = AttemptCell<Arc<SessionBinding>, AttemptFailure>;
 pub(crate) async fn ensure_session(
     owner: &Arc<RestAuthOwner>,
     gate: &SessionGate,
-    upstream: &Arc<RestCatalog>,
+    properties: &Arc<std::collections::HashMap<String, String>>,
 ) -> Result<Arc<SessionBinding>, AttemptFailure> {
     gate.get_or_attempt(|attempt| {
         let owner = Arc::clone(owner);
-        let upstream = Arc::clone(upstream);
-        async move { attempt_session(owner, upstream, attempt).await }.boxed()
+        let properties = Arc::clone(properties);
+        async move {
+            tokio::time::timeout(
+                crate::catalog_runtime::REST_READ_TIMEOUT,
+                super::configuration::establish(&owner, &properties),
+            )
+            .await
+            .unwrap_or(Err(BindingFailure::ConfigFetch))
+            .map(Arc::new)
+            .map_err(|step| AttemptFailure { attempt, step })
+        }
+        .boxed()
     })
     .await
-}
-
-/// One establishment attempt (L28): upstream's existence check of the probe
-/// table makes upstream establish its session; the auth owner captures the
-/// binding (or the failed step) and vetoes the probe request itself.
-async fn attempt_session(
-    owner: Arc<RestAuthOwner>,
-    upstream: Arc<RestCatalog>,
-    attempt: AttemptId,
-) -> Result<Arc<SessionBinding>, AttemptFailure> {
-    let probe = owner.begin_establishment();
-    let probe = TableIdent::new(probe, "t".to_string());
-    // The probe's own outcome is never surfaced (L29): a veto confirms the
-    // request was not sent, and every outcome is judged only by what the
-    // owner captured during this attempt.
-    let _probe_outcome = upstream.table_exists(&probe).await;
-    let (captured, probe_method) = owner.finish_establishment();
-    match captured {
-        Some(Ok(mut binding)) => {
-            binding.set_table_head_advertised(probe_method == Some(reqwest::Method::HEAD));
-            Ok(Arc::new(binding))
-        }
-        Some(Err(step)) => Err(AttemptFailure { attempt, step }),
-        // `/v1/config` failed: upstream never reached `catalog_session`.
-        None => Err(AttemptFailure {
-            attempt,
-            step: BindingFailure::ConfigFetch,
-        }),
-    }
 }
 
 #[cfg(test)]
@@ -380,7 +359,7 @@ mod establishment_tests {
     use reqwest::header::HeaderMap;
 
     use super::*;
-    use crate::iceberg::NamespaceIdent;
+    use crate::iceberg::{Catalog, NamespaceIdent, TableIdent};
     use crate::rest_protocol::binding::protocol_headers;
     use crate::rest_protocol::http::RestHttpClient;
     use crate::rest_protocol::test_server::{
@@ -624,13 +603,18 @@ mod establishment_tests {
     }
 
     #[tokio::test]
-    async fn no_observed_probe_method_counts_as_not_advertised() {
-        // Upstream cannot even build the probe request for this effective
-        // uri, so authentication never sees it; the binding still stands.
-        let (binding, requests) = probe_outcome(&[("uri", "not-a-url")], Some(&[TABLE_HEAD])).await;
-        assert!(!binding.table_head_advertised());
-        assert_eq!(binding.uri(), "not-a-url");
-        assert_eq!(requests, vec!["GET /v1/config"]);
+    async fn invalid_effective_route_refuses_establishment() {
+        let server = TestServer::start(Script::new().on(
+            "GET",
+            "/v1/config",
+            Reply::config(&[], &[("uri", "not-a-url")], Some(&[TABLE_HEAD])),
+        ));
+        let fixture = FrontendFixture::new(&[("uri", &server.url())], None, client()).await;
+        assert_eq!(
+            fixture.ensure_session().await.unwrap_err().step,
+            BindingFailure::InvalidServerConfig
+        );
+        assert_eq!(server.count("GET", "/v1/config"), 1);
     }
 
     #[tokio::test]

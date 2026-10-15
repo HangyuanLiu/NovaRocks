@@ -81,7 +81,7 @@ struct IcebergMetadataMaintenanceMarkerV1 {
     operation_kind: String,
     request_digest_hex: String,
     plan_digest_hex: String,
-    state_digest_hex: String,
+    intent_digest_hex: String,
     base_snapshot_id: Option<i64>,
 }
 
@@ -102,7 +102,7 @@ struct IcebergMetadataMaintenanceEvidenceV1 {
     operation_kind: String,
     request_digest_hex: String,
     plan_digest_hex: String,
-    state_digest_hex: String,
+    intent_digest_hex: String,
     identity_digest_hex: String,
 }
 
@@ -176,7 +176,7 @@ impl IcebergMetadataMaintenanceAdapter {
                 ..
             } => (*older_than_ms, *retain_last),
         };
-        let state_digest = state_digest(
+        let intent_digest = intent_digest(
             metadata.uuid().to_string().as_bytes(),
             table.metadata_location(),
             metadata
@@ -209,7 +209,7 @@ impl IcebergMetadataMaintenanceAdapter {
             0,
             0,
         );
-        Ok((payload, state_digest, summary))
+        Ok((payload, intent_digest, summary))
     }
 
     fn payload_for_plan(
@@ -235,7 +235,7 @@ impl IcebergMetadataMaintenanceAdapter {
             operation_kind: plan.operation_kind().to_string(),
             request_digest_hex: hex_encode(plan.request_digest()),
             plan_digest_hex: hex_encode(plan.plan_digest()),
-            state_digest_hex: hex_encode(plan.state_digest()),
+            intent_digest_hex: hex_encode(plan.intent_digest()),
             base_snapshot_id: payload.base_snapshot_id,
         }
     }
@@ -253,7 +253,7 @@ impl IcebergMetadataMaintenanceAdapter {
             operation_kind: plan.operation_kind().to_string(),
             request_digest_hex: hex_encode(plan.request_digest()),
             plan_digest_hex: hex_encode(plan.plan_digest()),
-            state_digest_hex: hex_encode(plan.state_digest()),
+            intent_digest_hex: hex_encode(plan.intent_digest()),
             identity_digest_hex: hex_encode(identity_digest(&self.descriptor, &self.key, plan)),
         };
         ExternalMutationEvidence::try_new(
@@ -428,7 +428,7 @@ impl IcebergMetadataMaintenanceAdapter {
             plan.operation_kind(),
             plan.request_digest(),
             plan.plan_digest(),
-            plan.state_digest(),
+            plan.intent_digest(),
             summary,
             canonical_json(
                 &IcebergMetadataMaintenanceReceiptV1 {
@@ -475,11 +475,11 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
                 request.context.initiation(),
             ))
             .map_err(connector_unsupported)?;
-        let (payload, state_digest, summary) = self.plan_payload(&request)?;
+        let (payload, intent_digest, summary) = self.plan_payload(&request)?;
         let provider_payload = canonical_json(&payload, "Iceberg metadata maintenance plan")?;
         let plan = ConnectorMetadataMaintenancePlan::try_new(
             &request,
-            state_digest,
+            intent_digest,
             summary,
             provider_payload,
         )?;
@@ -618,7 +618,7 @@ impl IcebergMetadataMaintenanceAdapter {
             plan.operation_kind(),
             plan.request_digest(),
             plan.plan_digest(),
-            plan.state_digest(),
+            plan.intent_digest(),
             ConnectorMetadataMaintenanceReceiptSummary::default(),
             canonical_json(
                 &IcebergMetadataMaintenanceReceiptV1 {
@@ -677,7 +677,7 @@ fn validate_frozen_state(
     payload: &IcebergMetadataMaintenancePlanPayloadV1,
 ) -> Result<(), ConnectorError> {
     let metadata = table.metadata();
-    let actual = state_digest(
+    let actual = intent_digest(
         metadata.uuid().to_string().as_bytes(),
         table.metadata_location(),
         metadata
@@ -686,7 +686,7 @@ fn validate_frozen_state(
         metadata.current_schema_id(),
         metadata.default_partition_spec_id(),
     );
-    if actual != plan.state_digest()
+    if actual != plan.intent_digest()
         || metadata.uuid().to_string() != payload.table_uuid
         || metadata_location_digest(table.metadata_location())
             != decode_digest(&payload.metadata_location_digest_hex)?
@@ -698,7 +698,7 @@ fn validate_frozen_state(
     Ok(())
 }
 
-fn state_digest(
+fn intent_digest(
     table_uuid: &[u8],
     metadata_location: Option<&str>,
     snapshot_id: Option<i64>,
@@ -938,7 +938,7 @@ mod tests {
             plan.operation_kind(),
             plan.request_digest(),
             plan.plan_digest(),
-            plan.state_digest(),
+            plan.intent_digest(),
             ConnectorMetadataMaintenanceReceiptSummary::default(),
             Bytes::from_static(b"receipt"),
         )
@@ -1161,7 +1161,7 @@ mod tests {
             payload.operation_kind = "mismatched-operation".to_string();
             let invalid_plan = ConnectorMetadataMaintenancePlan::try_new(
                 &request,
-                plan.state_digest(),
+                plan.intent_digest(),
                 plan.summary(),
                 canonical_json(&payload, "test invalid plan").expect("encode payload"),
             )

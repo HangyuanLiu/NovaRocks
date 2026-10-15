@@ -67,6 +67,8 @@ pub(crate) mod hive;
 pub(crate) mod hms_listing_observer;
 pub(crate) mod listing_admission;
 pub(crate) mod rest;
+pub(crate) mod publication;
+pub(crate) mod table_coordination;
 pub(crate) mod view_request;
 
 use std::fmt::Debug;

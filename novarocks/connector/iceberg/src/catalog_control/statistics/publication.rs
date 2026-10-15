@@ -310,6 +310,7 @@ pub(super) fn publish(
     STATISTICS_TRANSACTION_ADMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let journal = PublicationJournal::new(operation.token());
     let direct = TransitionalPublisher {
+        catalog_operation: crate::catalog::admission::CatalogOperation::Statistics,
         catalog: Arc::clone(session.provider.runtime().novarocks_catalog()),
         ident: projection.target.clone(),
         target_ref: "main".into(),

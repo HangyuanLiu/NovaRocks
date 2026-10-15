@@ -855,11 +855,12 @@ async fn create_initialization_is_complete_and_only_asserts_create() {
     );
 }
 #[tokio::test]
-async fn frozen_requests_match_three_stable_rest_goldens() {
+async fn frozen_requests_match_stable_rest_goldens() {
     for shape in [
         RequestShape::SnapshotProducing,
         RequestShape::MetadataOnly,
         RequestShape::Create,
+        RequestShape::RefRetention,
     ] {
         let base = fixture(FormatVersion::V2);
         let intent = intent(shape);
@@ -891,6 +892,18 @@ async fn frozen_requests_match_three_stable_rest_goldens() {
                     updates: HashMap::from([("analyzed".into(), "true".into())]),
                 }]))
                 .unwrap();
+        } else if shape == RequestShape::RefRetention {
+            engine
+                .stage_change(PreparedChange {
+                    updates: vec![TableUpdate::RemoveSnapshotRef {
+                        ref_name: "old".into(),
+                    }],
+                    requirements: vec![TableRequirement::RefSnapshotIdMatch {
+                        r#ref: "old".into(),
+                        snapshot_id: None,
+                    }],
+                })
+                .unwrap();
         } else {
             engine
                 .stage_change(change(append(engine.metadata(), 11)))
@@ -902,6 +915,9 @@ async fn frozen_requests_match_three_stable_rest_goldens() {
             RequestShape::SnapshotProducing => ("snapshot", include_str!("golden/snapshot.json")),
             RequestShape::MetadataOnly => ("metadata", include_str!("golden/metadata.json")),
             RequestShape::Create => ("create", include_str!("golden/create.json")),
+            RequestShape::RefRetention => {
+                ("ref-retention", include_str!("golden/ref-retention.json"))
+            }
         };
         let expected: serde_json::Value = serde_json::from_str(golden).unwrap();
         assert_eq!(
@@ -1040,4 +1056,44 @@ async fn new_spec_binds_missing_field_ids_before_rest_freeze() {
         serde_json::json!(1000)
     );
     assert_eq!(json["updates"][1]["spec-id"], serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn ref_retention_staging_generates_set_ref_assertion_but_requires_explicit_remove_assertion()
+{
+    let metadata = fixture(FormatVersion::V2);
+    let writer = TestWriter::new();
+    let operation = intent(RequestShape::RefRetention);
+    let mut engine = StagingEngine::begin(
+        StagingBase::Existing {
+            metadata,
+            metadata_location: "s3://bucket/metadata/v1.json".into(),
+        },
+        &operation,
+        &writer,
+    )
+    .unwrap();
+    // An unborn main has no existing snapshot. Removing an absent ref remains
+    // a legitimate metadata operation when its exact absence is asserted.
+    engine
+        .stage_change(PreparedChange {
+            requirements: vec![TableRequirement::RefSnapshotIdMatch {
+                r#ref: "old".into(),
+                snapshot_id: None,
+            }],
+            updates: vec![TableUpdate::RemoveSnapshotRef {
+                ref_name: "old".into(),
+            }],
+        })
+        .unwrap();
+    let request = engine.freeze(&[]).unwrap();
+    assert_eq!(request.shape(), RequestShape::RefRetention);
+    assert!(
+        request
+            .requirements()
+            .contains(&TableRequirement::RefSnapshotIdMatch {
+                r#ref: "old".into(),
+                snapshot_id: None
+            })
+    );
 }

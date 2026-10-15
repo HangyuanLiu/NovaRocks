@@ -651,13 +651,13 @@ pub(crate) async fn wait_until_requests(
     }
 }
 
-/// A frontend REST session composed as production composes it: the auth
-/// owner injected into the real upstream `RestCatalog`, sharing one HTTP
-/// client.
+/// A frontend REST session composed with the production auth owner, endpoints
+/// and shared establishment gate; no SDK session or probe is constructed.
 pub(crate) struct FrontendFixture {
     pub(crate) owner: Arc<super::auth::RestAuthOwner>,
-    pub(crate) gate: super::attempt::SessionGate,
-    pub(crate) upstream: Arc<crate::iceberg_catalog_rest::RestCatalog>,
+    pub(crate) gate: Arc<super::attempt::SessionGate>,
+    pub(crate) upstream: Arc<super::adapter::RestTransitionalAdapter>,
+    properties: Arc<HashMap<String, String>>,
 }
 
 impl FrontendFixture {
@@ -668,34 +668,37 @@ impl FrontendFixture {
         identity: Option<crate::access_binding::IcebergRestAuthMaterial>,
         http: super::http::RestHttpClient,
     ) -> Self {
-        use crate::iceberg::CatalogBuilder;
-
         let properties: HashMap<String, String> = properties
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
         let persistent = super::auth::PersistentRestConfig::from_properties(&properties)
             .expect("valid persistent REST definition");
-        let (owner, manager) =
-            super::auth::RestAuthOwner::frontend(identity, persistent, http.clone())
-                .expect("valid identity");
-        let upstream = crate::iceberg_catalog_rest::RestCatalogBuilder::default()
-            .with_client(http.reqwest_client().clone())
-            .with_auth_manager(manager)
-            .load("rest", properties)
-            .await
-            .expect("load upstream REST catalog");
+        let owner = super::auth::RestAuthOwner::frontend(identity, persistent, http)
+            .expect("valid identity");
+        let properties = Arc::new(properties);
+        let gate = Arc::new(super::attempt::SessionGate::default());
+        let endpoints = Arc::new(super::endpoints::RestEndpoints::new_with_gate(
+            Arc::clone(&properties),
+            Arc::clone(&owner),
+            crate::iceberg::Runtime::try_current().expect("test runtime"),
+            None,
+            Default::default(),
+            true,
+            Arc::clone(&gate),
+        ));
         Self {
             owner,
-            gate: super::attempt::SessionGate::default(),
-            upstream: Arc::new(upstream),
+            gate,
+            properties,
+            upstream: Arc::new(super::adapter::RestTransitionalAdapter::new(endpoints)),
         }
     }
 
     pub(crate) async fn ensure_session(
         &self,
     ) -> Result<Arc<super::binding::SessionBinding>, super::attempt::AttemptFailure> {
-        super::attempt::ensure_session(&self.owner, &self.gate, &self.upstream).await
+        super::attempt::ensure_session(&self.owner, &self.gate, &self.properties).await
     }
 }
 

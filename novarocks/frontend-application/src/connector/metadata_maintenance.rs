@@ -582,7 +582,7 @@ mod tests {
                 plan.operation_kind(),
                 plan.request_digest(),
                 plan.plan_digest(),
-                plan.state_digest(),
+                plan.intent_digest(),
                 ConnectorMetadataMaintenanceReceiptSummary::default(),
                 Bytes::new(),
             )

@@ -570,6 +570,7 @@ impl IcebergWriteSessionControl {
         .with_target_uuid(handle.table().table_uuid().to_string())
         .with_commit_uuid(handle.session_id().to_string());
         let direct = TransitionalPublisher {
+            catalog_operation: handle.flavor().catalog_operation(),
             catalog,
             ident: recipe.target.ident.clone(),
             target_ref: recipe.target_ref.clone(),

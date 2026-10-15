@@ -1,0 +1,8 @@
+{
+  "identifier": {"namespace": ["db"], "name": "t"},
+  "requirements": [
+    {"type": "assert-table-uuid", "uuid": "01010101-0101-0101-0101-010101010101"},
+    {"type": "assert-ref-snapshot-id", "ref": "old", "snapshot-id": null}
+  ],
+  "updates": [{"action": "remove-snapshot-ref", "ref-name": "old"}]
+}

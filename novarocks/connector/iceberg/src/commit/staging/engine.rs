@@ -196,6 +196,9 @@ impl<'a> StagingEngine<'a> {
         let mut updates = self.updates.clone();
         let mut metadata = self.metadata.clone();
         for update in change.updates {
+            if self.intent.shape() == RequestShape::RefRetention {
+                crate::commit::model::validate_ref_retention_update(&update)?;
+            }
             if self.intent.shape() == RequestShape::MetadataOnly
                 && matches!(
                     update,
@@ -231,7 +234,8 @@ impl<'a> StagingEngine<'a> {
             requirements: self.requirements,
             updates: self.updates,
             artifacts: self.artifacts.snapshot_artifacts(owned_references)?,
-        })
+        })?
+        .with_base_facts(&self.base)
     }
 }
 

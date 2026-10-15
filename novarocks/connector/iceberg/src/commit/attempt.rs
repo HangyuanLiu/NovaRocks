@@ -62,6 +62,7 @@ pub(crate) type RecoveryPreflight =
     std::sync::Arc<dyn Fn(&FrozenRequest, &IcebergCommitOperation) -> Result<()> + Send + Sync>;
 
 pub(crate) struct TransitionalPublisher {
+    pub catalog_operation: crate::catalog::admission::CatalogOperation,
     pub catalog: std::sync::Arc<dyn crate::catalog::NovaRocksCatalog>,
     pub ident: crate::iceberg::TableIdent,
     pub target_ref: String,
@@ -174,6 +175,7 @@ impl Publisher for OwnerPublisher {
             );
         };
         let admission = TransactionRequest {
+            operation: self.target.catalog_operation,
             identity: TransactionIdentity::new(
                 self.operation.authority().label(),
                 self.operation.to_bytes(),
@@ -479,6 +481,32 @@ async fn prepare(
                 .map(|s| s.snapshot_id()),
         );
         for snapshot in snapshots {
+            // Data live sets omit manifest objects. Freeze the exact physical
+            // roots of every AddSnapshot, including intermediate snapshots.
+            let snapshot_ref = engine.metadata().snapshot_by_id(snapshot).ok_or_else(|| {
+                ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::InvalidRequest,
+                    "Staged publication snapshot is missing",
+                )
+            })?;
+            let list = crate::manifest::load_manifest_list(
+                snapshot_ref,
+                attempt.file_io(),
+                engine.metadata(),
+            )
+            .await
+            .map_err(|error| before_dispatch_failure(&error))?;
+            for path in std::iter::once(snapshot_ref.manifest_list()).chain(
+                list.entries()
+                    .iter()
+                    .map(|manifest| manifest.manifest_path.as_str()),
+            ) {
+                let object =
+                    ObjectIdentity::new(path).map_err(|error| before_dispatch_failure(&error))?;
+                if cross_attempt.contains(&object) {
+                    references.insert(object);
+                }
+            }
             let mut inputs = ValidationInputs::new(engine.metadata(), Some(snapshot), attempt);
             for identity in inputs
                 .live_set()
@@ -1351,5 +1379,156 @@ mod tests {
                 .keys()
                 .any(|identity| identity.object().path() == file)
         );
+    }
+    struct ReusedManifest(crate::iceberg::spec::ManifestFile);
+    #[async_trait]
+    impl Preparer for ReusedManifest {
+        async fn prepare(
+            &self,
+            view: &crate::commit::staging::StagedView<'_>,
+            intent: &OperationIntent,
+        ) -> Result<PreparedChange> {
+            crate::commit::overwrite::prepare_snapshot_change(
+                view,
+                intent,
+                10000 + view.metadata().next_sequence_number(),
+                crate::iceberg::spec::Operation::Replace,
+                vec![self.0.clone()],
+                HashMap::new(),
+                false,
+            )
+            .await
+        }
+    }
+    async fn operation_manifest_fixture(
+        fixture: &Fixture,
+    ) -> (
+        TableMetadata,
+        crate::iceberg::spec::ManifestFile,
+        ObjectIdentity,
+    ) {
+        use crate::commit::model::ArtifactKind;
+        let metadata = fixture.metadata(FormatVersion::V2);
+        let added = AddedContent::new_logical_data(
+            data("file:///external-data.parquet", 3, Struct::empty()),
+            0,
+        )
+        .unwrap();
+        let intent = fixture.intent(&metadata, "main", vec![added]);
+        let (metadata, _) = fixture.stage(metadata, &intent, &FastAppendPreparer).await;
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let snapshot = metadata.snapshot_for_ref("main").unwrap();
+        let list = crate::manifest::load_manifest_list(snapshot, attempt.file_io(), &metadata)
+            .await
+            .unwrap();
+        let mut selected = list.entries()[0].clone();
+        let bytes = attempt
+            .file_io()
+            .new_input(&selected.manifest_path)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let mut objects = Vec::new();
+        for _ in 0..2 {
+            let object = attempt
+                .allocate(ArtifactClass::Operation, ArtifactKind::Manifest)
+                .unwrap();
+            let mut writer = attempt
+                .file_io()
+                .new_output(object.path())
+                .unwrap()
+                .writer()
+                .await
+                .unwrap();
+            writer.write(bytes.clone()).await.unwrap();
+            writer.close().await.unwrap();
+            objects.push(object);
+        }
+        selected.manifest_path = objects[0].path().to_string();
+        (metadata, selected, objects[1].clone())
+    }
+    #[tokio::test]
+    async fn operation_manifest_roots_survive_rejected_attempt_and_only_selected_roots_survive_success()
+     {
+        let fixture = Fixture::new();
+        let (metadata, selected, unused) = operation_manifest_fixture(&fixture).await;
+        let selected_object = ObjectIdentity::new(&selected.manifest_path).unwrap();
+        let intent = fixture.intent(&metadata, "main", vec![]);
+        let preparer = ReusedManifest(selected);
+        let first = fixture.operation.begin_attempt().unwrap();
+        let (request, _) = prepare(
+            &first,
+            &intent,
+            StagingBase::Existing {
+                metadata: metadata.clone(),
+                metadata_location: "file:///base.json".into(),
+            },
+            &PreparedChange::default(),
+            &[&preparer],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            request.artifacts().operation_references(),
+            [selected_object.clone()]
+        );
+        fixture
+            .operation
+            .cleanup(CleanupScope::ThisAttempt(first.attempt_token()))
+            .await;
+        assert!(
+            first
+                .file_io()
+                .exists(selected_object.path())
+                .await
+                .unwrap()
+        );
+        let next = fixture.operation.begin_attempt().unwrap();
+        let (request, retained) = prepare(
+            &next,
+            &intent,
+            StagingBase::Existing {
+                metadata,
+                metadata_location: "file:///base.json".into(),
+            },
+            &PreparedChange::default(),
+            &[&preparer],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            request.artifacts().operation_references(),
+            [selected_object.clone()]
+        );
+        assert!(!retained.contains(&unused));
+        fixture.operation.cleanup_after_commit(&retained).await;
+        assert!(next.file_io().exists(selected_object.path()).await.unwrap());
+        assert!(!next.file_io().exists(unused.path()).await.unwrap());
+    }
+    #[tokio::test]
+    async fn unknown_reused_manifest_request_retains_all_possible_operation_outputs() {
+        let fixture = Fixture::new();
+        let (metadata, selected, unused) = operation_manifest_fixture(&fixture).await;
+        let selected_path = selected.manifest_path.clone();
+        let intent = fixture.intent(&metadata, "main", vec![]);
+        let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Unknown);
+        let report = run(
+            &fixture.operation,
+            &intent,
+            &PreparedChange::default(),
+            &[&ReusedManifest(selected)],
+            &publisher,
+            policy(),
+        )
+        .await;
+        assert!(matches!(
+            report.publication,
+            PublicationOutcome::Unknown { .. }
+        ));
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        assert!(attempt.file_io().exists(&selected_path).await.unwrap());
+        assert!(attempt.file_io().exists(unused.path()).await.unwrap());
+        assert_eq!(publisher.requests.lock().unwrap().len(), 1);
     }
 }

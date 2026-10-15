@@ -692,6 +692,7 @@ mod tests {
             operation: token,
             marker: None,
             target: TransitionalPublisher {
+                catalog_operation: crate::catalog::admission::CatalogOperation::Overwrite,
                 catalog: fixture.owner.clone(),
                 ident: fixture.table_ident.clone(),
                 target_ref: target_ref.to_string(),
