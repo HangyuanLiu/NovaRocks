@@ -275,8 +275,8 @@ impl MvProjectionDeleteGuard {
         }
     }
 }
-pub enum MvDropReadiness {
-    ReadyToDrop(MvProjectionDeleteGuard),
+pub enum MvDropReadiness<G = MvProjectionDeleteGuard> {
+    ReadyToDrop(G),
     AlreadyAbsent,
 }
 /// One projection in the shown inventory, with what this process may do with
@@ -1426,10 +1426,7 @@ impl MvKeyedProjectionDeleteGuard {
             .map(|e| &e.projection.facts.source_revision().target_object_id)
     }
 }
-pub enum MvKeyedDropReadiness {
-    ReadyToDrop(MvKeyedProjectionDeleteGuard),
-    AlreadyAbsent,
-}
+pub type MvKeyedDropReadiness = MvDropReadiness<MvKeyedProjectionDeleteGuard>;
 #[async_trait::async_trait]
 pub trait MvKeyedReadOnlyCurrentProjectionSource: Send + Sync {
     async fn observe_current_keyed_read_only(

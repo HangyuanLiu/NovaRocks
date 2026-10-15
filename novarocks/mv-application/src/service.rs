@@ -296,12 +296,12 @@ impl<P: crate::scheduler::MvSchedulerProjection> MvProductServiceCore<P> {
     /// Execute the product-owned DROP state machine. The projection port
     /// supplies only exact durable facts; provider and catalog ports carry the
     /// outer effects without owning their order or terminal interpretation.
-    pub fn drop(
+    pub fn drop<G>(
         &self,
         operation: MvOperationContext,
         target: MvTarget,
         if_exists: bool,
-        projection: &dyn MvDropProjectionPort,
+        projection: &dyn MvDropProjectionPort<G>,
         provider: &dyn MvDropProviderPort,
         catalog_registration: &dyn MvDropCatalogRegistrationPort,
     ) -> Result<MvProductResult, MvProductError> {

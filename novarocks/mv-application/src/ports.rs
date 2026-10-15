@@ -194,18 +194,18 @@ pub trait MvDropCatalogRegistrationPort: Send + Sync {
 /// The product-owned durable side of DROP. An outer adapter may bridge sync
 /// execution, but cannot reinterpret missing-target policy, dependency safety,
 /// or the exact post-provider-delete CAS.
-pub trait MvDropProjectionPort: Send + Sync {
+pub trait MvDropProjectionPort<G = MvProjectionDeleteGuard>: Send + Sync {
     fn prepare_drop(
         &self,
         operation: MvOperationContext,
         target: &MvTarget,
         if_exists: bool,
-    ) -> Result<MvDropReadiness, MvProviderFailure>;
+    ) -> Result<MvDropReadiness<G>, MvProviderFailure>;
 
     fn delete_after_provider_drop(
         &self,
         operation: MvOperationContext,
-        guard: MvProjectionDeleteGuard,
+        guard: G,
     ) -> Result<(), MvProviderFailure>;
 }
 
