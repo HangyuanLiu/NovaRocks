@@ -20,7 +20,7 @@
 #[path = "support/shift_runtime_funding.rs"]
 mod support;
 use arrow::{
-    array::{Array, ArrayRef, LargeListArray, StringArray},
+    array::{Array, ArrayRef, LargeListArray, StringArray, new_empty_array},
     buffer::{Buffer, OffsetBuffer, ScalarBuffer},
     datatypes::{DataType, Field},
 };
@@ -144,10 +144,20 @@ fn json_object_actual_runtime_whole_groups_keep_query_facts_until_cross_thread_l
         let binding = json_binding();
         let runtime = runtime_for_names(&binding, &["json_object"]);
         let arrays: Vec<ArrayRef> = if data {
+            // Anonymous items use their canonical name. A named Struct member
+            // retains the original long diagnostic across layout normalization.
+            let child = DataType::Struct(
+                vec![Arc::new(Field::new(
+                    "field\0µ".repeat(100),
+                    DataType::Utf8,
+                    true,
+                ))]
+                .into(),
+            );
             vec![Arc::new(LargeListArray::new(
-                Arc::new(Field::new("field\0µ".repeat(100), DataType::Utf8, true)),
+                Arc::new(Field::new("item", child.clone(), true)),
                 OffsetBuffer::new(ScalarBuffer::from(vec![0i64, 0])),
-                Arc::new(StringArray::from(Vec::<&str>::new())),
+                new_empty_array(&child),
                 None,
             ))]
         } else {
