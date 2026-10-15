@@ -513,6 +513,7 @@ pub enum ConnectorCatalogMutationOperation {
     /// Replace application-owned opaque documents in one exact table metadata
     /// commit. Providers must not reinterpret this as an arbitrary property
     /// patch or publish a new data snapshot.
+    KeyedDocuments { intent: super::KeyedMutationIntent },
     UpdateApplicationDocuments {
         intent: super::ConnectorDocumentUpdateIntent,
     },
@@ -573,6 +574,7 @@ impl ConnectorCatalogMutationOperation {
             Self::CreateNamespace { .. } => "create-namespace",
             Self::DropNamespace { .. } => "drop-namespace",
             Self::CreateTable { .. } => "create-table",
+            Self::KeyedDocuments { .. } => "keyed-documents",
             Self::UpdateApplicationDocuments { .. } => "update-application-documents",
             Self::DropTable { .. } => "drop-table",
             Self::CreateView { .. } => "create-view",
@@ -601,6 +603,9 @@ impl ConnectorCatalogMutationOperation {
         operation_id: ConnectorMutationOperationId,
     ) -> Result<(), ConnectorError> {
         self.validate()?;
+        if let Self::KeyedDocuments { intent } = self {
+            intent.validate_for(owner, operation_id)?;
+        }
         if let Self::UpdateApplicationDocuments { intent } = self {
             intent.validate_for(owner, operation_id)?;
         }

@@ -95,6 +95,9 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         if let Err(error) = ConnectorCatalogMutation::admit(self, &request) {
             return Ok(known_uncommitted(error));
         }
+        if let ConnectorCatalogMutationOperation::KeyedDocuments { .. } = &request.operation {
+            return Err(unsupported("keyed document mutation is not installed"));
+        }
         if let ConnectorCatalogMutationOperation::UpdateApplicationDocuments { intent } =
             &request.operation
         {
@@ -237,6 +240,10 @@ fn catalog_admission_request(request: &ConnectorCatalogMutationRequest) -> Catal
         Mutation::CreateTable { table, .. } => (
             CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
             table_target(table),
+        ),
+        Mutation::KeyedDocuments { intent } => (
+            CatalogOperation::UpdateDocuments,
+            table_target(intent.admission.target()),
         ),
         Mutation::UpdateApplicationDocuments { intent } => (
             CatalogOperation::UpdateDocuments,
@@ -550,7 +557,8 @@ fn execute_operation(
                 RefActionOutcome::NoOp => ExternalMutationEffect::NoOp,
             })
         }
-        ConnectorCatalogMutationOperation::UpdateApplicationDocuments { .. } => {
+        ConnectorCatalogMutationOperation::KeyedDocuments { .. }
+        | ConnectorCatalogMutationOperation::UpdateApplicationDocuments { .. } => {
             Err(internal("special mutation bypassed its exact commit path"))
         }
     }
@@ -2771,7 +2779,8 @@ fn mutation_evidence(
                 expected_snapshot_id,
             }
         }
-        ConnectorCatalogMutationOperation::UpdateApplicationDocuments { .. } => {
+        ConnectorCatalogMutationOperation::KeyedDocuments { .. }
+        | ConnectorCatalogMutationOperation::UpdateApplicationDocuments { .. } => {
             return Err(internal(
                 "application-document update evidence requires its exact commit path",
             ));

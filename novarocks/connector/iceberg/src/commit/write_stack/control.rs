@@ -3328,6 +3328,10 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
             handle.document_publication(),
             &request.publication,
         ) {
+            (_, novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::KeyedDocuments(_)) => {
+                return Err(ConnectorError::new(ConnectorErrorKind::Unsupported,
+                    "keyed write publication is not installed"));
+            }
             (
                 Some(frozen),
                 novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::ApplicationDocuments(intent),

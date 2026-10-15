@@ -682,6 +682,7 @@ pub enum ConnectorStagedCreatePrepareOutcome {
 pub enum ConnectorStagedCreatePublicationPayload {
     Ordinary,
     ApplicationDocuments(ConnectorDocumentCreatePublicationIntent),
+    KeyedDocuments(super::KeyedCreateIntent),
 }
 
 #[derive(Clone)]
@@ -1389,6 +1390,9 @@ impl ConnectorStagedCreateLease {
         match &request.payload {
             ConnectorStagedCreatePublicationPayload::Ordinary
                 if request.handle.document_target().is_none() => {}
+            ConnectorStagedCreatePublicationPayload::KeyedDocuments(intent) => {
+                intent.validate_for_handle(&request.handle)?;
+            }
             ConnectorStagedCreatePublicationPayload::ApplicationDocuments(intent) => {
                 intent.validate_for_handle(&request.handle)?;
             }

@@ -1075,6 +1075,7 @@ pub struct ConnectorWriteFinishRequest<'a> {
 pub enum ConnectorWriteFinishPublication {
     None,
     ApplicationDocuments(ConnectorDocumentPublicationIntent),
+    KeyedDocuments(crate::connector::KeyedPublicationIntent),
 }
 
 /// Release a begin session that never reached a complete prepared write set.

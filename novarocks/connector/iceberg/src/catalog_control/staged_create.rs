@@ -1570,6 +1570,12 @@ fn publication_document_properties(
             }
             return Ok(None);
         }
+        ConnectorStagedCreatePublicationPayload::KeyedDocuments(_) => {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "keyed create publication is not installed",
+            ));
+        }
         ConnectorStagedCreatePublicationPayload::ApplicationDocuments(intent) => intent,
     };
     if handle.document_target() != Some(intent.prepared_target()) {
