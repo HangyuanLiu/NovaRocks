@@ -4470,6 +4470,7 @@ dependencies = [
  "novarocks-connector-iceberg-functions",
  "novarocks-constant-contract",
  "novarocks-functions",
+ "novarocks-local-program",
  "novarocks-parser",
  "novarocks-physical-plan",
  "novarocks-result-contract",

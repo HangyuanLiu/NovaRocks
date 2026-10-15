@@ -55,6 +55,34 @@ pub struct FilterOrderKey {
     pub null_order: FilterNullOrder,
 }
 
+/// Static payload domain of a direct-scan ordered filter. This admits no
+/// array provenance, allocation capacity, or interpretation of nominal values.
+/// Preparation and optional planner placement must use this same contract.
+pub fn is_ordered_filter_flat_payload_type(
+    value_type: &novarocks_type_contract::FunctionValueType,
+) -> bool {
+    use novarocks_type_contract::ValueKind;
+    matches!(
+        value_type.value_type().kind(),
+        ValueKind::Scalar(_) | ValueKind::String | ValueKind::Binary
+    ) && matches!(
+        value_type.data_type(),
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Binary
+            | DataType::FixedSizeBinary(_)
+            | DataType::Date32
+            | DataType::Timestamp(_, _)
+            | DataType::Decimal128(_, _)
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StaticFilterContract {
     Membership {
@@ -662,6 +690,57 @@ impl StaticFilterConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_filter_flat_payload_keeps_the_declared_scalar_domain() {
+        use novarocks_type_contract::{FunctionValueType as V, ValueLogicalType};
+        let accepted = [
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Utf8,
+            DataType::Binary,
+            DataType::FixedSizeBinary(7),
+            DataType::Date32,
+            DataType::Timestamp(TimeUnit::Microsecond, Some("Asia/Shanghai".into())),
+            DataType::Decimal128(20, 3),
+        ];
+        for nullable in [false, true] {
+            for data_type in &accepted {
+                let ty = V::new(data_type.clone(), nullable);
+                assert!(is_ordered_filter_flat_payload_type(&ty), "{ty:?}");
+                assert_eq!(ty.data_type(), data_type);
+                assert_eq!(ty.nullable(), nullable);
+            }
+            for data_type in [
+                DataType::Null,
+                DataType::UInt32,
+                DataType::LargeUtf8,
+                DataType::LargeBinary,
+                DataType::Utf8View,
+                DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    true,
+                ))),
+            ] {
+                let ty = V::new(data_type, nullable);
+                assert!(!is_ordered_filter_flat_payload_type(&ty), "{ty:?}");
+            }
+            for (data_type, logical) in [
+                (DataType::Utf8, ValueLogicalType::Json),
+                (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
+                (DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
+            ] {
+                let ty = V::try_with_logical_type(data_type, nullable, logical).unwrap();
+                assert!(!is_ordered_filter_flat_payload_type(&ty), "{ty:?}");
+            }
+        }
+    }
 
     #[test]
     fn complete_domain_and_original_canonical_are_paired_without_semantic_inference() {

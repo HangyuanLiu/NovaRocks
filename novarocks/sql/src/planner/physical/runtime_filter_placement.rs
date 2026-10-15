@@ -14,7 +14,10 @@ use crate::optimizer::options::SessionOptimizerSettings;
 use crate::planner::physical::runtime_filter::{
     RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
 };
-use crate::planner::physical::topn_runtime_filter_placement::place_aggregate_topn_runtime_filters;
+use crate::planner::physical::topn_runtime_filter_placement::{
+    AggregateTopNPlacementPolicy, place_aggregate_topn_runtime_filters,
+    place_aggregate_topn_runtime_filters_with_policy,
+};
 use crate::planner::physical::{
     JoinDistribution, JoinExecutionMode, PhysicalHashJoinEqCondition, PhysicalHashJoinNode,
     PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, PlanSetOpKind, RedistributeMode,
@@ -723,6 +726,35 @@ pub(crate) fn place_runtime_filters(
     root: &mut PhysicalPlanNode,
     settings: &SessionOptimizerSettings,
 ) {
+    place_runtime_filters_with_policy(root, settings, AggregateTopNPlacementPolicy::GlobalGroups);
+}
+
+/// The emission author explicitly permits the computed-type direct Partial
+/// route; both modes retain the original Global placement and ID space.
+pub(crate) fn place_runtime_filters_for_emission(
+    root: &mut PhysicalPlanNode,
+    settings: &SessionOptimizerSettings,
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
+) {
+    match emission_mode {
+        crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1 => {
+            place_runtime_filters(root, settings);
+        }
+        crate::compiler::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration => {
+            place_runtime_filters_with_policy(
+                root,
+                settings,
+                AggregateTopNPlacementPolicy::GlobalAndDirectPartialUtf8,
+            );
+        }
+    }
+}
+
+fn place_runtime_filters_with_policy(
+    root: &mut PhysicalPlanNode,
+    settings: &SessionOptimizerSettings,
+    policy: AggregateTopNPlacementPolicy,
+) {
     debug_assert!(
         tree_has_no_runtime_filters(root),
         "optimizer output must not carry runtime filters; RF placement is a planner-only pass (RFP-1)"
@@ -733,7 +765,19 @@ pub(crate) fn place_runtime_filters(
     }
     let mut next_filter_id: i32 = 0;
     place_node(root, &config, &mut next_filter_id);
-    place_aggregate_topn_runtime_filters(root, &mut next_filter_id, config.max_count);
+    match policy {
+        AggregateTopNPlacementPolicy::GlobalGroups => {
+            place_aggregate_topn_runtime_filters(root, &mut next_filter_id, config.max_count);
+        }
+        AggregateTopNPlacementPolicy::GlobalAndDirectPartialUtf8 => {
+            place_aggregate_topn_runtime_filters_with_policy(
+                root,
+                &mut next_filter_id,
+                config.max_count,
+                policy,
+            );
+        }
+    }
 }
 
 fn tree_has_no_runtime_filters(node: &PhysicalPlanNode) -> bool {

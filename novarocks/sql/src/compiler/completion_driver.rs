@@ -856,9 +856,10 @@ fn provider_or_ready_step(
     // Retain the exact catalogue snapshot that authored optimizer bindings,
     // rather than the earlier request snapshot whose outer owner may differ.
     common.functions = functions;
-    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_emission(
         &mut physical,
         &common.session.optimizer_settings,
+        common.emission_mode,
     );
     let offer_predicates = common
         .session
@@ -3177,7 +3178,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_aggregate_topn_sequence_diagnostic() {
+    fn ordered_aggregate_topn_compile_preserves_modes_and_exact_endpoints() {
         let suite =
             include_str!("../../../../tests/sql/correctness/aggregate/sql/compressed_key.sql");
         let original = suite
@@ -3191,10 +3192,10 @@ mod tests {
             .strip_prefix("USE ${case_db};")
             .expect("original query 140 selects its case namespace")
             .trim();
-        // A temporary SQL-owner diagnosis with no external resource. The
-        // historical lane replays the actual SHOW TABLE STATS observation
-        // from source 10a52a704; it does not assert the native query's winner.
-        // Keep the original Missing lane and independent legacy expectations.
+        // SQL owns this component regression; no external resource is used.
+        // Historical source statistics select a real preaggregation path, not
+        // a forced physical winner. Verify the actual filter and endpoints,
+        // since a successful compilation with no filter misses the regression.
         let observed_c9 = [("c9", 2, 10.140857276181588, 30_002.0)];
         let lanes: [(&str, &[(&str, u64, f64, f64)]); 2] =
             [("Missing", &[]), ("HistoricalC9", &observed_c9)];
@@ -3210,26 +3211,85 @@ mod tests {
                     ),
                     ("original-140", original),
                 ] {
-                    println!("C28_DIAGNOSTIC_INPUT {statistics} {mode:?} {label}: {sql}");
-                    match grouped_state_topn_sequence_fixture_with_observed_metrics(
+                    let progress = grouped_state_topn_sequence_fixture_with_observed_metrics(
                         sql, mode, metrics,
-                    ) {
-                        Ok(SqlCompileProgress::Complete(completed)) => {
-                            println!(
-                                "C28_DIAGNOSTIC_COMPLETE {statistics} {mode:?} {label}: {:#?}",
-                                completed.into_plan().plan()
-                            );
+                    )
+                    .unwrap_or_else(|error| panic!("{statistics} {mode:?} {label}: {error:#?}"));
+                    let SqlCompileProgress::Complete(completed) = progress else {
+                        panic!("unresolved completion needs for {statistics} {mode:?} {label}");
+                    };
+                    let owner = completed.into_plan();
+                    let plan = owner.plan();
+                    if metrics.is_empty() {
+                        assert!(plan.runtime_filters().is_empty(), "{mode:?} {label}");
+                        continue;
+                    }
+                    use novarocks_physical_plan::{
+                        AggregateGrouping, NodeKind, RuntimeFilterConsumerTarget,
+                        RuntimeFilterDomain, RuntimeFilterProducerTarget, TopNReduction,
+                    };
+                    assert_eq!(plan.runtime_filters().len(), 1, "{mode:?} {label}");
+                    let filter = plan.runtime_filters().values().next().unwrap();
+                    let RuntimeFilterDomain::Ordered { key, inclusive, .. } = &filter.domain else {
+                        panic!("expected the original ordered domain");
+                    };
+                    assert!(*inclusive);
+                    assert_eq!(key.ty.data_type(), &DataType::Utf8);
+                    assert!(key.ty.nullable());
+                    assert_eq!(filter.producers.len(), 1);
+                    assert_eq!(filter.consumers.len(), 1);
+                    let producer = &filter.producers[0];
+                    let fragment = &plan.fragments()[&producer.endpoint.fragment];
+                    let aggregate = &fragment.nodes()[&producer.endpoint.node];
+                    let NodeKind::Aggregate {
+                        grouping,
+                        group_by,
+                        calls,
+                    } = &aggregate.kind
+                    else {
+                        panic!("producer must remain on its original aggregate");
+                    };
+                    assert!(!calls.is_empty());
+                    assert_eq!(group_by.len(), 1);
+                    assert_eq!(
+                        fragment.expressions().get(group_by[0].0).unwrap().ty,
+                        key.ty
+                    );
+                    let RuntimeFilterProducerTarget::AggregateTopNKey {
+                        topn,
+                        limit,
+                        offset,
+                        ..
+                    } = producer.target
+                    else {
+                        panic!("expected the original Aggregate TopN target");
+                    };
+                    assert_eq!(limit, 100);
+                    assert_eq!(offset, 0);
+                    let parent = &fragment.nodes()[&topn];
+                    assert_eq!(parent.inputs.as_ref(), &[aggregate.id]);
+                    let NodeKind::TopN { reduction, .. } = &parent.kind else {
+                        panic!("expected the exact parent TopN");
+                    };
+                    let consumer = &filter.consumers[0];
+                    assert!(matches!(
+                        consumer.target,
+                        RuntimeFilterConsumerTarget::AggregateTopNScanField { .. }
+                    ));
+                    let scan_fragment = &plan.fragments()[&consumer.endpoint.fragment];
+                    let scan = &scan_fragment.nodes()[&consumer.endpoint.node];
+                    assert!(matches!(scan.kind, NodeKind::Scan { .. }));
+                    match mode {
+                        super::super::SqlPhysicalEmissionMode::OriginalNativeV1 => {
+                            assert_eq!(*grouping, AggregateGrouping::Complete);
+                            assert!(matches!(reduction, TopNReduction::Rows));
                         }
-                        Ok(SqlCompileProgress::Incomplete(progress)) => {
-                            panic!(
-                                "original fixture left unresolved completion needs for {statistics} {mode:?} {label}: {:?}",
-                                progress.needs()
-                            );
-                        }
-                        Err(error) => {
-                            println!(
-                                "C28_DIAGNOSTIC_REFUSAL {statistics} {mode:?} {label}: {error:#?}"
-                            );
+                        super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration => {
+                            assert_eq!(*grouping, AggregateGrouping::Partial);
+                            assert!(matches!(reduction, TopNReduction::GroupedStates { .. }));
+                            assert_eq!(consumer.endpoint.fragment, producer.endpoint.fragment);
+                            assert_eq!(aggregate.inputs.as_ref(), &[scan.id]);
+                            assert_eq!(producer.endpoint.values, consumer.endpoint.values);
                         }
                     }
                 }
