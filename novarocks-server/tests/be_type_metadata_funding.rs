@@ -27,10 +27,12 @@ use novarocks_memory::{
     AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority, TeardownEvidence, TopUpPolicy,
 };
 use novarocks_native_adapter::backend_task_execution::{
-    TypeMaterializationJournal, TypeMaterializationRefusal, materialize_package_types_for_test,
+    TypeMaterializationHost, TypeMaterializationJournal, TypeMaterializationRefusal,
+    materialize_package_types_for_test,
 };
 use novarocks_plan_codec::host_projection_v2::ProjectionFailure;
 use novarocks_plan_codec::physical_package_v2::test_support::decode_limits;
+use novarocks_plan_codec::physical_type_v2::{PackageTypeMaterializationScope, TypeCodecError};
 use novarocks_proto_models::{physical_package_v2 as package, physical_type_v2 as wire, plan};
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use novarocks_types::{
@@ -378,15 +380,23 @@ fn original_type_host_preserves_a_qualified_shared_shortage_without_running_body
     );
     // Requalify the exact same request against the remaining live filler.
     // The stale receipt is preserved, never reused as an admission verdict.
-    let novarocks_execution::runtime::kernel_memory::KernelMemoryAdmission::SharedShortage(
-        rechecked,
-    ) = novarocks_execution::runtime::kernel_memory::request_complete_operation(
-        Some(&binding),
-        journal.workset_bytes.unwrap(),
-    )
+    let loan = owner.loan();
+    let mut rechecked_journal = TypeMaterializationJournal::default();
+    let mut host = TypeMaterializationHost::new(&binding, &loan, &mut rechecked_journal);
+    let result = host.materialize(&journal.facts.unwrap(), || -> Result<_, TypeCodecError> {
+        panic!("the unchanged source request must refuse before its body")
+    });
+    let Err(ProjectionFailure::Host(TypeMaterializationRefusal::SharedShortage(rechecked))) =
+        result
     else {
-        panic!("the unchanged source request must still have a qualified shortage")
+        panic!(
+            "the unchanged source request must still have a qualified shortage: {:?}",
+            result.err()
+        )
     };
+    assert_eq!(rechecked_journal.shortage.as_ref(), Some(&rechecked));
+    assert_eq!(rechecked_journal.workset_bytes, journal.workset_bytes);
+    assert!(rechecked_journal.body.settlement.is_none());
     assert!(rechecked.coverage.complete);
     assert_eq!(rechecked.refusal.requested, receipt.refusal.requested);
     assert!(
