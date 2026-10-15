@@ -261,8 +261,8 @@ pub(crate) async fn prepare_snapshot_change(
     let parent_summary = parent
         .and_then(|id| metadata.snapshot_by_id(id))
         .map(|s| s.summary());
-    // A row-level preparer can calculate visible rows from its exact delete
-    // applicability facts. File counters alone cannot reconstruct that value.
+    // A preparer may supply an exact physical data-record total, including for
+    // a full overwrite whose parent total is absent.
     let exact_records = properties.get("total-records").cloned();
     let mut finalized = finalize_snapshot_summary(properties, parent_summary, truncate_full_table);
     if let Some(total) = exact_records {
@@ -328,10 +328,9 @@ pub(crate) async fn prepare_snapshot_change(
     })
 }
 
-/// Snapshot sizes count logical delete blobs rather than shared Puffin containers.
-pub(crate) fn set_visible_rows_after_removal(
+/// Removing a data file subtracts all its records, independently of its DVs.
+pub(crate) fn set_physical_rows_after_removal(
     view: &super::staging::StagedView<'_>,
-    removed: &[super::dependency::LiveEntry],
     summary: &mut HashMap<String, String>,
 ) -> crate::iceberg::Result<()> {
     let Some(total) = view
@@ -346,30 +345,16 @@ pub(crate) fn set_visible_rows_after_removal(
     let parent: u64 = total
         .parse()
         .map_err(|_| invalid("Parent total-records is invalid"))?;
-    let data_paths: std::collections::BTreeSet<_> = removed
-        .iter()
-        .filter_map(|entry| match entry.frozen.identity() {
-            super::model::EntryIdentity::DataFile { path } => Some(path),
-            _ => None,
-        })
-        .collect();
-    let deleted_vectors = removed.iter().filter(|entry| matches!(entry.frozen.identity(),
-        super::model::EntryIdentity::DeletionVector { referenced_data_file, .. } if data_paths.contains(referenced_data_file)
-    )).try_fold(0u64, |sum, entry| sum.checked_add(entry.file.record_count())
-        .ok_or_else(|| invalid("Removed deletion-vector cardinality overflow")))?;
     let removed_data: u64 = summary["deleted-records"]
         .parse()
         .expect("checked summary count");
     let added: u64 = summary["added-records"]
         .parse()
         .expect("checked summary count");
-    let removed_live = removed_data
-        .checked_sub(deleted_vectors)
-        .ok_or_else(|| invalid("Removed deletion-vector cardinality exceeds removed data rows"))?;
     let total = parent
-        .checked_sub(removed_live)
+        .checked_sub(removed_data)
         .and_then(|n| n.checked_add(added))
-        .ok_or_else(|| invalid("Visible row total overflow or underflow"))?;
+        .ok_or_else(|| invalid("Physical data-record total overflow or underflow"))?;
     summary.insert("total-records".into(), total.to_string());
     Ok(())
 }

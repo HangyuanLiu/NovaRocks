@@ -103,26 +103,18 @@ pub fn dv_data_file(written: &WrittenDvFile, referenced: &LiveFile) -> Result<Da
         .map_err(|e| format!("build DV DataFile failed: {e}"))
 }
 
+/// Count records in retained data files; deletion vectors do not remove them.
 pub fn dv_total_records(
     parent_total_records: Option<u64>,
-    newly_deleted_records: u64,
     added_data_records: u64,
 ) -> Result<Option<u64>, String> {
     parent_total_records
         .map(|parent| {
-            parent
-                .checked_sub(newly_deleted_records)
-                .ok_or_else(|| {
-                    format!(
-                        "DV delete total-records underflow: parent={parent}, deleted={newly_deleted_records}"
-                    )
-                })?
-                .checked_add(added_data_records)
-                .ok_or_else(|| {
-                    format!(
-                        "DV delete total-records overflow: parent={parent}, deleted={newly_deleted_records}, added={added_data_records}"
-                    )
-                })
+            parent.checked_add(added_data_records).ok_or_else(|| {
+                format!(
+                    "DV physical total-records overflow: parent={parent}, added={added_data_records}"
+                )
+            })
         })
         .transpose()
 }
@@ -443,10 +435,7 @@ mod t8b_tests {
             .with_summary(Summary {
                 operation: Operation::Append,
                 additional_properties: HashMap::from([
-                    (
-                        "total-records".into(),
-                        if with_dvs { "4" } else { "6" }.into(),
-                    ),
+                    ("total-records".into(), "6".into()),
                     ("total-data-files".into(), "2".into()),
                     (
                         "total-delete-files".into(),
@@ -524,6 +513,36 @@ mod t8b_tests {
         );
         inputs.live_set().await.unwrap().clone()
     }
+    // Read the resulting manifests rather than duplicating the summary delta formula.
+    fn assert_physical_record_total(
+        metadata: &TableMetadata,
+        live: &crate::commit::dependency::LiveSet,
+    ) -> u64 {
+        let physical: u64 = live
+            .values()
+            .filter(|entry| entry.file.content_type() == DataContentType::Data)
+            .map(|entry| entry.file.record_count())
+            .sum();
+        assert_eq!(
+            metadata
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .additional_properties["total-records"],
+            physical.to_string()
+        );
+        physical
+    }
+
+    #[test]
+    fn dv_physical_record_total_preserves_unknown_and_rejects_overflow() {
+        assert_eq!(dv_total_records(None, 3).unwrap(), None);
+        assert_eq!(dv_total_records(Some(0), 0).unwrap(), Some(0));
+        assert_eq!(dv_total_records(Some(2), 0).unwrap(), Some(2));
+        assert_eq!(dv_total_records(Some(2), 3).unwrap(), Some(5));
+        assert!(dv_total_records(Some(u64::MAX), 1).is_err());
+    }
+
     async fn raw_entries(writer: &Writer, metadata: &TableMetadata) -> Vec<ManifestEntry> {
         let list = crate::manifest::load_manifest_list(
             metadata.current_snapshot().unwrap(),
@@ -596,6 +615,21 @@ mod t8b_tests {
             "11"
         );
         let after = live(&writer, engine.metadata()).await;
+        assert_eq!(assert_physical_record_total(engine.metadata(), &after), 6);
+        assert!(
+            !snapshot
+                .summary()
+                .additional_properties
+                .contains_key("deleted-records")
+        );
+        assert_eq!(
+            snapshot.summary().additional_properties["added-position-deletes"],
+            "2"
+        );
+        assert_eq!(
+            snapshot.summary().additional_properties["removed-position-deletes"],
+            "1"
+        );
         assert_eq!(after[untouched.frozen.identity()].frozen, untouched.frozen);
         assert_eq!(
             after
@@ -665,6 +699,13 @@ mod t8b_tests {
         assert_eq!(snapshot.added_rows_count(), Some(7));
         assert_eq!(engine.metadata().next_row_id(), 7);
         let after = live(&writer, engine.metadata()).await;
+        assert_eq!(assert_physical_record_total(engine.metadata(), &after), 7);
+        assert!(
+            !snapshot
+                .summary()
+                .additional_properties
+                .contains_key("deleted-records")
+        );
         let mut ranges = after
             .values()
             .filter(|e| e.file.content_type() == DataContentType::Data)
@@ -698,6 +739,8 @@ mod t8b_tests {
             Operation::Append
         );
         assert_eq!(engine.metadata().next_row_id(), 8);
+        let after = live(&writer, engine.metadata()).await;
+        assert_eq!(assert_physical_record_total(engine.metadata(), &after), 8);
     }
     async fn mixed_historical_cow_baseline(writer: &Writer) -> TableMetadata {
         let metadata = baseline(writer, true, false).await;
@@ -899,7 +942,6 @@ mod t8b_tests {
         assert!(!after.contains_key(&old_data));
         assert!(!after.contains_key(&old_dv));
         assert_eq!(after[&other_dv].frozen, before[&other_dv].frozen);
-        assert!(RowLiveIndex::from_live(after).is_ok());
         let summary = &engine
             .metadata()
             .current_snapshot()
@@ -913,7 +955,9 @@ mod t8b_tests {
         assert_eq!(summary["removed-files-size"], "111");
         assert_eq!(summary["total-data-files"], "2");
         assert_eq!(summary["total-delete-files"], "1");
-        assert_eq!(summary["total-records"], "4");
+        assert_eq!(summary["total-records"], "5");
+        assert_eq!(assert_physical_record_total(engine.metadata(), &after), 5);
+        assert!(RowLiveIndex::from_live(after).is_ok());
         assert!(
             writer
                 .ledger
@@ -981,6 +1025,18 @@ mod t8b_tests {
         .await
         .unwrap();
         assert_eq!(vector.cardinality(), 2);
+        assert_eq!(assert_physical_record_total(engine.metadata(), &after), 6);
+        let summary = &engine
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .additional_properties;
+        assert_eq!(
+            summary["total-position-deletes"],
+            vector.cardinality().to_string()
+        );
+        assert!(!summary.contains_key("deleted-records"));
         assert!(vector.contains(0));
         assert!(vector.contains(2));
         for path in input_paths {

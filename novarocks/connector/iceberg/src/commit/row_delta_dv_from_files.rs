@@ -148,7 +148,7 @@ impl crate::commit::staging::Preparer for RowDeltaDvFromFilesPreparer {
             sum.checked_add(index.live[id].file.record_count())
                 .ok_or_else(|| to_iceberg_unexpected("Removed DV cardinality overflow".into()))
         })?;
-        let newly_deleted = new_dv_records.checked_sub(removed_records).ok_or_else(|| {
+        new_dv_records.checked_sub(removed_records).ok_or_else(|| {
             to_iceberg_unexpected(
                 "Replacement deletion vector lost source deleted positions".into(),
             )
@@ -160,7 +160,6 @@ impl crate::commit::staging::Preparer for RowDeltaDvFromFilesPreparer {
         let parent = target_ref_snapshot_id(view.metadata(), view.target_ref());
         let total = dv_total_records(
             snapshot_total_records(view.metadata(), parent).map_err(to_iceberg_unexpected)?,
-            newly_deleted,
             data_records,
         )
         .map_err(to_iceberg_unexpected)?;
@@ -169,7 +168,6 @@ impl crate::commit::staging::Preparer for RowDeltaDvFromFilesPreparer {
             summary.insert("added-delete-files".into(), dvs.len().to_string());
             summary.insert("added-position-delete-files".into(), dvs.len().to_string());
             summary.insert("added-position-deletes".into(), new_dv_records.to_string());
-            summary.insert("deleted-records".into(), newly_deleted.to_string());
         }
         if !data.is_empty() {
             summary.insert("added-data-files".into(), data.len().to_string());
