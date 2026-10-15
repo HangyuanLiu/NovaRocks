@@ -595,16 +595,29 @@ fn project_original_schema_host_preserves_real_qualified_shared_shortage_before_
             .fields()[0]
             .name(),
     );
+    // Settle the original producers before measuring real remaining capacity.
+    // The runtime now shares their labels; reclaimable old idle is not filler.
+    binding
+        .authority()
+        .request_maintenance(novarocks_memory::MaintenanceReason::ExplicitLocalReclaim);
+    let coverage = binding
+        .authority()
+        .maintain(binding.authority().maintenance_scan_bound().unwrap());
+    assert!(coverage.complete);
+    assert_eq!(coverage.deferred_active, 0);
+    let token_bytes = novarocks_memory::attribution::ATTRIBUTION_TOKEN_BYTES;
     let payload = usize::try_from(
         CAPACITY
             .checked_sub(binding.authority().root().committed_bytes())
             .unwrap()
-            .checked_sub(1024 + 8)
+            .checked_sub(novarocks_memory::OWNER_METADATA_BYTES)
+            .unwrap()
+            .checked_sub(u64::try_from(token_bytes).unwrap())
             .unwrap(),
     )
     .unwrap();
     assert!(payload >= 512);
-    let ready = match request_complete_operation(Some(&binding), payload + 8) {
+    let ready = match request_complete_operation(Some(&binding), payload + token_bytes) {
         KernelMemoryAdmission::Granted(ready) => ready,
         other => panic!("actual filler request must be granted: {other:?}"),
     };
@@ -613,8 +626,10 @@ fn project_original_schema_host_preserves_real_qualified_shared_shortage_before_
         .run(&mut filler_journal, || vec![0u8; payload])
         .unwrap();
     let settlement = filler_journal.settlement.as_ref().unwrap();
-    assert_eq!(settlement.accepted_live, (payload + 8) as u64);
+    assert_eq!(settlement.accepted_live, (payload + token_bytes) as u64);
     assert_eq!(settlement.debt, 0);
+    assert_eq!(filler_journal.settlement.as_ref().unwrap().debt, 0);
+    assert_eq!(binding.authority().root().committed_bytes(), CAPACITY);
     let error = prepare_project_metadata_for_test(
         compiled,
         site,

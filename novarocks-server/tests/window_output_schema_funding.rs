@@ -800,16 +800,29 @@ fn analytic_original_schema_actual_occupied_capacity_retains_qualified_shortage(
     let mut journal = ProjectMetadataJournal::default();
     let compiled = compile(&bytes, &binding, &tracker, &loan, &mut journal);
     let node = compiled.program().graph().root();
+    // Settle the original producers before measuring real remaining capacity.
+    // The runtime now shares their labels; reclaimable old idle is not filler.
+    binding
+        .authority()
+        .request_maintenance(novarocks_memory::MaintenanceReason::ExplicitLocalReclaim);
+    let coverage = binding
+        .authority()
+        .maintain(binding.authority().maintenance_scan_bound().unwrap());
+    assert!(coverage.complete);
+    assert_eq!(coverage.deferred_active, 0);
+    let token_bytes = novarocks_memory::attribution::ATTRIBUTION_TOKEN_BYTES;
     let payload = usize::try_from(
         CAPACITY
             .checked_sub(binding.authority().root().committed_bytes())
             .unwrap()
-            .checked_sub(1024 + 8)
+            .checked_sub(novarocks_memory::OWNER_METADATA_BYTES)
+            .unwrap()
+            .checked_sub(u64::try_from(token_bytes).unwrap())
             .unwrap(),
     )
     .unwrap();
     assert!(payload >= 512);
-    let ready = match request_complete_operation(Some(&binding), payload + 8) {
+    let ready = match request_complete_operation(Some(&binding), payload + token_bytes) {
         KernelMemoryAdmission::Granted(ready) => ready,
         other => panic!("real filler admission: {other:?}"),
     };
@@ -819,8 +832,10 @@ fn analytic_original_schema_actual_occupied_capacity_retains_qualified_shortage(
         .unwrap();
     assert_eq!(
         filler_journal.settlement.as_ref().unwrap().accepted_live,
-        (payload + 8) as u64
+        (payload + token_bytes) as u64
     );
+    assert_eq!(filler_journal.settlement.as_ref().unwrap().debt, 0);
+    assert_eq!(binding.authority().root().committed_bytes(), CAPACITY);
     let error = prepare_window_metadata_for_test(
         compiled,
         node,
