@@ -25,55 +25,14 @@
 use std::sync::Arc;
 
 use arrow::array::ArrayRef;
-use novarocks_functions::opaque_memory::{OpaqueReservation, OpaqueRetainedCharge};
+use novarocks_functions::opaque_memory::OpaqueRetainedCharge;
 use novarocks_functions::{
     AggregateStateAllocator, EvaluationCheckpoints, KernelDiagnostic, KernelEvaluationControl,
     KernelFailure, PreparedSourceCustody, ScalarResourceError, SourceBackingOwner,
     source_custody_prefix_facts,
 };
 
-/// Declared public work, never inferred private allocation geometry.
-#[derive(Clone, Copy)]
-pub(super) struct ArrowWorkShape {
-    pub(super) rows: usize,
-    pub(super) cells: usize,
-    pub(super) payload_bytes: usize,
-    pub(super) fields: usize,
-    pub(super) buffers: usize,
-}
-
-/// GroupedTopNArrowBudgetV1 from the accepted plan. Overflow is a fatal
-/// resource refusal; it cannot turn into a zero budget or a row data error.
-fn invoice(shape: ArrowWorkShape) -> Result<usize, KernelFailure> {
-    let checked = || {
-        16_384usize
-            .checked_add(64usize.checked_mul(shape.rows.checked_add(shape.cells)?)?)?
-            .checked_add(2usize.checked_mul(shape.payload_bytes)?)?
-            .checked_add(2_048usize.checked_mul(shape.fields)?)?
-            .checked_add(1_024usize.checked_mul(shape.buffers)?)
-    };
-    checked().ok_or(KernelFailure::ResourceExhausted)
-}
-
-/// Kept alive until the actual public operation and its temporary results
-/// have returned/dropped. This same host also adopts its new returned stock.
-pub(super) struct ArrowWorkBudget {
-    host: Arc<dyn AggregateStateAllocator>,
-    _reservation: OpaqueReservation,
-}
-impl ArrowWorkBudget {
-    pub(super) fn admit(
-        host: Arc<dyn AggregateStateAllocator>,
-        shape: ArrowWorkShape,
-    ) -> Result<Self, KernelFailure> {
-        let authority = OpaqueRetainedCharge::try_new(Arc::clone(&host))?;
-        let reservation = authority.reserve_operation(invoice(shape)?)?;
-        Ok(Self {
-            host,
-            _reservation: reservation,
-        })
-    }
-}
+pub(super) use crate::exec::arrow_work::{ArrowWorkBudget, ArrowWorkShape};
 
 /// The actual array is destroyed before its stock charge. SourceBackingOwner
 /// and the original Arrow custody author retain this owner through the last

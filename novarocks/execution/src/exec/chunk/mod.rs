@@ -18,6 +18,7 @@
 mod additional_buffers;
 mod chunk_impl;
 mod compiled_layout_metadata_request;
+mod filtered_output;
 mod hydrate;
 mod memory;
 mod output_metadata;
@@ -40,6 +41,7 @@ pub(crate) mod typed_fixture;
 pub(crate) use additional_buffers::AdditionalBufferLedger;
 pub use chunk_impl::{Chunk, ChunkBatchProjection};
 pub use compiled_layout_metadata_request::original_compiled_schema_metadata_request;
+pub(crate) use filtered_output::normalize_filter_mask_observed;
 pub use hydrate::dictionary_hydration_required_observed;
 pub use hydrate::hydrate_dictionary_columns_except;
 pub use hydrate::hydrate_dictionary_columns_observed;

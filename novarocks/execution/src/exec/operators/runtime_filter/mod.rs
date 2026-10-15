@@ -39,6 +39,9 @@ use arrow::array::ArrayRef;
 use arrow::compute::filter_record_batch;
 
 mod compiled;
+mod live_cursor;
+#[cfg(test)]
+mod live_cursor_tests;
 pub(crate) use compiled::{CompiledRuntimeFilterConsumers, CompiledRuntimeFilterKeys};
 
 pub(crate) struct NativeOrderedLiveConsumerSet {
@@ -264,46 +267,22 @@ impl NativeOrderedLiveConsumerSet {
         else {
             return Ok(());
         };
-        match outcome {
-            execution::LivePollOutcome::Updated {
-                snapshot,
-                terminal: update_terminal,
-            } => {
-                if observed.is_none_or(|seen| snapshot.logical_version() > seen) {
-                    *observed = Some(snapshot.logical_version());
-                    *latest_snapshot = Some(snapshot);
-                }
-                if let Some(update_terminal) = update_terminal {
-                    if latest_snapshot.is_none() {
-                        binding.state = NativeOrderedLiveBindingState::PassThrough;
-                    } else {
-                        *terminal = Some(update_terminal);
-                    }
-                }
+        match live_cursor::apply_poll_outcome(observed, latest_snapshot, terminal, outcome) {
+            Ok(live_cursor::LiveCursorDisposition::Keep) => {}
+            Ok(live_cursor::LiveCursorDisposition::PassThrough) => {
+                binding.state = NativeOrderedLiveBindingState::PassThrough;
             }
-            execution::LivePollOutcome::Idle {
-                latest_version,
-                terminal: idle_terminal,
-            } => {
-                if latest_version.is_some_and(|latest| observed.is_none_or(|seen| latest > seen)) {
-                    return Err(format!(
-                        "native ordered runtime-filter binding_id={} reported a newer live version without artifact",
-                        spec.binding_id()
-                    ));
-                }
-                if latest_version.is_some_and(|latest| observed.is_some_and(|seen| latest < seen)) {
-                    return Err(format!(
-                        "native ordered runtime-filter binding_id={} live cursor regressed",
-                        spec.binding_id()
-                    ));
-                }
-                if let Some(idle_terminal) = idle_terminal {
-                    if latest_snapshot.is_none() {
-                        binding.state = NativeOrderedLiveBindingState::PassThrough;
-                    } else {
-                        *terminal = Some(idle_terminal);
-                    }
-                }
+            Err(live_cursor::LiveCursorViolation::NewerVersionWithoutArtifact) => {
+                return Err(format!(
+                    "native ordered runtime-filter binding_id={} reported a newer live version without artifact",
+                    spec.binding_id()
+                ));
+            }
+            Err(live_cursor::LiveCursorViolation::Regressed) => {
+                return Err(format!(
+                    "native ordered runtime-filter binding_id={} live cursor regressed",
+                    spec.binding_id()
+                ));
             }
         }
         Ok(())

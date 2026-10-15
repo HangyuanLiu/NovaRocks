@@ -17,6 +17,7 @@
 
 //! Single-fragment execution kernels with no application-owner dependency.
 
+pub(crate) mod arrow_work;
 pub mod change_op;
 pub mod chunk;
 pub mod dict_encode;
