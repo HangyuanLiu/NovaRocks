@@ -35,9 +35,7 @@ pub(crate) type ScheduledRefreshRuntimeDecision = MvRefreshRuntimeDecision;
 /// the outer provider/query-execution adapter.
 #[derive(Clone, Debug)]
 pub(crate) struct ScheduledRefreshRequest {
-    product: MvScheduledRefreshRequest<
-        novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
-    >,
+    product: MvScheduledRefreshRequest,
     pub(crate) target: MvTarget,
 }
 

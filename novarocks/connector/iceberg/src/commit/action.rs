@@ -25,16 +25,8 @@ use std::collections::{BTreeMap, HashMap};
 pub(super) fn merge_snapshot_summary_properties(
     mut built_in: HashMap<String, String>,
     snapshot_properties: &BTreeMap<String, String>,
-    table_uuid: uuid::Uuid,
-    snapshot_id: i64,
 ) -> Result<HashMap<String, String>, String> {
-    let mut provider_properties =
-        crate::document_storage::publication::resolve_snapshot_properties(
-            snapshot_properties,
-            table_uuid,
-            snapshot_id,
-        )
-        .map_err(|error| error.to_string())?;
+    let mut provider_properties = snapshot_properties.clone();
     if let Some(raw_provenance) = provider_properties
         .get(MV_PUBLICATION_PROVENANCE_PROP)
         .cloned()

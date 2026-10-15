@@ -1623,7 +1623,7 @@ mod tests {
     fn legacy_managed_marker_refuses_all_writes() {
         let owner = owner();
         let metadata = metadata_with_properties(HashMap::from([(
-            crate::document_storage::observation::MANAGED_OWNER_PROPERTY.to_string(),
+            "novarocks.managed.owner".to_string(),
             "deployment".to_string(),
         )]));
         let payload = table_payload(Some(table_info(&metadata)));

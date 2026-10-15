@@ -20,10 +20,13 @@ use novarocks_catalog_application::{
     CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind, CatalogCreateCommand,
     CatalogDropCommand, CatalogRuntimeObservation,
 };
-use novarocks_mv_application::persistence::dependency::StoredMvDependency;
-use novarocks_mv_application::product::MvTarget;
-use novarocks_mv_application::repository::*;
+use novarocks_mv_application::state_store_repository::StateStoreMvRepository;
 use novarocks_spi::connector::{ConnectorInstanceId, ConnectorStopOwner};
+use novarocks_state_store_api::{
+    AttemptSupervisor, Direction, Key, KeyRange, RangePage, RangeRequest, ReadTransaction,
+    StateRecord, StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreIdentity,
+    WriteAttempt, WriteTransaction,
+};
 use novarocks_workload_control::{CancellationReason, ResultWindowClass};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
@@ -48,10 +51,10 @@ impl ActualPortDependency {
         let _ = self.release.lock().unwrap().recv();
         self.returned.store(true, Ordering::Release);
     }
-    fn destroy(&mut self) {
+    fn destroy(&self) {
         self.drops.fetch_add(1, Ordering::AcqRel);
         let _ = self.drop_started.send(());
-        let _ = self.drop_release.get_mut().unwrap().recv();
+        let _ = self.drop_release.lock().unwrap().recv();
         self.destroyed.store(true, Ordering::Release);
     }
 }
@@ -91,113 +94,84 @@ impl CatalogApplicationPort for HeldCatalogApplication {
     }
 }
 
-// The existing public in-memory repository implements the unrelated required
-// methods. Only the actual read port under test is overridden; no mutation runs.
-struct HeldMvRepository {
-    inner: novarocks_mv_application::test_repository::InMemoryMvRepository,
-    held: ActualPortDependency,
+// The real keyed repository runs against this actual StateStore. Hold its
+// original range callback after the seeded row has been read, then its store
+// owner destructor after the callback has returned. No probe owns the store.
+struct HeldMvStateStore {
+    inner: Arc<dyn StateStore>,
+    held: Arc<ActualPortDependency>,
+    expected_range: KeyRange,
+    expected_key: Key,
 }
-impl Drop for HeldMvRepository {
+impl Drop for HeldMvStateStore {
     fn drop(&mut self) {
         self.held.destroy();
     }
 }
+
+struct HeldMvRead {
+    inner: Box<dyn ReadTransaction>,
+    held: Arc<ActualPortDependency>,
+    expected_range: KeyRange,
+    expected_key: Key,
+    page_size: usize,
+}
 #[async_trait]
-impl MvRepository for HeldMvRepository {
-    async fn list_projections(&self) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
-        self.held.exact.store(true, Ordering::Release);
+impl ReadTransaction for HeldMvRead {
+    async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
+        self.held.other_calls.fetch_add(1, Ordering::AcqRel);
+        self.inner.get(key).await
+    }
+    async fn range(&mut self, request: &RangeRequest) -> Result<RangePage, StateStoreError> {
+        let page = self.inner.range(request).await?;
+        self.held.exact.store(
+            request.range == self.expected_range
+                && request.direction == Direction::Forward
+                && request.page_size == self.page_size
+                && request.continuation.is_none()
+                && page.continuation.is_none()
+                && page.records.len() == 1
+                && page.records.first().map(|row| &row.key) == Some(&self.expected_key),
+            Ordering::Release,
+        );
         self.held.enter();
-        Err(MvRepositoryError::new(
-            MvRepositoryErrorKind::Unavailable,
-            "actual held candidate inventory is unavailable",
+        Err(StateStoreError::new(
+            StateStoreErrorKind::ProviderUnavailable,
+            "actual held keyed candidate range is unavailable",
         ))
     }
-    async fn create_projection(
+    async fn abort(self: Box<Self>) -> Result<(), StateStoreError> {
+        self.inner.abort().await
+    }
+}
+#[async_trait]
+impl StateStore for HeldMvStateStore {
+    fn limits(&self) -> &StateStoreLimits {
+        self.inner.limits()
+    }
+    fn attempts(&self) -> &AttemptSupervisor {
+        self.inner.attempts()
+    }
+    async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
+        Ok(Box::new(HeldMvRead {
+            inner: self.inner.begin_read().await?,
+            held: self.held.clone(),
+            expected_range: self.expected_range.clone(),
+            expected_key: self.expected_key.clone(),
+            page_size: self.inner.limits().max_page_size,
+        }))
+    }
+    async fn begin_write(
         &self,
-        id: uuid::Uuid,
-        value: MvProjectionRequest,
-    ) -> Result<LoadedMvProjection, MvRepositoryError> {
+        attempt: WriteAttempt,
+        purpose: &str,
+    ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
         self.held.other_calls.fetch_add(1, Ordering::AcqRel);
-        self.inner.create_projection(id, value).await
+        self.inner.begin_write(attempt, purpose).await
     }
-    async fn replace_projection(
-        &self,
-        id: uuid::Uuid,
-        value: ReplaceMvProjectionRequest,
-    ) -> Result<LoadedMvProjection, MvRepositoryError> {
+    async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
         self.held.other_calls.fetch_add(1, Ordering::AcqRel);
-        self.inner.replace_projection(id, value).await
-    }
-    async fn load_by_id(&self, id: i64) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
-        self.held.other_calls.fetch_add(1, Ordering::AcqRel);
-        self.inner.load_by_id(id).await
-    }
-    async fn find_by_target(
-        &self,
-        target: &MvTarget,
-    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
-        self.held.other_calls.fetch_add(1, Ordering::AcqRel);
-        self.inner.find_by_target(target).await
-    }
-    async fn list_projection_inventory(
-        &self,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
-        self.held.other_calls.fetch_add(1, Ordering::AcqRel);
-        self.inner.list_projection_inventory(bound).await
-    }
-    async fn find_by_target_bounded(
-        &self,
-        target: &MvTarget,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
-        self.held.other_calls.fetch_add(1, Ordering::AcqRel);
-        self.inner.find_by_target_bounded(target, bound).await
-    }
-    async fn delete_projection(
-        &self,
-        id: uuid::Uuid,
-        value: DeleteMvProjectionRequest,
-    ) -> Result<bool, MvRepositoryError> {
-        self.held.other_calls.fetch_add(1, Ordering::AcqRel);
-        self.inner.delete_projection(id, value).await
-    }
-    #[cfg(feature = "test-controls")]
-    async fn wipe_accelerator(&self, id: uuid::Uuid) -> Result<(), MvRepositoryError> {
-        self.held.other_calls.fetch_add(1, Ordering::AcqRel);
-        self.inner.wipe_accelerator(id).await
-    }
-    async fn list_dependencies_by_downstream(
-        &self,
-        id: i64,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        self.held.other_calls.fetch_add(1, Ordering::AcqRel);
-        self.inner.list_dependencies_by_downstream(id).await
-    }
-    async fn list_dependencies_by_downstream_bounded(
-        &self,
-        id: i64,
-        version: &MvProjectionVersion,
-        bound: MvDependencyReadBound,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        self.held.other_calls.fetch_add(1, Ordering::AcqRel);
-        self.inner
-            .list_dependencies_by_downstream_bounded(id, version, bound)
-            .await
-    }
-    async fn list_downstream_dependencies(
-        &self,
-        upstream: &novarocks_mv_application::dependency::MvDependencyObjectRef,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        self.held.other_calls.fetch_add(1, Ordering::AcqRel);
-        self.inner.list_downstream_dependencies(upstream).await
-    }
-    async fn ensure_no_downstream_dependencies(
-        &self,
-        upstream: &novarocks_mv_application::dependency::MvDependencyObjectRef,
-    ) -> Result<(), MvRepositoryError> {
-        self.held.other_calls.fetch_add(1, Ordering::AcqRel);
-        self.inner.ensure_no_downstream_dependencies(upstream).await
+        self.inner.identity().await
     }
 }
 
@@ -251,36 +225,76 @@ fn observe_actual_completion_port(kind: ActualCompletionPort, class: ResultWindo
     };
     // Move the only external strong dependency owner into the actual owners.
     // Neither the test probes nor watchdog retain a dependency/window alias.
-    let (application, repository): (
-        Option<Arc<dyn CatalogApplicationPort>>,
-        Arc<dyn MvRepository>,
-    ) = match kind {
-        ActualCompletionPort::Catalog => (
-            Some(Arc::new(HeldCatalogApplication(original))),
-            Arc::new(novarocks_mv_application::test_repository::InMemoryMvRepository::default()),
-        ),
-        ActualCompletionPort::MaterializedView => (
-            None,
-            Arc::new(HeldMvRepository {
-                inner: Default::default(),
-                held: original,
-            }),
-        ),
-    };
-    let inventory = novarocks_mv_application::readiness::MvReadinessService::new(
-        repository,
-        Arc::new(novarocks_mv_application::process_runtime::ProcessRuntime::default()),
+    let inner: Arc<dyn StateStore> = Arc::new(
+        novarocks_state_store_testkit::testing::InMemoryStateStore::new("completion-held-keyed"),
+    );
+    let (application, store): (Option<Arc<dyn CatalogApplicationPort>>, Arc<dyn StateStore>) =
+        match kind {
+            ActualCompletionPort::Catalog => {
+                (Some(Arc::new(HeldCatalogApplication(original))), inner)
+            }
+            ActualCompletionPort::MaterializedView => {
+                // Seed before installing the hold. This must be an actual keyed
+                // root written by the repository's normal StateStore transaction.
+                let expected_key = runtime.block_on(async {
+                    let repository =
+                        StateStoreMvRepository::open(inner.clone(), Default::default())
+                            .await
+                            .unwrap();
+                    let facts = crate::mv::domain::test_admission::sample_keyed_projection(
+                        novarocks_mv_application::product::MvTarget::from_parts(
+                            Some("ice.main"),
+                            "db",
+                            "mv_candidate",
+                        ),
+                        Some(9),
+                    );
+                    let loaded = repository
+                        .install_keyed_projection(uuid::Uuid::now_v7(), facts, None)
+                        .await
+                        .unwrap();
+                    novarocks_mv_application::state_store_repository::key::projection_by_id_key(
+                        loaded.projection.mv_id,
+                    )
+                    .unwrap()
+                });
+                let prefix = novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY
+                    .key_with_suffix("/projection/by-id/")
+                    .unwrap();
+                (
+                    None,
+                    Arc::new(HeldMvStateStore {
+                        inner,
+                        held: Arc::new(original),
+                        expected_range: KeyRange::for_prefix(prefix).unwrap(),
+                        expected_key,
+                    }),
+                )
+            }
+        };
+    let repository = runtime
+        .block_on(StateStoreMvRepository::open(store, Default::default()))
+        .unwrap();
+    let product = novarocks_mv_application::service::MvKeyedProductService::new_with_keyed_management_continuation(
+        Default::default(), repository, Default::default(),
+        crate::mv::domain::test_admission::management_entrance(), Default::default(),
+    );
+    let inventory = crate::mv::domain::readiness::MvReadinessPort::from_product(
+        product.keyed_readiness_service().unwrap(),
+        runtime.handle().clone(),
+        product.management_entrance().unwrap(),
     );
     let owners = CompletionFactOwners::new(
         Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
         application,
         Arc::new(ConnectorControlHost::new()),
         Arc::new(UnifiedStatisticsResolver::default()),
-        MvCandidateReader::new(inventory.candidate_reader(), runtime.handle().clone()),
+        inventory.candidate_reader(),
         Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
         blocking.clone(),
     );
-    drop(inventory); // The actual port/closure now owns the only candidate reader.
+    drop(inventory);
+    drop(product); // The actual port/closure now owns the only repository/store aliases.
     let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
     let stop = ConnectorStopOwner::new();
     let context = ConnectorRequestContext::try_new(
@@ -417,14 +431,14 @@ fn actual_catalog_admit_keeps_internal_window_through_waiter_cancel_and_dependen
     observe_actual_completion_port(ActualCompletionPort::Catalog, ResultWindowClass::Internal);
 }
 #[test]
-fn actual_mv_list_projections_keeps_local_window_through_waiter_cancel_and_repository_drop() {
+fn actual_mv_keyed_state_store_range_keeps_local_window_through_waiter_cancel_and_store_drop() {
     observe_actual_completion_port(
         ActualCompletionPort::MaterializedView,
         ResultWindowClass::Local,
     );
 }
 #[test]
-fn actual_mv_list_projections_keeps_internal_window_through_waiter_cancel_and_repository_drop() {
+fn actual_mv_keyed_state_store_range_keeps_internal_window_through_waiter_cancel_and_store_drop() {
     observe_actual_completion_port(
         ActualCompletionPort::MaterializedView,
         ResultWindowClass::Internal,

@@ -1,17 +1,17 @@
 // Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements. See the NOTICE file
+// or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
-// regarding copyright ownership. The ASF licenses this file
+// regarding copyright ownership.  The ASF licenses this file
 // to you under the Apache License, Version 2.0 (the
 // "License"); you may not use this file except in compliance
-// with the License. You may obtain a copy of the License at
+// with the License.  You may obtain a copy of the License at
 //
 //   http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing,
 // software distributed under the License is distributed on an
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied. See the License for the
+// KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
 
@@ -61,7 +61,7 @@ impl WriteRecipe {
     fn freeze(
         handle: &IcebergCommitHandle,
         validated: &[ValidatedFragment<'_>],
-        documents: Option<FinishDocumentPublication<'_>>,
+        documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
     ) -> Result<Self, ConnectorError> {
         use crate::commit::model::Dependency;
         let facts = handle.table();
@@ -123,14 +123,8 @@ impl WriteRecipe {
                 sum.checked_add(file.record_count)
                     .ok_or_else(|| corrupt("Staged Iceberg row count overflow"))
             })?;
-        let mut summary = session_snapshot_properties_with_documents(
-            handle,
-            rows,
-            documents.and_then(FinishDocumentPublication::legacy),
-        )?;
-        let keyed_documents = documents
-            .and_then(FinishDocumentPublication::keyed)
-            .map(|intent| intent.documents.clone());
+        let mut summary = session_snapshot_properties_for_commit(handle, rows)?;
+        let keyed_documents = documents.map(|intent| intent.documents.clone());
         if let Some(keyed) = &keyed_documents {
             for record in &keyed.records {
                 let key =
@@ -158,14 +152,6 @@ impl WriteRecipe {
         } else {
             PreparedChange::default()
         };
-        if let Some(updates) = publication_metadata_updates(
-            handle.repartition(),
-            documents.and_then(FinishDocumentPublication::legacy),
-            &source,
-        )? {
-            // Repartition's declarative updates are canonicalized by StagingEngine.
-            prefix.updates = updates;
-        }
         // The writer schema and spec are exact admission facts, independent of the
         // ref dependency. A concurrent schema/spec change never reinterprets files.
         prefix
@@ -574,7 +560,7 @@ impl IcebergWriteSessionControl {
         handle: &IcebergCommitHandle,
         validated: &[ValidatedFragment<'_>],
         statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
-        documents: Option<FinishDocumentPublication<'_>>,
+        documents: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         let operation = IcebergCommitOperation::new(
@@ -600,10 +586,7 @@ impl IcebergWriteSessionControl {
         let recipe = match recipe {
             Ok(recipe) => recipe,
             Err(error) => {
-                let error = if documents
-                    .and_then(FinishDocumentPublication::keyed)
-                    .is_some()
-                {
+                let error = if documents.is_some() {
                     crate::document_storage::keyed::write::refusal_with_retained_bytes(
                         &self.runtime,
                         handle.table().namespace(),
@@ -888,7 +871,6 @@ pub(super) struct RecoveryPayload {
     pub base_snapshot_id: Option<i64>,
     pub base_sequence_number: i64,
     pub staging_dir: String,
-    pub document_manifest_digest: Option<[u8; 32]>,
     pub document_record_digest: Option<[u8; 32]>,
     operation_id: [u8; 16],
     attempt: RecoveryAttempt,
@@ -949,7 +931,6 @@ struct RecoveryTemplate {
     base_snapshot_id: Option<i64>,
     base_sequence_number: i64,
     staging_dir: String,
-    document_manifest_digest: Option<[u8; 32]>,
     document_record_digest: Option<[u8; 32]>,
 }
 
@@ -975,10 +956,6 @@ impl RecoveryTemplate {
             base_sequence_number: handle.table().base_sequence_number(),
             staging_dir: handle.staging_dir(),
             document_record_digest: handle.document_records_digest()?,
-            document_manifest_digest: handle
-                .document_manifest()?
-                .as_deref()
-                .map(crate::document_storage::publication::prepared_manifest_digest),
         })
     }
 
@@ -1063,7 +1040,6 @@ impl RecoveryTemplate {
             base_snapshot_id: self.base_snapshot_id,
             base_sequence_number: self.base_sequence_number,
             staging_dir: self.staging_dir.clone(),
-            document_manifest_digest: self.document_manifest_digest,
             document_record_digest: self.document_record_digest,
             operation_id: operation.token().to_bytes(),
             attempt: request.artifacts().attempt().into(),
@@ -1112,7 +1088,6 @@ impl RecoveryPayload {
             || self.base_snapshot_id != expected.base_snapshot_id
             || self.base_sequence_number != expected.base_sequence_number
             || self.staging_dir != expected.staging_dir
-            || self.document_manifest_digest != expected.document_manifest_digest
             || self.document_record_digest != expected.document_record_digest
             || self.metadata_location.is_empty()
         {
@@ -1259,7 +1234,6 @@ mod recovery_tests {
                 base_snapshot_id: None,
                 base_sequence_number: 0,
                 staging_dir: location,
-                document_manifest_digest: None,
                 document_record_digest: None,
             };
             Self {

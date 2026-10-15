@@ -16,15 +16,9 @@
 // under the License.
 
 use super::codec::*;
-use super::definition::{MvAcceleratorCommittedVersionRevision, MvAcceleratorSourceRevision};
 use super::identity::*;
-use super::projection::MvDocumentProjection;
-use crate::management::{DeploymentOwner, ProcessIncarnation};
-use crate::product::MvTarget;
 use bytes::Bytes;
-use novarocks_spi::connector::{
-    ConnectorCommittedVersion, ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableObjectId,
-};
+use novarocks_spi::connector::ConnectorTableObjectId;
 
 macro_rules! identity_fixture {
     ($name:ident, $kind:ty) => {
@@ -38,7 +32,6 @@ identity_fixture!(object_id, ObjectIdentity);
 identity_fixture!(field_id, FieldIdentity);
 identity_fixture!(schema_version, SchemaVersion);
 identity_fixture!(partition_spec_version, PartitionSpecVersion);
-identity_fixture!(native_data_version, NativeDataVersion);
 identity_fixture!(output_id, OutputIdentity);
 identity_fixture!(state_slot_id, StateSlotIdentity);
 identity_fixture!(aggregate_id, AggregateIdentity);
@@ -148,10 +141,11 @@ fn physical(
     }
 }
 
-fn sample_interpretation(definition: &EncodedDocument) -> InterpretationDocument {
+fn sample_interpretation(definition: &DefinitionDocument) -> InterpretationDocument {
     InterpretationDocument {
-        definition_revision: definition.revision(),
-        computation_identity: sample_definition().computation_identity,
+        definition_revision: super::keyed_documents::definition_revision(definition)
+            .expect("fixture D semantic revision"),
+        computation_identity: definition.computation_identity,
         outputs: vec![OutputBinding {
             output_id: output_id(21),
             target_field_id: field_id(31),
@@ -254,7 +248,7 @@ fn sample_interpretation(definition: &EncodedDocument) -> InterpretationDocument
     }
 }
 
-fn retraction_count_interpretation(definition: &EncodedDocument) -> InterpretationDocument {
+fn retraction_count_interpretation(definition: &DefinitionDocument) -> InterpretationDocument {
     let mut interpretation = sample_interpretation(definition);
     interpretation.state_slots = vec![
         StateSlot {
@@ -337,39 +331,6 @@ fn retraction_count_interpretation(definition: &EncodedDocument) -> Interpretati
     interpretation
 }
 
-fn sample_publication(
-    definition: &EncodedDocument,
-    interpretation: &EncodedDocument,
-) -> PublicationDocument {
-    PublicationDocument {
-        publication_prepared_at_ms: 1_700_000_001_000,
-        publication_id: PublicationIdentity::try_new(vec![91]).expect("publication id"),
-        definition_revision: definition.revision(),
-        interpretation_revision: interpretation.revision(),
-        inputs: vec![
-            PublicationInput {
-                relation_occurrence_id: 7,
-                object_id: source_object_identity(11),
-                native_data_version: native_data_version(101),
-            },
-            PublicationInput {
-                relation_occurrence_id: 8,
-                object_id: source_object_identity(11),
-                native_data_version: native_data_version(101),
-            },
-        ],
-        output: PublicationOutput {
-            object_id: object_id(71),
-            empty_result: false,
-        },
-        kind: PublicationKind::FullRefresh,
-        statistics: PublicationStatistics {
-            logical_result_rows: Some(1),
-            processed_input_rows: Some(100),
-        },
-    }
-}
-
 fn sample_configuration() -> ConfigurationDocument {
     ConfigurationDocument {
         refresh_policy: RefreshPolicy::AsyncInterval,
@@ -379,166 +340,192 @@ fn sample_configuration() -> ConfigurationDocument {
     }
 }
 
-/// Mutable fixture inputs. Production code cannot enable raw projection seeding.
-pub struct ProjectionFixture {
-    pub target: MvTarget,
+/// Pure D/L/C shapes with exact provider object facts; no publication is made.
+/// The target object is a provider identity, separate from D's source facts.
+pub struct MvDocumentFixture {
     pub object_id: ConnectorTableObjectId,
     pub definition: DefinitionDocument,
     pub interpretation: InterpretationDocument,
     pub configuration: ConfigurationDocument,
-    pub publication: Option<PublicationDocument>,
-    pub metadata_version: ConnectorCommittedVersion,
-    pub output_version: Option<ConnectorCommittedVersion>,
-    pub storage_rows: Option<u64>,
 }
 
-impl ProjectionFixture {
-    pub fn new(target: MvTarget, snapshot_id: Option<i64>) -> Self {
+impl MvDocumentFixture {
+    pub fn new() -> Self {
         let definition = sample_definition();
-        let encoded_definition = encode_definition(&definition).expect("fixture D");
-        let interpretation = sample_interpretation(&encoded_definition);
-        let encoded_interpretation = encode_interpretation(&interpretation).expect("fixture L");
+        let interpretation = sample_interpretation(&definition);
         Self {
-            target,
             object_id: ConnectorTableObjectId::try_new(Bytes::from_static(&[71]))
-                .expect("fixture object"),
+                .expect("fixture target object"),
             definition,
             interpretation,
             configuration: sample_configuration(),
-            publication: snapshot_id
-                .map(|_| sample_publication(&encoded_definition, &encoded_interpretation)),
-            metadata_version: ConnectorCommittedVersion::try_new(
-                Bytes::from_static(b"fixture-metadata"),
-                snapshot_id,
-            )
-            .expect("fixture metadata"),
-            output_version: snapshot_id.map(|id| {
-                ConnectorCommittedVersion::try_new(Bytes::from_static(b"fixture-output"), Some(id))
-                    .expect("fixture output")
-            }),
-            storage_rows: snapshot_id.map(|_| 1),
         }
     }
 
     pub fn with_retraction_count(mut self) -> Self {
-        self.interpretation = retraction_count_interpretation(
-            &encode_definition(&self.definition).expect("fixture D"),
-        );
+        self.interpretation = retraction_count_interpretation(&self.definition);
         self
     }
+}
 
-    pub fn build(mut self) -> Result<MvDocumentProjection, String> {
-        self.definition = build_definition(
-            self.definition.created_at_ms,
-            self.definition.query.clone(),
-            self.definition.relation_occurrences.clone(),
-            self.definition.outputs.clone(),
+impl Default for MvDocumentFixture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod pure_document_fixture_tests {
+    use super::super::codec::keyed::{BindingDocument, DataVersionFormat};
+    use super::super::keyed_documents::{build_keyed_versions, definition_revision};
+    use super::super::validation::{PersistenceDecodeBudget, validate_definition_interpretation};
+    use super::*;
+    use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorProviderId};
+
+    #[test]
+    fn pure_shapes_keep_full_definition_identity_and_avg_runtime_layout() {
+        let f = MvDocumentFixture::new();
+        let revision = definition_revision(&f.definition).unwrap();
+        validate_definition_interpretation(&f.definition, revision, &f.interpretation).unwrap();
+        assert_ne!(
+            revision,
+            encode_definition(&f.definition).unwrap().revision()
+        );
+        let bytes =
+            super::super::codec::keyed::encode_keyed_interpretation(&f.interpretation).unwrap();
+        let decoded = super::super::codec::keyed::decode_keyed_interpretation(
+            bytes.as_bytes(),
+            PersistenceDecodeBudget::default(),
         )
-        .map_err(|error| error.to_string())?;
-        let definition_revision = encode_definition(&self.definition)
-            .map_err(|e| e.to_string())?
-            .revision();
-        self.interpretation.definition_revision = definition_revision;
-        self.interpretation.computation_identity = self.definition.computation_identity;
-        self.interpretation.target.object_id =
-            ObjectIdentity::try_new(self.object_id.as_bytes().to_vec())
-                .map_err(|e| e.to_string())?;
-        let interpretation_revision = encode_interpretation(&self.interpretation)
-            .map_err(|e| e.to_string())?
-            .revision();
-        if let Some(publication) = &mut self.publication {
-            publication.definition_revision = definition_revision;
-            publication.interpretation_revision = interpretation_revision;
-            publication.output.object_id = self.interpretation.target.object_id.clone();
-        }
-        if self.publication.is_some() != self.output_version.is_some() {
-            return Err("fixture publication/output presence differ".into());
-        }
-        let source = MvAcceleratorSourceRevision {
-            target: ConnectorTableIdentity {
-                instance_id: ConnectorInstanceId::parse(
-                    self.target.catalog().ok_or("fixture catalog required")?,
+        .unwrap();
+        assert_eq!(decoded, f.interpretation);
+        assert_eq!(
+            decoded.aggregates[0].state_slot_ids,
+            vec![state_slot_id(42), state_slot_id(41)]
+        );
+        assert_eq!(
+            decoded
+                .state_slots
+                .iter()
+                .find(|s| s.slot_id == state_slot_id(41))
+                .unwrap()
+                .role,
+            StateRole::AvgCount
+        );
+        assert_eq!(
+            decoded
+                .state_slots
+                .iter()
+                .find(|s| s.slot_id == state_slot_id(42))
+                .unwrap()
+                .role,
+            StateRole::AvgSum
+        );
+        assert_eq!(
+            decoded
+                .target
+                .fields
+                .iter()
+                .filter(|f| f.target_field_id == field_id(35))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn pure_shapes_retain_exact_repeated_source_facts_and_binding_bound() {
+        let f = MvDocumentFixture::new();
+        assert_eq!(
+            f.definition
+                .relation_occurrences
+                .iter()
+                .map(|r| r.occurrence_id)
+                .collect::<Vec<_>>(),
+            vec![7, 8]
+        );
+        assert_eq!(
+            f.definition.relation_occurrences[0].object_id,
+            f.definition.relation_occurrences[1].object_id
+        );
+        let formats = f
+            .definition
+            .relation_occurrences
+            .iter()
+            .map(|occurrence| {
+                let raw =
+                    super::super::exact_revision::restore_persisted_object(&occurrence.object_id)
+                        .unwrap();
+                assert_eq!(raw.as_bytes().as_ref(), &[11]);
+                let exact = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                    ConnectorProviderId::parse("iceberg").unwrap(),
+                    &raw,
+                    Some(9),
                 )
-                .map_err(|e| e.to_string())?,
-                namespace: self.target.namespace().into(),
-                table: self.target.name().into(),
+                .unwrap();
+                let (persisted, _) =
+                    super::super::exact_revision::persist_exact_connector_revision(&exact).unwrap();
+                assert_eq!(persisted, occurrence.object_id);
+                let format = DataVersionFormat::from_issued_fact(exact.data_version()).unwrap();
+                assert_eq!(format.max_value_bytes, 9);
+                format
+            })
+            .collect();
+        let versions = build_keyed_versions(
+            &f.definition,
+            &f.interpretation,
+            BindingDocument {
+                data_versions: formats,
             },
-            target_object_id: self.object_id,
-            metadata_version: MvAcceleratorCommittedVersionRevision::from_committed(
-                &self.metadata_version,
-            ),
-            definition_revision,
-            interpretation_revision,
-            publication_revision: self
-                .publication
-                .as_ref()
-                .map(encode_publication)
-                .transpose()
-                .map_err(|e| e.to_string())?
-                .map(|value| value.revision()),
-            publication_output_version: self
-                .output_version
-                .as_ref()
-                .map(MvAcceleratorCommittedVersionRevision::from_committed),
-            configuration_revision: encode_configuration(&self.configuration)
-                .map_err(|e| e.to_string())?
-                .revision(),
-            deployment_owner: DeploymentOwner::parse("test-deployment").expect("fixture owner"),
-            process_incarnation: ProcessIncarnation::parse("test-process")
-                .expect("fixture incarnation"),
-        };
-        MvDocumentProjection::try_from_parts(
-            source,
-            self.metadata_version,
-            self.definition,
-            self.interpretation,
-            self.configuration,
-            self.publication.zip(self.output_version),
-            self.storage_rows,
         )
+        .unwrap();
+        assert_eq!(
+            versions.definition_revision(),
+            f.interpretation.definition_revision
+        );
+        assert_eq!(
+            versions.definition_revision(),
+            definition_revision(&f.definition).unwrap()
+        );
+        assert_eq!(
+            versions.interpretation.references().get("definition"),
+            Some(&versions.definition.identity())
+        );
+    }
+
+    #[test]
+    fn pure_retraction_shape_keeps_internal_owner_and_nonnull_count() {
+        let f = MvDocumentFixture::new().with_retraction_count();
+        validate_definition_interpretation(
+            &f.definition,
+            definition_revision(&f.definition).unwrap(),
+            &f.interpretation,
+        )
+        .unwrap();
+        let internal = f
+            .interpretation
+            .aggregates
+            .iter()
+            .find(|a| a.function_identity == INTERNAL_RETRACTION_COUNT_FUNCTION_IDENTITY)
+            .unwrap();
+        assert_eq!(
+            internal.aggregate_id,
+            internal_retraction_count_aggregate_identity()
+        );
+        assert_eq!(internal.state_slot_ids, vec![state_slot_id(42)]);
+        assert!(internal.source_fields.is_empty());
+        assert_eq!(internal.branch_id, None);
+        let count = f
+            .interpretation
+            .state_slots
+            .iter()
+            .find(|s| s.slot_id == state_slot_id(42))
+            .unwrap();
+        assert_eq!(count.role, StateRole::RetractionCount);
+        assert_eq!(count.type_signature, "bigint");
+        assert!(!count.nullable);
     }
 }
 
-pub fn sample_projection(target: MvTarget, snapshot_id: Option<i64>) -> MvDocumentProjection {
-    ProjectionFixture::new(target, snapshot_id)
-        .build()
-        .expect("validated fixture projection")
-}
-
-/// Test-only adapter for exercising the production reservation/source protocol.
-pub fn observed_current(
-    facts: &MvDocumentProjection,
-    catalog: novarocks_spi::connector::CatalogHandle,
-) -> super::documents::MvObservedCurrentDocuments {
-    use super::projection::MvPublicationState;
-    let source = facts.source_revision();
-    let (publication, output_version) = match facts.publication() {
-        MvPublicationState::NeverPublished => (None, None),
-        MvPublicationState::Published(value) => (
-            Some(value.document().clone()),
-            Some(value.output_version().clone()),
-        ),
-    };
-    super::documents::MvObservedCurrentDocuments {
-        management_target: crate::management::ManagedMvTarget::try_new(
-            catalog,
-            source.target.clone(),
-            source.target_object_id.clone(),
-        )
-        .expect("fixture catalog"),
-        deployment_owner: source.deployment_owner.clone(),
-        process_incarnation: source.process_incarnation.clone(),
-        target: source.target.clone(),
-        target_object_id: source.target_object_id.clone(),
-        metadata_version: facts.metadata_version().clone(),
-        definition: facts.definition().clone(),
-        definition_revision: source.definition_revision,
-        interpretation: facts.interpretation().clone(),
-        interpretation_revision: source.interpretation_revision,
-        publication,
-        publication_revision: source.publication_revision,
-        publication_output_version: output_version,
-        configuration: facts.configuration().clone(),
-        configuration_revision: source.configuration_revision,
-    }
-}
+#[path = "keyed_fixture.rs"]
+mod keyed_fixture;
+pub use keyed_fixture::{KeyedProjectionFixture, observed_current_keyed, sample_keyed_projection};

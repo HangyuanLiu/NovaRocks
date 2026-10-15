@@ -31,14 +31,13 @@ use sha2::{Digest, Sha256};
 
 use super::{
     CatalogHandle, ConnectorColumnDefinition, ConnectorControlRuntimeId,
-    ConnectorDocumentCreatePublicationIntent, ConnectorDocumentManagementAdmission, ConnectorError,
-    ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorMutationFailure,
-    ConnectorMutationOperationId, ConnectorPartitionTransform, ConnectorProviderBindingKey,
-    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableObjectId,
-    ConnectorWriteLease, ConnectorWriteReceipt, CreatePolicy, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, LakePublicationId,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MvExactPartitionField, MvExactPartitionTransform,
-    ProviderBindingEpoch,
+    ConnectorDocumentManagementAdmission, ConnectorError, ConnectorErrorKind,
+    ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationOperationId,
+    ConnectorPartitionTransform, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableObjectId, ConnectorWriteLease,
+    ConnectorWriteReceipt, CreatePolicy, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MvExactPartitionField, MvExactPartitionTransform, ProviderBindingEpoch,
 };
 
 pub const CONNECTOR_STAGED_CREATE_CONTRACT_VERSION: u32 = 1;
@@ -681,7 +680,6 @@ pub enum ConnectorStagedCreatePrepareOutcome {
 #[derive(Clone)]
 pub enum ConnectorStagedCreatePublicationPayload {
     Ordinary,
-    ApplicationDocuments(ConnectorDocumentCreatePublicationIntent),
     KeyedDocuments(super::KeyedCreateIntent),
 }
 
@@ -1391,9 +1389,6 @@ impl ConnectorStagedCreateLease {
             ConnectorStagedCreatePublicationPayload::Ordinary
                 if request.handle.document_target().is_none() => {}
             ConnectorStagedCreatePublicationPayload::KeyedDocuments(intent) => {
-                intent.validate_for_handle(&request.handle)?;
-            }
-            ConnectorStagedCreatePublicationPayload::ApplicationDocuments(intent) => {
                 intent.validate_for_handle(&request.handle)?;
             }
             _ => {

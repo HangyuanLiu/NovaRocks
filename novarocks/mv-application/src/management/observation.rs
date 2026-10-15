@@ -20,7 +20,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use novarocks_spi::connector::{ConnectorCommittedVersion, ConnectorDocumentManagementObservation};
+use novarocks_spi::connector::ConnectorCommittedVersion;
 
 use super::{
     CreateIntent, DeploymentOwner, EffectIdentity, ManagedMvTarget, ManagementOwnershipError,
@@ -107,24 +107,6 @@ pub struct FreshManagementObservation {
 }
 
 impl FreshManagementObservation {
-    fn try_from_connector(
-        request_id: ManagementObservationRequestId,
-        expected_target: &ManagedMvTarget,
-        observation: &ConnectorDocumentManagementObservation,
-    ) -> Result<Self, ManagementObservationError> {
-        observation
-            .validate_sealed()
-            .map_err(|_| ManagementObservationError::UnsealedObservation)?;
-        expected_target.validate_observation(observation)?;
-        Ok(Self {
-            request_id,
-            target: expected_target.clone(),
-            owner: DeploymentOwner::parse(observation.marker().owner())?,
-            incarnation: ProcessIncarnation::parse(observation.marker().incarnation())?,
-            metadata_version: observation.metadata_version().clone(),
-        })
-    }
-
     pub const fn target(&self) -> &ManagedMvTarget {
         &self.target
     }
@@ -227,21 +209,6 @@ impl PendingCreateIntentObservation {
     pub(super) const fn for_intent(intent: CreateIntent) -> Self {
         Self { intent }
     }
-
-    pub fn complete(
-        self,
-        observation: &ConnectorDocumentManagementObservation,
-    ) -> Result<FreshCreateIntentObservation, ManagementObservationError> {
-        observation
-            .validate_sealed()
-            .map_err(|_| ManagementObservationError::UnsealedObservation)?;
-        let target = ManagedMvTarget::from_observation(observation)?;
-        let target = self.intent.bind_target(target)?;
-        Ok(FreshCreateIntentObservation {
-            intent: self.intent,
-            target,
-        })
-    }
 }
 
 /// Exact provider observation that may narrow one previously unbound CREATE
@@ -318,13 +285,6 @@ impl PendingManagementObservation {
             metadata_version: view.metadata_version.clone(),
         };
         Ok((fresh, view))
-    }
-
-    pub fn complete(
-        self,
-        observation: &ConnectorDocumentManagementObservation,
-    ) -> Result<FreshManagementObservation, ManagementObservationError> {
-        FreshManagementObservation::try_from_connector(self.request_id, &self.target, observation)
     }
 }
 
@@ -514,31 +474,6 @@ impl ManagementObservationState {
             self.close_for_observation_error(&result);
         }
         result
-    }
-
-    /// Complete one exact request and apply it atomically to the state. This
-    /// path can close admission on object replacement; callers must not turn a
-    /// failed exact observation into a candidate miss.
-    pub fn complete_current_observation(
-        &mut self,
-        pending: PendingManagementObservation,
-        observation: &ConnectorDocumentManagementObservation,
-    ) -> Result<ManagementObservationPhase, ManagementObservationError> {
-        self.consume_current_request(pending.request_id)?;
-        let fresh = match pending.complete(observation) {
-            Ok(fresh) => fresh,
-            Err(error) => {
-                if matches!(
-                    error,
-                    ManagementObservationError::Ownership(ManagementOwnershipError::TargetReplaced)
-                ) {
-                    self.phase = ManagementObservationPhase::ClosedObjectReplacement;
-                    self.liveness.close();
-                }
-                return Err(error);
-            }
-        };
-        self.apply_current_observation(fresh)
     }
 
     /// Consume the current ticket even when a keyed provider observation fails.

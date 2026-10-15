@@ -44,11 +44,11 @@ use crate::connector::write_stack::runtime::{
 };
 use crate::connector::write_stack::target::{WriteTargetOrdinal, validate_dense_target_ordinals};
 use crate::connector::{
-    ConnectorDocumentPublicationDeclaration, ConnectorDocumentPublicationIntent,
-    ConnectorManagedPublicationIntent, ConnectorRowMutationEffect, ConnectorTableHandle,
-    ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion,
-    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
-    ConnectorWriteReceipt, ConnectorWriteRouteId, ConnectorWriteTargetRef,
+    ConnectorDocumentPublicationDeclaration, ConnectorManagedPublicationIntent,
+    ConnectorRowMutationEffect, ConnectorTableHandle, ConnectorWriteAbortOutcome,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion, ConnectorWriteInputRequest,
+    ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWriteReceipt, ConnectorWriteRouteId,
+    ConnectorWriteTargetRef,
 };
 use crate::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorProviderBindingKey, ConnectorRequestContext,
@@ -1074,7 +1074,6 @@ pub struct ConnectorWriteFinishRequest<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorWriteFinishPublication {
     None,
-    ApplicationDocuments(ConnectorDocumentPublicationIntent),
     KeyedDocuments(crate::connector::KeyedPublicationIntent),
 }
 

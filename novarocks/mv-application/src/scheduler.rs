@@ -23,9 +23,7 @@ use crate::persistence::codec::{
     ConfigurationDocument, PublicationInput, RefreshPolicy, RelationOccurrence,
 };
 use crate::persistence::definition::MvAcceleratorSourceRevision;
-use crate::persistence::projection::{
-    MvDocumentProjection, MvPublicationState, StoredMvProjection,
-};
+use crate::persistence::keyed_documents::StoredKeyedMvProjection;
 use crate::persistence::validation::validate_configuration;
 use crate::product::MvTarget;
 use crate::scheduler_runtime::{
@@ -41,30 +39,6 @@ pub enum MvSchedulerSemanticDecision {
     OnChangeNotDue,
     OnChangeDue,
     Invalid { reason: String },
-}
-
-/// Interpret C and the exact publication facts retained in a validated root.
-/// Current inputs are addressed by D occurrence, not FQN or a numeric snapshot.
-pub fn mv_scheduler_semantic_decision(
-    facts: &MvDocumentProjection,
-    now_ms: i64,
-    current_inputs: Option<&[PublicationInput]>,
-) -> MvSchedulerSemanticDecision {
-    if let Some(inputs) = current_inputs {
-        if let Err(reason) =
-            validate_current_inputs(&facts.definition().relation_occurrences, inputs)
-        {
-            return MvSchedulerSemanticDecision::Invalid { reason };
-        }
-    }
-    let publication = match facts.publication() {
-        MvPublicationState::NeverPublished => None,
-        MvPublicationState::Published(published) => Some((
-            published.document().publication_prepared_at_ms,
-            published.document().inputs.as_slice(),
-        )),
-    };
-    semantic_decision(facts.configuration(), publication, now_ms, current_inputs)
 }
 
 fn semantic_decision(
@@ -164,60 +138,6 @@ fn exact_inputs_match(published: &[PublicationInput], current: &[PublicationInpu
             .all(|input| by_occurrence.get(&input.relation_occurrence_id).copied() == Some(input))
 }
 
-/// One compile-time selected projection representation per scheduler owner.
-pub trait MvSchedulerProjection: Clone + std::fmt::Debug {
-    fn scheduler_id(&self) -> i64;
-    fn scheduler_source_revision(&self) -> &MvAcceleratorSourceRevision;
-    fn scheduler_definition(&self) -> &crate::persistence::codec::DefinitionDocument;
-    fn scheduler_configuration(&self) -> &ConfigurationDocument;
-    fn scheduler_decision(
-        &self,
-        now_ms: i64,
-        inputs: Option<&[PublicationInput]>,
-    ) -> MvSchedulerSemanticDecision;
-}
-impl MvSchedulerProjection for StoredMvProjection {
-    fn scheduler_id(&self) -> i64 {
-        self.mv_id
-    }
-    fn scheduler_source_revision(&self) -> &MvAcceleratorSourceRevision {
-        self.facts.source_revision()
-    }
-    fn scheduler_definition(&self) -> &crate::persistence::codec::DefinitionDocument {
-        self.facts.definition()
-    }
-    fn scheduler_configuration(&self) -> &ConfigurationDocument {
-        self.facts.configuration()
-    }
-    fn scheduler_decision(
-        &self,
-        now: i64,
-        inputs: Option<&[PublicationInput]>,
-    ) -> MvSchedulerSemanticDecision {
-        mv_scheduler_semantic_decision(&self.facts, now, inputs)
-    }
-}
-impl MvSchedulerProjection for crate::persistence::keyed_documents::StoredKeyedMvProjection {
-    fn scheduler_id(&self) -> i64 {
-        self.mv_id
-    }
-    fn scheduler_source_revision(&self) -> &MvAcceleratorSourceRevision {
-        self.facts.source_revision()
-    }
-    fn scheduler_definition(&self) -> &crate::persistence::codec::DefinitionDocument {
-        self.facts.definition()
-    }
-    fn scheduler_configuration(&self) -> &ConfigurationDocument {
-        self.facts.configuration()
-    }
-    fn scheduler_decision(
-        &self,
-        now: i64,
-        inputs: Option<&[PublicationInput]>,
-    ) -> MvSchedulerSemanticDecision {
-        mv_keyed_scheduler_semantic_decision(&self.facts, now, inputs)
-    }
-}
 pub fn mv_keyed_scheduler_semantic_decision(
     facts: &crate::persistence::keyed_documents::MvKeyedDocumentProjection,
     now: i64,
@@ -247,14 +167,14 @@ pub enum MvScheduledRefreshReason {
 }
 
 #[derive(Clone, Debug)]
-pub struct MvScheduledRefreshRequest<P = StoredMvProjection> {
-    projection: P,
+pub struct MvScheduledRefreshRequest {
+    projection: StoredKeyedMvProjection,
     target: MvTarget,
     reason: MvScheduledRefreshReason,
 }
 
-impl<P> MvScheduledRefreshRequest<P> {
-    pub fn projection(&self) -> &P {
+impl MvScheduledRefreshRequest {
+    pub fn projection(&self) -> &StoredKeyedMvProjection {
         &self.projection
     }
     pub fn target(&self) -> &MvTarget {
@@ -266,31 +186,30 @@ impl<P> MvScheduledRefreshRequest<P> {
 }
 
 /// Frozen D/C/P facts whose Current source observation is still outstanding.
-pub struct MvCurrentInputObservation<P = StoredMvProjection> {
-    projection: P,
+pub struct MvCurrentInputObservation {
+    projection: StoredKeyedMvProjection,
     target: MvTarget,
 }
 
-impl<P: MvSchedulerProjection> MvCurrentInputObservation<P> {
+impl MvCurrentInputObservation {
     pub fn target(&self) -> &MvTarget {
         &self.target
     }
-    pub fn projection(&self) -> &P {
+    pub fn projection(&self) -> &StoredKeyedMvProjection {
         &self.projection
     }
     pub fn occurrences(&self) -> &[RelationOccurrence] {
-        &self.projection.scheduler_definition().relation_occurrences
+        &self.projection.facts.definition().relation_occurrences
     }
 }
 
 #[derive(Debug)]
-pub struct MvRefreshScheduler<P: MvSchedulerProjection = StoredMvProjection> {
-    runtime:
-        MvRefreshProductRuntime<i64, MvAcceleratorSourceRevision, MvScheduledRefreshRequest<P>>,
+pub struct MvRefreshScheduler {
+    runtime: MvRefreshProductRuntime<i64, MvAcceleratorSourceRevision, MvScheduledRefreshRequest>,
 }
 
-impl<P: MvSchedulerProjection> MvRefreshScheduler<P> {
-    pub fn for_projection(config: MvSchedulerConfig) -> Self {
+impl MvRefreshScheduler {
+    pub fn new(config: MvSchedulerConfig) -> Self {
         Self {
             runtime: MvRefreshProductRuntime::new(config),
         }
@@ -301,27 +220,27 @@ impl<P: MvSchedulerProjection> MvRefreshScheduler<P> {
 
     pub fn observe_projection(
         &mut self,
-        projection: P,
+        projection: StoredKeyedMvProjection,
         now_ms: i64,
-    ) -> Option<MvCurrentInputObservation<P>> {
+    ) -> Option<MvCurrentInputObservation> {
         if !self.runtime.enabled()
             || !self.runtime.begin_observation(
-                projection.scheduler_id(),
-                projection.scheduler_source_revision().clone(),
+                projection.mv_id,
+                projection.facts.source_revision().clone(),
                 now_ms,
             )
-            || projection.scheduler_configuration().paused
+            || projection.facts.configuration().paused
         {
             return None;
         }
-        let target = &projection.scheduler_source_revision().target;
+        let target = &projection.facts.source_revision().target;
         let target = MvTarget::from_parts(
             Some(target.instance_id.as_str()),
             &target.namespace,
             &target.table,
         );
         if matches!(
-            projection.scheduler_configuration().refresh_policy,
+            projection.facts.configuration().refresh_policy,
             RefreshPolicy::AsyncOnChange
         ) {
             return Some(MvCurrentInputObservation { projection, target });
@@ -332,7 +251,7 @@ impl<P: MvSchedulerProjection> MvRefreshScheduler<P> {
 
     pub fn resolve_current_inputs(
         &mut self,
-        observation: MvCurrentInputObservation<P>,
+        observation: MvCurrentInputObservation,
         current_inputs: Vec<PublicationInput>,
         now_ms: i64,
     ) {
@@ -346,38 +265,37 @@ impl<P: MvSchedulerProjection> MvRefreshScheduler<P> {
 
     pub fn record_observation_failure(
         &mut self,
-        observation: &MvCurrentInputObservation<P>,
+        observation: &MvCurrentInputObservation,
         disposition: MvRefreshDisposition,
         now_ms: i64,
     ) {
         if self.runtime.is_current_source(
-            &observation.projection.scheduler_id(),
-            observation.projection.scheduler_source_revision(),
+            &observation.projection.mv_id,
+            observation.projection.facts.source_revision(),
         ) {
-            let _ =
-                self.runtime
-                    .record(&observation.projection.scheduler_id(), disposition, now_ms);
+            let _ = self
+                .runtime
+                .record(&observation.projection.mv_id, disposition, now_ms);
         }
     }
 
-    pub fn take_ready(&mut self) -> Vec<MvScheduledRefreshRequest<P>> {
+    pub fn take_ready(&mut self) -> Vec<MvScheduledRefreshRequest> {
         self.runtime.take_ready()
     }
     pub fn mark_started(&mut self, mv_id: i64) -> bool {
         self.runtime.mark_started(&mv_id)
     }
-    pub fn requeue(&mut self, request: MvScheduledRefreshRequest<P>) {
-        self.runtime
-            .requeue(request.projection.scheduler_id(), request);
+    pub fn requeue(&mut self, request: MvScheduledRefreshRequest) {
+        self.runtime.requeue(request.projection.mv_id, request);
     }
     pub fn complete(
         &mut self,
-        request: &MvScheduledRefreshRequest<P>,
+        request: &MvScheduledRefreshRequest,
         disposition: MvRefreshDisposition,
         now_ms: i64,
     ) -> MvRefreshRuntimeDecision {
         self.runtime
-            .complete(&request.projection.scheduler_id(), disposition, now_ms)
+            .complete(&request.projection.mv_id, disposition, now_ms)
     }
     pub fn record(
         &mut self,
@@ -390,47 +308,42 @@ impl<P: MvSchedulerProjection> MvRefreshScheduler<P> {
 
     fn apply_semantic_decision(
         &mut self,
-        projection: P,
+        projection: StoredKeyedMvProjection,
         target: MvTarget,
         current_inputs: Option<&[PublicationInput]>,
         now_ms: i64,
     ) {
-        if !self.runtime.is_current_source(
-            &projection.scheduler_id(),
-            projection.scheduler_source_revision(),
-        ) {
+        if !self
+            .runtime
+            .is_current_source(&projection.mv_id, projection.facts.source_revision())
+        {
             return;
         }
-        let reason = match projection.scheduler_decision(now_ms, current_inputs) {
-            MvSchedulerSemanticDecision::IntervalDue => MvScheduledRefreshReason::Interval,
-            MvSchedulerSemanticDecision::OnChangeDue => MvScheduledRefreshReason::SourceChange,
-            MvSchedulerSemanticDecision::Paused
-            | MvSchedulerSemanticDecision::Manual
-            | MvSchedulerSemanticDecision::IntervalNotDue { .. }
-            | MvSchedulerSemanticDecision::OnChangeNotDue => return,
-            MvSchedulerSemanticDecision::Invalid { reason } => {
-                self.runtime.record(
-                    &projection.scheduler_id(),
-                    MvRefreshDisposition::InvalidDefinition(reason.into()),
-                    now_ms,
-                );
-                return;
-            }
-        };
+        let reason =
+            match mv_keyed_scheduler_semantic_decision(&projection.facts, now_ms, current_inputs) {
+                MvSchedulerSemanticDecision::IntervalDue => MvScheduledRefreshReason::Interval,
+                MvSchedulerSemanticDecision::OnChangeDue => MvScheduledRefreshReason::SourceChange,
+                MvSchedulerSemanticDecision::Paused
+                | MvSchedulerSemanticDecision::Manual
+                | MvSchedulerSemanticDecision::IntervalNotDue { .. }
+                | MvSchedulerSemanticDecision::OnChangeNotDue => return,
+                MvSchedulerSemanticDecision::Invalid { reason } => {
+                    self.runtime.record(
+                        &projection.mv_id,
+                        MvRefreshDisposition::InvalidDefinition(reason.into()),
+                        now_ms,
+                    );
+                    return;
+                }
+            };
         self.runtime.enqueue(
-            projection.scheduler_id(),
+            projection.mv_id,
             MvScheduledRefreshRequest {
                 projection,
                 target,
                 reason,
             },
         );
-    }
-}
-
-impl MvRefreshScheduler<StoredMvProjection> {
-    pub fn new(config: MvSchedulerConfig) -> Self {
-        Self::for_projection(config)
     }
 }
 
@@ -493,274 +406,5 @@ impl Default for MvSchedulerConfig {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::persistence::codec::PublicationDocument;
-    use crate::persistence::codec::{PublicationKind, PublicationOutput, PublicationStatistics};
-    use crate::persistence::identity::{
-        DocumentRevision, NativeDataVersion, ObjectIdentity, PublicationIdentity, SchemaVersion,
-    };
-    use crate::persistence::test_support::ProjectionFixture;
-
-    fn stored(mv_id: i64, fixture: ProjectionFixture) -> StoredMvProjection {
-        StoredMvProjection {
-            mv_id,
-            facts: fixture.build().expect("valid scheduler projection"),
-        }
-    }
-
-    fn target() -> MvTarget {
-        MvTarget::from_parts(Some("ice"), "sales", "mv")
-    }
-
-    fn published_inputs(projection: &StoredMvProjection) -> Vec<PublicationInput> {
-        match projection.facts.publication() {
-            MvPublicationState::Published(published) => published.document().inputs.clone(),
-            MvPublicationState::NeverPublished => panic!("test projection must be published"),
-        }
-    }
-
-    fn configuration(policy: RefreshPolicy) -> ConfigurationDocument {
-        ConfigurationDocument {
-            refresh_policy: policy,
-            paused: false,
-            refresh_interval_ms: matches!(policy, RefreshPolicy::AsyncInterval).then_some(100),
-            max_staleness_ms: None,
-        }
-    }
-    fn input(id: u32, object: &[u8], version: &[u8]) -> PublicationInput {
-        PublicationInput {
-            relation_occurrence_id: id,
-            object_id: ObjectIdentity::try_new(object.to_vec()).unwrap(),
-            native_data_version: NativeDataVersion::try_new(version.to_vec()).unwrap(),
-        }
-    }
-    fn publication(inputs: Vec<PublicationInput>) -> PublicationDocument {
-        PublicationDocument {
-            publication_id: PublicationIdentity::try_new(vec![1]).unwrap(),
-            definition_revision: DocumentRevision::from_canonical_bytes(b"D"),
-            interpretation_revision: DocumentRevision::from_canonical_bytes(b"L"),
-            publication_prepared_at_ms: 1_000,
-            inputs,
-            output: PublicationOutput {
-                object_id: ObjectIdentity::try_new(b"target".to_vec()).unwrap(),
-                empty_result: false,
-            },
-            kind: PublicationKind::FullRefresh,
-            statistics: PublicationStatistics::default(),
-        }
-    }
-    fn occurrence(id: u32) -> RelationOccurrence {
-        RelationOccurrence {
-            occurrence_id: id,
-            catalog_at_binding: "iceberg".to_string(),
-            namespace_at_binding: "db".to_string(),
-            relation_at_binding: "base".to_string(),
-            qualifier_at_binding: "base".to_string(),
-            object_id: ObjectIdentity::try_new(b"source".to_vec()).unwrap(),
-            schema_version: SchemaVersion::try_new(vec![1]).unwrap(),
-            fields: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn default_policy_preserves_the_deployed_scheduler_bounds() {
-        assert_eq!(
-            MvSchedulerConfig::default(),
-            MvSchedulerConfig::new(false, 30_000, 1, 60_000, 1_800_000)
-        );
-    }
-    #[test]
-    fn interval_uses_published_fact_time_not_accelerator_insertion_time() {
-        let c = configuration(RefreshPolicy::AsyncInterval);
-        let p = publication(vec![input(7, b"source", b"v1")]);
-        assert_eq!(
-            semantic_decision(
-                &c,
-                Some((p.publication_prepared_at_ms, p.inputs.as_slice())),
-                1_099,
-                None
-            ),
-            MvSchedulerSemanticDecision::IntervalNotDue {
-                eligible_at_ms: 1_100
-            }
-        );
-        assert_eq!(
-            semantic_decision(
-                &c,
-                Some((p.publication_prepared_at_ms, p.inputs.as_slice())),
-                1_100,
-                None
-            ),
-            MvSchedulerSemanticDecision::IntervalDue
-        );
-        assert_eq!(
-            semantic_decision(&c, None, 1_099, None),
-            MvSchedulerSemanticDecision::IntervalDue
-        );
-    }
-    #[test]
-    fn on_change_compares_each_occurrence_and_complete_opaque_revision() {
-        let c = configuration(RefreshPolicy::AsyncOnChange);
-        let inputs = vec![input(7, b"source", b"v1"), input(42, b"source", b"v2")];
-        let p = publication(inputs.clone());
-        let mut reordered = inputs.clone();
-        reordered.reverse();
-        assert_eq!(
-            semantic_decision(
-                &c,
-                Some((p.publication_prepared_at_ms, p.inputs.as_slice())),
-                2_000,
-                Some(&reordered)
-            ),
-            MvSchedulerSemanticDecision::OnChangeNotDue
-        );
-        for changed in [
-            vec![input(7, b"source", b"v2"), input(42, b"source", b"v1")],
-            vec![input(7, b"replacement", b"v1"), inputs[1].clone()],
-            vec![inputs[0].clone()],
-        ] {
-            assert_eq!(
-                semantic_decision(
-                    &c,
-                    Some((p.publication_prepared_at_ms, p.inputs.as_slice())),
-                    2_000,
-                    Some(&changed)
-                ),
-                MvSchedulerSemanticDecision::OnChangeDue
-            );
-        }
-    }
-    #[test]
-    fn observations_require_every_occurrence_without_fqn_deduplication() {
-        let definition = vec![occurrence(7), occurrence(42)];
-        let current = vec![input(42, b"source", b"v2"), input(7, b"source", b"v1")];
-        assert!(validate_current_inputs(&definition, &current).is_ok());
-        for invalid in [
-            vec![current[0].clone()],
-            vec![current[0].clone(), current[0].clone()],
-            vec![current[0].clone(), input(99, b"source", b"v1")],
-            vec![current[0].clone(), input(7, b"replacement", b"v1")],
-        ] {
-            assert!(validate_current_inputs(&definition, &invalid).is_err());
-        }
-    }
-    #[test]
-    fn paused_manual_and_missing_observation_are_explicit() {
-        let mut paused = configuration(RefreshPolicy::AsyncInterval);
-        paused.paused = true;
-        assert_eq!(
-            semantic_decision(&paused, None, 100, None),
-            MvSchedulerSemanticDecision::Paused
-        );
-        assert_eq!(
-            semantic_decision(&configuration(RefreshPolicy::Manual), None, 100, None),
-            MvSchedulerSemanticDecision::Manual
-        );
-        assert!(matches!(
-            semantic_decision(
-                &configuration(RefreshPolicy::AsyncOnChange),
-                None,
-                100,
-                None
-            ),
-            MvSchedulerSemanticDecision::Invalid { .. }
-        ));
-        assert_eq!(
-            semantic_decision(
-                &configuration(RefreshPolicy::AsyncOnChange),
-                None,
-                100,
-                Some(&[input(7, b"source", b"empty-version")])
-            ),
-            MvSchedulerSemanticDecision::OnChangeDue
-        );
-    }
-    #[test]
-    fn duplicate_inputs_never_equal_a_publication() {
-        let expected = vec![input(7, b"source", b"v1"), input(42, b"source", b"v2")];
-        assert!(!exact_inputs_match(
-            &expected,
-            &[expected[0].clone(), expected[0].clone()]
-        ));
-    }
-
-    #[test]
-    fn concrete_interval_scheduler_consumes_the_validated_projection() {
-        let projection = stored(7, ProjectionFixture::new(target(), Some(11)));
-        let mut scheduler =
-            MvRefreshScheduler::new(MvSchedulerConfig::new(true, 30_000, 1, 10, 40));
-
-        assert!(
-            scheduler
-                .observe_projection(projection, 1_700_000_061_000)
-                .is_none()
-        );
-        let ready = scheduler.take_ready();
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].projection().mv_id, 7);
-        assert_eq!(ready[0].target(), &target());
-    }
-
-    #[test]
-    fn a_stale_observation_failure_cannot_block_a_newer_configuration() {
-        let mut first = ProjectionFixture::new(target(), Some(11));
-        first.configuration = configuration(RefreshPolicy::AsyncOnChange);
-        let first = stored(7, first);
-        let mut second = ProjectionFixture::new(target(), Some(11));
-        second.configuration = configuration(RefreshPolicy::AsyncOnChange);
-        second.configuration.max_staleness_ms = Some(1_000);
-        let second = stored(7, second);
-        let current = published_inputs(&second);
-        let mut scheduler =
-            MvRefreshScheduler::new(MvSchedulerConfig::new(true, 30_000, 1, 10, 40));
-
-        let stale = scheduler
-            .observe_projection(first, 1_700_000_002_000)
-            .expect("first observation");
-        let current_observation = scheduler
-            .observe_projection(second, 1_700_000_002_000)
-            .expect("new configuration observation");
-        scheduler.record_observation_failure(
-            &stale,
-            MvRefreshDisposition::TerminalFailure("late failure".to_string().into()),
-            1_700_000_002_000,
-        );
-        let mut changed = current;
-        changed[0].native_data_version = NativeDataVersion::try_new(b"changed".to_vec()).unwrap();
-        scheduler.resolve_current_inputs(current_observation, changed, 1_700_000_002_000);
-
-        assert_eq!(scheduler.take_ready().len(), 1);
-    }
-    #[test]
-    fn concrete_scheduler_has_explicit_terminal_decisions() {
-        let mut scheduler =
-            MvRefreshScheduler::new(MvSchedulerConfig::new(true, 30_000, 1, 10, 40));
-        assert_eq!(
-            scheduler.record(7, MvRefreshDisposition::Completed, 100),
-            MvRefreshRuntimeDecision::Success
-        );
-        assert_eq!(
-            scheduler.record(
-                7,
-                MvRefreshDisposition::TransientUnavailable("offline".to_string().into()),
-                100
-            ),
-            MvRefreshRuntimeDecision::TransientBackoff {
-                error: "offline".to_string().into(),
-                retry_at_ms: 110
-            }
-        );
-        for disposition in [
-            MvRefreshDisposition::InvalidDefinition("bad".to_string().into()),
-            MvRefreshDisposition::TerminalFailure("terminal".to_string().into()),
-            MvRefreshDisposition::Corruption("corrupt".to_string().into()),
-            MvRefreshDisposition::InvariantViolation("invariant".to_string().into()),
-        ] {
-            assert!(matches!(
-                scheduler.record(7, disposition, 100),
-                MvRefreshRuntimeDecision::Blocked { .. }
-            ));
-        }
-    }
-}
+#[path = "scheduler_tests.rs"]
+mod tests;

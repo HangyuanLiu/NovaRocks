@@ -24,7 +24,7 @@ use crate::product::{
     MvRefreshAttemptIdentity, MvStagedTarget, MvTarget,
 };
 use crate::publication::MvRefreshPublicationFinalizationFacts;
-use crate::readiness::{MvDropReadiness, MvProjectionDeleteGuard};
+use crate::readiness::{MvDropReadiness, MvKeyedProjectionDeleteGuard};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MvProviderFailureKind {
@@ -194,7 +194,7 @@ pub trait MvDropCatalogRegistrationPort: Send + Sync {
 /// The product-owned durable side of DROP. An outer adapter may bridge sync
 /// execution, but cannot reinterpret missing-target policy, dependency safety,
 /// or the exact post-provider-delete CAS.
-pub trait MvDropProjectionPort<G = MvProjectionDeleteGuard>: Send + Sync {
+pub trait MvDropProjectionPort<G = MvKeyedProjectionDeleteGuard>: Send + Sync {
     fn prepare_drop(
         &self,
         operation: MvOperationContext,

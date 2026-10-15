@@ -513,10 +513,6 @@ pub enum ConnectorCatalogMutationOperation {
     /// Typed marker, main-conditioned slot, or full-observation expiry intent.
     /// Each channel admits only the side effects specified by its own shape.
     KeyedDocuments { intent: super::KeyedMutationIntent },
-    /// Legacy metadata document update retained during the PR-local migration.
-    UpdateApplicationDocuments {
-        intent: super::ConnectorDocumentUpdateIntent,
-    },
     DropTable {
         table: ConnectorTableIdentity,
         policy: DropPolicy,
@@ -575,7 +571,6 @@ impl ConnectorCatalogMutationOperation {
             Self::DropNamespace { .. } => "drop-namespace",
             Self::CreateTable { .. } => "create-table",
             Self::KeyedDocuments { .. } => "keyed-documents",
-            Self::UpdateApplicationDocuments { .. } => "update-application-documents",
             Self::DropTable { .. } => "drop-table",
             Self::CreateView { .. } => "create-view",
             Self::DropView { .. } => "drop-view",
@@ -604,9 +599,6 @@ impl ConnectorCatalogMutationOperation {
     ) -> Result<(), ConnectorError> {
         self.validate()?;
         if let Self::KeyedDocuments { intent } = self {
-            intent.validate_for(owner, operation_id)?;
-        }
-        if let Self::UpdateApplicationDocuments { intent } = self {
             intent.validate_for(owner, operation_id)?;
         }
         Ok(())

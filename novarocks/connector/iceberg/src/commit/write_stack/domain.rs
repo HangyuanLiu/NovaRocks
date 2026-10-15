@@ -1959,7 +1959,6 @@ pub struct IcebergCommitHandle {
     /// aggregate requirements are exposed to FE planning.
     statistics_expectations:
         BTreeMap<WriteTargetOrdinal, Vec<novarocks_spi::connector::StatisticsArtifactIdentity>>,
-    document_manifest: std::sync::Mutex<Option<Vec<u8>>>,
     document_records: std::sync::Mutex<Option<BTreeMap<String, String>>>,
     terminal_finalization: std::sync::Mutex<novarocks_spi::connector::ExternalMutationFinalization>,
     recovery_evidence:
@@ -2214,7 +2213,6 @@ impl IcebergCommitHandle {
             copy_on_write,
             repartition,
             statistics_expectations: BTreeMap::new(),
-            document_manifest: std::sync::Mutex::new(None),
             document_records: std::sync::Mutex::new(None),
             terminal_finalization: std::sync::Mutex::new(
                 novarocks_spi::connector::ExternalMutationFinalization::Complete,
@@ -2373,34 +2371,6 @@ impl IcebergCommitHandle {
             .transpose()
     }
 
-    pub fn bind_document_manifest(&self, encoded: &[u8]) -> Result<(), ConnectorError> {
-        if self.document_publication.is_none() {
-            return Err(invalid(
-                "Iceberg ordinary session cannot bind a publication document manifest",
-            ));
-        }
-        let mut slot = self
-            .document_manifest
-            .lock()
-            .map_err(|_| corrupt("Iceberg document manifest lock is poisoned"))?;
-        match slot.as_deref() {
-            None => {
-                *slot = Some(encoded.to_vec());
-                Ok(())
-            }
-            Some(existing) if existing == encoded => Ok(()),
-            Some(_) => Err(invalid(
-                "Iceberg write session is already bound to different publication documents",
-            )),
-        }
-    }
-
-    pub fn document_manifest(&self) -> Result<Option<Vec<u8>>, ConnectorError> {
-        self.document_manifest
-            .lock()
-            .map(|manifest| manifest.clone())
-            .map_err(|_| corrupt("Iceberg document manifest lock is poisoned"))
-    }
     /// The partition replacement this session's commit applies, present only on
     /// a managed publication admitted with one.
     ///

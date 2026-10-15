@@ -18,15 +18,11 @@
 use std::fmt;
 use std::sync::Arc;
 
-use novarocks_spi::connector::{
-    CatalogHandle, ConnectorDocumentManagementObservation, ConnectorTableIdentity,
-    ConnectorTableObjectId,
-};
+use novarocks_spi::connector::{CatalogHandle, ConnectorTableIdentity, ConnectorTableObjectId};
 
 use super::EffectIdentity;
 
 const MAX_IDENTITY_BYTES: usize = 128;
-const MANAGED_MV_KIND: &str = "materialized-view";
 
 /// Stable management owner derived from `[native_trust].deployment_id`.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -82,16 +78,6 @@ impl ManagedMvTarget {
         })
     }
 
-    pub fn from_observation(
-        observation: &ConnectorDocumentManagementObservation,
-    ) -> Result<Self, ManagementOwnershipError> {
-        Self::try_new(
-            observation.catalog_handle().clone(),
-            observation.target().clone(),
-            observation.object_id().clone(),
-        )
-    }
-
     pub const fn catalog(&self) -> &CatalogHandle {
         &self.catalog
     }
@@ -102,22 +88,6 @@ impl ManagedMvTarget {
 
     pub const fn object_id(&self) -> &ConnectorTableObjectId {
         &self.object_id
-    }
-
-    pub(crate) fn validate_observation(
-        &self,
-        observation: &ConnectorDocumentManagementObservation,
-    ) -> Result<(), ManagementOwnershipError> {
-        if observation.catalog_handle() != &self.catalog
-            || observation.target() != &self.table
-            || observation.object_id() != &self.object_id
-        {
-            return Err(ManagementOwnershipError::TargetReplaced);
-        }
-        if observation.marker().kind() != MANAGED_MV_KIND {
-            return Err(ManagementOwnershipError::WrongObjectKind);
-        }
-        Ok(())
     }
 }
 

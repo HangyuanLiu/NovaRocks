@@ -88,6 +88,27 @@ fn version(
     Ok(value)
 }
 
+/// Build D with its complete MV-owned semantic identity and envelope limit.
+pub(crate) fn definition_version(
+    definition: &DefinitionDocument,
+) -> Result<ConnectorDocumentVersion, MvDocumentError> {
+    version(
+        "definition",
+        1,
+        vec![],
+        encode_definition(definition)
+            .map_err(|e| MvDocumentError::Contract(format!("document version definition: {e}")))?
+            .into_bytes(),
+    )
+}
+
+/// The same complete D identity consumed by CREATE and keyed L references.
+pub(crate) fn definition_revision(
+    definition: &DefinitionDocument,
+) -> Result<DocumentRevision, MvDocumentError> {
+    Ok(revision(definition_version(definition)?.identity()))
+}
+
 pub fn build_keyed_versions(
     definition: &DefinitionDocument,
     interpretation: &InterpretationDocument,
@@ -108,14 +129,7 @@ pub fn build_keyed_versions(
             );
         }
     }
-    let d = version(
-        "definition",
-        1,
-        vec![],
-        encode_definition(definition)
-            .map_err(|e| MvDocumentError::Contract(format!("document version definition: {e}")))?
-            .into_bytes(),
-    )?;
+    let d = definition_version(definition)?;
     let mut interpretation = interpretation.clone();
     interpretation.definition_revision = revision(d.identity());
     super::validation::validate_definition_interpretation(
@@ -709,10 +723,7 @@ pub fn keyed_view_fixture(
     snapshot: Option<i64>,
     published: bool,
 ) -> (CatalogHandle, KeyedDocumentView) {
-    let f = crate::persistence::test_support::ProjectionFixture::new(
-        crate::product::MvTarget::from_parts(Some("ice"), "sales", "mv"),
-        None,
-    );
+    let f = crate::persistence::test_support::MvDocumentFixture::new();
     let mut inputs = Vec::new();
     let mut formats = Vec::new();
     for occurrence in &f.definition.relation_occurrences {

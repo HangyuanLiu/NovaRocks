@@ -117,16 +117,23 @@ fn empty_completion_owners(
     blocking: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
     runtime: tokio::runtime::Handle,
 ) -> CompletionFactOwners {
-    let inventory = novarocks_mv_application::readiness::MvReadinessService::new(
-        Arc::new(novarocks_mv_application::test_repository::InMemoryMvRepository::default()),
-        Arc::new(novarocks_mv_application::process_runtime::ProcessRuntime::default()),
+    // MV inventory is unrelated to the held statistics port, but it still
+    // uses the real keyed StateStore owner rather than a legacy adapter.
+    let (product, repository) =
+        runtime.block_on(crate::mv::domain::test_admission::keyed_product());
+    let inventory = crate::mv::domain::readiness::MvReadinessPort::from_product(
+        product.keyed_readiness_service().unwrap(),
+        runtime,
+        product.management_entrance().unwrap(),
     );
+    drop(repository);
+    drop(product);
     CompletionFactOwners::new(
         Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
         None,
         Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
         Arc::new(UnifiedStatisticsResolver::default()),
-        crate::mv::domain::readiness::MvCandidateReader::new(inventory.candidate_reader(), runtime),
+        inventory.candidate_reader(),
         Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
         blocking,
     )

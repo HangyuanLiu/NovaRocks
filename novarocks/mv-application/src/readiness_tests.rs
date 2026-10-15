@@ -16,17 +16,31 @@
 // under the License.
 
 use super::*;
-use crate::persistence::test_support::{ProjectionFixture, observed_current, sample_projection};
-use crate::test_repository::InMemoryMvRepository;
+use crate::persistence::keyed_documents::MvKeyedDocumentProjection;
+use crate::persistence::test_support::{
+    KeyedProjectionFixture, observed_current_keyed, sample_keyed_projection,
+};
+use crate::state_store_repository::StateStoreMvRepository;
 use novarocks_spi::connector::{CatalogVersion, ConnectorInstanceId, ConnectorStopOwner};
 use std::time::{Duration, Instant};
 
 fn target() -> MvTarget {
     MvTarget::from_parts(Some("ice"), "sales", "mv")
 }
-fn service() -> (Arc<InMemoryMvRepository>, MvReadinessService) {
-    let repository = Arc::new(InMemoryMvRepository::default());
-    let service = MvReadinessService::new(repository.clone(), Arc::new(ProcessRuntime::default()));
+async fn service() -> (Arc<StateStoreMvRepository>, MvKeyedReadinessService) {
+    let repository = StateStoreMvRepository::open(
+        Arc::new(
+            novarocks_state_store_testkit::testing::InMemoryStateStore::new(format!(
+                "keyed-readiness-behavior-{}",
+                Uuid::now_v7()
+            )),
+        ),
+        novarocks_state_store_runtime::StateStoreRunPolicy::default(),
+    )
+    .await
+    .unwrap();
+    let service =
+        MvKeyedReadinessService::new(repository.clone(), Arc::new(ProcessRuntime::default()));
     (repository, service)
 }
 type Cancellation = ConnectorStopOwner;
@@ -49,17 +63,19 @@ fn request(version: u8, cancellation: Arc<Cancellation>) -> MvCurrentProjectionR
     .unwrap()
 }
 struct Source {
-    facts: MvDocumentProjection,
+    facts: MvKeyedDocumentProjection,
     entered: Option<Arc<tokio::sync::Semaphore>>,
     release: Option<Arc<tokio::sync::Semaphore>>,
     fail: bool,
 }
-#[async_trait::async_trait]
-impl MvCurrentProjectionSource for Source {
-    async fn observe(
+impl Source {
+    async fn observe_documents(
         &self,
         request: &MvCurrentProjectionRequest,
-    ) -> Result<MvCurrentProjectionObservation, MvProjectionError> {
+    ) -> Result<
+        crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+        MvProjectionError,
+    > {
         if let Some(entered) = &self.entered {
             entered.add_permits(1);
         }
@@ -72,43 +88,44 @@ impl MvCurrentProjectionSource for Source {
                 "injected source failure",
             ));
         }
-        let documents = observed_current(&self.facts, request.catalog().clone());
-        Ok(MvCurrentProjectionObservation {
-            management_admission: crate::management::MvCurrentManagementAdmission::for_test(
-                &documents,
-            ),
-            documents,
-            output_statistics: None,
-        })
+        Ok(observed_current_keyed(
+            &self.facts,
+            request.catalog().clone(),
+        ))
     }
 }
 #[async_trait::async_trait]
-impl MvReadOnlyCurrentProjectionSource for Source {
-    async fn observe_read_only(
+impl MvKeyedCurrentProjectionSource for Source {
+    async fn observe_current_keyed(
         &self,
-        request: &MvCurrentProjectionRequest,
-    ) -> Result<MvReadOnlyCurrentProjectionObservation, MvProjectionError> {
-        if let Some(entered) = &self.entered {
-            entered.add_permits(1);
-        }
-        if let Some(release) = &self.release {
-            release.acquire().await.unwrap().forget();
-        }
-        if self.fail {
-            return Err(MvProjectionError::new(
-                MvProjectionErrorKind::Unavailable,
-                "injected source failure",
-            ));
-        }
-        Ok(MvReadOnlyCurrentProjectionObservation {
-            documents: observed_current(&self.facts, request.catalog().clone()),
-            output_statistics: None,
-        })
+        request: MvCurrentProjectionRequest,
+    ) -> Result<
+        (
+            crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+            crate::management::MvCurrentManagementAdmission,
+        ),
+        MvProjectionError,
+    > {
+        let documents = self.observe_documents(&request).await?;
+        let admission = crate::management::MvCurrentManagementAdmission::for_test_keyed(&documents);
+        Ok((documents, admission))
+    }
+}
+#[async_trait::async_trait]
+impl MvKeyedReadOnlyCurrentProjectionSource for Source {
+    async fn observe_current_keyed_read_only(
+        &self,
+        request: MvCurrentProjectionRequest,
+    ) -> Result<
+        crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+        MvProjectionError,
+    > {
+        self.observe_documents(&request).await
     }
 }
 fn source(snapshot: i64) -> Source {
     Source {
-        facts: sample_projection(target(), Some(snapshot)),
+        facts: sample_keyed_projection(target(), Some(snapshot)),
         entered: None,
         release: None,
         fail: false,
@@ -117,9 +134,13 @@ fn source(snapshot: i64) -> Source {
 
 #[tokio::test]
 async fn restored_cache_is_query_candidate_but_not_current_management_ready() {
-    let (repository, service) = service();
+    let (repository, service) = service().await;
     repository
-        .create_projection(Uuid::now_v7(), sample_projection(target(), Some(1)).into())
+        .install_keyed_projection(
+            Uuid::now_v7(),
+            sample_keyed_projection(target(), Some(1)),
+            None,
+        )
         .await
         .unwrap();
     assert!(service.load_ready(&target()).await.is_err());
@@ -133,7 +154,7 @@ async fn restored_cache_is_query_candidate_but_not_current_management_ready() {
         1
     );
     service
-        .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
+        .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
         .await
         .unwrap();
     assert!(service.load_ready(&target()).await.unwrap().is_some());
@@ -141,12 +162,13 @@ async fn restored_cache_is_query_candidate_but_not_current_management_ready() {
 
 #[tokio::test]
 async fn sealed_read_only_current_rebuilds_inventory_without_granting_management_readiness() {
-    let (_, service) = service();
+    let (_, service) = service().await;
     service
         .observe_current_read_only_and_install(
             Uuid::now_v7(),
             request(1, Arc::default()),
             &source(1),
+            "test read-only Current".into(),
         )
         .await
         .unwrap();
@@ -163,7 +185,7 @@ async fn sealed_read_only_current_rebuilds_inventory_without_granting_management
     );
 
     service
-        .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
+        .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
         .await
         .unwrap();
     assert!(service.load_ready(&target()).await.unwrap().is_some());
@@ -171,13 +193,13 @@ async fn sealed_read_only_current_rebuilds_inventory_without_granting_management
 
 #[tokio::test]
 async fn changed_c_only_is_installed_as_a_whole_new_source_revision() {
-    let (_, service) = service();
-    let first = sample_projection(target(), Some(1));
+    let (_, service) = service().await;
+    let first = sample_keyed_projection(target(), Some(1));
     service
         .seed_projection(Uuid::now_v7(), first.clone())
         .await
         .unwrap();
-    let mut fixture = ProjectionFixture::new(target(), Some(1));
+    let mut fixture = KeyedProjectionFixture::new(target(), Some(1));
     fixture.configuration.paused = true;
     let next = fixture.build().unwrap();
     assert_ne!(first.source_revision(), next.source_revision());
@@ -200,7 +222,7 @@ async fn changed_c_only_is_installed_as_a_whole_new_source_revision() {
 #[tokio::test]
 async fn shared_logical_target_orders_different_catalog_handles_and_late_failures() {
     for late_failure in [false, true] {
-        let (_, service) = service();
+        let (_, service) = service().await;
         let entered = Arc::new(tokio::sync::Semaphore::new(0));
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         let mut slow = source(1);
@@ -209,20 +231,20 @@ async fn shared_logical_target_orders_different_catalog_handles_and_late_failure
         slow.fail = late_failure;
         let a = service.clone();
         let old = tokio::spawn(async move {
-            a.observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &slow)
+            a.observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &slow)
                 .await
         });
         entered.acquire().await.unwrap().forget();
         assert!(service.load_ready(&target()).await.unwrap().is_none());
         service
-            .observe_current_and_install(Uuid::now_v7(), request(2, Arc::default()), &source(2))
+            .observe_and_install(Uuid::now_v7(), request(2, Arc::default()), &source(2))
             .await
             .unwrap();
         let newer = service.load_ready(&target()).await.unwrap();
         release.add_permits(1);
         assert!(matches!(
             old.await.unwrap().unwrap(),
-            MvProjectionInstallOutcome::Superseded
+            MvKeyedProjectionInstallOutcome::Superseded
         ));
         assert_eq!(service.load_ready(&target()).await.unwrap(), newer);
     }
@@ -235,7 +257,7 @@ async fn shared_logical_target_orders_different_catalog_handles_and_late_failure
 /// about a target whose observation is succeeding as it asks.
 #[tokio::test]
 async fn a_management_read_waits_for_the_observation_already_in_flight() {
-    let (_, service) = service();
+    let (_, service) = service().await;
     let entered = Arc::new(tokio::sync::Semaphore::new(0));
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let mut slow = source(1);
@@ -244,7 +266,7 @@ async fn a_management_read_waits_for_the_observation_already_in_flight() {
     let installer = service.clone();
     let install = tokio::spawn(async move {
         installer
-            .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &slow)
+            .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &slow)
             .await
     });
     entered.acquire().await.unwrap().forget();
@@ -271,14 +293,38 @@ async fn a_management_read_waits_for_the_observation_already_in_flight() {
 /// past the bound the read answers exactly as it did before the wait existed.
 #[tokio::test(start_paused = true)]
 async fn a_management_read_stops_waiting_for_an_abandoned_observation() {
-    let (repository, service) = service();
+    let (repository, service) = service().await;
     repository
-        .create_projection(Uuid::now_v7(), sample_projection(target(), Some(1)).into())
+        .install_keyed_projection(
+            Uuid::now_v7(),
+            sample_keyed_projection(target(), Some(1)),
+            None,
+        )
         .await
         .unwrap();
-    let abandoned = service.reserve(target()).await.unwrap();
-    std::mem::forget(abandoned);
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut abandoned_source = source(2);
+    abandoned_source.entered = Some(entered.clone());
+    abandoned_source.release = Some(release);
+    let installer = service.clone();
+    let abandoned = tokio::spawn(async move {
+        installer
+            .observe_and_install(
+                Uuid::now_v7(),
+                request(1, Arc::default()),
+                &abandoned_source,
+            )
+            .await
+    });
+    // The public operation has already reserved this target and reached the
+    // actual source before its owner is dropped without settling that generation.
+    entered.acquire().await.unwrap().forget();
+    abandoned.abort();
+    assert!(abandoned.await.unwrap_err().is_cancelled());
+    let began = tokio::time::Instant::now();
     assert!(service.load_ready_settled(&target()).await.is_err());
+    assert!(tokio::time::Instant::now().duration_since(began) >= OBSERVATION_SETTLE_WAIT);
 }
 
 /// A materialized view is the target object it publishes into, not the
@@ -289,9 +335,9 @@ async fn a_management_read_stops_waiting_for_an_abandoned_observation() {
 /// aliases for management readiness.
 #[tokio::test]
 async fn one_target_object_is_projected_once_however_many_attachments_see_it() {
-    let (repository, service) = service();
+    let (repository, service) = service().await;
     service
-        .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
+        .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
         .await
         .unwrap();
 
@@ -299,7 +345,7 @@ async fn one_target_object_is_projected_once_however_many_attachments_see_it() {
     // name, a different catalog.
     let alias = MvTarget::from_parts(Some("ice_other"), "sales", "mv");
     let mut through_alias = source(1);
-    through_alias.facts = sample_projection(alias.clone(), Some(1));
+    through_alias.facts = sample_keyed_projection(alias.clone(), Some(1));
     let request = MvCurrentProjectionRequest::try_new(
         CatalogHandle::new(
             ConnectorInstanceId::parse("ice_other").unwrap(),
@@ -318,14 +364,14 @@ async fn one_target_object_is_projected_once_however_many_attachments_see_it() {
     .unwrap();
 
     let outcome = service
-        .observe_current_and_install(Uuid::now_v7(), request, &through_alias)
+        .observe_and_install(Uuid::now_v7(), request, &through_alias)
         .await
         .unwrap();
-    let MvProjectionInstallOutcome::AlreadyProjectedElsewhere(owner) = outcome else {
+    let MvKeyedProjectionInstallOutcome::AlreadyProjectedElsewhere(owner) = outcome else {
         panic!("a second attachment must not mint a second projection: {outcome:?}");
     };
     assert_eq!(owner, target());
-    assert_eq!(repository.list_projections().await.unwrap().len(), 1);
+    assert_eq!(repository.list_keyed_projections().await.unwrap().len(), 1);
     // The alias is not an MV of its own, so nothing guards a catalog on its
     // behalf and nothing reads it as a target.
     assert!(service.load_ready(&alias).await.unwrap().is_none());
@@ -340,9 +386,9 @@ async fn one_target_object_is_projected_once_however_many_attachments_see_it() {
 /// manages nothing yet, which is what the read-only path is for.
 #[tokio::test]
 async fn a_read_only_re_observation_does_not_revoke_management_this_process_holds() {
-    let (_, service) = service();
+    let (_, service) = service().await;
     service
-        .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
+        .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
         .await
         .unwrap();
     let managed = service.load_ready(&target()).await.unwrap();
@@ -353,6 +399,7 @@ async fn a_read_only_re_observation_does_not_revoke_management_this_process_hold
             Uuid::now_v7(),
             request(1, Arc::default()),
             &source(1),
+            "test read-only Current".into(),
         )
         .await
         .unwrap();
@@ -366,6 +413,7 @@ async fn a_read_only_re_observation_does_not_revoke_management_this_process_hold
             Uuid::now_v7(),
             request(1, Arc::default()),
             &source(2),
+            "test read-only Current".into(),
         )
         .await
         .unwrap();
@@ -374,66 +422,81 @@ async fn a_read_only_re_observation_does_not_revoke_management_this_process_hold
 
 #[tokio::test]
 async fn newer_failure_does_not_reauthorize_older_success() {
-    let (_, service) = service();
-    let a = service.reserve(target()).await.unwrap();
-    let b = service.reserve(target()).await.unwrap();
-    let error =
-        MvProjectionError::new(MvProjectionErrorKind::Unavailable, "new observation failed");
-    assert!(
-        service
-            .finish_observation(None, Uuid::now_v7(), b, Err(error), true)
+    let (_, service) = service().await;
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut older_source = source(1);
+    older_source.entered = Some(entered.clone());
+    older_source.release = Some(release.clone());
+    let installer = service.clone();
+    let older = tokio::spawn(async move {
+        installer
+            .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &older_source)
             .await
-            .is_err()
+    });
+    entered.acquire().await.unwrap().forget();
+    let mut newer_source = source(2);
+    newer_source.fail = true;
+    assert_eq!(
+        service
+            .observe_and_install(Uuid::now_v7(), request(2, Arc::default()), &newer_source,)
+            .await
+            .unwrap_err()
+            .kind(),
+        MvProjectionErrorKind::Unavailable,
     );
+    release.add_permits(1);
     assert!(matches!(
-        service
-            .finish_observation(
-                None,
-                Uuid::now_v7(),
-                a,
-                Ok((sample_projection(target(), Some(1)), None)),
-                true,
-            )
-            .await
-            .unwrap(),
-        MvProjectionInstallOutcome::Superseded
+        older.await.unwrap().unwrap(),
+        MvKeyedProjectionInstallOutcome::Superseded,
     ));
     assert_eq!(service.list_ready_projections().await.unwrap().len(), 0);
 }
 
 #[tokio::test]
 async fn fixed_repository_cas_is_captured_before_source_observation() {
-    let (repository, service) = service();
-    let reservation = service.reserve(target()).await.unwrap();
+    let (repository, service) = service().await;
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut older_source = source(1);
+    older_source.entered = Some(entered.clone());
+    older_source.release = Some(release.clone());
+    let installer = service.clone();
+    let older = tokio::spawn(async move {
+        installer
+            .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &older_source)
+            .await
+    });
+    // Reaching source proves the absent StateStore CAS baseline was captured.
+    entered.acquire().await.unwrap().forget();
     let external = repository
-        .create_projection(Uuid::now_v7(), sample_projection(target(), Some(2)).into())
+        .install_keyed_projection(
+            Uuid::now_v7(),
+            sample_keyed_projection(target(), Some(2)),
+            None,
+        )
         .await
         .unwrap();
+    release.add_permits(1);
     assert!(matches!(
-        service
-            .finish_observation(
-                None,
-                Uuid::now_v7(),
-                reservation,
-                Ok((sample_projection(target(), Some(1)), None)),
-                true,
-            )
-            .await
-            .unwrap(),
-        MvProjectionInstallOutcome::Superseded
+        older.await.unwrap().unwrap(),
+        MvKeyedProjectionInstallOutcome::Superseded,
     ));
     assert_eq!(
-        repository.find_by_target(&target()).await.unwrap(),
-        Some(external)
+        repository
+            .find_keyed_by_target(&target(), PersistenceDecodeBudget::default())
+            .await
+            .unwrap(),
+        Some(external),
     );
     assert!(service.load_ready(&target()).await.is_err());
 }
 
 #[tokio::test]
 async fn late_cancellation_and_delete_cannot_revoke_new_ready_generation() {
-    let (_, service) = service();
+    let (_, service) = service().await;
     service
-        .seed_projection(Uuid::now_v7(), sample_projection(target(), Some(1)))
+        .seed_projection(Uuid::now_v7(), sample_keyed_projection(target(), Some(1)))
         .await
         .unwrap();
     let deletion = service.reserve_projection_delete(target()).await.unwrap();
@@ -445,47 +508,56 @@ async fn late_cancellation_and_delete_cannot_revoke_new_ready_generation() {
     slow.release = Some(release.clone());
     let req = request(1, cancellation.clone());
     let a = service.clone();
-    let old = tokio::spawn(async move {
-        a.observe_current_and_install(Uuid::now_v7(), req, &slow)
-            .await
-    });
+    let old = tokio::spawn(async move { a.observe_and_install(Uuid::now_v7(), req, &slow).await });
     entered.acquire().await.unwrap().forget();
     service
-        .observe_current_and_install(Uuid::now_v7(), request(2, Arc::default()), &source(3))
+        .observe_and_install(Uuid::now_v7(), request(2, Arc::default()), &source(3))
         .await
         .unwrap();
     cancellation.request_stop();
     release.add_permits(1);
     assert!(matches!(
         old.await.unwrap().unwrap(),
-        MvProjectionInstallOutcome::Superseded
+        MvKeyedProjectionInstallOutcome::Superseded
     ));
     assert!(matches!(
         service
             .delete_after_provider_drop(Uuid::now_v7(), deletion)
             .await
             .unwrap(),
-        MvProjectionInstallOutcome::Superseded
+        MvKeyedProjectionInstallOutcome::Superseded
     ));
     assert!(service.load_ready(&target()).await.unwrap().is_some());
 }
 
 #[test]
 fn missing_p_with_existing_output_is_not_never_published() {
-    let mut fixture = ProjectionFixture::new(target(), Some(7));
+    let mut fixture = KeyedProjectionFixture::new(target(), Some(7));
     fixture.publication = None;
-    fixture.output_version = None;
-    fixture.storage_rows = None;
     assert!(
         fixture
             .build()
             .unwrap_err()
-            .contains("not a proven never-published")
+            .contains("data but no MV publication record")
     );
-    assert!(matches!(
-        sample_projection(target(), None).publication(),
-        crate::persistence::projection::MvPublicationState::NeverPublished
-    ));
+    assert!(sample_keyed_projection(target(), None).never_published());
+
+    // An empty slot-change snapshot remains never published only with the
+    // provider's explicit zero data-file and delete-file totals.
+    let mut empty = KeyedProjectionFixture::new(target(), Some(7));
+    empty.publication = None;
+    empty.file_totals = novarocks_spi::connector::SnapshotFileTotals {
+        data_files: Some(0),
+        delete_files: Some(0),
+    };
+    assert!(empty.build().unwrap().never_published());
+    let mut unknown = KeyedProjectionFixture::new(target(), Some(7));
+    unknown.publication = None;
+    unknown.file_totals = novarocks_spi::connector::SnapshotFileTotals {
+        data_files: None,
+        delete_files: Some(0),
+    };
+    assert!(unknown.build().is_err());
 }
 
 #[tokio::test]
@@ -501,7 +573,8 @@ async fn cancellation_during_repository_commit_leaves_cache_but_never_ready() {
     )
     .await
     .unwrap();
-    let service = MvReadinessService::new(repository.clone(), Arc::new(ProcessRuntime::default()));
+    let service =
+        MvKeyedReadinessService::new(repository.clone(), Arc::new(ProcessRuntime::default()));
     let gate = FaultGate::new();
     fault.pause_next_post_dispatch(gate.clone());
     let cancellation = Arc::new(Cancellation::default());
@@ -509,7 +582,7 @@ async fn cancellation_during_repository_commit_leaves_cache_but_never_ready() {
     let installer = service.clone();
     let task = tokio::spawn(async move {
         installer
-            .observe_current_and_install(Uuid::now_v7(), req, &source(1))
+            .observe_and_install(Uuid::now_v7(), req, &source(1))
             .await
     });
     tokio::time::timeout(Duration::from_secs(10), gate.wait_reached())
@@ -523,7 +596,7 @@ async fn cancellation_during_repository_commit_leaves_cache_but_never_ready() {
     );
     assert!(
         repository
-            .find_by_target(&target())
+            .find_keyed_by_target(&target(), PersistenceDecodeBudget::default())
             .await
             .unwrap()
             .is_some()
@@ -533,8 +606,8 @@ async fn cancellation_during_repository_commit_leaves_cache_but_never_ready() {
 
 #[tokio::test]
 async fn dependency_guard_uses_catalog_and_exact_object_not_locator_name() {
-    let (_, service) = service();
-    let facts = sample_projection(target(), Some(1));
+    let (_, service) = service().await;
+    let facts = sample_keyed_projection(target(), Some(1));
     let occurrence = facts.definition().relation_occurrences[0].clone();
     service
         .seed_projection(Uuid::now_v7(), facts)
@@ -576,12 +649,13 @@ async fn dependency_guard_uses_catalog_and_exact_object_not_locator_name() {
 
 #[tokio::test]
 async fn a_read_only_rebuild_is_readable_while_its_management_stays_closed() {
-    let (_, service) = service();
+    let (_, service) = service().await;
     service
         .observe_current_read_only_and_install(
             Uuid::now_v7(),
             request(1, Arc::default()),
             &source(1),
+            "test read-only Current".into(),
         )
         .await
         .unwrap();
@@ -599,12 +673,13 @@ async fn a_read_only_rebuild_is_readable_while_its_management_stays_closed() {
 
 #[tokio::test]
 async fn a_quarantined_projection_is_not_readable() {
-    let (_, service) = service();
+    let (_, service) = service().await;
     service
         .observe_current_read_only_and_install(
             Uuid::now_v7(),
             request(1, Arc::default()),
             &source(1),
+            "test read-only Current".into(),
         )
         .await
         .unwrap();
@@ -621,7 +696,7 @@ async fn a_quarantined_projection_is_not_readable() {
 
 #[tokio::test]
 async fn a_table_this_process_holds_no_projection_for_is_not_an_mv() {
-    let (_, service) = service();
+    let (_, service) = service().await;
 
     assert_eq!(
         service.query_admission(&target()).await.unwrap(),
@@ -645,24 +720,25 @@ fn local_inventory_bound() -> crate::repository::MvProjectionInventoryBound {
 
 #[tokio::test]
 async fn bounded_inventory_reloads_replacement_and_requires_its_exact_installed_version() {
-    let (repository, service) = service();
+    let (repository, service) = service().await;
     service
-        .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
+        .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
         .await
         .unwrap();
     let mut inventory = service
         .bounded_projection_inventory(local_inventory_bound())
         .await
         .unwrap();
-    let old = repository.find_by_target(&target()).await.unwrap().unwrap();
+    let old = repository
+        .find_keyed_by_target(&target(), PersistenceDecodeBudget::default())
+        .await
+        .unwrap()
+        .unwrap();
     let changed = repository
-        .replace_projection(
+        .install_keyed_projection(
             Uuid::now_v7(),
-            ReplaceMvProjectionRequest {
-                mv_id: old.projection.mv_id,
-                expected_version: old.version,
-                projection: sample_projection(target(), Some(2)).into(),
-            },
+            sample_keyed_projection(target(), Some(2)),
+            Some(old),
         )
         .await
         .unwrap();
@@ -673,7 +749,7 @@ async fn bounded_inventory_reloads_replacement_and_requires_its_exact_installed_
         .unwrap();
     assert!(inventory.next_listable().await.unwrap().is_none());
     service
-        .observe_current_and_install(Uuid::now_v7(), request(2, Arc::default()), &source(2))
+        .observe_and_install(Uuid::now_v7(), request(2, Arc::default()), &source(2))
         .await
         .unwrap();
     let mut inventory = service
@@ -691,9 +767,9 @@ async fn bounded_inventory_reloads_replacement_and_requires_its_exact_installed_
 
 #[tokio::test]
 async fn bounded_inventory_never_displays_a_projection_deleted_after_enumeration() {
-    let (repository, service) = service();
+    let (repository, service) = service().await;
     service
-        .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
+        .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
         .await
         .unwrap();
     let mut ready = service
@@ -704,16 +780,13 @@ async fn bounded_inventory_never_displays_a_projection_deleted_after_enumeration
         .bounded_projection_inventory(local_inventory_bound())
         .await
         .unwrap();
-    let old = repository.find_by_target(&target()).await.unwrap().unwrap();
+    let old = repository
+        .find_keyed_by_target(&target(), PersistenceDecodeBudget::default())
+        .await
+        .unwrap()
+        .unwrap();
     repository
-        .delete_projection(
-            Uuid::now_v7(),
-            DeleteMvProjectionRequest {
-                mv_id: old.projection.mv_id,
-                expected_version: old.version,
-                expected_source_revision: old.projection.facts.source_revision().clone(),
-            },
-        )
+        .delete_keyed_projection(Uuid::now_v7(), old)
         .await
         .unwrap();
     assert!(ready.next_ready().await.unwrap().is_none());
@@ -722,12 +795,13 @@ async fn bounded_inventory_never_displays_a_projection_deleted_after_enumeration
 
 #[tokio::test]
 async fn bounded_listable_inventory_preserves_exact_read_only_and_quarantine_reasons() {
-    let (_, service) = service();
+    let (_, service) = service().await;
     service
         .observe_current_read_only_and_install(
             Uuid::now_v7(),
             request(1, Arc::default()),
             &source(1),
+            "test read-only Current".into(),
         )
         .await
         .unwrap();
@@ -770,9 +844,9 @@ async fn bounded_listable_inventory_preserves_exact_read_only_and_quarantine_rea
 
 #[tokio::test]
 async fn bounded_listing_refuses_a_large_reason_before_cloning_it_into_a_row() {
-    let (_, service) = service();
+    let (_, service) = service().await;
     service
-        .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
+        .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
         .await
         .unwrap();
     service
@@ -791,9 +865,9 @@ async fn bounded_listing_refuses_a_large_reason_before_cloning_it_into_a_row() {
 #[tokio::test]
 async fn bounded_dependency_display_requires_ready_and_exact_installed_root_version() {
     use crate::repository::MvDependencyReadBound;
-    let (repository, service) = service();
+    let (repository, service) = service().await;
     service
-        .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
+        .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
         .await
         .unwrap();
     let loaded = service.load_ready(&target()).await.unwrap().unwrap();
@@ -826,13 +900,10 @@ async fn bounded_dependency_display_requires_ready_and_exact_installed_root_vers
         MvRepositoryErrorKind::InvalidRequest
     );
     let fresh = repository
-        .replace_projection(
+        .install_keyed_projection(
             Uuid::now_v7(),
-            ReplaceMvProjectionRequest {
-                mv_id: loaded.projection.mv_id,
-                expected_version: loaded.version.clone(),
-                projection: sample_projection(target(), Some(2)).into(),
-            },
+            sample_keyed_projection(target(), Some(2)),
+            Some(loaded.clone()),
         )
         .await
         .unwrap();
@@ -853,7 +924,7 @@ async fn bounded_dependency_display_requires_ready_and_exact_installed_root_vers
         MvRepositoryErrorKind::Unavailable
     );
     service
-        .observe_current_and_install(Uuid::now_v7(), request(2, Arc::default()), &source(2))
+        .observe_and_install(Uuid::now_v7(), request(2, Arc::default()), &source(2))
         .await
         .unwrap();
     assert!(

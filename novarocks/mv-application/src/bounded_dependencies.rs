@@ -20,7 +20,6 @@
 
 use crate::dependency::{MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine};
 use crate::persistence::dependency::StoredMvDependency;
-use crate::persistence::projection::StoredMvProjection;
 use crate::repository::{
     MvDependencyReadBound, MvProjectionInventoryBuilder, MvProjectionInventoryEntry,
     MvRepositoryError, MvRepositoryErrorKind,
@@ -153,16 +152,6 @@ fn display_bytes(object: &MvDependencyObjectRef) -> impl Iterator<Item = u8> + '
         .chain(object.name.bytes())
 }
 
-pub(crate) fn validate_canonical(
-    projection: &StoredMvProjection,
-    dependencies: &[StoredMvDependency],
-) -> Result<(), MvRepositoryError> {
-    validate_canonical_parts(
-        projection.mv_id,
-        projection.facts.definition(),
-        dependencies,
-    )
-}
 pub(crate) fn validate_canonical_parts(
     mv_id: i64,
     definition: &crate::persistence::codec::DefinitionDocument,

@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::persistence::exact_revision::{decode_fact, encode_fact_parts};
+use crate::persistence::identity::{NativeDataVersion, PublicationIdentity};
 use novarocks_spi::connector::{ConnectorProviderId, ConnectorSemanticFact};
 
 pub const KEYED_INTERPRETATION_FORMAT_VERSION: u32 = 2;
@@ -336,22 +337,21 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::test_support::ProjectionFixture;
-    use crate::product::MvTarget;
-    use bytes::Bytes;
-    use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorTableObjectId};
+    use crate::persistence::test_support::MvDocumentFixture;
+    use novarocks_spi::connector::ConnectorExactSemanticRevision;
     fn fixture() -> (
         DefinitionDocument,
         BindingDocument,
         KeyedPublicationDocument,
     ) {
-        let f = ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "db", "mv"), None);
+        let f = MvDocumentFixture::new();
         let mut inputs = Vec::new();
         let mut formats = Vec::new();
         for d in &f.definition.relation_occurrences {
             let data = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
                 ConnectorProviderId::parse("iceberg").unwrap(),
-                &ConnectorTableObjectId::try_new(Bytes::from_static(b"object")).unwrap(),
+                &crate::persistence::exact_revision::restore_persisted_object(&d.object_id)
+                    .unwrap(),
                 Some(17),
             )
             .unwrap();

@@ -21,12 +21,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use novarocks_spi::connector::{
     CatalogHandle, CatalogVersion, ConnectorCommittedVersion, ConnectorControlRuntimeId,
-    ConnectorDocumentManagementObservation, ConnectorDocumentManagementOperation,
-    ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
-    ConnectorDocumentStorageLimits, ConnectorInstanceId, ConnectorManagedObjectMarker,
-    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorStopOwner,
-    ConnectorTableIdentity, ConnectorTableObjectId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, ProviderBindingEpoch,
+    ConnectorDocumentManagementOperation, ConnectorInstanceId, ConnectorProviderBindingKey,
+    ConnectorRequestContext, ConnectorStopOwner, ConnectorTableIdentity, ConnectorTableObjectId,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, ProviderBindingEpoch,
 };
 
 use super::*;
@@ -76,37 +73,196 @@ fn request_context() -> ConnectorRequestContext {
     .unwrap()
 }
 
-fn connector_observation(
+/// The native retained lease validates the reply's exact scope; tests do not
+/// write a seal or construct a FreshManagementObservation on this boundary.
+struct KeyedManagementObservationCaps {
+    descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+    epoch: ProviderBindingEpoch,
+    reply: Result<
+        novarocks_spi::connector::KeyedDocumentView,
+        novarocks_spi::connector::KeyedDocumentReadError,
+    >,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn unused_keyed_management_test_capability() -> novarocks_spi::connector::ConnectorError {
+    novarocks_spi::connector::ConnectorError::new(
+        novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+        "not used by keyed management observation tests",
+    )
+}
+
+impl novarocks_spi::connector::ConnectorDocumentStorageObservation
+    for KeyedManagementObservationCaps
+{
+    fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+    fn incarnation(&self) -> ProviderBindingEpoch {
+        self.epoch
+    }
+    fn observe_keyed_documents(
+        &self,
+        _request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<
+        novarocks_spi::connector::KeyedDocumentView,
+        novarocks_spi::connector::KeyedDocumentReadError,
+    > {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.reply.clone()
+    }
+    fn observe_full_keyed_documents(
+        &self,
+        _request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<
+        novarocks_spi::connector::FullKeyedDocumentView,
+        novarocks_spi::connector::KeyedDocumentReadError,
+    > {
+        Err(unused_keyed_management_test_capability().into())
+    }
+    fn decode_keyed_slot_change_evidence(
+        &self,
+        _request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+        _evidence: novarocks_spi::connector::ExternalMutationEvidence,
+    ) -> Result<
+        novarocks_spi::connector::UnknownCommitEvidence,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Err(unused_keyed_management_test_capability())
+    }
+    fn resolve_keyed_commit(
+        &self,
+        _request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+        _evidence: novarocks_spi::connector::UnknownCommitEvidence,
+    ) -> Result<novarocks_spi::connector::CommitConclusion, novarocks_spi::connector::ConnectorError>
+    {
+        Err(unused_keyed_management_test_capability())
+    }
+    fn discover_documents(
+        &self,
+        _request: novarocks_spi::connector::ConnectorDocumentDiscoveryRequest,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorDocumentDiscoveryPage,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Err(unused_keyed_management_test_capability())
+    }
+}
+
+fn keyed_management_view(
     target: &ManagedMvTarget,
     marker_owner: &str,
     marker_incarnation: &str,
     metadata: u8,
-) -> ConnectorDocumentManagementObservation {
-    let request = ConnectorDocumentObservationRequest::try_new(
-        ConnectorProviderBindingKey {
-            instance_id: target.table().instance_id.clone(),
-            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
-        },
-        target.catalog().clone(),
-        target.table().clone(),
-        target.object_id().clone(),
-        ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::default()),
-        request_context(),
+) -> novarocks_spi::connector::KeyedDocumentView {
+    use crate::persistence::test_support::{KeyedProjectionFixture, observed_current_keyed};
+    let mut fixture = KeyedProjectionFixture::new(
+        crate::product::MvTarget::from_parts(
+            Some(target.table().instance_id.as_str()),
+            &target.table().namespace,
+            &target.table().table,
+        ),
+        None,
+    );
+    fixture.object_id = target.object_id().clone();
+    fixture.metadata_version =
+        ConnectorCommittedVersion::try_new(Bytes::from(vec![metadata]), Some(metadata as i64 + 1))
+            .unwrap();
+    let facts = fixture
+        .build()
+        .expect("canonical exact keyed management fixture");
+    let mut view = observed_current_keyed(&facts, target.catalog().clone()).view;
+    view.owner = ConnectorProviderBindingKey {
+        instance_id: target.table().instance_id.clone(),
+        incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
+    };
+    view.slots
+        .get_mut(&crate::persistence::keyed_documents::management_slot_name().unwrap())
+        .unwrap()
+        .value = crate::persistence::keyed_documents::management_slot(
+        &owner(marker_owner),
+        &incarnation(marker_incarnation),
     )
     .unwrap();
-    ConnectorDocumentManagementObservation::try_new(
-        &request,
-        ConnectorCommittedVersion::try_new(Bytes::from(vec![metadata]), Some(metadata as i64 + 1))
-            .unwrap(),
-        ConnectorManagedObjectMarker::try_new(
-            "materialized-view",
-            marker_owner,
-            marker_incarnation,
-        )
-        .unwrap(),
+    view
+}
+
+fn keyed_management_lease(
+    target: &ManagedMvTarget,
+    reply: Result<
+        novarocks_spi::connector::KeyedDocumentView,
+        novarocks_spi::connector::KeyedDocumentReadError,
+    >,
+) -> (
+    novarocks_spi::connector::ConnectorDocumentStorageLease,
+    novarocks_spi::connector::KeyedDocumentObservationRequest,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use novarocks_spi::connector::*;
+    let epoch = ProviderBindingEpoch::from_bytes([7; 16]);
+    let descriptor = ConnectorInstanceDescriptor {
+        provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+        instance_id: target.table().instance_id.clone(),
+    };
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observation = Arc::new(KeyedManagementObservationCaps {
+        descriptor: descriptor.clone(),
+        epoch,
+        reply,
+        calls: Arc::clone(&calls),
+    });
+    let documents =
+        ConnectorDocumentStorageBinding::try_new(descriptor, epoch, Some(observation), None)
+            .unwrap();
+    let properties = CatalogProperties::new(
+        target.catalog().clone(),
+        ConnectorProviderId::parse("iceberg").unwrap(),
+        1,
+        vec![],
         vec![],
     )
-    .unwrap()
+    .unwrap();
+    let binding = novarocks_catalog_application::test_support::test_control_binding_for(
+        target.table().instance_id.clone(),
+        7,
+    )
+    .with_catalog_properties(properties)
+    .and_then(|binding| binding.try_with_document_storage(Some(documents)))
+    .unwrap();
+    let lease = ConnectorControlPlanningLease::new(Arc::new(binding), || {})
+        .derive_document_storage_lease()
+        .unwrap();
+    let request = KeyedDocumentObservationRequest {
+        owner: lease.owner().clone(),
+        catalog_handle: target.catalog().clone(),
+        target: target.table().clone(),
+        object_id: target.object_id().clone(),
+        context: request_context(),
+    };
+    (lease, request, calls)
+}
+
+fn observe_keyed_management_mismatch(
+    entrance: &ManagementEntrance,
+    target: &ManagedMvTarget,
+    marker_owner: &str,
+    marker_incarnation: &str,
+    metadata: u8,
+) -> bool {
+    let (lease, request, calls) = keyed_management_lease(
+        target,
+        Ok(keyed_management_view(
+            target,
+            marker_owner,
+            marker_incarnation,
+            metadata,
+        )),
+    );
+    let result = entrance
+        .close_on_keyed_current_management_mismatch(&lease, request)
+        .unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    result
 }
 
 fn fresh_observation(
@@ -334,15 +490,16 @@ fn unsealed_management_observation_is_rejected_before_owner_policy() {
     let pending = state
         .begin_current_observation(ManagementObservationRequestId::from_bytes([38; 16]))
         .unwrap();
+    let mut escaped = keyed_management_view(&target, "deployment-a", "old", 1);
+    escaped.owner.incarnation = ProviderBindingEpoch::from_bytes([9; 16]);
+    let (lease, request, calls) = keyed_management_lease(&target, Ok(escaped));
     assert_eq!(
         state
-            .complete_current_observation(
-                pending,
-                &connector_observation(&target, "deployment-a", "old", 1),
-            )
+            .complete_keyed_current_observation(pending, &lease, request)
             .unwrap_err(),
         ManagementObservationError::UnsealedObservation
     );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(
         state.phase(),
         ManagementObservationPhase::AwaitingFreshObservation
@@ -1095,42 +1252,44 @@ fn current_marker_mismatch_closes_only_the_exact_local_management_target() {
         entrance.management_phase(mv_target.table()),
         MvManagementPhase::Manageable
     );
-    assert!(
-        !entrance.close_on_current_incarnation_mismatch(&connector_observation(
-            &mv_target,
-            "deployment-a",
-            "inc-a",
-            1,
-        ))
-    );
-    assert!(
-        !entrance.close_on_current_incarnation_mismatch(&connector_observation(
-            &mv_target,
-            "deployment-b",
-            "inc-b",
-            2,
-        ))
-    );
-    assert!(
-        !entrance.close_on_current_incarnation_mismatch(&connector_observation(
-            &target("mv", b"object-b"),
-            "deployment-a",
-            "inc-b",
-            2,
-        ))
-    );
+    assert!(!observe_keyed_management_mismatch(
+        &entrance,
+        &mv_target,
+        "deployment-a",
+        "inc-a",
+        1
+    ));
+    assert!(!observe_keyed_management_mismatch(
+        &entrance,
+        &target("mv", b"object-b"),
+        "deployment-a",
+        "inc-b",
+        2
+    ));
+    let other_catalog = ManagedMvTarget::try_new(
+        catalog(2),
+        mv_target.table().clone(),
+        mv_target.object_id().clone(),
+    )
+    .unwrap();
+    assert!(!observe_keyed_management_mismatch(
+        &entrance,
+        &other_catalog,
+        "deployment-a",
+        "inc-b",
+        2
+    ));
     assert_eq!(
         entrance.management_phase(mv_target.table()),
         MvManagementPhase::Manageable
     );
-    assert!(
-        entrance.close_on_current_incarnation_mismatch(&connector_observation(
-            &mv_target,
-            "deployment-a",
-            "inc-b",
-            2,
-        ))
-    );
+    assert!(observe_keyed_management_mismatch(
+        &entrance,
+        &mv_target,
+        "deployment-a",
+        "inc-b",
+        2
+    ));
     assert_eq!(
         entrance.management_phase(mv_target.table()),
         MvManagementPhase::IncarnationMismatch
@@ -1833,16 +1992,28 @@ fn create_intent_marks_before_stage_binds_once_and_blocks_a_lost_response() {
         ManagementAdmissionError::EffectUnsettled
     );
 
+    let mut escaped = keyed_management_view(&exact, "deployment-a", "inc-a", 1);
+    escaped.owner.incarnation = ProviderBindingEpoch::from_bytes([9; 16]);
+    let (bad_lease, bad_request, _) = keyed_management_lease(&exact, Ok(escaped));
     assert_eq!(
         entrance
             .begin_unbound_create_observation(&lost_intent)
             .unwrap()
-            .complete(&connector_observation(&exact, "deployment-a", "inc-a", 1))
+            .complete_keyed(&bad_lease, bad_request)
             .err()
             .unwrap(),
         ManagementObservationError::UnsealedObservation
     );
-    let fresh = FreshCreateIntentObservation::for_test(lost_intent.clone(), exact.clone());
+    let (lease, request, calls) = keyed_management_lease(
+        &exact,
+        Ok(keyed_management_view(&exact, "deployment-a", "inc-a", 1)),
+    );
+    let (fresh, _) = entrance
+        .begin_unbound_create_observation(&lost_intent)
+        .unwrap()
+        .complete_keyed(&lease, request)
+        .unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(fresh.target(), &exact);
     assert_eq!(
         entrance.resolve_unbound_create_as_unknown(fresh).unwrap(),
@@ -2953,4 +3124,113 @@ fn slot_change_unknown_remains_manageable_until_a_terminal_conclusion() {
             MvManagementPhase::Manageable
         );
     }
+}
+
+#[test]
+fn keyed_management_wrong_kind_is_rejected_before_owner_policy() {
+    let target = target("mv", b"object-a");
+    let mut state = ready_observation_state(target.clone(), "deployment-a", "inc-a");
+    let pending = state
+        .begin_current_observation(ManagementObservationRequestId::from_bytes([90; 16]))
+        .unwrap();
+    let mut view = keyed_management_view(&target, "deployment-b", "inc-b", 2);
+    let mut content = Vec::new();
+    for field in ["ordinary-table", "deployment-b", "inc-b"] {
+        content.extend_from_slice(&(field.len() as u32).to_be_bytes());
+        content.extend_from_slice(field.as_bytes());
+    }
+    view.slots
+        .get_mut(&crate::persistence::keyed_documents::management_slot_name().unwrap())
+        .unwrap()
+        .value
+        .content = Bytes::from(content);
+    let (lease, request, calls) = keyed_management_lease(&target, Ok(view));
+    assert_eq!(
+        state
+            .complete_keyed_current_observation(pending, &lease, request)
+            .unwrap_err(),
+        ManagementObservationError::InvalidProvenance
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // No valid foreign-owner observation was installed and the ticket is spent.
+    assert_eq!(state.phase(), ManagementObservationPhase::Ready);
+    assert_eq!(
+        state
+            .begin_current_observation(ManagementObservationRequestId::from_bytes([90; 16]))
+            .err()
+            .unwrap(),
+        ManagementObservationError::ReusedObservationRequest
+    );
+}
+
+#[test]
+fn typed_keyed_replacement_closes_the_state_after_consuming_the_request() {
+    use novarocks_spi::connector::{ConnectorError, ConnectorTableObjectBindingFailure};
+    let target = target("mv", b"object-a");
+    let mut state = ready_observation_state(target.clone(), "deployment-a", "inc-a");
+    let pending = state
+        .begin_current_observation(ManagementObservationRequestId::from_bytes([91; 16]))
+        .unwrap();
+    let (lease, request, calls) = keyed_management_lease(
+        &target,
+        Err(ConnectorError::table_object_binding(
+            ConnectorTableObjectBindingFailure::Replaced,
+            "test object was replaced",
+        )
+        .into()),
+    );
+    assert_eq!(
+        state
+            .complete_keyed_current_observation(pending, &lease, request)
+            .unwrap_err(),
+        ManagementObservationError::Ownership(ManagementOwnershipError::TargetReplaced)
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        state.phase(),
+        ManagementObservationPhase::ClosedObjectReplacement
+    );
+    assert!(!state.liveness().is_open());
+}
+
+#[test]
+fn keyed_foreign_owner_closes_the_exact_management_target() {
+    let target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(1));
+    let entrance = installed_entrance(&target, &dependencies);
+    assert!(observe_keyed_management_mismatch(
+        &entrance,
+        &target,
+        "deployment-b",
+        "inc-b",
+        2
+    ));
+    assert_eq!(
+        entrance.management_phase(target.table()),
+        MvManagementPhase::OwnerMismatch
+    );
+}
+
+#[test]
+fn keyed_create_narrowing_rejects_another_logical_target_before_provider_io() {
+    let exact = target("new_mv", b"created-object");
+    let intent = CreateIntent::try_new(
+        exact.catalog().clone(),
+        exact.table().clone(),
+        EffectIdentity::from_bytes([92; 16]),
+    )
+    .unwrap();
+    let other = target("another_mv", b"another-object");
+    let (lease, request, calls) = keyed_management_lease(
+        &other,
+        Ok(keyed_management_view(&other, "deployment-a", "inc-a", 1)),
+    );
+    assert_eq!(
+        PendingCreateIntentObservation::for_intent(intent)
+            .complete_keyed(&lease, request)
+            .err()
+            .unwrap(),
+        ManagementObservationError::EffectTargetMismatch
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

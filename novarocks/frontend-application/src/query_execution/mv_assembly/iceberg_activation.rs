@@ -129,7 +129,6 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
         planning_lease: &ConnectorControlPlanningLease,
         table: &ConnectorTableIdentity,
         expected_snapshot_id: i64,
-        storage_rows: u64,
         operation_id: uuid::Uuid,
         connector_context: &ConnectorRequestContext,
     ) -> Result<(), String> {
@@ -162,7 +161,6 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
             operation_id,
             crate::mv::domain::staged_create::PublishedOutput {
                 snapshot_id: expected_snapshot_id,
-                storage_rows,
             },
             // The publication already happened; observe under a scope that
             // cannot be mistaken for part of the same effect.

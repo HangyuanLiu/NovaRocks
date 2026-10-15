@@ -28,36 +28,7 @@ struct PreparedKeyed {
 }
 
 async fn keyed_fixture() -> Fixture {
-    let mut fixture = fixture().await;
-    // The shared legacy fixture deliberately has three old management keys.
-    // Remove them through the actual catalog before testing the new format;
-    // otherwise LegacyFormat would reject the first publication, correctly.
-    fixture.table = fixture
-        .catalog
-        .update_table(
-            crate::iceberg::TableCommit::builder()
-                .ident(fixture.table.identifier().clone())
-                .requirements(vec![TableRequirement::UuidMatch {
-                    uuid: fixture.table.metadata().uuid(),
-                }])
-                .updates(vec![TableUpdate::RemoveProperties {
-                    removals: vec![
-                        "novarocks.managed.kind".into(),
-                        "novarocks.managed.owner".into(),
-                        "novarocks.managed.incarnation".into(),
-                    ],
-                }])
-                .build(),
-        )
-        .await
-        .unwrap();
-    fixture.catalog.clear();
-    fixture
-        .provider
-        .runtime()
-        .control_state()
-        .invalidate_table_cache("db", "t");
-    fixture
+    fixture().await
 }
 
 async fn prepare_keyed(fixture: &Fixture, payload: &'static [u8]) -> PreparedKeyed {
@@ -260,7 +231,6 @@ fn assert_keyed_evidence(
         crate::commit::write_stack::control::decode_write_recovery_facts_for_test(&evidence)
             .unwrap();
     assert_eq!(payload["version"], serde_json::json!(4));
-    assert!(payload["document_manifest_digest"].is_null());
     assert_eq!(
         payload["document_record_digest"],
         serde_json::json!(expected_record_digest(&prepared.records))
@@ -576,4 +546,392 @@ async fn keyed_conflict_cleans_owned_files_without_another_prepare() {
             .current_snapshot_id()
             .is_none()
     );
+}
+
+// Preserve the two legacy session tests' unique branch/repartition facts while
+// using the existing independent record and closure expectations.
+async fn prepare_keyed_variant(
+    fixture: &Fixture,
+    technique: ConnectorManagedPublicationTechnique,
+    repartition: bool,
+) -> PreparedKeyed {
+    let mut prepared = prepare_keyed(fixture, b"result").await;
+    let (replacement, expected_partitioning) = if repartition {
+        let loaded = fixture
+            .catalog
+            .load_table(fixture.table.identifier())
+            .await
+            .unwrap();
+        let metadata = loaded.metadata();
+        assert!(metadata.default_partition_spec().is_unpartitioned());
+        let prior = ConnectorManagedPartitionSpecObservation::try_from_fields(
+            metadata.default_partition_spec_id(),
+            &[],
+        )
+        .unwrap();
+        let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
+            ConnectorWriteOperationId::from_bytes(prepared.declaration.publication_id().to_bytes()),
+            prior,
+            vec![
+                ConnectorManagedPartitionField::try_new(
+                    1,
+                    0,
+                    ConnectorManagedPartitionTransform::Identity,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let expected = crate::commit::write_stack::repartition::preview_managed_repartition(
+            metadata,
+            &replacement,
+        )
+        .unwrap()
+        .committed()
+        .clone();
+        assert_ne!(expected.spec_id(), metadata.default_partition_spec_id());
+        assert_eq!(expected.fields().len(), 1);
+        assert_eq!(expected.fields()[0].source_field_id(), 1);
+        assert_eq!(expected.fields()[0].source_column_name(), "id");
+        assert_eq!(
+            expected.fields()[0].transform(),
+            ConnectorManagedPartitionTransform::Identity
+        );
+        (Some(replacement), Some(expected))
+    } else {
+        (None, None)
+    };
+    let declaration = ConnectorDocumentPublicationDeclaration::try_new(
+        prepared.declaration.publication_id(),
+        prepared.declaration.admission().clone(),
+        prepared.declaration.target_object_id().clone(),
+        prepared.declaration.expected_base().clone(),
+        technique,
+        ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+        replacement,
+        expected_partitioning,
+    )
+    .unwrap();
+    prepared.intent.declaration = declaration.clone();
+    prepared.declaration = declaration;
+    prepared
+}
+
+fn keyed_begin_shape(
+    prepared: &PreparedKeyed,
+    shape: ConnectorManagedPublicationShape,
+) -> ConnectorWriteBeginRequest {
+    let mut request = keyed_begin(prepared);
+    request.intent = match (prepared.declaration.technique(), shape) {
+        (ConnectorManagedPublicationTechnique::Full, _) => ConnectorWriteIntent::Overwrite,
+        (
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationShape::RowMutation,
+        ) => ConnectorWriteIntent::RowDelta,
+        (ConnectorManagedPublicationTechnique::Incremental, _)
+        | (ConnectorManagedPublicationTechnique::MetadataOnly, _) => ConnectorWriteIntent::Append,
+    };
+    request.input = match shape {
+        ConnectorManagedPublicationShape::RowMutation => row_mutation_input(),
+        ConnectorManagedPublicationShape::Data
+        | ConnectorManagedPublicationShape::InsertOnlyChangeStream => data_input(),
+    };
+    request.flavor = ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+        declaration: prepared.declaration.clone(),
+        shape,
+    };
+    request
+}
+
+async fn assert_keyed_branch_publication(
+    fixture: &Fixture,
+    prepared: &PreparedKeyed,
+    snapshot_id: i64,
+    expected_updates: &[&'static str],
+) -> Table {
+    assert_exact_target_mutation(
+        fixture,
+        prepared.base_snapshot_id,
+        expected_updates,
+        snapshot_id,
+    );
+    let commits = fixture.catalog.commits();
+    for requirement in ["assert-current-schema-id", "assert-default-spec-id"] {
+        assert!(commits[0].requirement_kinds.contains(&requirement));
+    }
+    let snapshots = actual_snapshot_updates(fixture);
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].parent_snapshot_id(), prepared.base_snapshot_id);
+    let actual_records: BTreeMap<_, _> = snapshots[0]
+        .summary()
+        .additional_properties
+        .iter()
+        .filter(|(key, _)| key.starts_with("novarocks.doc.v2.record."))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    assert_eq!(actual_records, prepared.records);
+    let updates = fixture.catalog.raw_updates();
+    let actual_private: HashMap<_, _> = updates
+        .iter()
+        .flatten()
+        .filter_map(|u| match u {
+            TableUpdate::SetProperties { updates } => Some(updates),
+            _ => None,
+        })
+        .flat_map(|p| p.iter())
+        .filter(|(key, _)| key.starts_with("novarocks.doc."))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    assert_eq!(actual_private, prepared.expected_properties);
+    let table = fixture
+        .catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .unwrap();
+    let committed_private: HashMap<_, _> = table
+        .metadata()
+        .properties()
+        .iter()
+        .filter(|(key, _)| key.starts_with("novarocks.doc."))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    assert_eq!(committed_private, prepared.expected_properties);
+    table
+}
+
+#[tokio::test]
+async fn real_keyed_incremental_row_mutation_prepares_begins_and_finishes_one_exact_publication() {
+    use crate::commit::write_stack::domain::IcebergWriteBranch;
+    let fixture = row_lineage_fixture().await;
+    seed_empty_snapshot(&fixture).await;
+    let before = fixture
+        .catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .unwrap();
+    let before_live = live_data_for_test(fixture.provider.runtime().as_ref(), &before)
+        .await
+        .unwrap();
+    assert!(before_live.is_empty());
+    let prepared = prepare_keyed_variant(
+        &fixture,
+        ConnectorManagedPublicationTechnique::Incremental,
+        false,
+    )
+    .await;
+    let request = keyed_begin_shape(&prepared, ConnectorManagedPublicationShape::RowMutation);
+    assert_eq!(request.intent, ConnectorWriteIntent::RowDelta);
+    assert!(
+        crate::commit::write_stack::control::session_freezes_old_deletes(
+            &request.flavor,
+            &crate::commit::write_stack::test_support::merge_on_read_input_shape(),
+        )
+    );
+    fixture.catalog.clear();
+    let control = write_control(&fixture);
+    let plan = control.begin_write(request).unwrap();
+    let handle = iceberg_handle(&fixture, &plan);
+    assert_eq!(handle.table().format_version(), 3);
+    assert_eq!(
+        handle.table().schema_id(),
+        before.metadata().current_schema_id()
+    );
+    assert_eq!(handle.table().base_snapshot_id(), prepared.base_snapshot_id);
+    assert_eq!(
+        handle
+            .targets()
+            .iter()
+            .map(|target| target.branch())
+            .collect::<Vec<_>>(),
+        vec![IcebergWriteBranch::Data, IcebergWriteBranch::DeletionVector]
+    );
+    assert_eq!(plan.targets().len(), 2);
+    assert!(plan.targets().iter().all(|target| target.route().is_some()));
+    // The exact bytes may be bound before finish; finish's same-value binding
+    // must be idempotent and retain these bytes through checked dispatch.
+    assert!(handle.document_records().unwrap().is_none());
+    handle
+        .bind_document_records(prepared.records.clone())
+        .unwrap();
+    assert_eq!(
+        handle.document_records().unwrap(),
+        Some(prepared.records.clone())
+    );
+    assert!(fixture.catalog.commits().is_empty());
+    let result = control
+        .finish_write(empty_keyed_finish(&plan, &prepared))
+        .unwrap();
+    let ExternalMutationOutcome::KnownCommitted {
+        receipt,
+        finalization: ExternalMutationFinalization::Complete,
+        ..
+    } = result
+    else {
+        panic!("keyed incremental publication must commit")
+    };
+    assert_eq!(receipt.resulting_row_count(), Some(0));
+    let snapshot_id = receipt
+        .committed_version()
+        .and_then(|v| v.snapshot_id())
+        .unwrap();
+    let after = assert_keyed_branch_publication(
+        &fixture,
+        &prepared,
+        snapshot_id,
+        &["set-properties", "add-snapshot", "set-snapshot-ref"],
+    )
+    .await;
+    assert_eq!(
+        live_data_for_test(fixture.provider.runtime().as_ref(), &after)
+            .await
+            .unwrap(),
+        before_live
+    );
+    assert_eq!(
+        after.metadata().current_schema().as_ref(),
+        before.metadata().current_schema().as_ref()
+    );
+    assert_eq!(
+        handle.document_records().unwrap(),
+        Some(prepared.records.clone())
+    );
+    assert_keyed_evidence(&fixture, &plan, &prepared);
+}
+
+#[tokio::test]
+async fn real_keyed_eager_repartition_prepares_begins_and_finishes_one_exact_publication() {
+    use crate::commit::write_stack::domain::IcebergWriteBranch;
+    let fixture = keyed_fixture().await;
+    let before = fixture
+        .catalog
+        .load_table(fixture.table.identifier())
+        .await
+        .unwrap();
+    let prepared =
+        prepare_keyed_variant(&fixture, ConnectorManagedPublicationTechnique::Full, true).await;
+    let expected = prepared
+        .declaration
+        .expected_committed_partitioning()
+        .unwrap()
+        .clone();
+    let request = keyed_begin_shape(&prepared, ConnectorManagedPublicationShape::Data);
+    fixture.catalog.clear();
+    let control = write_control(&fixture);
+    let plan = control.begin_write(request).unwrap();
+    let handle = iceberg_handle(&fixture, &plan);
+    assert_eq!(plan.targets().len(), 1);
+    assert_eq!(handle.targets()[0].branch(), IcebergWriteBranch::Data);
+    // Commit authority remains on the old generation; writer binding already
+    // names the prospective partition spec before any file can be produced.
+    assert_eq!(
+        handle.table().schema_id(),
+        before.metadata().current_schema_id()
+    );
+    assert_eq!(
+        handle.table().default_partition_spec_id(),
+        before.metadata().default_partition_spec_id()
+    );
+    let adapter = crate::commit::write_stack::runtime::build_write_adapter(
+        fixture.provider.descriptor().clone(),
+        fixture.catalog_handle.clone(),
+    );
+    let writer = adapter.writer_handle(plan.targets()[0].handle()).unwrap();
+    assert_eq!(
+        writer.table().schema_id(),
+        before.metadata().current_schema_id()
+    );
+    assert_eq!(
+        writer.table().default_partition_spec_id(),
+        expected.spec_id()
+    );
+    let data = writer.data().unwrap();
+    assert_eq!(
+        data.input_schema(),
+        Some(&crate::schema_facts::iceberg_schema_def(
+            before.metadata().current_schema()
+        ))
+    );
+    assert_eq!(data.partition_source_column_names(), &["id".to_string()]);
+    assert_eq!(data.transform_exprs(), &["identity".to_string()]);
+    assert_eq!(
+        data.partition_column_names(),
+        &[expected.fields()[0].partition_field_name().to_string()]
+    );
+    assert!(handle.document_records().unwrap().is_none());
+    handle
+        .bind_document_records(prepared.records.clone())
+        .unwrap();
+    assert!(fixture.catalog.commits().is_empty());
+    let result = control
+        .finish_write(empty_keyed_finish(&plan, &prepared))
+        .unwrap();
+    let ExternalMutationOutcome::KnownCommitted {
+        receipt,
+        finalization: ExternalMutationFinalization::Complete,
+        ..
+    } = result
+    else {
+        panic!("keyed eager repartition must commit")
+    };
+    assert_eq!(receipt.resulting_row_count(), Some(0));
+    assert_eq!(receipt.committed_partitioning(), Some(&expected));
+    let snapshot_id = receipt
+        .committed_version()
+        .and_then(|v| v.snapshot_id())
+        .unwrap();
+    let after = assert_keyed_branch_publication(
+        &fixture,
+        &prepared,
+        snapshot_id,
+        &[
+            "add-spec",
+            "set-default-spec",
+            "set-properties",
+            "add-snapshot",
+            "set-snapshot-ref",
+        ],
+    )
+    .await;
+    assert_eq!(
+        after.metadata().default_partition_spec_id(),
+        expected.spec_id()
+    );
+    assert_eq!(
+        after.metadata().current_schema().as_ref(),
+        before.metadata().current_schema().as_ref()
+    );
+    assert!(
+        live_data_for_test(fixture.provider.runtime().as_ref(), &after)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        handle.document_records().unwrap(),
+        Some(prepared.records.clone())
+    );
+    assert_keyed_evidence(&fixture, &plan, &prepared);
+    let evidence = handle.recovery_evidence().unwrap();
+    let reconciled = control
+        .reconcile_write(ConnectorWriteSessionReconcileRequest {
+            commit: plan.commit_handle(),
+            evidence,
+            context: context(),
+        })
+        .unwrap();
+    let ExternalMutationOutcome::KnownCommitted {
+        receipt: reconciled,
+        finalization: ExternalMutationFinalization::Complete,
+        ..
+    } = reconciled
+    else {
+        panic!("known keyed eager repartition must reconcile idempotently")
+    };
+    assert_eq!(reconciled.resulting_row_count(), Some(0));
+    assert_eq!(reconciled.committed_partitioning(), Some(&expected));
+    assert_eq!(
+        reconciled.committed_version().and_then(|v| v.snapshot_id()),
+        Some(snapshot_id)
+    );
+    assert_eq!(fixture.catalog.commits().len(), 1);
 }

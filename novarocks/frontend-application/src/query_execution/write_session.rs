@@ -1287,11 +1287,10 @@ pub(crate) mod tests {
     use novarocks_proto_codec::connector_common::encode_connector_payload_message;
     use novarocks_spi::connector::ConnectorControlWriteBinding;
     use novarocks_spi::connector::document_storage::{
-        ConnectorDocument, ConnectorDocumentAttachment, ConnectorDocumentFormat,
-        ConnectorDocumentManagementAdmissionRequest, ConnectorDocumentManagementOperation,
-        ConnectorDocumentName, ConnectorDocumentOwner, ConnectorDocumentPublicationDeclaration,
-        ConnectorDocumentSet, ConnectorDocumentStorageBinding, ConnectorDocumentStorageManagement,
-        ConnectorPrepareDocumentsRequest, KeyedPublicationIntent,
+        ConnectorDocumentFormat, ConnectorDocumentManagementAdmissionRequest,
+        ConnectorDocumentManagementOperation, ConnectorDocumentPublicationDeclaration,
+        ConnectorDocumentStorageBinding, ConnectorDocumentStorageManagement,
+        KeyedPublicationIntent,
     };
     use novarocks_spi::connector::write_stack::{
         ConnectorCommitFragment, ConnectorWriterHandle, MAX_CONNECTOR_UNIQUE_WRITER_HANDLE_BYTES,
@@ -1790,13 +1789,6 @@ pub(crate) mod tests {
             _request: ConnectorDocumentManagementAdmissionRequest,
         ) -> Result<bytes::Bytes, ConnectorError> {
             Ok(bytes::Bytes::from_static(b"admitted-publication"))
-        }
-
-        fn prepare_documents(
-            &self,
-            _request: ConnectorPrepareDocumentsRequest,
-        ) -> Result<bytes::Bytes, ConnectorError> {
-            Ok(bytes::Bytes::from_static(b"prepared-publication"))
         }
     }
 

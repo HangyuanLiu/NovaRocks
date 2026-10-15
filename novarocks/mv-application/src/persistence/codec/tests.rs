@@ -18,13 +18,11 @@
 use super::*;
 use crate::persistence::identity::{
     AggregateIdentity, ApplyKeyIdentity, BranchIdentity, DocumentRevision, FieldIdentity,
-    NativeDataVersion, ObjectIdentity, OutputIdentity, PartitionSpecVersion, PublicationIdentity,
-    SchemaVersion, StateSlotIdentity,
+    ObjectIdentity, OutputIdentity, PartitionSpecVersion, SchemaVersion, StateSlotIdentity,
 };
 use crate::persistence::validation::runtime::{RuntimeDefinitionFacts, RuntimeInterpretationFacts};
 use crate::persistence::validation::{
-    DEFAULT_MAX_DOCUMENT_BYTES, PersistenceDecodeBudget, validate_document_set,
-    validate_live_relation_binding,
+    DEFAULT_MAX_DOCUMENT_BYTES, PersistenceDecodeBudget, validate_live_relation_binding,
 };
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
@@ -42,7 +40,6 @@ identity_fixture!(object_id, ObjectIdentity);
 identity_fixture!(field_id, FieldIdentity);
 identity_fixture!(schema_version, SchemaVersion);
 identity_fixture!(partition_spec_version, PartitionSpecVersion);
-identity_fixture!(native_data_version, NativeDataVersion);
 identity_fixture!(output_id, OutputIdentity);
 identity_fixture!(state_slot_id, StateSlotIdentity);
 identity_fixture!(aggregate_id, AggregateIdentity);
@@ -308,39 +305,6 @@ fn retraction_count_interpretation(definition: &EncodedDocument) -> Interpretati
     interpretation
 }
 
-fn sample_publication(
-    definition: &EncodedDocument,
-    interpretation: &EncodedDocument,
-) -> PublicationDocument {
-    PublicationDocument {
-        publication_prepared_at_ms: 1_700_000_001_000,
-        publication_id: PublicationIdentity::try_new(vec![91]).expect("publication id"),
-        definition_revision: definition.revision(),
-        interpretation_revision: interpretation.revision(),
-        inputs: vec![
-            PublicationInput {
-                relation_occurrence_id: 7,
-                object_id: object_id(11),
-                native_data_version: native_data_version(101),
-            },
-            PublicationInput {
-                relation_occurrence_id: 8,
-                object_id: object_id(11),
-                native_data_version: native_data_version(101),
-            },
-        ],
-        output: PublicationOutput {
-            object_id: object_id(71),
-            empty_result: false,
-        },
-        kind: PublicationKind::FullRefresh,
-        statistics: PublicationStatistics {
-            logical_result_rows: Some(1),
-            processed_input_rows: Some(100),
-        },
-    }
-}
-
 fn sample_configuration() -> ConfigurationDocument {
     ConfigurationDocument {
         refresh_policy: RefreshPolicy::AsyncInterval,
@@ -350,60 +314,59 @@ fn sample_configuration() -> ConfigurationDocument {
     }
 }
 
+fn keyed_facts() -> crate::persistence::keyed_documents::MvKeyedDocumentProjection {
+    crate::persistence::test_support::KeyedProjectionFixture::new(
+        crate::product::MvTarget::from_parts(Some("ice"), "sales", "mv"),
+        Some(17),
+    )
+    .build()
+    .unwrap()
+}
 #[test]
 fn current_document_set_charges_one_aggregate_item_budget() {
-    let definition = encode_definition(&sample_definition()).unwrap();
-    let interpretation = encode_interpretation(&sample_interpretation(&definition)).unwrap();
-    let publication =
-        encode_publication(&sample_publication(&definition, &interpretation)).unwrap();
-    let configuration = encode_configuration(&sample_configuration()).unwrap();
-    let default = PersistenceDecodeBudget::default();
-    let inputs = [
-        (definition.as_bytes(), wire::Schema::DefinitionDocument),
+    let facts = keyed_facts();
+    let versions = facts.versions();
+    let configuration = encode_configuration(facts.configuration()).unwrap();
+    let inputs: [(&[u8], wire::Schema); 4] = [
         (
-            interpretation.as_bytes(),
+            versions.definition.content(),
+            wire::Schema::DefinitionDocument,
+        ),
+        (
+            versions.interpretation.content(),
             wire::Schema::InterpretationDocument,
         ),
-        (publication.as_bytes(), wire::Schema::PublicationDocument),
+        (versions.binding.content(), wire::Schema::BindingDocument),
         (
             configuration.as_bytes(),
             wire::Schema::ConfigurationDocument,
         ),
     ];
+    let default = PersistenceDecodeBudget::default();
     let usages = inputs
         .iter()
         .map(|(bytes, schema)| wire::preflight(bytes, *schema, default).unwrap())
         .collect::<Vec<_>>();
-    let largest_document_items = usages
-        .iter()
-        .map(|usage| usage.expanded_items)
-        .max()
-        .unwrap();
-    assert!(
-        usages
-            .iter()
-            .map(|usage| usage.expanded_items)
-            .sum::<usize>()
-            > largest_document_items
-    );
+    let largest = usages.iter().map(|u| u.expanded_items).max().unwrap();
+    assert!(usages.iter().map(|u| u.expanded_items).sum::<usize>() > largest);
     let budget = PersistenceDecodeBudget {
-        max_items: largest_document_items,
+        max_items: largest,
         ..default
     };
     for (bytes, schema) in inputs {
         wire::preflight(bytes, schema, budget).expect("each document fits independently");
     }
-
     assert!(matches!(
-        preflight_current_document_set(
-            definition.as_bytes(),
-            interpretation.as_bytes(),
-            Some(publication.as_bytes()),
-            configuration.as_bytes(),
+        keyed::preflight_keyed_document_set(
+            inputs[0].0,
+            inputs[1].0,
+            inputs[2].0,
+            inputs[3].0,
+            None,
             budget,
         ),
         Err(PersistenceCodecError::ResourceBudget {
-            resource: "Current expanded items",
+            resource: "keyed Current items",
             ..
         })
     ));
@@ -486,7 +449,7 @@ fn runtime_interpretation_rejects_a_missing_union_branch_from_definition_input()
 }
 
 #[test]
-fn all_four_documents_round_trip_and_reference_exact_revisions() {
+fn definition_interpretation_configuration_round_trip_with_exact_references() {
     let definition = sample_definition();
     let encoded_definition = encode_definition(&definition).expect("encode definition");
     assert_eq!(
@@ -510,17 +473,6 @@ fn all_four_documents_round_trip_and_reference_exact_revisions() {
         interpretation
     );
 
-    let publication = sample_publication(&encoded_definition, &encoded_interpretation);
-    let encoded_publication = encode_publication(&publication).expect("encode publication");
-    assert_eq!(
-        decode_publication(
-            encoded_publication.as_bytes(),
-            PersistenceDecodeBudget::default()
-        )
-        .expect("decode publication"),
-        publication
-    );
-
     let configuration = sample_configuration();
     let encoded_configuration = encode_configuration(&configuration).expect("encode configuration");
     assert_eq!(
@@ -532,14 +484,12 @@ fn all_four_documents_round_trip_and_reference_exact_revisions() {
         configuration
     );
 
-    validate_document_set(
+    crate::persistence::validation::validate_definition_interpretation(
         &definition,
         encoded_definition.revision(),
         &interpretation,
-        encoded_interpretation.revision(),
-        &publication,
     )
-    .expect("consistent document set");
+    .expect("interpretation references the exact definition");
 }
 
 #[test]
@@ -1129,20 +1079,15 @@ fn tiny_nested_headers_consume_the_pre_prost_working_set_budget() {
 }
 
 #[test]
-fn stale_definition_or_interpretation_revision_is_rejected() {
+fn stale_definition_revision_is_rejected_by_the_interpretation_graph() {
     let definition = sample_definition();
-    let encoded_definition = encode_definition(&definition).expect("definition");
-    let interpretation = sample_interpretation(&encoded_definition);
-    let encoded_interpretation = encode_interpretation(&interpretation).expect("interpretation");
-    let mut publication = sample_publication(&encoded_definition, &encoded_interpretation);
-    publication.definition_revision = DocumentRevision::from_canonical_bytes(b"stale");
+    let encoded = encode_definition(&definition).unwrap();
+    let interpretation = sample_interpretation(&encoded);
     assert!(
-        validate_document_set(
+        crate::persistence::validation::validate_definition_interpretation(
             &definition,
-            encoded_definition.revision(),
+            DocumentRevision::from_canonical_bytes(b"stale"),
             &interpretation,
-            encoded_interpretation.revision(),
-            &publication,
         )
         .is_err()
     );
@@ -1162,20 +1107,12 @@ fn created_time_changes_document_revision_but_not_computation_identity() {
 }
 
 #[test]
-fn definition_and_publication_times_are_required_wire_facts() {
+fn definition_time_is_a_required_wire_fact() {
     let encoded = encode_definition(&sample_definition()).unwrap();
     let mut dto = super::proto::DefinitionDocument::decode(encoded.as_bytes()).unwrap();
     dto.created_at_ms = None;
     assert!(matches!(
         decode_definition(&dto.encode_to_vec(), PersistenceDecodeBudget::default()),
-        Err(PersistenceCodecError::MissingField(_))
-    ));
-    let l = encode_interpretation(&sample_interpretation(&encoded)).unwrap();
-    let p = encode_publication(&sample_publication(&encoded, &l)).unwrap();
-    let mut dto = super::proto::PublicationDocument::decode(p.as_bytes()).unwrap();
-    dto.publication_prepared_at_ms = None;
-    assert!(matches!(
-        decode_publication(&dto.encode_to_vec(), PersistenceDecodeBudget::default()),
         Err(PersistenceCodecError::MissingField(_))
     ));
 }

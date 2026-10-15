@@ -229,7 +229,6 @@ impl MvCommandExecutor {
                     catalog,
                     target,
                     operation_id,
-                    None,
                     context,
                 )
             },
@@ -878,7 +877,6 @@ impl crate::mv::domain::management_call::MvManagementOperations for MvCommandExe
                 catalog,
                 product_target,
                 uuid::Uuid::now_v7(),
-                None,
                 context.after_external_effect(),
             )?;
         } else {

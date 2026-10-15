@@ -138,9 +138,8 @@ pub fn build_mv_create_documents(
         }));
     }
     let interpretation = InterpretationDocument::try_from(RuntimeInterpretationFacts {
-        definition_revision: crate::persistence::codec::encode_definition(&definition)
-            .map_err(|error| format!("encode MV definition document: {error}"))?
-            .revision(),
+        definition_revision: super::keyed_documents::definition_revision(&definition)
+            .map_err(|error| format!("build MV definition semantic revision: {error}"))?,
         computation_identity: definition.computation_identity,
         output_bindings,
         aggregate_layout: aggregate.aggregate_layout,

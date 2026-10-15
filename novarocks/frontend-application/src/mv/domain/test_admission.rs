@@ -29,7 +29,7 @@ use bytes::Bytes;
 use novarocks_spi::connector::document_storage::{
     ConnectorDocumentManagementAdmission, ConnectorDocumentManagementAdmissionRequest,
     ConnectorDocumentManagementOperation, ConnectorDocumentStorageBinding,
-    ConnectorDocumentStorageManagement, ConnectorPrepareDocumentsRequest,
+    ConnectorDocumentStorageManagement,
 };
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorInstanceDescriptor,
@@ -73,13 +73,6 @@ impl ConnectorDocumentStorageManagement for AdmittingManagement {
         _request: ConnectorDocumentManagementAdmissionRequest,
     ) -> Result<Bytes, ConnectorError> {
         Ok(Bytes::from_static(b"test-admission-token"))
-    }
-
-    fn prepare_documents(
-        &self,
-        _request: ConnectorPrepareDocumentsRequest,
-    ) -> Result<Bytes, ConnectorError> {
-        Ok(Bytes::from_static(b"test-prepared-token"))
     }
 }
 
@@ -145,156 +138,9 @@ pub(crate) fn publication_admission(
         .expect("test publication admission")
 }
 
-/// Mutable inputs for FE tests; every build decodes an actual keyed Current view.
-pub(crate) struct KeyedProjectionFixture {
-    pub target: novarocks_mv_application::product::MvTarget,
-    pub object_id: ConnectorTableObjectId,
-    pub definition: novarocks_mv_application::persistence::codec::DefinitionDocument,
-    pub interpretation: novarocks_mv_application::persistence::codec::InterpretationDocument,
-    pub configuration: novarocks_mv_application::persistence::codec::ConfigurationDocument,
-    pub publication:
-        Option<novarocks_mv_application::persistence::codec::keyed::KeyedPublicationDocument>,
-    pub metadata_version: novarocks_spi::connector::ConnectorCommittedVersion,
-}
-impl KeyedProjectionFixture {
-    pub fn new(target: novarocks_mv_application::product::MvTarget, snapshot: Option<i64>) -> Self {
-        let f = novarocks_mv_application::persistence::test_support::ProjectionFixture::new(
-            target.clone(),
-            snapshot,
-        );
-        let (catalog, view) =
-            novarocks_mv_application::persistence::keyed_documents::keyed_view_fixture(
-                snapshot,
-                snapshot.is_some(),
-            );
-        let observed =
-            novarocks_mv_application::persistence::keyed_documents::decode_current_keyed_documents(
-                view,
-                catalog,
-                Default::default(),
-            )
-            .expect("keyed fixture");
-        Self {
-            target,
-            object_id: f.object_id,
-            definition: f.definition,
-            interpretation: f.interpretation,
-            configuration: f.configuration,
-            publication: observed.publication,
-            metadata_version: f.metadata_version,
-        }
-    }
-    pub fn with_retraction_count(mut self) -> Self {
-        self.interpretation =
-            novarocks_mv_application::persistence::test_support::ProjectionFixture::new(
-                self.target.clone(),
-                None,
-            )
-            .with_retraction_count()
-            .interpretation;
-        self
-    }
-    pub fn build(
-        mut self,
-    ) -> Result<
-        novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection,
-        String,
-    > {
-        use novarocks_mv_application::persistence::{
-            codec::keyed::{BindingDocument, DataVersionFormat},
-            identity::ObjectIdentity,
-            keyed_documents::*,
-        };
-        use novarocks_spi::connector::document_storage::*;
-        self.definition = novarocks_mv_application::persistence::codec::build_definition(
-            self.definition.created_at_ms,
-            self.definition.query.clone(),
-            self.definition.relation_occurrences.clone(),
-            self.definition.outputs.clone(),
-        )
-        .map_err(|e| e.to_string())?;
-        self.interpretation.computation_identity = self.definition.computation_identity;
-        self.interpretation.target.object_id =
-            ObjectIdentity::try_new(self.object_id.as_bytes().to_vec())
-                .map_err(|e| e.to_string())?;
-        let formats=self.definition.relation_occurrences.iter().map(|o|{
-            let object=novarocks_mv_application::persistence::exact_revision::restore_persisted_object(&o.object_id).map_err(|e|e.to_string())?;
-            let fact=novarocks_spi::connector::ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(ConnectorProviderId::parse("iceberg").unwrap(),&object,Some(17)).map_err(|e|e.to_string())?;
-            DataVersionFormat::from_issued_fact(fact.data_version()).map_err(|e|e.to_string())
-        }).collect::<Result<Vec<_>,String>>()?;
-        let versions = build_keyed_versions(
-            &self.definition,
-            &self.interpretation,
-            BindingDocument {
-                data_versions: formats,
-            },
-        )
-        .map_err(|e| e.to_string())?;
-        let snapshot = self.metadata_version.snapshot_id();
-        let (mut catalog, mut view) = keyed_view_fixture(snapshot, false);
-        view.table = ConnectorTableIdentity {
-            instance_id: ConnectorInstanceId::parse(
-                self.target
-                    .catalog()
-                    .ok_or("fixture target catalog missing")?,
-            )
-            .map_err(|e| e.to_string())?,
-            namespace: Arc::from(self.target.namespace()),
-            table: Arc::from(self.target.name()),
-        };
-        catalog = novarocks_spi::connector::CatalogHandle::new(
-            view.table.instance_id.clone(),
-            novarocks_spi::connector::CatalogVersion::from_bytes([1; 32]),
-        );
-        view.owner.instance_id = view.table.instance_id.clone();
-        view.object_id = self.object_id;
-        view.metadata_version = self.metadata_version;
-        view.versions = versions
-            .versions()
-            .into_iter()
-            .map(|v| (v.identity(), v))
-            .collect();
-        view.roots.get_mut("novarocks.mv").unwrap().identity = versions.binding.identity();
-        view.slots
-            .get_mut(&configuration_slot_name().map_err(|e| e.to_string())?)
-            .unwrap()
-            .value = keyed_configuration_slot_change(&self.configuration)
-            .map_err(|e| e.to_string())?
-            .slots
-            .into_values()
-            .next()
-            .unwrap();
-        view.slots
-            .get_mut(&management_slot_name().map_err(|e| e.to_string())?)
-            .unwrap()
-            .value = management_slot(
-            &novarocks_mv_application::management::DeploymentOwner::parse("test-deployment")
-                .unwrap(),
-            &novarocks_mv_application::management::ProcessIncarnation::parse("test-process")
-                .unwrap(),
-        )
-        .map_err(|e| e.to_string())?;
-        if let Some(p) = self.publication.as_mut() {
-            p.definition_revision = versions.definition_revision();
-            p.interpretation_revision = versions.interpretation_revision();
-            view.current_records = keyed_publication_document_set(&versions, &self.definition, p)
-                .map_err(|e| e.to_string())?
-                .records;
-            view.current_snapshot_file_totals.data_files = Some(1);
-        }
-        let observed = decode_current_keyed_documents(view, catalog, Default::default())
-            .map_err(|e| e.to_string())?;
-        MvKeyedDocumentProjection::try_from_current(observed)
-    }
-}
-pub(crate) fn sample_keyed_projection(
-    target: novarocks_mv_application::product::MvTarget,
-    snapshot: Option<i64>,
-) -> novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection {
-    KeyedProjectionFixture::new(target, snapshot)
-        .build()
-        .expect("keyed projection")
-}
+pub(crate) use novarocks_mv_application::persistence::test_support::{
+    KeyedProjectionFixture, sample_keyed_projection,
+};
 
 pub(crate) async fn keyed_repository()
 -> Arc<novarocks_mv_application::state_store_repository::StateStoreMvRepository> {

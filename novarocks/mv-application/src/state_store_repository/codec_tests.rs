@@ -23,26 +23,37 @@ use super::super::key::{
     projection_by_id_key, sequence_key, target_lookup_key,
 };
 use super::{
-    DecodedMvRecord, MvRecordKind, MvSequence, decode_projection, decode_record, encode_projection,
-    encode_record,
+    DecodedMvRecord, MvRecordKind, MvSequence, decode_keyed_projection, decode_record,
+    encode_keyed_projection, encode_record,
 };
 use crate::dependency::{MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine};
-use crate::persistence::projection::StoredMvProjection;
-use crate::persistence::test_support::sample_projection;
+use crate::persistence::keyed_documents::StoredKeyedMvProjection;
+use crate::persistence::test_support::sample_keyed_projection;
+use crate::persistence::validation::PersistenceDecodeBudget;
 use crate::product::MvTarget;
 use crate::repository::MvTargetLookup;
 use bytes::Bytes;
 use novarocks_state_store_api::{Key, Value};
 use uuid::Uuid;
 
-fn projection() -> StoredMvProjection {
-    StoredMvProjection {
+fn projection() -> StoredKeyedMvProjection {
+    StoredKeyedMvProjection {
         mv_id: 7,
-        facts: sample_projection(
+        facts: sample_keyed_projection(
             MvTarget::from_parts(Some("ice"), "sales", "orders_mv"),
             Some(11),
         ),
     }
+}
+
+// Obtain the canonical schema-four DTO, then mutate one field for negative
+// tests. This uses no retired model conversion or legacy document encoder.
+fn projection_dto(expected: &StoredKeyedMvProjection) -> super::StoredMvProjectionAvro {
+    let key = projection_by_id_key(expected.mv_id).unwrap();
+    let value = encode_keyed_projection(Uuid::now_v7(), expected).unwrap();
+    decode_record::<super::StoredMvProjectionAvro>(&key, &value)
+        .unwrap()
+        .value
 }
 
 fn upstream() -> MvDependencyObjectRef {
@@ -103,8 +114,9 @@ fn projection_codec_round_trips_complete_source_revision_and_waterline() {
     let expected = projection();
     let key = projection_by_id_key(expected.mv_id).unwrap();
     let operation_id = Uuid::now_v7();
-    let value = encode_projection(operation_id, &expected).unwrap();
-    let decoded = decode_projection(&key, &value).unwrap();
+    let value = encode_keyed_projection(operation_id, &expected).unwrap();
+    let decoded =
+        decode_keyed_projection(&key, &value, PersistenceDecodeBudget::default()).unwrap();
     assert_eq!(decoded.operation_id, operation_id);
     assert_eq!(decoded.value, expected);
     let source = decoded.value.facts.source_revision();
@@ -191,6 +203,19 @@ fn schema_catalog_contains_exactly_four_current_accelerator_subjects() {
             }
         );
     }
+    assert_eq!(
+        catalog.entry("mv.accelerator_projection", 3).unwrap().id(),
+        3
+    );
+    for version in [3, 4] {
+        let entry = catalog.entry("mv.accelerator_projection", version).unwrap();
+        let json: serde_json::Value = serde_json::from_str(entry.raw_schema()).unwrap();
+        let fields = json["fields"].as_array().unwrap();
+        for retained in ["storage_rows", "output_version"] {
+            let field = fields.iter().find(|f| f["name"] == retained).unwrap();
+            assert_eq!(field["type"][0], serde_json::json!("null"));
+        }
+    }
     assert!(catalog.entry("mv.definition", 4).is_err());
     assert!(catalog.entry("mv.refresh", 5).is_err());
     assert!(catalog.entry("mv.partition_state", 1).is_err());
@@ -200,19 +225,19 @@ fn schema_catalog_contains_exactly_four_current_accelerator_subjects() {
 fn canonical_root_rejects_tampered_output_payload_and_missing_document() {
     let expected = projection();
     let key = projection_by_id_key(expected.mv_id).unwrap();
-    let mut dto = super::StoredMvProjectionAvro::try_from(&expected).unwrap();
+    let mut dto = projection_dto(&expected);
     dto.output_version.as_mut().unwrap().payload =
         serde_bytes::ByteBuf::from(b"different-output".to_vec());
     let value = encode_record(MvRecordKind::Projection, Uuid::now_v7(), &dto).unwrap();
     assert!(
-        decode_projection(&key, &value)
+        decode_keyed_projection(&key, &value, PersistenceDecodeBudget::default())
             .unwrap_err()
-            .contains("exact output")
+            .contains("keyed MV cache source revision does not match exact document facts")
     );
-    let mut dto = super::StoredMvProjectionAvro::try_from(&expected).unwrap();
+    let mut dto = projection_dto(&expected);
     dto.configuration.clear();
     let value = encode_record(MvRecordKind::Projection, Uuid::now_v7(), &dto).unwrap();
-    assert!(decode_projection(&key, &value).is_err());
+    assert!(decode_keyed_projection(&key, &value, PersistenceDecodeBudget::default()).is_err());
 }
 
 #[test]
@@ -220,18 +245,18 @@ fn projection_decode_checks_the_local_page_budget_before_materialization() {
     use crate::persistence::validation::PersistenceDecodeBudget;
     let expected = projection();
     let key = projection_by_id_key(expected.mv_id).unwrap();
-    let value = encode_projection(Uuid::now_v7(), &expected).unwrap();
+    let value = encode_keyed_projection(Uuid::now_v7(), &expected).unwrap();
     let budget = PersistenceDecodeBudget {
         max_working_set_bytes: 4 * 1024 * 1024,
         ..PersistenceDecodeBudget::default()
     };
     assert_eq!(
-        super::decode_projection_with_budget(&key, &value, budget)
+        super::decode_keyed_projection(&key, &value, budget)
             .unwrap()
             .value,
         expected,
     );
-    let refusal = super::decode_projection_with_budget(
+    let refusal = super::decode_keyed_projection(
         &key,
         &value,
         PersistenceDecodeBudget {
@@ -244,7 +269,7 @@ fn projection_decode_checks_the_local_page_budget_before_materialization() {
         refusal.contains("outer decode working set bound"),
         "{refusal}"
     );
-    let refusal = super::decode_projection_with_budget(
+    let refusal = super::decode_keyed_projection(
         &key,
         &value,
         PersistenceDecodeBudget {
@@ -253,14 +278,17 @@ fn projection_decode_checks_the_local_page_budget_before_materialization() {
         },
     )
     .unwrap_err();
-    assert!(refusal.contains("exceeding the limit 1"), "{refusal}");
+    assert!(
+        refusal.contains("keyed MV cache document exceeds decode bound"),
+        "{refusal}"
+    );
 }
 
 #[test]
 fn projection_preflight_refuses_a_huge_avro_byte_declaration_before_owned_decode() {
     let expected = projection();
     let key = projection_by_id_key(expected.mv_id).unwrap();
-    let value = encode_projection(Uuid::now_v7(), &expected).unwrap();
+    let value = encode_keyed_projection(Uuid::now_v7(), &expected).unwrap();
     let mut bytes = value.as_bytes().to_vec();
     let fingerprint_len = u16::from_be_bytes(bytes[10..12].try_into().unwrap()) as usize;
     let payload_start = 12 + fingerprint_len + 16 + 4;
@@ -273,7 +301,7 @@ fn projection_preflight_refuses_a_huge_avro_byte_declaration_before_owned_decode
     bytes.extend_from_slice(&payload);
     let value = Value::try_from(Bytes::from(bytes)).unwrap();
     assert_eq!(
-        decode_projection(&key, &value).unwrap_err(),
+        decode_keyed_projection(&key, &value, PersistenceDecodeBudget::default()).unwrap_err(),
         "MV Accelerator Avro bytes are truncated"
     );
 }
@@ -283,12 +311,12 @@ fn projection_preflight_reserves_outer_and_documents_in_the_same_working_set() {
     use crate::persistence::validation::PersistenceDecodeBudget;
     let expected = projection();
     let key = projection_by_id_key(expected.mv_id).unwrap();
-    let value = encode_projection(Uuid::now_v7(), &expected).unwrap();
+    let value = encode_keyed_projection(Uuid::now_v7(), &expected).unwrap();
     let bytes = value.as_bytes();
     let fingerprint_len = u16::from_be_bytes(bytes[10..12].try_into().unwrap()) as usize;
     let payload = &bytes[12 + fingerprint_len + 16 + 4..];
     let outer = 4 * payload.len() + 4096;
-    let error = super::decode_projection_with_budget(
+    let error = super::decode_keyed_projection(
         &key,
         &value,
         PersistenceDecodeBudget {
@@ -306,8 +334,20 @@ fn projection_preflight_reserves_outer_and_documents_in_the_same_working_set() {
 #[test]
 fn dependency_decode_preflights_its_working_set_and_avro_lengths() {
     let root = projection();
-    let dependency =
-        crate::persistence::dependency::projection_dependencies(root.mv_id, &root.facts).remove(0);
+    let relation = &root.facts.definition().relation_occurrences[0];
+    let dependency = crate::persistence::dependency::StoredMvDependency {
+        downstream_mv_id: root.mv_id,
+        occurrence_id: relation.occurrence_id,
+        upstream_object_id: serde_bytes::ByteBuf::from(relation.object_id.as_bytes().to_vec()),
+        upstream: MvDependencyObjectRef {
+            catalog: Some(relation.catalog_at_binding.clone()),
+            database_or_namespace: relation.namespace_at_binding.clone(),
+            name: relation.relation_at_binding.clone(),
+            object_type: MvDependencyObjectType::Unclassified,
+            storage_engine: MvDependencyStorageEngine::Unclassified,
+        },
+        created_at_ms: root.facts.definition().created_at_ms,
+    };
     let key = super::super::key::dependency_by_downstream_key(
         root.mv_id,
         &dependency.upstream,
@@ -342,4 +382,26 @@ fn dependency_decode_preflights_its_working_set_and_avro_lengths() {
         super::decode_dependency_with_budget(&key, &value, 4 * 1024 * 1024).unwrap_err(),
         "MV Accelerator Avro bytes are truncated"
     );
+}
+
+#[test]
+fn keyed_projection_requires_binding_and_preserves_file_total_semantics() {
+    let expected = projection();
+    let key = projection_by_id_key(expected.mv_id).unwrap();
+    let mut missing = projection_dto(&expected);
+    missing.binding = None;
+    let value = encode_record(MvRecordKind::Projection, Uuid::now_v7(), &missing).unwrap();
+    assert!(decode_keyed_projection(&key, &value, PersistenceDecodeBudget::default()).is_err());
+    let mut negative = projection_dto(&expected);
+    negative.current_delete_files = Some(-1);
+    let value = encode_record(MvRecordKind::Projection, Uuid::now_v7(), &negative).unwrap();
+    assert!(
+        decode_keyed_projection(&key, &value, PersistenceDecodeBudget::default())
+            .unwrap_err()
+            .contains("negative cached file total")
+    );
+    let mut altered_source = projection_dto(&expected);
+    altered_source.source_revision.metadata_version.digest = "00".repeat(32);
+    let value = encode_record(MvRecordKind::Projection, Uuid::now_v7(), &altered_source).unwrap();
+    assert!(decode_keyed_projection(&key, &value, PersistenceDecodeBudget::default()).is_err());
 }

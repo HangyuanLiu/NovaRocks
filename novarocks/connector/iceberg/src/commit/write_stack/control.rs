@@ -849,33 +849,12 @@ pub(crate) fn session_snapshot_properties(
     handle: &IcebergCommitHandle,
     staged_data_rows: u64,
 ) -> Result<BTreeMap<String, String>, ConnectorError> {
-    session_snapshot_properties_with_documents(handle, staged_data_rows, None)
+    session_snapshot_properties_for_commit(handle, staged_data_rows)
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum FinishDocumentPublication<'a> {
-    Legacy(&'a novarocks_spi::connector::ConnectorDocumentPublicationIntent),
-    Keyed(&'a novarocks_spi::connector::KeyedPublicationIntent),
-}
-impl<'a> FinishDocumentPublication<'a> {
-    fn legacy(self) -> Option<&'a novarocks_spi::connector::ConnectorDocumentPublicationIntent> {
-        match self {
-            Self::Legacy(intent) => Some(intent),
-            Self::Keyed(_) => None,
-        }
-    }
-    fn keyed(self) -> Option<&'a novarocks_spi::connector::KeyedPublicationIntent> {
-        match self {
-            Self::Keyed(intent) => Some(intent),
-            Self::Legacy(_) => None,
-        }
-    }
-}
-
-fn session_snapshot_properties_with_documents(
+fn session_snapshot_properties_for_commit(
     handle: &IcebergCommitHandle,
     staged_data_rows: u64,
-    document_publication: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
 ) -> Result<BTreeMap<String, String>, ConnectorError> {
     let mut properties = BTreeMap::new();
     properties.insert(
@@ -894,49 +873,7 @@ fn session_snapshot_properties_with_documents(
             }
         }
     }
-    if let Some(publication) = document_publication {
-        crate::document_storage::publication::add_pending_snapshot_property(
-            &mut properties,
-            publication,
-        )?;
-    }
     Ok(properties)
-}
-
-fn publication_metadata_updates(
-    repartition: Option<&crate::commit::write_stack::repartition::IcebergPreparedRepartition>,
-    documents: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
-    metadata: &TableMetadata,
-) -> Result<Option<Vec<crate::iceberg::TableUpdate>>, ConnectorError> {
-    let mut updates = repartition.map(|prepared| prepared.metadata_updates().to_vec());
-    let metadata_properties = documents
-        .map(|documents| {
-            crate::document_storage::publication::publication_metadata_properties(
-                documents, metadata,
-            )
-        })
-        .transpose()?
-        .flatten();
-    if let Some(metadata_properties) = metadata_properties {
-        let updates = updates.as_mut().ok_or_else(|| {
-            invalid("metadata-attached publication documents require an atomic managed repartition")
-        })?;
-        match updates.last_mut() {
-            Some(crate::iceberg::TableUpdate::SetProperties { updates }) => {
-                for (key, value) in metadata_properties {
-                    if updates.insert(key, value).is_some() {
-                        return Err(invalid(
-                            "metadata-attached publication documents conflict with repartition properties",
-                        ));
-                    }
-                }
-            }
-            _ => updates.push(crate::iceberg::TableUpdate::SetProperties {
-                updates: metadata_properties,
-            }),
-        }
-    }
-    Ok(updates)
 }
 
 /// The replacement record one copy-on-write commit applies.
@@ -1117,7 +1054,7 @@ impl IcebergWriteSessionControl {
         prepared: &ConnectorPreparedWriteSet,
         statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
         frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>>,
-        document_publication: Option<FinishDocumentPublication<'_>>,
+        document_publication: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         #[cfg(feature = "test-controls")]
@@ -1187,9 +1124,7 @@ impl IcebergWriteSessionControl {
             document_publication,
             context,
         );
-        if document_publication
-            .and_then(FinishDocumentPublication::keyed)
-            .is_some()
+        if document_publication.is_some()
             && let Ok(ExternalMutationOutcome::KnownUncommitted {
                 failure: rejection, ..
             }) = &mut outcome
@@ -1456,15 +1391,6 @@ fn publication_row_count_from_metadata(
     })?;
     if let Some(records) = handle.document_records()? {
         validate_document_records(snapshot, &records)?;
-    } else if handle.document_publication().is_some() {
-        let expected_manifest = handle.document_manifest()?.ok_or_else(|| {
-            internal("application-document publication lost its prepared manifest")
-        })?;
-        crate::document_storage::publication::validate_expected_manifest(
-            metadata,
-            snapshot_id,
-            &expected_manifest,
-        )?;
     }
     snapshot
         .summary()
@@ -1737,19 +1663,6 @@ impl IcebergWriteSessionControl {
                             .snapshot_by_id(snapshot_id)
                             .ok_or_else(|| corrupt("selected publication snapshot is absent"))?,
                         &records,
-                    )?;
-                } else if decoded.document_manifest_digest.is_some() {
-                    let expected_manifest = handle.document_manifest()?.ok_or_else(|| {
-                        corrupt("Iceberg document publication evidence lost its prepared manifest")
-                    })?;
-                    // Exact application documents are part of commit
-                    // attribution, not a receipt projection. A matching
-                    // session marker alone must never resolve an unknown
-                    // outcome to committed.
-                    crate::document_storage::publication::validate_expected_manifest(
-                        metadata,
-                        snapshot_id,
-                        &expected_manifest,
                     )?;
                 }
                 let outcome = reconciled_known_committed_outcome(handle, snapshot_id, Ok(metadata));
@@ -3416,17 +3329,9 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
                     Ok((crate::document_storage::keyed::keys::record_key(&record.owner,&record.name), crate::document_storage::keyed::record::encode_record(record)?))
                 }).collect::<Result<BTreeMap<_,_>,ConnectorError>>()?;
                 handle.bind_document_records(records)?;
-                Some(FinishDocumentPublication::Keyed(intent))
+                Some(intent)
             }
             (None, novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::KeyedDocuments(_)) => return Err(invalid("ordinary write cannot attach keyed publication records")),
-            (
-                Some(frozen),
-                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::ApplicationDocuments(intent),
-            ) => {
-                intent.validate_for(frozen.declaration())?;
-                handle.bind_document_manifest(intent.prepared_documents().provider_token())?;
-                Some(FinishDocumentPublication::Legacy(intent))
-            }
             (
                 None,
                 novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None,
@@ -3434,14 +3339,6 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
             (Some(_), novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None) => {
                 return Err(invalid(
                     "Iceberg document publication session requires its prepared documents",
-                ));
-            }
-            (
-                None,
-                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::ApplicationDocuments(_),
-            ) => {
-                return Err(invalid(
-                    "Iceberg ordinary write cannot attach application publication documents",
                 ));
             }
         };

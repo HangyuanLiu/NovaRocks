@@ -3,7 +3,7 @@
 // with this work for additional information regarding copyright ownership.
 // The ASF licenses this file to you under the Apache License, Version 2.0.
 
-//! Additive keyed representation on the existing Accelerator owner and keys.
+//! Keyed projections on the single Accelerator owner and canonical indexes.
 use super::codec::{decode_keyed_projection, encode_keyed_projection};
 use super::*;
 use crate::persistence::keyed_documents::{MvKeyedDocumentProjection, StoredKeyedMvProjection};
@@ -50,6 +50,12 @@ impl StateStoreMvRepository {
         expected: Option<LoadedKeyedMvProjection>,
     ) -> Result<LoadedKeyedMvProjection, MvRepositoryError> {
         let target = facts.target();
+        if expected
+            .as_ref()
+            .is_some_and(|loaded| loaded.projection.facts.target() != target)
+        {
+            return Err(invalid("keyed projection replacement target differs"));
+        }
         let next = facts.clone();
         let expected_clone = expected.clone();
         let page_size = self.store.limits().max_page_size;
@@ -66,11 +72,6 @@ impl StateStoreMvRepository {
                     let index = target_key(&target).map_err(invalid_state_store)?;
                     let (id, condition) = match expected {
                         Some(expected) => {
-                            if expected.projection.facts.target() != target {
-                                return Err(invalid_state_store(
-                                    "keyed projection replacement target differs",
-                                ));
-                            }
                             let root = projection_by_id_key(expected.projection.mv_id)
                                 .map_err(invalid_state_store)?;
                             let record = transaction.get(&root).await?.ok_or_else(|| {
@@ -165,7 +166,10 @@ impl StateStoreMvRepository {
         .ok_or_else(|| corruption("installed keyed projection is missing"))
     }
 }
-fn keyed_dependencies(id: i64, facts: &MvKeyedDocumentProjection) -> Vec<StoredMvDependency> {
+pub(super) fn keyed_dependencies(
+    id: i64,
+    facts: &MvKeyedDocumentProjection,
+) -> Vec<StoredMvDependency> {
     use crate::dependency::{MvDependencyObjectType, MvDependencyStorageEngine};
     facts
         .definition()
@@ -210,14 +214,6 @@ mod tests {
                 .await
                 .unwrap(),
             Some(first.clone())
-        );
-        assert_eq!(
-            repository
-                .load_by_id(first.projection.mv_id)
-                .await
-                .unwrap_err()
-                .kind(),
-            MvRepositoryErrorKind::Corruption
         );
         let second = repository
             .install_keyed_projection(Uuid::now_v7(), facts.clone(), Some(first.clone()))

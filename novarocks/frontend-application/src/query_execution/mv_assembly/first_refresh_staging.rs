@@ -105,8 +105,6 @@ fn ordered_current_sources(
 fn ordered_previous_sources(
     rewrite: &crate::mv::domain::rewrite::context::IcebergMvRewriteContext,
 ) -> Result<Vec<crate::mv::domain::rewrite::context::MvRewriteSourceSnapshot>, String> {
-    use novarocks_mv_application::persistence::projection::MvPublicationState;
-
     match rewrite.mv_definition.facts.publication() {
         None if rewrite.previous.is_empty() => Ok(Vec::new()),
         None => Err("never-published MV first-refresh artifact has source history".to_string()),

@@ -24,7 +24,6 @@ use super::identity::{
     AggregateIdentity, BranchIdentity, FieldIdentity, OutputIdentity, PartitionSpecVersion,
     SchemaVersion, StateSlotIdentity,
 };
-use super::projection::MvDocumentProjection;
 use novarocks_spi::connector::{ConnectorCommittedVersion, ConnectorTableObjectId};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -72,19 +71,6 @@ pub struct MvRuntimeBindings {
     pub apply_key: Vec<MvPhysicalFieldFacts>,
     /// Interpretation UNION branch order; branches may share the same column.
     pub branches: Vec<(BranchIdentity, MvPhysicalFieldFacts)>,
-}
-
-pub fn reconstruct_runtime_bindings(
-    projection: &MvDocumentProjection,
-    schema: &MvExactTargetSchemaFacts,
-) -> Result<MvRuntimeBindings, String> {
-    reconstruct_from_documents(
-        projection.definition(),
-        projection.interpretation(),
-        &projection.source_revision().target_object_id,
-        projection.metadata_version(),
-        schema,
-    )
 }
 
 pub fn reconstruct_keyed_runtime_bindings(
@@ -233,12 +219,17 @@ fn reconstruct_from_documents(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::test_support::ProjectionFixture;
+    use crate::persistence::test_support::KeyedProjectionFixture;
     use crate::product::MvTarget;
 
-    fn fixture(retraction: bool) -> (MvDocumentProjection, MvExactTargetSchemaFacts) {
+    fn fixture(
+        retraction: bool,
+    ) -> (
+        super::super::keyed_documents::MvKeyedDocumentProjection,
+        MvExactTargetSchemaFacts,
+    ) {
         let mut fixture =
-            ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
+            KeyedProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
         if retraction {
             fixture = fixture.with_retraction_count();
         }
@@ -247,7 +238,9 @@ mod tests {
         (facts, schema)
     }
 
-    fn schema_for(facts: &MvDocumentProjection) -> MvExactTargetSchemaFacts {
+    fn schema_for(
+        facts: &super::super::keyed_documents::MvKeyedDocumentProjection,
+    ) -> MvExactTargetSchemaFacts {
         let mut seen = BTreeSet::new();
         let fields = facts
             .interpretation()
@@ -278,7 +271,7 @@ mod tests {
     fn reverse_binding_retains_avg_algorithm_order_apply_key_and_shared_branch_field() {
         let (facts, mut schema) = fixture(false);
         schema.fields.reverse();
-        let result = reconstruct_runtime_bindings(&facts, &schema).unwrap();
+        let result = reconstruct_keyed_runtime_bindings(&facts, &schema).unwrap();
         assert_eq!(result.outputs.len(), 1);
         assert_eq!(result.aggregates[0].states[0].role, StateRole::AvgSum);
         assert_eq!(result.aggregates[0].states[1].role, StateRole::AvgCount);
@@ -291,7 +284,7 @@ mod tests {
     #[test]
     fn reverse_binding_retains_internal_retraction_count_and_encoding() {
         let (facts, schema) = fixture(true);
-        let result = reconstruct_runtime_bindings(&facts, &schema).unwrap();
+        let result = reconstruct_keyed_runtime_bindings(&facts, &schema).unwrap();
         assert_eq!(result.aggregates.len(), 2);
         assert!(result.aggregates.iter().any(|aggregate| {
             aggregate
@@ -310,22 +303,22 @@ mod tests {
             Some(11),
         )
         .unwrap();
-        assert!(reconstruct_runtime_bindings(&facts, &wrong).is_err());
+        assert!(reconstruct_keyed_runtime_bindings(&facts, &wrong).is_err());
         let mut missing = schema.clone();
         missing.fields.pop();
-        assert!(reconstruct_runtime_bindings(&facts, &missing).is_err());
+        assert!(reconstruct_keyed_runtime_bindings(&facts, &missing).is_err());
         let mut duplicate = schema.clone();
         duplicate.fields.push(duplicate.fields[0].clone());
-        assert!(reconstruct_runtime_bindings(&facts, &duplicate).is_err());
+        assert!(reconstruct_keyed_runtime_bindings(&facts, &duplicate).is_err());
         let mut wrong_type = schema;
         wrong_type.fields[0].nullable = !wrong_type.fields[0].nullable;
-        assert!(reconstruct_runtime_bindings(&facts, &wrong_type).is_err());
+        assert!(reconstruct_keyed_runtime_bindings(&facts, &wrong_type).is_err());
     }
 
     #[test]
     fn nonzero_legacy_create_versions_fail_closed_against_exact_provider_observation() {
         let mut fixture =
-            ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
+            KeyedProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
         fixture.interpretation.target.schema_version =
             SchemaVersion::try_new(vec![1, 2, 3, 4]).unwrap();
         fixture.interpretation.target.partition_spec_version =
@@ -337,24 +330,24 @@ mod tests {
 
         observed.schema_version = provider_schema_version.clone();
         assert_eq!(
-            reconstruct_runtime_bindings(&old, &observed).unwrap_err(),
+            reconstruct_keyed_runtime_bindings(&old, &observed).unwrap_err(),
             "MV runtime target schema version is not from the exact document generation"
         );
 
         observed.schema_version = old.interpretation().target.schema_version.clone();
         observed.partition_spec_version = provider_spec_version.clone();
         assert_eq!(
-            reconstruct_runtime_bindings(&old, &observed).unwrap_err(),
+            reconstruct_keyed_runtime_bindings(&old, &observed).unwrap_err(),
             "MV runtime target partition spec is not from the exact document generation"
         );
 
         let mut current_fixture =
-            ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
+            KeyedProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
         current_fixture.interpretation.target.schema_version = provider_schema_version;
         current_fixture.interpretation.target.partition_spec_version = provider_spec_version;
         let current = current_fixture.build().unwrap();
         let current_observation = schema_for(&current);
-        reconstruct_runtime_bindings(&current, &current_observation).unwrap();
+        reconstruct_keyed_runtime_bindings(&current, &current_observation).unwrap();
     }
 
     #[test]
@@ -362,7 +355,7 @@ mod tests {
         use crate::persistence::codec::TargetPartitionTransform;
 
         let mut fixture =
-            ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
+            KeyedProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
         let source_target_field_id = fixture.interpretation.target.fields[0]
             .target_field_id
             .clone();
@@ -380,14 +373,14 @@ mod tests {
         ];
         let facts = fixture.build().unwrap();
         let mut schema = schema_for(&facts);
-        assert!(reconstruct_runtime_bindings(&facts, &schema).is_ok());
+        assert!(reconstruct_keyed_runtime_bindings(&facts, &schema).is_ok());
         schema.partition_fields.clear();
-        assert!(reconstruct_runtime_bindings(&facts, &schema).is_err());
+        assert!(reconstruct_keyed_runtime_bindings(&facts, &schema).is_err());
         schema.partition_fields = facts.interpretation().target.partition_fields.clone();
         schema.partition_fields.reverse();
-        assert!(reconstruct_runtime_bindings(&facts, &schema).is_err());
+        assert!(reconstruct_keyed_runtime_bindings(&facts, &schema).is_err());
         schema.partition_fields.reverse();
         schema.partition_fields[0].transform = TargetPartitionTransform::Bucket { num_buckets: 16 };
-        assert!(reconstruct_runtime_bindings(&facts, &schema).is_err());
+        assert!(reconstruct_keyed_runtime_bindings(&facts, &schema).is_err());
     }
 }

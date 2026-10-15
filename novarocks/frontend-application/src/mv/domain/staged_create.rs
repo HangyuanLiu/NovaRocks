@@ -449,9 +449,7 @@ pub(crate) fn install_created_current_projection(
         catalog,
         target,
         operation_id,
-        // A created MV has published nothing, so it has no output to carry
-        // storage statistics for.
-        None,
+        // A created MV has published no output to read back.
         None,
         MvConvergence::CommittedEffect,
         context,
@@ -459,8 +457,8 @@ pub(crate) fn install_created_current_projection(
     )
 }
 
-/// Re-observe a committed C-only configuration update and reopen management
-/// from the same sealed Current package.
+/// Re-observe a committed slot change and reopen management from the same
+/// keyed Current observation.
 pub(crate) fn install_configured_current_projection(
     entrance: &ManagementEntrance,
     readiness: &crate::mv::domain::readiness::MvReadinessPort,
@@ -468,9 +466,6 @@ pub(crate) fn install_configured_current_projection(
     catalog: CatalogHandle,
     target: novarocks_mv_application::product::MvTarget,
     operation_id: uuid::Uuid,
-    retained_statistics: Option<
-        novarocks_mv_application::persistence::projection::MvOutputStatistics,
-    >,
     context: ConnectorRequestContext,
 ) -> Result<(), String> {
     install_committed_current_projection(
@@ -481,7 +476,6 @@ pub(crate) fn install_configured_current_projection(
         target,
         operation_id,
         None,
-        retained_statistics,
         MvConvergence::CommittedEffect,
         context,
         "configured",
@@ -491,9 +485,8 @@ pub(crate) fn install_configured_current_projection(
 /// Install the Current projection of a target this statement just published.
 ///
 /// The publication wrote P into the same commit as its rows, so the projection
-/// is read back from that committed document set. The provider's own row count
-/// for that exact output rides along: it belongs to the publication, and the
-/// projection refuses it if the output it names is not the one observed.
+/// is read back from that committed document set. The observation must retain
+/// the exact carrier snapshot this statement committed.
 pub(crate) fn install_published_current_projection(
     entrance: &ManagementEntrance,
     readiness: &crate::mv::domain::readiness::MvReadinessPort,
@@ -512,7 +505,6 @@ pub(crate) fn install_published_current_projection(
         target,
         operation_id,
         Some(published),
-        None,
         MvConvergence::CommittedEffect,
         context,
         "published",
@@ -544,9 +536,7 @@ pub(crate) fn readmit_declared_target(
         catalog,
         target,
         operation_id,
-        // A readmission observes whatever the target holds; it publishes
-        // nothing of its own, so it attaches no storage statistics.
-        None,
+        // Readmission observes the current output without publishing one.
         None,
         MvConvergence::Readmission {
             previous_incarnation,
@@ -561,12 +551,10 @@ pub(crate) fn readmit_declared_target(
 ///
 /// The observation that installs the projection has to read back this exact
 /// output: a target that has moved on to a later publication is not the one
-/// this statement published, and storing this refresh's row count against that
-/// later output would attribute its result to someone else's commit.
+/// this statement published.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PublishedOutput {
     pub(crate) snapshot_id: i64,
-    pub(crate) storage_rows: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -578,9 +566,6 @@ fn install_committed_current_projection(
     target: novarocks_mv_application::product::MvTarget,
     operation_id: uuid::Uuid,
     published: Option<PublishedOutput>,
-    retained_statistics: Option<
-        novarocks_mv_application::persistence::projection::MvOutputStatistics,
-    >,
     convergence: MvConvergence,
     context: ConnectorRequestContext,
     effect: &str,
@@ -596,7 +581,6 @@ fn install_committed_current_projection(
         entrance,
         connector_control,
         published,
-        retained_statistics,
         convergence,
     };
     readiness
@@ -617,8 +601,6 @@ struct CommittedTargetCurrentSource<'a> {
     /// The output this observation must read back, absent when the effect
     /// published nothing.
     published: Option<PublishedOutput>,
-    retained_statistics:
-        Option<novarocks_mv_application::persistence::projection::MvOutputStatistics>,
     convergence: MvConvergence,
 }
 
@@ -917,53 +899,6 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             .map_err(|e| conflict(format!("install MV admission: {e:?}")))?;
         Ok((observed, admission))
     }
-}
-
-/// The statistics one publication may attach to the output it just read back.
-///
-/// Statistics belong to an exact output, so the output the observation found
-/// is proved to be this statement's own before its row count is attached to
-/// it. A target that has already moved to a later publication, or that carries
-/// no published output at all, is not this one.
-fn published_output_statistics(
-    published: Option<PublishedOutput>,
-    target_object_id: &ConnectorTableObjectId,
-    output_version: Option<&novarocks_spi::connector::ConnectorCommittedVersion>,
-) -> Result<Option<novarocks_mv_application::persistence::projection::MvOutputStatistics>, String> {
-    let Some(published) = published else {
-        return Ok(None);
-    };
-    let output_version = output_version.ok_or_else(|| {
-        "published MV observation carries no publication output version".to_string()
-    })?;
-    if output_version.snapshot_id() != Some(published.snapshot_id) {
-        return Err(format!(
-            "published MV observation read output snapshot {:?} instead of the committed {}",
-            output_version.snapshot_id(),
-            published.snapshot_id,
-        ));
-    }
-    Ok(Some(
-        novarocks_mv_application::persistence::projection::MvOutputStatistics {
-            object_id: target_object_id.clone(),
-            output_version: output_version.clone(),
-            storage_rows: published.storage_rows,
-        },
-    ))
-}
-
-/// A C-only update keeps an existing row count only for the same exact P output.
-fn retained_output_statistics(
-    retained: Option<&novarocks_mv_application::persistence::projection::MvOutputStatistics>,
-    target_object_id: &ConnectorTableObjectId,
-    output_version: Option<&novarocks_spi::connector::ConnectorCommittedVersion>,
-) -> Option<novarocks_mv_application::persistence::projection::MvOutputStatistics> {
-    retained
-        .filter(|statistics| {
-            statistics.object_id == *target_object_id
-                && output_version == Some(&statistics.output_version)
-        })
-        .cloned()
 }
 
 /// One admitted MV publication: the management lease it commits under and the
@@ -1312,97 +1247,4 @@ pub(crate) fn admit_mv_publication(
         entrance: entrance.clone(),
         repartitioned: false,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bytes::Bytes;
-    use novarocks_spi::connector::ConnectorCommittedVersion;
-
-    fn output(snapshot_id: i64) -> ConnectorCommittedVersion {
-        ConnectorCommittedVersion::try_new(
-            Bytes::from_static(b"metadata-current"),
-            Some(snapshot_id),
-        )
-        .expect("committed version")
-    }
-
-    fn object() -> ConnectorTableObjectId {
-        ConnectorTableObjectId::try_new(Bytes::from_static(b"target-object")).expect("object id")
-    }
-
-    #[test]
-    fn a_created_target_attaches_no_output_statistics() {
-        assert!(
-            published_output_statistics(None, &object(), None)
-                .expect("a create publishes nothing")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn a_configuration_update_keeps_rows_only_for_the_same_output() {
-        let retained = novarocks_mv_application::persistence::projection::MvOutputStatistics {
-            object_id: object(),
-            output_version: output(99),
-            storage_rows: 7,
-        };
-        assert_eq!(
-            retained_output_statistics(Some(&retained), &object(), Some(&output(99))),
-            Some(retained.clone())
-        );
-        assert!(
-            retained_output_statistics(Some(&retained), &object(), Some(&output(100))).is_none()
-        );
-        assert!(retained_output_statistics(Some(&retained), &object(), None).is_none());
-    }
-
-    #[test]
-    fn a_publication_attaches_its_rows_to_the_output_it_read_back() {
-        let statistics = published_output_statistics(
-            Some(PublishedOutput {
-                snapshot_id: 99,
-                storage_rows: 7,
-            }),
-            &object(),
-            Some(&output(99)),
-        )
-        .expect("the exact output is accepted")
-        .expect("a publication carries statistics");
-
-        assert_eq!(statistics.object_id, object());
-        assert_eq!(statistics.output_version, output(99));
-        assert_eq!(statistics.storage_rows, 7);
-    }
-
-    #[test]
-    fn an_advanced_output_refuses_this_publications_rows() {
-        let error = published_output_statistics(
-            Some(PublishedOutput {
-                snapshot_id: 99,
-                storage_rows: 7,
-            }),
-            &object(),
-            Some(&output(100)),
-        )
-        .expect_err("a later publication's output must not carry this refresh's rows");
-
-        assert!(error.contains("instead of the committed 99"), "{error}");
-    }
-
-    #[test]
-    fn a_never_published_observation_refuses_a_committed_publication() {
-        let error = published_output_statistics(
-            Some(PublishedOutput {
-                snapshot_id: 99,
-                storage_rows: 7,
-            }),
-            &object(),
-            None,
-        )
-        .expect_err("a committed publication must have been read back");
-
-        assert!(error.contains("no publication output version"), "{error}");
-    }
 }

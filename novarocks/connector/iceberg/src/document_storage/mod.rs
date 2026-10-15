@@ -15,25 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Iceberg storage for application-owned opaque documents.
-//!
-//! The application owns every document body and version. This module owns the
-//! Iceberg envelope, immutable sidecar names, exact metadata projection,
-//! catalog pagination, and provider-level reachability used by cleanup.
-
-pub(crate) mod codec;
+//! Inline keyed application documents, exact observations and admission.
+mod context;
 mod create;
 mod discovery;
-pub(crate) mod envelope;
-pub(crate) mod io;
-pub(crate) mod observation;
-pub(crate) mod publication;
-mod reference;
-mod retention;
-
-pub use create::IcebergDocumentStorage;
-pub(crate) use retention::retained_sidecars_for_roots;
-
 pub(crate) mod keyed;
-
+pub(crate) mod observation;
+pub use create::IcebergDocumentStorage;
 pub(crate) use create::validate_management_admission;

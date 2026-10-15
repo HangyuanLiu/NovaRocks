@@ -358,8 +358,6 @@ struct PreparedAutomaticAction {
     operation_uuid: uuid::Uuid,
     scope: novarocks_mv_application::management::EffectScope,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    retained_statistics:
-        Option<novarocks_mv_application::persistence::projection::MvOutputStatistics>,
 }
 
 impl TableMaintenanceAutomaticRunner {
@@ -523,7 +521,6 @@ impl TableMaintenanceAutomaticRunner {
                 "MV maintenance documents changed during admission",
             ));
         }
-        let retained_statistics = None;
         Ok(PreparedAutomaticAction {
             entrance,
             management,
@@ -533,7 +530,6 @@ impl TableMaintenanceAutomaticRunner {
             operation_uuid,
             scope,
             context,
-            retained_statistics,
         })
     }
 }
@@ -582,7 +578,6 @@ impl PreparedAutomaticAction {
                 self.catalog_handle,
                 self.product_target,
                 self.operation_uuid,
-                self.retained_statistics,
                 self.context.after_external_effect(),
             )
             .map_err(|error| {

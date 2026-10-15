@@ -21,15 +21,13 @@ use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorCommittedVersion, ConnectorControlRuntimeId,
-    ConnectorDocumentManagementObservation, ConnectorDocumentManagementOperation,
-    ConnectorTableIdentity, ConnectorTableObjectId,
+    ConnectorDocumentManagementOperation, ConnectorTableIdentity, ConnectorTableObjectId,
 };
 
 use crate::activity::{
     CanonicalMvTarget, MvActivityAdmissionError, MvActivityGate, MvActivityGateError,
     MvActivityLease, MvActivityObservation, MvActivityOwner, MvActivityTicket,
 };
-use crate::persistence::documents::MvObservedCurrentDocuments;
 
 /// Single-use proof that the management owner admitted the exact same Current
 /// observation after effect closure and owner/incarnation validation.
@@ -44,14 +42,6 @@ pub struct MvCurrentManagementAdmission {
 }
 
 impl MvCurrentManagementAdmission {
-    pub(crate) fn matches(&self, documents: &MvObservedCurrentDocuments) -> bool {
-        self.liveness.is_open()
-            && self.target == documents.management_target
-            && self.owner == documents.deployment_owner
-            && self.incarnation == documents.process_incarnation
-            && self.metadata_version == documents.metadata_version
-    }
-
     pub(crate) fn matches_keyed(
         &self,
         documents: &crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
@@ -76,17 +66,6 @@ impl MvCurrentManagementAdmission {
             owner: documents.deployment_owner.clone(),
             incarnation: documents.process_incarnation.clone(),
             metadata_version: documents.view.metadata_version.clone(),
-            liveness: ManagementObservationLiveness::new(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(documents: &MvObservedCurrentDocuments) -> Self {
-        Self {
-            target: documents.management_target.clone(),
-            owner: documents.deployment_owner.clone(),
-            incarnation: documents.process_incarnation.clone(),
-            metadata_version: documents.metadata_version.clone(),
             liveness: ManagementObservationLiveness::new(),
         }
     }
@@ -891,29 +870,6 @@ impl ManagementEntrance {
             installed.close();
         }
         Ok(true)
-    }
-
-    pub fn close_on_current_incarnation_mismatch(
-        &self,
-        observation: &ConnectorDocumentManagementObservation,
-    ) -> bool {
-        let mut state = lock(&self.inner.state);
-        let Some(current) = state.get_mut(observation.target()) else {
-            return false;
-        };
-        if current.target.catalog() != observation.catalog_handle()
-            || current.target.object_id() != observation.object_id()
-            || observation.marker().owner() != self.inner.owner.as_str()
-            || observation.marker().incarnation() == self.inner.incarnation.as_str()
-        {
-            return false;
-        }
-        current.ready = false;
-        current.incarnation_mismatch = true;
-        if let Some(installed) = &current.installed_observation {
-            installed.close();
-        }
-        true
     }
 
     /// Where one target stands in this process's activity gate. Diagnostic

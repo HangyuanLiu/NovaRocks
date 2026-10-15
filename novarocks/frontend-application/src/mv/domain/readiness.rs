@@ -111,18 +111,11 @@ fn local_inventory_bound() -> novarocks_mv_application::repository::MvProjection
 /// and DDL consumers, not whether a retained candidate can be independently
 /// proven against its exact publication.
 #[derive(Clone)]
-pub(crate) enum MvCandidateReader {
-    Keyed {
-        reader: ProductCandidateReader,
-        service: MvKeyedReadinessService,
-        management: std::sync::Arc<novarocks_mv_application::management::ManagementEntrance>,
-        handle: tokio::runtime::Handle,
-    },
-    #[cfg(test)]
-    LegacyHeld {
-        reader: novarocks_mv_application::readiness::MvCandidateReader,
-        handle: tokio::runtime::Handle,
-    },
+pub(crate) struct MvCandidateReader {
+    reader: ProductCandidateReader,
+    service: MvKeyedReadinessService,
+    management: std::sync::Arc<novarocks_mv_application::management::ManagementEntrance>,
+    handle: tokio::runtime::Handle,
 }
 
 impl MvReadinessPort {
@@ -173,7 +166,7 @@ impl MvReadinessPort {
     }
 
     pub(crate) fn candidate_reader(&self) -> MvCandidateReader {
-        MvCandidateReader::Keyed {
+        MvCandidateReader {
             reader: self.service.candidate_reader(),
             service: self.service.clone(),
             management: self.management.clone(),
@@ -417,19 +410,8 @@ impl MvReadinessPort {
 }
 
 impl MvCandidateReader {
-    #[cfg(test)]
-    pub(crate) fn new(
-        reader: novarocks_mv_application::readiness::MvCandidateReader,
-        handle: tokio::runtime::Handle,
-    ) -> Self {
-        Self::LegacyHeld { reader, handle }
-    }
     fn block_on<T>(&self, future: impl std::future::Future<Output = T>) -> T {
-        let handle = match self {
-            Self::Keyed { handle, .. } => handle,
-            #[cfg(test)]
-            Self::LegacyHeld { handle, .. } => handle,
-        };
+        let handle = &self.handle;
         match tokio::runtime::Handle::try_current() {
             Ok(_) => tokio::task::block_in_place(|| handle.block_on(future)),
             Err(_) => handle.block_on(future),
@@ -438,20 +420,7 @@ impl MvCandidateReader {
     pub(crate) fn list_candidate_definitions(
         &self,
     ) -> Result<Vec<StoredKeyedMvProjection>, MvRepositoryError> {
-        match self {
-            Self::Keyed { reader, .. } => self.block_on(reader.list_candidate_definitions()),
-            #[cfg(test)]
-            Self::LegacyHeld { reader, .. } => {
-                let legacy = self.block_on(reader.list_candidate_definitions())?;
-                if !legacy.is_empty() {
-                    return Err(MvRepositoryError::new(
-                        novarocks_mv_application::repository::MvRepositoryErrorKind::Corruption,
-                        "legacy held-port fixture unexpectedly returned facts",
-                    ));
-                }
-                Ok(Vec::new())
-            }
-        }
+        self.block_on(self.reader.list_candidate_definitions())
     }
     pub(crate) fn observe_current(
         &self,
@@ -461,14 +430,11 @@ impl MvCandidateReader {
         novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
         String,
     > {
-        let Self::Keyed {
+        let Self {
             service,
             management,
             ..
-        } = self
-        else {
-            return Err("held-port inventory does not observe lake documents".into());
-        };
+        } = self;
         let (mut observed,convergence)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management(lease,request.clone(),Default::default(),management).map_err(|e|e.to_string())?;
         if observed.deployment_owner != *management.owner()
             || observed.process_incarnation != *management.incarnation()
@@ -559,10 +525,8 @@ mod controlled_wipe_tests {
         activity::{MvActivityGateError, MvActivityOwner},
         process_runtime::{MvBackgroundRuntime, ProcessRuntime},
         product::MvTarget,
-        repository::MvRepository,
         scheduler::MvSchedulerConfig,
         service::MvKeyedProductService,
-        test_repository::InMemoryMvRepository,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;

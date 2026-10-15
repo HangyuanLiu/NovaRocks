@@ -330,8 +330,6 @@ fn execute_data(
         .publication_version()
         .snapshot_id()
         .ok_or_else(|| invalid("MV publication completed without a snapshot ID"))?;
-    let storage_rows = u64::try_from(committed.resulting_row_count())
-        .map_err(|_| invalid("MV publication committed a negative row count"))?;
     Ok(FrontendKnownCommittedPublication {
         install: PublishedProjectionInstall {
             activation: Arc::clone(&dependencies.provider_activation),
@@ -339,7 +337,6 @@ fn execute_data(
             table,
             context,
             snapshot_id,
-            storage_rows,
         },
         published,
         #[cfg(feature = "test-controls")]
@@ -484,8 +481,7 @@ fn execute_metadata_only(
         ));
     }
     // A metadata-only publication produced no logical result rows. P says so
-    // rather than repeating the target's own row count, which the receipt
-    // reports and the projection reads.
+    // rather than repeating the target's physical storage row count.
     let outcome = bind_publication_documents(planning, &intent, admitted, &session, 0, &context)
         .and_then(|()| {
             // Past this point the commit may have happened, so the publication
@@ -523,8 +519,6 @@ fn execute_metadata_only(
         .publication_version()
         .snapshot_id()
         .ok_or_else(|| invalid("MV metadata-only publication completed without a snapshot ID"))?;
-    let storage_rows = u64::try_from(committed.resulting_row_count())
-        .map_err(|_| invalid("MV metadata-only publication committed a negative row count"))?;
     Ok(FrontendKnownCommittedPublication {
         install: PublishedProjectionInstall {
             activation: Arc::clone(&dependencies.provider_activation),
@@ -532,7 +526,6 @@ fn execute_metadata_only(
             table,
             context,
             snapshot_id,
-            storage_rows,
         },
         published,
         #[cfg(feature = "test-controls")]
@@ -562,7 +555,6 @@ struct PublishedProjectionInstall {
     table: ConnectorTableIdentity,
     context: ConnectorRequestContext,
     snapshot_id: i64,
-    storage_rows: u64,
 }
 
 impl MvRefreshKnownCommittedPort for FrontendKnownCommittedPublication {
@@ -596,7 +588,6 @@ impl MvRefreshKnownCommittedPort for FrontendKnownCommittedPublication {
                 &install.planning,
                 &install.table,
                 install.snapshot_id,
-                install.storage_rows,
                 *attempt.as_uuid(),
                 &install.context,
             )

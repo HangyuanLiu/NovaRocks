@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Borrowed structural preflight of the closed StoredMvProjectionV3 datum.
+//! Borrowed structural preflight of the registered keyed projection datum.
 //! The envelope's registered schema and fingerprint are checked by the caller.
 //! No Avro Value, ByteBuf or document model exists until this check succeeds.
 
-use crate::persistence::codec::preflight_current_document_set;
 use crate::persistence::validation::PersistenceDecodeBudget;
 
 pub(super) fn projection(
@@ -110,15 +109,7 @@ pub(super) fn projection(
         .map_err(|e| e.to_string())?;
         return Ok(documents);
     }
-    preflight_current_document_set(
-        definition,
-        interpretation,
-        publication,
-        configuration,
-        documents,
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(documents)
+    Err("legacy MV projection has no keyed binding".into())
 }
 
 /// The registered dependency V3 is a fixed record, with no collections.

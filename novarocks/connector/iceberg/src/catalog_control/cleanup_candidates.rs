@@ -49,7 +49,6 @@ pub(super) async fn collect_orphan_candidates(
     table: &Table,
     older_than_ms: i64,
     binding: &IcebergReadBinding,
-    document_roots: Option<&[novarocks_spi::connector::ConnectorDocumentRetentionRoot]>,
     max_candidates: usize,
 ) -> Result<Vec<ScannedFile>, ConnectorError> {
     let metadata = table.metadata();
@@ -70,10 +69,6 @@ pub(super) async fn collect_orphan_candidates(
             .iter()
             .map(|entry| entry.metadata_file.clone()),
     );
-    live.extend(crate::document_storage::retained_sidecars_for_roots(
-        metadata,
-        document_roots,
-    )?);
     if let Some(current) = table.metadata_location() {
         live.insert(current.to_string());
     }
@@ -337,11 +332,11 @@ mod tests {
             .expect("write data");
         operator
             .write(
-                "warehouse/table/metadata/novarocks-documents/v1/document.bin",
+                "warehouse/table/metadata/scratch/nested/object.bin",
                 vec![2],
             )
             .await
-            .expect("write document");
+            .expect("write metadata object");
         operator
             .write("warehouse/other/data/unrelated.parquet", vec![3])
             .await
@@ -363,7 +358,7 @@ mod tests {
             paths,
             [
                 "warehouse/table/data/partition=1/file.parquet",
-                "warehouse/table/metadata/novarocks-documents/v1/document.bin",
+                "warehouse/table/metadata/scratch/nested/object.bin",
             ]
         );
     }

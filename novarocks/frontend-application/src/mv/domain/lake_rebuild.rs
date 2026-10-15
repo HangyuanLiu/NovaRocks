@@ -36,11 +36,11 @@ use novarocks_mv_application::readiness::{
     MvKeyedReadOnlyCurrentProjectionSource, MvProjectionError, MvProjectionErrorKind,
 };
 use novarocks_spi::connector::{
-    CatalogHandle, ConnectorControlResolver, ConnectorDocumentDiscoveryCompleteness,
-    ConnectorDocumentDiscoveryIncompleteReason, ConnectorDocumentDiscoveryRequest,
-    ConnectorDocumentStorageBudget, ConnectorDocumentStorageLimits, ConnectorError,
-    ConnectorErrorKind, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorTableObjectCaptureRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
+    CatalogHandle, ConnectorControlResolver, ConnectorDocumentDiscoveryBudget,
+    ConnectorDocumentDiscoveryCompleteness, ConnectorDocumentDiscoveryIncompleteReason,
+    ConnectorDocumentDiscoveryRequest, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableObjectCaptureRequest,
+    ConnectorTableObjectSelector, ConnectorTableResolution,
     MAX_CONNECTOR_DOCUMENT_DISCOVERY_PAGE_SIZE,
 };
 use uuid::Uuid;
@@ -499,8 +499,7 @@ fn discover_managed_mv_targets_in_namespace(
     context: ConnectorRequestContext,
 ) -> Result<ManagedMvDiscovery, ConnectorError> {
     let documents = planning.derive_document_storage_lease()?;
-    let budget =
-        ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default());
+    let budget = ConnectorDocumentDiscoveryBudget::default();
     let mut request = ConnectorDocumentDiscoveryRequest::try_new(
         documents.owner().clone(),
         documents.catalog_handle().clone(),

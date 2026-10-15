@@ -1782,7 +1782,7 @@ pub fn update_iceberg_mv_configuration_with_ports(
             .map_err(|e| format!("record MV configuration terminal: {e:?}"))?;
     }
     match disposition {
-        EffectDisposition::KnownCommitted=>crate::mv::domain::staged_create::install_configured_current_projection(entrance,ports.readiness().as_ref(),ports.connector_control(),catalog_handle,target,operation_uuid,None,context.clone().after_external_effect()),
+        EffectDisposition::KnownCommitted=>crate::mv::domain::staged_create::install_configured_current_projection(entrance,ports.readiness().as_ref(),ports.connector_control(),catalog_handle,target,operation_uuid,context.clone().after_external_effect()),
         EffectDisposition::KnownUncommitted=>{
             let detail=match resolved {crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted{failure,cleanup}=>crate::connector::mutation::known_uncommitted_message(failure,&cleanup),crate::connector::mutation::ResolvedCatalogMutation::ContractFailure{error,..}=>error.to_string(),_=>"provider rejected the commit".into()};
             Err(format!("MV refresh configuration update did not commit: {detail}"))

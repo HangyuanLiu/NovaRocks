@@ -268,13 +268,8 @@ pub(crate) async fn prepare_snapshot_change(
     if let Some(total) = exact_records {
         finalized.insert("total-records".into(), total);
     }
-    let properties = merge_snapshot_summary_properties(
-        finalized,
-        intent.summary(),
-        metadata.uuid(),
-        snapshot_id,
-    )
-    .map_err(to_iceberg_unexpected)?;
+    let properties = merge_snapshot_summary_properties(finalized, intent.summary())
+        .map_err(to_iceberg_unexpected)?;
     let list = super::staging::write_manifest_list(
         view.artifacts(),
         metadata,
@@ -752,39 +747,16 @@ mod tests {
         publish_append(fixture, table, target_ref, vec![file], BTreeMap::new()).await
     }
 
-    fn pending_document_properties() -> (BTreeMap<String, String>, Vec<u8>) {
-        let content = b"publication".to_vec();
-        let manifest =
-            crate::document_storage::envelope::IcebergDocumentManifestV1 {
-                version: crate::document_storage::envelope::DOCUMENT_MANIFEST_VERSION,
-                documents: vec![crate::document_storage::envelope::IcebergDocumentEnvelopeV1 {
-                version: crate::document_storage::envelope::DOCUMENT_ENVELOPE_VERSION,
-                owner: "novarocks.mv".to_string(),
-                name: "publication".to_string(),
-                format_owner: "novarocks.mv".to_string(),
-                format_name: "publication".to_string(),
-                format_version: 1,
-                revision: novarocks_spi::connector::ConnectorDocumentRevision::for_content(
-                    &content,
-                )
-                .to_bytes(),
-                encoded_len: content.len() as u64,
-                references: Vec::new(),
-                attachment:
-                    crate::document_storage::envelope::IcebergDocumentAttachmentV1::CommitOutput,
-                carrier: crate::document_storage::envelope::IcebergDocumentCarrierV1::Available {
-                    content,
-                },
-            }],
-            };
-        let unresolved = crate::document_storage::codec::encode_document_manifest(&manifest)
-            .expect("encode prepared publication")
-            .to_vec();
-        let properties = BTreeMap::from([(
-            crate::document_storage::publication::PENDING_DOCUMENT_MANIFEST_PROPERTY.to_string(),
-            String::from_utf8(unresolved.clone()).expect("manifest is utf8"),
-        )]);
-        (properties, unresolved)
+    fn keyed_record_properties() -> (BTreeMap<String, String>, (String, String)) {
+        let record = novarocks_spi::connector::ConnectorSnapshotRecord {
+            owner: "example.application".into(),
+            name: "state".into(),
+            binding: None,
+            payload: bytes::Bytes::from_static(b"opaque-publication"),
+        };
+        let key = crate::document_storage::keyed::keys::record_key(&record.owner, &record.name);
+        let value = crate::document_storage::keyed::record::encode_record(&record).unwrap();
+        (BTreeMap::from([(key.clone(), value.clone())]), (key, value))
     }
 
     async fn live_data_paths(table: &Table, target_ref: &str) -> BTreeSet<String> {
@@ -816,7 +788,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_only_document_publication_creates_one_exact_snapshot() {
+    async fn empty_append_publishes_one_snapshot_with_exact_keyed_record() {
         let fixture = empty_local_table(FormatVersion::V2).await;
         let table = fixture
             .catalog
@@ -824,7 +796,7 @@ mod tests {
             .await
             .unwrap();
         let before_count = table.metadata().snapshots().len();
-        let (snapshot_properties, unresolved) = pending_document_properties();
+        let (snapshot_properties, expected_record) = keyed_record_properties();
         let snapshot_id =
             publish_append(&fixture, &table, "main", Vec::new(), snapshot_properties).await;
         let reloaded = fixture
@@ -834,12 +806,16 @@ mod tests {
             .unwrap();
         assert_eq!(reloaded.metadata().current_snapshot_id(), Some(snapshot_id));
         assert_eq!(reloaded.metadata().snapshots().len(), before_count + 1);
-        crate::document_storage::publication::validate_expected_manifest(
-            reloaded.metadata(),
-            snapshot_id,
-            &unresolved,
-        )
-        .expect("validate exact committed output attachment");
+        assert_eq!(
+            reloaded
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .additional_properties
+                .get(&expected_record.0),
+            Some(&expected_record.1)
+        );
         let current = reloaded.metadata().current_snapshot().unwrap();
         assert_eq!(
             current.summary().additional_properties["added-data-files"],
@@ -849,13 +825,10 @@ mod tests {
             current.summary().additional_properties["added-records"],
             "0"
         );
-        assert!(!current.summary().additional_properties.contains_key(
-            crate::document_storage::publication::PENDING_DOCUMENT_MANIFEST_PROPERTY,
-        ));
     }
 
     #[tokio::test]
-    async fn v06_metadata_only_document_publication_preserves_populated_live_data_files() {
+    async fn empty_append_preserves_populated_live_data_and_exact_keyed_record() {
         let fixture = empty_local_table(FormatVersion::V2).await;
         let table = fixture
             .catalog
@@ -872,7 +845,7 @@ mod tests {
         let base_snapshot_id = populated.metadata().current_snapshot_id().unwrap();
         let before_paths = live_data_paths(&populated, "main").await;
         assert_eq!(before_paths, BTreeSet::from([existing_path]));
-        let (snapshot_properties, unresolved) = pending_document_properties();
+        let (snapshot_properties, expected_record) = keyed_record_properties();
         let snapshot_id = publish_append(
             &fixture,
             &populated,
@@ -902,12 +875,13 @@ mod tests {
             snapshot.summary().additional_properties["added-data-files"],
             "0"
         );
-        crate::document_storage::publication::validate_expected_manifest(
-            published.metadata(),
-            snapshot_id,
-            &unresolved,
-        )
-        .expect("validate documents on the advanced snapshot");
+        assert_eq!(
+            snapshot
+                .summary()
+                .additional_properties
+                .get(&expected_record.0),
+            Some(&expected_record.1)
+        );
     }
 
     #[tokio::test]
