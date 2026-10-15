@@ -22,7 +22,7 @@ use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::publication::PublicationFixture;
-use novarocks_cluster_harness::publication_service::{CommitOutcome, HoldStage};
+use novarocks_cluster_harness::publication_service::{CommitOutcome, Hold, HoldStage};
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, ServerHandle,
 };
@@ -30,6 +30,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const CATALOG: &str = "publication_catalog";
@@ -156,7 +157,11 @@ access_key_secret = "${ENV:NOVA_PUBLICATION_SECRET_KEY}"
                 Property::StreamDeadline => stream_deadline(context, fixture),
                 Property::ExpiryConcurrency | Property::ManifestReprepare => {
                     for value in 1..=4 { conn.query_drop(format!("INSERT INTO {TABLE} VALUES ({value})"))?; }
-                    maintenance_race(context, fixture, self.property)
+                    maintenance_race(context, fixture, self.property)?;
+                    if matches!(self.property, Property::ExpiryConcurrency) {
+                        expiry_properties(context, fixture)?;
+                    }
+                    Ok(())
                 }
             }
         })
@@ -199,12 +204,15 @@ fn sql(context: &ScenarioContext, statement: &str) -> Result<()> {
     .run(|conn| conn.query_drop(statement).map_err(Into::into))
 }
 fn metadata(fixture: &PublicationFixture) -> Result<Value> {
+    table_metadata(fixture, "orders")
+}
+fn table_metadata(fixture: &PublicationFixture, table: &str) -> Result<Value> {
     Ok(reqwest::blocking::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
         .build()?
         .get(format!(
-            "{}/v1/namespaces/ns/tables/orders",
+            "{}/v1/namespaces/ns/tables/{table}?snapshots=all",
             fixture.rest().endpoints().rest_uri
         ))
         .send()?
@@ -232,6 +240,90 @@ fn require_unknown(outcome: &Result<()>) -> Result<()> {
     );
     Ok(())
 }
+fn spawn_sql(context: &ScenarioContext, statement: String) -> JoinHandle<Result<()>> {
+    let user = context.mysql_user().to_owned();
+    let port = context.mysql_port();
+    let deadline = context.deadline();
+    std::thread::spawn(move || {
+        mysql_actor::connect_until(&user, port, deadline)?
+            .run(|conn| conn.query_drop(statement).map_err(Into::into))
+    })
+}
+fn joined(query: JoinHandle<Result<()>>) -> Result<Result<()>> {
+    query
+        .join()
+        .map_err(|_| anyhow::anyhow!("publication SQL actor panicked"))
+}
+fn aggregate(failures: &[(&str, Option<String>)]) -> Result<()> {
+    let failures = failures
+        .iter()
+        .filter_map(|(stage, error)| error.as_ref().map(|error| format!("{stage}: {error}")))
+        .collect::<Vec<_>>();
+    ensure!(failures.is_empty(), "{}", failures.join("; "));
+    Ok(())
+}
+fn failure<T>(result: &Result<T>) -> Option<String> {
+    result.as_ref().err().map(|error| format!("{error:#}"))
+}
+/// Release, join and observe the exact Java wrapper independently, even when
+/// the primary assertion or release fails. Persist all outcomes before return.
+fn finish_service<T>(
+    context: &ScenarioContext,
+    name: &str,
+    hold: &mut Hold,
+    phase: Result<T>,
+    query: JoinHandle<Result<()>>,
+    join_while_held: bool,
+    inspect_while_held: impl FnOnce(&Result<()>) -> Result<()>,
+) -> Result<(T, Result<()>, CommitOutcome)> {
+    let mut actor = Some(query);
+    let mut outcome = None;
+    if join_while_held && phase.is_ok() {
+        outcome = Some(joined(actor.take().unwrap()));
+    }
+    let inspection = if let Some(Ok(result)) = &outcome {
+        inspect_while_held(result)
+    } else {
+        Ok(())
+    };
+    let release = hold.release();
+    let outcome = outcome.unwrap_or_else(|| joined(actor.take().unwrap()));
+    let exited = hold.wait_for_original_exit(context.deadline());
+    let trace = hold.trace().and_then(|trace| {
+        fs::write(
+            context.scenario_root().join(format!("{name}-trace.ndjson")),
+            trace,
+        )?;
+        Ok(())
+    });
+    let receipt = save(
+        context,
+        &format!("{name}-actors.json"),
+        &json!({
+            "phase_error":failure(&phase),"held_inspection_error":failure(&inspection),"release_error":failure(&release),
+            "join_error":failure(&outcome),"sql_actor_actual_exit":true,"sql_actor_join_succeeded":outcome.is_ok(),
+            "sql_result":outcome.as_ref().ok().map(|result| format!("{result:?}")),
+            "original_exit":format!("{exited:?}"),"trace_error":failure(&trace)
+        }),
+    );
+    let sql_failure =
+        if phase.is_err() || inspection.is_err() || release.is_err() || exited.is_err() {
+            outcome.as_ref().ok().and_then(failure)
+        } else {
+            None
+        };
+    aggregate(&[
+        ("phase", failure(&phase)),
+        ("SQL outcome during failed cleanup", sql_failure),
+        ("held inspection", failure(&inspection)),
+        ("release", failure(&release)),
+        ("join", failure(&outcome)),
+        ("original actual exit", failure(&exited)),
+        ("trace", failure(&trace)),
+        ("actor receipt", failure(&receipt)),
+    ])?;
+    Ok((phase?, outcome?, exited?))
+}
 fn late_commit(context: &mut ScenarioContext, fixture: &PublicationFixture) -> Result<()> {
     let before = metadata(fixture)?;
     let control = fixture.proxy()?;
@@ -257,55 +349,43 @@ fn late_commit(context: &mut ScenarioContext, fixture: &PublicationFixture) -> R
         );
         Ok(())
     })();
-    // For this property the SQL must finish while the original server request remains held.
-    // A failure still releases before joining; no actor handle is detached.
-    let query_result = if phase.is_ok() {
-        query
-            .join()
-            .map_err(|_| anyhow::anyhow!("publication SQL actor panicked"))?
-    } else {
-        let _ = hold.release();
-        let _ = query.join();
-        phase?;
-        unreachable!()
-    };
-    let assertions = (|| -> Result<()> {
-        require_unknown(&query_result)?;
-        ensure!(
-            started.elapsed() >= Duration::from_millis(EVIDENCE_MS * 4 / 5),
-            "SQL completed before evidence budget"
-        );
-        ensure!(
-            metadata(fixture)? == before,
-            "automatic reconcile saw a newer metadata version"
-        );
-        ensure!(
-            control
-                .mutation_counts("ns", "orders")
-                .table_commit_forwarded
-                == counts.table_commit_forwarded + 1,
-            "Unknown dispatched another mutation"
-        );
-        ensure!(
-            control
-                .mutation_counts("ns", "orders")
-                .table_load_while_commit_pending
-                > counts.table_load_while_commit_pending,
-            "FE did not load old metadata while the exact original commit remained pending"
-        );
+    let (_, _, exited) = finish_service(
+        context,
+        "service",
+        &mut hold,
+        phase,
+        query,
+        true,
+        |query_result| {
+            require_unknown(query_result)?;
+            ensure!(
+                started.elapsed() >= Duration::from_millis(EVIDENCE_MS * 4 / 5),
+                "SQL completed before evidence budget"
+            );
+            ensure!(
+                metadata(fixture)? == before,
+                "automatic reconcile saw a newer metadata version"
+            );
+            ensure!(
+                control
+                    .mutation_counts("ns", "orders")
+                    .table_commit_forwarded
+                    == counts.table_commit_forwarded + 1,
+                "Unknown dispatched another mutation"
+            );
+            ensure!(
+                control
+                    .mutation_counts("ns", "orders")
+                    .table_load_while_commit_pending
+                    > counts.table_load_while_commit_pending,
+                "FE did not load old metadata while the exact original commit remained pending"
+            );
 
-        Ok(())
-    })();
-    let release = hold.release();
-    let exited = hold.wait_for_original_exit(context.deadline());
-    fs::write(
-        context.scenario_root().join("service-trace.ndjson"),
-        hold.trace()?,
+            Ok(())
+        },
     )?;
-    assertions?;
-    release?;
     ensure!(
-        exited? == CommitOutcome::Succeeded,
+        exited == CommitOutcome::Succeeded,
         "late original request did not commit"
     );
     let after = metadata(fixture)?;
@@ -356,20 +436,18 @@ fn post_commit_reload(context: &mut ScenarioContext, fixture: &PublicationFixtur
             .send()?.error_for_status()?;
         Ok(applied)
     })();
-    let released = hold.release();
-    let outcome = query
-        .join()
-        .map_err(|_| anyhow::anyhow!("post-commit SQL actor panicked"))?;
-    let exited = hold.wait_for_original_exit(context.deadline());
-    fs::write(
-        context.scenario_root().join("post-commit-trace.ndjson"),
-        hold.trace()?,
+    let (applied, outcome, exited) = finish_service(
+        context,
+        "post-commit",
+        &mut hold,
+        phase,
+        query,
+        false,
+        |_| Ok(()),
     )?;
-    let applied = phase?;
-    released?;
     outcome.context("post-commit response should preserve Applied evidence")?;
     ensure!(
-        exited? == CommitOutcome::Succeeded,
+        exited == CommitOutcome::Succeeded,
         "post-commit wrapper did not exit after success"
     );
     let after = metadata(fixture)?;
@@ -392,59 +470,115 @@ fn post_commit_reload(context: &mut ScenarioContext, fixture: &PublicationFixtur
 
 fn stream_deadline(context: &mut ScenarioContext, fixture: &PublicationFixture) -> Result<()> {
     let control = fixture.proxy()?;
-    for (action, statement) in [
+    for (index, (action, statement, unknown)) in [
         (
             "table-commit",
             format!("ALTER TABLE {TABLE} ADD COLUMN streamed BIGINT"),
+            true,
         ),
         (
             "catalog-mutation",
             format!("CREATE TABLE {CATALOG}.ns.created (k INT)"),
+            true,
         ),
         (
             "catalog-mutation",
             format!("CREATE DATABASE {CATALOG}.streamed_namespace"),
+            true,
         ),
         (
             "catalog-mutation",
             format!("CREATE VIEW {CATALOG}.ns.streamed_view AS SELECT 1 AS k"),
+            true,
         ),
-    ] {
+        (
+            "catalog-mutation",
+            format!("DROP VIEW {CATALOG}.ns.streamed_view"),
+            false,
+        ),
+        (
+            "catalog-mutation",
+            format!("DROP TABLE {CATALOG}.ns.created"),
+            false,
+        ),
+        (
+            "catalog-mutation",
+            format!("DROP DATABASE {CATALOG}.streamed_namespace"),
+            false,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let before = control.traffic_snapshot();
         let guard = control.arm_next(action, "stream-response")?;
         let started = Instant::now();
         let outcome = sql(context, &statement);
         let elapsed = started.elapsed();
+        // Preserve a trace even if finishing the body owner fails.
+        let early_trace = save(
+            context,
+            &format!("stream-{index}-trace.json"),
+            &guard.trace(),
+        );
         let evidence = guard.finish();
-        require_unknown(&outcome)?;
-        let trace = evidence?.summary();
-        ensure!(
-            trace.contains("response-stream-chunk") && trace.contains("response-stream-exited"),
-            "slow response did not stream and exit: {trace}"
+        let after = control.traffic_snapshot();
+        let trace_saved = match &evidence {
+            Ok(evidence) => save(
+                context,
+                &format!("stream-{index}-trace.json"),
+                evidence.trace(),
+            ),
+            Err(_) => early_trace,
+        };
+        let receipt = save(
+            context,
+            &format!("stream-{index}-result.json"),
+            &json!({
+                "statement":statement,"sql_result":format!("{outcome:?}"),
+                "elapsed_ms":elapsed.as_millis(),"before":before,"after":after,
+                "body_owner_error":failure(&evidence),"sql_actor_actual_exit":true
+            }),
         );
+        aggregate(&[
+            ("body actual exit", failure(&evidence)),
+            ("trace", failure(&trace_saved)),
+            ("receipt", failure(&receipt)),
+        ])?;
+        let evidence = evidence?;
+        let mutations =
+            |counters: &novarocks_cluster_harness::publication_catalog::TrafficCounters| {
+                counters
+                    .by_method
+                    .iter()
+                    .filter(|(method, _)| !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS"))
+                    .map(|(_, count)| *count)
+                    .sum::<u64>()
+            };
         ensure!(
-            elapsed >= Duration::from_millis(EVIDENCE_MS * 4 / 5)
-                && elapsed < Duration::from_secs(15),
-            "slow response escaped total budget: {elapsed:?}"
+            mutations(&after) == mutations(&before) + 1,
+            "stream mutation was replayed or not forwarded exactly once: {statement}"
         );
-        context.action(format!("slow body returned Unknown under {EVIDENCE_MS} ms evidence budget and body owner exited: {action}"));
-    }
-    // A bodyless success status is already decisive evidence. It must not
-    // wait for an artificial body or regress when that body owner closes.
-    for statement in [
-        format!("DROP VIEW {CATALOG}.ns.streamed_view"),
-        format!("DROP TABLE {CATALOG}.ns.created"),
-        format!("DROP DATABASE {CATALOG}.streamed_namespace"),
-    ] {
-        let guard = control.arm_next("catalog-mutation", "stream-response")?;
-        let outcome = sql(context, &statement);
-        let trace = guard.finish()?.summary();
-        outcome.context("bodyless successful mutation lost Applied evidence")?;
+        let trace = evidence.summary();
         ensure!(
             trace.contains("response-stream-exited"),
-            "bodyless response owner did not exit"
+            "body owner did not actually exit: {trace}"
         );
-        context
-            .action("bodyless catalog success retained Applied evidence and response owner exited");
+        if unknown {
+            require_unknown(&outcome)?;
+            ensure!(
+                trace.contains("response-stream-chunk"),
+                "slow response never streamed: {trace}"
+            );
+            ensure!(
+                elapsed >= Duration::from_millis(EVIDENCE_MS * 4 / 5)
+                    && elapsed < Duration::from_secs(15),
+                "slow response escaped total budget: {elapsed:?}"
+            );
+        } else {
+            outcome.context("bodyless successful mutation lost Applied evidence")?;
+        }
+        context.action(format!("stream mutation {index}: one forwarded request, bounded SQL outcome, raw trace and body actual exit"));
     }
     Ok(())
 }
@@ -523,19 +657,17 @@ fn maintenance_race(
         }
         Ok(())
     })();
-    let release = hold.release();
-    let outcome = query
-        .join()
-        .map_err(|_| anyhow::anyhow!("maintenance SQL actor panicked"))?;
-    let original = hold.wait_for_original_exit(context.deadline());
-    fs::write(
-        context.scenario_root().join("service-trace.ndjson"),
-        hold.trace()?,
+    let (_, outcome, original) = finish_service(
+        context,
+        "maintenance",
+        &mut hold,
+        phase,
+        query,
+        false,
+        |_| Ok(()),
     )?;
-    phase?;
-    release?;
     ensure!(
-        original? == CommitOutcome::Conflict,
+        original == CommitOutcome::Conflict,
         "original maintenance request did not hit actual JDBC conflict"
     );
     outcome.context("maintenance did not successfully reprepare after definite conflict")?;
@@ -591,5 +723,582 @@ fn maintenance_race(
         &json!({"before":before,"after":after,"protected_snapshot":candidate,"append_snapshot":competitor_snapshot,"rows":actual,"original":"Conflict","commit_method_actual_exit":true,"sql_actor_actual_exit":true}),
     )?;
     context.action("observed real server CAS conflict, successful reprepare, retained exact snapshot/ref IDs, and source readability");
+    Ok(())
+}
+
+fn table_url(fixture: &PublicationFixture, table: &str) -> String {
+    format!(
+        "{}/v1/namespaces/ns/tables/{table}",
+        fixture.rest().endpoints().rest_uri
+    )
+}
+fn rest_client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()?)
+}
+fn seed(context: &ScenarioContext, fixture: &PublicationFixture, table: &str) -> Result<Value> {
+    sql(
+        context,
+        &format!(
+            "CREATE TABLE publication_setup.ns.{table} (k INT) TBLPROPERTIES (\"format-version\"=\"2\", \"history.expire.min-snapshots-to-keep\"=\"1\")"
+        ),
+    )?;
+    for value in 1..=3 {
+        sql(
+            context,
+            &format!("INSERT INTO publication_setup.ns.{table} VALUES ({value})"),
+        )?;
+    }
+    // The final overwrite makes the first snapshot's data unreachable from
+    // main. Its later source read cannot pass merely through main protection.
+    sql(
+        context,
+        &format!("INSERT OVERWRITE publication_setup.ns.{table} VALUES (4)"),
+    )?;
+    ensure!(
+        rows(context, table, None)? == vec![4],
+        "seed overwrite did not replace main data"
+    );
+    table_metadata(fixture, table)
+}
+fn snapshot_list(metadata: &Value, snapshot: i64) -> Result<String> {
+    Ok(metadata["snapshots"]
+        .as_array()
+        .context("complete snapshots missing")?
+        .iter()
+        .find(|entry| entry["snapshot-id"] == snapshot)
+        .context("exact snapshot missing")?["manifest-list"]
+        .as_str()
+        .context("manifest list missing")?
+        .to_owned())
+}
+fn oldest(metadata: &Value) -> Result<i64> {
+    metadata["snapshots"]
+        .as_array()
+        .context("snapshots missing")?
+        .iter()
+        .min_by_key(|snapshot| snapshot["sequence-number"].as_i64())
+        .context("snapshots empty")?["snapshot-id"]
+        .as_i64()
+        .context("snapshot ID missing")
+}
+fn set_ref(
+    fixture: &PublicationFixture,
+    table: &str,
+    before: &Value,
+    name: &str,
+    kind: &str,
+    old: Value,
+    target: i64,
+) -> Result<()> {
+    rest_client()?.post(table_url(fixture, table)).json(&json!({
+        "requirements":[{"type":"assert-table-uuid","uuid":before["table-uuid"]},
+            {"type":"assert-ref-snapshot-id","ref":name,"snapshot-id":old}],
+        "updates":[{"action":"set-snapshot-ref","ref-name":name,"type":kind,"snapshot-id":target}]
+    })).send()?.error_for_status()?;
+    Ok(())
+}
+/// An independently registered, read-only source retains the pre-expiry
+/// metadata pointer. GC cannot discover this other catalog entry; reading it
+/// after expiry proves the actual old data files remain readable.
+fn register_source(fixture: &PublicationFixture, table: &str) -> Result<String> {
+    let response: Value = rest_client()?
+        .get(table_url(fixture, table))
+        .query(&[("snapshots", "all")])
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let name = format!("source_{table}");
+    rest_client()?
+        .post(format!(
+            "{}/v1/namespaces/ns/register",
+            fixture.rest().endpoints().rest_uri
+        ))
+        .json(&json!({"name":name,"metadata-location":response["metadata-location"]}))
+        .send()?
+        .error_for_status()?;
+    Ok(name)
+}
+fn rows(context: &ScenarioContext, table: &str, version: Option<&str>) -> Result<Vec<i32>> {
+    let version = version
+        .map(|version| format!(" FOR VERSION AS OF {version}"))
+        .unwrap_or_default();
+    mysql_actor::connect_until(
+        context.mysql_user(),
+        context.mysql_port(),
+        context.deadline(),
+    )?
+    .run(|conn| {
+        Ok(conn.query(format!(
+            "SELECT k FROM {CATALOG}.ns.{table}{version} ORDER BY k"
+        ))?)
+    })
+}
+fn expire(catalog: &str, table: &str) -> String {
+    format!(
+        "ALTER TABLE {catalog}.ns.{table} EXPIRE SNAPSHOTS OLDER THAN '2099-01-01 00:00:00' RETAIN LAST 1"
+    )
+}
+fn finish_proxy<T>(
+    context: &ScenarioContext,
+    name: &str,
+    mut guard: novarocks_cluster_harness::publication_catalog::FixtureFaultGuard,
+    phase: Result<T>,
+    query: JoinHandle<Result<()>>,
+) -> Result<(T, Result<()>)> {
+    let release = guard.release();
+    let outcome = joined(query);
+    let early_trace = save(context, &format!("{name}-trace.json"), &guard.trace());
+    let exit = guard.finish();
+    let trace = match &exit {
+        Ok(evidence) => save(context, &format!("{name}-trace.json"), evidence.trace()),
+        Err(_) => early_trace,
+    };
+    let receipt = save(
+        context,
+        &format!("{name}-actors.json"),
+        &json!({
+            "phase_error":failure(&phase),"release_error":failure(&release),
+            "join_error":failure(&outcome),"sql_actor_actual_exit":true,"sql_actor_join_succeeded":outcome.is_ok(),
+            "sql_result":outcome.as_ref().ok().map(|result| format!("{result:?}")),
+            "proxy_actual_exit_error":failure(&exit),"trace_error":failure(&trace)
+        }),
+    );
+    let sql_failure = if phase.is_err() || release.is_err() || exit.is_err() {
+        outcome.as_ref().ok().and_then(failure)
+    } else {
+        None
+    };
+    aggregate(&[
+        ("phase", failure(&phase)),
+        ("SQL outcome during failed cleanup", sql_failure),
+        ("release", failure(&release)),
+        ("join", failure(&outcome)),
+        ("proxy actual exit", failure(&exit)),
+        ("trace", failure(&trace)),
+        ("actor receipt", failure(&receipt)),
+    ])?;
+    Ok((phase?, outcome?))
+}
+fn expiry_properties(context: &mut ScenarioContext, fixture: &PublicationFixture) -> Result<()> {
+    for case in ["ref_move", "new_branch", "lost_tag"] {
+        let table = format!("expiry_{case}");
+        let mut before = seed(context, fixture, &table)?;
+        let candidate = oldest(&before)?;
+        let candidate_list = snapshot_list(&before, candidate)?;
+        let source = register_source(fixture, &table)?;
+        ensure!(
+            rows(context, &source, Some(&candidate.to_string()))? == vec![1],
+            "source snapshot does not match the independently seeded first append"
+        );
+        let current = before["current-snapshot-id"]
+            .as_i64()
+            .context("current snapshot missing")?;
+        if case == "ref_move" {
+            set_ref(
+                fixture,
+                &table,
+                &before,
+                "moving",
+                "tag",
+                Value::Null,
+                current,
+            )?;
+            before = table_metadata(fixture, &table)?;
+        }
+        let control = fixture.proxy()?;
+        let count = control.mutation_counts("ns", &table).table_commit_forwarded;
+        let traffic_before = control.traffic_snapshot();
+        let guard = control.arm_next(
+            "table-commit",
+            "before-requirement-check-hold-for-concurrent-shell",
+        )?;
+        let query = spawn_sql(context, expire(CATALOG, &table));
+        let phase = (|| -> Result<(Value, Option<i64>)> {
+            guard.wait_until_entered(context.deadline())?;
+            match case {
+                "ref_move" => set_ref(
+                    fixture,
+                    &table,
+                    &before,
+                    "moving",
+                    "tag",
+                    json!(current),
+                    candidate,
+                )?,
+                "new_branch" => {
+                    set_ref(
+                        fixture,
+                        &table,
+                        &before,
+                        "dev2",
+                        "branch",
+                        Value::Null,
+                        candidate,
+                    )?;
+                    // This alias is a distinct logical catalog: an external writer
+                    // relative to the expiry catalog's local coordination domain.
+                    sql(
+                        context,
+                        &catalog_sql(fixture, "publication_branch_writer", 30_000),
+                    )?;
+                    sql(
+                        context,
+                        &format!(
+                            "INSERT INTO publication_branch_writer.ns.{table}.branch_dev2 VALUES (99)"
+                        ),
+                    )?;
+                }
+                "lost_tag" => set_ref(
+                    fixture,
+                    &table,
+                    &before,
+                    "unexpected_tag",
+                    "tag",
+                    Value::Null,
+                    candidate,
+                )?,
+                _ => unreachable!(),
+            }
+            let competitor = table_metadata(fixture, &table)?;
+            let branch = competitor["refs"]["dev2"]["snapshot-id"].as_i64();
+            save(
+                context,
+                &format!("{case}-before.json"),
+                &json!({"before":before,"competitor":competitor,
+                "candidate":candidate,"candidate_manifest_list":candidate_list,"independent_source":source}),
+            )?;
+            Ok((competitor, branch))
+        })();
+        let ((competitor, branch), outcome) = finish_proxy(context, case, guard, phase, query)?;
+        let after = table_metadata(fixture, &table)?;
+        let forwarded = control.mutation_counts("ns", &table).table_commit_forwarded - count;
+        save(
+            context,
+            &format!("{case}-result.json"),
+            &json!({"after":after,"sql_result":format!("{outcome:?}"),
+            "forwarded":forwarded,"candidate":candidate,"source":source}),
+        )?;
+        match case {
+            "ref_move" => {
+                outcome.context("expiry did not reprepare after moving an existing ref")?;
+                let traffic_after = control.traffic_snapshot();
+                ensure!(
+                    traffic_after
+                        .by_status
+                        .get(&409)
+                        .copied()
+                        .unwrap_or_default()
+                        == traffic_before
+                            .by_status
+                            .get(&409)
+                            .copied()
+                            .unwrap_or_default()
+                            + 1,
+                    "existing ref move did not cause an actual REST 409"
+                );
+                ensure!(
+                    forwarded == 2,
+                    "existing-ref conflict did not produce exactly two attempts"
+                );
+                ensure!(
+                    after["refs"]["moving"]["snapshot-id"] == candidate,
+                    "moved ref target lost"
+                );
+                ensure!(
+                    snapshot_list(&after, candidate)? == candidate_list,
+                    "moved ref snapshot lost"
+                );
+                ensure!(
+                    fixture.rest().object_exists(&candidate_list)?,
+                    "moved ref manifest list deleted"
+                );
+                ensure!(
+                    rows(context, &table, Some("'moving'"))? == vec![1],
+                    "moved ref source unreadable"
+                );
+            }
+            "new_branch" => {
+                outcome.context("expiry failed with a new external branch")?;
+                ensure!(
+                    forwarded == 1,
+                    "new branch race unexpectedly replayed expiry"
+                );
+                let branch = branch.context("external branch snapshot absent")?;
+                ensure!(
+                    after["refs"]["dev2"]["snapshot-id"] == branch,
+                    "external branch target lost"
+                );
+                let list = snapshot_list(&competitor, branch)?;
+                ensure!(
+                    snapshot_list(&after, branch)? == list
+                        && fixture.rest().object_exists(&list)?,
+                    "external branch manifest list lost"
+                );
+                ensure!(
+                    rows(context, &table, Some("'dev2'"))? == vec![1, 99],
+                    "external branch shared source files lost"
+                );
+            }
+            "lost_tag" => {
+                let diagnostic = format!(
+                    "{:#}",
+                    outcome
+                        .err()
+                        .context("lost tag expiry did not report Applied anomaly")?
+                );
+                // The maintenance FE currently stringifies EngineError, whose
+                // Display omits its typed code. Require the actual canonical
+                // known-Applied reclamation failure, not an invented wire code.
+                let committed_failure =
+                    "Expiration Applied with unexpectedly lost refs (files protected): ";
+                let lost_ref =
+                    format!("unexpected_tag: snapshot={candidate}, manifest-list={candidate_list}");
+                ensure!(
+                    diagnostic.contains(committed_failure) && diagnostic.contains(&lost_ref),
+                    "lost tag diagnostic lacks canonical known-Applied failure and exact recovery facts: {diagnostic}"
+                );
+                ensure!(forwarded == 1, "Applied lost-tag mutation was replayed");
+                ensure!(
+                    after["refs"].get("unexpected_tag").is_none(),
+                    "fixture did not produce a lost tag"
+                );
+                ensure!(
+                    after["snapshots"]
+                        .as_array()
+                        .context("snapshots missing")?
+                        .iter()
+                        .all(|snapshot| snapshot["snapshot-id"] != candidate),
+                    "candidate was not actually expired"
+                );
+                ensure!(
+                    fixture.rest().object_exists(&candidate_list)?,
+                    "lost tag manifest list deleted"
+                );
+                ensure!(
+                    rows(context, &source, Some(&candidate.to_string()))? == vec![1],
+                    "lost tag source files unreadable"
+                );
+            }
+            _ => unreachable!(),
+        }
+        ensure!(
+            rows(context, &table, None)? == vec![4],
+            "expiry changed main source rows"
+        );
+        context.action(format!("expiry {case}: exact snapshot/ref IDs, reachable manifest list and independent source read verified"));
+    }
+    local_expiry_serialization(context, fixture)
+}
+fn wait_for_statement(context: &ScenarioContext, statement: &str) -> Result<()> {
+    loop {
+        let present = mysql_actor::connect_until(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.deadline(),
+        )?
+        .run(|conn| {
+            let rows: Vec<mysql::Row> = conn.query("SHOW FULL PROCESSLIST")?;
+            Ok(rows.iter().any(|row| {
+                row.get::<Option<String>, _>("Info").flatten().as_deref() == Some(statement)
+            }))
+        })?;
+        if present {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < context.deadline(),
+            "local ref never reached FE statement ownership"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+fn local_expiry_serialization(
+    context: &mut ScenarioContext,
+    fixture: &PublicationFixture,
+) -> Result<()> {
+    let table = "expiry_local_serial";
+    let before = seed(context, fixture, table)?;
+    let candidate = oldest(&before)?;
+    let control = fixture.proxy()?;
+    let initial_count = control.mutation_counts("ns", table).table_commit_forwarded;
+    let mut hold = fixture.service().arm(&format!("ns.{table}"))?;
+    let query = spawn_sql(context, expire(CATALOG, table));
+    let mut reference = None;
+    let phase = (|| -> Result<()> {
+        hold.wait_until_held(context.deadline())?;
+        let count = control.mutation_counts("ns", table).table_commit_forwarded;
+        let statement = format!(
+            "ALTER TABLE {CATALOG}.ns.{table} CREATE TAG local_waiter AS OF VERSION {candidate}"
+        );
+        reference = Some(spawn_sql(context, statement.clone()));
+        wait_for_statement(context, &statement)?;
+        std::thread::sleep(Duration::from_millis(250));
+        ensure!(
+            !reference.as_ref().unwrap().is_finished(),
+            "local ref did not wait for expiry conclusion"
+        );
+        ensure!(
+            control.mutation_counts("ns", table).table_commit_forwarded == count,
+            "same-catalog ref dispatched while definite expiry was held"
+        );
+        ensure!(
+            table_metadata(fixture, table)?["refs"]
+                .get("local_waiter")
+                .is_none(),
+            "local ref became visible before expiry conclusion"
+        );
+        Ok(())
+    })();
+    let expired = finish_service(
+        context,
+        "local-serialization",
+        &mut hold,
+        phase,
+        query,
+        false,
+        |_| Ok(()),
+    );
+    // Join the waiting ref even if release, the expiry actor or wrapper failed.
+    let reference = reference.map(joined).transpose();
+    let receipt = save(
+        context,
+        "local-serialization-ref.json",
+        &json!({
+            "expiry":format!("{expired:?}"),"ref_actor":format!("{reference:?}"),
+            "ref_actor_actual_exit":!matches!(&reference,Ok(None))
+        }),
+    );
+    aggregate(&[
+        ("expiry", failure(&expired)),
+        ("ref join", failure(&reference)),
+        ("receipt", failure(&receipt)),
+    ])?;
+    let (_, expired, original) = expired?;
+    expired.context("local serialized expiry did not apply")?;
+    ensure!(
+        original == CommitOutcome::Succeeded,
+        "local expiry did not actually commit"
+    );
+    let rejected = reference?
+        .context("ref actor not started")?
+        .err()
+        .context("ref planned against an already expired snapshot after lock release")?;
+    let diagnostic = format!("{rejected:#}");
+    ensure!(
+        diagnostic.to_ascii_lowercase().contains("snapshot")
+            && diagnostic.contains(&candidate.to_string()),
+        "local ref failed for a reason other than the removed snapshot: {diagnostic}"
+    );
+    ensure!(
+        control.mutation_counts("ns", table).table_commit_forwarded == initial_count + 1,
+        "local ref dispatched against the removed snapshot"
+    );
+    let after = table_metadata(fixture, table)?;
+    ensure!(
+        after["refs"].get("local_waiter").is_none() && snapshot_list(&after, candidate).is_err(),
+        "serialized ref restored an expired snapshot"
+    );
+    ensure!(
+        rows(context, table, None)? == vec![4],
+        "serialized expiry changed source rows"
+    );
+    context.action("same-catalog ref was FE-owned, did not dispatch while expiry was held, then rejected the removed snapshot");
+
+    // Unknown releases the same logical catalog lock. A new local ref can
+    // publish before the original, already dispatched request takes effect.
+    let table = "expiry_unknown_window";
+    let before = seed(context, fixture, table)?;
+    let candidate = oldest(&before)?;
+    let list = snapshot_list(&before, candidate)?;
+    let source = register_source(fixture, table)?;
+    sql(
+        context,
+        &catalog_sql(fixture, "publication_unknown", EVIDENCE_MS),
+    )?;
+    let unknown_count = control.mutation_counts("ns", table).table_commit_forwarded;
+    let mut guard = control.arm_next(
+        "table-commit",
+        "before-requirement-check-hold-for-concurrent-shell",
+    )?;
+    let query = spawn_sql(context, expire("publication_unknown", table));
+    let phase = guard.wait_until_entered(context.deadline());
+    // Preserve all cleanup paths if the hold was not reached; otherwise join
+    // while held so Unknown is proven before publishing the local ref.
+    if let Err(error) = phase {
+        return finish_proxy(context, "unknown-window", guard, Err::<(), _>(error), query)
+            .map(|_| ());
+    }
+    let original_sql = joined(query);
+    let phase = (|| -> Result<()> {
+        require_unknown(
+            original_sql
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error:#}"))?,
+        )?;
+        sql(
+            context,
+            &format!(
+                "ALTER TABLE publication_unknown.ns.{table} CREATE TAG after_unknown AS OF VERSION {candidate}"
+            ),
+        )?;
+        let tagged = table_metadata(fixture, table)?;
+        ensure!(
+            tagged["refs"]["after_unknown"]["snapshot-id"] == candidate,
+            "same-catalog ref did not publish after Unknown released the lock"
+        );
+        save(context, "unknown-window-before-release.json", &tagged)
+    })();
+    let release = guard.release();
+    let early_trace = save(context, "unknown-window-trace.json", &guard.trace());
+    let exit = guard.finish();
+    let trace = match &exit {
+        Ok(evidence) => save(context, "unknown-window-trace.json", evidence.trace()),
+        Err(_) => early_trace,
+    };
+    let after = table_metadata(fixture, table);
+    let receipt = save(
+        context,
+        "unknown-window-result.json",
+        &json!({
+            "statement":format!("{original_sql:?}"),"phase_error":failure(&phase),
+            "release_error":failure(&release),"proxy_actual_exit_error":failure(&exit),
+            "after":after.as_ref().ok(),"candidate":candidate,"manifest_list":list,
+            "sql_actor_actual_exit":true,"sql_actor_join_succeeded":original_sql.is_ok(),"guarantee":"local serialization ends at Unknown; late application remains possible"
+        }),
+    );
+    aggregate(&[
+        ("phase", failure(&phase)),
+        ("release", failure(&release)),
+        ("join", failure(&original_sql)),
+        ("proxy actual exit", failure(&exit)),
+        ("trace", failure(&trace)),
+        ("metadata", failure(&after)),
+        ("receipt", failure(&receipt)),
+    ])?;
+    let after = after?;
+    ensure!(
+        control.mutation_counts("ns", table).table_commit_forwarded == unknown_count + 2,
+        "Unknown expiry or the following local tag was replayed"
+    );
+    ensure!(
+        after["refs"].get("after_unknown").is_none() && snapshot_list(&after, candidate).is_err(),
+        "fixture did not demonstrate the late expiry loss window after Unknown"
+    );
+    ensure!(
+        fixture.rest().object_exists(&list)?,
+        "Unknown expiry deleted a candidate manifest list"
+    );
+    ensure!(
+        rows(context, &source, Some(&candidate.to_string()))? == vec![1],
+        "Unknown expiry deleted source data files"
+    );
+    ensure!(
+        rows(context, table, None)? == vec![4],
+        "late expiry changed main source rows"
+    );
+    context.action("Unknown unlocked the same catalog; local tag applied before original late expiry removed it, while physical files remained readable");
     Ok(())
 }

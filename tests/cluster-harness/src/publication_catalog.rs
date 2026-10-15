@@ -77,9 +77,14 @@ pub struct FixtureFaultGuard {
 
 pub struct FixtureFaultEvidence {
     events: Vec<String>,
+    trace: Value,
 }
 
 impl FixtureFaultEvidence {
+    pub fn trace(&self) -> &Value {
+        &self.trace
+    }
+
     pub fn summary(&self) -> String {
         self.events.join(" -> ")
     }
@@ -486,6 +491,19 @@ fn parse_fault(value: &str) -> Result<PublicationFault> {
 }
 
 impl FixtureFaultGuard {
+    /// Snapshot the exact arm trace before cleanup consumes the guard. This is
+    /// evidence, not a substitute for finish's actual-exit verification.
+    pub fn trace(&self) -> Value {
+        let state = self
+            .control
+            .next_fault
+            .lock()
+            .expect("publication fault mutex");
+        Value::Array(state.trace.iter().filter(|event| event.arm_id == self.arm_id)
+            .map(|event| json!({"sequence":event.sequence,"arm_id":event.arm_id,"event":event.event}))
+            .collect())
+    }
+
     pub fn wait_until_entered(&self, deadline: Instant) -> Result<()> {
         self.control.wait_until_entered(&self.arm_id, deadline)
     }
@@ -541,6 +559,7 @@ impl FixtureFaultGuard {
             Instant::now() + Duration::from_secs(5),
         )?;
         Ok(FixtureFaultEvidence {
+            trace: self.trace(),
             events: self.control.trace_events(&self.arm_id),
         })
     }

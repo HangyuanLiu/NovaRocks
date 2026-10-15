@@ -179,3 +179,37 @@ The image uses local pinned inputs and `--pull=false`. Missing input is a
 fixture precondition failure. Keep raw failed attempts, trace, image identity,
 container logs, SQL error/result, release result and actual-exit evidence;
 retries use a fresh artifact directory and preserve the original failure.
+
+The native `catalog-publication/expiry-concurrency` scenario uses fresh tables
+for each property. It checks an external move of an existing ref (actual REST
+409 and a fresh successful attempt), a new branch followed by an append (exact
+branch snapshot and manifest-list plus branch reads), and an externally added
+tag removed by the frozen expiry (Applied error containing the lost tag,
+snapshot and manifest-list). For the lost tag it independently registers the
+pre-expiry metadata under a source name, then reads that exact old snapshot
+after GC. The seed ends with a full overwrite so this first snapshot's data
+is absent from current main. This other catalog entry is invisible to the expiry's protection
+scan: its successful read and the exact manifest-list HEAD prove retained
+source files, rather than inferring preservation from current main row counts.
+
+The same scenario observes a local ref in `SHOW FULL PROCESSLIST` while a
+same-catalog expiry is held, requires zero ref dispatch before conclusion,
+and requires rejection of the removed snapshot afterwards. A separate short
+budget phase observes expiry Unknown, successfully creates a local tag in
+that same logical catalog, then releases the original request and observes
+the late expiry remove it. Files must remain readable. This phase documents
+the explicit limit of local serialization after Unknown; it does not claim
+that the lock prevents the late application window. Cross-generation lock
+identity, cancellation and different-table progress are tested by the
+catalog lifecycle owner, not inferred from this same-generation scenario.
+
+For every slow-body mutation, `stream-deadline` preserves the complete arm
+trace (`sequence`, `arm_id`, `event`), SQL outcome and before/after actual HTTP
+counters before asserting one forwarded mutation. Stream exit verification
+still runs if saving the initial trace fails. Native service-held actors
+aggregate primary phase, release, SQL join, exact original Java wrapper exit
+and trace-write failures, and retain each result in `*-actors.json`. A release
+failure never skips joining the SQL actor. These are executable assertions;
+changing them does not constitute a same-SHA native acceptance receipt. Run
+each of the four explicit scenario names individually with `--only` and a
+fresh artifact root when collecting final evidence.
