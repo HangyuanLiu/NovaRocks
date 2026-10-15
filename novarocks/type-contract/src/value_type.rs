@@ -48,6 +48,48 @@ impl ValueTypeStorageLifetime {
         Self(None)
     }
 
+    /// Actual Arc request when combining two distinct retained lifetimes.
+    /// Reusing the same lifetime or a pure lifetime requires no allocation.
+    pub fn retaining_allocation_layout()
+    -> Result<std::alloc::Layout, crate::owned_resources::layout::LayoutResourceError> {
+        crate::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            SharedTypeStorageLifetime,
+        >())
+    }
+
+    fn flat_retention_backing_layout(
+        count: usize,
+    ) -> Result<std::alloc::Layout, crate::owned_resources::layout::LayoutResourceError> {
+        std::alloc::Layout::array::<Self>(count)
+            .map_err(|_| crate::owned_resources::layout::LayoutResourceError::Arithmetic)
+    }
+
+    fn flat_retention_holder_layout()
+    -> Result<std::alloc::Layout, crate::owned_resources::layout::LayoutResourceError> {
+        crate::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
+            FlatSharedTypeStorageLifetime,
+        >())
+    }
+
+    /// Upper requests for this original flat holder: Vec, possible Box trim,
+    /// and the actual private Arc payload. The caller supplies an input-derived
+    /// loan-count bound; this visitor creates no holder or capacity grant.
+    pub fn retaining_flat_allocation_layouts_upper<E>(
+        count: usize,
+        visit: &mut dyn FnMut(std::alloc::Layout) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<crate::owned_resources::layout::LayoutResourceError>,
+    {
+        if count == 0 {
+            return Ok(());
+        }
+        let backing = Self::flat_retention_backing_layout(count)?;
+        visit(backing)?;
+        visit(backing)?;
+        visit(Self::flat_retention_holder_layout()?)
+    }
+
     /// Preserve responsibility for reused backing, admitting the actual extra
     /// holder before combining distinct lifetimes. This is a construction hook,
     /// not an allocation grant; the caller supplies its original request port.
@@ -61,9 +103,7 @@ impl ValueTypeStorageLifetime {
             (None, _) => Ok(original.clone()),
             (Some(new), Some(old)) if Arc::ptr_eq(new, old) => Ok(self.clone()),
             _ => {
-                request(crate::owned_resources::layout::arc_layout(
-                    std::alloc::Layout::new::<SharedTypeStorageLifetime>(),
-                )?)?;
+                request(Self::retaining_allocation_layout()?)?;
                 Ok(Self::held(Arc::new(SharedTypeStorageLifetime {
                     _new: self.clone(),
                     _original: original.clone(),
@@ -105,7 +145,7 @@ impl ValueTypeStorageLifetime {
         I: Iterator<Item = Result<&'a Self, E>> + Clone,
     {
         use crate::owned_resources::layout::LayoutResourceError;
-        use crate::owned_resources::{copy, layout, vec as owned_vec};
+        use crate::owned_resources::{copy, vec as owned_vec};
         let distinct = |original: &&Self| match (&self.0, &original.0) {
             (_, None) => false,
             (Some(own), Some(other)) => !Arc::ptr_eq(own, other),
@@ -136,8 +176,7 @@ impl ValueTypeStorageLifetime {
             // Runtime callers must supply that holder's actual owning marker.
             return Err(E::from(LayoutResourceError::SourceModel));
         }
-        let backing = std::alloc::Layout::array::<Self>(count)
-            .map_err(|_| E::from(LayoutResourceError::Arithmetic))?;
+        let backing = Self::flat_retention_backing_layout(count).map_err(E::from)?;
         work.flush().map_err(E::from)?;
         request(backing)?;
         let mut loans = Vec::new();
@@ -176,8 +215,7 @@ impl ValueTypeStorageLifetime {
         )
         .map_err(|error| error.into_caller())?;
         work.flush().map_err(E::from)?;
-        let holder = layout::arc_layout(std::alloc::Layout::new::<FlatSharedTypeStorageLifetime>())
-            .map_err(E::from)?;
+        let holder = Self::flat_retention_holder_layout().map_err(E::from)?;
         request(holder)?;
         let retained_bytes = backing
             .size()
@@ -210,11 +248,7 @@ impl ValueTypeStorageLifetime {
             (None, _) => Ok(original.clone()),
             (Some(new), Some(old)) if Arc::ptr_eq(new, old) => Ok(self.clone()),
             _ => {
-                creation.exact(|| {
-                    crate::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
-                        SharedTypeStorageLifetime,
-                    >())
-                })?;
+                creation.exact(Self::retaining_allocation_layout)?;
                 Ok(Self::held(Arc::new(SharedTypeStorageLifetime {
                     _new: self.clone(),
                     _original: original.clone(),

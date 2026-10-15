@@ -829,6 +829,7 @@ pub(super) fn decode(
         None::<Receiver<'_, '_, '_, Infallible>>,
         None,
         None,
+        &mut None,
     )
     .map_err(ProjectionFailure::without_host)
 }
@@ -995,7 +996,7 @@ fn materialized_layout<H, F: novarocks_type_contract::ValueSchemaCreationFactory
     }
     let node = Node::Carrier(id);
     let map = matches!(index.kind(id)?, Kind::Map(_));
-    let count = if map { 2 } else { index.child_count(node)? };
+    let count = layout_child_count(index, node)?;
     let mut scope = match factory {
         Some(factory) => Some(begin_physical_scope(factory, receiver, work)?),
         None => None,
@@ -1256,6 +1257,134 @@ fn source_role_flags<H>(
     Ok(fields)
 }
 
+/// Forecast only requests introduced by the existing physical materializer
+/// after the final numeric snapshot. This grants no capacity and mutates none
+/// of the original receiver/creator counters. Layout caching visits each
+/// declared Carrier at most once; unused definitions are a finite conservative
+/// upper, never a policy cap or another decode/materialization pass.
+fn physical_tail_funding_facts<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
+    mut facts: super::PackageTypeProjectionFacts,
+    table: &wire::TypeTable,
+    index: &Index<'_>,
+    order: &[Node],
+    summaries: &BTreeMap<Node, Summary>,
+    factory: Option<&F>,
+) -> Result<super::PackageTypeProjectionFacts, HostError<H>> {
+    let original_requests = facts.allocation_requests_upper_bound;
+    let mut add_request = |allocation: Layout, count: usize| -> Result<(), HostError<H>> {
+        if allocation.size() == 0 || count == 0 {
+            return Ok(());
+        }
+        let bytes = allocation
+            .size()
+            .checked_mul(count)
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        facts.allocation_requests_upper_bound = facts
+            .allocation_requests_upper_bound
+            .checked_add(count)
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        facts.allocation_request_bytes_upper_bound = facts
+            .allocation_request_bytes_upper_bound
+            .checked_add(bytes)
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        facts.coexisting_source_and_request_bytes_upper_bound = facts
+            .coexisting_source_and_request_bytes_upper_bound
+            .checked_add(bytes)
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        let work_upper = TypeDecodeModel::request_work_upper(allocation, count)?;
+        facts.cumulative_work_upper_bound = facts
+            .cumulative_work_upper_bound
+            .checked_add(work_upper)
+            .ok_or(CompileControlError::ResourceExhausted)?;
+        Ok(())
+    };
+    for &node in order {
+        let children = index.child_count(node)?;
+        if let Some(factory) = factory {
+            let summary = summaries
+                .get(&node)
+                .ok_or(E::InvalidShape("physical funding summary is absent"))?;
+            let (own_scope, loan_scope, dictionary) = match node {
+                Node::Field(_) => (true, false, false),
+                Node::Carrier(id) => {
+                    let kind = index.kind(id)?;
+                    let upper =
+                        TypeDecodeModel::carrier_entity_upper(kind, summary.dictionary_boxes)?;
+                    let dictionary = matches!(kind, Kind::Dictionary(_));
+                    (
+                        upper != 0,
+                        summary.shared_backing && (dictionary || (upper == 0 && children > 1)),
+                        dictionary,
+                    )
+                }
+            };
+            if own_scope {
+                factory.visit_scope_allocation_layouts(&mut |layout| add_request(layout, 1))?;
+            }
+            if loan_scope {
+                factory.visit_scope_allocation_layouts(&mut |layout| add_request(layout, 1))?;
+            }
+            if loan_scope || (!dictionary && own_scope) {
+                ValueTypeStorageLifetime::retaining_flat_allocation_layouts_upper(
+                    children,
+                    &mut |layout| add_request(layout, 1),
+                )?;
+            }
+            if dictionary && own_scope {
+                add_request(ValueTypeStorageLifetime::retaining_allocation_layout()?, 1)?;
+            }
+        }
+        if let Node::Carrier(_) = node
+            && !table.value_types.is_empty()
+        {
+            // The sole cache author owns one scope, Vec/possible trim, shared
+            // Arrow loan, and ValueLayout holder per reached Carrier. Map's
+            // key/value count is the same frozen projection as that author.
+            let child_layouts = layout_child_count(index, node)?;
+            if let Some(factory) = factory {
+                factory.visit_scope_allocation_layouts(&mut |layout| add_request(layout, 1))?;
+                add_request(ValueTypeStorageLifetime::retaining_allocation_layout()?, 1)?;
+            }
+            add_request(
+                Layout::array::<ValueLayout>(child_layouts)
+                    .map_err(|_| CompileControlError::ResourceExhausted)?,
+                2,
+            )?;
+            add_request(ValueLayout::storage_allocation_layout()?, 1)?;
+            let summary = summaries
+                .get(&node)
+                .ok_or(E::InvalidShape("layout funding summary is absent"))?;
+            // clone_carrier copies only Dictionary Boxes; other descendants
+            // share their original Field/Fields/UnionFields/timezone Arcs.
+            add_request(Layout::new::<DataType>(), summary.dictionary_boxes)?;
+        }
+    }
+    if factory.is_some() {
+        ValueTypeStorageLifetime::retaining_flat_allocation_layouts_upper(
+            order.len(),
+            &mut |layout| add_request(layout, 1),
+        )?;
+    }
+    facts.cumulative_work_upper_bound = facts
+        .cumulative_work_upper_bound
+        .checked_add(TypeDecodeModel::funding_projection_work(
+            order.len(),
+            facts
+                .allocation_requests_upper_bound
+                .checked_sub(original_requests)
+                .ok_or(CompileControlError::ResourceExhausted)?,
+        )?)
+        .ok_or(CompileControlError::ResourceExhausted)?;
+    Ok(facts)
+}
+
+fn layout_child_count(index: &Index<'_>, node: Node) -> Result<usize, E> {
+    match node {
+        Node::Carrier(id) if matches!(index.kind(id)?, Kind::Map(_)) => Ok(2),
+        _ => index.child_count(node),
+    }
+}
+
 fn decode_body<'source, H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     table: &'source wire::TypeTable,
     limits: TypeProjectionLimits,
@@ -1264,6 +1393,7 @@ fn decode_body<'source, H, F: novarocks_type_contract::ValueSchemaCreationFactor
     mut receiver: Option<Receiver<'_, 'source, '_, H>>,
     factory: Option<&F>,
     source_facts: Option<&SourceFactsIndex<'source>>,
+    funding: &mut Option<&mut dyn super::PackageTypeFundingScope<H>>,
 ) -> Result<DecodedTypeTable, HostError<H>> {
     let (index, physical_strings) = preflight(table, limits, work, &mut receiver, source_facts)?;
     // Unique facts IDs + equal cardinality + lookup of every actual Field
@@ -1475,305 +1605,327 @@ fn decode_body<'source, H, F: novarocks_type_contract::ValueSchemaCreationFactor
     // No original physical carrier or field metadata was allocated above. Observe
     // the admitted graph tail before the first materialization.
     work.flush()?;
-    let mut carriers = BTreeMap::new();
-    let mut fields = BTreeMap::new();
-    let mut values = BTreeMap::new();
-    let mut field_loans = if package {
-        let mut loans = Vec::new();
-        loans
-            .try_reserve_exact(table.fields.len())
-            .map_err(|_| E::from(CompileControlError::ResourceExhausted))?;
-        work.step()?;
-        Some(loans)
+    let namespace = if source_facts.is_some() {
+        super::TypeMaterializationNamespace::Source
+    } else {
+        super::TypeMaterializationNamespace::ExecutionPhysical
+    };
+    let funding_facts = if funding.is_some() {
+        receiver
+            .as_ref()
+            .map(|receiver| receiver.model.facts_in(receiver.limits))
+            .transpose()?
+            .map(|facts| {
+                physical_tail_funding_facts(facts, table, &index, &order, &summaries, factory)
+            })
+            .transpose()?
     } else {
         None
     };
-    for node in order {
-        work.step()?;
-        match node {
-            Node::Carrier(id) => {
-                let summary = summaries
-                    .get(&node)
-                    .ok_or(E::InvalidShape("physical carrier summary is absent"))?;
-                let kind = index.kind(id)?;
-                let upper = TypeDecodeModel::carrier_entity_upper(kind, summary.dictionary_boxes)?;
-                let mut scope = match factory {
-                    Some(factory) if upper != 0 => {
-                        Some(begin_physical_scope(factory, &mut receiver, work)?)
-                    }
-                    _ => None,
-                };
-                if let Some(scope) = scope.as_mut() {
-                    work.flush()?;
-                    scope
-                        .observe_opaque_upper_bound(upper)
-                        .map_err(HostError::Host)?;
-                }
-                let dictionary = matches!(kind, Kind::Dictionary(_));
-                let separate_loan = summary.shared_backing
-                    && (dictionary || (upper == 0 && index.child_count(node)? > 1));
-                let mut loan_scope = match factory {
-                    Some(factory) if separate_loan => {
-                        Some(begin_physical_scope(factory, &mut receiver, work)?)
-                    }
-                    _ => None,
-                };
-                let cloned_backing = if factory.is_none() {
-                    storage.clone()
-                } else if let Some(loan) = loan_scope.as_mut() {
-                    retain_physical_children(
-                        node,
-                        &index,
-                        &carriers,
-                        &fields,
-                        loan,
-                        &mut receiver,
-                        work,
-                    )?
-                } else if !dictionary && let Some(scope) = scope.as_mut() {
-                    retain_physical_children(
-                        node,
-                        &index,
-                        &carriers,
-                        &fields,
-                        scope,
-                        &mut receiver,
-                        work,
-                    )?
-                } else if dictionary {
-                    // No shared descendant exists; the copied Boxes belong
-                    // only to the new Dictionary constructor, not the source.
-                    ValueTypeStorageLifetime::pure()
-                } else {
-                    borrowed_physical_child(node, &index, &carriers, &fields, work)?
-                };
-                let backing = if dictionary && let Some(scope) = scope.as_mut() {
-                    scope
-                        .storage_lifetime()
-                        .retaining_observed(&cloned_backing, |layout| {
-                            scoped_request(scope, layout, &mut receiver, work)
-                        })?
-                } else {
-                    cloned_backing.clone()
-                };
-                let graph = receiver
-                    .as_ref()
-                    .and_then(|r| r.graph.map(|graph| (graph, id)));
-                let ty = opaque(package, work, |work| {
-                    materialize(index.kind(id)?, &carriers, &fields, work, graph)
-                })?;
-                if strict(receiver.as_ref(), node, work)? {
-                    validate_type(&ty, work)?;
-                } else {
-                    novarocks_type_contract::validate_arrow_carrier_parameters_observed(
-                        &ty,
-                        || work.step().map_err(E::from),
-                    )?;
-                }
-                opaque(package, work, |_| {
-                    carriers.insert(
-                        id,
-                        Materialized {
-                            layout: None,
-                            value: ty,
-                            storage: backing,
-                            clone_storage: cloned_backing,
-                        },
-                    );
-                    Ok(())
-                })?;
-            }
-            Node::Field(id) => {
-                let source = index.field(id)?;
-                let attributes = field_attributes(source, source_facts, work)?;
-                let mut scope = match factory {
-                    Some(factory) => Some(begin_physical_scope(factory, &mut receiver, work)?),
-                    None => None,
-                };
-                let backing = if let Some(scope) = scope.as_mut() {
+    let mut original_body = Some(|| -> Result<DecodedTypeTable, HostError<H>> {
+        let mut carriers = BTreeMap::new();
+        let mut fields = BTreeMap::new();
+        let mut values = BTreeMap::new();
+        let mut field_loans = if package {
+            let mut loans = Vec::new();
+            loans
+                .try_reserve_exact(table.fields.len())
+                .map_err(|_| E::from(CompileControlError::ResourceExhausted))?;
+            work.step()?;
+            Some(loans)
+        } else {
+            None
+        };
+        for node in order {
+            work.step()?;
+            match node {
+                Node::Carrier(id) => {
                     let summary = summaries
                         .get(&node)
-                        .ok_or(E::InvalidShape("physical Field summary is absent"))?;
-                    let upper = TypeDecodeModel::field_entity_upper(
-                        source,
-                        attributes.metadata,
-                        summary.dictionary_boxes,
-                    )?;
-                    work.flush()?;
-                    scope
-                        .observe_opaque_upper_bound(upper)
-                        .map_err(HostError::Host)?;
-                    retain_physical_children(
-                        node,
-                        &index,
-                        &carriers,
-                        &fields,
-                        scope,
-                        &mut receiver,
-                        work,
-                    )?
-                } else {
-                    storage.clone()
-                };
-                let ty = carrier_ref(&carriers, required(source.carrier_type_id)?, work, package)?;
-                observe_bytes(source.name.as_bytes(), work)?;
-                let field = opaque(package, work, |_| {
-                    Ok(
-                        match (attributes.dictionary_id, attributes.dictionary_is_ordered) {
-                            #[allow(deprecated)]
-                            (Some(id), Some(ordered)) => Field::new_dict(
-                                source.name.clone(),
-                                ty,
-                                source.nullable,
-                                id,
-                                ordered,
-                            ),
-                            (None, None) => Field::new(source.name.clone(), ty, source.nullable),
-                            _ => {
-                                return Err(E::InvalidShape(
-                                    "incomplete field dictionary attributes",
-                                ));
-                            }
-                        },
-                    )
-                })?;
-                let mut metadata = opaque(package, work, |_| {
-                    Ok(MaterializedMetadataMap::with_capacity(
-                        attributes.metadata.len(),
-                    ))
-                })?;
-                for entry in attributes.metadata {
-                    work.step()?;
-                    observe_bytes(entry.key.as_bytes(), work)?;
-                    observe_bytes(entry.value.as_bytes(), work)?;
+                        .ok_or(E::InvalidShape("physical carrier summary is absent"))?;
+                    let kind = index.kind(id)?;
+                    let upper =
+                        TypeDecodeModel::carrier_entity_upper(kind, summary.dictionary_boxes)?;
+                    let mut scope = match factory {
+                        Some(factory) if upper != 0 => {
+                            Some(begin_physical_scope(factory, &mut receiver, work)?)
+                        }
+                        _ => None,
+                    };
+                    if let Some(scope) = scope.as_mut() {
+                        work.flush()?;
+                        scope
+                            .observe_opaque_upper_bound(upper)
+                            .map_err(HostError::Host)?;
+                    }
+                    let dictionary = matches!(kind, Kind::Dictionary(_));
+                    let separate_loan = summary.shared_backing
+                        && (dictionary || (upper == 0 && index.child_count(node)? > 1));
+                    let mut loan_scope = match factory {
+                        Some(factory) if separate_loan => {
+                            Some(begin_physical_scope(factory, &mut receiver, work)?)
+                        }
+                        _ => None,
+                    };
+                    let cloned_backing = if factory.is_none() {
+                        storage.clone()
+                    } else if let Some(loan) = loan_scope.as_mut() {
+                        retain_physical_children(
+                            node,
+                            &index,
+                            &carriers,
+                            &fields,
+                            loan,
+                            &mut receiver,
+                            work,
+                        )?
+                    } else if !dictionary && let Some(scope) = scope.as_mut() {
+                        retain_physical_children(
+                            node,
+                            &index,
+                            &carriers,
+                            &fields,
+                            scope,
+                            &mut receiver,
+                            work,
+                        )?
+                    } else if dictionary {
+                        // No shared descendant exists; the copied Boxes belong
+                        // only to the new Dictionary constructor, not the source.
+                        ValueTypeStorageLifetime::pure()
+                    } else {
+                        borrowed_physical_child(node, &index, &carriers, &fields, work)?
+                    };
+                    let backing = if dictionary && let Some(scope) = scope.as_mut() {
+                        scope
+                            .storage_lifetime()
+                            .retaining_observed(&cloned_backing, |layout| {
+                                scoped_request(scope, layout, &mut receiver, work)
+                            })?
+                    } else {
+                        cloned_backing.clone()
+                    };
+                    let graph = receiver
+                        .as_ref()
+                        .and_then(|r| r.graph.map(|graph| (graph, id)));
+                    let ty = opaque(package, work, |work| {
+                        materialize(index.kind(id)?, &carriers, &fields, work, graph)
+                    })?;
+                    if strict(receiver.as_ref(), node, work)? {
+                        validate_type(&ty, work)?;
+                    } else {
+                        novarocks_type_contract::validate_arrow_carrier_parameters_observed(
+                            &ty,
+                            || work.step().map_err(E::from),
+                        )?;
+                    }
                     opaque(package, work, |_| {
-                        metadata.insert(entry.key.clone(), entry.value.clone());
+                        carriers.insert(
+                            id,
+                            Materialized {
+                                layout: None,
+                                value: ty,
+                                storage: backing,
+                                clone_storage: cloned_backing,
+                            },
+                        );
                         Ok(())
                     })?;
                 }
-                let field = metadata.into_field(field);
-                opaque(package, work, |_| {
-                    let field = field.into_shared();
-                    if let Some(loans) = field_loans.as_mut() {
-                        loans.push(field.loan());
+                Node::Field(id) => {
+                    let source = index.field(id)?;
+                    let attributes = field_attributes(source, source_facts, work)?;
+                    let mut scope = match factory {
+                        Some(factory) => Some(begin_physical_scope(factory, &mut receiver, work)?),
+                        None => None,
+                    };
+                    let backing = if let Some(scope) = scope.as_mut() {
+                        let summary = summaries
+                            .get(&node)
+                            .ok_or(E::InvalidShape("physical Field summary is absent"))?;
+                        let upper = TypeDecodeModel::field_entity_upper(
+                            source,
+                            attributes.metadata,
+                            summary.dictionary_boxes,
+                        )?;
+                        work.flush()?;
+                        scope
+                            .observe_opaque_upper_bound(upper)
+                            .map_err(HostError::Host)?;
+                        retain_physical_children(
+                            node,
+                            &index,
+                            &carriers,
+                            &fields,
+                            scope,
+                            &mut receiver,
+                            work,
+                        )?
+                    } else {
+                        storage.clone()
+                    };
+                    let ty =
+                        carrier_ref(&carriers, required(source.carrier_type_id)?, work, package)?;
+                    observe_bytes(source.name.as_bytes(), work)?;
+                    let field = opaque(package, work, |_| {
+                        Ok(
+                            match (attributes.dictionary_id, attributes.dictionary_is_ordered) {
+                                #[allow(deprecated)]
+                                (Some(id), Some(ordered)) => Field::new_dict(
+                                    source.name.clone(),
+                                    ty,
+                                    source.nullable,
+                                    id,
+                                    ordered,
+                                ),
+                                (None, None) => {
+                                    Field::new(source.name.clone(), ty, source.nullable)
+                                }
+                                _ => {
+                                    return Err(E::InvalidShape(
+                                        "incomplete field dictionary attributes",
+                                    ));
+                                }
+                            },
+                        )
+                    })?;
+                    let mut metadata = opaque(package, work, |_| {
+                        Ok(MaterializedMetadataMap::with_capacity(
+                            attributes.metadata.len(),
+                        ))
+                    })?;
+                    for entry in attributes.metadata {
+                        work.step()?;
+                        observe_bytes(entry.key.as_bytes(), work)?;
+                        observe_bytes(entry.value.as_bytes(), work)?;
+                        opaque(package, work, |_| {
+                            metadata.insert(entry.key.clone(), entry.value.clone());
+                            Ok(())
+                        })?;
                     }
-                    fields.insert(
-                        id,
-                        Materialized {
-                            layout: None,
-                            value: field.into_original_field_ref(),
-                            clone_storage: backing.clone(),
-                            storage: backing,
-                        },
-                    );
-                    Ok(())
-                })?;
+                    let field = metadata.into_field(field);
+                    opaque(package, work, |_| {
+                        let field = field.into_shared();
+                        if let Some(loans) = field_loans.as_mut() {
+                            loans.push(field.loan());
+                        }
+                        fields.insert(
+                            id,
+                            Materialized {
+                                layout: None,
+                                value: field.into_original_field_ref(),
+                                clone_storage: backing.clone(),
+                                storage: backing,
+                            },
+                        );
+                        Ok(())
+                    })?;
+                }
             }
         }
-    }
-    for source in &table.value_types {
-        work.step()?;
-        let logical_id = required(source.logical_type_id)?;
-        let carrier_id = required(source.carrier_type_id)?;
-        let layout = materialized_layout(
-            carrier_id,
-            &index,
-            &mut carriers,
-            &fields,
-            factory,
-            &storage,
-            &mut receiver,
-            work,
-        )?;
-        work.step()?;
-        work.flush()?;
-        let value_type = logical
-            .get_observed(logical_id, work)?
-            .ok_or(E::InvalidShape("logical root was not materialized"))?;
-        work.flush()?;
-        let value_type = value_type.clone();
-        work.step()?;
-        work.flush()?;
-        let binding = TypedValueBinding::try_new_observed(value_type, layout, |units| {
-            for _ in 0..units {
-                work.step()?;
-            }
-            Ok::<_, E>(())
-        })?;
-        let value = FunctionValueType::try_from_typed_binding(binding)?;
-        opaque(package, work, |_| {
-            values.insert(source.id, value);
-            Ok(())
-        })?;
-    }
-    for source in &table.fields {
-        work.step()?;
-        if let Some(logical_id) = source.logical_type_id {
-            let covered = opaque(package, work, |_| {
-                Ok(source_nodes.contains(&Node::Field(source.id)))
+        for source in &table.value_types {
+            work.step()?;
+            let logical_id = required(source.logical_type_id)?;
+            let carrier_id = required(source.carrier_type_id)?;
+            let layout = materialized_layout(
+                carrier_id,
+                &index,
+                &mut carriers,
+                &fields,
+                factory,
+                &storage,
+                &mut receiver,
+                work,
+            )?;
+            work.step()?;
+            work.flush()?;
+            let value_type = logical
+                .get_observed(logical_id, work)?
+                .ok_or(E::InvalidShape("logical root was not materialized"))?;
+            work.flush()?;
+            let value_type = value_type.clone();
+            work.step()?;
+            work.flush()?;
+            let binding = TypedValueBinding::try_new_observed(value_type, layout, |units| {
+                for _ in 0..units {
+                    work.step()?;
+                }
+                Ok::<_, E>(())
             })?;
-            if !covered {
-                let value_type = logical
-                    .get_observed(logical_id, work)?
-                    .ok_or(E::InvalidShape("logical field was not materialized"))?;
-                let field = opaque(package, work, |_| {
-                    fields.get(&source.id).ok_or(E::InvalidShape(
-                        "logical field carrier was not materialized",
+            let value = FunctionValueType::try_from_typed_binding(binding)?;
+            opaque(package, work, |_| {
+                values.insert(source.id, value);
+                Ok(())
+            })?;
+        }
+        for source in &table.fields {
+            work.step()?;
+            if let Some(logical_id) = source.logical_type_id {
+                let covered = opaque(package, work, |_| {
+                    Ok(source_nodes.contains(&Node::Field(source.id)))
+                })?;
+                if !covered {
+                    let value_type = logical
+                        .get_observed(logical_id, work)?
+                        .ok_or(E::InvalidShape("logical field was not materialized"))?;
+                    let field = opaque(package, work, |_| {
+                        fields.get(&source.id).ok_or(E::InvalidShape(
+                            "logical field carrier was not materialized",
+                        ))
+                    })?;
+                    novarocks_type_contract::validate_value_layout_observed(
+                        value_type,
+                        field.data_type(),
+                        |units| {
+                            for _ in 0..units {
+                                work.step()?;
+                            }
+                            Ok::<_, E>(())
+                        },
+                    )?;
+                }
+            }
+        }
+        let mut field_values = BTreeMap::new();
+        for source in &table.fields {
+            work.step()?;
+            if let Some(binding_id) = source.value_binding_id {
+                let value = opaque(package, work, |_| {
+                    values.get(&binding_id).ok_or(E::InvalidShape(
+                        "paired execution binding was not materialized",
                     ))
                 })?;
-                novarocks_type_contract::validate_value_layout_observed(
-                    value_type,
-                    field.data_type(),
+                let field = opaque(package, work, |_| {
+                    fields
+                        .get(&source.id)
+                        .ok_or(E::InvalidShape("paired source field was not materialized"))
+                })?;
+                if !novarocks_connector_contract::write_field_matches_execution_type_observed::<E>(
+                    field,
+                    value,
                     |units| {
                         for _ in 0..units {
                             work.step()?;
                         }
-                        Ok::<_, E>(())
+                        Ok(())
                     },
-                )?;
-            }
-        }
-    }
-    let mut field_values = BTreeMap::new();
-    for source in &table.fields {
-        work.step()?;
-        if let Some(binding_id) = source.value_binding_id {
-            let value = opaque(package, work, |_| {
-                values.get(&binding_id).ok_or(E::InvalidShape(
-                    "paired execution binding was not materialized",
-                ))
-            })?;
-            let field = opaque(package, work, |_| {
-                fields
-                    .get(&source.id)
-                    .ok_or(E::InvalidShape("paired source field was not materialized"))
-            })?;
-            if !novarocks_connector_contract::write_field_matches_execution_type_observed::<E>(
-                field,
-                value,
-                |units| {
-                    for _ in 0..units {
-                        work.step()?;
-                    }
+                )? {
+                    return Err(E::InvalidShape(
+                        "source field conflicts with explicitly paired execution layout",
+                    )
+                    .into());
+                }
+                let value = value.clone_observed(|| work.step().map_err(E::from))?;
+                opaque(package, work, |_| {
+                    field_values.insert(source.id, value);
                     Ok(())
-                },
-            )? {
-                return Err(E::InvalidShape(
-                    "source field conflicts with explicitly paired execution layout",
-                )
-                .into());
+                })?;
             }
-            let value = value.clone_observed(|| work.step().map_err(E::from))?;
-            opaque(package, work, |_| {
-                field_values.insert(source.id, value);
-                Ok(())
-            })?;
         }
-    }
-    if let Some(graph) = receiver.as_ref().and_then(|receiver| receiver.graph) {
-        let mut previous_recipe = None;
-        let mut decoded_bytes = 0;
-        graph.roots().visit::<E>(
+        if let Some(graph) = receiver.as_ref().and_then(|receiver| receiver.graph) {
+            let mut previous_recipe = None;
+            let mut decoded_bytes = 0;
+            graph.roots().visit::<E>(
             &mut |root, work| {
                 if let PackageTypeRootSource::WriterField {
                     recipe, binding, ..
@@ -1809,54 +1961,65 @@ fn decode_body<'source, H, F: novarocks_type_contract::ValueSchemaCreationFactor
             },
             work,
         )?;
-    }
-    let metadata_namespace = match field_loans {
-        Some(loans) => {
-            // TypeDecodeModel admitted the exact source record Vec/shrink/Arc
-            // before original materialization. No decoded Field is cloned.
-            work.flush()?;
-            let loans = loans.into_boxed_slice();
-            work.step()?;
-            work.flush()?;
-            let loans = loans.into();
-            work.step()?;
-            work.flush()?;
-            Some(novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace::from_original_loans(loans))
         }
-        None => None,
-    };
-    let mut table_storage = storage;
-    if factory.is_some() {
-        // Existing schema/source exports borrow raw Arrow handles together
-        // with the complete namespace marker. Preserve that custody until
-        // those actual callers can consume per-field loans. Complete FVTs
-        // above never borrow this wrapper/main responsibility.
-        let backing = carriers
-            .values()
-            .map(|entry| Ok(&entry.storage))
-            .chain(fields.values().map(|entry| Ok(&entry.storage)));
-        table_storage = table_storage.retaining_flat_observed(
-            backing,
-            |layout| {
-                request(&mut receiver, layout).map_err(|error| match error {
-                    AdmissionRefusal::Control(cause) => HostError::from(cause),
-                    AdmissionRefusal::Host(cause) => cause,
-                })
-            },
-            work,
-        )?;
+        let metadata_namespace = match field_loans {
+            Some(loans) => {
+                // TypeDecodeModel admitted the exact source record Vec/shrink/Arc
+                // before original materialization. No decoded Field is cloned.
+                work.flush()?;
+                let loans = loans.into_boxed_slice();
+                work.step()?;
+                work.flush()?;
+                let loans = loans.into();
+                work.step()?;
+                work.flush()?;
+                Some(novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace::from_original_loans(loans))
+            }
+            None => None,
+        };
+        let mut table_storage = storage;
+        if factory.is_some() {
+            // Existing schema/source exports borrow raw Arrow handles together
+            // with the complete namespace marker. Preserve that custody until
+            // those actual callers can consume per-field loans. Complete FVTs
+            // above never borrow this wrapper/main responsibility.
+            let backing = carriers
+                .values()
+                .map(|entry| Ok(&entry.storage))
+                .chain(fields.values().map(|entry| Ok(&entry.storage)));
+            table_storage = table_storage.retaining_flat_observed(
+                backing,
+                |layout| {
+                    request(&mut receiver, layout).map_err(|error| match error {
+                        AdmissionRefusal::Control(cause) => HostError::from(cause),
+                        AdmissionRefusal::Host(cause) => cause,
+                    })
+                },
+                work,
+            )?;
+        }
+        Ok(DecodedTypeTable {
+            source_fields: None,
+            field_execution_refs,
+            creation_requests: None,
+            metadata_namespace,
+            storage: table_storage,
+            carriers,
+            fields,
+            values,
+            field_values,
+        })
+    });
+    match (funding.as_deref_mut(), funding_facts.as_ref()) {
+        (Some(funding), Some(facts)) => funding.materialize(namespace, facts, &mut || {
+            original_body
+                .take()
+                .expect("materialization continuation runs once")()
+        }),
+        _ => original_body
+            .take()
+            .expect("unfunded original continuation")(),
     }
-    Ok(DecodedTypeTable {
-        source_fields: None,
-        field_execution_refs,
-        creation_requests: None,
-        metadata_namespace,
-        storage: table_storage,
-        carriers,
-        fields,
-        values,
-        field_values,
-    })
 }
 
 /// Compose the two original model prefixes on their original package limits.
@@ -2037,6 +2200,7 @@ pub(super) fn decode_source_fields_with_creator<H>(
         None,
         None,
         work,
+        &mut None,
     )
 }
 
@@ -2057,6 +2221,7 @@ pub(super) fn decode_source_fields_input_derived_with_creator<H>(
         None,
         None,
         work,
+        &mut None,
     )
 }
 
@@ -2081,6 +2246,7 @@ pub(super) fn decode_source_fields_input_derived_with_factory<
         None,
         Some(factory),
         work,
+        &mut None,
     )
 }
 
@@ -2094,6 +2260,7 @@ fn decode_source_fields_core<H, F: novarocks_type_contract::ValueSchemaCreationF
     parent: Option<&mut dyn SourceParentAdmission<H>>,
     factory: Option<&F>,
     work: &mut CompileCheckpoints<'_>,
+    funding: &mut Option<&mut dyn super::PackageTypeFundingScope<H>>,
 ) -> Result<super::DecodedSourceFieldTable, HostError<H>> {
     let has_creator = creation.is_some() || parent.as_ref().is_some_and(|p| p.has_creator());
     let table = source_table
@@ -2214,6 +2381,7 @@ fn decode_source_fields_core<H, F: novarocks_type_contract::ValueSchemaCreationF
         }),
         factory,
         Some(&source_facts),
+        funding,
     )?;
     decoded.creation_requests = has_creator.then_some(admission.total);
     Ok(super::DecodedSourceFieldTable {
@@ -2269,6 +2437,7 @@ pub(super) fn decode_package_with_storage(
         &mut resources,
         work,
         None,
+        &mut None,
     )
     .map_err(ProjectionFailure::without_host)
 }
@@ -2282,7 +2451,7 @@ pub(super) fn decode_package_with_creator<H>(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedTypeTable, HostError<H>> {
     decode_package_created_core::<H, shared_resources::NoFactory>(
-        package, source, limits, creation, None, work,
+        package, source, limits, creation, None, work, &mut None,
     )
 }
 
@@ -2297,7 +2466,15 @@ pub(super) fn decode_package_with_factory<
     factory: &F,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedTypeTable, HostError<H>> {
-    decode_package_created_core(package, source, limits, creation, Some(factory), work)
+    decode_package_created_core(
+        package,
+        source,
+        limits,
+        creation,
+        Some(factory),
+        work,
+        &mut None,
+    )
 }
 
 fn decode_package_created_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
@@ -2307,6 +2484,7 @@ fn decode_package_created_core<H, F: novarocks_type_contract::ValueSchemaCreatio
     creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
     factory: Option<&F>,
     work: &mut CompileCheckpoints<'_>,
+    funding: &mut Option<&mut dyn super::PackageTypeFundingScope<H>>,
 ) -> Result<DecodedTypeTable, HostError<H>> {
     let storage = creation.storage_lifetime();
     let mut resources = PackageDecodeResources {
@@ -2329,6 +2507,7 @@ fn decode_package_created_core<H, F: novarocks_type_contract::ValueSchemaCreatio
         &mut resources,
         work,
         factory,
+        funding,
     )?;
     decoded.creation_requests = Some(resources.total);
     Ok(decoded)
@@ -2342,6 +2521,7 @@ fn decode_package_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory
     resources: &mut PackageDecodeResources<'_, '_, '_, H>,
     work: &mut CompileCheckpoints<'_>,
     factory: Option<&F>,
+    funding: &mut Option<&mut dyn super::PackageTypeFundingScope<H>>,
 ) -> Result<DecodedTypeTable, HostError<H>> {
     let table = package
         .types
@@ -2399,6 +2579,7 @@ fn decode_package_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory
         }),
         factory,
         None,
+        funding,
     )?;
     resources.finish_namespace()?;
     let source_table = package
@@ -2415,8 +2596,149 @@ fn decode_package_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory
         Some(resources),
         factory,
         work,
+        funding,
     )?;
     resources.finish_namespace()?;
     decoded.source_fields = Some(source_fields);
     Ok(decoded)
+}
+
+pub(super) fn decode_package_with_funding<H>(
+    package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
+    source: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+    host: &mut dyn super::PackageTypeFundingScope<H>,
+) -> Result<DecodedTypeTable, HostError<H>> {
+    let mut resources = PackageDecodeResources {
+        creation: None,
+        pure_admit: Some(admit),
+        limits,
+        source,
+        completed: PackageTypeProjectionFacts::default(),
+        completed_scoped: 0,
+        current: PackageTypeProjectionFacts::default(),
+        current_scoped: 0,
+        previous_non_scoped: 0,
+        total: 0,
+    };
+    decode_package_core::<H, shared_resources::NoFactory>(
+        package,
+        source,
+        ValueTypeStorageLifetime::pure(),
+        limits,
+        &mut resources,
+        work,
+        None,
+        &mut Some(host),
+    )
+}
+
+pub(super) fn decode_package_with_factory_and_funding<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
+    package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
+    source: usize,
+    limits: PackageTypeProjectionLimits,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    factory: &F,
+    work: &mut CompileCheckpoints<'_>,
+    funding: &mut dyn super::PackageTypeFundingScope<H>,
+) -> Result<DecodedTypeTable, HostError<H>> {
+    decode_package_created_core(
+        package,
+        source,
+        limits,
+        creation,
+        Some(factory),
+        work,
+        &mut Some(funding),
+    )
+}
+
+#[cfg(test)]
+mod funding_forecast_tests {
+    use super::*;
+    use novarocks_type_contract::{ValueSchemaCreationFactory, ValueSchemaScopeBeginFailure};
+
+    struct UnqualifiedFactory;
+    struct UnopenedScope;
+    impl ValueSchemaCreationScope<Infallible> for UnopenedScope {
+        fn storage_lifetime(&self) -> ValueTypeStorageLifetime {
+            unreachable!("numeric forecast must not construct a scope")
+        }
+        fn request_layout(&mut self, _: Layout) -> Result<(), Infallible> {
+            unreachable!("numeric forecast must not request capacity")
+        }
+        fn observe_opaque_upper_bound(&mut self, _: usize) -> Result<(), Infallible> {
+            unreachable!("numeric forecast must not request capacity")
+        }
+    }
+    impl ValueSchemaCreationFactory<Infallible> for UnqualifiedFactory {
+        type Scope<'a> = UnopenedScope;
+        fn begin_scope(&self) -> Result<Self::Scope<'_>, Infallible> {
+            unreachable!("numeric forecast must not construct a scope")
+        }
+        fn begin_scope_observed<O>(
+            &self,
+            _: &mut dyn FnMut(Layout) -> Result<(), O>,
+        ) -> Result<Self::Scope<'_>, ValueSchemaScopeBeginFailure<O, Infallible>> {
+            unreachable!("numeric forecast must not construct a scope")
+        }
+    }
+    struct Control;
+    impl novarocks_type_contract::PureCompileControl for Control {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn physical_tail_forecast_rejects_absent_scope_geometry_without_opening_scope() {
+        let table = wire::TypeTable {
+            carriers: vec![wire::CarrierTypeDefinition {
+                id: 1,
+                kind: Some(Kind::Primitive(plan::ArrowPrimitiveType::Int64 as i32)),
+            }],
+            fields: vec![wire::FieldDefinition {
+                id: 2,
+                name: "original".into(),
+                nullable: false,
+                carrier_type_id: Some(1),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let limits = TypeProjectionLimits {
+            max_definitions: 8,
+            max_expanded_nodes: 32,
+            max_string_bytes: 1024,
+        };
+        let mut work =
+            CompileCheckpoints::try_new(&Control, novarocks_type_contract::CompilePhase::Decode)
+                .unwrap();
+        let mut receiver: Option<Receiver<'_, '_, '_, Infallible>> = None;
+        let (index, _) = preflight(&table, limits, &mut work, &mut receiver, None).unwrap();
+        let (order, _, _, summaries) =
+            topology(&index, &table, limits, &mut work, &mut receiver).unwrap();
+        let result = physical_tail_funding_facts(
+            super::super::PackageTypeProjectionFacts::default(),
+            &table,
+            &index,
+            &order,
+            &summaries,
+            Some(&UnqualifiedFactory),
+        );
+        assert!(matches!(
+            result,
+            Err(ProjectionFailure::Codec(E::ResourceSource(
+                "type backing lifetime holder source model drift"
+            )))
+        ));
+    }
 }

@@ -2446,6 +2446,65 @@ mod tests {
     }
 
     #[test]
+    fn static_and_compiled_layouts_keep_complete_raw_domains_and_legacy_projection() {
+        use novarocks_type_contract::FunctionValueType;
+        use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+        for (logical, carrier) in [
+            (ValueLogicalType::Physical, DataType::FixedSizeBinary(16)),
+            (ValueLogicalType::LargeInt, DataType::FixedSizeBinary(16)),
+            (ValueLogicalType::Uuid, DataType::FixedSizeBinary(16)),
+            (ValueLogicalType::Variant, DataType::LargeBinary),
+            (ValueLogicalType::Json, DataType::Utf8),
+            (ValueLogicalType::Hll, DataType::Binary),
+            (ValueLogicalType::Bitmap, DataType::Binary),
+            (ValueLogicalType::Object, DataType::Binary),
+            (ValueLogicalType::Percentile, DataType::Binary),
+        ] {
+            let mut field = Field::new("value", carrier, true);
+            if let Some(marker) = logical.metadata_value() {
+                field = field.with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into());
+            }
+            let source = ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                field.clone(),
+                None,
+                None,
+            )])
+            .unwrap();
+            assert_eq!(source.slots()[0].field(), &field);
+            let declaration =
+                FunctionValueType::try_with_logical_type(field.data_type().clone(), true, logical)
+                    .unwrap();
+            let layout = crate::exec::chunk::typed_fixture::layout(
+                Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    field.data_type().clone(),
+                    true,
+                )])),
+                &[SlotId::new(1)],
+                &[declaration.clone()],
+            );
+            for restored in [
+                ChunkSchema::from_static_layout(&layout).unwrap(),
+                ChunkSchema::from_compiled_layout(&layout).unwrap(),
+            ] {
+                let slot = &restored.slots()[0];
+                assert_eq!(slot.field().metadata().capacity(), 0);
+                assert_eq!(slot.typed_binding(), declaration.typed_binding());
+                assert_eq!(slot.field().data_type(), field.data_type());
+                assert_eq!(slot.field().is_nullable(), field.is_nullable());
+                assert_eq!(slot.field().name(), field.name());
+                let legacy = declaration.try_to_legacy_field_projection("value").unwrap();
+                assert_eq!(&legacy, &field);
+                assert_eq!(
+                    novarocks_type_contract::field_logical_type(&legacy).unwrap(),
+                    logical
+                );
+            }
+        }
+    }
+
+    #[test]
     fn static_layout_thaw_narrows_each_slot_and_keeps_actual_schema_owner() {
         use crate::exec::pipeline::operator::input_construction::{
             ConstructionFailure, try_runtime_input_construction_factory,

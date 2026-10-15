@@ -999,7 +999,7 @@ fn actual_builtin_truncate_installs_its_exact_dynamic_cpu_record_and_complete_ef
     assert_eq!(installed.abi, PureKernelAbi::ScalarV1);
     let effects = declared.effects.as_ref().unwrap();
     assert_eq!(effects.value_stability, FunctionVolatility::Immutable);
-    assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::MayRaise);
+    assert_eq!(effects.own_row_error, FunctionIntrinsicRowError::NoRowError);
     assert_eq!(effects.failure_behavior, FunctionFailureBehavior::Propagate);
     assert_eq!(effects.null_behavior, FunctionNullBehavior::Strict);
     assert_eq!(effects.argument_control, ArgumentControl::Eager);
@@ -1841,4 +1841,35 @@ fn selected_owner_control_remains_a_top_level_specialization_failure() {
         );
         assert_eq!(owner.counts.prepare.load(Ordering::Relaxed), 0);
     }
+}
+
+#[test]
+fn c16_p1_scalar_invocation_data_requires_real_invocation_abi_at_registration() {
+    let mut owner = Owner::new(false);
+    owner.declaration = owner
+        .declaration
+        .with_scalar_invocation_data_overloads([overload_id(SCALAR)])
+        .unwrap();
+    assert!(matches!(
+        register_owner(Arc::new(owner), &[PureKernelAbi::ScalarV1]),
+        Err(PureCatalogError::InvalidAbi { .. })
+    ));
+    let mut owner = Owner::new(false);
+    owner.declaration = owner
+        .declaration
+        .with_scalar_invocation_data_overloads([overload_id(SCALAR)])
+        .unwrap();
+    owner.implementations[0].abi = PureKernelAbi::ScalarInvocationV1;
+    assert!(register_owner(Arc::new(owner), &[PureKernelAbi::ScalarInvocationV1]).is_ok());
+    // Existing invocation ABIs need not gain this original declaration. This
+    // positive requirement deliberately does not backfill old owner facts.
+    let mut owner = Owner::new(false);
+    owner.implementations[0].abi = PureKernelAbi::ScalarInvocationV1;
+    assert!(
+        !owner
+            .declaration
+            .has_scalar_invocation_data(&overload_id(SCALAR))
+            .unwrap()
+    );
+    assert!(register_owner(Arc::new(owner), &[PureKernelAbi::ScalarInvocationV1]).is_ok());
 }

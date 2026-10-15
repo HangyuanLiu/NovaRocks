@@ -37,29 +37,48 @@ enum SourceDomain {
         batch_rows: usize,
         rows: HostVec<usize, HostAggregateAllocator>,
     },
+    DirectSparse {
+        batch_rows: usize,
+        // Field destruction order keeps the actual grant live through Vec Drop.
+        rows: Vec<usize>,
+        scope: Option<OpaqueReservation>,
+    },
 }
 impl SourceDomain {
     fn batch_rows(&self) -> usize {
         match self {
-            Self::All { batch_rows } | Self::Sparse { batch_rows, .. } => *batch_rows,
+            Self::All { batch_rows }
+            | Self::Sparse { batch_rows, .. }
+            | Self::DirectSparse { batch_rows, .. } => *batch_rows,
         }
     }
     fn len(&self) -> usize {
         match self {
             Self::All { batch_rows } => *batch_rows,
             Self::Sparse { rows, .. } => rows.len(),
+            Self::DirectSparse { rows, .. } => rows.len(),
         }
     }
     fn row(&self, ordinal: usize) -> Option<usize> {
         match self {
             Self::All { batch_rows } => (ordinal < *batch_rows).then_some(ordinal),
             Self::Sparse { rows, .. } => rows.get(ordinal).copied(),
+            Self::DirectSparse { rows, .. } => rows.get(ordinal).copied(),
         }
     }
     fn bytes(&self) -> usize {
         match self {
             Self::All { .. } => 0,
             Self::Sparse { rows, .. } => rows.capacity() * std::mem::size_of::<usize>(),
+            Self::DirectSparse { rows, .. } => rows.capacity() * std::mem::size_of::<usize>(),
+        }
+    }
+    fn opaque_admission_bytes(&self) -> usize {
+        match self {
+            Self::DirectSparse {
+                scope: Some(scope), ..
+            } => scope.remaining_bytes(),
+            _ => 0,
         }
     }
 }
@@ -103,7 +122,7 @@ impl ScalarInvocationData {
             + self.0.original.get().expect("published Data").capacity()
     }
     pub fn retained_admission_bytes(&self) -> usize {
-        self.0.diagnostic_scope.remaining_bytes()
+        self.0.diagnostic_scope.remaining_bytes() + self.0.domain.opaque_admission_bytes()
     }
 }
 impl PartialEq for ScalarInvocationData {
@@ -132,7 +151,101 @@ impl std::error::Error for ScalarInvocationData {}
 /// A private slot for one actual invoking call. It is not an activation receipt,
 /// a prepared diagnostic, a scalar instance, or an implicit empty-domain call.
 pub(super) struct ScalarDataSlot(HostShared<ScalarDataInner>);
+
+/// A virgin direct slot cannot be cloned or published through the old borrowed
+/// slot interface. Its sole writer consumes it before exposing any Data alias.
+pub(super) struct DirectScalarDataSlot(HostShared<ScalarDataInner>);
+
+/// The exact requests of the original direct holder, before constructing it.
+/// The complete String is moved into this holder and has a separate author.
+pub(crate) fn direct_slot_request_layouts(
+    selection: Selection<'_>,
+) -> Result<(std::alloc::Layout, Option<std::alloc::Layout>), KernelFailure> {
+    let rows = if selection.is_all() || selection.is_empty() {
+        None
+    } else {
+        Some(
+            std::alloc::Layout::array::<usize>(selection.len())
+                .map_err(|_| KernelFailure::ResourceExhausted)?,
+        )
+    };
+    Ok((HostShared::<ScalarDataInner>::allocation_layout(), rows))
+}
+impl DirectScalarDataSlot {
+    pub(super) fn publish_original(self, message: String) -> ScalarInvocationData {
+        // No handle or reference to the cell escaped construction. This is the
+        // only set on this cell, so the pinned OnceLock author cannot wait.
+        let _ = self.0.original.set(message);
+        ScalarInvocationData(self.0)
+    }
+}
 impl ScalarDataSlot {
+    pub(super) fn prepare_direct_for_actual_invocation(
+        contract: Arc<ScalarCallContract>,
+        selection: Selection<'_>,
+        allocator: &HostAggregateAllocator,
+        diagnostic_scope: OpaqueReservation,
+        source_scope: Option<OpaqueReservation>,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<DirectScalarDataSlot, KernelFailure> {
+        if !diagnostic_scope.belongs_to_allocator(allocator) {
+            return Err(crate::kernel_control::invalid(
+                "scalar diagnostic scope uses another host authority",
+            ));
+        }
+        let (_, source_layout) = direct_slot_request_layouts(selection)?;
+        let source_bytes = source_layout.map_or(0, |layout| layout.size());
+        match &source_scope {
+            Some(scope)
+                if source_bytes != 0
+                    && scope.belongs_to_allocator(allocator)
+                    && scope.remaining_bytes() == source_bytes => {}
+            None if source_bytes == 0 => {}
+            _ => {
+                return Err(crate::kernel_control::invalid(
+                    "scalar source scope differs from its exact host layout",
+                ));
+            }
+        }
+        let domain = if selection.is_all() {
+            SourceDomain::All {
+                batch_rows: selection.batch_rows(),
+            }
+        } else {
+            // Move the scope into its holder before allocating. Every early
+            // return now drops the backing before relinquishing its grant.
+            let mut domain = SourceDomain::DirectSparse {
+                batch_rows: selection.batch_rows(),
+                rows: Vec::new(),
+                scope: source_scope,
+            };
+            let SourceDomain::DirectSparse { rows, .. } = &mut domain else {
+                unreachable!("direct sparse source holder");
+            };
+            if !selection.is_empty() {
+                work.flush()?;
+                rows.try_reserve_exact(selection.len())
+                    .map_err(|_| KernelFailure::ResourceExhausted)?;
+                work.flush()?;
+            }
+            for row in selection.iter() {
+                rows.push(row);
+                work.step()?;
+            }
+            domain
+        };
+        Ok(DirectScalarDataSlot(HostShared::try_new_direct(
+            ScalarDataInner {
+                contract,
+                domain,
+                allocator_metadata_bytes: allocator.metadata_bytes(),
+                original: OnceLock::new(),
+                diagnostic_scope,
+            },
+            allocator.clone(),
+            work,
+        )?))
+    }
     pub(super) fn prepare_for_actual_invocation(
         contract: Arc<ScalarCallContract>,
         selection: Selection<'_>,
@@ -248,3 +361,118 @@ impl ScalarInvocationLatch {
 #[cfg(test)]
 #[path = "scalar_invocation_data_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod request_layout_tests {
+    use super::*;
+    use crate::opaque_memory::{OpaqueAllocationHost, OpaqueRetainedCharge};
+    use crate::source_custody_resources_tests::measured;
+    use crate::{AggregateStateAllocator, FunctionValueType, KernelEvaluationControl};
+    use arrow_schema::DataType;
+    use std::{
+        alloc::Layout,
+        ptr::NonNull,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    #[derive(Default)]
+    struct Host {
+        live: AtomicUsize,
+        opaque: AtomicUsize,
+    }
+    impl AggregateStateAllocator for Host {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, KernelFailure> {
+            let pointer = NonNull::new(unsafe { std::alloc::alloc(layout) })
+                .ok_or(KernelFailure::ResourceExhausted)?;
+            self.live.fetch_add(layout.size(), Ordering::Relaxed);
+            Ok(pointer)
+        }
+        unsafe fn release(&self, pointer: NonNull<u8>, layout: Layout) {
+            unsafe { std::alloc::dealloc(pointer.as_ptr(), layout) };
+            self.live.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+        fn opaque_allocation_host(&self) -> Option<&dyn OpaqueAllocationHost> {
+            Some(self)
+        }
+    }
+    impl OpaqueAllocationHost for Host {
+        fn reserve_opaque(&self, bytes: usize) -> Result<(), KernelFailure> {
+            self.opaque.fetch_add(bytes, Ordering::Relaxed);
+            Ok(())
+        }
+        fn release_opaque(&self, bytes: usize) {
+            self.opaque.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+    struct Control;
+    impl KernelEvaluationControl for Control {
+        fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+        fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+            panic!("direct slot construction never waits")
+        }
+    }
+
+    #[test]
+    fn invocation_scalar_resources_direct_slot_matches_independent_original_requests() {
+        // This original prepared author supplies only the immutable carrier
+        // contract. This is a slot request probe, not a JSON funding receipt.
+        let prepared = super::super::string_md5_owner::prepared_for_test_with_policy(
+            "md5",
+            &[FunctionValueType::new(DataType::Utf8, true)],
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        )
+        .unwrap();
+        let rows: Vec<_> = (0..321).map(|i| 2 * i).collect();
+        for selection in [
+            Selection::all(9),
+            Selection::all(0),
+            Selection::try_sparse(1000, &rows).unwrap(),
+            Selection::try_sparse(9, &[]).unwrap(),
+        ] {
+            let host = Arc::new(Host::default());
+            let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+            let before = host.live.load(Ordering::Relaxed);
+            let charge = OpaqueRetainedCharge::try_new(host.clone()).unwrap();
+            let diagnostic = charge.reserve_operation(4096).unwrap();
+            let source_bytes = if selection.is_all() {
+                0
+            } else {
+                selection.len() * size_of::<usize>()
+            };
+            let source = if source_bytes == 0 {
+                None
+            } else {
+                Some(charge.reserve_operation(source_bytes).unwrap())
+            };
+            let (bound, preparation) = measured(|| {
+                crate::invocation_scalar_resources::direct_data_slot_geometry(selection)
+            });
+            assert_eq!(preparation, (0, 0, 0, 0));
+            let bound = bound.unwrap();
+            let mut work = EvaluationCheckpoints::new(&Control);
+            let (slot, actual) = measured(|| {
+                ScalarDataSlot::prepare_direct_for_actual_invocation(
+                    prepared.contract().clone(),
+                    selection,
+                    &allocator,
+                    diagnostic,
+                    source,
+                    &mut work,
+                )
+            });
+            let slot = slot.unwrap();
+            assert_eq!(actual.0, bound.requested_bytes);
+            assert_eq!(actual.1, bound.requests);
+            assert_eq!(actual.2, bound.peak_bytes);
+            assert_eq!(actual.3, bound.requested_bytes);
+            drop(slot);
+            assert_eq!(host.live.load(Ordering::Relaxed), before);
+            assert_eq!(host.opaque.load(Ordering::Relaxed), 0);
+            drop(allocator);
+            assert_eq!(host.live.load(Ordering::Relaxed), 0);
+        }
+    }
+}

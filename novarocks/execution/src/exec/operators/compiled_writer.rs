@@ -52,7 +52,9 @@ use crate::exec::node::table_write_relation::{
     RootWriteResultRelationTemplate, WriterMultiplexRelationTemplate,
 };
 use crate::exec::node::table_writer::TableWriterRuntimeBinding;
-use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
+use crate::exec::operators::compiled_expression::{
+    RuntimeKernelControl, evaluate_chunk_all, instances,
+};
 use crate::exec::operators::compiled_writer_statistics::{
     CompiledFinishStatistics, CompiledWriterPartialFactory,
 };
@@ -283,6 +285,62 @@ struct CompiledWriterProjector {
     instances: Option<Vec<CompiledExpressionInstance>>,
 }
 
+#[cfg(test)]
+pub(crate) fn source_loan_test_projector(
+    program: Arc<LocalProgram>,
+    observer: Option<Arc<crate::exec::expr::compiled_program::input_source::SlotSourceObserver>>,
+) -> Box<dyn WriterPageProjection> {
+    use novarocks_local_program::ProgramNodeExpressionRole;
+    // Reuse the original checked Slot fixture, through the actual projector's
+    // project() method. This fixture tests input borrowing and handoff, not
+    // provider recipe construction or WriterProjection root admission.
+    let site = ProgramExpressionRootSite::Node {
+        node: ProgramNodeId::new(3),
+        role: ProgramNodeExpressionRole::ProjectOutput { expression: 1 },
+    };
+    let input = program.graph().nodes()[2].output_layout();
+    let field = Arc::clone(&input.schema().fields()[1]);
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+    let value_type = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
+        input
+            .value_binding_at(1)
+            .expect("original Slot declaration")
+            .clone(),
+    )
+    .unwrap();
+    let layout = crate::exec::chunk::typed_fixture::layout(
+        schema.clone(),
+        &[novarocks_types::SlotId(100)],
+        &[value_type],
+    );
+    let control = RuntimeKernelControl::new(Arc::new(RuntimeErrorState::default()));
+    let mut slots = None;
+    instances(&mut slots, &program, &[site], &control).unwrap();
+    if let Some(observer) = observer {
+        slots.as_mut().unwrap()[0].observe_slot_source(observer);
+    }
+    let tracker =
+        crate::runtime::mem_tracker::MemTracker::new_root("writer source-loan construction");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+        crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+        tracker,
+        Arc::new(RuntimeErrorState::default()),
+    ).unwrap();
+    let mut projector = CompiledWriterProjector {
+        program,
+        sites: Arc::from([site]),
+        schema,
+        layout,
+        chunk_schema: None,
+        construction: None,
+        control,
+        instances: slots,
+    };
+    projector.prepare(Some(&factory)).unwrap();
+    Box::new(projector)
+}
+
 impl WriterPageProjection for CompiledWriterProjector {
     fn prepare(
         &mut self,
@@ -326,12 +384,7 @@ impl WriterPageProjection for CompiledWriterProjector {
             .map_err(|_| ConstructionFailure::from(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.sites.len());
         for (instance, site) in instances.iter_mut().zip(self.sites.iter()) {
-            columns.push(evaluate_all(
-                instance,
-                *site,
-                chunk.record_batch(),
-                &self.control,
-            )?);
+            columns.push(evaluate_chunk_all(instance, *site, chunk, &self.control)?);
         }
         crate::exec::node::table_writer::validate_writer_projection_requiredness(
             &self.schema,

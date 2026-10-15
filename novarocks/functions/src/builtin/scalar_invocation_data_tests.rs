@@ -475,3 +475,6 @@ fn scalar_whole_data_private_data_and_seven_kernel_causes_end_instance_without_f
 
 #[path = "scalar_invocation_lifecycle_tests.rs"]
 mod scalar_invocation_lifecycle_tests;
+
+#[path = "scalar_invocation_data_direct_tests.rs"]
+mod scalar_invocation_data_direct_tests;

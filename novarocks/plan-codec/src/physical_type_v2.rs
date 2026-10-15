@@ -181,6 +181,133 @@ pub fn decode_package_type_table_observed(
     decode::decode_package(package, source_retained_bytes, limits, admit, work)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypeMaterializationNamespace {
+    ExecutionPhysical,
+    Source,
+}
+
+/// Funding around the original physical/source materialization tail only.
+/// Logical namespace construction retains its own creator responsibility.
+/// A host may run the borrowed continuation at most once; it authors no types.
+pub trait PackageTypeMaterializationScope {
+    type HostError;
+    fn materialize<C, B>(
+        &mut self,
+        facts: &PackageTypeProjectionFacts,
+        body: B,
+    ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<C, Self::HostError>>
+    where
+        C: From<TypeCodecError>,
+        B: FnOnce() -> Result<DecodedTypeTable, C>;
+
+    fn materialize_namespace<C, B>(
+        &mut self,
+        _namespace: TypeMaterializationNamespace,
+        facts: &PackageTypeProjectionFacts,
+        body: B,
+    ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<C, Self::HostError>>
+    where
+        C: From<TypeCodecError>,
+        B: FnOnce() -> Result<DecodedTypeTable, C>,
+    {
+        self.materialize(facts, body)
+    }
+}
+
+/// Object-safe funding for a receiver with an already selected real creator.
+/// Both original creator and funding failures stay in the caller's typed port.
+pub trait PackageTypeFundingScope<H> {
+    fn materialize(
+        &mut self,
+        namespace: TypeMaterializationNamespace,
+        facts: &PackageTypeProjectionFacts,
+        body: &mut dyn FnMut() -> Result<
+            DecodedTypeTable,
+            crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+        >,
+    ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>>;
+}
+
+impl<H, T: PackageTypeMaterializationScope<HostError = H>> PackageTypeFundingScope<H> for T {
+    fn materialize(
+        &mut self,
+        namespace: TypeMaterializationNamespace,
+        facts: &PackageTypeProjectionFacts,
+        body: &mut dyn FnMut() -> Result<
+            DecodedTypeTable,
+            crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+        >,
+    ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>>
+    {
+        use crate::host_projection_v2::ProjectionFailure;
+        match PackageTypeMaterializationScope::materialize_namespace(self, namespace, facts, body) {
+            Ok(value) => Ok(value),
+            Err(ProjectionFailure::Host(cause)) => Err(ProjectionFailure::Host(cause)),
+            Err(ProjectionFailure::Codec(original)) => Err(original),
+        }
+    }
+}
+
+/// Pure/direct expansion has no construction funding capability.
+pub struct DirectTypeMaterialization;
+impl PackageTypeMaterializationScope for DirectTypeMaterialization {
+    type HostError = std::convert::Infallible;
+    fn materialize<C, B>(
+        &mut self,
+        _: &PackageTypeProjectionFacts,
+        body: B,
+    ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<C, Self::HostError>>
+    where
+        C: From<TypeCodecError>,
+        B: FnOnce() -> Result<DecodedTypeTable, C>,
+    {
+        body().map_err(crate::host_projection_v2::ProjectionFailure::Codec)
+    }
+}
+
+pub fn decode_package_type_table_with_host_observed<G: PackageTypeMaterializationScope>(
+    package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
+    source_retained_bytes: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+    host: &mut G,
+) -> Result<
+    DecodedTypeTable,
+    crate::host_projection_v2::ProjectionFailure<TypeCodecError, G::HostError>,
+> {
+    decode::decode_package_with_funding(package, source_retained_bytes, limits, admit, work, host)
+}
+
+pub(crate) fn decode_package_type_table_with_funding_in<H>(
+    package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
+    source: usize,
+    limits: PackageTypeProjectionLimits,
+    admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+    funding: &mut dyn PackageTypeFundingScope<H>,
+) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
+    decode::decode_package_with_funding(package, source, limits, admit, work, funding)
+}
+
+pub fn decode_package_type_table_with_factory_and_funding_in<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
+    package: &novarocks_proto_models::physical_package_v2::FragmentPackage,
+    source: usize,
+    limits: PackageTypeProjectionLimits,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    factory: &F,
+    work: &mut CompileCheckpoints<'_>,
+    funding: &mut dyn PackageTypeFundingScope<H>,
+) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
+    decode::decode_package_with_factory_and_funding(
+        package, source, limits, creation, factory, work, funding,
+    )
+}
+
 /// Production creator supplies the real retained storage lifetime. The caller
 /// owns admission/control; this entry neither mints a hold nor a capacity grant.
 pub fn decode_package_type_table_with_storage_observed(

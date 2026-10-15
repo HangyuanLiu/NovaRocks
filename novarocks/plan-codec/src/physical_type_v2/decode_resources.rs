@@ -101,8 +101,34 @@ impl TypeDecodeModel {
         self.bytes = add(self.bytes, bytes)?;
         // Actual initialization/movement and abort cleanup of admitted backing.
         // Library interiors remain opaque; this is not cooperative work.
-        self.work = add(self.work, add(mul(bytes, 4)?, mul(count, 128)?)?)?;
+        self.work = add(self.work, Self::request_work_upper(allocation, count)?)?;
         Ok(())
+    }
+    /// The original request contributor's initialization/movement and abort
+    /// cleanup law, also used by a funding-only forecast of those requests.
+    pub(super) fn request_work_upper(
+        allocation: Layout,
+        count: usize,
+    ) -> Result<usize, CompileControlError> {
+        add(mul(mul(allocation.size(), count)?, 4)?, mul(count, 128)?)
+    }
+    /// Numeric projection only: per graph vertex, at most six original BTree
+    /// lookups (child count, physical summary/kind, cache child kind/count,
+    /// cache summary) plus at most 128 scalar/Layout checked operations in
+    /// the finite scope/retention/cache branches. No source-byte walk or
+    /// cooperative callback is represented by this opaque arithmetic bound.
+    pub(super) fn funding_projection_work(
+        nodes: usize,
+        future_requests: usize,
+    ) -> Result<usize, E> {
+        let lookup = btree::lookup_work_typed(nodes).map_err(tree_error)?;
+        // Each forecast request also has its own bounded checked/Layout
+        // arithmetic. This is separate from real allocation cleanup work.
+        add(
+            mul(nodes, add(mul(lookup, 6)?, 128)?)?,
+            mul(future_requests, 128)?,
+        )
+        .map_err(Into::into)
     }
     /// Classify already-known final Field requests before the first parent
     /// gate. Numerical totals remain the one original model; the parent only
@@ -251,7 +277,7 @@ impl TypeDecodeModel {
         model.request(array::<Loan>(table.fields.len())?, 2)?;
         model.request(arc(array::<Loan>(table.fields.len())?)?, 1)?;
         // One terminal ConnectorError contains fixed writer-law text or a
-        // bounded logical-enum diagnostic (under128 bytes). Rust1.92 String
+        // bounded logical-enum diagnostic (under128 bytes). Rust1.98 String
         // growth has at most128 requests and <=4*128 cumulative payload bytes.
         // This is an error-path request upper, not a semantic message limit.
         model.requests = add(model.requests, 128)?;
@@ -305,8 +331,8 @@ impl TypeDecodeModel {
                 let n = fields.fields.len();
                 self.request(array::<i8>(n)?, 1)?;
                 self.request(array::<Arc<Field>>(n)?, 1)?;
-                // Arrow58.2 UnionFields::try_new owns Vec::new()+push, followed
-                // by Arc::from(Vec). Rust1.92 amortized capacities start at4
+                // Arrow58.4 UnionFields::try_new owns Vec::new()+push, followed
+                // by Arc::from(Vec). Rust1.98 amortized capacities start at4
                 // tuples and double: at mostN requests, cumulative <=4N tuples.
                 if n != 0 {
                     let growth = array::<(i8, Arc<Field>)>(mul(n, 4)?)?;
@@ -405,7 +431,7 @@ impl TypeDecodeModel {
     /// Requests of the unchanged strict Value walker, which starts with one
     /// heap tuple and grows its Vec on child pushes. No tree grammar is copied.
     /// The caller supplies its original unfolded Carrier summary before the
-    /// walk: Rust1.92 min-four/doubling growth has at most N requests and
+    /// walk: Rust1.98 min-four/doubling growth has at most N requests and
     /// cumulative payload at most 4N tuples, including the initial singleton.
     fn metadata_validation(&mut self, visits: usize) -> Result<(), E> {
         let key = NR_LOGICAL_TYPE_KEY.len();

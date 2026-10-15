@@ -204,6 +204,146 @@ fn actual_projection_error_and_ordinary_decode_failure_are_preserved() {
         corrupt("Iceberg table handle has no serialized metadata")
     );
 }
+
+#[test]
+fn historical_cow_projection_keeps_nominal_domains_and_raw_carriers_distinct() {
+    use arrow::datatypes::DataType;
+    use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType, field_logical_type};
+
+    let mut fields = schema(FormatVersion::V3, false)
+        .as_struct()
+        .fields()
+        .to_vec();
+    for (id, name, ty) in [
+        (5, "h", PrimitiveType::Binary),
+        (6, "b", PrimitiveType::Binary),
+        (7, "n", PrimitiveType::Fixed(16)),
+        (8, "raw", PrimitiveType::Fixed(16)),
+        (9, "u", PrimitiveType::Uuid),
+    ] {
+        fields.push(Arc::new(NestedField::optional(id, name, ty.into())));
+    }
+    let historical_schema = IcebergSchema::builder()
+        .with_fields(fields.clone())
+        .build()
+        .unwrap();
+    fields.push(Arc::new(NestedField::optional(
+        10,
+        "current_only",
+        PrimitiveType::Boolean.into(),
+    )));
+    let current_schema = IcebergSchema::builder()
+        .with_fields(fields)
+        .build()
+        .unwrap();
+    let properties = HashMap::from([
+        (
+            crate::scalar_integer_domain::PROPERTY.into(),
+            r#"{"1":"tinyint"}"#.into(),
+        ),
+        (HIDDEN_COLUMNS_PROPERTY.into(), "hidden".into()),
+        (format!("{LOGICAL_TYPE_PROPERTY_PREFIX}h"), "hll".into()),
+        (format!("{LOGICAL_TYPE_PROPERTY_PREFIX}b"), "bitmap".into()),
+        (
+            format!("{LOGICAL_TYPE_PROPERTY_PREFIX}n"),
+            "largeint".into(),
+        ),
+    ]);
+    let base = TableMetadataBuilder::new(
+        historical_schema,
+        PartitionSpec::unpartition_spec().into_unbound(),
+        SortOrder::unsorted_order(),
+        "memory://cow-schema/nominal".into(),
+        FormatVersion::V3,
+        properties,
+    )
+    .unwrap()
+    .build()
+    .unwrap()
+    .metadata;
+    let old = snapshot(&base, 40, base.current_schema_id(), 1);
+    let history = base
+        .into_builder(None)
+        .add_snapshot(old)
+        .unwrap()
+        .add_schema(current_schema)
+        .unwrap()
+        .set_current_schema(-1)
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+    // Match the original stock wire-normalized load provenance.
+    let metadata: TableMetadata =
+        serde_json::from_str(&serde_json::to_string(&history).unwrap()).unwrap();
+    let source = payload(&metadata, 40);
+    let borrowed = projected_schema_with_metadata(&source, &[], &metadata).unwrap();
+    assert_eq!(borrowed, projected_schema(&source, &[]).unwrap());
+    assert!(
+        !borrowed
+            .fields()
+            .iter()
+            .any(|field| field.name() == "current_only")
+    );
+    for (ordinal, logical) in [
+        (3, ValueLogicalType::Hll),
+        (4, ValueLogicalType::Bitmap),
+        (5, ValueLogicalType::LargeInt),
+    ] {
+        assert_eq!(
+            field_logical_type(borrowed.field(ordinal)).unwrap(),
+            logical
+        );
+        assert_eq!(
+            borrowed.field(ordinal).metadata()[NR_LOGICAL_TYPE_KEY],
+            logical.metadata_value().unwrap()
+        );
+    }
+    assert_eq!(
+        borrowed.field(6).data_type(),
+        &DataType::FixedSizeBinary(16)
+    );
+    assert!(
+        !borrowed
+            .field(6)
+            .metadata()
+            .contains_key(NR_LOGICAL_TYPE_KEY)
+    );
+    assert_eq!(
+        field_logical_type(borrowed.field(7)).unwrap(),
+        ValueLogicalType::Uuid
+    );
+    assert_eq!(borrowed.field(0).data_type(), &DataType::Int8);
+    assert_eq!(
+        borrowed.field(0).metadata()[crate::default_value::ICEBERG_INITIAL_DEFAULT_META_KEY],
+        "7"
+    );
+    assert!(
+        borrowed
+            .field(1)
+            .metadata()
+            .contains_key(novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL)
+    );
+    assert!(
+        borrowed
+            .fields()
+            .iter()
+            .skip(8)
+            .all(|field| !field.is_nullable())
+    );
+    let projected = projected_schema_with_metadata(&source, &[5, 6, 3, 5], &metadata).unwrap();
+    assert_eq!(projected.fields()[0], projected.fields()[3]);
+    assert_eq!(
+        field_logical_type(projected.field(0)).unwrap(),
+        ValueLogicalType::LargeInt
+    );
+    assert!(
+        !projected
+            .field(1)
+            .metadata()
+            .contains_key(NR_LOGICAL_TYPE_KEY)
+    );
+}
 #[test]
 fn self_built_synthetic_doc_is_not_the_production_wire_normalized_provenance() {
     // A lawful in-memory library schema can contain extra synthetic child doc.

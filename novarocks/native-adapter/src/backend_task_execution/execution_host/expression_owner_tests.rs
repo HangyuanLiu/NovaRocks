@@ -125,14 +125,14 @@ fn late_in(
     Arc<MemTracker>,
 ) {
     let (compiled, tracker) = compiled_in_source(sql, scratch);
-    let sites = actual_in_sites(&compiled.program);
+    let sites = actual_in_sites(&compiled.program());
     assert_eq!(
         sites.len(),
         expected_calls,
         "SQL must actually retain PreparedInList, not fold it away"
     );
     let late = compiled
-        .program
+        .program()
         .native_inlist_recipe(sites[0])
         .unwrap()
         .clone();
@@ -356,9 +356,9 @@ impl ValueSchemaCreationFactory<NativeTypeConstructionError> for TracedFactory<'
 #[test]
 fn actual_host_expression_all_family_and_final_arc_scopes_exit_independently() {
     let (compiled, source_tracker) = compiled_in_source(ONE_IN, 0);
-    let sites = actual_in_sites(&compiled.program);
+    let sites = actual_in_sites(&compiled.program());
     assert_eq!(sites.len(), 1);
-    let checked = compiled.program.checked().clone();
+    let checked = compiled.program().checked().clone();
     let tracker = MemTracker::new_root("actual expression entity scopes");
     let trace = TraceState::default();
     let actual = NativeTypeConstruction::try_with_control(tracker.clone(), &trace).unwrap();
@@ -464,8 +464,8 @@ fn actual_constructor_events(checked: ProgramLexicalBindings) -> Vec<ActualScope
 #[test]
 fn actual_host_expression_each_first_tracker_refusal_preserves_cause_and_has_no_tail() {
     let (compiled, source_tracker) = compiled_in_source(ONE_IN, 0);
-    assert_eq!(actual_in_sites(&compiled.program).len(), 1);
-    let checked = compiled.program.checked().clone();
+    assert_eq!(actual_in_sites(&compiled.program()).len(), 1);
+    let checked = compiled.program().checked().clone();
     let discovered = actual_constructor_events(checked.clone());
     assert!(!discovered.is_empty());
     // Every real nonzero scope/header/map request in this actual constructor

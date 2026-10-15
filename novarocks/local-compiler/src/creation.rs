@@ -51,7 +51,11 @@ pub(crate) fn finish_attempt<T, H>(
         &result,
         Err(FragmentCreationError::Control(_)
             | FragmentCreationError::Creator(_)
-            | FragmentCreationError::Resource(_))
+            | FragmentCreationError::Resource(_)
+            | FragmentCreationError::Compile(
+                FragmentCompileError::ProjectMetadataRequest(_)
+                    | FragmentCompileError::ProjectMetadataHost { .. }
+            ))
     ) {
         return result;
     }

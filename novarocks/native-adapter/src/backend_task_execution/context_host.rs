@@ -1104,6 +1104,10 @@ fn context_type_construction_rejection(
     use novarocks_type_contract::CompileControlError as C;
     use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
     let category = match cause {
+        E::Funding(cause) => match cause.as_ref() {
+            super::TypeMaterializationRefusal::Stopped(_) => TaskFailureCategory::Execution,
+            _ => TaskFailureCategory::ResourceExhausted,
+        },
         E::Control(C::Cancelled | C::DeadlineExceeded) => TaskFailureCategory::Execution,
         E::Resource(LayoutResourceError::SourceModel) => TaskFailureCategory::Internal,
         E::Control(C::ResourceExhausted) | E::Capacity(_) | E::Resource(_) => {

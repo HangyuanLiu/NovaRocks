@@ -203,6 +203,11 @@ pub trait PreparedAggregateKernel: Send + Sync + fmt::Debug + 'static {
     fn requires_emission_context(&self) -> bool {
         false
     }
+    /// Immutable declaration for framework helper backing on the same host.
+    /// Existing owners make no new resource-coverage claim by default.
+    fn requires_helper_memory(&self) -> bool {
+        false
+    }
     fn prepare_update_evaluation<'batch>(
         &'batch self,
         input: SelectedAggregateUpdateInput<'batch, 'batch>,
@@ -272,7 +277,7 @@ pub trait PreparedAggregateKernel: Send + Sync + fmt::Debug + 'static {
     ) -> Result<ArrayRef, crate::EvaluationFailure>
     where
         Self::State: 'state,
-        I: ExactSizeIterator<Item = &'state Self::State>,
+        I: ExactSizeIterator<Item = &'state Self::State> + Clone,
     {
         self.build_intermediate_evaluation(states, control)
     }
@@ -284,7 +289,7 @@ pub trait PreparedAggregateKernel: Send + Sync + fmt::Debug + 'static {
     ) -> Result<ArrayRef, crate::EvaluationFailure>
     where
         Self::State: 'state,
-        I: ExactSizeIterator<Item = &'state Self::State>,
+        I: ExactSizeIterator<Item = &'state Self::State> + Clone,
     {
         self.build_final_evaluation(states, control)
     }
@@ -359,7 +364,15 @@ pub fn specialize_aggregate<O: PureAggregateImplementation + ?Sized>(
     options: AggregatePreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<AggregateSpecialization<O::Kernel>, FunctionSpecializationFailure> {
-    specialize_aggregate_once(owner, input, selected, None, arguments, options, control)
+    specialize_aggregate_once(
+        (owner, O::prepare_aggregate),
+        input,
+        selected,
+        None,
+        arguments,
+        options,
+        control,
+    )
 }
 pub fn specialize_frozen_aggregate<O: PureAggregateImplementation + ?Sized>(
     owner: &O,
@@ -371,7 +384,7 @@ pub fn specialize_frozen_aggregate<O: PureAggregateImplementation + ?Sized>(
     control: &dyn PureCompileControl,
 ) -> Result<AggregateSpecialization<O::Kernel>, FunctionSpecializationFailure> {
     specialize_aggregate_once(
-        owner,
+        (owner, O::prepare_aggregate),
         input,
         selected,
         Some(frozen),
@@ -380,8 +393,17 @@ pub fn specialize_frozen_aggregate<O: PureAggregateImplementation + ?Sized>(
         control,
     )
 }
-fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>(
-    owner: &O,
+pub(crate) type AggregatePreparationMethod<O> =
+    fn(
+        &O,
+        CallEffectInput<'_>,
+        Arc<AggregateCallContract>,
+        &dyn PureCompileControl,
+    ) -> Result<Arc<<O as PureAggregateImplementation>::Kernel>, KernelFailure>;
+
+/// Both use points retain one refinement, contract and preparation author.
+pub(crate) fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>(
+    preparation: (&O, AggregatePreparationMethod<O>),
     input: CallEffectInput<'_>,
     selected: Arc<FunctionBindingSelection>,
     frozen: Option<&CallEffects>,
@@ -389,6 +411,7 @@ fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>(
     options: AggregatePreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<AggregateSpecialization<O::Kernel>, FunctionSpecializationFailure> {
+    let (owner, prepare) = preparation;
     specialize_aggregate_once_core(
         owner,
         input,
@@ -403,9 +426,7 @@ fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>(
             )
         },
         |contract| {
-            owner
-                .prepare_aggregate(input, contract, control)
-                .map_err(FunctionSpecializationFailure::Kernel)
+            prepare(owner, input, contract, control).map_err(FunctionSpecializationFailure::Kernel)
         },
     )
 }
@@ -419,6 +440,37 @@ pub(crate) fn specialize_aggregate_once_checked<O: PureAggregateImplementation +
     arguments: ScopedExpressionEffects,
     options: AggregatePreparationOptions,
     control: &dyn PureCompileControl,
+) -> Result<
+    AggregateSpecialization<O::Kernel>,
+    crate::CheckedOwnerFailure<FunctionSpecializationFailure>,
+> {
+    specialize_aggregate_once_checked_with_preparation(
+        owner,
+        checked,
+        input,
+        selected,
+        frozen,
+        arguments,
+        options,
+        control,
+        |contract| owner.prepare_aggregate_checked(input, checked, contract, control),
+    )
+}
+
+pub(crate) fn specialize_aggregate_once_checked_with_preparation<
+    O: PureAggregateImplementation + ?Sized,
+>(
+    owner: &O,
+    checked: &crate::CheckedCallEffectInput<'_>,
+    input: CallEffectInput<'_>,
+    selected: Arc<FunctionBindingSelection>,
+    frozen: Option<&CallEffects>,
+    arguments: ScopedExpressionEffects,
+    options: AggregatePreparationOptions,
+    control: &dyn PureCompileControl,
+    prepare: impl FnOnce(
+        Arc<AggregateCallContract>,
+    ) -> Result<Arc<O::Kernel>, crate::CheckedOwnerFailure<KernelFailure>>,
 ) -> Result<
     AggregateSpecialization<O::Kernel>,
     crate::CheckedOwnerFailure<FunctionSpecializationFailure>,
@@ -437,18 +489,16 @@ pub(crate) fn specialize_aggregate_once_checked<O: PureAggregateImplementation +
             )
         },
         |contract| {
-            owner
-                .prepare_aggregate_checked(input, checked, contract, control)
-                .map_err(|error| match error {
-                    crate::CheckedOwnerFailure::Original(error) => {
-                        crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::Kernel(
-                            error,
-                        ))
-                    }
-                    crate::CheckedOwnerFailure::UnconvertedOwner => {
-                        crate::CheckedOwnerFailure::UnconvertedOwner
-                    }
-                })
+            prepare(contract).map_err(|error| match error {
+                crate::CheckedOwnerFailure::Original(error) => {
+                    crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::Kernel(
+                        error,
+                    ))
+                }
+                crate::CheckedOwnerFailure::UnconvertedOwner => {
+                    crate::CheckedOwnerFailure::UnconvertedOwner
+                }
+            })
         },
     )
 }
@@ -981,7 +1031,20 @@ where
     K::State: 'state,
     I: ExactSizeIterator<Item = &'state K::State> + Clone,
 {
+    // Declare the lease first: the observer and its private Mutex backing
+    // must be destroyed before the temporary reservation is released.
+    let _helper_lease = if kernel.requires_helper_memory() {
+        Some(crate::aggregate_helper_memory::reserve_observation_backing(
+            context.and_then(AggregateEmissionContext::allocator),
+        )?)
+    } else {
+        None
+    };
     let observed = crate::kernel_control::KernelControlObservation::new(control);
+    if _helper_lease.is_some() {
+        // Exclusively initialize the fresh journal without invoking control.
+        observed.finish(Ok(()))?;
+    }
     let result =
         emit_aggregate_evaluation_observed(kernel, states, row_capacity, context, &observed);
     match result {

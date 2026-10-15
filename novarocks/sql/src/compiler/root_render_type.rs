@@ -59,6 +59,7 @@ fn root_domain_matches(field: &ResultField) -> bool {
     )
 }
 fn schema(fields: &[ResultField], offset: i32) -> Result<ClientRenderSchema, String> {
+    validate_public_fields(fields)?;
     if fields.is_empty() || fields.len() > P::MAX_COLUMNS || !(-86_399..=86_399).contains(&offset) {
         return Err(invalid());
     }
@@ -98,6 +99,42 @@ fn schema(fields: &[ResultField], offset: i32) -> Result<ClientRenderSchema, Str
     }
     ClientRenderSchema::try_new(columns, fields.len()).map_err(|error| error.to_string())
 }
+/// Qualify the complete public declaration without imposing a renderer's
+/// carrier profile or recovering domains from source annotations.
+pub fn validate_public_result_logical_identities(
+    port: Option<&novarocks_physical_plan::ResultPort>,
+) -> Result<(), String> {
+    if let Some(port) = port {
+        validate_public_fields(&port.fields)?;
+    }
+    Ok(())
+}
+
+fn validate_public_fields(fields: &[ResultField]) -> Result<(), String> {
+    fn walk(value: &ValueTypeRef, depth: usize, nodes: &mut usize) -> Result<(), String> {
+        *nodes = nodes.checked_add(1).ok_or_else(limited)?;
+        if depth > P::MAX_DEPTH || *nodes > P::SCHEMA_TYPE_NODES {
+            return Err(limited());
+        }
+        if matches!(value.kind(), ValueKind::Nominal(V::Uuid)) {
+            return Err("public output logical type UUID is unsupported".into());
+        }
+        for index in 0..value.child_count() {
+            walk(
+                value.child_type_at(index).expect("validated child ordinal"),
+                depth + 1,
+                nodes,
+            )?;
+        }
+        Ok(())
+    }
+    let mut nodes = 0;
+    for field in fields {
+        walk(field.ty.value_type(), 1, &mut nodes)?;
+    }
+    Ok(())
+}
+
 fn invalid() -> String {
     "client render identity or storage is unsupported or inconsistent".into()
 }
@@ -400,6 +437,104 @@ mod tests {
         ValueType::try_from_value(semantic, ValueLayout::try_new(&layout, storage).unwrap())
             .unwrap()
     }
+    #[test]
+    fn public_identity_gate_preserves_original_wide_map_semantic_profile() {
+        let map = D::Map(
+            Arc::new(Field::new(
+                "entries",
+                D::Struct(
+                    vec![
+                        Arc::new(Field::new("key", D::Int32, false)),
+                        Arc::new(Field::new("value", D::Int32, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        // The original render profile counts each Map and its key/value,
+        // without adding the synthetic Arrow entries Struct as a fourth node.
+        let fields = (0..2049)
+            .map(|_| output("m", map.clone(), Domain::Plain))
+            .collect::<Vec<_>>();
+        assert!(fields.len() <= P::MAX_COLUMNS);
+        assert!(3 * fields.len() <= P::SCHEMA_TYPE_NODES);
+        assert!(4 * fields.len() > P::SCHEMA_TYPE_NODES);
+        assert_eq!(schema(&fields, 0).unwrap().columns().len(), fields.len());
+    }
+
+    #[test]
+    fn complete_public_identities_keep_original_declarations_and_refuse_uuid() {
+        let mut large = output("large", D::FixedSizeBinary(16), Domain::Plain);
+        large.ty =
+            ValueType::try_with_logical_type(D::FixedSizeBinary(16), true, V::LargeInt).unwrap();
+        assert_eq!(
+            schema(&[large], 0).unwrap().columns()[0].field.native_type,
+            N::LargeInt
+        );
+        let physical = output_type(
+            "large",
+            ValueType::try_with_logical_type(D::FixedSizeBinary(16), true, V::LargeInt).unwrap(),
+            Domain::Plain,
+        );
+        assert_eq!(
+            schema(&[physical], 0).unwrap().columns()[0]
+                .field
+                .native_type,
+            N::LargeInt
+        );
+        let json_plain = output("j", D::Utf8, Domain::Plain);
+        assert_eq!(
+            schema(&[json_plain], 0).unwrap().columns()[0]
+                .field
+                .native_type,
+            N::String
+        );
+        let mut uuid = output("u", D::FixedSizeBinary(16), Domain::Plain);
+        uuid.ty = ValueType::try_with_logical_type(D::FixedSizeBinary(16), true, V::Uuid).unwrap();
+        let error = schema(&[uuid], 0).unwrap_err();
+        assert!(error.contains("UUID") && error.contains("unsupported"));
+    }
+
+    #[test]
+    fn complete_nested_variant_uses_original_renderer_and_uuid_is_named_refusal() {
+        for (marker, storage, nominal) in [
+            ("variant", D::LargeBinary, V::Variant),
+            ("uuid", D::FixedSizeBinary(16), V::Uuid),
+        ] {
+            let hold = ValueTypeStorageLifetime::pure();
+            let child = ValueType::try_with_logical_type(storage.clone(), true, nominal).unwrap();
+            let semantic = ValueTypeRef::try_new(
+                ValueKind::List(child.value_type().clone()),
+                true,
+                hold.clone(),
+            )
+            .unwrap();
+            let layout = D::List(Arc::new(Field::new("item", storage, true)));
+            let ty =
+                ValueType::try_from_value(semantic, ValueLayout::try_new(&layout, hold).unwrap())
+                    .unwrap();
+            let field = output_type("items", ty, Domain::Plain);
+            if marker == "uuid" {
+                let error = schema(&[field], 0).unwrap_err();
+                assert!(error.contains("UUID") && error.contains("unsupported"));
+            } else {
+                let result = schema(&[field], 0).unwrap();
+                let N::List(child) = &result.columns()[0].field.native_type else {
+                    panic!("expected list")
+                };
+                assert_eq!(child.native_type, N::Variant);
+                assert_eq!(
+                    child.presentation,
+                    R::VariantJson {
+                        timezone_offset_seconds: 0
+                    }
+                );
+            }
+        }
+    }
+
     #[test]
     fn repeated_values_keep_ordered_occurrences_and_names_never_infer_domains() {
         let mut fields = vec![

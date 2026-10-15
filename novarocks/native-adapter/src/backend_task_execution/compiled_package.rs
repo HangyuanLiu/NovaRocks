@@ -33,12 +33,14 @@ use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{ConstantPolicy, PureEngineFunctionCatalog};
 use novarocks_local_compiler::{
     FragmentCreationError, LocalCompileOptions, ProviderPreparationError,
-    compile_fragment_with_creation, validate_fragment_providers,
+    compile_fragment_with_creation, compile_fragment_with_creation_and_project_metadata_host,
+    validate_fragment_providers,
 };
 use novarocks_local_program::{KernelAbiVersion, LocalProgram};
 use novarocks_plan_codec::host_projection_v2::ProjectionFailure;
 use novarocks_plan_codec::physical_package_v2::{
     PackageDecodeError, PackageDecodeLimits, decode_fragment_package_with_factory,
+    decode_fragment_package_with_factory_and_funding,
 };
 use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 use novarocks_spi::connector::ConnectorStopView;
@@ -49,6 +51,11 @@ use novarocks_type_contract::{
 pub use crate::native_type_construction::NativeTypeConstructionError;
 
 use crate::compiled_runtime_filter::CompiledRuntimeFilterEndpoints;
+
+use super::project_materialization::ProjectMetadataHost;
+use super::type_materialization::{TypeMaterializationHost, TypeMaterializationRefusal};
+use novarocks_execution::runtime::preparation_memory::PreparationMemoryRefusal;
+use novarocks_type_contract::MetadataRequestError;
 
 /// The task facts a compiled program is specialized for.
 #[derive(Clone, Copy, Debug)]
@@ -70,6 +77,9 @@ pub enum CompiledPackageError {
     /// The package is not receivable, its providers refuse it, or the
     /// compiler refuses one of its shapes.
     Refused(String),
+    TypeMaterialization(TypeMaterializationRefusal),
+    ProjectMetadata(PreparationMemoryRefusal),
+    ProjectMetadataRequest(MetadataRequestError),
 }
 
 impl fmt::Display for CompiledPackageError {
@@ -79,6 +89,9 @@ impl fmt::Display for CompiledPackageError {
             Self::Construction(cause) => cause.fmt(f),
             Self::Decode(cause) => cause.fmt(f),
             Self::Refused(detail) => f.write_str(detail),
+            Self::TypeMaterialization(cause) => cause.fmt(f),
+            Self::ProjectMetadata(cause) => cause.fmt(f),
+            Self::ProjectMetadataRequest(cause) => cause.fmt(f),
         }
     }
 }
@@ -90,6 +103,9 @@ impl Error for CompiledPackageError {
             Self::Construction(cause) => Some(cause),
             Self::Decode(cause) => Some(cause),
             Self::Refused(_) => None,
+            Self::TypeMaterialization(cause) => Some(cause),
+            Self::ProjectMetadata(cause) => Some(cause),
+            Self::ProjectMetadataRequest(cause) => Some(cause),
         }
     }
 }
@@ -102,8 +118,85 @@ impl Error for CompiledPackageError {
 /// package's cuts, so it is projected here, before the package is consumed.
 #[derive(Debug)]
 pub struct CompiledTaskProgram {
-    pub program: LocalProgram,
+    output: CompiledProgramOutput,
     pub runtime_filters: CompiledRuntimeFilterEndpoints,
+}
+
+#[derive(Debug)]
+enum CompiledProgramOutput {
+    Native(ValidatedNativeProgram),
+    Direct(LocalProgram),
+}
+#[derive(Debug)]
+struct ValidatedNativeProgram {
+    program: LocalProgram,
+}
+impl CompiledTaskProgram {
+    /// Independently authored programs retain their original Direct preparation.
+    pub fn direct(program: LocalProgram, runtime_filters: CompiledRuntimeFilterEndpoints) -> Self {
+        Self {
+            output: CompiledProgramOutput::Direct(program),
+            runtime_filters,
+        }
+    }
+    pub fn program(&self) -> &LocalProgram {
+        match &self.output {
+            CompiledProgramOutput::Native(source) => &source.program,
+            CompiledProgramOutput::Direct(program) => program,
+        }
+    }
+    fn native(program: LocalProgram, runtime_filters: CompiledRuntimeFilterEndpoints) -> Self {
+        Self {
+            output: CompiledProgramOutput::Native(ValidatedNativeProgram { program }),
+            runtime_filters,
+        }
+    }
+    /// Consume the sealed output at the original Arc allocation handoff.
+    /// No owned program or detachable provenance can be recombined by callers.
+    pub(crate) fn into_preparation(self) -> PreparedCompiledProgram {
+        match self.output {
+            CompiledProgramOutput::Native(source) => PreparedCompiledProgram {
+                program: Arc::new(source.program),
+                source: PreparedCompiledSource::Native,
+                _runtime_filters: self.runtime_filters,
+            },
+            CompiledProgramOutput::Direct(program) => PreparedCompiledProgram {
+                program: Arc::new(program),
+                source: PreparedCompiledSource::Direct,
+                _runtime_filters: self.runtime_filters,
+            },
+        }
+    }
+}
+enum PreparedCompiledSource {
+    Native,
+    Direct,
+}
+pub(crate) struct PreparedCompiledProgram {
+    program: Arc<LocalProgram>,
+    source: PreparedCompiledSource,
+    _runtime_filters: CompiledRuntimeFilterEndpoints,
+}
+impl PreparedCompiledProgram {
+    pub(crate) fn program(&self) -> &Arc<LocalProgram> {
+        &self.program
+    }
+    pub(crate) fn native_metadata_loan(&self) -> Option<NativeCompiledMetadataLoan<'_>> {
+        match self.source {
+            PreparedCompiledSource::Native => Some(NativeCompiledMetadataLoan {
+                program: &self.program,
+            }),
+            PreparedCompiledSource::Direct => None,
+        }
+    }
+}
+pub(crate) struct NativeCompiledMetadataLoan<'a> {
+    program: &'a Arc<LocalProgram>,
+}
+impl NativeCompiledMetadataLoan<'_> {
+    pub(crate) fn program(&self) -> &Arc<LocalProgram> {
+        self.program
+    }
 }
 
 /// A sealed, borrowed factory supplied by the actual admitted BE preparation.
@@ -153,6 +246,15 @@ impl novarocks_type_contract::ValueSchemaCreationFactory<NativeTypeConstructionE
         = CompiledTypeScope<'a>
     where
         Self: 'a;
+    fn visit_scope_allocation_layouts<E>(
+        &self,
+        visit: &mut dyn FnMut(std::alloc::Layout) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+    {
+        self.inner.visit_scope_allocation_layouts(visit)
+    }
     fn begin_scope(&self) -> Result<Self::Scope<'_>, NativeTypeConstructionError> {
         Ok(CompiledTypeScope {
             inner: self.inner.begin_scope()?,
@@ -173,6 +275,8 @@ impl novarocks_type_contract::ValueSchemaCreationFactory<NativeTypeConstructionE
 
 /// Turns one task's package bytes into its LocalProgram.
 pub trait CompiledPackageCompiler: Send + Sync + 'static {
+    /// Explicit Direct construction retains the main typed creator contract.
+    /// It grants no Native funding-source provenance.
     fn compile(
         &self,
         package: &[u8],
@@ -180,6 +284,19 @@ pub trait CompiledPackageCompiler: Send + Sync + 'static {
         creation: &mut ValueSchemaCreation<'_, NativeTypeConstructionError>,
         type_scopes: &CompiledTypeScopes<'_, '_>,
         control: &dyn PureCompileControl,
+    ) -> Result<CompiledTaskProgram, CompiledPackageError>;
+
+    /// The admitted Native owner supplies both original funding capabilities.
+    /// There is no default delegation to Direct preparation.
+    fn compile_with_funding(
+        &self,
+        package: &[u8],
+        options: CompiledTaskOptions,
+        creation: &mut ValueSchemaCreation<'_, NativeTypeConstructionError>,
+        type_scopes: &CompiledTypeScopes<'_, '_>,
+        control: &dyn PureCompileControl,
+        type_host: &mut TypeMaterializationHost<'_>,
+        project_host: &mut ProjectMetadataHost<'_>,
     ) -> Result<CompiledTaskProgram, CompiledPackageError>;
 }
 
@@ -223,14 +340,60 @@ where
         type_scopes: &CompiledTypeScopes<'_, '_>,
         control: &dyn PureCompileControl,
     ) -> Result<CompiledTaskProgram, CompiledPackageError> {
-        let package = decode_fragment_package_with_factory(
+        self.compile_body(package, options, creation, type_scopes, control, None, None)
+    }
+    fn compile_with_funding(
+        &self,
+        package: &[u8],
+        options: CompiledTaskOptions,
+        creation: &mut ValueSchemaCreation<'_, NativeTypeConstructionError>,
+        type_scopes: &CompiledTypeScopes<'_, '_>,
+        control: &dyn PureCompileControl,
+        type_host: &mut TypeMaterializationHost<'_>,
+        project_host: &mut ProjectMetadataHost<'_>,
+    ) -> Result<CompiledTaskProgram, CompiledPackageError> {
+        self.compile_body(
             package,
-            &self.model,
-            &self.decode_limits,
+            options,
             creation,
             type_scopes,
             control,
+            Some(type_host),
+            Some(project_host),
         )
+    }
+}
+impl<E: Error + Send + Sync + 'static> CompiledPackageInterpreter<E> {
+    fn compile_body(
+        &self,
+        package: &[u8],
+        options: CompiledTaskOptions,
+        creation: &mut ValueSchemaCreation<'_, NativeTypeConstructionError>,
+        type_scopes: &CompiledTypeScopes<'_, '_>,
+        control: &dyn PureCompileControl,
+        type_host: Option<&mut TypeMaterializationHost<'_>>,
+        project_host: Option<&mut ProjectMetadataHost<'_>>,
+    ) -> Result<CompiledTaskProgram, CompiledPackageError> {
+        let native = type_host.is_some() && project_host.is_some();
+        let package = match type_host {
+            Some(type_host) => decode_fragment_package_with_factory_and_funding(
+                package,
+                &self.model,
+                &self.decode_limits,
+                creation,
+                type_scopes,
+                control,
+                &mut NativeTypeFunding(type_host),
+            ),
+            None => decode_fragment_package_with_factory(
+                package,
+                &self.model,
+                &self.decode_limits,
+                creation,
+                type_scopes,
+                control,
+            ),
+        }
         .map_err(package_decode_failure)?;
         let runtime_filters =
             CompiledRuntimeFilterEndpoints::from_package(&package).map_err(|error| {
@@ -256,35 +419,145 @@ where
         let mut temporary = type_scopes
             .begin_scope()
             .map_err(CompiledPackageError::Construction)?;
-        let program = compile_fragment_with_creation(
-            validated,
-            &self.functions,
-            LocalCompileOptions {
-                pipeline_dop: options.pipeline_dop,
-                root_sink_dop,
-                kernel_abi: KernelAbiVersion::CURRENT,
-                constants: self.constants,
-                exchange_wait: options.exchange_wait,
-            },
-            creation,
-            &mut temporary,
-            type_scopes,
-            control,
-        )
+        let options = LocalCompileOptions {
+            pipeline_dop: options.pipeline_dop,
+            root_sink_dop,
+            kernel_abi: KernelAbiVersion::CURRENT,
+            constants: self.constants,
+            exchange_wait: options.exchange_wait,
+        };
+        let program = match project_host {
+            Some(project_host) => compile_fragment_with_creation_and_project_metadata_host(
+                validated,
+                &self.functions,
+                options,
+                creation,
+                &mut temporary,
+                type_scopes,
+                control,
+                project_host,
+            ),
+            None => compile_fragment_with_creation(
+                validated,
+                &self.functions,
+                options,
+                creation,
+                &mut temporary,
+                type_scopes,
+                control,
+            ),
+        }
         .map_err(|error| match error {
             FragmentCreationError::Control(cause) => CompiledPackageError::Control(cause),
             FragmentCreationError::Creator(cause) => CompiledPackageError::Construction(cause),
             FragmentCreationError::Resource(cause) => {
                 CompiledPackageError::Construction(NativeTypeConstructionError::Resource(cause))
             }
+            FragmentCreationError::Compile(
+                novarocks_local_compiler::FragmentCompileError::ProjectMetadataRequest(cause),
+            ) => CompiledPackageError::ProjectMetadataRequest(cause),
+            FragmentCreationError::Compile(
+                novarocks_local_compiler::FragmentCompileError::ProjectMetadataHost { error },
+            ) => match error.downcast::<PreparationMemoryRefusal>() {
+                Ok(cause) => CompiledPackageError::ProjectMetadata(*cause),
+                Err(error) => {
+                    CompiledPackageError::Refused(format!("package does not compile: {error}"))
+                }
+            },
             FragmentCreationError::Compile(other) => {
                 CompiledPackageError::Refused(format!("package does not compile: {other}"))
             }
         })?;
-        Ok(CompiledTaskProgram {
-            program,
-            runtime_filters,
+        Ok(if native {
+            CompiledTaskProgram::native(program, runtime_filters)
+        } else {
+            CompiledTaskProgram::direct(program, runtime_filters)
         })
+    }
+}
+
+/// Borrow the actual Native creator without exposing a provenance constructor.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_native_type_construction_for_test<R>(
+    tracker: Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
+    control: &dyn PureCompileControl,
+    body: impl FnOnce(
+        &mut ValueSchemaCreation<'_, NativeTypeConstructionError>,
+        &CompiledTypeScopes<'_, '_>,
+    ) -> R,
+) -> Result<R, NativeTypeConstructionError> {
+    let creator = crate::native_type_construction::NativeTypeConstruction::try_with_control(
+        tracker, control,
+    )?;
+    let scopes = CompiledTypeScopes::new(&creator);
+    let mut request = |layout| creator.request_layout(layout);
+    let mut opaque = |bytes| creator.request_opaque_upper_bound(bytes);
+    let mut creation =
+        ValueSchemaCreation::new(creator.storage_lifetime(), &mut request, &mut opaque);
+    Ok(body(&mut creation, &scopes))
+}
+
+/// Test-support composition of the actual admitted creator and funded receiver.
+/// The test supplies its real tracker/control and original funding hosts.
+#[cfg(any(test, feature = "test-support"))]
+pub fn compile_native_package_with_funding_for_test(
+    compiler: &dyn CompiledPackageCompiler,
+    package: &[u8],
+    options: CompiledTaskOptions,
+    tracker: Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
+    control: &dyn PureCompileControl,
+    type_host: &mut TypeMaterializationHost<'_>,
+    project_host: &mut ProjectMetadataHost<'_>,
+) -> Result<CompiledTaskProgram, CompiledPackageError> {
+    let creator =
+        crate::native_type_construction::NativeTypeConstruction::try_with_control(tracker, control)
+            .map_err(CompiledPackageError::Construction)?;
+    let scopes = CompiledTypeScopes::new(&creator);
+    let mut request = |layout| creator.request_layout(layout);
+    let mut opaque = |bytes| creator.request_opaque_upper_bound(bytes);
+    let mut creation =
+        ValueSchemaCreation::new(creator.storage_lifetime(), &mut request, &mut opaque);
+    compiler.compile_with_funding(
+        package,
+        options,
+        &mut creation,
+        &scopes,
+        control,
+        type_host,
+        project_host,
+    )
+}
+
+struct NativeTypeFunding<'borrow, 'host>(&'borrow mut TypeMaterializationHost<'host>);
+impl novarocks_plan_codec::physical_type_v2::PackageTypeFundingScope<NativeTypeConstructionError>
+    for NativeTypeFunding<'_, '_>
+{
+    fn materialize(
+        &mut self,
+        namespace: novarocks_plan_codec::physical_type_v2::TypeMaterializationNamespace,
+        facts: &novarocks_plan_codec::physical_type_v2::PackageTypeProjectionFacts,
+        body: &mut dyn FnMut() -> Result<
+            novarocks_plan_codec::physical_type_v2::DecodedTypeTable,
+            ProjectionFailure<
+                novarocks_plan_codec::physical_type_v2::TypeCodecError,
+                NativeTypeConstructionError,
+            >,
+        >,
+    ) -> Result<
+        novarocks_plan_codec::physical_type_v2::DecodedTypeTable,
+        ProjectionFailure<
+            novarocks_plan_codec::physical_type_v2::TypeCodecError,
+            NativeTypeConstructionError,
+        >,
+    > {
+        use novarocks_plan_codec::physical_type_v2::PackageTypeMaterializationScope;
+        match self.0.materialize_namespace(namespace, facts, body) {
+            Ok(value) => Ok(value),
+            Err(ProjectionFailure::Codec(original)) => Err(original),
+            Err(ProjectionFailure::Host(original)) => Err(ProjectionFailure::Host(
+                NativeTypeConstructionError::Funding(Box::new(original)),
+            )),
+        }
     }
 }
 
@@ -292,6 +565,9 @@ fn package_decode_failure(
     error: ProjectionFailure<PackageDecodeError, NativeTypeConstructionError>,
 ) -> CompiledPackageError {
     match error {
+        ProjectionFailure::Host(NativeTypeConstructionError::Funding(cause)) => {
+            CompiledPackageError::TypeMaterialization(*cause)
+        }
         ProjectionFailure::Host(cause) => CompiledPackageError::Construction(cause),
         ProjectionFailure::Codec(PackageDecodeError::Control(cause)) => {
             CompiledPackageError::Control(cause)
@@ -334,3 +610,7 @@ impl PureCompileControl for TaskPreparationControl {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "compiled_metadata_host_tests.rs"]
+mod metadata_host_tests;

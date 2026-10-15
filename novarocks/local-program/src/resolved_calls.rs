@@ -61,6 +61,7 @@ pub struct ProgramUseRef {
 pub enum ProgramCallSite {
     Expression(ProgramUseRef),
     Aggregate { node: ProgramNodeId, call: u32 },
+    TopNState { node: ProgramNodeId, call: u32 },
     Window { node: ProgramNodeId, call: u32 },
     WriterPartial { node: ProgramNodeId, call: u32 },
     WriterFinal { node: ProgramNodeId, call: u32 },
@@ -77,6 +78,7 @@ pub struct ProgramExpressionCallScope {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProgramAggregateCallScope {
     Aggregate { node: ProgramNodeId, call: u32 },
+    TopNState { node: ProgramNodeId, call: u32 },
     WriterPartial { node: ProgramNodeId, call: u32 },
     WriterFinal { node: ProgramNodeId, call: u32 },
 }
@@ -479,13 +481,35 @@ impl ProgramResolvedCalls {
                             &mut |token, work| {
                                 validate_aggregate(
                                     &snapshot,
-                                    node_id,
-                                    call,
+                                    ProgramAggregateCallScope::Aggregate {
+                                        node: node_id,
+                                        call,
+                                    },
                                     function,
                                     *need_finalize,
                                     token,
                                     work,
                                 )
+                            },
+                        )?;
+                    }
+                }
+                ProgramNodeKind::GroupedTopN { functions, .. } => {
+                    for (ordinal, function) in functions.iter().enumerate() {
+                        let call = u32::try_from(ordinal)
+                            .map_err(|_| ProgramResolvedCallsError::TooManyItems)?;
+                        let scope = ProgramAggregateCallScope::TopNState {
+                            node: node_id,
+                            call,
+                        };
+                        attach(
+                            ProgramCallSite::TopNState {
+                                node: node_id,
+                                call,
+                            },
+                            CheckedScope::Aggregate(scope),
+                            &mut |token, work| {
+                                validate_aggregate(&snapshot, scope, function, false, token, work)
                             },
                         )?;
                     }
@@ -919,13 +943,29 @@ fn aggregate_contract(
 
 fn validate_aggregate(
     snapshot: &ProgramRootControlBindings,
-    node: ProgramNodeId,
-    ordinal: u32,
+    scope: ProgramAggregateCallScope,
     source: &StaticAggregateCall,
     finalize: bool,
     token: &PureCallSpecialization,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProgramResolvedCallsError> {
+    let (node, ordinal) = match scope {
+        ProgramAggregateCallScope::Aggregate { node, call }
+        | ProgramAggregateCallScope::TopNState { node, call } => (node, call),
+        _ => return Err(ProgramResolvedCallsError::InvalidSite),
+    };
+    let role = |argument| match scope {
+        ProgramAggregateCallScope::TopNState { .. } => {
+            ProgramNodeExpressionRole::TopNStateArgument {
+                call: ordinal,
+                argument,
+            }
+        }
+        _ => ProgramNodeExpressionRole::AggregateInput {
+            call: ordinal,
+            argument,
+        },
+    };
     let contract = aggregate_contract(token)?;
     check_aggregate_source(source.frozen.as_deref(), &source.resolved, contract, work)?;
     let same_interpretation = match (
@@ -967,11 +1007,7 @@ fn validate_aggregate(
             check_argument_root(
                 snapshot,
                 node,
-                ProgramNodeExpressionRole::AggregateInput {
-                    call: ordinal,
-                    argument: u32::try_from(argument)
-                        .map_err(|_| ProgramResolvedCallsError::TooManyItems)?,
-                },
+                role(u32::try_from(argument).map_err(|_| ProgramResolvedCallsError::TooManyItems)?),
                 ty,
                 work,
             )?;
@@ -983,10 +1019,7 @@ fn validate_aggregate(
         check_argument_root(
             snapshot,
             node,
-            ProgramNodeExpressionRole::AggregateInput {
-                call: ordinal,
-                argument: 0,
-            },
+            role(0),
             contract
                 .state_input_type()
                 .ok_or(ProgramResolvedCallsError::WrongArguments)?,

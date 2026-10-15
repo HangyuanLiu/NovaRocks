@@ -35,6 +35,8 @@ pub(crate) mod compiled_aggregate;
 pub(crate) mod compiled_change_events;
 pub(crate) mod compiled_expression;
 pub(crate) mod compiled_generate_series;
+pub(crate) mod compiled_grouped_topn;
+pub(crate) mod compiled_grouped_topn_resources;
 pub(crate) mod compiled_nljoin;
 pub(crate) mod compiled_repeat;
 pub(crate) mod compiled_sort;
@@ -124,3 +126,9 @@ pub use table_function_processor::TableFunctionProcessorFactory;
 pub use table_writer::TableWriterOperatorFactory;
 pub use unpivot_processor::UnpivotProcessorFactory;
 pub use values_source::ValuesSourceFactory;
+
+#[cfg(feature = "test-support")]
+pub use compiled_expression::{CompiledProjectProcessorFactory, prepare_project_factory_for_test};
+
+#[cfg(feature = "test-support")]
+pub use compiled_window::{CompiledWindowProcessorFactory, prepare_window_factory_for_test};

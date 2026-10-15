@@ -924,6 +924,32 @@ impl<O: PureFunctionMetadataOwner + PureAggregateImplementation> PureAggregateIm
 impl<O: PureFunctionMetadataOwner + PureAggregateWindowImplementation>
     PureAggregateWindowImplementation for RegisteredOwner<O>
 {
+    fn prepare_aggregate_for_window(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<Self::Kernel>, KernelFailure> {
+        self.owner
+            .prepare_aggregate_for_window(input, contract, control)
+    }
+    fn prepare_aggregate_for_window_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<Self::Kernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        checked
+            .require_registered(self.declaration.as_ref(), input)
+            .map_err(|_| {
+                crate::CheckedOwnerFailure::Original(crate::kernel_control::invalid(
+                    "preparation borrows a different registered checked owner",
+                ))
+            })?;
+        self.owner
+            .prepare_aggregate_for_window_checked(input, checked, contract, control)
+    }
     fn prepare_aggregate_window(
         &self,
         aggregate: Arc<Self::Kernel>,
@@ -1584,6 +1610,8 @@ fn register_owner<O: PureFunctionMetadataOwner + 'static>(
             ));
         }
         if !allowed.contains(&implementation.abi)
+            || (declaration.has_scalar_invocation_data(&overload.identity)?
+                && implementation.abi != PureKernelAbi::ScalarInvocationV1)
             || !implementation.abi.accepts(
                 declaration.kind(),
                 declaration.effect_declaration(&overload.identity)?,
@@ -1803,7 +1831,12 @@ impl EngineFunctionCatalogBuilder {
                 let base = binding
                     .declaration
                     .effect_declaration(&implementation.overload)?;
-                if !implementation.abi.accepts(binding.declaration.kind(), base) {
+                if !implementation.abi.accepts(binding.declaration.kind(), base)
+                    || (binding
+                        .declaration
+                        .has_scalar_invocation_data(&overload.identity)?
+                        && implementation.abi != PureKernelAbi::ScalarInvocationV1)
+                {
                     return Err(PureCatalogError::InvalidAbi {
                         function: binding.declaration.function_id().clone(),
                         overload: implementation.overload.clone(),

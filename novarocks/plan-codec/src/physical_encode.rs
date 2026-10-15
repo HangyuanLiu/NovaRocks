@@ -2407,7 +2407,8 @@ fn validate_table_binding(
         control,
     )?;
     let request = original.request();
-    let bound = ResolvedFunctionBinding {
+    let mut bound = ResolvedFunctionBinding {
+        declared_scalar_invocation_data: false,
         admitted_execution_abi: None,
         function_id: function.function_id.clone(),
         kind: novarocks_functions::FunctionKind::Table,
@@ -2426,7 +2427,7 @@ fn validate_table_binding(
         },
     };
     catalog
-        .validate_bound(&bound, request, control)
+        .validate_legacy_bound_observed(&mut bound, request, control)
         .map_err(|error| match error {
             novarocks_functions::FunctionBindingError::Control(error) => {
                 PhysicalEncodeError::Control(error)
@@ -2513,7 +2514,8 @@ fn validate_bound_function_request(
         validate_v1_value_type(&aggregate.intermediate_type)
             .map_err(|reason| format!("aggregate intermediate: {reason}"))?;
     }
-    let bound = ResolvedFunctionBinding {
+    let mut bound = ResolvedFunctionBinding {
+        declared_scalar_invocation_data: false,
         admitted_execution_abi: None,
         function_id: function.function_id.clone(),
         kind: function.kind,
@@ -2532,7 +2534,7 @@ fn validate_bound_function_request(
         },
     };
     catalog
-        .validate_bound(&bound, request, control)
+        .validate_legacy_bound_observed(&mut bound, request, control)
         .map_err(|error| match error {
             novarocks_functions::FunctionBindingError::Control(error) => {
                 PhysicalEncodeError::Control(error)
@@ -11229,3 +11231,7 @@ pub(crate) mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "c16_p1_json_object_binding_tests.rs"]
+mod c16_p1_json_object_binding_tests;

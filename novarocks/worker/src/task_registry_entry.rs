@@ -24,7 +24,7 @@
 //! request from being mistaken for a brand new task.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::{InstalledLease, MonotonicInstant, QueryContextDomains, TerminationLatch};
 use novarocks_execution_contract::task_execution::creation::PreparedTaskFacts;
@@ -96,8 +96,8 @@ pub(super) struct CreationFailure {
 /// round this cell belongs to, never by comparing its own body with the
 /// winner's: the frontend freezes exactly one body per identity, so a request
 /// naming an identity asks for the entity that identity already names.
-pub(super) struct CreationCell {
-    decision: Arc<Mutex<CreationDecision>>,
+pub(crate) struct CreationCell {
+    decision: Arc<CreationControlState>,
     accepted_status: Mutex<Option<Arc<TaskStatusOwner>>>,
 }
 
@@ -106,11 +106,37 @@ struct CreationDecision {
     stop: Option<PreparationStop>,
 }
 
+/// One synchronization owner for the actual winner and every borrowed view.
+pub(crate) struct CreationControlState {
+    decision: Mutex<CreationDecision>,
+    changed: Condvar,
+}
+impl CreationControlState {
+    pub(crate) fn stop(&self) -> Option<PreparationStop> {
+        self.decision.lock().expect("creation cell lock").stop
+    }
+    pub(crate) fn wait(&self, cadence: std::time::Duration) -> Result<(), PreparationStop> {
+        let decision = self.decision.lock().expect("creation cell lock");
+        if let Some(stop) = decision.stop {
+            return Err(stop);
+        }
+        let (decision, _) = self
+            .changed
+            .wait_timeout(decision, cadence)
+            .expect("creation cell wait");
+        match decision.stop {
+            Some(stop) => Err(stop),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Read-only observation of the creation winner's actual stop decision.
 /// This retains no registry, task input, query context or status publication.
 #[derive(Clone)]
 pub struct TaskPreparationStopView {
-    decision: Arc<Mutex<CreationDecision>>,
+    decision: Arc<CreationControlState>,
+    cadence: std::time::Duration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,8 +145,17 @@ pub enum TaskPreparationStopCause {
     LeaseExpired,
 }
 impl TaskPreparationStopView {
+    /// Borrow the original winner's stop decision and bounded wait.
+    pub fn borrow_control(&self) -> crate::PreparationControlLoan<'_> {
+        crate::PreparationControlLoan::from_view(self)
+    }
+
+    pub(crate) fn control(&self) -> (&CreationControlState, std::time::Duration) {
+        (&self.decision, self.cadence)
+    }
+
     pub fn stop_cause(&self) -> Option<TaskPreparationStopCause> {
-        match self.decision.lock().expect("creation cell lock").stop {
+        match self.decision.stop() {
             None => None,
             Some(PreparationStop::Abort(AbortCause::LeaseExpired)) => {
                 Some(TaskPreparationStopCause::LeaseExpired)
@@ -133,12 +168,12 @@ impl TaskPreparationStopView {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn unstopped_for_test() -> Self {
-        CreationCell::new().preparation_stop_view()
+        CreationCell::new().preparation_stop_view(std::time::Duration::from_millis(1))
     }
 }
 
-#[derive(Copy, Clone, Debug)]
-pub(super) enum PreparationStop {
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PreparationStop {
     Cancel(CancelReason),
     Abort(AbortCause),
 }
@@ -146,26 +181,38 @@ pub(super) enum PreparationStop {
 impl CreationCell {
     pub(super) fn new() -> Self {
         Self {
-            decision: Arc::new(Mutex::new(CreationDecision {
-                failure: None,
-                stop: None,
-            })),
+            decision: Arc::new(CreationControlState {
+                decision: Mutex::new(CreationDecision {
+                    failure: None,
+                    stop: None,
+                }),
+                changed: Condvar::new(),
+            }),
             accepted_status: Mutex::new(None),
         }
     }
 
-    pub(super) fn preparation_stop_view(&self) -> TaskPreparationStopView {
+    pub(super) fn preparation_stop_view(
+        &self,
+        cadence: std::time::Duration,
+    ) -> TaskPreparationStopView {
         TaskPreparationStopView {
             decision: Arc::clone(&self.decision),
+            cadence,
         }
     }
 
     pub(super) fn fail(&self, failure: CreationFailure) {
-        self.decision.lock().expect("creation cell lock").failure = Some(failure);
+        self.decision
+            .decision
+            .lock()
+            .expect("creation cell lock")
+            .failure = Some(failure);
     }
 
     pub(super) fn failure(&self) -> Option<CreationFailure> {
         self.decision
+            .decision
             .lock()
             .expect("creation cell lock")
             .failure
@@ -178,7 +225,7 @@ impl CreationCell {
     /// requested first; once it is claimed, no later stop is accepted. The
     /// resulting decision is read back through [`Self::stop`].
     pub(super) fn claim_failure(&self, failure: CreationFailure) {
-        let mut decision = self.decision.lock().expect("creation cell lock");
+        let mut decision = self.decision.decision.lock().expect("creation cell lock");
         if decision.stop.is_none() {
             decision.failure = Some(failure);
         }
@@ -196,18 +243,23 @@ impl CreationCell {
     }
 
     pub(super) fn request_stop(&self, stop: PreparationStop) -> bool {
-        let mut decision = self.decision.lock().expect("creation cell lock");
+        let mut decision = self.decision.decision.lock().expect("creation cell lock");
         if decision.failure.is_some() {
             return false;
         }
         if decision.stop.is_none() || matches!(stop, PreparationStop::Abort(_)) {
             decision.stop = Some(stop);
         }
+        self.decision.changed.notify_all();
         true
     }
 
-    pub(super) fn stop(&self) -> Option<PreparationStop> {
-        self.decision.lock().expect("creation cell lock").stop
+    pub(crate) fn stop(&self) -> Option<PreparationStop> {
+        self.decision.stop()
+    }
+
+    pub(crate) fn control_state(&self) -> &CreationControlState {
+        &self.decision
     }
 }
 
@@ -218,7 +270,7 @@ mod preparation_stop_view_tests {
     #[test]
     fn borrowed_preparation_view_observes_original_cancel_and_abort_precedence() {
         let cell = CreationCell::new();
-        let view = cell.preparation_stop_view();
+        let view = cell.preparation_stop_view(std::time::Duration::from_millis(1));
         assert_eq!(view.stop_cause(), None);
         assert!(cell.request_stop(PreparationStop::Cancel(
             CancelReason::UpstreamNoLongerNeeded
@@ -237,9 +289,22 @@ mod preparation_stop_view_tests {
     }
 
     #[test]
+    fn explicit_zero_cadence_preserves_immediate_poll_and_original_stop() {
+        let cell = CreationCell::new();
+        let view = cell.preparation_stop_view(std::time::Duration::ZERO);
+        assert!(view.borrow_control().wait().is_ok());
+        assert!(view.borrow_control().checkpoint().is_ok());
+        assert!(cell.request_stop(PreparationStop::Abort(AbortCause::LeaseExpired)));
+        assert_eq!(
+            view.borrow_control().wait(),
+            Err(PreparationStop::Abort(AbortCause::LeaseExpired))
+        );
+    }
+
+    #[test]
     fn claimed_failure_remains_primary_and_does_not_publish_a_stop() {
         let cell = CreationCell::new();
-        let view = cell.preparation_stop_view();
+        let view = cell.preparation_stop_view(std::time::Duration::from_millis(1));
         cell.claim_failure(CreationFailure {
             outcome: OperationOutcome::InvalidStateOrRequest,
             detail: "original preparation failure".to_string(),

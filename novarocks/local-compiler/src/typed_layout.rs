@@ -66,13 +66,12 @@ pub(crate) fn copy_name_with_creation<H>(
     }
     Ok(copied)
 }
-pub(crate) fn local_name_with_creation<H>(
+pub(crate) fn with_local_name<T>(
     prefix: &str,
     node: impl std::fmt::Display,
     ordinal: impl std::fmt::Display,
-    work: &mut CompileCheckpoints<'_>,
-    creation: &mut ValueSchemaCreation<'_, H>,
-) -> Result<String, LayoutCreationFailure<H>> {
+    body: impl FnOnce(&str) -> T,
+) -> Result<T, LayoutError> {
     use std::fmt::Write;
     struct Buffer {
         bytes: [u8; 96],
@@ -90,15 +89,28 @@ pub(crate) fn local_name_with_creation<H>(
             Ok(())
         }
     }
-    work.flush()?;
     let mut buffer = Buffer {
         bytes: [0; 96],
         len: 0,
     };
     write!(&mut buffer, "{prefix}_{node}_{ordinal}").map_err(|_| LayoutError::AllocationModel)?;
     let name = std::str::from_utf8(&buffer.bytes[..buffer.len]).map_err(|_| LayoutError::Encode)?;
-    copy_name_with_creation(name, work, creation)
+    Ok(body(name))
 }
+
+pub(crate) fn local_name_with_creation<H>(
+    prefix: &str,
+    node: impl std::fmt::Display,
+    ordinal: impl std::fmt::Display,
+    work: &mut CompileCheckpoints<'_>,
+    creation: &mut ValueSchemaCreation<'_, H>,
+) -> Result<String, LayoutCreationFailure<H>> {
+    work.flush()?;
+    with_local_name(prefix, node, ordinal, |name| {
+        copy_name_with_creation(name, work, creation)
+    })?
+}
+
 impl TypedLayoutBuilder {
     pub(crate) fn new_with_creation<H>(
         count: usize,

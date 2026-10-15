@@ -158,7 +158,7 @@ mod tests {
                 .iter()
                 .map(|declaration| (declaration.provider_id(), declaration.contract_revision()))
                 .collect::<Vec<_>>(),
-            vec![("iceberg", 5), ("paimon", 1)]
+            vec![("iceberg", 7), ("paimon", 1)]
         );
         assert!(
             declarations
@@ -431,7 +431,7 @@ mod tests {
             PLAN_TREE,
         )
         .unwrap();
-        for prior_revision in [4, 5] {
+        for prior_revision in [4, 5, 6] {
             let prior = novarocks_version::derive_repository_native_compatibility_material(
                 native_carrier_declarations(manifest.contracts()).unwrap(),
                 [0x31; 32],

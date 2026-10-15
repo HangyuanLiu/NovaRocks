@@ -350,9 +350,37 @@ impl PreparedAggregateKernel for ByKernel {
 #[derive(Clone, Copy)]
 pub(super) enum ByPreparationDomain {
     InstalledAggregate,
-    #[cfg(any(test, feature = "test-support"))]
     OriginalWindow,
 }
+
+/// Preserve the original public type diagnostic without exposing the private
+/// typed binding/storage Debug representation or constructing a type tree.
+struct OriginalByInputProfile<'a>([&'a FunctionValueType; 2]);
+impl std::fmt::Debug for OriginalByInputProfile<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct Value<'a>(&'a FunctionValueType);
+        impl std::fmt::Debug for Value<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("FunctionValueType")
+                    .field("data_type", self.0.data_type())
+                    .field("nullable", &self.0.nullable())
+                    .field("logical_type", &self.0.logical_type())
+                    .finish()
+            }
+        }
+        struct Argument<'a>(&'a FunctionValueType);
+        impl std::fmt::Debug for Argument<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_tuple("Value").field(&Value(self.0)).finish()
+            }
+        }
+        f.debug_list()
+            .entry(&Argument(self.0[0]))
+            .entry(&Argument(self.0[1]))
+            .finish()
+    }
+}
+
 pub(super) fn validate_contract(
     contract: &AggregateCallContract,
     domain: ByPreparationDomain,
@@ -375,7 +403,6 @@ pub(super) fn validate_contract(
     // neither route changes the catalogue derivation or exact result type.
     let installed_reader_required = match domain {
         ByPreparationDomain::InstalledAggregate => true,
-        #[cfg(any(test, feature = "test-support"))]
         ByPreparationDomain::OriginalWindow => false,
     };
     if installed_reader_required
@@ -385,7 +412,7 @@ pub(super) fn validate_contract(
         return Err(invalid(&format!(
             "{} has no installed max_by/min_by input profile for {:?}",
             contract.call().function_id().as_str(),
-            contract.call().selected().argument_types
+            OriginalByInputProfile([value, key])
         )));
     }
     if !super::aggregate_any_value::matches_nullable_source(value, output, work)?

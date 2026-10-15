@@ -131,6 +131,22 @@ pub trait Operator: Send {
         let _ = profiles;
     }
 
+    /// An exact frozen schema construction site, independent of funding.
+    /// The preparation caller may qualify its real body with original scope.
+    fn compiled_schema_preparation_site(
+        &self,
+    ) -> Option<(
+        &Arc<novarocks_local_program::LocalProgram>,
+        crate::runtime::preparation_metadata::CompiledSchemaSite,
+    )> {
+        None
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn prepared_schema_for_test(&self) -> Option<crate::exec::chunk::ChunkSchemaRef> {
+        None
+    }
+
     fn prepare(&mut self) -> ExecutionResult<()> {
         Ok(())
     }

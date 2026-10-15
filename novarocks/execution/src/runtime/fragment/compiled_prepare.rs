@@ -37,7 +37,7 @@ use crate::exec::fragment::program::FragmentSinkKind;
 use crate::exec::node::table_finish::TableFinishRuntimeBinding;
 use crate::exec::node::table_writer::TableWriterRuntimeBinding;
 use crate::exec::operators::ResultBufferSinkFactory;
-use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler;
+use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::exchange::materialize_compiled_exchange_receivers;
 use crate::runtime::fragment::instance::FragmentInstanceSpec;
@@ -273,8 +273,26 @@ pub fn compiled_sink_kind(
 /// legacy submission produces, so the Task host starts, observes and cleans
 /// it up unchanged.
 pub fn prepare_compiled_fragment(
+    submission: CompiledFragmentSubmission,
+    context: FragmentPrepareContext,
+) -> Result<DormantFragmentHandle, FragmentLaunchError> {
+    prepare_compiled_fragment_in(submission, context, None)
+}
+
+pub fn prepare_compiled_fragment_with_metadata_host(
+    submission: CompiledFragmentSubmission,
+    context: FragmentPrepareContext,
+    host: &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
+) -> Result<DormantFragmentHandle, FragmentLaunchError> {
+    prepare_compiled_fragment_in(submission, context, Some(host))
+}
+
+fn prepare_compiled_fragment_in(
     mut submission: CompiledFragmentSubmission,
     context: FragmentPrepareContext,
+    schema_preparation: Option<
+        &mut dyn crate::runtime::preparation_metadata::CompiledSchemaPreparationScope,
+    >,
 ) -> Result<DormantFragmentHandle, FragmentLaunchError> {
     // The write capabilities move into the one pipeline graph that owns them.
     let writers = std::mem::take(&mut submission.writers);
@@ -457,7 +475,7 @@ pub fn prepare_compiled_fragment(
         )?;
         let scan_bindings =
             materialize_compiled_scan_bindings(program, &submission.scans, instance)?;
-        prepare_compiled_program_pipeline_execution_with_profiler(
+        prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation(
             Arc::clone(program),
             Duration::from_millis(50),
             sink,
@@ -469,6 +487,7 @@ pub fn prepare_compiled_fragment(
             pipeline_dop,
             runtime_state,
             Arc::clone(&context.event_sink),
+            schema_preparation,
         )
         .map_err(|error| {
             FragmentLaunchError::from_failure(
