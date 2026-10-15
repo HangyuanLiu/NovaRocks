@@ -1013,6 +1013,8 @@ pub(crate) struct AdmittedMvPublication {
     /// than re-read at commit time, where they could name a later generation
     /// than the one this publication was admitted for.
     source_revision: MvAcceleratorSourceRevision,
+    /// Logical cardinality of that same admitted P, not physical file totals.
+    previous_logical_rows: Option<u64>,
     definition: DefinitionDocument,
     interpretation: InterpretationDocument,
     versions: novarocks_mv_application::persistence::keyed_documents::MvKeyedVersions,
@@ -1138,8 +1140,8 @@ impl AdmittedMvPublication {
         Ok(())
     }
 
-    /// Complete P from the watermark this refresh pinned and what its writers
-    /// produced. A repartition publishes its new L beside P in the same set.
+    /// Complete P from the pinned watermark and the target's post-write
+    /// logical cardinality. A repartition publishes its new L in the same set.
     ///
     /// The set is built here rather than by the caller because P's two
     /// references are to the D and L this publication was admitted against,
@@ -1148,7 +1150,7 @@ impl AdmittedMvPublication {
         &self,
         publication_id: LakePublicationId,
         inputs: &MvPublicationInputs,
-        logical_result_rows: u64,
+        logical_result_rows: Option<u64>,
     ) -> Result<novarocks_spi::connector::KeyedPublication, String> {
         let versions = if self.repartitioned {
             novarocks_mv_application::persistence::keyed_documents::build_keyed_versions(
@@ -1178,7 +1180,7 @@ impl AdmittedMvPublication {
                 definition_revision: versions.definition_revision(),
                 interpretation_revision: versions.interpretation_revision(),
                 inputs: inputs.inputs().to_vec(),
-                logical_result_rows: Some(logical_result_rows),
+                logical_result_rows,
             };
         novarocks_mv_application::persistence::keyed_documents::keyed_publication_document_set(
             &versions,
@@ -1207,6 +1209,10 @@ pub(crate) struct AdmittedMvDataPublication {
 }
 
 impl AdmittedMvDataPublication {
+    pub(crate) const fn previous_logical_rows(&self) -> Option<u64> {
+        self.publication.previous_logical_rows
+    }
+
     /// Freeze the watermark against the D this publication was admitted for.
     pub(crate) fn try_new(
         publication: AdmittedMvPublication,
@@ -1241,7 +1247,7 @@ impl AdmittedMvDataPublication {
     pub(crate) fn publication_document_set(
         &self,
         publication_id: LakePublicationId,
-        logical_result_rows: u64,
+        logical_result_rows: Option<u64>,
     ) -> Result<novarocks_spi::connector::KeyedPublication, String> {
         self.publication
             .publication_document_set(publication_id, &self.inputs, logical_result_rows)
@@ -1335,6 +1341,10 @@ pub(crate) fn admit_mv_publication(
         .map_err(|error| format!("name the MV publication target: {error:?}"))?,
         incarnation: entrance.incarnation().clone(),
         source_revision: source.clone(),
+        previous_logical_rows: projection
+            .facts
+            .publication()
+            .map_or(Some(0), |publication| publication.logical_result_rows),
         definition: projection.facts.definition().clone(),
         interpretation: projection.facts.interpretation().clone(),
         versions: projection.facts.versions().clone(),

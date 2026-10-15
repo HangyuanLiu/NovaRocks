@@ -551,6 +551,51 @@ impl ConnectorWriteSession {
         ConnectorPreparedWriteSet::try_new(row_count, decoded, &self.expected_targets())
     }
 
+    /// Project the visible-row effect of one complete MV write before binding
+    /// its publication. The provider interprets its own exact fragments; the
+    /// generic affected-row count retains its original meaning.
+    pub(crate) fn logical_rows_after_write(
+        &self,
+        prepared: &DecodedPreparedWriteSet,
+        previous: Option<u64>,
+        context: &ConnectorRequestContext,
+    ) -> Result<Option<u64>, ConnectorError> {
+        let decoded = self.interpret_parts(prepared.row_count(), prepared.fragments().to_vec())?;
+        self.logical_rows_after_prepared(&decoded, previous, context)
+    }
+
+    pub(crate) fn logical_rows_after_empty_publication(
+        &self,
+        previous: Option<u64>,
+        context: &ConnectorRequestContext,
+    ) -> Result<Option<u64>, ConnectorError> {
+        if !self.metadata_only_publication {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "only a metadata-only publication may project an implicit empty write",
+            ));
+        }
+        let prepared = ConnectorPreparedWriteSet::try_new(0, Vec::new(), &self.expected_targets())?;
+        self.logical_rows_after_prepared(&prepared, previous, context)
+    }
+
+    fn logical_rows_after_prepared(
+        &self,
+        prepared: &ConnectorPreparedWriteSet,
+        previous: Option<u64>,
+        context: &ConnectorRequestContext,
+    ) -> Result<Option<u64>, ConnectorError> {
+        ensure_finish_context_active(context)?;
+        match self.lease.session().prepared_logical_row_change(
+            self.plan.commit_handle(),
+            prepared,
+            context,
+        )? {
+            Some(change) => change.apply(previous),
+            None => Ok(None),
+        }
+    }
+
     /// Collect one query's complete prepared write set into this session.
     ///
     /// A statement that drives several queries against one session -- a
@@ -1392,6 +1437,8 @@ pub(crate) mod tests {
         pub(crate) reconcile: usize,
         pub(crate) statistics: Vec<WriteStatisticsArtifact>,
         pub(crate) publication: Option<ConnectorWriteFinishPublication>,
+        row_change: Option<Option<novarocks_spi::connector::write_stack::ConnectorWriteRowChange>>,
+        row_change_queries: usize,
         /// What the last terminal request could actually read object storage
         /// with. A real provider resolves this before it reloads table metadata
         /// or writes a manifest, so recording it here is recording whether the
@@ -1410,6 +1457,30 @@ pub(crate) mod tests {
     }
 
     impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSession {
+        fn prepared_logical_row_change(
+            &self,
+            commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitHandle,
+            prepared: &ConnectorPreparedWriteSet,
+            _: &ConnectorRequestContext,
+        ) -> Result<
+            Option<novarocks_spi::connector::write_stack::ConnectorWriteRowChange>,
+            ConnectorError,
+        > {
+            self.adapter.commit_handle(commit)?;
+            assert_eq!(prepared.row_count(), 1);
+            for (_, fragment) in prepared.fragments() {
+                self.adapter.commit_fragment(fragment)?;
+            }
+            let mut recorded = self.recorded.lock().unwrap();
+            recorded.row_change_queries += 1;
+            recorded.row_change.ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "scripted row change is unavailable",
+                )
+            })
+        }
+
         fn begin_cow_write_checked(
             &self,
             request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
@@ -2142,6 +2213,42 @@ pub(crate) mod tests {
         assert_eq!(committed.affected_rows(), Some(7));
         assert_eq!(fixture.session.finish_invocations(), 1);
         assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
+    }
+
+    #[test]
+    fn logical_row_projection_uses_provider_effect_without_committing_or_changing_affected_rows() {
+        use novarocks_spi::connector::write_stack::ConnectorWriteRowChange;
+        let fixture = fixture_with_outcome(1, 16, known_committed());
+        let completion = completion(&fixture.session, 1);
+        fixture.recorded.lock().unwrap().row_change = Some(Some(ConnectorWriteRowChange::Delta {
+            inserted: 1,
+            deleted: 0,
+        }));
+        assert_eq!(
+            completion
+                .logical_rows_after_write(Some(2), &request_context())
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(completion.row_count(), 1);
+        assert_eq!(fixture.session.finish_invocations(), 0);
+        fixture.recorded.lock().unwrap().row_change = Some(None);
+        assert_eq!(
+            completion
+                .logical_rows_after_write(Some(2), &request_context())
+                .unwrap(),
+            None
+        );
+        fixture.recorded.lock().unwrap().row_change = None;
+        assert!(
+            completion
+                .logical_rows_after_write(Some(2), &request_context())
+                .is_err()
+        );
+        assert_eq!(fixture.recorded.lock().unwrap().row_change_queries, 3);
+        let committed = finish_write_session(completion, request_context()).unwrap();
+        assert_eq!(committed.affected_rows(), Some(1));
+        assert_eq!(fixture.session.finish_invocations(), 1);
     }
 
     #[test]

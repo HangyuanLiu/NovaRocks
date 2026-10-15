@@ -93,6 +93,15 @@ impl ConnectorWriteSessionCompletion {
         self.prepared.row_count()
     }
 
+    pub(crate) fn logical_rows_after_write(
+        &self,
+        previous: Option<u64>,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<Option<u64>, novarocks_spi::connector::ConnectorError> {
+        self.session
+            .logical_rows_after_write(&self.prepared, previous, context)
+    }
+
     /// Whether the closed data plane produced no commit fragment at all.
     ///
     /// This is not "zero rows": a writer that accepted no row still emits its

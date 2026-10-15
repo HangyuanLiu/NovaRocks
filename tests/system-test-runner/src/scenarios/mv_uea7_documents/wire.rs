@@ -456,7 +456,7 @@ impl Graph {
         graph.definition = d;
         graph.interpretation = l;
         if let Some(p) = active {
-            graph.validate_p(p)?;
+            let _ = graph.record_logical_rows(p)?;
         } else if let Some(id) = graph.current {
             let snapshot = metadata["snapshots"]
                 .as_array()
@@ -472,7 +472,7 @@ impl Graph {
         }
         for (id, p) in &graph.snapshots {
             if let Some(p) = p {
-                if let Err(e) = graph.validate_p(p) {
+                if let Err(e) = graph.record_logical_rows(p) {
                     if Some(*id) == graph.current {
                         return Err(e);
                     }
@@ -591,7 +591,7 @@ impl Graph {
         );
         Ok((d, l))
     }
-    fn validate_p(&self, p: &Record) -> Result<()> {
+    pub fn record_logical_rows(&self, p: &Record) -> Result<Option<u64>> {
         let b = p.binding.as_ref().context("MV publication missing B")?;
         let (d, _) = self.closure(b)?;
         validate_payload(
@@ -752,15 +752,17 @@ pub(in crate::scenarios) fn validate_payload(
     bytes: &[u8],
     count: usize,
     bounds: &[usize],
-) -> Result<()> {
+) -> Result<Option<u64>> {
     ensure!(bytes.len() >= 28 && bytes[0] == 1, "invalid P header");
     let frozen = i64::from_be_bytes(bytes[17..25].try_into()?);
     ensure!(frozen >= 0, "negative P frozen time");
     let mut p = 26;
-    match bytes[25] {
-        0 => {}
+    let logical_rows = match bytes[25] {
+        0 => None,
         1 => {
+            let value = bytes.get(p..p + 8).context("truncated P logical rows")?;
             p += 8;
+            Some(u64::from_be_bytes(value.try_into()?))
         }
         _ => bail!("invalid P row presence"),
     };
@@ -783,7 +785,7 @@ pub(in crate::scenarios) fn validate_payload(
         ensure!(p <= bytes.len(), "truncated P value");
     }
     ensure!(p == bytes.len(), "trailing P bytes");
-    Ok(())
+    Ok(logical_rows)
 }
 
 #[cfg(test)]
@@ -807,7 +809,7 @@ mod tests {
         let mut wrong_kind = vec![10, 1, 1];
         wrong_kind.extend_from_slice(&b[2..]);
         assert!(binding_bounds(&wrong_kind).is_err());
-        validate_payload(&p, 2, &[9, 9]).unwrap();
+        assert_eq!(validate_payload(&p, 2, &[9, 9]).unwrap(), Some(7));
         for end in 0..p.len() {
             assert!(validate_payload(&p[..end], 2, &[9, 9]).is_err());
         }

@@ -284,21 +284,23 @@ fn execute_data(
             error,
         ));
     }
-    bind_publication_documents(
-        planning,
-        &intent,
-        admitted,
-        authority.session(),
-        authority.row_count(),
-        &context,
-    )?;
-    // Past this point the commit may have happened, so the publication owns an
-    // outcome it must report. Marking it here rather than at admission keeps a
-    // statement that failed before the provider call from leaving the target
-    // unsettled over an effect nobody attempted.
-    admitted
-        .mark_dispatched(intent.publication_id())
-        .map_err(invalid)?;
+    let documents = authority
+        .logical_rows_after_write(admitted.previous_logical_rows(), &context)
+        .map_err(|error| invalid(error.to_string()))
+        .and_then(|rows| bind_publication_documents(&intent, admitted, authority.session(), rows))
+        // Only after every pre-commit fact has been built does the admission
+        // take responsibility for a possibly dispatched external effect.
+        .and_then(|()| {
+            admitted
+                .mark_dispatched(intent.publication_id())
+                .map_err(invalid)
+        });
+    if let Err(error) = documents {
+        crate::query_execution::mv_assembly::iceberg_activation::release_mv_write_session_without_commit(
+            authority.session(), &context,
+        );
+        return Err(error);
+    }
     // Every publication commits, so there is no second route out of here. A
     // window that materialized nothing commits an empty write, which is what
     // advances the watermark P records; the `NoOp` effect that used to fall
@@ -346,17 +348,16 @@ fn execute_data(
 
 /// Bind the exact publication document this write promised when it opened.
 ///
-/// The session opened with a declaration and no payload because P states what
-/// the write produced, and that only became true when the writers closed.
+/// The session opened with a declaration and no payload because P states the
+/// post-write logical cardinality, which requires the completed write effect
+/// and the admitted prior publication.
 /// Building P here and binding it before finish is what makes the document and
 /// the rows it describes one commit rather than two.
 fn bind_publication_documents(
-    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
     intent: &MvRefreshPublicationIntent,
     admitted: &crate::mv::domain::staged_create::AdmittedMvDataPublication,
     session: &crate::query_execution::write_session::ConnectorWriteSession,
-    logical_result_rows: u64,
-    context: &ConnectorRequestContext,
+    logical_result_rows: Option<u64>,
 ) -> Result<(), MvApplicationError> {
     let declaration = session
         .pending_publication_declaration()
@@ -480,9 +481,12 @@ fn execute_metadata_only(
             error,
         ));
     }
-    // A metadata-only publication produced no logical result rows. P says so
-    // rather than repeating the target's physical storage row count.
-    let outcome = bind_publication_documents(planning, &intent, admitted, &session, 0, &context)
+    // No data changes: preserve the admitted target's logical cardinality.
+    // The empty write is still projected through its exact provider session.
+    let outcome = session
+        .logical_rows_after_empty_publication(admitted.previous_logical_rows(), &context)
+        .map_err(|error| invalid(error.to_string()))
+        .and_then(|rows| bind_publication_documents(&intent, admitted, &session, rows))
         .and_then(|()| {
             // Past this point the commit may have happened, so the publication
             // owns an outcome it must report.

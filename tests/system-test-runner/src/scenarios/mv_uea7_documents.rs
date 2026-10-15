@@ -1420,6 +1420,11 @@ impl Documents {
             count == Some(302),
             "300-refresh output lost source rows: {count:?}"
         );
+        let logical_rows = graph.record_logical_rows(&current_record(&stable)?)?;
+        ensure!(
+            logical_rows == count,
+            "publication logical rows differ from the complete MV: P={logical_rows:?} actual={count:?}"
+        );
         ensure!(
             graph.private_bytes <= 262144 && graph.record_bytes.iter().all(|b| *b <= 4096),
             "inline documents exceeded frozen limits"

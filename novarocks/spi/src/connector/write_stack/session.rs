@@ -1084,8 +1084,9 @@ pub struct ConnectorWriteSessionReconcileRequest<'a> {
 /// The frontend-only external write authority of one exact provider
 /// generation.
 ///
-/// Every method here mutates, or may mutate, external catalog state. None of
-/// them is reachable from a backend role binding.
+/// Admission and prepared-result projection read exact provider facts; terminal
+/// methods own external catalog effects. None is reachable from a backend role
+/// binding.
 pub trait ConnectorWriteControl: Send + Sync {
     fn binding_key(&self) -> &ConnectorProviderBindingKey;
 
@@ -1114,6 +1115,22 @@ pub trait ConnectorWriteControl: Send + Sync {
         &self,
         request: ConnectorWriteFinishRequest<'_>,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError>;
+
+    /// Project a complete prepared write's exact visible-row change against
+    /// this session's admitted version, without committing or reading data.
+    /// None means the provider cannot establish that logical fact; physical
+    /// file record totals and writer input counts are not substitutes.
+    fn prepared_logical_row_change(
+        &self,
+        _commit: &ConnectorWriteCommitHandle,
+        _prepared: &ConnectorPreparedWriteSet,
+        _context: &ConnectorRequestContext,
+    ) -> Result<Option<super::prepared::ConnectorWriteRowChange>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector does not project prepared logical row changes",
+        ))
+    }
 
     fn abort_write(
         &self,

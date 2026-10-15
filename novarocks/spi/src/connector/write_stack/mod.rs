@@ -66,7 +66,10 @@ pub use limits::{
     MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES, MAX_CONNECTOR_UNIQUE_WRITER_HANDLE_BYTES,
     MAX_CONNECTOR_WRITE_TARGETS, MAX_CONNECTOR_WRITER_HANDLE_BYTES,
 };
-pub use prepared::{ConnectorPreparedWriteSet, PreparedWriteSetLedger, WriteRowCountAccumulator};
+pub use prepared::{
+    ConnectorPreparedWriteSet, ConnectorWriteRowChange, PreparedWriteSetLedger,
+    WriteRowCountAccumulator,
+};
 pub use relation::{
     MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES, MAX_WRITE_RELATION_FIELD_NAME_BYTES,
     MAX_WRITE_RELATION_METADATA_ENTRIES_PER_FIELD, MAX_WRITE_RELATION_METADATA_KEY_BYTES,

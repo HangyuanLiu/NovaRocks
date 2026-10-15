@@ -35,6 +35,7 @@
 //!   recovery evidence. Marker absence during reconciliation is *not* proof of
 //!   non-commit, so an unresolved session stays unknown.
 
+mod logical_rows;
 mod publication;
 mod recovery_codec;
 
@@ -2519,6 +2520,17 @@ impl IcebergWriteSessionControl {
                 branches,
             },
         )?;
+        let handle = if handle.document_publication().is_some() {
+            handle.with_frozen_delete_merge_targets(
+                targets
+                    .iter()
+                    .filter(|target| target.branch().writes_deletes())
+                    .map(|target| (target.ordinal(), target.handle().old_deletes().clone()))
+                    .collect(),
+            )?
+        } else {
+            handle
+        };
         if let Some(content) = frozen_rewrite {
             if targets.len() != content.groups.len() {
                 return Err(internal(
@@ -3196,6 +3208,24 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         novarocks_spi::connector::ConnectorCowBeginFailure,
     > {
         self.begin_cow_original(request, original, existing_caller_upper)
+    }
+
+    fn prepared_logical_row_change(
+        &self,
+        commit: &novarocks_spi::connector::write_stack::ConnectorWriteCommitHandle,
+        prepared: &ConnectorPreparedWriteSet,
+        context: &ConnectorRequestContext,
+    ) -> Result<
+        Option<novarocks_spi::connector::write_stack::ConnectorWriteRowChange>,
+        ConnectorError,
+    > {
+        validate_context(context)?;
+        let handle = self.adapter.commit_handle(commit)?;
+        let validated = validate_prepared_set(handle, &self.adapter, prepared)?;
+        validate_merged_old_references(&handle.frozen_old_references(), &validated)?;
+        let result = logical_rows::project(handle, &validated)?;
+        validate_context(context)?;
+        Ok(result)
     }
 
     fn finish_write(

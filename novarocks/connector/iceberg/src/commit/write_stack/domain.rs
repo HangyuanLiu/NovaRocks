@@ -1762,6 +1762,11 @@ pub struct IcebergCommitHandle {
     document_publication: Option<IcebergDocumentPublicationFacts>,
     targets: Vec<IcebergSealedWriteTarget>,
     delete_owner: BTreeMap<String, WriteTargetOrdinal>,
+    /// Managed publications retain the same exact merge facts already frozen
+    /// for their BE writers. This is session-local evidence for logical row
+    /// changes, never a serialized second source of delete identities.
+    frozen_delete_merge_targets:
+        Option<BTreeMap<WriteTargetOrdinal, BTreeMap<String, IcebergOldDeleteMergeTarget>>>,
     /// The frozen metadata of a staged target, present exactly on a
     /// staged-create session. It stands in for the catalog load every other
     /// flavor performs, and the seal reads its schema and partition spec to
@@ -2019,6 +2024,7 @@ impl IcebergCommitHandle {
             document_publication,
             targets,
             delete_owner,
+            frozen_delete_merge_targets: None,
             staged_metadata,
             source_metadata: None,
             rewrite_inputs,
@@ -2032,6 +2038,52 @@ impl IcebergCommitHandle {
             recovery_evidence: Arc::new(std::sync::Mutex::new(None)),
             state: std::sync::Mutex::new(IcebergWriteSessionState::Active),
         })
+    }
+
+    pub(crate) fn with_frozen_delete_merge_targets(
+        mut self,
+        targets: BTreeMap<WriteTargetOrdinal, BTreeMap<String, IcebergOldDeleteMergeTarget>>,
+    ) -> Result<Self, ConnectorError> {
+        if self.document_publication.is_none() || self.frozen_delete_merge_targets.is_some() {
+            return Err(invalid(
+                "Iceberg logical row facts require one managed publication owner",
+            ));
+        }
+        let mut identities = BTreeMap::new();
+        for (ordinal, files) in &targets {
+            let mut entries = BTreeMap::new();
+            for (path, target) in files {
+                if path != target.data_file_path()
+                    || Some(target.base_snapshot_id()) != self.table.base_snapshot_id()
+                {
+                    return Err(invalid(
+                        "Iceberg logical row facts differ from their frozen data-file target",
+                    ));
+                }
+                entries.insert(
+                    path.clone(),
+                    target
+                        .references()
+                        .iter()
+                        .map(|reference| reference.entry_identity())
+                        .collect::<Vec<_>>(),
+                );
+            }
+            identities.insert(*ordinal, entries);
+        }
+        if identities != self.frozen_old_references() {
+            return Err(invalid(
+                "Iceberg logical row facts differ from the sealed old-delete identities",
+            ));
+        }
+        self.frozen_delete_merge_targets = Some(targets);
+        Ok(self)
+    }
+
+    pub(crate) fn frozen_delete_merge_targets(
+        &self,
+    ) -> Option<&BTreeMap<WriteTargetOrdinal, BTreeMap<String, IcebergOldDeleteMergeTarget>>> {
+        self.frozen_delete_merge_targets.as_ref()
     }
 
     pub(crate) fn with_source_metadata(

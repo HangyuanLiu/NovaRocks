@@ -74,6 +74,64 @@ SHOW MATERIALIZED VIEWS;
 SELECT k, v FROM rows_mv ORDER BY k;
 
 -- query 10
+-- @skip_result_check=true
+INSERT INTO mvrows_${uuid0}.ns_${uuid0}.fact VALUES ('north', 30);
+
+-- query 11
+-- This refresh accepts one new row, while the complete target contains two.
+-- Its physical data-file records include the previously deleted east row.
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=3,slot-changes=0,logical-rows=2,total-records=3,delete-files-min=1
+REFRESH MATERIALIZED VIEW rows_mv WITH SYNC MODE;
+
+-- query 12
+-- @skip_result_check=true
+-- @result_rows_where=Name=rows_mv
+-- @result_rows_count=1
+-- @result_rows_expect=LastRefreshRows=2
+SHOW MATERIALIZED VIEWS;
+
+-- query 13
+SELECT k, v FROM rows_mv ORDER BY k;
+
+-- query 14
+-- An unchanged source produces a metadata-only publication. Its zero accepted
+-- rows must preserve the complete target's logical row count and physical files.
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=4,slot-changes=0,logical-rows=2,total-records=3,delete-files-min=1,metadata-only-last=true
+REFRESH MATERIALIZED VIEW rows_mv WITH SYNC MODE;
+
+-- query 15
+-- @skip_result_check=true
+-- @result_rows_where=Name=rows_mv
+-- @result_rows_count=1
+-- @result_rows_expect=LastRefreshRows=2
+SHOW MATERIALIZED VIEWS;
+
+-- query 16
+SELECT k, v FROM rows_mv ORDER BY k;
+
+-- query 17
+-- @skip_result_check=true
+DELETE FROM fact WHERE k IN ('west', 'north');
+
+-- query 18
+-- Deleting both remaining rows accepts two changes, but leaves zero target rows.
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.rows_mv,publications=5,slot-changes=0,logical-rows=0
+REFRESH MATERIALIZED VIEW rows_mv WITH SYNC MODE;
+
+-- query 19
+-- @skip_result_check=true
+-- @result_rows_where=Name=rows_mv
+-- @result_rows_count=1
+-- @result_rows_expect=LastRefreshRows=0
+SHOW MATERIALIZED VIEWS;
+
+-- query 20
+SELECT COUNT(*) AS row_count FROM rows_mv;
+
+-- query 21
 -- @cleanup=true
 -- @skip_result_check=true
 SET CATALOG mvrows_${uuid0};

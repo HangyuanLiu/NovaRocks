@@ -4782,3 +4782,541 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
         "read and split scopes must release content after their actual exit"
     );
 }
+
+fn project_prepared_managed_rows(
+    technique: ConnectorManagedPublicationTechnique,
+    shape: ConnectorManagedPublicationShape,
+    merge_targets: Vec<IcebergOldDeleteMergeTarget>,
+    entries: Vec<(WriteTargetOrdinal, IcebergCommitFragment)>,
+) -> Result<Option<novarocks_spi::connector::write_stack::ConnectorWriteRowChange>, ConnectorError>
+{
+    let mut material =
+        session_material(if shape == ConnectorManagedPublicationShape::RowMutation {
+            merge_on_read_input_shape()
+        } else {
+            data_input_shape()
+        });
+    material.merge_targets = merge_targets;
+    let (handle, targets) = flavor_session(plan_document_publication_branches(
+        &material,
+        document_publication_facts_with_shape(
+            technique,
+            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+            shape,
+        ),
+    )?);
+    let handle = handle.with_frozen_delete_merge_targets(
+        targets
+            .iter()
+            .filter(|target| target.branch().writes_deletes())
+            .map(|target| (target.ordinal(), target.handle().old_deletes().clone()))
+            .collect(),
+    )?;
+    let expected = handle.expected_targets();
+    let adapter = adapter("unit", 1);
+    let commit = adapter.wrap_commit_handle(handle);
+    // Accepted input rows are deliberately unrelated to the artifact counts.
+    let prepared = ConnectorPreparedWriteSet::try_new(
+        u64::MAX,
+        entries
+            .into_iter()
+            .map(|(ordinal, fragment)| (ordinal, adapter.wrap_commit_fragment(fragment)))
+            .collect(),
+        &expected,
+    )?;
+    let (_executor, runtime) = unreachable_rest_runtime();
+    let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+        descriptor("unit"),
+        ProviderBindingEpoch::new(),
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").unwrap(),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+        runtime,
+    );
+    let result = control.prepared_logical_row_change(&commit, &prepared, &request_context());
+    assert!(matches!(
+        adapter.commit_handle(&commit)?.state()?,
+        IcebergWriteSessionState::Active
+    ));
+    result
+}
+
+fn logical_data_fragment(path: &str, rows: u64) -> IcebergCommitFragment {
+    IcebergCommitFragment::data_file(
+        IcebergDataFileArtifact::try_new(
+            path.into(),
+            IcebergFileFormat::Parquet,
+            sample_partition(),
+            sample_metrics(rows, 4096),
+            None,
+        )
+        .unwrap(),
+    )
+}
+
+fn logical_dv_fragment(
+    path: &str,
+    data: &str,
+    cardinality: u64,
+    offset: i64,
+    merged: Vec<EntryIdentity>,
+) -> IcebergCommitFragment {
+    IcebergCommitFragment::deletion_vector(
+        crate::commit::write_stack::domain::IcebergDeletionVectorArtifact::try_new(
+            path.into(),
+            sample_partition(),
+            sample_metrics(cardinality, 4096),
+            data.into(),
+            crate::commit::write_stack::domain::IcebergContentRange::try_new(offset, 64).unwrap(),
+            cardinality,
+            merged,
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn managed_prepared_logical_rows_distinguish_replacement_append_and_empty_delta() {
+    use novarocks_spi::connector::write_stack::ConnectorWriteRowChange::{Delta, Replace};
+    for (technique, expected) in [
+        (ConnectorManagedPublicationTechnique::Full, Replace(12)),
+        (
+            ConnectorManagedPublicationTechnique::Incremental,
+            Delta {
+                inserted: 12,
+                deleted: 0,
+            },
+        ),
+    ] {
+        assert_eq!(
+            project_prepared_managed_rows(
+                technique,
+                ConnectorManagedPublicationShape::Data,
+                vec![],
+                vec![
+                    (ordinal(0), logical_data_fragment("s3://b/new-a.parquet", 5)),
+                    (ordinal(0), logical_data_fragment("s3://b/new-b.parquet", 7)),
+                ]
+            )
+            .unwrap(),
+            Some(expected)
+        );
+    }
+    for (technique, shape, expected) in [
+        (
+            ConnectorManagedPublicationTechnique::Full,
+            ConnectorManagedPublicationShape::Data,
+            Replace(0),
+        ),
+        (
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationShape::RowMutation,
+            Delta {
+                inserted: 0,
+                deleted: 0,
+            },
+        ),
+        (
+            ConnectorManagedPublicationTechnique::MetadataOnly,
+            ConnectorManagedPublicationShape::Data,
+            Delta {
+                inserted: 0,
+                deleted: 0,
+            },
+        ),
+    ] {
+        assert_eq!(
+            project_prepared_managed_rows(technique, shape, vec![], vec![]).unwrap(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn managed_prepared_logical_rows_count_only_touched_dv_net_changes() {
+    use super::test_support::puffin_ref;
+    use novarocks_spi::connector::write_stack::ConnectorWriteRowChange::Delta;
+    let a = "s3://b/wh/db/t/data/a.parquet";
+    let b = "s3://b/wh/db/t/data/b.parquet";
+    let old_a = puffin_ref("s3://b/old.puffin", Some(a), 4096, 2, 4, 64).unwrap();
+    // This untouched file's deletes must neither be subtracted nor cause None.
+    let untouched = puffin_ref("s3://b/old.puffin", Some(b), 4096, 0, 100, 64).unwrap();
+    for (new_count, expected_deleted) in [(2, 0), (5, 3)] {
+        assert_eq!(
+            project_prepared_managed_rows(
+                ConnectorManagedPublicationTechnique::Incremental,
+                ConnectorManagedPublicationShape::RowMutation,
+                vec![
+                    merge_target(a, 100, vec![old_a.clone()]),
+                    merge_target(b, 100, vec![untouched.clone()])
+                ],
+                vec![
+                    (
+                        ordinal(0),
+                        logical_data_fragment("s3://b/new-data.parquet", 5)
+                    ),
+                    (
+                        ordinal(1),
+                        logical_dv_fragment(
+                            "s3://b/new.puffin",
+                            a,
+                            new_count,
+                            4,
+                            vec![old_a.entry_identity()]
+                        )
+                    ),
+                ],
+            )
+            .unwrap(),
+            Some(Delta {
+                inserted: 5,
+                deleted: expected_deleted
+            })
+        );
+    }
+    assert_eq!(
+        project_prepared_managed_rows(
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationShape::RowMutation,
+            vec![merge_target(a, 100, vec![])],
+            vec![(
+                ordinal(1),
+                logical_dv_fragment("s3://b/first.puffin", a, 5, 4, vec![])
+            )],
+        )
+        .unwrap(),
+        Some(Delta {
+            inserted: 0,
+            deleted: 5
+        })
+    );
+    let old_b = puffin_ref("s3://b/old.puffin", Some(b), 4096, 4, 100, 64).unwrap();
+    assert_eq!(
+        project_prepared_managed_rows(
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationShape::RowMutation,
+            vec![
+                merge_target(a, 100, vec![old_a.clone()]),
+                merge_target(b, 100, vec![old_b.clone()])
+            ],
+            vec![
+                (
+                    ordinal(1),
+                    logical_dv_fragment(
+                        "s3://b/new-shared.puffin",
+                        a,
+                        5,
+                        4,
+                        vec![old_a.entry_identity()]
+                    )
+                ),
+                (
+                    ordinal(1),
+                    logical_dv_fragment(
+                        "s3://b/new-shared.puffin",
+                        b,
+                        6,
+                        100,
+                        vec![old_b.entry_identity()]
+                    )
+                ),
+            ],
+        )
+        .unwrap(),
+        Some(Delta {
+            inserted: 0,
+            deleted: 5
+        })
+    );
+}
+
+#[test]
+fn managed_prepared_logical_rows_leave_unprovable_old_cardinality_unknown() {
+    use super::test_support::puffin_ref;
+    let data = "s3://b/wh/db/t/data/a.parquet";
+    for references in [
+        vec![puffin_ref("s3://b/old.puffin", Some(data), 4096, 0, 4, 64).unwrap()],
+        vec![parquet_ref("s3://b/old.parquet", Some(data), 4096, 2).unwrap()],
+        vec![parquet_ref("s3://b/shared.parquet", None, 4096, 20).unwrap()],
+    ] {
+        let merged = references
+            .iter()
+            .map(|reference| reference.entry_identity())
+            .collect();
+        assert_eq!(
+            project_prepared_managed_rows(
+                ConnectorManagedPublicationTechnique::Incremental,
+                ConnectorManagedPublicationShape::RowMutation,
+                vec![merge_target(data, 100, references)],
+                vec![(
+                    ordinal(1),
+                    logical_dv_fragment("s3://b/new.puffin", data, 5, 4, merged)
+                )],
+            )
+            .unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
+fn managed_prepared_logical_rows_reject_duplicate_and_mismatched_delete_proofs() {
+    use super::test_support::puffin_ref;
+    let data = "s3://b/wh/db/t/data/a.parquet";
+    let old = puffin_ref("s3://b/old.puffin", Some(data), 4096, 2, 4, 64).unwrap();
+    let project = |entries| {
+        project_prepared_managed_rows(
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationShape::RowMutation,
+            vec![merge_target(data, 100, vec![old.clone()])],
+            entries,
+        )
+    };
+    let missing = project(vec![(
+        ordinal(1),
+        logical_dv_fragment("s3://b/new.puffin", data, 5, 4, vec![]),
+    )])
+    .unwrap_err();
+    assert!(missing.message().contains("merged 0 old references"));
+    let duplicate = project(vec![
+        (
+            ordinal(1),
+            logical_dv_fragment("s3://b/new.puffin", data, 5, 4, vec![old.entry_identity()]),
+        ),
+        (
+            ordinal(1),
+            logical_dv_fragment(
+                "s3://b/another.puffin",
+                data,
+                5,
+                4,
+                vec![old.entry_identity()],
+            ),
+        ),
+    ])
+    .unwrap_err();
+    assert!(
+        duplicate
+            .message()
+            .contains("more than one delete artifact")
+    );
+    let foreign = project(vec![(
+        ordinal(1),
+        logical_dv_fragment("s3://b/new.puffin", "s3://b/foreign.parquet", 5, 4, vec![]),
+    )])
+    .unwrap_err();
+    assert!(foreign.message().contains("never routed"));
+}
+
+#[test]
+fn managed_prepared_logical_rows_reject_impossible_cardinality_and_checked_overflow() {
+    use super::test_support::puffin_ref;
+    let data = "s3://b/wh/db/t/data/a.parquet";
+    for (old_count, new_count, rows, expected) in [
+        (5, 3, 100, "lost frozen deleted rows"),
+        (2, 6, 5, "exceeds its frozen data-file row count"),
+        (
+            6,
+            5,
+            5,
+            "frozen deletion vector exceeds its data-file row count",
+        ),
+    ] {
+        let old = puffin_ref("s3://b/old.puffin", Some(data), 4096, old_count, 4, 64).unwrap();
+        let error = project_prepared_managed_rows(
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationShape::RowMutation,
+            vec![merge_target(data, rows, vec![old.clone()])],
+            vec![(
+                ordinal(1),
+                logical_dv_fragment(
+                    "s3://b/new.puffin",
+                    data,
+                    new_count,
+                    4,
+                    vec![old.entry_identity()],
+                ),
+            )],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert!(error.message().contains(expected), "{error}");
+    }
+    let old_refs = vec![
+        puffin_ref("s3://b/old.puffin", Some(data), 4096, 2, 4, 64).unwrap(),
+        puffin_ref("s3://b/old.puffin", Some(data), 4096, 3, 100, 64).unwrap(),
+    ];
+    let merged = old_refs
+        .iter()
+        .map(|reference| reference.entry_identity())
+        .collect();
+    let duplicate_old = project_prepared_managed_rows(
+        ConnectorManagedPublicationTechnique::Incremental,
+        ConnectorManagedPublicationShape::RowMutation,
+        vec![merge_target(data, 100, old_refs)],
+        vec![(
+            ordinal(1),
+            logical_dv_fragment("s3://b/new.puffin", data, 5, 4, merged),
+        )],
+    )
+    .unwrap_err();
+    assert!(
+        duplicate_old
+            .message()
+            .contains("more than one deletion vector")
+    );
+    let error = project_prepared_managed_rows(
+        ConnectorManagedPublicationTechnique::Full,
+        ConnectorManagedPublicationShape::Data,
+        vec![],
+        ["a", "b", "c"]
+            .into_iter()
+            .map(|name| {
+                (
+                    ordinal(0),
+                    logical_data_fragment(&format!("s3://b/{name}.parquet"), i64::MAX as u64),
+                )
+            })
+            .collect(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("logical insertion count overflowed")
+    );
+}
+
+#[test]
+fn prepared_logical_rows_require_exact_adapter_and_live_context_and_exclude_ordinary_dml() {
+    let (_executor, runtime) = unreachable_rest_runtime();
+    let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+        descriptor("unit"),
+        ProviderBindingEpoch::new(),
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").unwrap(),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+        runtime,
+    );
+    let (ordinary, _) = flavor_session(
+        plan_ordinary_branches(
+            IcebergWriteFlavor::Append,
+            &session_material(data_input_shape()),
+        )
+        .unwrap(),
+    );
+    let adapter = adapter("unit", 1);
+    let commit = adapter.wrap_commit_handle(ordinary);
+    let empty = ConnectorPreparedWriteSet::try_new(99, vec![], &[ordinal(0)]).unwrap();
+    assert_eq!(
+        control
+            .prepared_logical_row_change(&commit, &empty, &request_context())
+            .unwrap(),
+        None
+    );
+    let (other, _) = flavor_session(
+        plan_ordinary_branches(
+            IcebergWriteFlavor::Append,
+            &session_material(data_input_shape()),
+        )
+        .unwrap(),
+    );
+    let foreign_adapter = self::adapter("unit", 2);
+    let foreign = foreign_adapter.wrap_commit_handle(other);
+    assert_eq!(
+        control
+            .prepared_logical_row_change(&foreign, &empty, &request_context())
+            .unwrap_err()
+            .kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
+    let foreign_fragment = ConnectorPreparedWriteSet::try_new(
+        1,
+        vec![(
+            ordinal(0),
+            foreign_adapter.wrap_commit_fragment(data_fragment("s3://b/foreign.parquet")),
+        )],
+        &[ordinal(0)],
+    )
+    .unwrap();
+    assert_eq!(
+        control
+            .prepared_logical_row_change(&commit, &foreign_fragment, &request_context())
+            .unwrap_err()
+            .kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
+    let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+    let cancelled = ConnectorRequestContext::try_new(
+        Instant::now() + Duration::from_secs(30),
+        stop.view(),
+        65536,
+        1048576,
+    )
+    .unwrap();
+    stop.request_stop();
+    assert_eq!(
+        control
+            .prepared_logical_row_change(&commit, &empty, &cancelled)
+            .unwrap_err()
+            .kind(),
+        ConnectorErrorKind::Cancelled
+    );
+}
+
+#[test]
+fn logical_row_merge_facts_must_match_the_one_sealed_reference_owner() {
+    let data = "s3://b/wh/db/t/data/a.parquet";
+    let mut material = session_material(merge_on_read_input_shape());
+    material.merge_targets = vec![merge_target(
+        data,
+        100,
+        vec![
+            super::test_support::puffin_ref("s3://b/old.puffin", Some(data), 4096, 2, 4, 64)
+                .unwrap(),
+        ],
+    )];
+    let make = || {
+        flavor_session(
+            plan_document_publication_branches(
+                &material,
+                document_publication_facts_with_shape(
+                    ConnectorManagedPublicationTechnique::Incremental,
+                    ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+                    ConnectorManagedPublicationShape::RowMutation,
+                ),
+            )
+            .unwrap(),
+        )
+    };
+    let (handle, _) = make();
+    let mismatched = BTreeMap::from([(
+        ordinal(1),
+        BTreeMap::from([(data.to_owned(), merge_target(data, 100, vec![]))]),
+    )]);
+    assert!(
+        handle
+            .with_frozen_delete_merge_targets(mismatched)
+            .unwrap_err()
+            .message()
+            .contains("sealed old-delete identities")
+    );
+    let (handle, targets) = make();
+    let facts = targets
+        .iter()
+        .filter(|target| target.branch().writes_deletes())
+        .map(|target| (target.ordinal(), target.handle().old_deletes().clone()))
+        .collect::<BTreeMap<_, _>>();
+    let handle = handle
+        .with_frozen_delete_merge_targets(facts.clone())
+        .unwrap();
+    assert!(
+        handle
+            .with_frozen_delete_merge_targets(facts)
+            .unwrap_err()
+            .message()
+            .contains("one managed publication owner")
+    );
+}
