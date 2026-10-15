@@ -831,7 +831,7 @@ impl RuntimeOrderContract {
         order_contract_digest: [u8; 32],
     ) -> Self {
         Self {
-            keys,
+            keys: RuntimeOrderKeys::Legacy(keys),
             comparator_digest,
             digest: order_contract_digest,
         }

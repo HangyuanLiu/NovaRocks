@@ -206,7 +206,9 @@ impl OrderedTopNAllocationHost {
                 "pure Aggregate TopN runtime filter requires one complete order key",
             )));
         };
-        if key.data_type != arrow::datatypes::DataType::Utf8 {
+        if key.value_type.data_type() != &arrow::datatypes::DataType::Utf8
+            || key.value_type.logical_type() != novarocks_functions::ValueLogicalType::Physical
+        {
             return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
                 "pure Aggregate TopN runtime filter order key type other than Utf8 is not installed",
             )));
@@ -219,8 +221,9 @@ impl OrderedTopNAllocationHost {
             .try_reserve_exact(1)
             .map_err(|_| KernelFailure::ResourceExhausted)?;
         work.flush()?;
-        slots.push(RuntimeOrderKey::with_order(
-            arrow::datatypes::DataType::Utf8,
+        let value_type = key.value_type.clone_observed(|| work.step())?;
+        slots.push(RuntimeOrderKey::with_value_type(
+            value_type,
             match key.direction {
                 FilterSortDirection::Ascending => RuntimeOrderSortDirection::Ascending,
                 FilterSortDirection::Descending => RuntimeOrderSortDirection::Descending,

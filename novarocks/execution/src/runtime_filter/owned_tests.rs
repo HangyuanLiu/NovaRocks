@@ -315,7 +315,7 @@ fn static_utf8_order(
 ) -> novarocks_local_program::StaticFilterContract {
     novarocks_local_program::StaticFilterContract::Ordered {
         keys: Arc::from([novarocks_local_program::FilterOrderKey {
-            data_type: DataType::Utf8,
+            value_type: novarocks_functions::FunctionValueType::new(DataType::Utf8, true),
             direction,
             null_order,
         }]),
@@ -348,8 +348,8 @@ fn ordered_topn_owned_frozen_key_slots_share_last_owner_and_preserve_legacy_cont
                 .utf8_order_contract(&static_utf8_order(direction, nulls), &Control::pass())
                 .unwrap();
             let expected = RuntimeOrderContract::from_frozen(
-                [RuntimeOrderKey::with_order(
-                    DataType::Utf8,
+                [RuntimeOrderKey::with_value_type(
+                    novarocks_functions::FunctionValueType::new(DataType::Utf8, true),
                     expected_direction,
                     expected_nulls,
                 )],
@@ -393,6 +393,33 @@ fn ordered_topn_owned_frozen_key_slots_share_last_owner_and_preserve_legacy_cont
             .unwrap();
             assert_eq!(tracker.current(), 0);
         }
+    }
+}
+
+// Owner-local regression: an exact frozen key keeps its semantic binding,
+// including nullability, while its slots share the original paid backing.
+#[test]
+fn ordered_topn_owned_frozen_keys_preserve_complete_nullability() {
+    use novarocks_local_program::{FilterNullOrder, FilterSortDirection, StaticFilterContract};
+    for nullable in [false, true] {
+        let value_type = novarocks_functions::FunctionValueType::new(DataType::Utf8, nullable);
+        let mut frozen = static_utf8_order(FilterSortDirection::Descending, FilterNullOrder::Last);
+        let StaticFilterContract::Ordered { keys, .. } = &mut frozen else {
+            unreachable!()
+        };
+        Arc::make_mut(keys)[0].value_type = value_type.clone();
+        let tracker = MemTracker::new_root("ordered-frozen-complete-binding");
+        let host = OrderedTopNAllocationHost::new(tracker.clone());
+        let order = host.utf8_order_contract(&frozen, &Control::pass()).unwrap();
+        assert_eq!(order.keys()[0].value_type(), Some(&value_type));
+        assert_eq!(order.keys()[0].value_type().unwrap().nullable(), nullable);
+        let shared = order.clone();
+        drop(order);
+        drop(host);
+        assert!(tracker.current() > 0);
+        assert_eq!(shared.keys()[0].value_type(), Some(&value_type));
+        drop(shared);
+        assert_eq!(tracker.current(), 0);
     }
 }
 
@@ -455,7 +482,7 @@ fn ordered_topn_owned_frozen_key_slots_preserve_control_causes_and_named_uninsta
     };
     let wrong_type = StaticFilterContract::Ordered {
         keys: Arc::from([novarocks_local_program::FilterOrderKey {
-            data_type: DataType::Int64,
+            value_type: novarocks_functions::FunctionValueType::new(DataType::Int64, true),
             ..keys[0].clone()
         }]),
         comparator_digest: [17; 32],
@@ -467,7 +494,7 @@ fn ordered_topn_owned_frozen_key_slots_preserve_control_causes_and_named_uninsta
         contract_digest: [23; 32],
     };
     let membership = StaticFilterContract::membership(
-        &DataType::Utf8,
+        &novarocks_functions::FunctionValueType::new(DataType::Utf8, true),
         novarocks_local_program::FilterNullSemantics::NeverMatches,
     )
     .unwrap();

@@ -124,11 +124,8 @@ impl ExecutionFailure {
     pub fn detail(&self) -> &str {
         match &self.cause {
             ExecutionFailureCause::Pipeline(message) => message,
-<<<<<<< HEAD
             ExecutionFailureCause::Construction(error) => error.detail(),
-=======
             ExecutionFailureCause::RuntimeFilter(error) => error.detail(),
->>>>>>> 4d5711bb8 (Preserve nominal runtime-filter failure payloads through Native reporting)
             ExecutionFailureCause::RequiredRow(error) => error.error().message(),
             ExecutionFailureCause::InvocationData(error) => error.message(),
             ExecutionFailureCause::ScalarInvocationData(error) => error.message(),
@@ -207,7 +204,6 @@ impl From<KernelFailure> for ExecutionFailure {
         }
     }
 }
-<<<<<<< HEAD
 impl From<ConstructionFailure> for ExecutionFailure {
     fn from(error: ConstructionFailure) -> Self {
         match error {
@@ -226,13 +222,14 @@ impl From<crate::runtime::exchange::ExchangeReceiveFailure> for ExecutionFailure
         match error {
             crate::runtime::exchange::ExchangeReceiveFailure::Wire(message) => message.into(),
             crate::runtime::exchange::ExchangeReceiveFailure::Construction(cause) => cause.into(),
-=======
+        }
+    }
+}
 impl From<crate::runtime_filter::RuntimeFilterFailure> for ExecutionFailure {
     fn from(error: crate::runtime_filter::RuntimeFilterFailure) -> Self {
         Self {
             cause: ExecutionFailureCause::RuntimeFilter(error),
             context: None,
->>>>>>> 4d5711bb8 (Preserve nominal runtime-filter failure payloads through Native reporting)
         }
     }
 }
