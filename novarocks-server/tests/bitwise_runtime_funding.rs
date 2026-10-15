@@ -147,7 +147,7 @@ fn pool(ty: &DataType, value: Option<i64>) -> ConstantPool {
     ConstantPool::try_new(
         std::sync::Arc::new(ty.try_to_field("original-bitwise-selected-pool").unwrap()),
         ty.clone(),
-        array(&ty.data_type, vec![Some(1), value]).to_data(),
+        array(ty.data_type(), vec![Some(1), value]).to_data(),
         ConstantPolicy {
             max_rows: 8,
             max_array_nodes: 8,

@@ -597,6 +597,77 @@ fn c16_p1_json_object_differential_unsupported_null_carriers_and_suppressed_nest
         DataType::Decimal64(18, 2),
     ] {
         let nulls = new_null_array(&data_type, 3);
+        if matches!(data_type, DataType::Utf8View | DataType::BinaryView) {
+            // View columns are rejected at the real Chunk ingress, before
+            // JSONObject runs. Retain that contract separately from the
+            // installed constant-pool route to the original computation.
+            let expected = match data_type {
+                DataType::Utf8View => "unsupported scalar type: Utf8View",
+                DataType::BinaryView => "unsupported scalar type: BinaryView",
+                _ => unreachable!("the view carriers are matched above"),
+            };
+            let view_type = FunctionValueType::new(data_type.clone(), true);
+            let pooled = constant(view_type.clone(), nulls.slice(0, 1));
+            assert_eq!(pooled.value_type(), &view_type);
+            assert_eq!(pooled.pool().array().data_type(), &data_type);
+            assert!(pooled.pool().array().is_null(0));
+            for view_is_key in [false, true] {
+                for policy in [
+                    DecimalOverflowPolicy::OutputNull,
+                    DecimalOverflowPolicy::ReportError,
+                ] {
+                    let base = ScalarDiffSpec::new("json_object")
+                        .decimal_overflow(policy)
+                        .expect_result_type(result())
+                        .sparse_selections(5, 0xC161)
+                        .legacy_constants(LegacyConstantForm::Pool);
+                    let plain_type = FunctionValueType::new(DataType::Utf8, true);
+                    let plain: ArrayRef = Arc::new(StringArray::from(vec!["v"; 3]));
+                    let raw = if view_is_key {
+                        base.clone()
+                            .typed_column(view_type.clone(), nulls.clone())
+                            .typed_column(plain_type.clone(), plain.clone())
+                    } else {
+                        base.clone()
+                            .typed_column(plain_type.clone(), plain.clone())
+                            .typed_column(view_type.clone(), nulls.clone())
+                    };
+                    let legacy_kind = ScalarLegacyImplementation::Function(
+                        lookup_function("json_object").unwrap(),
+                    );
+                    let result_type = result();
+                    let raw_call = ScalarCall {
+                        spec: &raw,
+                        legacy_kind,
+                        result_type: &result_type,
+                        rows: 3,
+                    };
+                    assert_eq!(
+                        raw_call.evaluate_legacy(None).unwrap_err(),
+                        "view carriers are not supported by the current execution engine"
+                    );
+                    let spec = if view_is_key {
+                        base.constant(pooled.clone())
+                            .typed_column(plain_type, plain)
+                    } else {
+                        base.typed_column(plain_type, plain)
+                            .constant(pooled.clone())
+                    };
+                    let pooled_call = ScalarCall {
+                        spec: &spec,
+                        legacy_kind,
+                        result_type: &result_type,
+                        rows: 3,
+                    };
+                    assert_eq!(pooled_call.evaluate_legacy(None).unwrap_err(), expected);
+                    let summary = assert_scalar_matches_v1(spec);
+                    assert_eq!(summary.result_type, result_type);
+                    assert_eq!(summary.selections, 6);
+                    assert_eq!(summary.legacy_batch_errors, summary.selections);
+                }
+            }
+            continue;
+        }
         compare(vec![
             typed(Arc::new(StringArray::from(vec!["v"; 3]))),
             typed(nulls.clone()),
