@@ -275,7 +275,7 @@ impl ConnectorControlResolver for Resolver {
 }
 
 struct Fixture {
-    entrance: ManagementEntrance,
+    entrance: Arc<ManagementEntrance>,
     resolver: Resolver,
     caps: Arc<TargetCaps>,
     catalog: CatalogHandle,
@@ -404,7 +404,7 @@ impl Fixture {
             .unwrap();
         caps.events.lock().unwrap().clear();
         Self {
-            entrance,
+            entrance: Arc::new(entrance),
             resolver,
             caps,
             catalog,
@@ -677,41 +677,58 @@ async fn an_actual_local_committed_effect_still_uses_committed_convergence() {
 
 #[tokio::test]
 async fn admitted_current_does_not_issue_authority_for_a_foreign_owner() {
-    let fixture = Fixture::new(vec![]);
-    fixture
-        .caps
-        .current
-        .lock()
-        .unwrap()
-        .slots
-        .get_mut(&management_slot_name().unwrap())
-        .unwrap()
-        .value = management_slot(
-        &DeploymentOwner::parse("foreign-deployment").unwrap(),
-        fixture.entrance.incarnation(),
-    )
-    .unwrap();
-    let error = fixture
-        .observe(MvConvergence::AdmittedCurrent)
-        .await
-        .err()
-        .unwrap();
-    assert_eq!(error.kind(), MvProjectionErrorKind::SourceConflict);
-    assert!(
-        error
-            .to_string()
-            .contains("cannot renew this target admission")
-    );
-    assert_eq!(
-        *fixture.caps.events.lock().unwrap(),
-        vec!["capture", "observe"]
-    );
-    assert_eq!(
+    for metadata_renewal in [false, true] {
+        let fixture = Fixture::new(vec![]);
+        let prior_request = fixture.management_request();
+        let (prior_documents, _prior_admission) = fixture
+            .observe(MvConvergence::AdmittedCurrent)
+            .await
+            .unwrap();
+        let convergence = if metadata_renewal {
+            MvConvergence::MetadataOnlyCurrent {
+            expected: Arc::new(novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection::try_from_current(prior_documents).unwrap()),
+        }
+        } else {
+            MvConvergence::AdmittedCurrent
+        };
+        fixture.caps.events.lock().unwrap().clear();
         fixture
-            .entrance
-            .pending_slot_changes(fixture.managed.table()),
-        0
-    );
+            .caps
+            .current
+            .lock()
+            .unwrap()
+            .slots
+            .get_mut(&management_slot_name().unwrap())
+            .unwrap()
+            .value = management_slot(
+            &DeploymentOwner::parse("foreign-deployment").unwrap(),
+            fixture.entrance.incarnation(),
+        )
+        .unwrap();
+        let error = fixture.observe(convergence).await.err().unwrap();
+        assert_eq!(error.kind(), MvProjectionErrorKind::SourceConflict);
+        assert!(
+            error
+                .to_string()
+                .contains("Current management names another owner or incarnation")
+        );
+        assert_eq!(
+            *fixture.caps.events.lock().unwrap(),
+            vec!["capture", "observe"]
+        );
+        assert_eq!(
+            fixture
+                .entrance
+                .pending_slot_changes(fixture.managed.table()),
+            0
+        );
+
+        assert_eq!(
+            fixture.entrance.management_phase(fixture.managed.table()),
+            MvManagementPhase::OwnerMismatch
+        );
+        assert!(fixture.entrance.acquire(prior_request, || false).is_err());
+    }
 }
 
 #[tokio::test]
@@ -760,4 +777,116 @@ async fn admitted_current_rejects_a_foreign_catalog_before_metadata_or_document_
     assert!(error.to_string().contains("catalog generation changed"));
     assert!(fixture.caps.events.lock().unwrap().is_empty());
     fixture.assert_manageable();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_only_current_renewal_installs_fresh_generation_in_the_same_repository() {
+    use novarocks_mv_application::process_runtime::ProcessRuntime;
+    use novarocks_mv_application::readiness::MvKeyedReadinessService;
+    let fixture = Fixture::new(vec![]);
+    let repository = crate::mv::domain::test_admission::keyed_repository().await;
+    let service = MvKeyedReadinessService::new(repository, Arc::new(ProcessRuntime::default()));
+    let readiness = crate::mv::domain::readiness::MvReadinessPort::from_product(
+        service.clone(),
+        tokio::runtime::Handle::current(),
+        fixture.entrance.clone(),
+    );
+    let source = ManagedTargetCurrentSource {
+        entrance: &fixture.entrance,
+        connector_control: &fixture.resolver,
+        published: None,
+        convergence: MvConvergence::AdmittedCurrent,
+    };
+    service
+        .observe_and_install(uuid::Uuid::now_v7(), fixture.request(), &source)
+        .await
+        .unwrap();
+    let before = service.load_ready(&fixture.target).await.unwrap().unwrap();
+    let next = ConnectorCommittedVersion::try_new(
+        Bytes::from_static(b"expired-history-same-current"),
+        Some(17),
+    )
+    .unwrap();
+    fixture.caps.current.lock().unwrap().metadata_version = next.clone();
+    assert_ne!(before.projection.facts.metadata_version(), &next);
+    super::install_metadata_only_current_projection(
+        &fixture.entrance,
+        &readiness,
+        &fixture.resolver,
+        fixture.catalog.clone(),
+        Arc::new(before.projection.facts.clone()),
+        context(),
+    )
+    .unwrap();
+    let after = service.load_ready(&fixture.target).await.unwrap().unwrap();
+    assert_eq!(after.projection.mv_id, before.projection.mv_id);
+    assert_eq!(after.projection.facts.metadata_version(), &next);
+    assert_eq!(after.projection.facts.publication_snapshot(), Some(17));
+    assert_eq!(
+        after.projection.facts.definition(),
+        before.projection.facts.definition()
+    );
+    assert_eq!(
+        after.projection.facts.interpretation(),
+        before.projection.facts.interpretation()
+    );
+    assert_eq!(
+        after.projection.facts.versions(),
+        before.projection.facts.versions()
+    );
+    assert_eq!(
+        after.projection.facts.publication(),
+        before.projection.facts.publication()
+    );
+    fixture.assert_manageable();
+    drop(
+        fixture
+            .entrance
+            .acquire(fixture.management_request(), || false)
+            .unwrap(),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_only_current_renewal_refuses_a_changed_carrier_on_its_actual_read() {
+    use novarocks_mv_application::process_runtime::ProcessRuntime;
+    use novarocks_mv_application::readiness::MvKeyedReadinessService;
+    let fixture = Fixture::new(vec![]);
+    let repository = crate::mv::domain::test_admission::keyed_repository().await;
+    let service = MvKeyedReadinessService::new(repository, Arc::new(ProcessRuntime::default()));
+    let readiness = crate::mv::domain::readiness::MvReadinessPort::from_product(
+        service.clone(),
+        tokio::runtime::Handle::current(),
+        fixture.entrance.clone(),
+    );
+    let source = ManagedTargetCurrentSource {
+        entrance: &fixture.entrance,
+        connector_control: &fixture.resolver,
+        published: None,
+        convergence: MvConvergence::AdmittedCurrent,
+    };
+    service
+        .observe_and_install(uuid::Uuid::now_v7(), fixture.request(), &source)
+        .await
+        .unwrap();
+    let before = service.load_ready(&fixture.target).await.unwrap().unwrap();
+    fixture.caps.advance_to_committed_slot();
+    let error = super::install_metadata_only_current_projection(
+        &fixture.entrance,
+        &readiness,
+        &fixture.resolver,
+        fixture.catalog.clone(),
+        Arc::new(before.projection.facts.clone()),
+        context(),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("carrier changed during metadata-only Current renewal"),
+        "{error}"
+    );
+    assert!(service.load_ready(&fixture.target).await.is_err());
+    assert_eq!(
+        *fixture.caps.events.lock().unwrap(),
+        vec!["capture", "observe", "capture", "observe"]
+    );
 }

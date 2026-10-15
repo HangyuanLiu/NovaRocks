@@ -507,6 +507,52 @@ pub(crate) fn install_admitted_current_projection(
     )
 }
 
+/// Renew the exact metadata generation after external metadata maintenance.
+/// The actual installation read must retain every current MV carrier fact.
+pub(crate) fn install_metadata_only_current_projection(
+    entrance: &ManagementEntrance,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    catalog: CatalogHandle,
+    expected: std::sync::Arc<
+        novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection,
+    >,
+    context: ConnectorRequestContext,
+) -> Result<(), String> {
+    install_current_projection(
+        entrance,
+        readiness,
+        connector_control,
+        catalog,
+        expected.target(),
+        uuid::Uuid::now_v7(),
+        None,
+        MvConvergence::MetadataOnlyCurrent { expected },
+        context,
+        "metadata-maintained",
+    )
+}
+
+pub(crate) fn metadata_only_current_matches(
+    expected: &novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection,
+    observed: &novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+) -> bool {
+    let source = expected.source_revision();
+    observed.view.table == source.target
+        && observed.view.object_id == source.target_object_id
+        && observed.view.current_snapshot == expected.metadata_version().snapshot_id()
+        && observed.publication_snapshot == expected.publication_snapshot()
+        && observed.deployment_owner == source.deployment_owner
+        && observed.process_incarnation == source.process_incarnation
+        && observed.configuration_revision == source.configuration_revision
+        && observed.publication_revision == source.publication_revision
+        && &observed.definition == expected.definition()
+        && &observed.interpretation == expected.interpretation()
+        && &observed.versions == expected.versions()
+        && &observed.configuration == expected.configuration()
+        && observed.publication.as_ref() == expected.publication()
+}
+
 /// Install the Current projection of a target this statement just published.
 ///
 /// The publication wrote P into the same commit as its rows, so the projection
@@ -635,6 +681,12 @@ enum MvConvergence {
     /// A manageable target remains admitted after a configuration observation
     /// or resolved slot change; its live admission is renewed from Current.
     AdmittedCurrent,
+    /// Only metadata generation may change while retaining the same carrier.
+    MetadataOnlyCurrent {
+        expected: std::sync::Arc<
+            novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection,
+        >,
+    },
     /// An effect this process committed must be re-observed before management
     /// reopens.
     CommittedEffect,
@@ -793,11 +845,18 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             request.context().clone(),
         );
         let mut state = match &self.convergence {
-            MvConvergence::AdmittedCurrent => {
+            MvConvergence::AdmittedCurrent | MvConvergence::MetadataOnlyCurrent { .. } => {
                 let (observed, admission, _) = self
                     .entrance
                     .observe_keyed_admission(&documents, observation, request.decode_budget())
                     .map_err(|e| conflict(format!("observe admitted MV Current: {e}")))?;
+                if let MvConvergence::MetadataOnlyCurrent { expected } = &self.convergence {
+                    if !metadata_only_current_matches(expected, &observed) {
+                        return Err(conflict(
+                            "MV carrier changed during metadata-only Current renewal".into(),
+                        ));
+                    }
+                }
                 return Ok((observed, admission));
             }
             MvConvergence::CommittedEffect => self.entrance.begin_committed_convergence(

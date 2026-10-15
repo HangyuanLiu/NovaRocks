@@ -386,6 +386,121 @@ fn exact_version<'a>(
     }
     Ok(value)
 }
+fn decode_keyed_binding_documents(
+    view: &KeyedDocumentView,
+    binding_id: DocumentIdentity,
+    configuration_content: &[u8],
+    publication_payload: Option<&[u8]>,
+    budget: PersistenceDecodeBudget,
+) -> Result<(DefinitionDocument, InterpretationDocument, MvKeyedVersions), MvDocumentError> {
+    let b = exact_version(view, binding_id, "binding", 1)?;
+    let d_id = *b
+        .references()
+        .get("definition")
+        .ok_or_else(|| MvDocumentError::Contract("binding lacks definition reference".into()))?;
+    let l_id = *b.references().get("interpretation").ok_or_else(|| {
+        MvDocumentError::Contract("binding lacks interpretation reference".into())
+    })?;
+    if b.references().len() != 2 {
+        return contract("binding has unexpected references");
+    }
+    let d = exact_version(view, d_id, "definition", 1)?;
+    let l = exact_version(view, l_id, "interpretation", 2)?;
+    if !d.references().is_empty()
+        || l.references() != &BTreeMap::from([("definition".into(), d_id)])
+    {
+        return contract("invalid D/L document reference closure");
+    }
+    preflight_keyed_document_set(
+        d.content(),
+        l.content(),
+        b.content(),
+        configuration_content,
+        publication_payload,
+        budget,
+    )?;
+    let definition = decode_definition(d.content(), budget)?;
+    let interpretation = decode_keyed_interpretation(l.content(), budget)?;
+    let binding = decode_binding(b.content(), budget)?;
+    super::validation::validate_definition_interpretation(
+        &definition,
+        revision(d_id),
+        &interpretation,
+    )?;
+    if interpretation.target.object_id.as_bytes() != view.object_id.as_bytes().as_ref() {
+        return contract("interpretation binds a different target object");
+    }
+    if binding.data_versions.len() != definition.relation_occurrences.len() {
+        return contract("binding occurrence count differs from definition");
+    }
+    let versions = MvKeyedVersions {
+        definition: d.clone(),
+        interpretation: l.clone(),
+        binding: b.clone(),
+        binding_document: binding,
+    };
+    Ok((definition, interpretation, versions))
+}
+
+/// Strict root facts used solely for deletion of an already admitted target.
+/// This is neither a current data projection nor a readmission capability.
+pub(crate) struct MvKeyedDropDocuments {
+    pub target: ManagedMvTarget,
+    pub owner: DeploymentOwner,
+    pub incarnation: ProcessIncarnation,
+    pub versions: MvKeyedVersions,
+    pub configuration_revision: DocumentRevision,
+}
+
+pub(crate) fn decode_keyed_drop_documents(
+    view: &KeyedDocumentView,
+    catalog: CatalogHandle,
+    budget: PersistenceDecodeBudget,
+) -> Result<MvKeyedDropDocuments, MvDocumentError> {
+    if view.metadata_version.snapshot_id() != view.current_snapshot
+        || catalog.catalog_name() != &view.table.instance_id
+        || view.owner.instance_id != view.table.instance_id
+    {
+        return contract("MV DROP keyed catalog or current metadata scope mismatch");
+    }
+    let target = ManagedMvTarget::try_new(catalog, view.table.clone(), view.object_id.clone())
+        .map_err(|error| MvDocumentError::Contract(error.to_string()))?;
+    let management = view
+        .slots
+        .get(&management_slot_name()?)
+        .ok_or_else(|| MvDocumentError::Contract("missing MV management slot".into()))?;
+    let (owner, incarnation) = decode_management_slot(&management.value)?;
+    let configuration = view
+        .slots
+        .get(&configuration_slot_name()?)
+        .ok_or_else(|| MvDocumentError::Contract("missing MV configuration slot".into()))?;
+    if configuration.value.format != format("configuration", 1)? {
+        return contract("unsupported MV configuration slot format");
+    }
+    decode_configuration(&configuration.value.content, budget)?;
+    let root = view
+        .roots
+        .get(MV_DOCUMENT_OWNER)
+        .filter(|root| !root.dangling)
+        .ok_or_else(|| MvDocumentError::Contract("MV binding root is absent or dangling".into()))?;
+    let (_, _, versions) = decode_keyed_binding_documents(
+        view,
+        root.identity,
+        &configuration.value.content,
+        None,
+        budget,
+    )?;
+    Ok(MvKeyedDropDocuments {
+        target,
+        owner,
+        incarnation,
+        versions,
+        configuration_revision: DocumentRevision::from_canonical_bytes(
+            &configuration.value.content,
+        ),
+    })
+}
+
 pub fn decode_current_keyed_documents(
     view: KeyedDocumentView,
     catalog: CatalogHandle,
@@ -443,24 +558,6 @@ pub fn decode_current_keyed_documents(
                 MvDocumentError::Contract("MV binding root is absent or dangling".into())
             })?,
     };
-    let b = exact_version(&view, binding_id, "binding", 1)?;
-    let d_id = *b
-        .references()
-        .get("definition")
-        .ok_or_else(|| MvDocumentError::Contract("binding lacks definition reference".into()))?;
-    let l_id = *b.references().get("interpretation").ok_or_else(|| {
-        MvDocumentError::Contract("binding lacks interpretation reference".into())
-    })?;
-    if b.references().len() != 2 {
-        return contract("binding has unexpected references");
-    }
-    let d = exact_version(&view, d_id, "definition", 1)?;
-    let l = exact_version(&view, l_id, "interpretation", 2)?;
-    if !d.references().is_empty()
-        || l.references() != &BTreeMap::from([("definition".into(), d_id)])
-    {
-        return contract("invalid D/L document reference closure");
-    }
     if let Some(record) = record {
         let bytes = "novarocks.doc.v2.record.novarocks.mv~publication".len()
             + 2
@@ -473,36 +570,21 @@ pub fn decode_current_keyed_documents(
             ));
         }
     }
-    preflight_keyed_document_set(
-        d.content(),
-        l.content(),
-        b.content(),
+    let (definition, interpretation, versions) = decode_keyed_binding_documents(
+        &view,
+        binding_id,
         &c.value.content,
         record.map(|r| r.payload.as_ref()),
         budget,
     )?;
-    let definition = decode_definition(d.content(), budget)?;
-    let interpretation = decode_keyed_interpretation(l.content(), budget)?;
-    let binding = decode_binding(b.content(), budget)?;
-    super::validation::validate_definition_interpretation(
-        &definition,
-        revision(d_id),
-        &interpretation,
-    )?;
-    if interpretation.target.object_id.as_bytes() != view.object_id.as_bytes().as_ref() {
-        return contract("interpretation binds a different target object");
-    }
-    if binding.data_versions.len() != definition.relation_occurrences.len() {
-        return contract("binding occurrence count differs from definition");
-    }
     let publication = record
         .map(|r| {
             decode_publication_payload(
                 &r.payload,
                 &definition,
-                revision(d_id),
-                revision(l_id),
-                &binding,
+                versions.definition_revision(),
+                versions.interpretation_revision(),
+                &versions.binding_document,
             )
         })
         .transpose()?;
@@ -515,12 +597,6 @@ pub fn decode_current_keyed_documents(
             })
         })
         .transpose()?;
-    let versions = MvKeyedVersions {
-        definition: d.clone(),
-        interpretation: l.clone(),
-        binding: b.clone(),
-        binding_document: binding,
-    };
     Ok(MvKeyedObservedCurrentDocuments {
         management_target,
         deployment_owner: owner,
@@ -705,17 +781,31 @@ pub fn observe_current_keyed_documents_with_management(
     MvDocumentError,
 > {
     let catalog = request.catalog_handle.clone();
+    let (view, convergence) = observe_current_keyed_view_with_management(lease, request, entrance)?;
+    let observed = decode_current_keyed_documents(view, catalog, budget)?;
+    Ok((observed, convergence))
+}
+
+pub(crate) fn observe_current_keyed_view_with_management(
+    lease: &ConnectorDocumentStorageLease,
+    request: KeyedDocumentObservationRequest,
+    entrance: &crate::management::ManagementEntrance,
+) -> Result<(KeyedDocumentView, crate::management::SlotChangeConvergence), MvDocumentError> {
+    let catalog = request.catalog_handle.clone();
     let mut view = lease
         .observe_keyed_documents(request.clone())
         .map_err(MvDocumentError::KeyedStorage)?;
+    // Revocation grants no authority. A generic reader may still return valid
+    // foreign-owned facts for a read-only projection; corrupt P remains an error.
+    entrance.revoke_foreign_current_management(&view, &catalog)?;
     let convergence = entrance.resolve_pending_slot_changes(lease, request.clone())?;
     if convergence.reinstall_current_projection {
         view = lease
             .observe_keyed_documents(request)
             .map_err(MvDocumentError::KeyedStorage)?;
+        entrance.revoke_foreign_current_management(&view, &catalog)?;
     }
-    let observed = decode_current_keyed_documents(view, catalog, budget)?;
-    Ok((observed, convergence))
+    Ok((view, convergence))
 }
 
 #[cfg(any(test, feature = "test-support"))]

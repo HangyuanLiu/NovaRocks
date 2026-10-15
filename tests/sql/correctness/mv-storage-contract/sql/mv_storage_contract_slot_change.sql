@@ -154,9 +154,14 @@ DROP MATERIALIZED VIEW IF EXISTS first_slot_mv;
 DROP MATERIALIZED VIEW IF EXISTS unknown_slot_mv;
 DROP TABLE mvslot_${uuid0}.ns_${uuid0}.fact FORCE;
 DROP DATABASE mvslot_${uuid0}.ns_${uuid0};
-DROP CATALOG mvslot_${uuid0};
 
 -- query 22
 -- @cleanup=true
 -- @skip_result_check=true
 shell: rm -f "${TMPDIR:-/tmp}/novarocks-slot-before-${uuid0}.json" "${TMPDIR:-/tmp}/novarocks-slot-same-${uuid0}.json"
+
+-- query 23
+-- Detach even if earlier object cleanup failed, before another case restarts FE.
+-- @cleanup=true
+-- @skip_result_check=true
+DROP CATALOG mvslot_${uuid0};

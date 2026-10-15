@@ -78,10 +78,15 @@ fn request_context() -> ConnectorRequestContext {
 struct KeyedManagementObservationCaps {
     descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
     epoch: ProviderBindingEpoch,
-    reply: Result<
-        novarocks_spi::connector::KeyedDocumentView,
-        novarocks_spi::connector::KeyedDocumentReadError,
+    reply: std::sync::Mutex<
+        Result<
+            novarocks_spi::connector::KeyedDocumentView,
+            novarocks_spi::connector::KeyedDocumentReadError,
+        >,
     >,
+    after_resolution: std::sync::Mutex<Option<novarocks_spi::connector::KeyedDocumentView>>,
+    conclusions:
+        std::sync::Mutex<std::collections::VecDeque<novarocks_spi::connector::CommitConclusion>>,
     calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -109,7 +114,7 @@ impl novarocks_spi::connector::ConnectorDocumentStorageObservation
         novarocks_spi::connector::KeyedDocumentReadError,
     > {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.reply.clone()
+        self.reply.lock().unwrap().clone()
     }
     fn observe_full_keyed_documents(
         &self,
@@ -136,7 +141,21 @@ impl novarocks_spi::connector::ConnectorDocumentStorageObservation
         _evidence: novarocks_spi::connector::UnknownCommitEvidence,
     ) -> Result<novarocks_spi::connector::CommitConclusion, novarocks_spi::connector::ConnectorError>
     {
-        Err(unused_keyed_management_test_capability())
+        let conclusion = self
+            .conclusions
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(unused_keyed_management_test_capability)?;
+        if matches!(
+            conclusion,
+            novarocks_spi::connector::CommitConclusion::Committed(_)
+        ) {
+            if let Some(view) = self.after_resolution.lock().unwrap().take() {
+                *self.reply.lock().unwrap() = Ok(view);
+            }
+        }
+        Ok(conclusion)
     }
     fn discover_documents(
         &self,
@@ -198,6 +217,21 @@ fn keyed_management_lease(
     novarocks_spi::connector::KeyedDocumentObservationRequest,
     Arc<std::sync::atomic::AtomicUsize>,
 ) {
+    let (lease, request, caps) = keyed_management_lease_with_caps(target, reply);
+    (lease, request, Arc::clone(&caps.calls))
+}
+
+fn keyed_management_lease_with_caps(
+    target: &ManagedMvTarget,
+    reply: Result<
+        novarocks_spi::connector::KeyedDocumentView,
+        novarocks_spi::connector::KeyedDocumentReadError,
+    >,
+) -> (
+    novarocks_spi::connector::ConnectorDocumentStorageLease,
+    novarocks_spi::connector::KeyedDocumentObservationRequest,
+    Arc<KeyedManagementObservationCaps>,
+) {
     use novarocks_spi::connector::*;
     let epoch = ProviderBindingEpoch::from_bytes([7; 16]);
     let descriptor = ConnectorInstanceDescriptor {
@@ -208,12 +242,18 @@ fn keyed_management_lease(
     let observation = Arc::new(KeyedManagementObservationCaps {
         descriptor: descriptor.clone(),
         epoch,
-        reply,
+        reply: std::sync::Mutex::new(reply),
+        after_resolution: std::sync::Mutex::new(None),
+        conclusions: std::sync::Mutex::new(std::collections::VecDeque::new()),
         calls: Arc::clone(&calls),
     });
-    let documents =
-        ConnectorDocumentStorageBinding::try_new(descriptor, epoch, Some(observation), None)
-            .unwrap();
+    let documents = ConnectorDocumentStorageBinding::try_new(
+        descriptor,
+        epoch,
+        Some(observation.clone()),
+        None,
+    )
+    .unwrap();
     let properties = CatalogProperties::new(
         target.catalog().clone(),
         ConnectorProviderId::parse("iceberg").unwrap(),
@@ -239,7 +279,7 @@ fn keyed_management_lease(
         object_id: target.object_id().clone(),
         context: request_context(),
     };
-    (lease, request, calls)
+    (lease, request, observation)
 }
 
 fn observe_keyed_management_mismatch(
@@ -3286,4 +3326,802 @@ fn keyed_create_narrowing_rejects_another_logical_target_before_provider_io() {
         ManagementObservationError::EffectTargetMismatch
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// Seed admission through a retained native observation, without constructing
+/// FreshManagementObservation or a full-observation token in the test.
+fn installed_keyed_drop_fixture() -> (
+    ManagementEntrance,
+    ManagedMvTarget,
+    ManagementDependencySet,
+    novarocks_spi::connector::ConnectorDocumentStorageLease,
+    novarocks_spi::connector::KeyedDocumentObservationRequest,
+    Arc<KeyedManagementObservationCaps>,
+) {
+    use crate::persistence::{
+        keyed_documents::{decode_current_keyed_documents, management_slot, management_slot_name},
+        test_support::{KeyedProjectionFixture, observed_current_keyed},
+    };
+    let target = target("drop-mv", b"drop-object");
+    let mut fixture = KeyedProjectionFixture::new(
+        crate::product::MvTarget::from_parts(Some("iceberg"), "db", "drop-mv"),
+        Some(2),
+    );
+    fixture.object_id = target.object_id().clone();
+    let facts = fixture.build().unwrap();
+    let mut view = observed_current_keyed(&facts, target.catalog().clone()).view;
+    view.owner.incarnation = ProviderBindingEpoch::from_bytes([7; 16]);
+    view.slots
+        .get_mut(&management_slot_name().unwrap())
+        .unwrap()
+        .value = management_slot(&owner("deployment-a"), &incarnation("inc-a")).unwrap();
+    let (lease, request, caps) = keyed_management_lease_with_caps(&target, Ok(view));
+    let mut observation = ManagementObservationState::try_new(
+        target.clone(),
+        owner("deployment-a"),
+        incarnation("inc-a"),
+        ManagementContinuation::SameOwner {
+            previous_incarnation: incarnation("inc-a"),
+        },
+        vec![],
+        None,
+        None,
+    )
+    .unwrap();
+    let pending = observation
+        .begin_current_observation(ManagementObservationRequestId::from_bytes([93; 16]))
+        .unwrap();
+    let (phase, view) = observation
+        .complete_keyed_current_observation(pending, &lease, request.clone())
+        .unwrap();
+    assert_eq!(phase, ManagementObservationPhase::Ready);
+    let documents =
+        decode_current_keyed_documents(view, target.catalog().clone(), Default::default()).unwrap();
+    assert!(documents.publication.is_some());
+    let dependencies = documents.management_dependencies(lease.control_runtime_id());
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
+    entrance
+        .install_observed_target(&observation, dependencies.clone())
+        .unwrap();
+    (entrance, target, dependencies, lease, request, caps)
+}
+
+#[test]
+fn keyed_drop_of_external_data_snapshot_preserves_current_projection_refusal() {
+    use crate::persistence::keyed_documents::decode_current_keyed_documents;
+    let (entrance, target, _, lease, request, caps) = installed_keyed_drop_fixture();
+    let original = caps.reply.lock().unwrap().as_ref().unwrap().clone();
+    let mut external = original.clone();
+    external.current_snapshot = Some(3);
+    external.metadata_version =
+        ConnectorCommittedVersion::try_new(Bytes::from_static(b"external"), Some(3)).unwrap();
+    external.current_records.clear();
+    *caps.reply.lock().unwrap() = Ok(external.clone());
+    assert!(
+        decode_current_keyed_documents(external, target.catalog().clone(), Default::default())
+            .is_err()
+    );
+    assert!(
+        entrance
+            .observe_keyed_admission(&lease, request.clone(), Default::default())
+            .is_err()
+    );
+    let (first, _) = entrance
+        .observe_keyed_drop(&lease, request.clone(), Default::default())
+        .unwrap();
+    assert_eq!(first.target(), &target);
+    let mut management = entrance.acquire(first.request(), || false).unwrap();
+    let (second, _) = entrance
+        .observe_keyed_drop(&lease, request, Default::default())
+        .unwrap();
+    assert!(first.matches(&second));
+    management
+        .mark_dispatched(EffectResponsibility::new(
+            EffectIdentity::from_bytes([94; 16]),
+            target.clone(),
+            incarnation("inc-a"),
+            EffectScope::CATALOG_AND_OBJECT_DELETION,
+            ManagementTimestamp::from_unix_millis(1_000),
+        ))
+        .unwrap();
+    management
+        .record_drop_terminal(EffectDisposition::KnownCommitted)
+        .unwrap();
+    assert_eq!(
+        entrance.management_phase(target.table()),
+        MvManagementPhase::NotObserved
+    );
+    // This management-only operation did not change the provider's data facts.
+    let retained = caps.reply.lock().unwrap().as_ref().unwrap().clone();
+    assert!(retained.current_records.is_empty());
+    assert!(
+        decode_current_keyed_documents(retained, target.catalog().clone(), Default::default())
+            .is_err()
+    );
+    assert!(!original.current_records.is_empty());
+}
+
+#[test]
+fn keyed_drop_refuses_foreign_owner_and_incarnation_without_renewing_admission() {
+    use crate::persistence::keyed_documents::{management_slot, management_slot_name};
+    for (marker_owner, marker_incarnation, expected) in [
+        ("deployment-b", "inc-a", MvManagementPhase::OwnerMismatch),
+        (
+            "deployment-a",
+            "inc-b",
+            MvManagementPhase::IncarnationMismatch,
+        ),
+    ] {
+        let (entrance, target, _, lease, request, caps) = installed_keyed_drop_fixture();
+        caps.reply
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .slots
+            .get_mut(&management_slot_name().unwrap())
+            .unwrap()
+            .value =
+            management_slot(&owner(marker_owner), &incarnation(marker_incarnation)).unwrap();
+        assert!(
+            entrance
+                .observe_keyed_drop(&lease, request, Default::default())
+                .is_err()
+        );
+        assert_eq!(entrance.management_phase(target.table()), expected);
+    }
+}
+
+#[test]
+fn keyed_drop_refuses_exact_scope_changes_before_observation() {
+    for wrong_catalog in [false, true] {
+        let (entrance, target, _, lease, mut request, caps) = installed_keyed_drop_fixture();
+        let calls = caps.calls.load(std::sync::atomic::Ordering::SeqCst);
+        if wrong_catalog {
+            request.catalog_handle = catalog(2);
+        } else {
+            request.object_id = object(b"replacement");
+        }
+        assert!(
+            entrance
+                .observe_keyed_drop(&lease, request, Default::default())
+                .is_err()
+        );
+        assert_eq!(caps.calls.load(std::sync::atomic::Ordering::SeqCst), calls);
+        assert_eq!(
+            entrance.management_phase(target.table()),
+            MvManagementPhase::Manageable
+        );
+    }
+    let (entrance, target, _, _lease, request, caps) = installed_keyed_drop_fixture();
+    let view = caps.reply.lock().unwrap().clone();
+    let (another_runtime, _, _) = keyed_management_lease(&target, view);
+    assert!(
+        entrance
+            .observe_keyed_drop(&another_runtime, request, Default::default())
+            .is_err()
+    );
+}
+
+#[test]
+fn keyed_drop_does_not_bypass_publication_unknown_or_committed_convergence() {
+    for disposition in [
+        EffectDisposition::CommitUnknown,
+        EffectDisposition::KnownCommitted,
+    ] {
+        let (entrance, target, dependencies, lease, request, _) = installed_keyed_drop_fixture();
+        let mut publication = entrance
+            .acquire(
+                ManagementRequest::try_new(
+                    target.catalog().clone(),
+                    target.table().clone(),
+                    Some(target.object_id().clone()),
+                    ConnectorDocumentManagementOperation::Publication,
+                    Some(dependencies),
+                    EffectScope::CATALOG_COMMIT,
+                )
+                .unwrap(),
+                || false,
+            )
+            .unwrap();
+        publication
+            .mark_dispatched(EffectResponsibility::new(
+                EffectIdentity::from_bytes([95; 16]),
+                target.clone(),
+                incarnation("inc-a"),
+                EffectScope::CATALOG_COMMIT,
+                ManagementTimestamp::from_unix_millis(1_000),
+            ))
+            .unwrap();
+        publication.record_terminal(disposition).unwrap();
+        assert!(
+            entrance
+                .observe_keyed_drop(&lease, request, Default::default())
+                .is_err()
+        );
+        assert_ne!(
+            entrance.management_phase(target.table()),
+            MvManagementPhase::Manageable
+        );
+    }
+}
+
+#[test]
+fn keyed_drop_reconciles_soft_slot_evidence_through_the_retained_lease() {
+    use novarocks_spi::connector::{
+        CommitConclusion, CommitProof, ConnectorSlotName, UnknownCommitEvidence,
+        UnknownCommitIdentity,
+    };
+    let (entrance, target, dependencies, lease, request, caps) = installed_keyed_drop_fixture();
+    let mut slot = entrance
+        .acquire(
+            ManagementRequest::try_new(
+                target.catalog().clone(),
+                target.table().clone(),
+                Some(target.object_id().clone()),
+                ConnectorDocumentManagementOperation::SingleTargetUpdate,
+                Some(dependencies),
+                EffectScope::CATALOG_COMMIT,
+            )
+            .unwrap(),
+            || false,
+        )
+        .unwrap();
+    slot.mark_dispatched(EffectResponsibility::new(
+        EffectIdentity::from_bytes([96; 16]),
+        target.clone(),
+        incarnation("inc-a"),
+        EffectScope::CATALOG_COMMIT,
+        ManagementTimestamp::from_unix_millis(1_000),
+    ))
+    .unwrap();
+    slot.record_slot_change_unknown(UnknownCommitEvidence {
+        asserted_parent: Some(2),
+        preselected_snapshot: 3,
+        identity: UnknownCommitIdentity::SlotWriter {
+            slot: ConnectorSlotName::try_new("novarocks.mv", "configuration").unwrap(),
+        },
+    })
+    .unwrap();
+    caps.conclusions.lock().unwrap().extend([
+        CommitConclusion::StillUnknown,
+        CommitConclusion::Committed(CommitProof::SlotWriter),
+    ]);
+    let (first, unknown) = entrance
+        .observe_keyed_drop(&lease, request.clone(), Default::default())
+        .unwrap();
+    assert!(unknown.conclusions.is_empty());
+    assert_eq!(entrance.pending_slot_changes(target.table()), 1);
+    assert_eq!(
+        entrance.management_phase(target.table()),
+        MvManagementPhase::Manageable
+    );
+    let before = caps.calls.load(std::sync::atomic::Ordering::SeqCst);
+    let (second, committed) = entrance
+        .observe_keyed_drop(&lease, request, Default::default())
+        .unwrap();
+    assert!(first.matches(&second));
+    assert!(committed.reinstall_current_projection);
+    assert_eq!(
+        caps.calls.load(std::sync::atomic::Ordering::SeqCst),
+        before + 2
+    );
+    assert_eq!(entrance.pending_slot_changes(target.table()), 0);
+    assert_eq!(
+        entrance.latest_slot_change_conclusion(target.table()),
+        Some(CommitConclusion::Committed(CommitProof::SlotWriter))
+    );
+    assert_eq!(
+        entrance.management_phase(target.table()),
+        MvManagementPhase::Manageable
+    );
+}
+
+#[test]
+fn keyed_drop_requires_an_intact_current_root_closure() {
+    let (entrance, target, _, lease, request, caps) = installed_keyed_drop_fixture();
+    {
+        let mut reply = caps.reply.lock().unwrap();
+        let view = reply.as_mut().unwrap();
+        let root = view.roots["novarocks.mv"].identity;
+        view.versions.remove(&root);
+    }
+    assert!(
+        entrance
+            .observe_keyed_drop(&lease, request, Default::default())
+            .is_err()
+    );
+    assert_eq!(
+        entrance.management_phase(target.table()),
+        MvManagementPhase::Manageable
+    );
+}
+
+#[test]
+fn fresh_foreign_keyed_admission_closes_old_authority_even_without_current_p() {
+    use crate::persistence::keyed_documents::{management_slot, management_slot_name};
+    for publication in ["valid", "missing", "malformed"] {
+        let (entrance, target, dependencies, lease, request, caps) = installed_keyed_drop_fixture();
+        let (_, prior_admission, _) = entrance
+            .observe_keyed_admission(&lease, request.clone(), Default::default())
+            .unwrap();
+        assert!(prior_admission.is_open());
+        {
+            let mut reply = caps.reply.lock().unwrap();
+            let view = reply.as_mut().unwrap();
+            view.slots
+                .get_mut(&management_slot_name().unwrap())
+                .unwrap()
+                .value = management_slot(&owner("deployment-b"), &incarnation("inc-b")).unwrap();
+            match publication {
+                "missing" => view.current_records.clear(),
+                "malformed" => {
+                    view.current_records[0].payload = Bytes::from_static(b"invalid MV P")
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            entrance
+                .observe_keyed_admission(&lease, request, Default::default())
+                .is_err()
+        );
+        assert!(!prior_admission.is_open());
+        assert_eq!(
+            entrance.management_phase(target.table()),
+            MvManagementPhase::OwnerMismatch
+        );
+        let request = ManagementRequest::try_new(
+            target.catalog().clone(),
+            target.table().clone(),
+            Some(target.object_id().clone()),
+            ConnectorDocumentManagementOperation::Publication,
+            Some(dependencies),
+            EffectScope::CATALOG_COMMIT,
+        )
+        .unwrap();
+        assert!(entrance.acquire(request, || false).is_err());
+    }
+}
+
+#[test]
+fn keyed_drop_freezes_configuration_content_and_rejects_changed_root_semantics() {
+    use crate::persistence::{
+        codec::decode_configuration,
+        keyed_documents::{
+            configuration_slot_name, keyed_configuration_slot_change, management_slot_name,
+        },
+        test_support::{KeyedProjectionFixture, observed_current_keyed},
+    };
+    let (entrance, target, _, lease, request, caps) = installed_keyed_drop_fixture();
+    let (first, _) = entrance
+        .observe_keyed_drop(&lease, request.clone(), Default::default())
+        .unwrap();
+    {
+        let mut reply = caps.reply.lock().unwrap();
+        let view = reply.as_mut().unwrap();
+        let slot = view
+            .slots
+            .get_mut(&configuration_slot_name().unwrap())
+            .unwrap();
+        let mut configuration =
+            decode_configuration(&slot.value.content, Default::default()).unwrap();
+        configuration.paused = !configuration.paused;
+        slot.value = keyed_configuration_slot_change(&configuration)
+            .unwrap()
+            .slots
+            .into_values()
+            .next()
+            .unwrap();
+    }
+    let (second, _) = entrance
+        .observe_keyed_drop(&lease, request.clone(), Default::default())
+        .unwrap();
+    assert!(!first.matches(&second));
+    let mut changed = KeyedProjectionFixture::new(
+        crate::product::MvTarget::from_parts(Some("iceberg"), "db", "drop-mv"),
+        Some(2),
+    )
+    .with_retraction_count();
+    changed.object_id = target.object_id().clone();
+    let mut view = observed_current_keyed(&changed.build().unwrap(), target.catalog().clone()).view;
+    let old = caps.reply.lock().unwrap().as_ref().unwrap().clone();
+    view.owner = old.owner;
+    view.slots.insert(
+        management_slot_name().unwrap(),
+        old.slots[&management_slot_name().unwrap()].clone(),
+    );
+    *caps.reply.lock().unwrap() = Ok(view);
+    assert!(
+        entrance
+            .observe_keyed_drop(&lease, request, Default::default())
+            .is_err()
+    );
+}
+
+#[test]
+fn keyed_drop_revokes_foreign_management_before_corrupt_configuration_or_root() {
+    use crate::persistence::keyed_documents::{
+        configuration_slot_name, management_slot, management_slot_name,
+    };
+    use novarocks_spi::connector::{
+        CommitConclusion, CommitProof, ConnectorSlotName, UnknownCommitEvidence,
+        UnknownCommitIdentity,
+    };
+    for after_resolution in [false, true] {
+        for corrupt_configuration in [false, true] {
+            let (entrance, target, dependencies, lease, request, caps) =
+                installed_keyed_drop_fixture();
+            let (_, prior, _) = entrance
+                .observe_keyed_admission(&lease, request.clone(), Default::default())
+                .unwrap();
+            let old_request = ManagementRequest::try_new(
+                target.catalog().clone(),
+                target.table().clone(),
+                Some(target.object_id().clone()),
+                ConnectorDocumentManagementOperation::Publication,
+                Some(dependencies.clone()),
+                EffectScope::CATALOG_COMMIT,
+            )
+            .unwrap();
+            let mut slot = entrance
+                .acquire(
+                    ManagementRequest::try_new(
+                        target.catalog().clone(),
+                        target.table().clone(),
+                        Some(target.object_id().clone()),
+                        ConnectorDocumentManagementOperation::SingleTargetUpdate,
+                        Some(dependencies),
+                        EffectScope::CATALOG_COMMIT,
+                    )
+                    .unwrap(),
+                    || false,
+                )
+                .unwrap();
+            slot.mark_dispatched(EffectResponsibility::new(
+                EffectIdentity::from_bytes([97; 16]),
+                target.clone(),
+                incarnation("inc-a"),
+                EffectScope::CATALOG_COMMIT,
+                ManagementTimestamp::from_unix_millis(1_000),
+            ))
+            .unwrap();
+            slot.record_slot_change_unknown(UnknownCommitEvidence {
+                asserted_parent: Some(2),
+                preselected_snapshot: 3,
+                identity: UnknownCommitIdentity::SlotWriter {
+                    slot: ConnectorSlotName::try_new("novarocks.mv", "configuration").unwrap(),
+                },
+            })
+            .unwrap();
+            let mut foreign = caps.reply.lock().unwrap().as_ref().unwrap().clone();
+            foreign
+                .slots
+                .get_mut(&management_slot_name().unwrap())
+                .unwrap()
+                .value = management_slot(&owner("deployment-b"), &incarnation("inc-b")).unwrap();
+            if corrupt_configuration {
+                foreign
+                    .slots
+                    .get_mut(&configuration_slot_name().unwrap())
+                    .unwrap()
+                    .value
+                    .content = Bytes::new();
+            } else {
+                foreign.roots.get_mut("novarocks.mv").unwrap().dangling = true;
+            }
+            caps.conclusions
+                .lock()
+                .unwrap()
+                .push_back(CommitConclusion::Committed(CommitProof::SlotWriter));
+            if after_resolution {
+                *caps.after_resolution.lock().unwrap() = Some(foreign);
+            } else {
+                *caps.reply.lock().unwrap() = Ok(foreign);
+            }
+            assert!(
+                entrance
+                    .observe_keyed_drop(&lease, request, Default::default())
+                    .is_err()
+            );
+            assert!(!prior.is_open());
+            assert_eq!(
+                entrance.management_phase(target.table()),
+                MvManagementPhase::OwnerMismatch
+            );
+            assert!(entrance.acquire(old_request, || false).is_err());
+            assert_eq!(
+                entrance.pending_slot_changes(target.table()),
+                usize::from(!after_resolution)
+            );
+            assert_eq!(
+                caps.conclusions.lock().unwrap().len(),
+                usize::from(!after_resolution)
+            );
+        }
+    }
+}
+
+#[test]
+fn keyed_drop_corrupt_configuration_or_root_still_refuses_for_the_matching_owner() {
+    use crate::persistence::keyed_documents::configuration_slot_name;
+    for corrupt_configuration in [false, true] {
+        let (entrance, _, _, lease, request, caps) = installed_keyed_drop_fixture();
+        let (_, prior, _) = entrance
+            .observe_keyed_admission(&lease, request.clone(), Default::default())
+            .unwrap();
+        {
+            let mut reply = caps.reply.lock().unwrap();
+            let view = reply.as_mut().unwrap();
+            if corrupt_configuration {
+                view.slots
+                    .get_mut(&configuration_slot_name().unwrap())
+                    .unwrap()
+                    .value
+                    .content = Bytes::new();
+            } else {
+                view.roots.get_mut("novarocks.mv").unwrap().dangling = true;
+            }
+        }
+        assert!(
+            entrance
+                .observe_keyed_drop(&lease, request, Default::default())
+                .is_err()
+        );
+        assert!(prior.is_open());
+    }
+}
+
+#[test]
+fn keyed_drop_foreign_scope_does_not_revoke_another_targets_authority() {
+    use crate::persistence::keyed_documents::{management_slot, management_slot_name};
+    for foreign_catalog in [false, true] {
+        let (entrance, target, dependencies, lease, mut request, caps) =
+            installed_keyed_drop_fixture();
+        let (_, prior, _) = entrance
+            .observe_keyed_admission(&lease, request.clone(), Default::default())
+            .unwrap();
+        {
+            let mut reply = caps.reply.lock().unwrap();
+            let view = reply.as_mut().unwrap();
+            view.slots
+                .get_mut(&management_slot_name().unwrap())
+                .unwrap()
+                .value = management_slot(&owner("deployment-b"), &incarnation("inc-b")).unwrap();
+            if foreign_catalog {
+                request.catalog_handle = catalog(2);
+            } else {
+                view.object_id = object(b"another-current-object");
+            }
+        }
+        assert!(
+            entrance
+                .observe_keyed_drop(&lease, request, Default::default())
+                .is_err()
+        );
+        assert!(prior.is_open());
+        assert_eq!(
+            entrance.management_phase(target.table()),
+            MvManagementPhase::Manageable
+        );
+        drop(
+            entrance
+                .acquire(
+                    ManagementRequest::try_new(
+                        target.catalog().clone(),
+                        target.table().clone(),
+                        Some(target.object_id().clone()),
+                        ConnectorDocumentManagementOperation::Publication,
+                        Some(dependencies),
+                        EffectScope::CATALOG_COMMIT,
+                    )
+                    .unwrap(),
+                    || false,
+                )
+                .unwrap(),
+        );
+    }
+}
+
+#[test]
+fn shared_current_reader_revokes_foreign_authority_before_publication_decoding() {
+    use crate::persistence::keyed_documents::{
+        management_slot, management_slot_name, observe_current_keyed_documents_with_management,
+    };
+    for publication in ["valid", "missing", "malformed"] {
+        let (entrance, target, dependencies, lease, request, caps) = installed_keyed_drop_fixture();
+        let (_, prior, _) = entrance
+            .observe_keyed_admission(&lease, request.clone(), Default::default())
+            .unwrap();
+        {
+            let mut reply = caps.reply.lock().unwrap();
+            let view = reply.as_mut().unwrap();
+            view.slots
+                .get_mut(&management_slot_name().unwrap())
+                .unwrap()
+                .value = management_slot(&owner("deployment-b"), &incarnation("inc-b")).unwrap();
+            match publication {
+                "missing" => view.current_records.clear(),
+                "malformed" => view.current_records[0].payload = Bytes::from_static(b"invalid P"),
+                _ => {}
+            }
+        }
+        let before = caps.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let result = observe_current_keyed_documents_with_management(
+            &lease,
+            request,
+            Default::default(),
+            &entrance,
+        );
+        assert_eq!(
+            caps.calls.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1
+        );
+        if publication == "valid" {
+            let (foreign, _) = result.unwrap();
+            assert_eq!(foreign.deployment_owner, owner("deployment-b"));
+            assert_eq!(foreign.process_incarnation, incarnation("inc-b"));
+            assert!(foreign.publication.is_some());
+        } else {
+            assert!(result.is_err());
+        }
+        assert!(!prior.is_open());
+        assert_eq!(
+            entrance.management_phase(target.table()),
+            MvManagementPhase::OwnerMismatch
+        );
+        assert!(
+            entrance
+                .acquire(
+                    ManagementRequest::try_new(
+                        target.catalog().clone(),
+                        target.table().clone(),
+                        Some(target.object_id().clone()),
+                        ConnectorDocumentManagementOperation::Publication,
+                        Some(dependencies),
+                        EffectScope::CATALOG_COMMIT,
+                    )
+                    .unwrap(),
+                    || false
+                )
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn shared_current_reader_revokes_from_the_actual_post_resolution_reload() {
+    use crate::persistence::keyed_documents::{
+        management_slot, management_slot_name, observe_current_keyed_documents_with_management,
+    };
+    use novarocks_spi::connector::{
+        CommitConclusion, CommitProof, ConnectorSlotName, UnknownCommitEvidence,
+        UnknownCommitIdentity,
+    };
+    let (entrance, target, dependencies, lease, request, caps) = installed_keyed_drop_fixture();
+    let (_, prior, _) = entrance
+        .observe_keyed_admission(&lease, request.clone(), Default::default())
+        .unwrap();
+    let old_request = ManagementRequest::try_new(
+        target.catalog().clone(),
+        target.table().clone(),
+        Some(target.object_id().clone()),
+        ConnectorDocumentManagementOperation::Publication,
+        Some(dependencies.clone()),
+        EffectScope::CATALOG_COMMIT,
+    )
+    .unwrap();
+    let mut slot = entrance
+        .acquire(
+            ManagementRequest::try_new(
+                target.catalog().clone(),
+                target.table().clone(),
+                Some(target.object_id().clone()),
+                ConnectorDocumentManagementOperation::SingleTargetUpdate,
+                Some(dependencies),
+                EffectScope::CATALOG_COMMIT,
+            )
+            .unwrap(),
+            || false,
+        )
+        .unwrap();
+    slot.mark_dispatched(EffectResponsibility::new(
+        EffectIdentity::from_bytes([98; 16]),
+        target.clone(),
+        incarnation("inc-a"),
+        EffectScope::CATALOG_COMMIT,
+        ManagementTimestamp::from_unix_millis(1_000),
+    ))
+    .unwrap();
+    slot.record_slot_change_unknown(UnknownCommitEvidence {
+        asserted_parent: Some(2),
+        preselected_snapshot: 3,
+        identity: UnknownCommitIdentity::SlotWriter {
+            slot: ConnectorSlotName::try_new("novarocks.mv", "configuration").unwrap(),
+        },
+    })
+    .unwrap();
+    let mut foreign = caps.reply.lock().unwrap().as_ref().unwrap().clone();
+    foreign
+        .slots
+        .get_mut(&management_slot_name().unwrap())
+        .unwrap()
+        .value = management_slot(&owner("deployment-b"), &incarnation("inc-b")).unwrap();
+    foreign.current_records[0].payload = Bytes::from_static(b"invalid P after resolver");
+    *caps.after_resolution.lock().unwrap() = Some(foreign);
+    caps.conclusions
+        .lock()
+        .unwrap()
+        .push_back(CommitConclusion::Committed(CommitProof::SlotWriter));
+    let before = caps.calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        observe_current_keyed_documents_with_management(
+            &lease,
+            request,
+            Default::default(),
+            &entrance
+        )
+        .is_err()
+    );
+    assert_eq!(
+        caps.calls.load(std::sync::atomic::Ordering::SeqCst),
+        before + 2
+    );
+    assert!(!prior.is_open());
+    assert_eq!(
+        entrance.management_phase(target.table()),
+        MvManagementPhase::OwnerMismatch
+    );
+    assert!(entrance.acquire(old_request, || false).is_err());
+    assert_eq!(entrance.pending_slot_changes(target.table()), 0);
+}
+
+#[test]
+fn shared_current_reader_foreign_scope_does_not_revoke_another_target() {
+    use crate::persistence::keyed_documents::{
+        management_slot, management_slot_name, observe_current_keyed_documents_with_management,
+    };
+    let (entrance, target, dependencies, lease, request, caps) = installed_keyed_drop_fixture();
+    let (_, prior, _) = entrance
+        .observe_keyed_admission(&lease, request.clone(), Default::default())
+        .unwrap();
+    {
+        let mut reply = caps.reply.lock().unwrap();
+        let view = reply.as_mut().unwrap();
+        view.object_id = object(b"unrelated-object");
+        view.slots
+            .get_mut(&management_slot_name().unwrap())
+            .unwrap()
+            .value = management_slot(&owner("deployment-b"), &incarnation("inc-b")).unwrap();
+    }
+    assert!(
+        observe_current_keyed_documents_with_management(
+            &lease,
+            request,
+            Default::default(),
+            &entrance
+        )
+        .is_err()
+    );
+    assert!(prior.is_open());
+    assert_eq!(
+        entrance.management_phase(target.table()),
+        MvManagementPhase::Manageable
+    );
+    drop(
+        entrance
+            .acquire(
+                ManagementRequest::try_new(
+                    target.catalog().clone(),
+                    target.table().clone(),
+                    Some(target.object_id().clone()),
+                    ConnectorDocumentManagementOperation::Publication,
+                    Some(dependencies),
+                    EffectScope::CATALOG_COMMIT,
+                )
+                .unwrap(),
+                || false,
+            )
+            .unwrap(),
+    );
 }

@@ -3114,7 +3114,7 @@ fn refresh_connector_preparation_error(error: ConnectorError) -> RefreshError {
 /// refresh reaches publication admission. Observe the provider's Current
 /// marker first so another incarnation closes this process's admission even
 /// when later planning fails against the changed metadata generation.
-fn close_management_on_current_management_mismatch(
+fn reobserve_current_management_before_refresh(
     source: &IcebergMvCorePorts,
     target: &IcebergMvTarget,
     context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -3159,13 +3159,13 @@ fn close_management_on_current_management_mismatch(
         binding.object_id,
         context.clone(),
     );
-    source
+    let observed = source
         .readiness()
         .candidate_reader()
         .observe_current(&documents_lease, request.clone())?;
     let closed = source
         .management_entrance()?
-        .close_on_keyed_current_management_mismatch(&documents_lease, request)
+        .close_on_keyed_current_management_mismatch(&documents_lease, request.clone())
         .map_err(|e| e.to_string())?;
     if closed {
         tracing::warn!(
@@ -3174,6 +3174,33 @@ fn close_management_on_current_management_mismatch(
             name = %target.table,
             "fresh Current MV management slot names another writer; management closed"
         );
+    }
+    if !closed {
+        let ready = source
+            .readiness()
+            .load_ready(&MvTarget {
+                catalog: Some(target.catalog.clone()),
+                database: target.namespace.clone(),
+                name: target.table.clone(),
+            })
+            .map_err(|error| error.to_string())?;
+        if let Some(ready) = ready {
+            let expected = &ready.projection.facts;
+            if expected.metadata_version() != &observed.view.metadata_version
+                && crate::mv::domain::staged_create::metadata_only_current_matches(
+                    expected, &observed,
+                )
+            {
+                crate::mv::domain::staged_create::install_metadata_only_current_projection(
+                    source.management_entrance()?.as_ref(),
+                    source.readiness().as_ref(),
+                    source.connector_control(),
+                    request.catalog_handle.clone(),
+                    std::sync::Arc::new(expected.clone()),
+                    context.clone(),
+                )?;
+            }
+        }
     }
     Ok(closed)
 }
@@ -3195,10 +3222,10 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
     // MV facts. A snapshot fence may rebuild sealed Current only as a
     // read-only candidate; this path has no authority to readmit management
     // readiness and therefore still fails the refresh.
-    // Historical v1/v2 recovery stays in the legacy execution adapter; a
-    // current frontend-owned attempt must never perform recovery before its
-    // durable v3 intent exists.
-    if close_management_on_current_management_mismatch(source, &iceberg_target, connector_context)
+    // Metadata maintenance may renew an existing admission only while its
+    // carrier facts remain identical. This observation cannot recover an old
+    // document format or reopen management without explicit readmission.
+    if reobserve_current_management_before_refresh(source, &iceberg_target, connector_context)
         .map_err(RefreshError::user)?
     {
         return Err(RefreshError::user(
@@ -5209,8 +5236,6 @@ fn prepare_iceberg_mv_drop_management(
     target: &IcebergMvTarget,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Option<PreparedIcebergMvDrop>, String> {
-    use novarocks_mv_application::management::{EffectScope, ManagedMvTarget, ManagementRequest};
-    use novarocks_spi::connector::document_storage::ConnectorDocumentManagementOperation;
     use novarocks_spi::connector::{
         ConnectorControlResolver, ConnectorTableIdentity, ConnectorTableObjectCaptureRequest,
         ConnectorTableObjectSelector, ConnectorTableResolution,
@@ -5237,11 +5262,6 @@ fn prepare_iceberg_mv_drop_management(
     let control =
         ConnectorControlResolver::acquire_current(ports.connector_control(), &instance_id)
             .map_err(|error| format!("acquire MV DROP catalog: {error}"))?;
-    let catalog_handle = control
-        .binding()
-        .catalog_handle()
-        .map_err(|error| format!("bind MV DROP catalog: {error}"))?
-        .clone();
     let binding = control
         .binding()
         .metadata()
@@ -5268,48 +5288,23 @@ fn prepare_iceberg_mv_drop_management(
             binding.object_id.clone(),
             context.clone(),
         );
-        ports
-            .readiness()
-            .candidate_reader()
-            .observe_current(&documents_lease, request.clone())?;
-        let (observed, _, _) = entrance
-            .observe_keyed_admission(
-                &documents_lease,
-                request,
-                novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(
-                ),
-            )
-            .map_err(|e| e.to_string())?;
-        Ok::<_, String>(observed)
+        entrance
+            .observe_keyed_drop(&documents_lease, request, Default::default())
+            .map(|(observation, _)| observation)
+            .map_err(|error| error.to_string())
     };
     let first_documents = observe()?;
-    let dependencies = first_documents.management_dependencies(control.control_runtime_id());
     let management = entrance
-        .acquire(
-            ManagementRequest::try_new(
-                catalog_handle,
-                table.clone(),
-                Some(binding.object_id.clone()),
-                ConnectorDocumentManagementOperation::Drop,
-                Some(dependencies.clone()),
-                EffectScope::CATALOG_AND_OBJECT_DELETION,
-            )
-            .map_err(|error| format!("build MV DROP admission: {error:?}"))?,
-            || context.is_cancelled(),
-        )
+        .acquire(first_documents.request(), || context.is_cancelled())
         .map_err(|error| format!("admit MV DROP: {error:?}"))?;
     let documents = observe()?;
-    if documents.management_dependencies(control.control_runtime_id()) != dependencies
-        || documents.view.object_id != binding.object_id
-        || documents.deployment_owner != *entrance.owner()
-        || documents.process_incarnation != *entrance.incarnation()
-    {
-        return Err("MV DROP target changed or is not owned by this process".to_string());
+    if !first_documents.matches(&documents) {
+        return Err("MV DROP target changed before dispatch admission".to_string());
     }
     let mutation_lease = control
         .derive_mutation_lease()
         .map_err(|error| format!("derive MV DROP mutation lease: {error}"))?;
-    let exact_target = documents.management_target.clone();
+    let exact_target = documents.target().clone();
     Ok(Some(PreparedIcebergMvDrop {
         entrance_lease: Some(management),
         mutation_lease,
