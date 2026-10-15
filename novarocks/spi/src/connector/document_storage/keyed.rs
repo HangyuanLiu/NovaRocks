@@ -667,7 +667,14 @@ impl std::fmt::Display for KeyedDocumentReadError {
         }
     }
 }
-impl std::error::Error for KeyedDocumentReadError {}
+impl std::error::Error for KeyedDocumentReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Invalid(error) => Some(error),
+            Self::LegacyFormat { .. } => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
