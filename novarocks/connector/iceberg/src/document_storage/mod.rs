@@ -33,3 +33,5 @@ mod retention;
 
 pub use create::IcebergDocumentStorage;
 pub(crate) use retention::retained_sidecars_for_roots;
+
+pub(crate) mod keyed;
