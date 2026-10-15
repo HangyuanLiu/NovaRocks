@@ -406,8 +406,11 @@ fn consumer(binding_id: u32) -> FilterConsumerAtExpr {
             binding_id,
             7,
             FilterConsumerActivation::BlockingSnapshot,
-            StaticFilterContract::membership(&DataType::Int64, FilterNullSemantics::NeverMatches)
-                .expect("membership contract"),
+            StaticFilterContract::membership(
+                &novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                FilterNullSemantics::NeverMatches,
+            )
+            .expect("membership contract"),
             FilterReduction::SetUnion,
         )
         .expect("blocking membership consumer"),

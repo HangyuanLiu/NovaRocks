@@ -1249,47 +1249,30 @@ fn freeze_unpivot_constant(value: super::unpivot::UnpivotConstant) -> lp::Unpivo
 
 fn freeze_filter_contract(
     contract: &rf::RuntimeFilterExecutionContract,
-) -> lp::StaticFilterContract {
+) -> Result<lp::StaticFilterContract> {
     match contract {
         rf::RuntimeFilterExecutionContract::Membership(schema) => {
-            lp::StaticFilterContract::Membership {
-                data_type: schema.data_type().clone(),
-                null_semantics: match schema.null_semantics() {
-                    rf::RuntimeFilterNullSemantics::NeverMatches => {
-                        lp::FilterNullSemantics::NeverMatches
-                    }
-                    rf::RuntimeFilterNullSemantics::NullSafeEqual => {
-                        lp::FilterNullSemantics::NullSafeEqual
-                    }
-                },
-                digest: schema.digest(),
-            }
+            let value_type = schema.value_type().ok_or_else(|| LocalProgramLoweringError::new(
+                "runtime-filter membership contract has no complete execution declaration"))?;
+            lp::StaticFilterContract::membership_from_canonical(
+                schema.canonical_schema().clone(), value_type.clone(),
+            ).map_err(|cause| LocalProgramLoweringError::new(cause.to_string()))
         }
-        rf::RuntimeFilterExecutionContract::Ordered(order) => lp::StaticFilterContract::Ordered {
-            keys: order
-                .keys()
-                .iter()
-                .map(|key| lp::FilterOrderKey {
-                    data_type: key.data_type().clone(),
-                    direction: match key.direction() {
-                        rf::contribution::RuntimeOrderSortDirection::Ascending => {
-                            lp::FilterSortDirection::Ascending
-                        }
-                        rf::contribution::RuntimeOrderSortDirection::Descending => {
-                            lp::FilterSortDirection::Descending
-                        }
-                    },
-                    null_order: match key.null_order() {
-                        rf::contribution::RuntimeOrderNullOrder::First => {
-                            lp::FilterNullOrder::First
-                        }
-                        rf::contribution::RuntimeOrderNullOrder::Last => lp::FilterNullOrder::Last,
-                    },
-                })
-                .collect(),
-            comparator_digest: order.comparator_digest(),
-            contract_digest: order.digest(),
-        },
+        rf::RuntimeFilterExecutionContract::Ordered(order) => Ok(lp::StaticFilterContract::Ordered {
+            keys: order.keys().iter().map(|key| Ok(lp::FilterOrderKey {
+                value_type: key.value_type().ok_or_else(|| LocalProgramLoweringError::new(
+                    "runtime-filter ordered key has no complete execution declaration"))?.clone(),
+                direction: match key.direction() {
+                    rf::contribution::RuntimeOrderSortDirection::Ascending => lp::FilterSortDirection::Ascending,
+                    rf::contribution::RuntimeOrderSortDirection::Descending => lp::FilterSortDirection::Descending,
+                },
+                null_order: match key.null_order() {
+                    rf::contribution::RuntimeOrderNullOrder::First => lp::FilterNullOrder::First,
+                    rf::contribution::RuntimeOrderNullOrder::Last => lp::FilterNullOrder::Last,
+                },
+            })).collect::<Result<Vec<_>>>()?.into(),
+            comparator_digest: order.comparator_digest(), contract_digest: order.digest(),
+        }),
     }
 }
 
@@ -1336,7 +1319,7 @@ fn freeze_consumer(binding: &RuntimeFilterConsumerBinding) -> Result<lp::StaticF
         contract.binding_id().get(),
         contract.channel_id().get(),
         activation,
-        freeze_filter_contract(contract.contract()),
+        freeze_filter_contract(contract.contract())?,
         freeze_reduction(contract.reduction())?,
     )
     .map_err(|error| LocalProgramLoweringError::new(error.to_string()))
@@ -1355,7 +1338,7 @@ fn freeze_producer(
         contract.binding_id().get(),
         contract.channel_id().get(),
         kind,
-        freeze_filter_contract(contract.contract()),
+        freeze_filter_contract(contract.contract())?,
         freeze_reduction(contract.reduction())?,
     )
     .map_err(|error| LocalProgramLoweringError::new(error.to_string()))

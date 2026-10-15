@@ -127,11 +127,11 @@ fn metadata_source_program(
             7,
             8,
             FilterProducerKind::Membership,
-            StaticFilterContract::Membership {
-                data_type: DataType::Int64,
-                null_semantics: FilterNullSemantics::NeverMatches,
-                digest: [1; 32],
-            },
+            StaticFilterContract::membership(
+                &novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                FilterNullSemantics::NeverMatches,
+            )
+            .unwrap(),
             FilterReduction::SetUnion,
         )
         .unwrap();
@@ -171,7 +171,10 @@ fn metadata_source_program(
             FilterProducerKind::OrderedBound,
             StaticFilterContract::Ordered {
                 keys: Arc::from([FilterOrderKey {
-                    data_type: DataType::Int64,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                     direction: FilterSortDirection::Ascending,
                     null_order: FilterNullOrder::Last,
                 }]),

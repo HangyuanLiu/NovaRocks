@@ -50,7 +50,7 @@ pub enum FilterNullOrder {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FilterOrderKey {
-    pub data_type: DataType,
+    pub value_type: novarocks_type_contract::FunctionValueType,
     pub direction: FilterSortDirection,
     pub null_order: FilterNullOrder,
 }
@@ -58,9 +58,8 @@ pub struct FilterOrderKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StaticFilterContract {
     Membership {
-        data_type: DataType,
-        null_semantics: FilterNullSemantics,
-        digest: [u8; 32],
+        canonical: FilterMembershipSchema,
+        value_type: novarocks_type_contract::FunctionValueType,
     },
     Ordered {
         keys: Arc<[FilterOrderKey]>,
@@ -140,18 +139,36 @@ impl StaticFilterContract {
     /// canonical membership schema. This is the only way a compiler obtains
     /// the digest a runtime consumer and producer verify.
     pub fn membership(
-        data_type: &DataType,
+        value_type: &novarocks_type_contract::FunctionValueType,
         null_semantics: FilterNullSemantics,
     ) -> Result<Self, FilterMembershipSchemaError> {
-        let schema = FilterMembershipSchema::try_new(data_type, null_semantics)?;
+        let canonical = FilterMembershipSchema::try_new(value_type.data_type(), null_semantics)?;
         Ok(Self::Membership {
-            data_type: schema.data_type().clone(),
-            null_semantics,
-            digest: schema.digest(),
+            canonical,
+            value_type: value_type.clone(),
         })
     }
 
+    /// Adopt the original immutable artifact and independent complete domain.
+    /// No canonical bytes or type tree are rebuilt here.
+    pub fn membership_from_canonical(
+        canonical: FilterMembershipSchema,
+        value_type: novarocks_type_contract::FunctionValueType,
+    ) -> Result<Self, StaticFilterError> {
+        let contract = Self::Membership {
+            canonical,
+            value_type,
+        };
+        contract.validate()?;
+        Ok(contract)
+    }
+
     fn validate(&self) -> Result<(), StaticFilterError> {
+        if matches!(self, Self::Membership { canonical, value_type } if canonical.data_type() != value_type.data_type())
+        {
+            return Err(StaticFilterError::KindContractMismatch);
+        }
+
         if matches!(self, Self::Ordered { keys, .. } if keys.is_empty()) {
             return Err(StaticFilterError::EmptyOrderedKeys);
         }
@@ -647,12 +664,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn complete_domain_and_original_canonical_are_paired_without_semantic_inference() {
+        use novarocks_type_contract::{FunctionValueType as V, ValueLogicalType};
+        let canonical =
+            FilterMembershipSchema::try_new(&DataType::Utf8, FilterNullSemantics::NeverMatches)
+                .unwrap();
+        let text = StaticFilterContract::membership_from_canonical(
+            canonical.clone(),
+            V::new(DataType::Utf8, false),
+        )
+        .unwrap();
+        let json = StaticFilterContract::membership_from_canonical(
+            canonical.clone(),
+            V::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(
+            text, json,
+            "equal artifact bytes do not author complete execution domains"
+        );
+        assert!(matches!(
+            StaticFilterContract::membership_from_canonical(
+                canonical,
+                V::new(DataType::Int64, false)
+            ),
+            Err(StaticFilterError::KindContractMismatch)
+        ));
+    }
+
+    #[test]
     fn rejects_role_mismatch_before_binding_a_session() {
-        let contract = StaticFilterContract::Membership {
-            data_type: DataType::Int64,
-            null_semantics: FilterNullSemantics::NeverMatches,
-            digest: [3; 32],
-        };
+        let contract = StaticFilterContract::membership(
+            &novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            FilterNullSemantics::NeverMatches,
+        )
+        .unwrap();
         assert!(matches!(
             StaticFilterProducer::try_new(
                 1,
@@ -689,11 +735,13 @@ mod tests {
             Ok(schema.clone())
         );
         assert_eq!(
-            StaticFilterContract::membership(&DataType::Int32, FilterNullSemantics::NullSafeEqual),
+            StaticFilterContract::membership(
+                &novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+                FilterNullSemantics::NullSafeEqual
+            ),
             Ok(StaticFilterContract::Membership {
-                data_type: DataType::Int32,
-                null_semantics: FilterNullSemantics::NullSafeEqual,
-                digest: schema.digest(),
+                canonical: schema.clone(),
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
             })
         );
     }

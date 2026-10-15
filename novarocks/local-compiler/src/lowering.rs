@@ -344,7 +344,8 @@ fn lower_with_creation<H, F: novarocks_type_contract::ValueSchemaCreationFactory
     // Provider reads and writes are admitted per scan and writer below; each
     // local runtime-filter endpoint is admitted here and later lowered by its
     // own scan or join.
-    let mut runtime_filters = crate::runtime_filter::plan_runtime_filters(package, &reads, work)?;
+    let mut runtime_filters =
+        crate::runtime_filter::plan_runtime_filters(package, &reads, factory, work)?;
     // The result port exists exactly for a Result sink; a stream producer
     // has no result labels and never borrows another fragment's port.
     let result = package.result();

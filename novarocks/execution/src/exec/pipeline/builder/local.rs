@@ -310,23 +310,14 @@ fn runtime_filter_contract(
 ) -> Result<execution::RuntimeFilterExecutionContract, String> {
     match contract {
         lp::StaticFilterContract::Membership {
-            data_type,
-            null_semantics,
-            digest,
+            canonical,
+            value_type,
         } => {
-            let null_semantics = match null_semantics {
-                lp::FilterNullSemantics::NeverMatches => {
-                    execution::RuntimeFilterNullSemantics::NeverMatches
-                }
-                lp::FilterNullSemantics::NullSafeEqual => {
-                    execution::RuntimeFilterNullSemantics::NullSafeEqual
-                }
-            };
-            let schema = execution::RuntimeFilterMembershipSchema::new(data_type, null_semantics)
-                .map_err(|error| error.to_string())?;
-            if schema.digest() != *digest {
-                return Err("local program membership filter digest mismatch".to_string());
-            }
+            let schema = execution::RuntimeFilterMembershipSchema::from_canonical_value_type(
+                canonical.clone(),
+                value_type.clone(),
+            )
+            .map_err(|error| error.to_string())?;
             Ok(execution::RuntimeFilterExecutionContract::Membership(
                 schema,
             ))
@@ -339,8 +330,8 @@ fn runtime_filter_contract(
             let keys = keys
                 .iter()
                 .map(|key| {
-                    execution::contribution::RuntimeOrderKey::with_order(
-                        key.data_type.clone(),
+                    execution::contribution::RuntimeOrderKey::with_value_type(
+                        key.value_type.clone(),
                         match key.direction {
                             lp::FilterSortDirection::Ascending => {
                                 execution::contribution::RuntimeOrderSortDirection::Ascending

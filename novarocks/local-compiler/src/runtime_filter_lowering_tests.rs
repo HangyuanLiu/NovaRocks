@@ -922,7 +922,11 @@ fn filter_requirements(program: &LocalProgram) -> Vec<i32> {
 }
 
 fn membership(null_semantics: FilterNullSemantics) -> StaticFilterContract {
-    StaticFilterContract::membership(&DataType::Int64, null_semantics).unwrap()
+    StaticFilterContract::membership(
+        &nullable_int64(matches!(null_semantics, FilterNullSemantics::NullSafeEqual)),
+        null_semantics,
+    )
+    .unwrap()
 }
 
 /// The join's one membership producer: binding `binding`, channel FILTER,

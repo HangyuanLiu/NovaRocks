@@ -155,6 +155,22 @@ pub struct RuntimeFilterMembershipSchema {
 }
 
 impl RuntimeFilterMembershipSchema {
+    pub fn from_canonical_value_type(
+        canonical: FilterMembershipSchema,
+        value_type: novarocks_functions::FunctionValueType,
+    ) -> Result<Self, RuntimeFilterContractViolation> {
+        if canonical.data_type() != value_type.data_type() {
+            return Err(RuntimeFilterContractViolation::new(
+                RuntimeFilterContractViolationKind::ContractMismatch,
+                "membership canonical carrier differs from complete execution declaration",
+            ));
+        }
+        Ok(Self {
+            canonical,
+            complete_type: Some(value_type),
+        })
+    }
+
     pub fn new(
         data_type: &DataType,
         null_semantics: RuntimeFilterNullSemantics,
