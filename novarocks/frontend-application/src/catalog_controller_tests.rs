@@ -29,6 +29,7 @@
 //!
 //! Each test below pins one of those, by observing behaviour rather than shape.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -37,7 +38,9 @@ use super::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::application::{
     FrontendApplicationErrorKind, FrontendApplicationHost, FrontendExecutionConfig,
 };
-use crate::catalog_application::{CatalogRuntimeProjection, MvCatalogReferenceReader};
+use crate::catalog_application::{
+    CatalogAdmissionObserver, CatalogRuntimeProjection, MvCatalogReferenceReader,
+};
 use crate::state_store::testing as state_store_fixture;
 use crate::topology::ClusterBackendOpenConfig;
 use novarocks_catalog_application::ConnectorControlHost;
@@ -69,7 +72,7 @@ use novarocks_state_store_api::{
     WriteTransaction,
 };
 use novarocks_state_store_runtime::StateStoreHost;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -392,21 +395,54 @@ fn create_command(name: &str) -> CatalogCreateCommand {
     }
 }
 
+struct CatalogReadyObserver {
+    admitted: watch::Sender<BTreeSet<ConnectorInstanceId>>,
+}
+
+impl CatalogAdmissionObserver for CatalogReadyObserver {
+    fn catalog_admitted(&self, instance_id: &ConnectorInstanceId) {
+        self.admitted.send_modify(|admitted| {
+            admitted.insert(instance_id.clone());
+        });
+    }
+}
+
+struct ObservedCatalogPort {
+    service: Arc<CatalogApplicationService>,
+    observer: Arc<CatalogReadyObserver>,
+}
+
+impl std::ops::Deref for ObservedCatalogPort {
+    type Target = Arc<CatalogApplicationService>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.service
+    }
+}
+
 fn port_with(
     source: CatalogDesiredStateSource,
     factory: SelectivelyFailingFactory,
-) -> (Arc<ConnectorControlHost>, Arc<CatalogApplicationService>) {
+) -> (Arc<ConnectorControlHost>, ObservedCatalogPort) {
     let control = Arc::new(
         ConnectorControlHost::with_role_factories(vec![Arc::new(factory)]).expect("control host"),
     );
-    let port = Arc::new(CatalogApplicationService::new(
+    let projection = CatalogRuntimeProjection::new();
+    let observer = Arc::new(CatalogReadyObserver {
+        admitted: watch::channel(BTreeSet::new()).0,
+    });
+    let admission_observer: Arc<dyn CatalogAdmissionObserver> = observer.clone();
+    projection
+        .bind_admission_observer(&admission_observer)
+        .expect("bind test catalog readiness observer");
+    let service = Arc::new(CatalogApplicationService::new(
         source,
         Arc::clone(&control),
-        CatalogRuntimeProjection::new().publisher(),
+        projection.publisher(),
         tokio::runtime::Handle::current(),
         Arc::new(MvCatalogReferenceReader),
     ));
-    (control, port)
+    (control, ObservedCatalogPort { service, observer })
 }
 
 fn controller(
@@ -417,14 +453,29 @@ fn controller(
         .expect("catalog controller")
 }
 
-async fn ready_attachment_id(port: &CatalogApplicationService, name: &str) -> Uuid {
-    for _ in 0..100 {
-        if let CatalogAdmission::Ready(observation) = port.admit_catalog(&catalog(name)) {
-            return observation.attachment_id;
+async fn ready_attachment_id(port: &ObservedCatalogPort, name: &str) -> Uuid {
+    // Subscribe before reading admission: completion between the read and
+    // changed() remains visible. The publisher notifies only after installing
+    // Ready; a fixed number of task yields does not observe that completion.
+    let mut admitted = port.observer.admitted.subscribe();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let CatalogAdmission::Ready(observation) = port.admit_catalog(&catalog(name)) {
+                return observation.attachment_id;
+            }
+            admitted
+                .changed()
+                .await
+                .expect("test retains the catalog admission observer");
         }
-        tokio::task::yield_now().await;
-    }
-    panic!("catalog `{name}` did not become Ready after scheduler materialization")
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "catalog `{name}` did not become Ready after scheduler materialization: {:?}",
+            port.admit_catalog(&catalog(name))
+        )
+    })
 }
 
 async fn shutdown(mut host: StateStoreHost) {
