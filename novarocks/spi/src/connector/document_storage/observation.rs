@@ -1054,6 +1054,39 @@ impl ConnectorDocumentDiscoveryPage {
 }
 
 pub trait ConnectorDocumentStorageObservation: Send + Sync {
+    /// New inline observation. During the PR-local migration, old providers
+    /// reject this capability explicitly rather than synthesizing a view.
+    fn observe_keyed_documents(
+        &self,
+        _request: super::KeyedDocumentObservationRequest,
+    ) -> Result<super::KeyedDocumentView, super::KeyedDocumentReadError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "keyed document observation is not installed",
+        )
+        .into())
+    }
+    fn observe_full_keyed_documents(
+        &self,
+        _request: super::KeyedDocumentObservationRequest,
+    ) -> Result<super::FullKeyedDocumentView, super::KeyedDocumentReadError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "full keyed document observation is not installed",
+        )
+        .into())
+    }
+    fn resolve_keyed_commit(
+        &self,
+        _request: super::KeyedDocumentObservationRequest,
+        _evidence: super::UnknownCommitEvidence,
+    ) -> Result<super::CommitConclusion, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "keyed commit resolution is not installed",
+        ))
+    }
+
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn incarnation(&self) -> ProviderBindingEpoch;
 

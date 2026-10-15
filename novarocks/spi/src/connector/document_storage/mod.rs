@@ -23,6 +23,8 @@
 //! arbitrary table-property patch API.
 
 mod document;
+pub mod keyed;
+pub use keyed::*;
 mod observation;
 mod operation;
 mod retention;

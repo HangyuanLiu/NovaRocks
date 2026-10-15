@@ -886,6 +886,54 @@ impl ConnectorDocumentStorageLease {
         })
     }
 
+    pub fn observe_keyed_documents(
+        &self,
+        request: super::KeyedDocumentObservationRequest,
+    ) -> Result<super::KeyedDocumentView, super::KeyedDocumentReadError> {
+        self.validate_keyed_request(&request)?;
+        let view = self
+            .observation()?
+            .observe_keyed_documents(request.clone())?;
+        view.validate_for(&request)?;
+        Ok(view)
+    }
+    pub fn observe_full_keyed_documents(
+        &self,
+        request: super::KeyedDocumentObservationRequest,
+    ) -> Result<super::FullKeyedDocumentView, super::KeyedDocumentReadError> {
+        self.validate_keyed_request(&request)?;
+        let view = self
+            .observation()?
+            .observe_full_keyed_documents(request.clone())?;
+        view.current.validate_for(&request)?;
+        if view.token.owner() != &request.owner
+            || view.token.table() != &request.target
+            || view.token.object_id() != &request.object_id
+            || view.token.metadata_version() != &view.current.metadata_version
+        {
+            return Err(
+                invalid("full keyed observation token does not match its exact load").into(),
+            );
+        }
+        Ok(view)
+    }
+    pub fn resolve_keyed_commit(
+        &self,
+        request: super::KeyedDocumentObservationRequest,
+        evidence: super::UnknownCommitEvidence,
+    ) -> Result<super::CommitConclusion, ConnectorError> {
+        self.validate_keyed_request(&request)?;
+        self.observation()?.resolve_keyed_commit(request, evidence)
+    }
+    fn validate_keyed_request(
+        &self,
+        request: &super::KeyedDocumentObservationRequest,
+    ) -> Result<(), ConnectorError> {
+        request.validate()?;
+        validate_owner_key(&self.owner, &request.owner)?;
+        validate_catalog_handle(&self.catalog_handle, &request.catalog_handle)
+    }
+
     pub fn observe_documents(
         &self,
         request: ConnectorDocumentObservationRequest,
