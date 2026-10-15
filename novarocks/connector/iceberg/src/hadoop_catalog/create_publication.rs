@@ -205,17 +205,21 @@ impl PreparedCatalogDispatch for HadoopPreparedCreate {
                     "injected conditional existing response loss",
                 ))
             }
+            Ok(_)
+                if self
+                    .client
+                    .take_test_fault(HadoopCatalogTestFault::AfterConditionalUnsupported) =>
+            {
+                Err(FileError::new(
+                    FileErrorKind::Unsupported,
+                    "injected unsupported response after conditional storage operation",
+                ))
+            }
             value => value,
         };
         let definitely_exists = match conditional {
             Ok(ConditionalCreateOutcome::Created) => return self.applied(),
             Ok(ConditionalCreateOutcome::AlreadyExists) => true,
-            Err(error) if error.kind() == FileErrorKind::Unsupported => {
-                return not_dispatched(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    error.to_string(),
-                ));
-            }
             Err(_) => false,
         };
         #[cfg(test)]
@@ -564,5 +568,68 @@ mod tests {
                 .join("db/t/metadata/v1.metadata.json")
                 .exists()
         );
+    }
+    #[tokio::test]
+    async fn unsupported_after_conditional_storage_is_not_a_negative_proof() {
+        for existing in [false, true] {
+            for readable in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let (catalog, attempt, context, journal) =
+                    fixture(directory.path().to_str().unwrap(), true, existing).await;
+                let bytes = attempt.metadata_bytes.clone();
+                let facts = attempt.facts.clone();
+                let before = std::fs::read(&facts.metadata_location).ok();
+                catalog.inject_test_fault(HadoopCatalogTestFault::AfterConditionalUnsupported);
+                if !readable {
+                    catalog.inject_test_fault(HadoopCatalogTestFault::AuthoritativeV1Read);
+                }
+                let outcome = publish(catalog, attempt, true, context, &journal).await;
+                if !existing && readable {
+                    assert!(
+                        matches!(outcome, ExternalMutationOutcome::KnownCommitted { effect: ExternalMutationEffect::Applied, receipt, .. } if receipt == facts.table_uuid)
+                    );
+                } else {
+                    assert!(
+                        matches!(outcome, ExternalMutationOutcome::CommitUnknown { .. }),
+                        "a returned storage error has no not-dispatched stage: {outcome:?}"
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(&facts.metadata_location).unwrap(),
+                    before.unwrap_or(bytes.to_vec())
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_existing_v1_is_corrupt_after_definite_exists_but_unknown_after_response_loss()
+     {
+        for ambiguous in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (catalog, attempt, context, journal) =
+                fixture(directory.path().to_str().unwrap(), true, true).await;
+            std::fs::write(&attempt.facts.metadata_location, b"{").unwrap();
+            if ambiguous {
+                catalog.inject_test_fault(
+                    HadoopCatalogTestFault::AfterExistingConditionalResponseLoss,
+                );
+            }
+            let outcome = publish(catalog, attempt, true, context, &journal).await;
+            if ambiguous {
+                assert!(matches!(
+                    outcome,
+                    ExternalMutationOutcome::CommitUnknown { .. }
+                ));
+            } else {
+                assert!(
+                    matches!(outcome, ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == ConnectorMutationFailureKind::CorruptData)
+                );
+            }
+            assert_eq!(
+                std::fs::read(directory.path().join("db/t/metadata/v1.metadata.json")).unwrap(),
+                b"{"
+            );
+        }
     }
 }

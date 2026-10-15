@@ -148,6 +148,7 @@ pub(crate) enum HadoopCreateReconciliation {
 enum HadoopCatalogTestFault {
     BeforeConditionalRequest,
     AfterConditionalResponseLoss,
+    AfterConditionalUnsupported,
     AfterExistingConditionalResponseLoss,
     BeforeConditionalReadEvidenceExpiry,
     BeforeCanonicalDrop,
