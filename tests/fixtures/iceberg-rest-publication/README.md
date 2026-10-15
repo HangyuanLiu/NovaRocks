@@ -59,6 +59,15 @@ bounded NDJSON trace, exact mutation/object-I/O counters, request/response
 bodies, container log, and a manifest binding the evidence to the Git HEAD and
 exact image identities.
 
+The directory is checked before fixture actions. A failed run captures bounded
+live trace/metrics diagnostics before cleanup, retains the available work files,
+container log and identity, and records the original exit status separately from
+the container cleanup status. INT and TERM retain exit statuses 130 and 143.
+Diagnostic or cleanup failures do not replace the original failure. If copying
+the work files fails, the script preserves their original directory and prints
+its exact path. Missing diagnostics remain unavailable; a cleanup status alone
+does not prove that every service or HTTP actor has exited.
+
 For the V11 main-ref requirement oracle, run `run-v11.sh` with the same
 environment and artifact options. It includes the V07 scenarios, then tests
 four format-v3 tables. Two start without a main snapshot; two first publish a
