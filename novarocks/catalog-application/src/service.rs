@@ -121,6 +121,30 @@ struct ProjectionAttempt {
 struct CatalogMaterializer {
     identity: novarocks_spi::connector::CatalogScopeIdentity,
     factory: Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory>,
+    reader: Option<Arc<dyn novarocks_spi::connector::CatalogActivityReader>>,
+}
+
+#[derive(Default)]
+struct CatalogMaterializers {
+    current: BTreeMap<ConnectorInstanceId, CatalogMaterializer>,
+    draining: Vec<(
+        novarocks_spi::connector::CatalogScopeIdentity,
+        std::sync::Weak<dyn novarocks_spi::connector::CatalogActivityReader>,
+    )>,
+}
+impl CatalogMaterializers {
+    fn retain_draining(&mut self, owner: &CatalogMaterializer) {
+        self.draining
+            .retain(|(_, reader)| reader.strong_count() > 0);
+        if let Some(reader) = &owner.reader {
+            self.draining
+                .push((owner.identity.clone(), Arc::downgrade(reader)));
+        }
+    }
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.current.is_empty()
+    }
 }
 
 struct MaterializationSubmission {
@@ -205,7 +229,7 @@ pub struct CatalogApplicationService {
     runtime: Handle,
     projections: Mutex<BTreeMap<ConnectorInstanceId, LocalProjection>>,
     /// Desired-entry lifetime, independent of current/retiring generations.
-    catalog_materializers: Mutex<BTreeMap<ConnectorInstanceId, CatalogMaterializer>>,
+    catalog_materializers: Mutex<CatalogMaterializers>,
     complete_reachable_catalogs: Mutex<Option<BTreeSet<CatalogHandle>>>,
     next_generation: AtomicU64,
     scheduler: ProjectionScheduler,
@@ -225,7 +249,7 @@ impl CatalogApplicationService {
             runtime_publisher,
             runtime,
             projections: Mutex::new(BTreeMap::new()),
-            catalog_materializers: Mutex::new(BTreeMap::new()),
+            catalog_materializers: Mutex::new(CatalogMaterializers::default()),
             complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
             scheduler: ProjectionScheduler::new(CatalogMaterializationConfig::default()),
@@ -264,7 +288,7 @@ impl CatalogApplicationService {
             runtime_publisher,
             runtime,
             projections: Mutex::new(BTreeMap::new()),
-            catalog_materializers: Mutex::new(BTreeMap::new()),
+            catalog_materializers: Mutex::new(CatalogMaterializers::default()),
             complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
             scheduler: ProjectionScheduler::new(materialization_config),
@@ -779,18 +803,26 @@ impl CatalogApplicationService {
                     "catalog materialization owner lock is poisoned",
                 )
             })?;
-            let owner = owners
-                .entry(instance_id.clone())
-                .or_insert_with(|| CatalogMaterializer {
-                    identity: identity.clone(),
-                    factory: factory.open_catalog(identity.clone()),
-                });
-            if owner.identity != identity {
-                *owner = CatalogMaterializer {
-                    identity: identity.clone(),
-                    factory: factory.open_catalog(identity),
-                };
+            if owners
+                .current
+                .get(&instance_id)
+                .is_some_and(|owner| owner.identity != identity)
+            {
+                let old = owners.current.remove(&instance_id).expect("existing owner");
+                owners.retain_draining(&old);
             }
+            let owner = owners
+                .current
+                .entry(instance_id.clone())
+                .or_insert_with(|| {
+                    let opened = factory.open_catalog(identity.clone());
+                    let reader = opened.activity_reader();
+                    CatalogMaterializer {
+                        identity,
+                        factory: opened,
+                        reader,
+                    }
+                });
             Arc::clone(&owner.factory)
         };
         self.mark_unavailable(
@@ -1102,7 +1134,9 @@ impl CatalogApplicationService {
     fn retire_projection(&self, instance_id: &ConnectorInstanceId) {
         if let Ok(mut attempts) = self.scheduler.attempts.lock() {
             if let Ok(mut owners) = self.catalog_materializers.lock() {
-                owners.remove(instance_id);
+                if let Some(old) = owners.current.remove(instance_id) {
+                    owners.retain_draining(&old);
+                }
             }
             attempts.retain(|_, attempt| {
                 if &attempt.instance_id == instance_id {
@@ -1134,6 +1168,38 @@ impl CatalogApplicationService {
 }
 
 impl CatalogApplicationPort for CatalogApplicationService {
+    fn catalog_activity_sources(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::CatalogActivitySource>, CatalogApplicationError> {
+        let mut owners = self.catalog_materializers.lock().map_err(|_| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                "catalog activity owner lock is poisoned",
+            )
+        })?;
+        owners
+            .draining
+            .retain(|(_, reader)| reader.strong_count() > 0);
+        let mut sources = owners
+            .current
+            .values()
+            .map(|owner| novarocks_spi::connector::CatalogActivitySource {
+                identity: owner.identity.clone(),
+                current: true,
+                reader: owner.reader.clone(),
+            })
+            .collect::<Vec<_>>();
+        sources.extend(owners.draining.iter().filter_map(|(identity, weak)| {
+            weak.upgrade()
+                .map(|reader| novarocks_spi::connector::CatalogActivitySource {
+                    identity: identity.clone(),
+                    current: false,
+                    reader: Some(reader),
+                })
+        }));
+        Ok(sources)
+    }
+
     fn create_catalog(
         &self,
         command: CatalogCreateCommand,
@@ -2149,6 +2215,21 @@ mod tests {
         port.run_materialization(first_work).await;
         let first = control.acquire_current(&instance).expect("real G1 lease");
         let first_runtime = first.binding().control_runtime_id();
+        let sources = port.catalog_activity_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        let first_activity = sources[0]
+            .reader
+            .as_ref()
+            .expect("Iceberg reader")
+            .snapshot();
+        assert_eq!(first_activity.source_entry_id, identity);
+        assert_eq!(first_activity.generations.len(), 1);
+        assert_eq!(
+            first_activity.generations[0].generation.unwrap().as_bytes(),
+            &first.binding().incarnation().to_bytes()
+        );
+        drop(sources);
+
         let first_properties = first.binding().catalog_properties().unwrap().clone();
         assert_eq!(
             first_properties.credential_bindings(),
@@ -2171,6 +2252,20 @@ mod tests {
         port.run_materialization(second_work).await;
         let second = control.acquire_current(&instance).expect("real G2 lease");
         assert_ne!(first_runtime, second.binding().control_runtime_id());
+        let sources = port.catalog_activity_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        let both = sources[0].reader.as_ref().unwrap().snapshot();
+        assert_eq!(both.generations.len(), 2);
+        for lease in [&first, &second] {
+            assert!(
+                both.generations
+                    .iter()
+                    .any(|row| row.generation.unwrap().as_bytes()
+                        == &lease.binding().incarnation().to_bytes())
+            );
+        }
+        drop(sources);
+
         assert_eq!(
             first.binding().catalog_properties().unwrap(),
             &first_properties
@@ -2206,6 +2301,31 @@ mod tests {
         let replacement = replacement.expect("new attachment");
         assert!(!Arc::ptr_eq(&scoped_owner, &replacement.factory));
         port.run_materialization(replacement).await;
+        let sources = port.catalog_activity_sources().unwrap();
+        assert_eq!(
+            sources.len(),
+            2,
+            "replacement cannot hide the retained old scope"
+        );
+        assert_eq!(sources.iter().filter(|s| s.current).count(), 1);
+        assert!(
+            sources
+                .iter()
+                .any(|s| !s.current && s.identity.source_entry_id() == identity)
+        );
+        let current = sources.iter().find(|s| s.current).unwrap();
+        assert_ne!(current.identity.source_entry_id(), identity);
+        assert_eq!(
+            current
+                .reader
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .generations
+                .len(),
+            1
+        );
+        drop(sources);
         drop(first);
         drop(second);
         port.retire_projection(&instance);

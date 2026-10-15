@@ -49,6 +49,7 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
 pub const PROVIDER_ID: &str = "iceberg";
 
 pub mod access_binding;
+mod activity;
 mod authority_source;
 pub(crate) mod catalog;
 pub mod catalog_cache;

@@ -119,7 +119,7 @@ impl RestHttpClient {
                     Ok(result) => result,
                     Err(_) => {
                         return (
-                            DispatchStage::WrittenNoStatus(NoStatusCause::ReadTimeout),
+                            DispatchStage::WrittenNoStatus(NoStatusCause::DeadlineExceeded),
                             None,
                         );
                     }
@@ -688,7 +688,7 @@ mod tests {
             .await;
         assert_eq!(
             stage,
-            DispatchStage::WrittenNoStatus(NoStatusCause::ReadTimeout)
+            DispatchStage::WrittenNoStatus(NoStatusCause::DeadlineExceeded)
         );
         assert!(body.is_none());
         assert!(started.elapsed() < Duration::from_secs(1));

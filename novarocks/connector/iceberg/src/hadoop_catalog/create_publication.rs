@@ -249,6 +249,7 @@ impl PreparedCatalogDispatch for HadoopPreparedCreate {
                 let failure = crate::commit::attempt::before_dispatch_failure(&error);
                 refused(failure.kind(), failure.to_string())
             }
+            Err(error) => super::publication::unknown_error("conditional-create-readback", error),
             _ => unknown(
                 "conditional-create-readback",
                 "Hadoop conditional create has no exact positive acknowledgement or readback",

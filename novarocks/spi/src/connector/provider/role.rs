@@ -86,6 +86,10 @@ impl CatalogScopeIdentity {
 /// desired entry is removed or replaced. Each invocation builds an independent
 /// generation; only explicitly catalog-scoped provider state is shared.
 pub trait ProviderCatalogControlFactory: Send + Sync {
+    fn activity_reader(&self) -> Option<Arc<dyn super::CatalogActivityReader>> {
+        None
+    }
+
     fn materialize(
         &self,
         properties: NormalizedCatalogProperties,

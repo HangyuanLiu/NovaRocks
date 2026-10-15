@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod activity;
 mod definition;
 mod registry;
 mod role;
@@ -30,3 +31,8 @@ pub use role::{
     ProviderExecutionRoleFactory, ProviderRoleDefinition, SealedProviderRoleRegistry,
 };
 pub use types::{ProviderReadTypes, ProviderWriteTypes};
+
+pub use activity::{
+    CatalogActivityEvents, CatalogActivityPhase, CatalogActivityReader, CatalogActivitySnapshot,
+    CatalogActivitySource, CatalogGenerationActivity, CatalogPhaseActivity,
+};

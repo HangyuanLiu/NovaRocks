@@ -347,6 +347,7 @@ pub(crate) fn prepare_rest_staged_table(
     let finalization = stage
         .context(original)
         .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
+    let _finalizing = stage.journal.finalization_activity(entry);
     let bytes = document.take().ok_or_else(|| {
         RestStagedPrepareFailure::AppliedButUnusable(
             "REST stage-create response document is unavailable after attribution".into(),
@@ -903,8 +904,9 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             });
         }
         let stage_publication = StagePublication {
-            journal: crate::commit::attempt::observation::PublicationJournal::new(
+            journal: crate::commit::attempt::observation::PublicationJournal::for_runtime(
                 crate::commit::model::OperationToken::from_mutation(request.operation_id),
+                self.runtime.resources().catalog_runtime(),
             ),
             receipt: self.receipt(
                 request.operation_id,
@@ -977,6 +979,10 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                         );
                     }
                 };
+                let _finalizing = stage_publication
+                    .journal
+                    .current_entry()
+                    .and_then(|entry| stage_publication.journal.finalization_activity(entry));
                 let table_location = staged.table.metadata().location().to_string();
                 // Past this point the staged create has been dispatched and
                 // accepted, so no local failure may still be reported as

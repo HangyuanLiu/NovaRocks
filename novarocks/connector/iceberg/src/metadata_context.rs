@@ -196,6 +196,7 @@ impl IcebergMetadataContext {
         let binding = resources.planning_binding().clone();
         let build_control = control.clone();
         let iceberg_runtime = resources.catalog_runtime().iceberg_runtime().clone();
+        let activity = resources.catalog_runtime().activity().cloned();
         let catalog = resources
             .catalog_runtime()
             .block_on(async move {
@@ -209,6 +210,7 @@ impl IcebergMetadataContext {
                         binding,
                         rest_access_delegation,
                         iceberg_runtime,
+                        activity,
                     )
                     .await?;
                 if let Some(control) = &build_control {
@@ -355,10 +357,16 @@ impl IcebergMetadataContext {
         let uuid = observed.table.metadata().uuid();
         let coordination = Arc::clone(self.table_coordination());
         let wait_request = request.clone();
+        let activity = self.resources.catalog_runtime().activity().cloned();
         let guard = self
             .resources
             .catalog_runtime()
-            .block_on(async move { coordination.acquire(uuid, &wait_request).await })
+            .block_on(async move {
+                let _waiting = activity.as_ref().map(|owner| {
+                    owner.enter(novarocks_spi::connector::CatalogActivityPhase::TableCoordination)
+                });
+                coordination.acquire(uuid, &wait_request).await
+            })
             .map_err(|message| ConnectorError::new(ConnectorErrorKind::Unavailable, message))??;
         let fresh = self
             .observe_table_classified_for_request(namespace, table, request)

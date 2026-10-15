@@ -44,6 +44,10 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
         // A duplicate invocation is an independent call error. It cannot
         // manufacture a rejection or cleanup authority for the live entry.
         let claim = self.claim_dispatch()?;
+        let preparing = self
+            .activity
+            .as_ref()
+            .map(|owner| owner.enter(novarocks_spi::connector::CatalogActivityPhase::PreDispatch));
         let entry_ref = JournalEntryRef(claim.key);
         let (descriptor, generation) = {
             let state = self
@@ -60,10 +64,14 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             )
         };
         if let Err(error) = preparation.check_active() {
-            claim.refuse(super::super::before_dispatch_failure(
+            let failure = super::super::before_dispatch_failure(
                 &Error::new(ErrorKind::Unexpected, "Publication preparation stopped")
                     .with_source(error),
-            ));
+            );
+            if let Some(activity) = &self.activity {
+                activity.preparation_failed(&failure);
+            }
+            claim.refuse(failure);
             return Ok(entry_ref);
         }
         // Every adapter receives the original preparation control and owns
@@ -73,6 +81,9 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
+                if let Some(activity) = &self.activity {
+                    activity.preparation_failed(&error.0);
+                }
                 claim.refuse(error.0);
                 return Ok(entry_ref);
             }
@@ -80,17 +91,22 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
         let (binding, dispatch) = match prepared {
             PreparedPublication::Mutation { binding, dispatch } => (binding, dispatch),
             PreparedPublication::NoOp => {
-                if claim
+                match claim
                     .begin_dispatch(&preparation, &MemoryDispatchBarrier)
                     .await
-                    .is_ok()
                 {
-                    self.conclude_entry(
+                    Ok(_) => self.conclude_entry(
                         entry_ref,
                         DispatchEvidence::Applied {
                             proof: CommitProof::no_op(),
                         },
-                    );
+                    ),
+                    Err(error) => {
+                        if let Some(activity) = &self.activity {
+                            activity
+                                .preparation_failed(&super::super::before_dispatch_failure(&error));
+                        }
+                    }
                 }
                 return Ok(entry_ref);
             }
@@ -99,39 +115,53 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             claim.refuse(super::super::before_dispatch_failure(&error));
             return Ok(entry_ref);
         }
-        if claim
+        if let Err(error) = claim
             .begin_dispatch(&preparation, &MemoryDispatchBarrier)
             .await
-            .is_err()
         {
+            if let Some(activity) = &self.activity {
+                activity.preparation_failed(&super::super::before_dispatch_failure(&error));
+            }
             return Ok(entry_ref);
         }
-        let evidence_context = match policy.begin_evidence(&preparation) {
-            Ok(context) => context,
-            Err(error) => {
-                self.conclude_entry(
-                    entry_ref,
-                    DispatchEvidence::NotDispatched {
-                        failure: super::super::before_dispatch_failure(
-                            &Error::new(
-                                ErrorKind::Unexpected,
-                                "Publication evidence grant refused",
-                            )
-                            .with_source(error),
-                        ),
-                    },
-                );
-                return Ok(entry_ref);
-            }
+        let Some(evidence_context) = self.begin_entry_evidence(entry_ref, &preparation, policy)
+        else {
+            return Ok(entry_ref);
         };
+        drop(preparing);
+        let dispatching = self
+            .activity
+            .as_ref()
+            .map(|owner| owner.enter(novarocks_spi::connector::CatalogActivityPhase::Dispatch));
+        let evidence_wait = self
+            .activity
+            .as_ref()
+            .map(|owner| owner.enter(novarocks_spi::connector::CatalogActivityPhase::Evidence));
         self.mark_dispatch_start(entry_ref);
         // No statement cancellation branch may drop a dispatched mutation.
         let completion = dispatch.dispatch_once(evidence_context).await;
         // This is deliberately the first statement after adapter return.
         self.conclude_entry(entry_ref, completion.evidence);
+        if let Some(activity) = &self.activity {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(&state.entries[&entry_ref.0].phase,
+                EntryPhase::Concluded(DispatchEvidence::Unknown { failure, .. } | DispatchEvidence::NotDispatched { failure } | DispatchEvidence::Rejected { failure, .. })
+                if failure.kind() == ConnectorMutationFailureKind::DeadlineExceeded)
+            {
+                activity.evidence_expired();
+            }
+        }
+        drop(evidence_wait);
+        drop(dispatching);
         if let Some(work) = completion.finalization {
             let finalization = match self.finalization_context(entry_ref, policy) {
-                Ok(context) => work.run(context).await,
+                Ok(context) => {
+                    let _finalizing = self.finalization_activity(entry_ref);
+                    work.run(context).await
+                }
                 Err(error) => ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
                     ConnectorMutationFailureKind::Internal,
                     error.message(),
@@ -140,6 +170,33 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             self.record_entry_finalization(entry_ref, finalization);
         }
         Ok(entry_ref)
+    }
+
+    fn begin_entry_evidence(
+        &self,
+        entry_ref: JournalEntryRef,
+        preparation: &ConnectorRequestContext,
+        policy: CatalogEvidencePolicy,
+    ) -> Option<crate::catalog::publication::EvidenceContext> {
+        match policy.begin_evidence(preparation) {
+            Ok(context) => Some(context),
+            Err(error) => {
+                let failure = super::super::before_dispatch_failure(
+                    &Error::new(ErrorKind::Unexpected, "Publication evidence grant refused")
+                        .with_source(error),
+                );
+                self.conclude_entry(
+                    entry_ref,
+                    DispatchEvidence::NotDispatched {
+                        failure: failure.clone(),
+                    },
+                );
+                if let Some(activity) = &self.activity {
+                    activity.preparation_failed(&failure);
+                }
+                None
+            }
+        }
     }
 
     pub(super) fn mark_dispatch_start(&self, entry_ref: JournalEntryRef) {
@@ -609,6 +666,280 @@ mod tests {
         }
         assert_eq!(stage.state.lock().unwrap().entries.len(), 2);
         assert!(second.current_entry().is_none());
+    }
+
+    struct ActivityDispatch {
+        entered: Arc<Notify>,
+        exit: Arc<Notify>,
+        fin_entered: Arc<Notify>,
+        fin_exit: Arc<Notify>,
+    }
+    struct ActivityFinalization {
+        entered: Arc<Notify>,
+        exit: Arc<Notify>,
+    }
+    #[async_trait]
+    impl PreparedCatalogDispatch for ActivityDispatch {
+        async fn dispatch_once(self: Box<Self>, _: EvidenceContext) -> DispatchCompletion {
+            self.entered.notify_one();
+            self.exit.notified().await;
+            DispatchCompletion {
+                evidence: DispatchEvidence::Applied {
+                    proof: CommitProof::applied(None),
+                },
+                finalization: Some(Box::new(ActivityFinalization {
+                    entered: self.fin_entered,
+                    exit: self.fin_exit,
+                })),
+            }
+        }
+    }
+    #[async_trait]
+    impl FinalizationWork for ActivityFinalization {
+        async fn run(self: Box<Self>, _: EvidenceContext) -> ExternalMutationFinalization {
+            self.entered.notify_one();
+            self.exit.notified().await;
+            ExternalMutationFinalization::Complete
+        }
+    }
+    fn activity_scope() -> Arc<crate::activity::CatalogActivity> {
+        crate::activity::CatalogActivity::new(novarocks_spi::connector::CatalogScopeIdentity::new(
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
+            novarocks_spi::connector::ConnectorInstanceId::parse("catalog.activity").unwrap(),
+            Uuid::now_v7(),
+        ))
+    }
+    #[tokio::test]
+    async fn activity_tracks_actual_evidence_exit_then_independent_finalization() {
+        use novarocks_spi::connector::{CatalogActivityPhase as P, CatalogActivityReader};
+        let (mut journal, preparation) = super::super::tests::catalog_journal();
+        let root = activity_scope();
+        journal.activity = Some(root.generation());
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let preparation = preparation.with_additional_stop(stop.view());
+        let entered = Arc::new(Notify::new());
+        let exit = Arc::new(Notify::new());
+        let fin_entered = Arc::new(Notify::new());
+        let fin_exit = Arc::new(Notify::new());
+        let dispatch = ActivityDispatch {
+            entered: entered.clone(),
+            exit: exit.clone(),
+            fin_entered: fin_entered.clone(),
+            fin_exit: fin_exit.clone(),
+        };
+        let active = journal.clone();
+        let duplicate_preparation = preparation.clone();
+        let task = tokio::spawn(async move {
+            active
+                .publish_once(
+                    preparation,
+                    CatalogEvidencePolicy::default(),
+                    |_, _, _| async {
+                        Ok(PreparedPublication::Mutation {
+                            binding: None,
+                            dispatch: Box::new(dispatch),
+                        })
+                    },
+                )
+                .await
+        });
+        entered.notified().await;
+        stop.request_stop();
+        let snapshot = root.snapshot();
+        assert_eq!(snapshot.phases[P::PreDispatch as usize].inflight, 0);
+        assert_eq!(snapshot.phases[P::Dispatch as usize].inflight, 1);
+        assert_eq!(snapshot.phases[P::Evidence as usize].inflight, 1);
+        assert!(
+            journal
+                .publish_once(
+                    duplicate_preparation,
+                    CatalogEvidencePolicy::default(),
+                    |_, _, _| async {
+                        panic!("duplicate preparation");
+                        #[allow(unreachable_code)]
+                        Ok(PreparedPublication::NoOp)
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(root.snapshot().phases[P::Dispatch as usize].started, 1);
+        exit.notify_one();
+        fin_entered.notified().await;
+        assert!(matches!(journal.phase(), Phase::Committed(_, _, _)));
+        let snapshot = root.snapshot();
+        assert_eq!(snapshot.phases[P::Dispatch as usize].inflight, 0);
+        assert_eq!(snapshot.phases[P::Evidence as usize].exited, 1);
+        assert_eq!(snapshot.phases[P::Finalization as usize].inflight, 1);
+        assert!(!task.is_finished());
+        fin_exit.notify_one();
+        task.await.unwrap().unwrap();
+        assert_eq!(root.snapshot().phases[P::Finalization as usize].exited, 1);
+        assert_eq!(root.snapshot().events.pre_dispatch_cancelled, 0);
+    }
+    #[tokio::test]
+    async fn activity_noop_and_original_preparation_stop_never_count_dispatch() {
+        use novarocks_spi::connector::{CatalogActivityPhase as P, CatalogActivityReader};
+        for cancelled in [false, true] {
+            let (mut journal, preparation) = super::super::tests::catalog_journal();
+            let root = activity_scope();
+            journal.activity = Some(root.generation());
+            let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+            let preparation = preparation.with_additional_stop(stop.view());
+            if cancelled {
+                stop.request_stop();
+            }
+            journal
+                .publish_once(
+                    preparation,
+                    CatalogEvidencePolicy::default(),
+                    |_, _, _| async { Ok(PreparedPublication::NoOp) },
+                )
+                .await
+                .unwrap();
+            let snapshot = root.snapshot();
+            assert_eq!(snapshot.phases[P::Dispatch as usize].started, 0);
+            assert_eq!(snapshot.phases[P::Evidence as usize].started, 0);
+            assert_eq!(snapshot.phases[P::PreDispatch as usize].exited, 1);
+            assert_eq!(snapshot.events.pre_dispatch_cancelled, u64::from(cancelled));
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_stop_between_barrier_and_evidence_grant_is_undispatched_and_counted() {
+        use novarocks_spi::connector::{CatalogActivityPhase as P, CatalogActivityReader};
+        let (mut journal, preparation) = super::super::tests::catalog_journal();
+        let root = activity_scope();
+        journal.activity = Some(root.generation());
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let preparation = preparation.with_additional_stop(stop.view());
+        let claim = journal.claim_dispatch().unwrap();
+        let entry = claim
+            .begin_dispatch(&preparation, &MemoryDispatchBarrier)
+            .await
+            .unwrap();
+        stop.request_stop();
+        assert!(
+            journal
+                .begin_entry_evidence(entry, &preparation, CatalogEvidencePolicy::default())
+                .is_none()
+        );
+        assert!(
+            matches!(journal.commit_outcome(entry), CatalogOutcome::KnownUncommitted { failure } if failure.kind() == ConnectorMutationFailureKind::Cancelled)
+        );
+        let snapshot = root.snapshot();
+        assert_eq!(snapshot.events.pre_dispatch_cancelled, 1);
+        assert_eq!(snapshot.phases[P::Dispatch as usize].started, 0);
+        assert_eq!(snapshot.phases[P::Evidence as usize].started, 0);
+        assert!(
+            journal
+                .entry_descriptor(entry)
+                .unwrap()
+                .first_dispatch_ms
+                .is_none()
+        );
+    }
+
+    struct RealRestActivityDispatch(crate::rest_protocol::mutation::prepared::PreparedRestMutation);
+    #[async_trait]
+    impl PreparedCatalogDispatch for RealRestActivityDispatch {
+        async fn dispatch_once(self: Box<Self>, context: EvidenceContext) -> DispatchCompletion {
+            let observed = self.0.dispatch(context).await;
+            DispatchCompletion::evidence(observed.dispatch_evidence())
+        }
+    }
+    #[tokio::test]
+    async fn activity_real_blackhole_keeps_evidence_after_stop_and_counts_only_explicit_expiry() {
+        use crate::rest_protocol::mutation::prepared::{MutationRoute, PreparedRestMutation};
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use novarocks_spi::connector::{CatalogActivityPhase as P, CatalogActivityReader};
+        let server = TestServer::start(
+            Script::new()
+                .on(
+                    "GET",
+                    "/v1/config",
+                    Reply::json(200, &serde_json::json!({"defaults":{},"overrides":{}})),
+                )
+                .on("POST", "/v1/namespaces/db/tables/t", Reply::NeverAnswer),
+        );
+        let (_, endpoints) = crate::catalog_runtime::build_vended_rest_generation_for_test(
+            std::collections::HashMap::from([("uri".into(), server.url())]),
+            None,
+            crate::iceberg::Runtime::try_current().unwrap(),
+        )
+        .await
+        .unwrap();
+        let (mut journal, preparation) = super::super::tests::catalog_journal();
+        let root = activity_scope();
+        journal.activity = Some(root.generation());
+        endpoints
+            .publication_generation
+            .bind(journal.current_checked().unwrap().evidence.incarnation())
+            .unwrap();
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let preparation = preparation.with_additional_stop(stop.view());
+        let active = journal.clone();
+        let task = tokio::spawn(async move {
+            active
+                .publish_once(
+                    preparation,
+                    CatalogEvidencePolicy {
+                        evidence: std::time::Duration::from_secs(2),
+                        ..Default::default()
+                    },
+                    move |descriptor, generation, preparation| async move {
+                        let prepared = PreparedRestMutation::prepare(
+                            endpoints,
+                            MutationRoute::CommitTable(
+                                crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
+                            ),
+                            &descriptor,
+                            generation,
+                            &preparation,
+                            crate::rest_protocol::evidence::AttributionExpectation::table_commit(
+                                Uuid::nil(),
+                                None,
+                            )
+                            .unwrap(),
+                            false,
+                            None,
+                        )
+                        .await?;
+                        Ok(PreparedPublication::Mutation {
+                            binding: Some(prepared.binding().clone()),
+                            dispatch: Box::new(RealRestActivityDispatch(prepared)),
+                        })
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while server.count("POST", "/v1/namespaces/db/tables/t") == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real mutation arrived");
+        stop.request_stop();
+        tokio::task::yield_now().await;
+        assert_eq!(root.snapshot().phases[P::Dispatch as usize].inflight, 1);
+        assert_eq!(root.snapshot().phases[P::Evidence as usize].inflight, 1);
+        assert!(!task.is_finished());
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            journal.commit_outcome(entry),
+            CatalogOutcome::CommitUnknown { .. }
+        ));
+        let snapshot = root.snapshot();
+        assert_eq!(snapshot.phases[P::Evidence as usize].inflight, 0);
+        assert_eq!(snapshot.phases[P::Evidence as usize].exited, 1);
+        assert_eq!(snapshot.events.evidence_expired, 1);
+        assert_eq!(snapshot.events.pre_dispatch_cancelled, 0);
+        assert_eq!(server.count("POST", "/v1/namespaces/db/tables/t"), 1);
     }
 
     struct BudgetDispatch {

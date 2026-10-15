@@ -115,6 +115,17 @@ impl std::error::Error for CatalogApplicationError {}
 
 /// The Catalog application's command and admission dependency.
 pub trait CatalogApplicationPort: Send + Sync {
+    /// Observation only. Implementations without this capability must report
+    /// unsupported rather than inventing an empty, healthy catalog set.
+    fn catalog_activity_sources(
+        &self,
+    ) -> Result<Vec<novarocks_spi::connector::CatalogActivitySource>, CatalogApplicationError> {
+        Err(CatalogApplicationError::new(
+            CatalogApplicationErrorKind::Unavailable,
+            "Catalog activity observation is unavailable",
+        ))
+    }
+
     fn create_catalog(
         &self,
         command: CatalogCreateCommand,

@@ -128,6 +128,16 @@ fn rejected(stage: &'static str, message: &'static str) -> DispatchCompletion {
         },
     })
 }
+pub(super) fn unknown_error(stage: &'static str, error: Error) -> DispatchCompletion {
+    DispatchCompletion::evidence(DispatchEvidence::Unknown {
+        failure: crate::commit::attempt::before_dispatch_failure(&error),
+        observation: ProtocolObservation {
+            adapter: "hadoop",
+            stage,
+            ..Default::default()
+        },
+    })
+}
 pub(super) fn unknown(stage: &'static str, message: &'static str) -> DispatchCompletion {
     DispatchCompletion::evidence(DispatchEvidence::Unknown {
         failure: ConnectorMutationFailure::new(ConnectorMutationFailureKind::Unavailable, message),
@@ -244,11 +254,8 @@ impl PreparedCatalogDispatch for HadoopPreparedUpdate {
         {
             tokio::time::sleep_until(evidence.deadline().into()).await;
         }
-        if evidence.expired() {
-            return unknown(
-                "before-hint-write",
-                "Hadoop metadata was written but the evidence deadline forbids starting its version hint",
-            );
+        if let Err(error) = HadoopFileSystemCatalog::check_publication_budget(Some(evidence)) {
+            return unknown_error("before-hint-write", error);
         }
         if self
             .client

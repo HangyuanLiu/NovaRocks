@@ -305,7 +305,10 @@ pub(super) fn publish(
     };
     #[cfg(test)]
     STATISTICS_TRANSACTION_ADMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let journal = PublicationJournal::new(operation.token());
+    let journal = PublicationJournal::for_runtime(
+        operation.token(),
+        session.provider.runtime().resources().catalog_runtime(),
+    );
     let publisher = journal.observe_prepared(Arc::new(CatalogPublisher {
         catalog_operation: crate::catalog::admission::CatalogOperation::Statistics,
         catalog: Arc::clone(session.provider.runtime().novarocks_catalog()),

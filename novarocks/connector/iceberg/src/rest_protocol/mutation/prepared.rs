@@ -262,9 +262,22 @@ impl PreparedRestOutcome {
                 failure: ConnectorMutationFailure::new(*kind, self.evidence.message()),
                 observation,
             },
-            RestEvidence::Unknown { .. } => DispatchEvidence::Unknown {
+            RestEvidence::Unknown { diagnosis } => DispatchEvidence::Unknown {
                 failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::Unavailable,
+                    if matches!(
+                        diagnosis.reason,
+                        super::super::evidence::UnknownReason::NoStatus(
+                            super::super::evidence::NoStatusCause::DeadlineExceeded
+                        ) | super::super::evidence::UnknownReason::ProtocolAnomaly(
+                            super::super::evidence::AnomalyCause::Read(
+                                super::super::evidence::BodyReadFailure::DeadlineExceeded
+                            )
+                        )
+                    ) {
+                        ConnectorMutationFailureKind::DeadlineExceeded
+                    } else {
+                        ConnectorMutationFailureKind::Unavailable
+                    },
                     self.evidence.message(),
                 ),
                 observation,

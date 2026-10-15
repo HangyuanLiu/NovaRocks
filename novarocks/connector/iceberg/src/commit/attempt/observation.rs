@@ -142,6 +142,7 @@ pub(crate) struct JournalEntryRef(Uuid);
 pub(crate) struct PublicationJournal<R> {
     operation: OperationToken,
     frontier: u64,
+    activity: Option<Arc<crate::activity::GenerationActivity>>,
     state: Arc<Mutex<JournalState<R>>>,
 }
 impl<R> Clone for PublicationJournal<R> {
@@ -149,6 +150,7 @@ impl<R> Clone for PublicationJournal<R> {
         Self {
             operation: self.operation,
             frontier: self.frontier,
+            activity: self.activity.clone(),
             state: Arc::clone(&self.state),
         }
     }
@@ -165,10 +167,24 @@ enum Phase<R> {
     Unknown(Checked<R>, ConnectorMutationFailure),
 }
 impl<R: Clone + Send + Sync> PublicationJournal<R> {
+    #[cfg(test)]
     pub(crate) fn new(operation: OperationToken) -> Self {
+        Self::new_with_activity(operation, None)
+    }
+    pub(crate) fn for_runtime(
+        operation: OperationToken,
+        runtime: &crate::resources::IcebergCatalogRuntime,
+    ) -> Self {
+        Self::new_with_activity(operation, runtime.activity().cloned())
+    }
+    fn new_with_activity(
+        operation: OperationToken,
+        activity: Option<Arc<crate::activity::GenerationActivity>>,
+    ) -> Self {
         Self {
             operation,
             frontier: 0,
+            activity,
             state: Arc::new(Mutex::new(JournalState {
                 entries: BTreeMap::new(),
                 current: BTreeMap::new(),
@@ -208,6 +224,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
         Ok(Self {
             operation: self.operation,
             frontier,
+            activity: self.activity.clone(),
             state: Arc::clone(&self.state),
         })
     }
@@ -436,6 +453,31 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             "Publication conclusion requires its single dispatch permit"
         );
         entry.phase = EntryPhase::Concluded(evidence);
+    }
+    /// Observes an exact positively-applied entry. This grants no budget or I/O authority.
+    pub(crate) fn finalization_activity(
+        &self,
+        entry_ref: JournalEntryRef,
+    ) -> Option<crate::activity::ActivityGuard> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state.entries.get(&entry_ref.0)?;
+        if matches!(
+            entry.phase,
+            EntryPhase::Concluded(DispatchEvidence::Applied { .. })
+        ) || (matches!(
+            entry.phase,
+            EntryPhase::Concluded(DispatchEvidence::Unknown { .. })
+        ) && entry.positive_proof.is_some())
+        {
+            self.activity.as_ref().map(|owner| {
+                owner.enter(novarocks_spi::connector::CatalogActivityPhase::Finalization)
+            })
+        } else {
+            None
+        }
     }
     /// Adapter and producer finalization share one finite phase grant. A
     /// subsequent projection cannot restart the deadline after cache work.
@@ -961,17 +1003,25 @@ impl<R> DispatchClaim<R> {
         preparation: &ConnectorRequestContext,
         barrier: &dyn DispatchBarrier,
     ) -> Result<JournalEntryRef> {
-        preparation.check_active().map_err(|error| {
-            Error::new(ErrorKind::Unexpected, "Publication preparation stopped").with_source(error)
-        })?;
-        tokio::select! {
-            result=barrier.wait(preparation)=>result?,
-            _=preparation.stop().stopped()=>return Err(Error::new(ErrorKind::Unexpected,"Publication barrier cancelled")),
-            _=tokio::time::sleep_until(preparation.deadline().into())=>return Err(Error::new(ErrorKind::Unexpected,"Publication barrier deadline elapsed")),
+        let admitted: Result<()> = async {
+            preparation.check_active().map_err(|error| {
+                Error::new(ErrorKind::Unexpected, "Publication preparation stopped").with_source(error)
+            })?;
+            tokio::select! {
+                result=barrier.wait(preparation)=>result?,
+                _=preparation.stop().stopped()=>return Err(Error::new(ErrorKind::Unexpected,"Publication barrier cancelled")
+                    .with_source(novarocks_spi::connector::ConnectorError::new(novarocks_spi::connector::ConnectorErrorKind::Cancelled,"Publication barrier cancelled"))),
+                _=tokio::time::sleep_until(preparation.deadline().into())=>return Err(Error::new(ErrorKind::Unexpected,"Publication barrier deadline elapsed")
+                    .with_source(novarocks_spi::connector::ConnectorError::new(novarocks_spi::connector::ConnectorErrorKind::DeadlineExceeded,"Publication barrier deadline elapsed"))),
+            }
+            preparation.check_active().map_err(|error| {
+                Error::new(ErrorKind::Unexpected, "Publication preparation stopped").with_source(error)
+            })
+        }.await;
+        if let Err(error) = admitted {
+            self.refuse(super::before_dispatch_failure(&error));
+            return Err(error);
         }
-        preparation.check_active().map_err(|error| {
-            Error::new(ErrorKind::Unexpected, "Publication preparation stopped").with_source(error)
-        })?;
         let mut state = self
             .state
             .lock()

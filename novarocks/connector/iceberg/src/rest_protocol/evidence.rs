@@ -74,6 +74,8 @@ pub(crate) enum NotWrittenCause {
 /// Why a written request produced no status line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NoStatusCause {
+    /// The explicitly granted phase deadline elapsed before headers arrived.
+    DeadlineExceeded,
     /// The read timeout elapsed before a status line arrived.
     ReadTimeout,
     /// The connection closed before a status line arrived.

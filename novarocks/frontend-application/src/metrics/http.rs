@@ -84,6 +84,7 @@ impl MetricsHttpServer {
         island_reader: Arc<dyn BackendIslandSnapshotReader>,
         convergence_reader: Option<Arc<dyn QueryLifecycleConvergenceReader>>,
         memory_authority: Arc<novarocks_memory::MemoryAuthority>,
+        catalog_activity: Option<Arc<dyn novarocks_catalog_application::CatalogApplicationPort>>,
         #[cfg(feature = "test-controls")] statement_observation: Option<
             Arc<crate::preparation_diagnostics::StatementObservationOwner>,
         >,
@@ -125,6 +126,7 @@ impl MetricsHttpServer {
                         island_reader,
                         convergence_reader,
                         memory_authority,
+                        catalog_activity,
                         cfg!(feature = "test-controls"),
                         #[cfg(feature = "test-controls")]
                         statement_observation,
@@ -265,6 +267,7 @@ mod tests {
             )),
             None,
             Arc::new(authority),
+            None,
             Some(handler),
         )
         .unwrap();

@@ -2405,8 +2405,9 @@ fn execute_catalog_publication_recorded(
 > {
     use crate::catalog::catalog_request::CatalogResponseDocument;
     let drop_scope = frozen.drop_scope();
-    let journal = crate::commit::attempt::observation::PublicationJournal::new(
+    let journal = crate::commit::attempt::observation::PublicationJournal::for_runtime(
         crate::commit::model::OperationToken::from_mutation(request.operation_id),
+        provider.runtime().resources().catalog_runtime(),
     );
     if let Err(error) = journal.prepare_catalog_with_receipts(
         evidence,
@@ -2579,8 +2580,9 @@ fn execute_application_document_update(
         Ok(commit) => commit,
         Err(error) => return Ok(known_uncommitted(invalid(error.to_string()))),
     };
-    let journal = crate::commit::attempt::observation::PublicationJournal::new(
+    let journal = crate::commit::attempt::observation::PublicationJournal::for_runtime(
         crate::commit::model::OperationToken::from_mutation(request.operation_id),
+        provider.runtime().resources().catalog_runtime(),
     );
     let seed = receipt(provider, request.operation_id, request.operation.kind())?;
     if let Err(error) = journal.record(external_evidence, seed, &commit) {
@@ -2638,6 +2640,7 @@ fn execute_application_document_update(
         journal.current_entry().expect("committed document update has a publication entry"), policy,
     ).and_then(|grant| grant.for_io(&request.context))
         .and_then(|context| {
+            let _finalizing = journal.current_entry().and_then(|entry| journal.finalization_activity(entry));
             provider
                 .runtime()
                 .load_table_for_request(&table.namespace, &table.table, &context)
@@ -5251,7 +5254,15 @@ mod tests {
             descriptor.clone(),
             incarnation,
             Some(storage.clone()),
-            Some(Arc::new(HadoopDocumentTestCapability { storage })),
+            Some(
+                if provider.runtime().control_state().configuration().kind
+                    == crate::catalog_config::IcebergCatalogKind::Rest
+                {
+                    storage as Arc<dyn ConnectorDocumentStorageManagement>
+                } else {
+                    Arc::new(HadoopDocumentTestCapability { storage })
+                },
+            ),
         )
         .expect("document storage binding");
         let capability = Arc::new(provider.clone());
@@ -6976,6 +6987,157 @@ mod tests {
         }
     }
 
+    struct ReleaseProducerRead(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for ReleaseProducerRead {
+        fn drop(&mut self) {
+            let (lock, ready) = &*self.0;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+    }
+    #[test]
+    fn activity_producer_document_reload_is_finalization_after_applied_evidence() {
+        use crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY;
+        use crate::document_storage::observation::{
+            MANAGED_INCARNATION_PROPERTY, MANAGED_KIND_PROPERTY, MANAGED_OWNER_PROPERTY,
+        };
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use novarocks_spi::connector::{
+            CatalogActivityPhase as P, CatalogActivityReader, CatalogScopeIdentity,
+        };
+        struct ReplyState {
+            before: serde_json::Value,
+            after: Option<serde_json::Value>,
+            desired: HashMap<String, String>,
+            committed: bool,
+        }
+        let marker = managed_marker();
+        let before = test_metadata(HashMap::from([
+            (MANAGED_KIND_PROPERTY.into(), marker.kind().into()),
+            (MANAGED_OWNER_PROPERTY.into(), marker.owner().into()),
+            (
+                MANAGED_INCARNATION_PROPERTY.into(),
+                marker.incarnation().into(),
+            ),
+            (
+                DOCUMENT_MANIFEST_PROPERTY.into(),
+                initial_mv_document_manifest(),
+            ),
+        ]));
+        let state = Arc::new(std::sync::Mutex::new(ReplyState {
+            before: serde_json::json!({
+            "metadata-location":"memory://warehouse/managed/mv/metadata/before.json", "metadata": before }),
+            after: None,
+            desired: HashMap::new(),
+            committed: false,
+        }));
+        let wire = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let get_wire = wire.clone();
+        let get_state = state.clone();
+        let post_state = state.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let server = TestServer::start(Script::new()
+            .on("GET", "/v1/config", Reply::config(&[], &[], None))
+            .on_fn("GET", "/v1/namespaces/managed/tables/mv", move |_,_| {
+                let (committed, reply) = { let state = get_state.lock().unwrap();
+                    (state.committed, if state.committed { state.after.clone().unwrap() } else { state.before.clone() }) };
+                if committed {
+                    entered_tx.send(()).unwrap();
+                    let (lock, ready) = &*get_wire;
+                    drop(ready.wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(20), |released| !*released).unwrap());
+                }
+                Reply::json(200, &reply)
+            })
+            .on_fn("POST", "/v1/namespaces/managed/tables/mv", move |request,_| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let mut state = post_state.lock().unwrap();
+                assert!(!state.committed, "one actual mutation only");
+                assert_eq!(body["updates"], serde_json::json!([{"action":"set-properties", "updates":state.desired}]));
+                state.committed = true;
+                Reply::json(200, state.after.as_ref().unwrap())
+            }));
+        let _server_release = ReleaseProducerRead(wire.clone());
+        let root = crate::activity::CatalogActivity::new(CatalogScopeIdentity::new(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            ConnectorInstanceId::parse("ice").unwrap(),
+            uuid::Uuid::now_v7(),
+        ));
+        let (_executor, provider) =
+            variant_definition_provider_observed(&server.url(), Some(root.generation()));
+        let table = ConnectorTableIdentity {
+            instance_id: provider.descriptor().instance_id.clone(),
+            namespace: "managed".into(),
+            table: "mv".into(),
+        };
+        let update = application_document_update_fixture(&provider, &table);
+        let operation_id = update.request.operation_id;
+        let ConnectorCatalogMutationOperation::UpdateApplicationDocuments { intent } =
+            &update.request.operation
+        else {
+            unreachable!()
+        };
+        let desired =
+            crate::document_storage::publication::update_properties(intent, operation_id, &before)
+                .unwrap();
+        let mut after = serde_json::to_value(&before).unwrap();
+        for (key, value) in &desired {
+            after["properties"][key] = serde_json::Value::String(value.clone());
+        }
+        {
+            let mut state = state.lock().unwrap();
+            state.desired = desired;
+            state.after = Some(
+                serde_json::json!({"metadata-location":"memory://warehouse/managed/mv/metadata/after.json", "metadata":after}),
+            );
+        }
+        std::thread::scope(|threads| {
+            // Released before scope's implicit join even if an assertion panics.
+            let release = ReleaseProducerRead(wire.clone());
+            let worker = threads.spawn(|| provider.execute(update.request));
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("real post-publication reload entered");
+            let snapshot = root.snapshot();
+            for phase in [P::Evidence, P::Dispatch, P::PreDispatch] {
+                assert_eq!(snapshot.phases[phase as usize].inflight, 0);
+            }
+            assert_eq!(snapshot.phases[P::Finalization as usize].inflight, 1);
+            assert_eq!(snapshot.phases[P::Bridge as usize].inflight, 1);
+            assert!(!worker.is_finished());
+            assert_eq!(server.count("POST", "/v1/namespaces/managed/tables/mv"), 1);
+            drop(release);
+            let outcome = worker.join().unwrap().unwrap();
+            let ExternalMutationOutcome::KnownCommitted {
+                effect,
+                receipt,
+                finalization,
+            } = outcome
+            else {
+                panic!("producer must retain Applied")
+            };
+            assert_eq!(effect, ExternalMutationEffect::Applied);
+            assert_eq!(finalization, ExternalMutationFinalization::Complete);
+            assert_eq!(receipt.operation_id(), operation_id);
+        });
+        let snapshot = root.snapshot();
+        for phase in [
+            P::Evidence,
+            P::Dispatch,
+            P::PreDispatch,
+            P::Finalization,
+            P::Bridge,
+        ] {
+            let row = &snapshot.phases[phase as usize];
+            assert_eq!(row.inflight, 0);
+            assert_eq!(row.started, row.exited);
+            assert_eq!(row.elapsed_count, row.exited);
+        }
+        assert_eq!(server.count("POST", "/v1/namespaces/managed/tables/mv"), 1);
+        drop(provider);
+        server.shut_down();
+        assert!(root.snapshot().generations.is_empty());
+    }
+
     #[test]
     fn committed_document_update_receipt_overflow_is_only_a_finalization_failure() {
         let (_executor, _warehouse, provider) = provider();
@@ -7533,6 +7695,12 @@ mod tests {
     /// The REST spy detects catalog requests; the existing refusing FileIO
     /// owner makes either synchronous or spawned object access fail the test.
     fn variant_definition_provider(endpoint: &str) -> (tokio::runtime::Runtime, IcebergMetadata) {
+        variant_definition_provider_observed(endpoint, None)
+    }
+    fn variant_definition_provider_observed(
+        endpoint: &str,
+        activity: Option<Arc<crate::activity::GenerationActivity>>,
+    ) -> (tokio::runtime::Runtime, IcebergMetadata) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let configuration = crate::catalog_config::parse_catalog_configuration(
             "ice",
@@ -7549,9 +7717,14 @@ mod tests {
             Arc::new(RefuseFileIo),
             Arc::new(RefuseFileIo),
         );
+        let resources = IcebergMetadataResources::new(binding, executor.handle().clone());
+        let resources = match activity {
+            Some(activity) => resources.with_activity(activity),
+            None => resources,
+        };
         let runtime = IcebergMetadataContext::try_new(
             IcebergCatalogControlState::new(configuration),
-            IcebergMetadataResources::new(binding, executor.handle().clone()),
+            resources,
         )
         .expect("lazy REST generation");
         let provider = IcebergMetadata::new(

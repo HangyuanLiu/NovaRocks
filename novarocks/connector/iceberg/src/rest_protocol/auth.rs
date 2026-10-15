@@ -264,6 +264,7 @@ pub(crate) struct RestAuthOwner {
     token: AttemptCell<HeaderValue, AttemptFailure>,
     /// Frontend only: state of the current establishment attempt.
     frontend: bool,
+    activity: Option<Arc<crate::activity::GenerationActivity>>,
 }
 
 impl fmt::Debug for RestAuthOwner {
@@ -290,7 +291,20 @@ impl RestAuthOwner {
         persistent: PersistentRestConfig,
         http: RestHttpClient,
     ) -> Result<Arc<Self>, String> {
-        Ok(Arc::new(Self::new(identity, persistent, http, true)?))
+        Self::frontend_observed(identity, persistent, http, None)
+    }
+    pub(crate) fn frontend_observed(
+        identity: Option<IcebergRestAuthMaterial>,
+        persistent: PersistentRestConfig,
+        http: RestHttpClient,
+        activity: Option<Arc<crate::activity::GenerationActivity>>,
+    ) -> Result<Arc<Self>, String> {
+        let mut owner = Self::new(identity, persistent, http, true)?;
+        owner.activity = activity;
+        Ok(Arc::new(owner))
+    }
+    pub(crate) fn activity(&self) -> Option<&Arc<crate::activity::GenerationActivity>> {
+        self.activity.as_ref()
     }
 
     /// The backend owner; it never builds an upstream client.
@@ -328,6 +342,7 @@ impl RestAuthOwner {
             http,
             token: AttemptCell::default(),
             frontend,
+            activity: None,
         })
     }
 
@@ -361,7 +376,13 @@ impl RestAuthOwner {
                 let persistent = Arc::clone(&self.persistent);
                 let client_id = client_id.clone();
                 let client_secret = client_secret.clone();
+                let activity = self.activity.clone();
                 async move {
+                    let _initializer = activity.as_ref().map(|owner| {
+                        owner.enter(
+                            novarocks_spi::connector::CatalogActivityPhase::AuthorizationInitializer,
+                        )
+                    });
                     exchange_token(http, persistent, client_id, client_secret)
                         .await
                         .map_err(|step| AttemptFailure { attempt, step })

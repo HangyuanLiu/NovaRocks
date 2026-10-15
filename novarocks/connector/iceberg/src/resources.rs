@@ -21,7 +21,6 @@
 //! discover a runtime or credentials from process-global state.
 
 use std::future::Future;
-#[cfg(feature = "test-controls")]
 use std::sync::Arc;
 
 use crate::access_binding::IcebergReadBinding;
@@ -30,6 +29,7 @@ use crate::access_binding::IcebergReadBinding;
 pub struct IcebergCatalogRuntime {
     handle: tokio::runtime::Handle,
     iceberg_runtime: crate::iceberg::Runtime,
+    activity: Option<Arc<crate::activity::GenerationActivity>>,
 }
 
 impl IcebergCatalogRuntime {
@@ -42,7 +42,12 @@ impl IcebergCatalogRuntime {
         Self {
             handle,
             iceberg_runtime,
+            activity: None,
         }
+    }
+
+    pub(crate) fn activity(&self) -> Option<&Arc<crate::activity::GenerationActivity>> {
+        self.activity.as_ref()
     }
 
     /// The SDK runtime captured once from this role-local runtime owner.
@@ -59,10 +64,20 @@ impl IcebergCatalogRuntime {
         F::Output: Send + 'static,
     {
         let handle = self.handle.clone();
+        // Retained through join, including panic and statement cancellation.
+        let _bridge = self
+            .activity
+            .as_ref()
+            .map(|owner| owner.enter(novarocks_spi::connector::CatalogActivityPhase::Bridge));
         std::thread::Builder::new()
             .name("iceberg-catalog-runtime".to_string())
             .spawn(move || handle.block_on(future))
-            .map_err(|error| format!("spawn Iceberg catalog runtime bridge: {error}"))?
+            .map_err(|error| {
+                if let Some(activity) = &self.activity {
+                    activity.bridge_spawn_failed();
+                }
+                format!("spawn Iceberg catalog runtime bridge: {error}")
+            })?
             .join()
             .map_err(|_| "Iceberg catalog runtime bridge panicked".to_string())
     }
@@ -98,6 +113,14 @@ impl IcebergMetadataResources {
             planning_binding,
             catalog_runtime: IcebergCatalogRuntime::new(catalog_runtime),
         }
+    }
+
+    pub(crate) fn with_activity(
+        mut self,
+        activity: Arc<crate::activity::GenerationActivity>,
+    ) -> Self {
+        self.catalog_runtime.activity = Some(activity);
+        self
     }
 
     pub fn planning_binding(&self) -> &IcebergReadBinding {

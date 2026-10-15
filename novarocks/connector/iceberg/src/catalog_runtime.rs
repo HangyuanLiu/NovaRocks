@@ -132,6 +132,7 @@ async fn build_rest_catalog_with_access_delegation(
     binding: IcebergReadBinding,
     rest_access_delegation: RestAccessDelegationMode,
     runtime: crate::iceberg::Runtime,
+    activity: Option<Arc<crate::activity::GenerationActivity>>,
 ) -> Result<RestGeneration, String> {
     use crate::rest_protocol::wire::{REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE};
 
@@ -178,6 +179,7 @@ async fn build_rest_catalog_with_access_delegation(
         identity,
         storage_factory,
         runtime,
+        activity,
     )
     .await
 }
@@ -192,11 +194,14 @@ async fn assemble_rest_generation(
     identity: Option<crate::access_binding::IcebergRestAuthMaterial>,
     storage_factory: Option<Arc<dyn crate::iceberg::io::StorageFactory>>,
     runtime: crate::iceberg::Runtime,
+    activity: Option<Arc<crate::activity::GenerationActivity>>,
 ) -> Result<RestGeneration, String> {
     let persistent =
         crate::rest_protocol::auth::PersistentRestConfig::from_properties(&properties)?;
     let http = crate::rest_protocol::http::RestHttpClient::new()?;
-    let owner = crate::rest_protocol::auth::RestAuthOwner::frontend(identity, persistent, http)?;
+    let owner = crate::rest_protocol::auth::RestAuthOwner::frontend_observed(
+        identity, persistent, http, activity,
+    )?;
     let endpoints = Arc::new(crate::rest_protocol::endpoints::RestEndpoints::new(
         Arc::new(properties),
         owner,
@@ -236,6 +241,7 @@ pub(crate) async fn build_vended_rest_generation_for_test(
         identity,
         None,
         runtime,
+        None,
     )
     .await?;
     Ok((generation.upstream, generation.endpoints))
@@ -307,6 +313,7 @@ pub async fn build_catalog_client(
         binding,
         RestAccessDelegationMode::Static,
         runtime,
+        None,
     )
     .await
 }
@@ -318,6 +325,7 @@ pub(crate) async fn build_catalog_client_with_rest_access_delegation(
     binding: IcebergReadBinding,
     rest_access_delegation: RestAccessDelegationMode,
     runtime: crate::iceberg::Runtime,
+    activity: Option<Arc<crate::activity::GenerationActivity>>,
 ) -> Result<IcebergCatalogClient, String> {
     crate::catalog::publication::CatalogEvidencePolicy::from_properties(&configuration.properties)?;
     match configuration.kind {
@@ -341,6 +349,7 @@ pub(crate) async fn build_catalog_client_with_rest_access_delegation(
                 binding,
                 rest_access_delegation,
                 runtime,
+                activity,
             )
             .await?;
             let generic: Arc<dyn crate::iceberg::Catalog> = upstream.clone();

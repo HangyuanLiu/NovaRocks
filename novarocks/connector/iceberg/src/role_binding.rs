@@ -104,6 +104,7 @@ impl ConnectorControlRoleBindingFactory for IcebergControlRoleBindingFactory {
     ) -> Arc<dyn novarocks_spi::connector::ProviderCatalogControlFactory> {
         Arc::new(IcebergCatalogControlFactory {
             factory: self.clone(),
+            activity: crate::activity::CatalogActivity::new(identity.clone()),
             identity,
             coordination: Arc::new(
                 crate::catalog::table_coordination::IcebergTableCoordination::default(),
@@ -115,17 +116,27 @@ impl ConnectorControlRoleBindingFactory for IcebergControlRoleBindingFactory {
 struct IcebergCatalogControlFactory {
     factory: IcebergControlRoleBindingFactory,
     identity: novarocks_spi::connector::CatalogScopeIdentity,
+    activity: Arc<crate::activity::CatalogActivity>,
     coordination: Arc<crate::catalog::table_coordination::IcebergTableCoordination>,
 }
 
 impl novarocks_spi::connector::ProviderCatalogControlFactory for IcebergCatalogControlFactory {
+    fn activity_reader(&self) -> Option<Arc<dyn novarocks_spi::connector::CatalogActivityReader>> {
+        Some(self.activity.clone())
+    }
+
     fn materialize(
         &self,
         properties: NormalizedCatalogProperties,
         context: MaterializationContext,
     ) -> BoxFuture<'static, Result<ConnectorControlRoleBinding, ConnectorMaterializationError>>
     {
-        let resources = self.factory.resources.clone();
+        let activity = self.activity.generation();
+        let resources = self
+            .factory
+            .resources
+            .clone()
+            .with_activity(activity.clone());
         let coordination = Arc::clone(&self.coordination);
         let identity = self.identity.clone();
         #[cfg(feature = "mem-1-m07-hms-listing-observe")]
@@ -136,6 +147,8 @@ impl novarocks_spi::connector::ProviderCatalogControlFactory for IcebergCatalogC
             .and_then(|slot| slot.active_probe());
         let permits = Arc::clone(&self.factory.blocking_materialization_permits);
         Box::pin(async move {
+            let waiting = activity
+                .enter(novarocks_spi::connector::CatalogActivityPhase::MaterializationWaiting);
             context.check_active()?;
             if properties.as_catalog_properties().provider_id() != identity.provider_id()
                 || properties.handle().catalog_name() != identity.instance_id()
@@ -157,8 +170,12 @@ impl novarocks_spi::connector::ProviderCatalogControlFactory for IcebergCatalogC
             })?;
             context.check_active()?;
             let worker_context = context.clone();
+            drop(waiting);
+            let worker = activity
+                .enter(novarocks_spi::connector::CatalogActivityPhase::MaterializationWorker);
             let binding = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
+                let _worker = worker;
                 materialize_control_blocking(
                     resources,
                     coordination,
@@ -604,6 +621,149 @@ mod tests {
                 .expect("the decoded handle belongs to this generation")
                 .table(),
             &table_facts()
+        );
+    }
+
+    struct BlockingControlIdentity {
+        entered: Arc<tokio::sync::Notify>,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+    impl crate::access_binding::IcebergStaticCredentialResolver for BlockingControlIdentity {
+        fn resolve_object_store_static(
+            &self,
+            _: &novarocks_spi::connector::StaticCredentialReference,
+        ) -> Result<novarocks_fs::ObjectStoreSecretMaterial, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "test owns no object-store identity",
+            ))
+        }
+        fn resolve_catalog_control(
+            &self,
+            _: &novarocks_spi::connector::StaticCredentialReference,
+        ) -> Result<crate::access_binding::IcebergRestAuthMaterial, ConnectorError> {
+            self.entered.notify_one();
+            let (lock, ready) = &*self.gate;
+            let released = lock.lock().unwrap();
+            drop(
+                ready
+                    .wait_timeout_while(released, Duration::from_secs(30), |released| !*released)
+                    .unwrap(),
+            );
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "injected identity resolver exit before HTTP",
+            ))
+        }
+    }
+    struct ReleaseIdentityGate(Arc<(Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for ReleaseIdentityGate {
+        fn drop(&mut self) {
+            let (lock, ready) = &*self.0;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_materialization_wrapper_keeps_the_actual_worker_and_bridge_visible() {
+        use novarocks_spi::connector::{
+            CatalogActivityPhase as P, CatalogCredentialBinding, CatalogCredentialMode,
+            CatalogCredentialPurpose, CredentialConsumerRole, StaticCredentialReference,
+        };
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let release = ReleaseIdentityGate(gate.clone());
+        let handle = tokio::runtime::Handle::current();
+        let fs = novarocks_fs::FsAccessResources::new(
+            Arc::new(novarocks_fs::ObjectStoreProviderPool::new(Default::default()).unwrap()),
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(handle.clone())),
+            Arc::new(TokioFileTaskSpawner::new(handle.clone())),
+        );
+        let access =
+            crate::access_binding::IcebergReadBinding::with_static_metadata_credential_resolver(
+                fs,
+                Arc::new(BlockingControlIdentity {
+                    entered: entered.clone(),
+                    gate,
+                }),
+            );
+        let factory = IcebergControlRoleBindingFactory::new(
+            IcebergMetadataResources::new(access, handle),
+            NonZeroUsize::new(1).unwrap(),
+        );
+        let instance = ConnectorInstanceId::parse("catalog.blocked").unwrap();
+        let provider = ConnectorProviderId::parse("iceberg").unwrap();
+        let properties = CatalogProperties::new(
+            CatalogHandle::new(instance.clone(), CatalogVersion::from_bytes([7; 32])),
+            provider.clone(),
+            1,
+            vec![
+                CatalogProperty::new("iceberg.catalog.type", "rest").unwrap(),
+                CatalogProperty::new("uri", "http://127.0.0.1:1").unwrap(),
+            ],
+            vec![
+                CatalogCredentialBinding::try_new(
+                    CatalogCredentialPurpose::CatalogControl,
+                    CredentialConsumerRole::Frontend,
+                    CatalogCredentialMode::Static(
+                        StaticCredentialReference::try_new("coordinator", "v1").unwrap(),
+                    ),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let scoped = factory.open_catalog(novarocks_spi::connector::CatalogScopeIdentity::new(
+            provider,
+            instance,
+            uuid::Uuid::now_v7(),
+        ));
+        let reader = scoped.activity_reader().unwrap();
+        let context = MaterializationContext::new(Instant::now() + Duration::from_secs(20));
+        let work = scoped.materialize(
+            factory.normalize_and_validate(properties).unwrap(),
+            context.clone(),
+        );
+        let wrapper = tokio::spawn(work);
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("resolver entered real worker");
+        context.cancel();
+        wrapper.abort();
+        match wrapper.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("wrapper must be cancelled"),
+        }
+        let snapshot = reader.snapshot();
+        assert_eq!(
+            snapshot.phases[P::MaterializationWorker as usize].inflight,
+            1
+        );
+        assert_eq!(snapshot.phases[P::Bridge as usize].inflight, 1);
+        assert_eq!(snapshot.generations.len(), 1);
+        assert_eq!(snapshot.generations[0].generation, None);
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = reader.snapshot();
+                if snapshot.phases[P::MaterializationWorker as usize].inflight == 0
+                    && snapshot.phases[P::Bridge as usize].inflight == 0
+                    && snapshot.generations.is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual worker and bridge exited");
+        let snapshot = reader.snapshot();
+        assert_eq!(snapshot.phases[P::MaterializationWorker as usize].exited, 1);
+        assert_eq!(snapshot.phases[P::Bridge as usize].exited, 1);
+        assert_eq!(
+            factory.blocking_materialization_permits.available_permits(),
+            1
         );
     }
 

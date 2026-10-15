@@ -40,3 +40,6 @@ pub(crate) mod test_server;
 
 pub(crate) mod configuration;
 pub(crate) mod wire;
+
+#[cfg(test)]
+mod activity_tests;

@@ -478,7 +478,10 @@ impl IcebergWriteSessionControl {
                 return Ok(self.reject_operation(&operation, format_error_to_connector(error)));
             }
         };
-        let journal = PublicationJournal::new(operation.token());
+        let journal = PublicationJournal::for_runtime(
+            operation.token(),
+            self.runtime.resources().catalog_runtime(),
+        );
         let template =
             match RecoveryTemplate::from_handle(&self.descriptor, self.key.incarnation, handle) {
                 Ok(template) => template,
@@ -593,6 +596,9 @@ impl IcebergWriteSessionControl {
                     .and_then(|grant| grant.for_io(context))
                 {
                     Ok(finalization_context) => {
+                        let _finalizing = journal
+                            .current_entry()
+                            .and_then(|entry| journal.finalization_activity(entry));
                         match self.publication_row_count(handle, snapshot_id, &finalization_context)
                         {
                             Ok(rows) => rows,

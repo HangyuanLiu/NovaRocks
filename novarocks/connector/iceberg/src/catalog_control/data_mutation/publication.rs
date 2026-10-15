@@ -226,7 +226,10 @@ impl RegisteredIcebergDataMutationBackend {
                 });
             }
         };
-        let journal = PublicationJournal::new(operation.token());
+        let journal = PublicationJournal::for_runtime(
+            operation.token(),
+            self.runtime.resources().catalog_runtime(),
+        );
         // External registered parquet is deliberately never adopted into this ledger.
         let setup = (|| {
             let table = self.reload_table(
@@ -341,7 +344,12 @@ impl RegisteredIcebergDataMutationBackend {
                     self.runtime.novarocks_catalog().evidence_policy(),
                 )
                 .and_then(|grant| grant.for_io(context))
-                .and_then(|context| self.finalize_publication(planned, &context));
+                .and_then(|context| {
+                    let _finalizing = journal
+                        .current_entry()
+                        .and_then(|entry| journal.finalization_activity(entry));
+                    self.finalize_publication(planned, &context)
+                });
             if let Err(error) = result {
                 if let Some(entry) = journal.current_entry() {
                     journal.record_entry_finalization(

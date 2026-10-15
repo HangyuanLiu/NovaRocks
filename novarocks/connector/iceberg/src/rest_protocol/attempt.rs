@@ -205,6 +205,9 @@ pub(crate) async fn ensure_session(
         let owner = Arc::clone(owner);
         let properties = Arc::clone(properties);
         async move {
+            let _initializer = owner.activity().map(|owner| {
+                owner.enter(novarocks_spi::connector::CatalogActivityPhase::SessionInitializer)
+            });
             tokio::time::timeout(
                 crate::catalog_runtime::REST_READ_TIMEOUT,
                 super::configuration::establish(&owner, &properties),
