@@ -39,6 +39,8 @@ pub(crate) use compiled::family_fixture::{
     package_with_sink_and_names as family_package_with_sink_and_names, values as family_values,
 };
 #[cfg(test)]
+pub(crate) use compiled::ordered_scan_with_numeric_membership_fixture;
+#[cfg(test)]
 pub(crate) use compiled::{compiled_statistics_finish_fixture, compiled_statistics_writer_fixture};
 mod local;
 #[cfg(test)]

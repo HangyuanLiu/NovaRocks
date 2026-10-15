@@ -1226,6 +1226,8 @@ mod join_tests;
 #[cfg(test)]
 #[path = "compiled_runtime_filter_tests.rs"]
 mod runtime_filter_tests;
+#[cfg(test)]
+pub(crate) use runtime_filter_tests::ordered_scan_with_numeric_membership_fixture;
 
 #[cfg(test)]
 #[path = "compiled_runtime_filter_compile_tests.rs"]

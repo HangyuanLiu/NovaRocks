@@ -880,3 +880,6 @@ fn compiled_ordered_source_required_residual_row_error_precedes_invalid_live_sna
 
 #[path = "compiled_ordered_pipeline_tests.rs"]
 mod pipeline_tests;
+
+#[path = "compiled_ordered_membership_source_tests.rs"]
+mod membership_tests;

@@ -255,8 +255,20 @@ impl Consumer {
         else {
             unreachable!()
         };
-        assert_eq!(runtime_filters.len(), 1);
-        let spec = &runtime_filters[0].consumer;
+        let mut ordered = runtime_filters.iter().filter(|binding| {
+            matches!(
+                binding.consumer.contract(),
+                novarocks_local_program::StaticFilterContract::Ordered { .. }
+            )
+        });
+        let spec = &ordered
+            .next()
+            .expect("one original ordered binding")
+            .consumer;
+        assert!(
+            ordered.next().is_none(),
+            "exactly one original ordered binding"
+        );
         let expected = rf::RuntimeFilterConsumerContract::ordered_live(
             rf::RuntimeFilterBindingId::new(spec.binding_id()),
             rf::RuntimeFilterChannelId::new(spec.channel_id()),
