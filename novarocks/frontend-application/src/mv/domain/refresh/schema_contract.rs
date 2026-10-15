@@ -22,9 +22,9 @@ use crate::mv::domain::refresh::target::IcebergMvTarget;
 use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
 use novarocks_mv_application::persistence::codec::{InterpretationDocument, RelationOccurrence};
 use novarocks_mv_application::persistence::identity::FieldIdentity;
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::persistence::runtime_bindings::{
-    MvRuntimeBindings, reconstruct_runtime_bindings,
+    MvRuntimeBindings, reconstruct_keyed_runtime_bindings,
 };
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorRequestContext, MvStorageObservationPort,
@@ -43,7 +43,7 @@ pub(crate) struct MvOccurrenceFieldRebind {
 }
 
 pub(crate) fn validate_projection_target(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     observation: &MvSchemaValidationObservation,
 ) -> Result<MvRuntimeBindings, String> {
     let target = projection.facts.target();
@@ -56,7 +56,7 @@ pub(crate) fn validate_projection_target(
             "MV target schema observation belongs to another requested locator".to_string(),
         );
     }
-    reconstruct_runtime_bindings(&projection.facts, observation.exact_schema())
+    reconstruct_keyed_runtime_bindings(&projection.facts, observation.exact_schema())
 }
 
 /// Schema version may advance after a rename or an unrelated added column.
@@ -121,7 +121,7 @@ pub(crate) fn validate_relation_occurrence_schema(
 /// Aggregate state is interpreted only by validated L, never by a schema-contract version.
 pub fn validate_aggregate_schema_contract_metadata<'a>(
     target: &IcebergMvTarget,
-    projection: &'a StoredMvProjection,
+    projection: &'a StoredKeyedMvProjection,
 ) -> Result<&'a InterpretationDocument, String> {
     let interpretation = projection.facts.interpretation();
     if interpretation.aggregates.is_empty() {
@@ -134,7 +134,7 @@ pub fn validate_aggregate_schema_contract_metadata<'a>(
 }
 
 pub(crate) fn validate_aggregate_schema_contract_for_base(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     occurrence: &RelationOccurrence,
     base_observation: &MvSchemaValidationObservation,
     target_observation: &MvSchemaValidationObservation,
@@ -148,7 +148,7 @@ pub(crate) fn validate_aggregate_schema_contract_for_base(
 pub(crate) fn validate_repartition_schema_contract(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     base_refs: &[TableIdentity],
     target_observation: &MvSchemaValidationObservation,
     connector_context: &ConnectorRequestContext,
@@ -187,8 +187,8 @@ pub(crate) fn validate_repartition_schema_contract(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use bytes::Bytes;
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
     use novarocks_mv_application::product::MvTarget;
     use novarocks_spi::connector::{
         ConnectorCommittedVersion, ConnectorInstanceId, ConnectorTableIdentity,
@@ -207,8 +207,8 @@ mod tests {
         .unwrap()
     }
 
-    fn projection() -> StoredMvProjection {
-        StoredMvProjection {
+    fn projection() -> StoredKeyedMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 1,
             facts: ProjectionFixture::new(
                 MvTarget::from_parts(Some("ice"), "sales", "mv"),
@@ -220,7 +220,7 @@ mod tests {
     }
 
     fn target_observation(
-        projection: &StoredMvProjection,
+        projection: &StoredKeyedMvProjection,
         metadata_version: ConnectorCommittedVersion,
     ) -> MvSchemaValidationObservation {
         let facts = &projection.facts;

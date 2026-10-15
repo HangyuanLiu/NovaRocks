@@ -26,9 +26,9 @@ use novarocks_mv_application::dependency::{
     MvDependencyStorageEngine,
 };
 use novarocks_mv_application::persistence::dependency::{
-    CreateMvDependencyRequest, StoredMvDependency, stored_definition_dependency_ref,
+    CreateMvDependencyRequest, StoredMvDependency, stored_keyed_definition_dependency_ref,
 };
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_types::naming::TableIdentity;
 
 #[derive(Debug)]
@@ -107,7 +107,7 @@ pub(crate) fn ensure_no_iceberg_mv_targets_in_scope_with_readiness(
         .map_err(|e| format!("load MV projections for drop target scope check failed: {e}"))?;
     let targets = projections
         .iter()
-        .map(|loaded| stored_definition_dependency_ref(&loaded.projection))
+        .map(|loaded| stored_keyed_definition_dependency_ref(&loaded.projection))
         .collect::<Vec<_>>();
 
     validate_no_iceberg_mv_targets_in_scope(scope_catalog, scope_namespace, &targets)
@@ -130,7 +130,7 @@ pub(crate) fn ensure_no_external_iceberg_dependents_with_readiness(
         .map(|loaded| &loaded.projection)
         .collect::<Vec<_>>();
     for loaded in &projections {
-        let mv_target = stored_definition_dependency_ref(&loaded.projection);
+        let mv_target = stored_keyed_definition_dependency_ref(&loaded.projection);
         let dependencies = readiness
             .list_ready_dependencies_by_downstream(loaded)
             .map_err(|e| format!("load MV dependencies for drop scope check failed: {e}"))?;
@@ -161,7 +161,7 @@ pub(crate) fn validate_no_create_cycle_with_readiness(
         .map(|loaded| &loaded.projection)
         .collect::<Vec<_>>();
     for loaded in &projections {
-        let target = stored_definition_dependency_ref(&loaded.projection);
+        let target = stored_keyed_definition_dependency_ref(&loaded.projection);
         let dependencies = readiness
             .list_ready_dependencies_by_downstream(loaded)
             .map_err(|e| format!("load MV dependencies for cycle check failed: {e}"))?;
@@ -185,7 +185,7 @@ pub(crate) fn validate_no_create_cycle_with_readiness(
 /// objects remain separate occurrence records throughout this conversion.
 pub(crate) fn classify_ready_dependency_occurrences(
     mut dependencies: Vec<StoredMvDependency>,
-    ready_inventory: &[&StoredMvProjection],
+    ready_inventory: &[&StoredKeyedMvProjection],
 ) -> Result<Vec<StoredMvDependency>, String> {
     for dependency in &mut dependencies {
         let persisted = novarocks_mv_application::persistence::identity::ObjectIdentity::try_new(
@@ -220,7 +220,7 @@ pub(crate) fn classify_ready_dependency_occurrences(
             ));
         }
         if let Some(projection) = matched {
-            dependency.upstream = stored_definition_dependency_ref(projection);
+            dependency.upstream = stored_keyed_definition_dependency_ref(projection);
         } else {
             dependency.upstream.object_type = MvDependencyObjectType::Table;
             dependency.upstream.storage_engine = MvDependencyStorageEngine::ExternalTable;
@@ -235,9 +235,9 @@ mod tests {
 
     use super::*;
     use crate::mv::domain::dependency::scope as dependency_scope;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use novarocks_mv_application::dependency::iceberg_mv_dependency_ref;
     use novarocks_mv_application::persistence::exact_revision::persist_exact_query_revision;
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
     use novarocks_mv_application::product::MvTarget;
     use novarocks_query_application::api::{DataVersion, ObjectIdentity, ProviderFactFormat};
     use novarocks_spi::connector::ConnectorTableObjectId;
@@ -247,12 +247,12 @@ mod tests {
         namespace: &str,
         table: &str,
         object: &[u8],
-    ) -> StoredMvProjection {
+    ) -> StoredKeyedMvProjection {
         let mut fixture =
             ProjectionFixture::new(MvTarget::from_parts(Some(catalog), namespace, table), None);
         fixture.object_id = ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(object))
             .expect("fixture target object");
-        StoredMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 1,
             facts: fixture.build().expect("validated document projection"),
         }
@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn target_scope_uses_the_validated_projection_target() {
         let projection = projection("catalog", "Namespace", "Table", b"target-object");
-        let projected = [stored_definition_dependency_ref(&projection)];
+        let projected = [stored_keyed_definition_dependency_ref(&projection)];
         assert_eq!(
             projected,
             [iceberg_mv_dependency_ref("catalog", "Namespace", "Table")]
@@ -420,7 +420,7 @@ mod tests {
         )
         .expect("ordinary source table occurrence");
         let edges = [(
-            stored_definition_dependency_ref(&target),
+            stored_keyed_definition_dependency_ref(&target),
             dependencies
                 .into_iter()
                 .map(|dependency| dependency.upstream)
@@ -449,8 +449,8 @@ mod tests {
         )
         .expect("exact upstream occurrences");
         assert_eq!(classified.len(), 2);
-        let target = stored_definition_dependency_ref(&downstream);
-        let upstream_target = stored_definition_dependency_ref(&upstream);
+        let target = stored_keyed_definition_dependency_ref(&downstream);
+        let upstream_target = stored_keyed_definition_dependency_ref(&upstream);
         let edges = [
             (upstream_target.clone(), Vec::new()),
             (
@@ -469,16 +469,14 @@ mod tests {
     }
 
     fn empty_readiness() -> MvReadinessPort {
+        let handle = tokio::runtime::Handle::current();
+        let (product, _) = tokio::task::block_in_place(|| {
+            handle.block_on(crate::mv::domain::test_admission::keyed_product())
+        });
         MvReadinessPort::from_product(
-            novarocks_mv_application::readiness::MvReadinessService::new(
-                std::sync::Arc::new(
-                    novarocks_mv_application::test_repository::InMemoryMvRepository::default(),
-                ),
-                std::sync::Arc::new(
-                    novarocks_mv_application::process_runtime::ProcessRuntime::default(),
-                ),
-            ),
-            tokio::runtime::Handle::current(),
+            product.keyed_readiness_service().unwrap(),
+            handle,
+            product.management_entrance().unwrap(),
         )
     }
 

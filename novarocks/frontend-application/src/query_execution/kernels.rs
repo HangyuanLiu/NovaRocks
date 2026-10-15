@@ -197,6 +197,7 @@ pub struct DmlExecutionKernel {
     typed_connector_control: Arc<ConnectorControlHost>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     query_execution: QueryExecutionService,
     connector_runtime: Option<tokio::runtime::Handle>,
     lake_publication_runtime_policy:
@@ -240,6 +241,7 @@ impl DmlExecutionKernel {
         typed_connector_control: Arc<ConnectorControlHost>,
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+        mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         query_execution: QueryExecutionService,
     ) -> Self {
         let DmlPlanningServices {
@@ -258,6 +260,7 @@ impl DmlExecutionKernel {
             typed_connector_control,
             unified_statistics,
             mv_storage_observation,
+            mv_readiness,
             query_execution,
             connector_runtime: None,
             lake_publication_runtime_policy: None,
@@ -330,6 +333,10 @@ impl DmlExecutionKernel {
 
     pub(crate) fn mv_storage_observation(&self) -> &Arc<dyn MvStorageObservationPort> {
         &self.mv_storage_observation
+    }
+
+    pub(crate) fn mv_readiness(&self) -> &Arc<MvReadinessPort> {
+        &self.mv_readiness
     }
 
     pub(crate) fn query_execution(&self) -> &QueryExecutionService {
@@ -468,6 +475,7 @@ pub struct MaintenanceExecutionKernel {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<ConnectorControlHost>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     query_execution: QueryExecutionService,
     service: Arc<dyn TableMaintenanceService>,
 }
@@ -481,6 +489,7 @@ impl MaintenanceExecutionKernel {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<ConnectorControlHost>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+        mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         query_execution: QueryExecutionService,
         service: Arc<dyn TableMaintenanceService>,
         constant_policy: novarocks_functions::ConstantPolicy,
@@ -495,6 +504,7 @@ impl MaintenanceExecutionKernel {
             connector_control,
             typed_connector_control,
             mv_storage_observation,
+            mv_readiness,
             query_execution,
             service,
         }
@@ -528,6 +538,10 @@ impl MaintenanceExecutionKernel {
 
     pub(crate) fn mv_storage_observation(&self) -> &Arc<dyn MvStorageObservationPort> {
         &self.mv_storage_observation
+    }
+
+    pub(crate) fn mv_readiness(&self) -> &Arc<MvReadinessPort> {
+        &self.mv_readiness
     }
 
     pub(crate) fn query_execution(&self) -> &QueryExecutionService {

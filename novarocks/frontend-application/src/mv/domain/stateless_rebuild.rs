@@ -177,7 +177,7 @@ fn split_table_reference(table: &str, current_database: &str) -> Result<(String,
 pub fn execute_typed_novarocks_imv_stateless_rebuild(
     connector_control: &dyn ConnectorControlResolver,
     readiness: &MvReadinessPort,
-    product: &novarocks_mv_application::service::MvProductService,
+    product: &novarocks_mv_application::service::MvKeyedProductService,
     statement: &CallStatement,
     current_database: &str,
     connector_context: ConnectorRequestContext,
@@ -209,7 +209,7 @@ pub fn execute_typed_novarocks_imv_stateless_rebuild(
 fn execute_request_with_context(
     connector_control: &dyn ConnectorControlResolver,
     readiness: &MvReadinessPort,
-    product: &novarocks_mv_application::service::MvProductService,
+    product: &novarocks_mv_application::service::MvKeyedProductService,
     req: &ImvStatelessRebuildRequest,
     connector_context: ConnectorRequestContext,
     mut claim: novarocks_failpoint::scope::ActionClaim,
@@ -238,15 +238,21 @@ fn execute_request_with_context(
     //
     // The existence proof reads the same exact document set used by the
     // non-destructive levels below.
-    let documents = observe_current_documents(&exact_lease, &loaded_table, connector_context, req)?;
+    let documents = observe_current_documents(
+        readiness,
+        &exact_lease,
+        &loaded_table,
+        connector_context,
+        req,
+    )?;
     if req.required_level == StatelessLevel::Wipe {
         readiness.wipe_accelerator_for_test(product, uuid::Uuid::now_v7(), &mut claim)?;
         return Ok(StatementResult::Query(build_rebuild_result(
             StatelessLevel::Wipe,
-            &hex::encode(documents.definition_revision().as_bytes()),
-            &hex::encode(documents.interpretation_revision().as_bytes()),
+            &hex::encode(documents.versions.definition_revision().as_bytes()),
+            &hex::encode(documents.versions.interpretation_revision().as_bytes()),
             documents
-                .publication_revision()
+                .publication_revision
                 .map(|revision| hex::encode(revision.as_bytes()))
                 .as_deref(),
             "accelerator-wiped",
@@ -255,7 +261,7 @@ fn execute_request_with_context(
 
     claim.record_hit().map_err(|error| error.to_string())?;
     let publication_revision = documents
-        .publication_revision()
+        .publication_revision
         .map(|revision| hex::encode(revision.as_bytes()));
     let available = available_level(publication_revision.is_some());
     // For the non-destructive levels the procedure reports the level it CAN
@@ -263,8 +269,8 @@ fn execute_request_with_context(
     // `required_level` is not gated here.
     Ok(StatementResult::Query(build_rebuild_result(
         available,
-        &hex::encode(documents.definition_revision().as_bytes()),
-        &hex::encode(documents.interpretation_revision().as_bytes()),
+        &hex::encode(documents.versions.definition_revision().as_bytes()),
+        &hex::encode(documents.versions.interpretation_revision().as_bytes()),
         publication_revision.as_deref(),
         "lake-documents",
     )?))
@@ -281,16 +287,15 @@ fn available_level(has_publication: bool) -> StatelessLevel {
 /// Read the view's own documents straight from the lake, so a level that
 /// clears the cache cannot clear the cache of an MV that is not there.
 fn observe_current_documents(
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
     exact_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     loaded_table: &novarocks_spi::connector::ConnectorTableMetadata,
     context: ConnectorRequestContext,
     req: &ImvStatelessRebuildRequest,
-) -> Result<novarocks_mv_application::persistence::documents::MvObservedCurrentDocuments, String> {
-    use novarocks_spi::connector::document_storage::{
-        ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
-        ConnectorDocumentStorageLimits,
-    };
-
+) -> Result<
+    novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+    String,
+> {
     let binding = exact_lease
         .binding()
         .metadata()
@@ -306,27 +311,21 @@ fn observe_current_documents(
     let documents_lease = exact_lease
         .derive_document_storage_lease()
         .map_err(|error| format!("derive stateless rebuild document lease: {error}"))?;
-    let request = ConnectorDocumentObservationRequest::try_new(
-        documents_lease.owner().clone(),
-        documents_lease.catalog_handle().clone(),
+    let request = crate::mv::domain::staged_create::keyed_request(
+        &documents_lease,
         loaded_table.identity.clone(),
         binding.object_id.clone(),
-        ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
         context,
-    )
-    .map_err(|error| format!("build stateless rebuild document observation: {error}"))?;
-    novarocks_mv_application::persistence::documents::observe_current_management_document_set(
-        &documents_lease,
-        request,
-        novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
-    )
-    .map_err(|error| {
-        format!(
-            "MV '{}.{}' has no readable lake documents in catalog '{}': {error}",
-            req.namespace, req.mv, req.catalog
-        )
-    })
-    .map(|observed| observed.into_parts().1)
+    );
+    readiness
+        .candidate_reader()
+        .observe_current(&documents_lease, request)
+        .map_err(|e| {
+            format!(
+                "MV '{}.{}' has no readable keyed lake documents in catalog '{}': {e}",
+                req.namespace, req.mv, req.catalog
+            )
+        })
 }
 
 fn build_rebuild_result(

@@ -319,6 +319,7 @@ impl InsertEngine for DmlExecutionKernel {
         crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context(
             self.mv_storage_observation().as_ref(),
             &planning_lease,
+        self.mv_readiness().as_ref(),
             &target,
             crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Insert,
             connector_context,
@@ -585,6 +586,7 @@ mod tests {
             std::sync::Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
             Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
+            crate::mv::domain::test_admission::test_readiness(),
             crate::query_execution::compiler::test_query_execution_service(),
         )
     }

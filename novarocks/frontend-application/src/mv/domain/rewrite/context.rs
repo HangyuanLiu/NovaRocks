@@ -25,10 +25,10 @@ use novarocks_mv_application::persistence::{
     codec::{ApplyKeyKind, DefinitionDocument, ExpressionKind, SourceFieldReference, StateRole},
     exact_revision::{persist_exact_connector_revision, restore_exact_query_revision},
     identity::{DocumentRevision, PartitionSpecVersion},
-    projection::{MvPublicationState, StoredMvProjection},
+    keyed_documents::StoredKeyedMvProjection,
     runtime_bindings::{
         MvExactTargetSchemaFacts, MvPhysicalFieldFacts, MvRuntimeBindings,
-        reconstruct_runtime_bindings,
+        reconstruct_keyed_runtime_bindings,
     },
 };
 use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorTableObjectId};
@@ -83,7 +83,7 @@ pub struct IcebergMvRewriteContext {
     pub mv_id: i64,
     pub current_catalog: Option<String>,
     pub current_database: String,
-    pub mv_definition: Arc<StoredMvProjection>,
+    pub mv_definition: Arc<StoredKeyedMvProjection>,
     pub canonical_select_query: Arc<novarocks_parser::ast::Query>,
     /// Ordered, one entry per base scan, in D's own occurrence order.
     pub base_refs: Arc<[RefreshBaseRelationOccurrence]>,
@@ -121,7 +121,7 @@ impl IcebergMvRewriteContext {
         reason = "The immutable MV handoff keeps source schema and complete write declarations independent."
     )]
     pub fn from_parts(
-        projection: Arc<StoredMvProjection>,
+        projection: Arc<StoredKeyedMvProjection>,
         current: Vec<MvRewriteSourceSnapshot>,
         previous: Vec<MvRewriteSourceSnapshot>,
         target_table_uuid: String,
@@ -154,7 +154,7 @@ impl IcebergMvRewriteContext {
         {
             return Err("MV rewrite target fields lack their exact complete declarations".into());
         }
-        let runtime_bindings = reconstruct_runtime_bindings(facts, &exact_target)?;
+        let runtime_bindings = reconstruct_keyed_runtime_bindings(facts, &exact_target)?;
         let target_field_ids = validate_target_schema(&target_arrow_schema, &exact_target)?;
         let pin = validate_source_pins(facts.definition(), current)?;
         let (previous_snapshot_ids, previous_table_object_ids) =
@@ -181,15 +181,7 @@ impl IcebergMvRewriteContext {
             })
             .collect::<Vec<_>>();
         let target = facts.target();
-        let target_snapshot_id = match facts.publication() {
-            MvPublicationState::NeverPublished => None,
-            MvPublicationState::Published(published) => Some(
-                published
-                    .output_version()
-                    .snapshot_id()
-                    .ok_or("MV rewrite output has no provider-issued snapshot selector")?,
-            ),
-        };
+        let target_snapshot_id = facts.metadata_version().snapshot_id();
         Ok(Self {
             target: TableIdentity {
                 catalog: target
@@ -454,22 +446,22 @@ type RefreshHistory = (
 );
 
 fn validate_history(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     previous: Vec<MvRewriteSourceSnapshot>,
 ) -> Result<RefreshHistory, String> {
     let published = match projection.facts.publication() {
-        MvPublicationState::NeverPublished if previous.is_empty() => {
+        None if previous.is_empty() => {
             return Ok((BTreeMap::new(), BTreeMap::new()));
         }
-        MvPublicationState::NeverPublished => {
+        None => {
             return Err("NeverPublished MV cannot have refresh history".into());
         }
-        MvPublicationState::Published(published) => published,
+        Some(published) => published,
     };
     let previous = validate_source_pins(projection.facts.definition(), previous)?;
     let mut snapshots = BTreeMap::new();
     let mut objects = BTreeMap::new();
-    for input in &published.document().inputs {
+    for input in &published.inputs {
         let occurrence = SqlMvRelationOccurrenceId::new(input.relation_occurrence_id);
         let value = previous
             .get(&occurrence)
@@ -533,7 +525,7 @@ fn sql_lineage(
 }
 
 fn sql_schema_facts(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     bindings: &MvRuntimeBindings,
     analysis: &MvRewriteAnalysisFacts,
 ) -> Result<SqlImvSchemaContractFacts, String> {
@@ -946,9 +938,9 @@ pub(crate) fn arrow_type_from_contract_signature(type_signature: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
 
-    fn projection() -> StoredMvProjection {
+    fn projection() -> StoredKeyedMvProjection {
         let object = ConnectorTableObjectId::try_new(Bytes::from_static(&[11])).unwrap();
         let revision = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
             novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
@@ -964,7 +956,7 @@ mod tests {
         for occurrence in &mut fixture.definition.relation_occurrences {
             occurrence.object_id = persisted_object.clone();
         }
-        StoredMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 17,
             facts: fixture.build().unwrap(),
         }

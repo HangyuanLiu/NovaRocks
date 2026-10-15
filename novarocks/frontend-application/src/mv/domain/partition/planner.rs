@@ -17,10 +17,10 @@
 
 use crate::mv::domain::model::{AffectedTargetPartitions, MvPartitionKey};
 use crate::mv::domain::partition::mapping::map_connector_partition_to_mv_key;
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 
 pub(crate) struct AffectedPartitionPlanInput<'a> {
-    pub projection: &'a StoredMvProjection,
+    pub projection: &'a StoredKeyedMvProjection,
     pub source_occurrence_id: u32,
     pub target_partition: &'a novarocks_mv_application::persistence::schema::MvPartitionContract,
     pub partition_impact:
@@ -89,13 +89,13 @@ pub(crate) fn plan_affected_partitions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use novarocks_mv_application::persistence::schema::MvPartitionContract;
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
     use novarocks_mv_application::product::MvTarget;
     use novarocks_spi::connector::ConnectorChangeWindowPartitionImpact;
 
-    fn projection() -> StoredMvProjection {
-        StoredMvProjection {
+    fn projection() -> StoredKeyedMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 1,
             facts: ProjectionFixture::new(
                 MvTarget::from_parts(Some("ice"), "sales", "mv"),

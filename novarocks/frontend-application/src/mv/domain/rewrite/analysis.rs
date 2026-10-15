@@ -27,7 +27,7 @@
 use novarocks_mv_application::persistence::codec::{
     TargetPartitionFieldBinding, TargetPartitionTransform,
 };
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
 use novarocks_mv_application::persistence::schema::MvPartitionContract;
 use novarocks_sql::planning::mv::{
@@ -48,7 +48,7 @@ use crate::mv::domain::rewrite::context::{
 
 /// Everything one refresh attempt already froze before analysis is derived.
 pub(crate) struct MvRewriteAnalysisInput<'a> {
-    pub projection: &'a StoredMvProjection,
+    pub projection: &'a StoredKeyedMvProjection,
     /// Reconstructed against the exact target observation for this attempt.
     pub runtime_bindings: &'a MvRuntimeBindings,
     /// The provider's partition names and numeric scan-key spec from the same

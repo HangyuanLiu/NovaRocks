@@ -99,7 +99,7 @@ use novarocks_mv_application::persistence::definition::CreateMvDefinitionRequest
 use novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy;
 use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
 use novarocks_mv_application::persistence::exact_revision::restore_exact_query_revision;
-use novarocks_mv_application::persistence::projection::{MvPublicationState, StoredMvProjection};
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::persistence::schema as mv_schema;
 use novarocks_mv_application::persistence::schema::{
     APPLY_KEY_FIELD_ID_PROPERTY, APPLY_KEY_SOURCE_PROPERTY,
@@ -335,6 +335,7 @@ struct IcebergMvCreatePreparation {
     branch_id_column_name: Option<String>,
     source_field_observations:
         Vec<novarocks_mv_application::persistence::aggregate_bindings::MvCreateRelationObservation>,
+    binding_document: novarocks_mv_application::persistence::codec::keyed::BindingDocument,
     created_at_ms: i64,
     /// Runtime state layout frozen during the same CREATE analysis as the
     /// physical request. Stateless shapes use the validated empty layout so
@@ -525,27 +526,6 @@ impl IcebergMvCreateProviderAdapter {
         drop(terminal_context);
         Ok(proof)
     }
-
-    /// The marker the provider stamps on every object this deployment manages.
-    fn managed_object_marker(
-        &self,
-    ) -> Result<
-        novarocks_spi::connector::document_storage::ConnectorManagedObjectMarker,
-        MvCreateProviderError,
-    > {
-        let entrance = self
-            .ports
-            .management_entrance()
-            .map_err(engine_target_error)?;
-        novarocks_spi::connector::document_storage::ConnectorManagedObjectMarker::try_new(
-            "materialized-view",
-            entrance.owner().as_str(),
-            entrance.incarnation().as_str(),
-        )
-        .map_err(|error| {
-            engine_target_error(format!("build the MV managed object marker: {error}"))
-        })
-    }
 }
 
 impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
@@ -693,8 +673,18 @@ impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
             (documents, write)
         };
         let target = self.take_staged_target(&prepared, staged)?;
-        let marker = self.managed_object_marker()?;
-        match target.publish(&documents, write, marker, &self.connector_context) {
+        let entrance = self
+            .ports
+            .management_entrance()
+            .map_err(engine_target_error)?;
+        match target.publish(
+            &documents,
+            prepared.binding_document.clone(),
+            write,
+            entrance.owner(),
+            entrance.incarnation(),
+            &self.connector_context,
+        ) {
             StagedPublishOutcome::Published(object_id) => Ok(CreatedMvTarget {
                 target: plan.target.clone(),
                 object_id,
@@ -1016,7 +1006,7 @@ fn prepare_iceberg_mv_create_with_ports(
     })?;
     let property = derive_fragment_property(&analysis, &completion_control)?;
     let create_persistence_facts = analysis.refresh_input.create_persistence_facts()?;
-    let source_field_observations =
+    let (source_field_observations, binding_document) =
         crate::mv::domain::persistence::source_bindings::observe_mv_create_source_bindings(
             ports.storage_observation.as_ref(),
             &create_persistence_facts,
@@ -1145,6 +1135,7 @@ fn prepare_iceberg_mv_create_with_ports(
         create_persistence_facts,
         branch_id_column_name,
         source_field_observations,
+        binding_document,
         columns,
         aggregate_runtime_layout,
         partition_fields,
@@ -1362,7 +1353,7 @@ fn observed_iceberg_type_sql_head(type_signature: &str) -> String {
 /// version to compare.
 fn validate_branch_union_contract(
     target: &IcebergMvTarget,
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     query_branch_count: usize,
     target_observation: &MvSchemaValidationObservation,
 ) -> Result<(), String> {
@@ -1404,7 +1395,7 @@ fn validate_branch_union_contract(
 /// are the persisted counterpart, so a mismatch is still an error.
 fn validate_union_projection_schema_contract_for_base(
     iceberg_target: &IcebergMvTarget,
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     branch_count: usize,
     occurrence: &RelationOccurrence,
     base_observation: &MvSchemaValidationObservation,
@@ -1604,7 +1595,7 @@ fn refresh_policy_descriptor_json(
 /// management entrance. D, L and P are neither rewritten nor reconstructed.
 pub fn update_iceberg_mv_configuration_with_ports(
     ports: &IcebergMvCorePorts,
-    definition: &StoredMvProjection,
+    definition: &StoredKeyedMvProjection,
     change: impl FnOnce(
         &novarocks_mv_application::persistence::codec::ConfigurationDocument,
     ) -> Result<
@@ -1614,39 +1605,37 @@ pub fn update_iceberg_mv_configuration_with_ports(
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
     use novarocks_mv_application::management::{
-        EffectDisposition, EffectIdentity, EffectResponsibility, EffectScope, ManagedMvTarget,
-        ManagementRequest, ManagementTimestamp,
+        EffectDisposition, EffectIdentity, EffectResponsibility, EffectScope, ManagementRequest,
     };
     use novarocks_mv_application::persistence::codec::{ConfigurationDocument, RefreshPolicy};
+    use novarocks_mv_application::persistence::keyed_documents::{
+        keyed_configuration_slot_change, observe_current_keyed_documents_with_management,
+    };
     use novarocks_spi::connector::document_storage::{
         ConnectorDocumentManagementAdmissionRequest, ConnectorDocumentManagementOperation,
-        ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
-        ConnectorDocumentStorageLimits, ConnectorDocumentUpdateIntent,
-        ConnectorManagedObjectMarkerChange, ConnectorPrepareDocumentsRequest,
+        KeyedMutation, KeyedMutationIntent,
     };
     use novarocks_spi::connector::{
         ConnectorControlResolver, ConnectorMutationOperationId, ConnectorTableIdentity,
         ConnectorTableObjectCaptureRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
     };
-
-    let target = definition.facts.target().clone();
-    let catalog_name = target
+    let target = definition.facts.target();
+    let catalog = target
         .catalog()
         .ok_or_else(|| "document-managed MV target has no catalog".to_string())?;
-    let instance_id =
-        ConnectorInstanceId::parse(catalog_name).map_err(|error| error.to_string())?;
+    let instance = ConnectorInstanceId::parse(catalog).map_err(|e| e.to_string())?;
     let table = ConnectorTableIdentity {
-        instance_id: instance_id.clone(),
+        instance_id: instance.clone(),
         namespace: Arc::from(target.namespace()),
         table: Arc::from(target.name()),
     };
     let entrance = ports.management_entrance()?.as_ref();
-    let lease = ConnectorControlResolver::acquire_current(ports.connector_control(), &instance_id)
-        .map_err(|error| format!("acquire MV configuration catalog: {error}"))?;
+    let lease = ConnectorControlResolver::acquire_current(ports.connector_control(), &instance)
+        .map_err(|e| e.to_string())?;
     let catalog_handle = lease
         .binding()
         .catalog_handle()
-        .map_err(|error| format!("bind MV configuration catalog: {error}"))?
+        .map_err(|e| e.to_string())?
         .clone();
     let binding = lease
         .binding()
@@ -1657,44 +1646,30 @@ pub fn update_iceberg_mv_configuration_with_ports(
             selector: ConnectorTableObjectSelector::Current,
             context: context.clone(),
         })
-        .map_err(|error| format!("bind MV configuration target: {error}"))?;
+        .map_err(|e| e.to_string())?;
     if binding.metadata.identity != table {
-        return Err("MV provider bound a different configuration target".to_string());
+        return Err("MV provider bound a different configuration target".into());
     }
     let documents_lease = lease
         .derive_document_storage_lease()
-        .map_err(|error| format!("derive MV configuration document lease: {error}"))?;
-    let observe = |observation_context: &novarocks_spi::connector::ConnectorRequestContext| {
-        let request = ConnectorDocumentObservationRequest::try_new(
-            documents_lease.owner().clone(),
-            documents_lease.catalog_handle().clone(),
-            table.clone(),
-            binding.object_id.clone(),
-            ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
-            observation_context.clone(),
-        )
-        .map_err(|error| format!("build MV configuration observation: {error}"))?;
-        let observed = novarocks_mv_application::persistence::documents::observe_current_management_document_set(
+        .map_err(|e| e.to_string())?;
+    let request = crate::mv::domain::staged_create::keyed_request(
+        &documents_lease,
+        table.clone(),
+        binding.object_id.clone(),
+        context.clone(),
+    );
+    ports
+        .readiness()
+        .candidate_reader()
+        .observe_current(&documents_lease, request.clone())?;
+    let (initial, _, _) = entrance
+        .observe_keyed_admission(
             &documents_lease,
-            request,
+            request.clone(),
             novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
         )
-        .map(|observed| observed.into_parts())
-        .map_err(|error| format!("observe MV configuration documents: {error}"))?;
-        if entrance.close_on_current_incarnation_mismatch(&observed.0) {
-            tracing::warn!(target = ?table, "fresh Current MV marker names another incarnation; management closed");
-            return Err(
-                "MV Current marker names another process incarnation; management is closed"
-                    .to_string(),
-            );
-        }
-        Ok(observed)
-    };
-
-    // The first Current observation supplies the entrance's frozen D/L/P
-    // dependencies. Once the FIFO lease is ours, read C again so a preceding
-    // configuration writer cannot be overwritten with a stale pause or policy.
-    let (_, initial) = observe(context)?;
+        .map_err(|e| e.to_string())?;
     let dependencies = initial.management_dependencies(lease.control_runtime_id());
     let mut management = entrance
         .acquire(
@@ -1706,52 +1681,39 @@ pub fn update_iceberg_mv_configuration_with_ports(
                 Some(dependencies.clone()),
                 EffectScope::CATALOG_COMMIT,
             )
-            .map_err(|error| format!("build MV configuration admission: {error:?}"))?,
+            .map_err(|e| format!("build MV configuration admission: {e:?}"))?,
             || context.is_cancelled(),
         )
-        .map_err(|error| format!("admit MV configuration write: {error:?}"))?;
-    // The FIFO wait can outlive another writer's catalog effect. Reusing the
-    // pre-admission request scope would replay its cached C after admission.
+        .map_err(|e| format!("admit MV configuration write: {e:?}"))?;
     let admitted_context = context.clone().after_external_effect();
-    let (observation, documents) = observe(&admitted_context)?;
-    if documents.management_dependencies(lease.control_runtime_id()) != dependencies {
+    let request = crate::mv::domain::staged_create::keyed_request(
+        &documents_lease,
+        table.clone(),
+        binding.object_id.clone(),
+        admitted_context.clone(),
+    );
+    let (observed, _) = observe_current_keyed_documents_with_management(
+        &documents_lease,
+        request.clone(),
+        novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
+        entrance,
+    )
+    .map_err(|e| e.to_string())?;
+    if observed.management_dependencies(lease.control_runtime_id()) != dependencies {
         return Err(
             "MV definition, interpretation or publication changed during configuration admission"
-                .to_string(),
+                .into(),
         );
     }
-    if observation.marker().owner() != entrance.owner().as_str()
-        || observation.marker().incarnation() != entrance.incarnation().as_str()
+    if observed.deployment_owner != *entrance.owner()
+        || observed.process_incarnation != *entrance.incarnation()
     {
-        return Err("MV configuration target is no longer owned by this process".to_string());
+        return Err("MV configuration target is no longer owned by this process".into());
     }
-    // C changes no published rows. Carry this process's known row count only
-    // when the final Current observation still names the exact same output.
-    let retained_statistics = ports
-        .readiness()
-        .load_ready(&sql_target_from_product(&target))
-        .map_err(|error| format!("load MV output before configuration update: {error}"))?
-        .and_then(|loaded| match loaded.projection.facts.publication() {
-            MvPublicationState::Published(published) => published.storage_rows().map(|rows| {
-                novarocks_mv_application::persistence::projection::MvOutputStatistics {
-                    object_id: loaded
-                        .projection
-                        .facts
-                        .source_revision()
-                        .target_object_id
-                        .clone(),
-                    output_version: published.output_version().clone(),
-                    storage_rows: rows,
-                }
-            }),
-            MvPublicationState::NeverPublished => None,
-        });
-    let desired = change(documents.configuration())?;
+    let desired = change(&observed.configuration)?;
     let positive = |value: Option<i64>, field: &str| {
         value
-            .map(|value| {
-                u64::try_from(value).map_err(|_| format!("MV {field} must not be negative"))
-            })
+            .map(|v| u64::try_from(v).map_err(|_| format!("MV {field} must not be negative")))
             .transpose()
     };
     let configuration = ConfigurationDocument {
@@ -1764,10 +1726,6 @@ pub fn update_iceberg_mv_configuration_with_ports(
         refresh_interval_ms: positive(desired.interval_ms, "refresh interval")?,
         max_staleness_ms: positive(desired.max_staleness_ms, "maximum staleness")?,
     };
-    if configuration == *documents.configuration() {
-        return Ok(());
-    }
-
     let operation_uuid = uuid::Uuid::now_v7();
     let operation_id = ConnectorMutationOperationId::from_bytes(*operation_uuid.as_bytes());
     let admission = documents_lease
@@ -1776,88 +1734,64 @@ pub fn update_iceberg_mv_configuration_with_ports(
                 documents_lease.owner().clone(),
                 catalog_handle.clone(),
                 operation_id,
-                table,
+                table.clone(),
                 Some(binding.object_id.clone()),
                 ConnectorDocumentManagementOperation::SingleTargetUpdate,
                 admitted_context.clone(),
             )
-            .map_err(|error| format!("build MV configuration document admission: {error}"))?,
+            .map_err(|e| e.to_string())?,
         )
-        .map_err(|error| format!("admit MV configuration documents: {error}"))?;
-    let prepared = documents_lease
-        .prepare_documents(
-            ConnectorPrepareDocumentsRequest::try_new(
-                admission,
-                novarocks_mv_application::persistence::documents::configuration_document_set(
-                    &configuration,
-                )
-                .map_err(|error| format!("encode MV configuration document: {error}"))?,
-                admitted_context.clone(),
-            )
-            .map_err(|error| format!("build MV configuration preparation: {error}"))?,
-        )
-        .map_err(|error| format!("prepare MV configuration document: {error}"))?;
-    let intent = ConnectorDocumentUpdateIntent::try_new(
-        prepared,
-        observation.clone(),
-        ConnectorManagedObjectMarkerChange::Preserve,
-    )
-    .map_err(|error| format!("build MV configuration update: {error}"))?;
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| "system clock is before the Unix epoch".to_string())?;
-    let last_dispatch = u64::try_from(timestamp.as_millis())
-        .map(ManagementTimestamp::from_unix_millis)
-        .map_err(|_| "system clock exceeds u64 milliseconds".to_string())?;
-    let mutation = lease
-        .derive_mutation_lease()
-        .map_err(|error| format!("derive MV configuration mutation lease: {error}"))?;
+        .map_err(|e| e.to_string())?;
+    let intent = KeyedMutationIntent {
+        admission,
+        expected_metadata: observed.view.metadata_version.clone(),
+        expected_snapshot: observed.view.current_snapshot,
+        mutation: KeyedMutation::SlotChange(
+            keyed_configuration_slot_change(&configuration).map_err(|e| e.to_string())?,
+        ),
+    };
     management
         .mark_dispatched(EffectResponsibility::new(
             EffectIdentity::from_bytes(operation_id.to_bytes()),
-            ManagedMvTarget::from_observation(&observation)
-                .map_err(|error| format!("name MV configuration target: {error:?}"))?,
+            observed.management_target.clone(),
             entrance.incarnation().clone(),
             EffectScope::CATALOG_COMMIT,
-            last_dispatch,
+            crate::mv::domain::staged_create::now_management_timestamp()?,
         ))
-        .map_err(|error| format!("mark MV configuration dispatched: {error:?}"))?;
+        .map_err(|e| format!("mark MV configuration dispatched: {e:?}"))?;
+    let mutation = lease.derive_mutation_lease().map_err(|e| e.to_string())?;
     let resolved = crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
         &mutation,
         operation_id,
-        novarocks_spi::connector::ConnectorCatalogMutationOperation::UpdateApplicationDocuments {
-            intent,
-        },
-        admitted_context.clone(),
+        novarocks_spi::connector::ConnectorCatalogMutationOperation::KeyedDocuments { intent },
+        admitted_context,
     );
     let disposition = configuration_effect_disposition(&resolved);
-    management
-        .record_terminal(disposition)
-        .map_err(|error| format!("record MV configuration terminal: {error:?}"))?;
+    if let crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { evidence, .. } =
+        &resolved
+    {
+        let typed = documents_lease
+            .decode_keyed_slot_change_evidence(request, evidence.clone())
+            .map_err(|e| format!("decode MV configuration uncertainty: {e}"))?;
+        management
+            .record_slot_change_unknown(typed)
+            .map_err(|e| format!("record pending MV configuration: {e:?}"))?;
+    } else {
+        management
+            .record_terminal(disposition)
+            .map_err(|e| format!("record MV configuration terminal: {e:?}"))?;
+    }
     match disposition {
-        EffectDisposition::KnownCommitted => {
-            crate::mv::domain::staged_create::install_configured_current_projection(
-                entrance,
-                ports.readiness().as_ref(),
-                ports.connector_control(),
-                catalog_handle,
-                target,
-                operation_uuid,
-                retained_statistics,
-                context.clone().after_external_effect(),
-            )
-        }
-        EffectDisposition::KnownUncommitted => {
-            Err("MV refresh configuration update did not commit".to_string())
-        }
-        EffectDisposition::CommitUnknown => Err(
-            "MV refresh configuration outcome is unknown; management remains closed until readmission"
-                .to_string(),
-        ),
+        EffectDisposition::KnownCommitted=>crate::mv::domain::staged_create::install_configured_current_projection(entrance,ports.readiness().as_ref(),ports.connector_control(),catalog_handle,target,operation_uuid,None,context.clone().after_external_effect()),
+        EffectDisposition::KnownUncommitted=>{
+            let detail=match resolved {crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted{failure,cleanup}=>crate::connector::mutation::known_uncommitted_message(failure,&cleanup),crate::connector::mutation::ResolvedCatalogMutation::ContractFailure{error,..}=>error.to_string(),_=>"provider rejected the commit".into()};
+            Err(format!("MV refresh configuration update did not commit: {detail}"))
+        },
+        EffectDisposition::CommitUnknown=>Err("MV refresh configuration outcome is unknown; a fresh observation will resolve its pending slot".into()),
     }
 }
 
-fn configuration_effect_disposition(
+pub(crate) fn configuration_effect_disposition(
     resolved: &crate::connector::mutation::ResolvedCatalogMutation,
 ) -> novarocks_mv_application::management::EffectDisposition {
     use crate::connector::mutation::{MutationDispatchState, ResolvedCatalogMutation};
@@ -2349,7 +2283,7 @@ mod tests {
     fn test_two_relation_projection(
         left: &TableIdentity,
         right: &TableIdentity,
-    ) -> StoredMvProjection {
+    ) -> StoredKeyedMvProjection {
         test_two_relation_projection_with_qualifiers(left, right, "l", "r")
     }
 
@@ -2358,12 +2292,11 @@ mod tests {
         right: &TableIdentity,
         left_qualifier: &str,
         right_qualifier: &str,
-    ) -> StoredMvProjection {
-        let mut fixture =
-            novarocks_mv_application::persistence::test_support::ProjectionFixture::new(
-                novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "sales", "mv"),
-                None,
-            );
+    ) -> StoredKeyedMvProjection {
+        let mut fixture = crate::mv::domain::test_admission::KeyedProjectionFixture::new(
+            novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "sales", "mv"),
+            None,
+        );
         for (occurrence, (table, qualifier)) in fixture
             .definition
             .relation_occurrences
@@ -2375,7 +2308,7 @@ mod tests {
             occurrence.relation_at_binding.clone_from(&table.table);
             occurrence.qualifier_at_binding = qualifier.to_string();
         }
-        StoredMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 1,
             facts: fixture.build().expect("two-relation fixture projection"),
         }
@@ -2736,7 +2669,7 @@ fn merge_affected_partition_results(
     reason = "Multi-base partition planning keeps each separately observed provider fact explicit."
 )]
 fn plan_multi_base_affected_partitions(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     target_partition: &mv_schema::MvPartitionContract,
     mode: RefreshMode,
     bases: &[RefreshBaseRelationOccurrence],
@@ -2842,7 +2775,7 @@ fn plan_aggregate_mv_affected_partitions(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     base: &RefreshBaseRelationOccurrence,
     state_baseline: &RefreshStateBaseline,
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     target_partition: &mv_schema::MvPartitionContract,
     mode: RefreshMode,
     previous_snapshot_id: Option<i64>,
@@ -2961,14 +2894,14 @@ fn log_planned_iceberg_mv_affected_partitions(
 }
 
 pub(crate) fn build_refresh_state_baseline(
-    mv_definition: &StoredMvProjection,
+    mv_definition: &StoredKeyedMvProjection,
     target: &crate::mv::domain::refresh::target_binding::MvTargetBinding,
 ) -> Result<RefreshStateBaseline, String> {
     let definition = mv_definition.facts.definition();
     let previous_sources = match mv_definition.facts.publication() {
-        MvPublicationState::NeverPublished => Vec::new(),
-        MvPublicationState::Published(publication) => {
-            if publication.document().inputs.len() != definition.relation_occurrences.len() {
+        None => Vec::new(),
+        Some(publication) => {
+            if publication.inputs.len() != definition.relation_occurrences.len() {
                 return Err(
                     "MV publication inputs do not cover every D relation occurrence".into(),
                 );
@@ -2976,7 +2909,7 @@ pub(crate) fn build_refresh_state_baseline(
             definition
                 .relation_occurrences
                 .iter()
-                .zip(&publication.document().inputs)
+                .zip(&publication.inputs)
                 .map(|(occurrence, input)| {
                     if occurrence.occurrence_id != input.relation_occurrence_id {
                         return Err(format!(
@@ -3035,7 +2968,9 @@ fn occurrence_table(occurrence: &RelationOccurrence) -> TableIdentity {
 /// requires, and which is what pairs each entry back with the occurrence it
 /// came from. A relation named twice is two entries: two mentions of one table
 /// are two sources, and everything downstream keys them by occurrence.
-fn definition_base_refs(projection: &StoredMvProjection) -> Result<Vec<TableIdentity>, String> {
+fn definition_base_refs(
+    projection: &StoredKeyedMvProjection,
+) -> Result<Vec<TableIdentity>, String> {
     Ok(projection
         .facts
         .definition()
@@ -3054,7 +2989,7 @@ fn definition_has_join(query: &ast::Query) -> bool {
 /// D's occurrences in their own order, proven to describe exactly the base
 /// locators this attempt resolved.
 fn definition_occurrences_for_base_refs<'a>(
-    projection: &'a StoredMvProjection,
+    projection: &'a StoredKeyedMvProjection,
     base_refs: &[TableIdentity],
 ) -> Result<Vec<&'a RelationOccurrence>, String> {
     let occurrences = &projection.facts.definition().relation_occurrences;
@@ -3078,7 +3013,7 @@ fn definition_occurrences_for_base_refs<'a>(
 /// The same resolution, projected to what the planning contract carries: each
 /// base relation paired with the occurrence the documents say it is.
 fn base_relation_occurrences(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     base_refs: &[TableIdentity],
 ) -> Result<Vec<RefreshBaseRelationOccurrence>, String> {
     Ok(definition_occurrences_for_base_refs(projection, base_refs)?
@@ -3190,15 +3125,11 @@ fn refresh_connector_preparation_error(error: ConnectorError) -> RefreshError {
 /// refresh reaches publication admission. Observe the provider's Current
 /// marker first so another incarnation closes this process's admission even
 /// when later planning fails against the changed metadata generation.
-fn close_management_on_current_incarnation_mismatch(
+fn close_management_on_current_management_mismatch(
     source: &IcebergMvCorePorts,
     target: &IcebergMvTarget,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<bool, String> {
-    use novarocks_spi::connector::document_storage::{
-        ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
-        ConnectorDocumentStorageLimits,
-    };
     use novarocks_spi::connector::{
         ConnectorControlResolver, ConnectorTableIdentity, ConnectorTableObjectCaptureRequest,
         ConnectorTableObjectSelector, ConnectorTableResolution,
@@ -3233,32 +3164,26 @@ fn close_management_on_current_incarnation_mismatch(
     let documents_lease = lease
         .derive_document_storage_lease()
         .map_err(|error| format!("derive MV Current marker document lease: {error}"))?;
-    let request = ConnectorDocumentObservationRequest::try_new(
-        documents_lease.owner().clone(),
-        documents_lease.catalog_handle().clone(),
+    let request = crate::mv::domain::staged_create::keyed_request(
+        &documents_lease,
         table,
         binding.object_id,
-        ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
         context.clone(),
-    )
-    .map_err(|error| format!("build MV Current marker observation: {error}"))?;
-    let (observation, _) =
-        novarocks_mv_application::persistence::documents::observe_current_management_document_set(
-            &documents_lease,
-            request,
-            novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
-        )
-        .map_err(|error| format!("observe MV Current marker documents: {error}"))?
-        .into_parts();
+    );
+    source
+        .readiness()
+        .candidate_reader()
+        .observe_current(&documents_lease, request.clone())?;
     let closed = source
         .management_entrance()?
-        .close_on_current_incarnation_mismatch(&observation);
+        .close_on_keyed_current_management_mismatch(&documents_lease, request)
+        .map_err(|e| e.to_string())?;
     if closed {
         tracing::warn!(
             catalog = %target.catalog,
             database = %target.namespace,
             name = %target.table,
-            "fresh Current MV marker names another incarnation; management closed"
+            "fresh Current MV management slot names another writer; management closed"
         );
     }
     Ok(closed)
@@ -3284,7 +3209,7 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
     // Historical v1/v2 recovery stays in the legacy execution adapter; a
     // current frontend-owned attempt must never perform recovery before its
     // durable v3 intent exists.
-    if close_management_on_current_incarnation_mismatch(source, &iceberg_target, connector_context)
+    if close_management_on_current_management_mismatch(source, &iceberg_target, connector_context)
         .map_err(RefreshError::user)?
     {
         return Err(RefreshError::user(
@@ -3303,9 +3228,13 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
         source.readiness().test_controls(),
     )
     .map_err(refresh_connector_preparation_error)?;
-    if let Err(snapshot_error) =
-        validate_target_snapshot(&iceberg_target, &mv_definition, &target_binding)
-    {
+    if let Err(snapshot_error) = validate_target_snapshot(
+        &iceberg_target,
+        &mv_definition,
+        &target_binding,
+        source.management_entrance()?.as_ref(),
+        connector_context,
+    ) {
         reconcile_published_lake_projection(
             source,
             &iceberg_target,
@@ -3760,7 +3689,7 @@ fn plan_iceberg_union_projection_mv_refresh(
     stmt: &MvRefreshRequest,
     current_catalog: Option<&str>,
     current_database: &str,
-    mv_definition: &StoredMvProjection,
+    mv_definition: &StoredKeyedMvProjection,
     base_refs: &[TableIdentity],
     branch_count: usize,
     target_binding: &MvTargetBinding,
@@ -3957,7 +3886,7 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
     stmt: &MvRefreshRequest,
     current_catalog: Option<&str>,
     current_database: &str,
-    mv_definition: &StoredMvProjection,
+    mv_definition: &StoredKeyedMvProjection,
     base_refs: &[TableIdentity],
     caps: &RefreshCapabilities,
     canonical_select_query: &ast::Query,
@@ -4138,7 +4067,7 @@ fn plan_iceberg_aggregate_mv_refresh(
     stmt: &MvRefreshRequest,
     current_catalog: Option<&str>,
     current_database: &str,
-    mv_definition: &StoredMvProjection,
+    mv_definition: &StoredKeyedMvProjection,
     base_refs: &[TableIdentity],
     caps: &RefreshCapabilities,
     canonical_select_query: &ast::Query,
@@ -4443,7 +4372,7 @@ fn plan_iceberg_aggregate_mv_refresh(
     reason = "The final plan constructor preserves each separately validated refresh contract fact."
 )]
 fn build_iceberg_refresh_plan(
-    mv_definition: &StoredMvProjection,
+    mv_definition: &StoredKeyedMvProjection,
     target: MvTarget,
     stmt: &MvRefreshRequest,
     current_catalog: Option<&str>,
@@ -4708,7 +4637,7 @@ fn validate_refresh_pin_table_object_ids_against_baseline(
 /// the table -- two sides of a self-join have the same table and differ in
 /// nothing else.
 pub fn join_base_refs_for_definition<'a>(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     canonical_query: &ast::Query,
     base_refs: &'a [RefreshBaseRelationOccurrence],
 ) -> Result<
@@ -4886,8 +4815,8 @@ fn refresh_explain_rewrite_disabled_rules(
 #[cfg(test)]
 mod partition_planning_tests {
     use super::*;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use mv_schema::{MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract};
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
 
     fn key(value: &str) -> crate::mv::domain::model::MvPartitionKey {
         crate::mv::domain::model::MvPartitionKey::new(
@@ -4925,8 +4854,8 @@ mod partition_planning_tests {
         }
     }
 
-    fn projection() -> StoredMvProjection {
-        StoredMvProjection {
+    fn projection() -> StoredKeyedMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 1,
             facts: ProjectionFixture::new(
                 novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "sales", "mv"),
@@ -5209,7 +5138,7 @@ struct RewriteMergeRefreshOptions {
 /// SQL target resolution and Connector mutation remain outside the product;
 /// the product fixes their admissible order and terminal meaning.
 pub(crate) fn drop_iceberg_mv_with_product(
-    product: &novarocks_mv_application::service::MvProductService,
+    product: &novarocks_mv_application::service::MvKeyedProductService,
     ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -5292,10 +5221,7 @@ fn prepare_iceberg_mv_drop_management(
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Option<PreparedIcebergMvDrop>, String> {
     use novarocks_mv_application::management::{EffectScope, ManagedMvTarget, ManagementRequest};
-    use novarocks_spi::connector::document_storage::{
-        ConnectorDocumentManagementOperation, ConnectorDocumentObservationRequest,
-        ConnectorDocumentStorageBudget, ConnectorDocumentStorageLimits,
-    };
+    use novarocks_spi::connector::document_storage::ConnectorDocumentManagementOperation;
     use novarocks_spi::connector::{
         ConnectorControlResolver, ConnectorTableIdentity, ConnectorTableObjectCaptureRequest,
         ConnectorTableObjectSelector, ConnectorTableResolution,
@@ -5347,32 +5273,27 @@ fn prepare_iceberg_mv_drop_management(
         .map_err(|error| format!("derive MV DROP document lease: {error}"))?;
     let entrance = ports.management_entrance()?;
     let observe = || {
-        let request = ConnectorDocumentObservationRequest::try_new(
-            documents_lease.owner().clone(),
-            documents_lease.catalog_handle().clone(),
+        let request = crate::mv::domain::staged_create::keyed_request(
+            &documents_lease,
             table.clone(),
             binding.object_id.clone(),
-            ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
             context.clone(),
-        )
-        .map_err(|error| format!("build MV DROP observation: {error}"))?;
-        let observed = novarocks_mv_application::persistence::documents::observe_current_management_document_set(
-            &documents_lease,
-            request,
-            novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
-        )
-        .map(|observed| observed.into_parts())
-        .map_err(|error| format!("observe MV DROP documents: {error}"))?;
-        if entrance.close_on_current_incarnation_mismatch(&observed.0) {
-            tracing::warn!(target = ?table, "fresh Current MV marker names another incarnation; management closed");
-            return Err(
-                "MV Current marker names another process incarnation; management is closed"
-                    .to_string(),
-            );
-        }
-        Ok(observed)
+        );
+        ports
+            .readiness()
+            .candidate_reader()
+            .observe_current(&documents_lease, request.clone())?;
+        let (observed, _, _) = entrance
+            .observe_keyed_admission(
+                &documents_lease,
+                request,
+                novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>(observed)
     };
-    let (_, first_documents) = observe()?;
+    let first_documents = observe()?;
     let dependencies = first_documents.management_dependencies(control.control_runtime_id());
     let management = entrance
         .acquire(
@@ -5388,19 +5309,18 @@ fn prepare_iceberg_mv_drop_management(
             || context.is_cancelled(),
         )
         .map_err(|error| format!("admit MV DROP: {error:?}"))?;
-    let (observation, documents) = observe()?;
+    let documents = observe()?;
     if documents.management_dependencies(control.control_runtime_id()) != dependencies
-        || observation.object_id() != &binding.object_id
-        || observation.marker().owner() != entrance.owner().as_str()
-        || observation.marker().incarnation() != entrance.incarnation().as_str()
+        || documents.view.object_id != binding.object_id
+        || documents.deployment_owner != *entrance.owner()
+        || documents.process_incarnation != *entrance.incarnation()
     {
         return Err("MV DROP target changed or is not owned by this process".to_string());
     }
     let mutation_lease = control
         .derive_mutation_lease()
         .map_err(|error| format!("derive MV DROP mutation lease: {error}"))?;
-    let exact_target = ManagedMvTarget::from_observation(&observation)
-        .map_err(|error| format!("name MV DROP target: {error:?}"))?;
+    let exact_target = documents.management_target.clone();
     Ok(Some(PreparedIcebergMvDrop {
         entrance_lease: Some(management),
         mutation_lease,
@@ -5416,14 +5336,18 @@ struct IcebergDropProjection<'a> {
     expected_object_id: Option<ConnectorTableObjectId>,
 }
 
-impl novarocks_mv_application::ports::MvDropProjectionPort for IcebergDropProjection<'_> {
+impl
+    novarocks_mv_application::ports::MvDropProjectionPort<
+        novarocks_mv_application::readiness::MvKeyedProjectionDeleteGuard,
+    > for IcebergDropProjection<'_>
+{
     fn prepare_drop(
         &self,
         _operation: novarocks_mv_application::product::MvOperationContext,
         target: &novarocks_mv_application::product::MvTarget,
         if_exists: bool,
     ) -> Result<
-        novarocks_mv_application::readiness::MvDropReadiness,
+        novarocks_mv_application::readiness::MvKeyedDropReadiness,
         novarocks_mv_application::ports::MvProviderFailure,
     > {
         let target = sql_target_from_product(target);
@@ -5433,10 +5357,10 @@ impl novarocks_mv_application::ports::MvDropProjectionPort for IcebergDropProjec
             .map_err(drop_preflight_projection_failure)?;
         match (&readiness, &self.expected_object_id) {
             (
-                novarocks_mv_application::readiness::MvDropReadiness::ReadyToDrop(guard),
+                novarocks_mv_application::readiness::MvKeyedDropReadiness::ReadyToDrop(guard),
                 Some(expected),
             ) if guard.expected_target_object_id() == Some(expected) => Ok(readiness),
-            (novarocks_mv_application::readiness::MvDropReadiness::AlreadyAbsent, None) => {
+            (novarocks_mv_application::readiness::MvKeyedDropReadiness::AlreadyAbsent, None) => {
                 Ok(readiness)
             }
             _ => Err(novarocks_mv_application::ports::MvProviderFailure::new(
@@ -5449,26 +5373,26 @@ impl novarocks_mv_application::ports::MvDropProjectionPort for IcebergDropProjec
     fn delete_after_provider_drop(
         &self,
         operation: novarocks_mv_application::product::MvOperationContext,
-        guard: novarocks_mv_application::readiness::MvProjectionDeleteGuard,
+        guard: novarocks_mv_application::readiness::MvKeyedProjectionDeleteGuard,
     ) -> Result<(), novarocks_mv_application::ports::MvProviderFailure> {
         match self
             .readiness
             .delete_after_provider_drop(operation.operation_id, guard)
             .map_err(drop_provider_failure)?
         {
-            novarocks_mv_application::readiness::MvProjectionInstallOutcome::Removed
-            | novarocks_mv_application::readiness::MvProjectionInstallOutcome::AlreadyAbsent => {
+            novarocks_mv_application::readiness::MvKeyedProjectionInstallOutcome::Removed
+            | novarocks_mv_application::readiness::MvKeyedProjectionInstallOutcome::AlreadyAbsent => {
                 Ok(())
             }
-            novarocks_mv_application::readiness::MvProjectionInstallOutcome::Superseded => {
+            novarocks_mv_application::readiness::MvKeyedProjectionInstallOutcome::Superseded => {
                 Err(novarocks_mv_application::ports::MvProviderFailure::new(
                     novarocks_mv_application::ports::MvProviderFailureKind::TargetReplaced,
                     "MV projection changed after the provider DROP committed",
                 ))
             }
-            novarocks_mv_application::readiness::MvProjectionInstallOutcome::Installed(_)
-            | novarocks_mv_application::readiness::MvProjectionInstallOutcome::Unchanged(_)
-            | novarocks_mv_application::readiness::MvProjectionInstallOutcome::AlreadyProjectedElsewhere(_) => {
+            novarocks_mv_application::readiness::MvKeyedProjectionInstallOutcome::Installed(_)
+            | novarocks_mv_application::readiness::MvKeyedProjectionInstallOutcome::Unchanged(_)
+            | novarocks_mv_application::readiness::MvKeyedProjectionInstallOutcome::AlreadyProjectedElsewhere(_) => {
                 Err(novarocks_mv_application::ports::MvProviderFailure::new(
                     novarocks_mv_application::ports::MvProviderFailureKind::Corruption,
                     "MV DROP finalization returned an installation outcome",

@@ -349,13 +349,6 @@ fn execute_set_owner(
     let challenge = parse_challenge(&request.challenge)?;
     let new_owner = DeploymentOwner::parse(&request.new_deployment)
         .map_err(|error| format!("parse the declared new deployment: {error:?}"))?;
-    if &new_owner == continuation.local_owner() {
-        return Err(
-            "novarocks_mv_set_owner names this deployment; a target is handed to another \
-             deployment, and taking one back is a handover run from there"
-                .to_string(),
-        );
-    }
     let mut record = ManagementAuditRecord {
         action: ManagementAuditAction::SetOwner,
         session_principal: session_principal.to_string(),
@@ -405,7 +398,6 @@ fn execute_set_owner(
                     MvOwnerHandoverOutcome::HandedOver { previous_owner } => {
                         Some(previous_owner.clone())
                     }
-                    MvOwnerHandoverOutcome::AlreadyOwned => None,
                 },
             ),
             row(
@@ -413,7 +405,6 @@ fn execute_set_owner(
                 Some(
                     match &outcome {
                         MvOwnerHandoverOutcome::HandedOver { .. } => "HANDED_OVER",
-                        MvOwnerHandoverOutcome::AlreadyOwned => "ALREADY_OWNED",
                     }
                     .to_string(),
                 ),
@@ -481,6 +472,8 @@ fn status_rows(status: &MvManagementStatus) -> Vec<Vec<Option<String>>> {
             Some(status.local_incarnation.as_str().to_string()),
         ),
         row("UnsettledEffects", Some(status.unsettled.len().to_string())),
+        row("PendingSlotChanges", Some(status.pending_slot_changes.to_string())),
+        row("LatestSlotChangeConclusion", status.latest_slot_change_conclusion.as_ref().map(|c|match c {novarocks_spi::connector::document_storage::CommitConclusion::Committed(_)=>"Committed",novarocks_spi::connector::document_storage::CommitConclusion::NotCommitted(_)=>"NotCommitted",novarocks_spi::connector::document_storage::CommitConclusion::InvalidatedUndetermined=>"InvalidatedUndetermined",novarocks_spi::connector::document_storage::CommitConclusion::StillUnknown=>"StillUnknown"}.to_string())),
         row("Challenge", status.challenge.map(render_challenge)),
         row("RequiredEvidence", status.required_evidence.clone()),
         row(
@@ -759,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn handing_a_target_to_this_very_deployment_is_refused_before_anything_is_recorded() {
+    fn same_owner_handover_still_requires_an_issued_challenge() {
         let audit: Arc<dyn ManagementAuditSink> = Arc::new(RecordingAudit::default());
         let error = try_execute_management_call(
             Some(&Arc::new(continuation_service())),
@@ -768,9 +761,9 @@ mod tests {
             "root",
             &set_owner_call("deployment-a", "00000000-0000-7000-8000-000000000001"),
         )
-        .expect_err("a handover to the local deployment is not a handover");
+        .expect_err("an unissued challenge cannot authorize same-owner handover");
 
-        assert!(error.contains("names this deployment"), "{error}");
+        assert!(!error.contains("names this deployment"), "{error}");
     }
 
     #[test]
@@ -833,5 +826,76 @@ mod tests {
         .expect_err("a product with no management authority cannot answer");
 
         assert!(error.contains("management authority"), "{error}");
+    }
+    #[test]
+    fn same_owner_handover_reaches_the_operation_once_and_spends_its_challenge() {
+        struct SameOwner(std::sync::atomic::AtomicUsize);
+        impl MvManagementOperations for SameOwner {
+            fn readmit(
+                &self,
+                _: &ManagementCallTarget,
+                _: ProcessIncarnation,
+                _: Vec<ReadmissionPermit>,
+            ) -> Result<(), String> {
+                unreachable!("handover only")
+            }
+            fn hand_over(
+                &self,
+                _: &ManagementCallTarget,
+                owner: DeploymentOwner,
+            ) -> Result<MvOwnerHandoverOutcome, String> {
+                assert_eq!(owner.as_str(), "deployment-a");
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(MvOwnerHandoverOutcome::HandedOver {
+                    previous_owner: owner.as_str().into(),
+                })
+            }
+        }
+        let continuation = Arc::new(continuation_service());
+        let table = ManagementCallTarget {
+            catalog: "ice".into(),
+            database: "db".into(),
+            name: "mv".into(),
+        }
+        .table()
+        .unwrap();
+        let challenge = new_challenge();
+        let status = continuation.status(&table, None, challenge).unwrap();
+        assert_eq!(status.challenge, Some(challenge));
+        let rows = status_rows(&status);
+        assert!(
+            rows.iter()
+                .any(|r| r == &row("PendingSlotChanges", Some("0".into())))
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r == &row("LatestSlotChangeConclusion", None))
+        );
+        let statement = set_owner_call(
+            "deployment-a",
+            &uuid::Uuid::from_bytes(challenge.to_bytes()).to_string(),
+        );
+        let operations = SameOwner(std::sync::atomic::AtomicUsize::new(0));
+        let audit: Arc<dyn ManagementAuditSink> = Arc::new(RecordingAudit::default());
+        try_execute_management_call(
+            Some(&continuation),
+            Some(&audit),
+            &operations,
+            "root",
+            &statement,
+        )
+        .unwrap();
+        assert_eq!(operations.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            try_execute_management_call(
+                Some(&continuation),
+                Some(&audit),
+                &operations,
+                "root",
+                &statement
+            )
+            .is_err()
+        );
+        assert_eq!(operations.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

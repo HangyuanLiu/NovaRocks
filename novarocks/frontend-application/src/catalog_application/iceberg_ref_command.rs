@@ -28,16 +28,19 @@ use novarocks_spi::connector::MvStorageObservationPort;
 pub struct IcebergRefCommandExecutor {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
+    mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
 }
 
 impl IcebergRefCommandExecutor {
     pub fn new(
         connector_control: Arc<dyn ConnectorControlRegistry>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
+        mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     ) -> Self {
         Self {
             connector_control,
             storage_observation,
+            mv_readiness,
         }
     }
 
@@ -50,6 +53,7 @@ impl IcebergRefCommandExecutor {
         crate::mv::domain::ref_flow::execute_with_ports(
             self.connector_control.as_ref(),
             self.storage_observation.as_ref(),
+            self.mv_readiness.as_ref(),
             current_database,
             statement,
             connector_context,

@@ -24,7 +24,7 @@ use novarocks_mv_application::{
     product::MvTarget as ProductMvTarget,
     scheduler::MvScheduledRefreshRequest,
     scheduler_runtime::{MvRefreshDisposition, MvRefreshRuntimeDecision},
-    service::MvProductService,
+    service::MvKeyedProductService,
 };
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
@@ -35,14 +35,16 @@ pub(crate) type ScheduledRefreshRuntimeDecision = MvRefreshRuntimeDecision;
 /// the outer provider/query-execution adapter.
 #[derive(Clone, Debug)]
 pub(crate) struct ScheduledRefreshRequest {
-    product: MvScheduledRefreshRequest,
+    product: MvScheduledRefreshRequest<
+        novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
+    >,
     pub(crate) target: MvTarget,
 }
 
 impl ScheduledRefreshRequest {
     pub(crate) fn projection(
         &self,
-    ) -> &novarocks_mv_application::persistence::projection::StoredMvProjection {
+    ) -> &novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection {
         self.product.projection()
     }
 }
@@ -62,7 +64,7 @@ pub(crate) trait ScheduledRefreshRunner: Send + Sync {
 /// neither constructs nor retains queue, backoff, source-revision or policy
 /// state; it supplies the one provider snapshot read the product admits.
 pub(crate) fn poll(
-    product: &MvProductService,
+    product: &MvKeyedProductService,
     readiness: &MvReadinessPort,
     engine: &dyn MvBackgroundEngine,
     now_ms: i64,
@@ -100,16 +102,16 @@ pub(crate) fn poll(
     })
 }
 
-pub(crate) fn mark_started(product: &MvProductService, mv_id: i64) -> bool {
+pub(crate) fn mark_started(product: &MvKeyedProductService, mv_id: i64) -> bool {
     product.with_refresh_scheduler(|scheduler| scheduler.mark_started(mv_id))
 }
 
-pub(crate) fn requeue(product: &MvProductService, request: ScheduledRefreshRequest) {
+pub(crate) fn requeue(product: &MvKeyedProductService, request: ScheduledRefreshRequest) {
     product.with_refresh_scheduler(|scheduler| scheduler.requeue(request.product));
 }
 
 pub(crate) fn complete(
-    product: &MvProductService,
+    product: &MvKeyedProductService,
     request: &ScheduledRefreshRequest,
     disposition: ScheduledRefreshDisposition,
     now_ms: i64,

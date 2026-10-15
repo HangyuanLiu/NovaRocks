@@ -31,7 +31,7 @@ use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target};
 use novarocks_mv_application::persistence::codec::{ConfigurationDocument, RefreshPolicy};
 use novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy;
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_parser::ast::Visit;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
@@ -136,7 +136,7 @@ fn load_definition_for_alter(
     current_catalog: Option<&str>,
     db: &str,
     name_parts: &[String],
-) -> Result<StoredMvProjection, String> {
+) -> Result<StoredKeyedMvProjection, String> {
     let target = resolve_refresh_target(current_catalog, db, name_parts)?;
     let Some(definition) = readiness
         .load_ready(&MvTarget {
@@ -195,7 +195,7 @@ pub fn create_mv_with_ports(
 /// Drop an MV through the readiness-aware Accelerator view and the injected
 /// MV backend.
 pub fn drop_mv_with_ports(
-    product: &novarocks_mv_application::service::MvProductService,
+    product: &novarocks_mv_application::service::MvKeyedProductService,
     ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     db: &str,

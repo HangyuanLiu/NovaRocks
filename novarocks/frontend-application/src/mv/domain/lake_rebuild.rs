@@ -27,24 +27,20 @@
 
 use std::sync::Arc;
 
-use novarocks_mv_application::persistence::documents::{
-    MvDocumentError, observe_current_management_documents,
-};
-use novarocks_mv_application::persistence::projection::{MvPublicationState, StoredMvProjection};
+use novarocks_mv_application::persistence::documents::MvDocumentError;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::persistence::validation::PersistenceDecodeBudget;
 use novarocks_mv_application::product::MvTarget;
 use novarocks_mv_application::readiness::{
-    MvCurrentProjectionRequest, MvProjectionError, MvProjectionErrorKind,
-    MvProjectionInstallOutcome, MvReadOnlyCurrentProjectionObservation,
-    MvReadOnlyCurrentProjectionSource,
+    MvCurrentProjectionRequest, MvKeyedProjectionInstallOutcome,
+    MvKeyedReadOnlyCurrentProjectionSource, MvProjectionError, MvProjectionErrorKind,
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorControlResolver, ConnectorDocumentDiscoveryCompleteness,
     ConnectorDocumentDiscoveryIncompleteReason, ConnectorDocumentDiscoveryRequest,
-    ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
-    ConnectorDocumentStorageLimits, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableObjectCaptureRequest,
-    ConnectorTableObjectSelector, ConnectorTableResolution,
+    ConnectorDocumentStorageBudget, ConnectorDocumentStorageLimits, ConnectorError,
+    ConnectorErrorKind, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
+    ConnectorTableObjectCaptureRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
     MAX_CONNECTOR_DOCUMENT_DISCOVERY_PAGE_SIZE,
 };
 use uuid::Uuid;
@@ -133,6 +129,7 @@ fn rebuild_imv_cache_from_catalogs_inner(
     )?;
     let source = LakeReadOnlyCurrentSource {
         connector_control: ctx.connector_control,
+        reader: ctx.readiness.candidate_reader(),
     };
     for instance_id in instance_ids {
         let discovered = match discover_managed_mv_targets(
@@ -246,7 +243,7 @@ fn rediscover_one_target(
             // one finds a view this process already holds. There is
             // nothing to install, nothing to close management on, and no
             // second candidate to validate.
-            Ok(MvProjectionInstallOutcome::AlreadyProjectedElsewhere(owner)) => {
+            Ok(MvKeyedProjectionInstallOutcome::AlreadyProjectedElsewhere(owner)) => {
                 tracing::debug!(
                     catalog = instance_id.as_str(),
                     mv_target = target.name(),
@@ -339,7 +336,10 @@ pub(crate) fn rebuild_one_lake_package_if_missing_verified(
         PersistenceDecodeBudget::default(),
     )
     .map_err(|error| format!("prepare targeted read-only MV observation: {error}"))?;
-    let source = LakeReadOnlyCurrentSource { connector_control };
+    let source = LakeReadOnlyCurrentSource {
+        connector_control,
+        reader: readiness.candidate_reader(),
+    };
     readiness
         .observe_current_read_only_and_install(Uuid::now_v7(), request, &source)
         .map(|_| ())
@@ -348,14 +348,18 @@ pub(crate) fn rebuild_one_lake_package_if_missing_verified(
 
 struct LakeReadOnlyCurrentSource<'a> {
     connector_control: &'a dyn ConnectorControlResolver,
+    reader: crate::mv::domain::readiness::MvCandidateReader,
 }
 
 #[async_trait::async_trait]
-impl MvReadOnlyCurrentProjectionSource for LakeReadOnlyCurrentSource<'_> {
-    async fn observe_read_only(
+impl MvKeyedReadOnlyCurrentProjectionSource for LakeReadOnlyCurrentSource<'_> {
+    async fn observe_current_keyed_read_only(
         &self,
-        request: &MvCurrentProjectionRequest,
-    ) -> Result<MvReadOnlyCurrentProjectionObservation, MvProjectionError> {
+        request: MvCurrentProjectionRequest,
+    ) -> Result<
+        novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+        MvProjectionError,
+    > {
         let catalog = request.target().catalog().ok_or_else(|| {
             MvProjectionError::new(
                 MvProjectionErrorKind::SourceConflict,
@@ -406,25 +410,15 @@ impl MvReadOnlyCurrentProjectionSource for LakeReadOnlyCurrentSource<'_> {
         let documents = lease
             .derive_document_storage_lease()
             .map_err(project_connector_error)?;
-        let observation_request = ConnectorDocumentObservationRequest::try_new(
-            documents.owner().clone(),
-            documents.catalog_handle().clone(),
+        let observation_request = crate::mv::domain::staged_create::keyed_request(
+            &documents,
             table,
             binding.object_id,
-            ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
             request.context().clone(),
-        )
-        .map_err(project_connector_error)?;
-        let documents = observe_current_management_documents(
-            &documents,
-            observation_request,
-            request.decode_budget(),
-        )
-        .map_err(MvProjectionError::from)?;
-        Ok(MvReadOnlyCurrentProjectionObservation {
-            documents,
-            output_statistics: None,
-        })
+        );
+        self.reader
+            .observe_current(&documents, observation_request)
+            .map_err(|e| MvProjectionError::new(MvProjectionErrorKind::SourceConflict, e))
     }
 }
 
@@ -579,13 +573,13 @@ fn canonical_target(table: &ConnectorTableIdentity) -> MvTarget {
 fn installed_projection(
     ctx: &LakeRebuildContext<'_>,
     target: &MvTarget,
-) -> Result<StoredMvProjection, String> {
+) -> Result<StoredKeyedMvProjection, String> {
     ctx.readiness
         .candidate_reader()
         .list_candidate_definitions()
         .map_err(|error| format!("list MV candidates after lake rebuild failed: {error}"))?
         .into_iter()
-        .find(|projection| projection.facts.target() == target)
+        .find(|projection| projection.facts.target() == *target)
         .ok_or_else(|| {
             "read-only MV installation did not publish its candidate inventory".to_string()
         })
@@ -602,7 +596,7 @@ fn validate_installed_candidate(
         .list_candidate_definitions()
         .map_err(|error| format!("list MV candidates after lake rebuild failed: {error}"))?
         .into_iter()
-        .find(|projection| projection.facts.target() == target)
+        .find(|projection| projection.facts.target() == *target)
         .ok_or_else(|| {
             "read-only MV installation did not publish its candidate inventory".to_string()
         })?;
@@ -642,13 +636,10 @@ fn audit_retained_lake_mv_base_identities(
 /// throughout; repeated names are never collapsed into an FQN map.
 fn verify_published_base_identities(
     ctx: &LakeRebuildContext<'_>,
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     connector_context: &ConnectorRequestContext,
 ) -> Result<(), String> {
-    if matches!(
-        projection.facts.publication(),
-        MvPublicationState::NeverPublished
-    ) {
+    if matches!(projection.facts.publication(), None) {
         return Ok(());
     }
     for occurrence in &projection.facts.definition().relation_occurrences {
@@ -703,7 +694,7 @@ fn verify_published_base_identities(
 
 fn projection_catalogs_are_admitted(
     application: Option<&dyn novarocks_catalog_application::CatalogApplicationPort>,
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
 ) -> Result<bool, String> {
     let Some(application) = application else {
         return Ok(false);
@@ -740,7 +731,7 @@ fn project_connector_error(error: ConnectorError) -> MvProjectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorProviderId, ConnectorTableObjectId,
     };
@@ -789,8 +780,8 @@ mod tests {
         )
     }
 
-    fn stored_projection() -> StoredMvProjection {
-        StoredMvProjection {
+    fn stored_projection() -> StoredKeyedMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 7,
             facts: ProjectionFixture::new(
                 MvTarget::from_parts(Some("ice"), "analytics", "mv_orders"),
@@ -843,9 +834,12 @@ mod tests {
     #[test]
     fn canonical_projection_retains_duplicate_relation_occurrences() {
         let projection = stored_projection();
-        let dependencies = projection.facts.dependencies();
+        let dependencies = &projection.facts.definition().relation_occurrences;
         assert_eq!(dependencies.len(), 2);
-        assert_eq!(dependencies[0].relation, dependencies[1].relation);
+        assert_eq!(
+            dependencies[0].relation_at_binding,
+            dependencies[1].relation_at_binding
+        );
         assert_ne!(dependencies[0].occurrence_id, dependencies[1].occurrence_id);
         assert_eq!(
             dependencies[0].object_id.as_bytes(),

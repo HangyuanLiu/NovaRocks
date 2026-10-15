@@ -39,6 +39,7 @@ use novarocks_sql::semantic::command::{
 pub(crate) fn execute_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
     _current_database: &str,
     stmt: &AlterIcebergTableSqlCommand,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -64,6 +65,7 @@ pub(crate) fn execute_with_ports(
     crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context(
         storage_observation,
         &exact_lease,
+        readiness,
         &target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::AlterTable,
         connector_context.clone(),

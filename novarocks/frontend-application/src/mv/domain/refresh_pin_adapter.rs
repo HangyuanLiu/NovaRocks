@@ -17,7 +17,7 @@
 
 use crate::mv::domain::refresh::pin::{RefreshSnapshotPin, RefreshSnapshotPinOccurrence};
 use novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision;
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
 use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
@@ -32,7 +32,7 @@ use std::sync::Arc;
 pub fn capture_refresh_snapshot_pin_with_ports(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     connector_context: &ConnectorRequestContext,
 ) -> Result<RefreshSnapshotPin, String> {
     let relations = &projection.facts.definition().relation_occurrences;

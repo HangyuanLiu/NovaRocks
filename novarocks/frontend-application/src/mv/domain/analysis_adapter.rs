@@ -25,7 +25,7 @@ use crate::mv::domain::lifecycle::MvListRow;
 use crate::mv::domain::model::MvStorageEngine;
 use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_mv_application::persistence::codec::{ConfigurationDocument, RefreshPolicy};
-use novarocks_mv_application::persistence::projection::{MvPublicationState, StoredMvProjection};
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::readiness::MvListedManageability;
 use novarocks_query_application::api::{QueryResult, build_utf8_table_query_result};
 
@@ -208,7 +208,7 @@ pub(crate) fn list_mv_result_with_ports(
 fn manageability_parts<'a>(
     manageability: &'a MvListedManageability,
     entrance: Option<&novarocks_mv_application::management::ManagementEntrance>,
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
 ) -> (&'static str, &'a str) {
     use novarocks_mv_application::management::MvManagementPhase;
 
@@ -238,13 +238,13 @@ fn manageability_parts<'a>(
 fn manageability_display(
     manageability: &MvListedManageability,
     entrance: Option<&novarocks_mv_application::management::ManagementEntrance>,
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
 ) -> String {
     let (prefix, reason) = manageability_parts(manageability, entrance, projection);
     format!("{prefix}{reason}")
 }
 
-fn base_tables_bytes(projection: &StoredMvProjection) -> usize {
+fn base_tables_bytes(projection: &StoredKeyedMvProjection) -> usize {
     let occurrences = &projection.facts.definition().relation_occurrences;
     occurrences.iter().fold(
         occurrences.len().saturating_sub(1).saturating_mul(2),
@@ -258,7 +258,7 @@ fn base_tables_bytes(projection: &StoredMvProjection) -> usize {
     )
 }
 
-fn base_tables_display(projection: &StoredMvProjection) -> String {
+fn base_tables_display(projection: &StoredKeyedMvProjection) -> String {
     let mut output = String::with_capacity(base_tables_bytes(projection));
     for (index, relation) in projection
         .facts
@@ -280,7 +280,7 @@ fn base_tables_display(projection: &StoredMvProjection) -> String {
 }
 
 fn mv_row_bytes(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     dependency_bytes: usize,
     manageability_bytes: usize,
 ) -> usize {
@@ -288,16 +288,10 @@ fn mv_row_bytes(
     let facts = &projection.facts;
     let configuration = facts.configuration();
     let (refresh_time, refresh_rows) = match facts.publication() {
-        MvPublicationState::NeverPublished => (0, 0),
-        MvPublicationState::Published(published) => (
+        None => (0, 0),
+        Some(published) => (
+            published.publication_prepared_at_ms.to_string().len(),
             published
-                .document()
-                .publication_prepared_at_ms
-                .to_string()
-                .len(),
-            published
-                .document()
-                .statistics
                 .logical_result_rows
                 .map_or(0, |n| n.to_string().len()),
         ),
@@ -335,7 +329,7 @@ fn mv_row_bytes(
 }
 
 fn admit_mv_row(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     dependency_bytes: usize,
     manageability_bytes: usize,
     rows: usize,
@@ -360,7 +354,7 @@ fn admit_mv_row(
 }
 
 fn matches_show_filter(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     current_catalog: Option<&str>,
     stmt: &MvShowStatement,
     storage_filter: Option<MvStorageEngine>,
@@ -385,7 +379,7 @@ fn matches_show_filter(
 }
 
 fn list_row_from_projection(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     dependencies: String,
     manageability: String,
 ) -> MvListRow {
@@ -394,19 +388,16 @@ fn list_row_from_projection(
     let definition = facts.definition();
     let configuration = facts.configuration();
     let (last_refresh_time, last_refresh_rows) = match facts.publication() {
-        MvPublicationState::NeverPublished => (None, None),
-        MvPublicationState::Published(published) => {
-            let publication = published.document();
+        None => (None, None),
+        Some(published) => {
+            let publication = published;
             (
                 // This is P's frozen publication-fact time, not provider
                 // commit completion or Accelerator insertion time.
                 Some(publication.publication_prepared_at_ms.to_string()),
                 // SHOW reports logical result rows only. Unknown is NULL,
                 // never filled from physical storage or processed input rows.
-                publication
-                    .statistics
-                    .logical_result_rows
-                    .map(|rows| rows.to_string()),
+                publication.logical_result_rows.map(|rows| rows.to_string()),
             )
         }
     };
@@ -452,7 +443,7 @@ fn refresh_status_for_configuration(configuration: &ConfigurationDocument) -> St
 /// repository boundary.
 fn dependency_display_for_mv_with_readiness(
     readiness: &MvReadinessPort,
-    projection: &novarocks_mv_application::repository::LoadedMvProjection,
+    projection: &novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection,
     maximum: usize,
 ) -> Result<String, String> {
     let dependencies = readiness
@@ -617,7 +608,7 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use novarocks_mv_application::product::MvTarget;
 
     fn fixture(snapshot_id: Option<i64>) -> ProjectionFixture {
@@ -627,8 +618,8 @@ mod tests {
         )
     }
 
-    fn stored(fixture: ProjectionFixture) -> StoredMvProjection {
-        StoredMvProjection {
+    fn stored(fixture: ProjectionFixture) -> StoredKeyedMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 42,
             facts: fixture.build().expect("valid document projection"),
         }
@@ -669,9 +660,7 @@ mod tests {
         let mut fixture = fixture(Some(201));
         let publication = fixture.publication.as_mut().expect("published fixture");
         publication.publication_prepared_at_ms = 1_700_000_001_234;
-        publication.statistics.logical_result_rows = Some(7);
-        publication.statistics.processed_input_rows = Some(101);
-        fixture.storage_rows = Some(19);
+        publication.logical_result_rows = Some(7);
         let projection = stored(fixture);
         let row = list_row_from_projection(&projection, String::new(), "MANAGEABLE".to_string());
 
@@ -683,23 +672,16 @@ mod tests {
         );
         assert_eq!(row.last_refresh_time.as_deref(), Some("1700000001234"),);
         assert_eq!(row.last_refresh_rows.as_deref(), Some("7"));
-        let MvPublicationState::Published(published) = projection.facts.publication() else {
+        let Some(published) = projection.facts.publication() else {
             panic!("expected a published projection");
         };
-        assert_eq!(published.storage_rows(), Some(19));
-        assert_eq!(
-            published.document().statistics.processed_input_rows,
-            Some(101)
-        );
     }
 
     #[test]
     fn show_keeps_unknown_logical_rows_null_despite_other_row_statistics() {
         let mut fixture = fixture(Some(201));
         let publication = fixture.publication.as_mut().expect("published fixture");
-        publication.statistics.logical_result_rows = None;
-        publication.statistics.processed_input_rows = Some(101);
-        fixture.storage_rows = Some(19);
+        publication.logical_result_rows = None;
         let row =
             list_row_from_projection(&stored(fixture), String::new(), "MANAGEABLE".to_string());
 
@@ -711,9 +693,7 @@ mod tests {
     fn show_preserves_published_zero_logical_rows() {
         let mut fixture = fixture(Some(201));
         let publication = fixture.publication.as_mut().expect("published fixture");
-        publication.output.empty_result = true;
-        publication.statistics.logical_result_rows = Some(0);
-        fixture.storage_rows = Some(0);
+        publication.logical_result_rows = Some(0);
         let row =
             list_row_from_projection(&stored(fixture), String::new(), "MANAGEABLE".to_string());
 
@@ -809,10 +789,10 @@ mod tests {
 mod manageability_tests {
     use super::*;
 
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
 
-    fn projection() -> StoredMvProjection {
-        StoredMvProjection {
+    fn projection() -> StoredKeyedMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 42,
             facts: ProjectionFixture::new(
                 novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "db", "mv"),
@@ -973,16 +953,16 @@ mod compile_control_tests {
 #[cfg(test)]
 mod bounded_mv_row_tests {
     use super::*;
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use novarocks_mv_application::product::MvTarget;
     use novarocks_query_application::api::LocalResultBound;
 
-    fn projection() -> StoredMvProjection {
+    fn projection() -> StoredKeyedMvProjection {
         let mut fixture =
             ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(1));
         fixture.definition.query.effective_sql = "select a deliberately long SQL text".into();
         fixture.configuration.max_staleness_ms = Some(1234);
-        StoredMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 7,
             facts: fixture.build().unwrap(),
         }

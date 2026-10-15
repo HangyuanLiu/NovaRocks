@@ -216,6 +216,27 @@ impl MvCommandExecutor {
             return Ok(Some(result));
         }
         #[cfg(feature = "test-controls")]
+        if let Some(result) = crate::mv::domain::document_expiry::try_execute_document_expiry(
+            &self.ports,
+            statement,
+            current_database,
+            connector_context,
+            &|catalog, target, operation_id, context| {
+                crate::mv::domain::staged_create::install_configured_current_projection(
+                    self.ports.management_entrance()?.as_ref(),
+                    self.ports.readiness().as_ref(),
+                    self.ports.connector_control(),
+                    catalog,
+                    target,
+                    operation_id,
+                    None,
+                    context,
+                )
+            },
+        )? {
+            return Ok(Some(result));
+        }
+        #[cfg(feature = "test-controls")]
         return crate::mv::domain::execute_typed_novarocks_imv_stateless_rebuild(
             self.ports.connector_control(),
             self.ports.readiness().as_ref(),
@@ -819,21 +840,57 @@ impl crate::mv::domain::management_call::MvManagementOperations for MvCommandExe
     ) -> Result<crate::mv::domain::management_handover::MvOwnerHandoverOutcome, String> {
         let entrance = self.ports.management_entrance()?;
         let table = target.connector_table()?;
-        crate::mv::domain::management_handover::hand_over_managed_target(
+        let context = crate::connector::connector_request_context(
+            None,
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+        )?
+        .after_external_effect();
+        let outcome = crate::mv::domain::management_handover::hand_over_managed_target(
             entrance.as_ref(),
             self.ports.connector_control(),
             target,
             &table,
             &new_owner,
-            // The handover reads and rewrites a marker that may name another
-            // writer entirely; observe under a scope that cannot be mistaken
-            // for part of one of this process's own effects.
-            crate::connector::connector_request_context(
+            context.clone(),
+        )?;
+        let planning = crate::connector::acquire_metadata_planning_lease(
+            self.ports.connector_control(),
+            &target.catalog,
+        )?;
+        let catalog = planning
+            .binding()
+            .catalog_handle()
+            .map_err(|e| e.to_string())?
+            .clone();
+        let product_target = novarocks_mv_application::product::MvTarget::from_parts(
+            Some(&target.catalog),
+            &target.database,
+            &target.name,
+        );
+        if new_owner == *entrance.owner()
+            && entrance.management_phase(&table)
+                != novarocks_mv_application::management::MvManagementPhase::NotObserved
+        {
+            crate::mv::domain::staged_create::install_configured_current_projection(
+                entrance.as_ref(),
+                self.ports.readiness().as_ref(),
+                self.ports.connector_control(),
+                catalog,
+                product_target,
+                uuid::Uuid::now_v7(),
                 None,
-                novarocks_spi::connector::ConnectorStopOwner::new().view(),
-            )?
-            .after_external_effect(),
-        )
+                context.after_external_effect(),
+            )?;
+        } else {
+            crate::mv::domain::lake_rebuild::rebuild_one_lake_package_if_missing_verified(
+                self.ports.readiness().as_ref(),
+                self.ports.connector_control(),
+                catalog,
+                product_target,
+                context.after_external_effect(),
+            )?;
+        }
+        Ok(outcome)
     }
 }
 

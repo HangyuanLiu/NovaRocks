@@ -38,7 +38,7 @@ use novarocks_mv_application::{
         MaintenanceCoordinatorConfig, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
     },
     process_runtime::{MvBackgroundRuntime, MvBackgroundStop, MvBackgroundTasks},
-    service::MvProductService,
+    service::MvKeyedProductService,
 };
 use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
 use novarocks_query_application::api::BackendTopologyService;
@@ -60,7 +60,7 @@ use super::{
 pub struct FrontendMvProductAdapter {
     readiness: Arc<MvReadinessPort>,
     refresh: refresh::FrontendMvRefreshDependencies,
-    product_service: Arc<MvProductService>,
+    product_service: Arc<MvKeyedProductService>,
     maintenance_config: MaintenanceCoordinatorConfig,
     table_maintenance_service: Arc<dyn TableMaintenanceService>,
     execution_role: novarocks_types::ClusterRole,
@@ -90,7 +90,7 @@ impl FrontendMvProductAdapter {
         >,
         execution_role: novarocks_types::ClusterRole,
         topology: BackendTopologyService,
-        product_service: Arc<MvProductService>,
+        product_service: Arc<MvKeyedProductService>,
         maintenance_config: MaintenanceCoordinatorConfig,
         table_maintenance_service: Arc<dyn TableMaintenanceService>,
         optimizer_query_mem_limit_bytes: u64,
@@ -123,7 +123,7 @@ impl FrontendMvProductAdapter {
         Arc::clone(&self.readiness)
     }
 
-    pub(crate) fn product_service(&self) -> &MvProductService {
+    pub(crate) fn product_service(&self) -> &MvKeyedProductService {
         self.product_service.as_ref()
     }
 
@@ -292,7 +292,7 @@ struct RefreshWorkerDependencies {
     maintenance_config: MaintenanceCoordinatorConfig,
     table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
     table_maintenance_service: Arc<dyn TableMaintenanceService>,
-    product_service: Arc<MvProductService>,
+    product_service: Arc<MvKeyedProductService>,
     root_admission: RootAdmissionHandle,
     optimizer_query_mem_limit_bytes: u64,
     attempt_timeout: Duration,
@@ -375,7 +375,7 @@ fn run_startup_continuation(
     source: &crate::mv::startup_isolation_file::StartupIsolationSource,
     readiness: &MvReadinessPort,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    product_service: &MvProductService,
+    product_service: &MvKeyedProductService,
 ) {
     let (Some(entrance), Some(continuation)) = (
         product_service.management_entrance(),

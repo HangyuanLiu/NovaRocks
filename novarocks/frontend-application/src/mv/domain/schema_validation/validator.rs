@@ -26,11 +26,11 @@ use crate::mv::domain::refresh::schema_contract::{
 };
 use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
 use novarocks_mv_application::persistence::codec::RelationOccurrence;
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 
 /// Validate one D source occurrence and the exact target generation.
 pub(crate) fn validate_schema_contract(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     occurrence: &RelationOccurrence,
     current_base: &MvSchemaValidationObservation,
     current_target: &MvSchemaValidationObservation,
@@ -45,7 +45,7 @@ pub(crate) fn validate_schema_contract(
 /// Validate every ordered D occurrence used by a join or UNION definition.
 /// Repeated physical objects remain separate occurrences.
 pub(crate) fn validate_join_schema_contract(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     bases: &[(&RelationOccurrence, &MvSchemaValidationObservation)],
     current_target: &MvSchemaValidationObservation,
 ) -> Result<Vec<MvOccurrenceFieldRebind>, String> {
@@ -78,11 +78,11 @@ pub(crate) fn validate_join_schema_contract(
 }
 
 /// Validate that all branch bindings are materializable from the exact target
-/// schema. `reconstruct_runtime_bindings`, reached through
+/// schema. `reconstruct_keyed_runtime_bindings`, reached through
 /// `validate_projection_target`, checks the opaque field identity, type and
 /// nullability of each branch field.
 pub(crate) fn validate_branch_id_field(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     current_target: &MvSchemaValidationObservation,
 ) -> Result<(), String> {
     if projection.facts.interpretation().branches.is_empty() {
@@ -97,7 +97,7 @@ pub(crate) fn validate_branch_id_field(
 }
 
 fn require_projection_occurrence(
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     occurrence: &RelationOccurrence,
 ) -> Result<(), String> {
     if projection
@@ -134,9 +134,9 @@ fn require_row_lineage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use bytes::Bytes;
     use novarocks_mv_application::persistence::codec::PhysicalFieldLogicalIdentity;
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
     use novarocks_mv_application::product::MvTarget;
     use novarocks_spi::connector::{
         ConnectorCommittedVersion, ConnectorInstanceId, ConnectorRequestContext,
@@ -156,8 +156,8 @@ mod tests {
         .unwrap()
     }
 
-    fn projection() -> StoredMvProjection {
-        StoredMvProjection {
+    fn projection() -> StoredKeyedMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 1,
             facts: ProjectionFixture::new(
                 MvTarget::from_parts(Some("ice"), "sales", "mv"),
@@ -227,7 +227,7 @@ mod tests {
     }
 
     fn target_observation_with_metadata(
-        projection: &StoredMvProjection,
+        projection: &StoredKeyedMvProjection,
         metadata_version: ConnectorCommittedVersion,
     ) -> MvSchemaValidationObservation {
         let context = context();
@@ -282,7 +282,7 @@ mod tests {
         )
     }
 
-    fn target_observation(projection: &StoredMvProjection) -> MvSchemaValidationObservation {
+    fn target_observation(projection: &StoredKeyedMvProjection) -> MvSchemaValidationObservation {
         target_observation_with_metadata(projection, projection.facts.metadata_version().clone())
     }
 

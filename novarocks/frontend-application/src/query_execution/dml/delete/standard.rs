@@ -117,6 +117,7 @@ pub(crate) fn prepare_delete_statement(
     crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
         state.connector_control().as_ref(),
         state.mv_storage_observation().as_ref(),
+        state.mv_readiness().as_ref(),
         &target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Delete,
     )?;

@@ -1091,6 +1091,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context(
             self.kernel.mv_storage_observation().as_ref(),
             &exact_lease,
+            self.kernel.mv_readiness().as_ref(),
             &crate::catalog_application::resolver::TargetBackend {
                 provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
                     .expect("static Iceberg provider ID"),

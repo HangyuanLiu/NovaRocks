@@ -55,3 +55,6 @@ pub use flow::{
 };
 #[cfg(feature = "test-controls")]
 pub use stateless_rebuild::execute_typed_novarocks_imv_stateless_rebuild;
+
+#[cfg(feature = "test-controls")]
+pub(crate) mod document_expiry;

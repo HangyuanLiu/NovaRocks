@@ -29,12 +29,12 @@ use novarocks_mv_application::product::{
     MvCommand, MvCreateCommand, MvCreatedTarget, MvOperationContext, MvProductError,
     MvProductErrorKind, MvProductResult, MvStagedTarget, MvTarget as ProductMvTarget,
 };
-use novarocks_mv_application::service::MvProductService;
+use novarocks_mv_application::service::MvKeyedProductService;
 use novarocks_sql::planning::mv::SqlMvTarget;
 use uuid::Uuid;
 
 pub(super) fn handle_create(
-    product: &MvProductService,
+    product: &MvKeyedProductService,
     engine: &dyn MvCreateProviderAdapter,
     statement: &MvCreateStatement,
     context: MvRequestContext<'_>,

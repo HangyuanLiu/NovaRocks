@@ -22,7 +22,7 @@ use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_mv_application::dependency::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
-use novarocks_mv_application::persistence::dependency::stored_definition_dependency_ref;
+use novarocks_mv_application::persistence::dependency::stored_keyed_definition_dependency_ref;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,7 +102,7 @@ pub(crate) fn build_upstream_refresh_steps_with_readiness(
         .map(|loaded| &loaded.projection)
         .collect::<Vec<_>>();
     for loaded in &projections {
-        let target = stored_definition_dependency_ref(&loaded.projection);
+        let target = stored_keyed_definition_dependency_ref(&loaded.projection);
         let dependencies = readiness
             .list_ready_dependencies_by_downstream(loaded)
             .map_err(|e| format!("load MV dependencies for refresh graph failed: {e}"))?;

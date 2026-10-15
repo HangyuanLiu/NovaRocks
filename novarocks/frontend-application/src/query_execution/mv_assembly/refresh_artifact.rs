@@ -49,7 +49,8 @@ pub(crate) enum MvStagedRefreshWriteMode {
 /// artifact contains its logical plan only; persistence and refresh-context
 /// reconstruction stay at this application boundary.
 pub(crate) struct MvFirstRefreshLogicalContext {
-    pub(crate) mv_definition: novarocks_mv_application::persistence::projection::StoredMvProjection,
+    pub(crate) mv_definition:
+        novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
     pub(crate) canonical_select_query: novarocks_parser::ast::Query,
     pub(crate) base_refs: Vec<novarocks_types::naming::TableIdentity>,
     pub(crate) pin: Vec<MvRewriteSourceSnapshot>,

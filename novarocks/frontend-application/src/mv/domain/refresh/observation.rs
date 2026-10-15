@@ -24,7 +24,7 @@ use crate::mv::domain::refresh::target::IcebergMvTarget;
 use crate::mv::domain::storage_observation::{
     MvRefreshBaseObservation, MvSchemaValidationObservation,
 };
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorRequestContext, ConnectorTableResolution,
@@ -83,7 +83,7 @@ pub(crate) fn observe_current_refresh_base(
 pub(crate) fn observe_refresh_schema(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     base_refs: &[TableIdentity],
     target: &IcebergMvTarget,
     retained_target_observation: Option<&MvSchemaValidationObservation>,
@@ -138,12 +138,12 @@ pub(crate) fn observe_refresh_schema(
 pub(crate) fn rebind_mv_definition_before_refresh_derivation(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
     base_refs: &[TableIdentity],
     target: &IcebergMvTarget,
     retained_target_observation: Option<&MvSchemaValidationObservation>,
     connector_context: &ConnectorRequestContext,
-) -> Result<(StoredMvProjection, String), String> {
+) -> Result<(StoredKeyedMvProjection, String), String> {
     let (_, renames) = observe_refresh_schema(
         connector_control,
         storage_observation,

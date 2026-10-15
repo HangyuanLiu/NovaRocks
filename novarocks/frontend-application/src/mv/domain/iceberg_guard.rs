@@ -15,18 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
-use std::sync::Arc;
-
-use novarocks_spi::connector::document_storage::{
-    ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
-    ConnectorDocumentStorageLimits,
-};
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorControlResolver, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableObjectCaptureRequest,
     ConnectorTableObjectSelector, ConnectorTableResolution,
 };
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::catalog_application::resolver::TargetBackend;
 use novarocks_types::naming::normalize_identifier;
@@ -71,6 +66,7 @@ impl IcebergMvUserMutation {
 pub fn reject_if_iceberg_mv_table_with_ports(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
     target: &TargetBackend,
     mutation: IcebergMvUserMutation,
 ) -> Result<(), String> {
@@ -89,6 +85,7 @@ pub fn reject_if_iceberg_mv_table_with_ports(
     reject_if_iceberg_mv_table_with_planning_lease_and_context(
         storage_observation,
         &exact_lease,
+        readiness,
         target,
         mutation,
         context,
@@ -102,6 +99,7 @@ pub fn reject_if_iceberg_mv_table_with_ports(
 pub fn reject_if_iceberg_mv_table_with_planning_lease_and_context(
     _storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     exact_lease: &ConnectorControlPlanningLease,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
     target: &TargetBackend,
     mutation: IcebergMvUserMutation,
     context: ConnectorRequestContext,
@@ -140,51 +138,32 @@ pub fn reject_if_iceberg_mv_table_with_planning_lease_and_context(
     let documents = exact_lease
         .derive_document_storage_lease()
         .map_err(|error| format!("derive MV mutation guard document lease: {error}"))?;
-    let request = ConnectorDocumentObservationRequest::try_new(
-        documents.owner().clone(),
-        documents.catalog_handle().clone(),
+    let request = crate::mv::domain::staged_create::keyed_request(
+        &documents,
         identity,
         binding.object_id,
-        ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
         context,
-    )
-    .map_err(|error| format!("build MV mutation guard observation: {error}"))?;
-    let observation = match documents.observe_current_management(request.clone()) {
-        Ok(observation) => Some(observation),
-        Err(error) if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound => {
-            // NotFound also covers a table disappearing after the object
-            // capture. Reobserve the same object before treating the missing
-            // marker as an ordinary table, and reject orphaned MV documents.
-            let frozen = documents
-                .observe_documents(request)
-                .map_err(|error| format!("observe MV mutation guard documents: {error}"))?;
-            if frozen
-                .documents()
-                .iter()
-                .any(|document| document.id().owner().as_str() == "novarocks.mv")
-            {
-                return Err(format!(
-                    "table {}.{}.{} is a materialized view; {}",
-                    target.catalog,
-                    target.namespace,
-                    target.table,
-                    mutation.guidance()
-                ));
-            }
-            None
+    );
+    let view = match documents.observe_keyed_documents(request.clone()) {
+        Ok(view) => view,
+        Err(novarocks_spi::connector::document_storage::KeyedDocumentReadError::LegacyFormat {
+            key,
+        }) => {
+            return if mutation == IcebergMvUserMutation::DropTable {
+                Ok(())
+            } else {
+                Err(format!("LegacyFormat: {key}; only DROP TABLE is supported"))
+            };
         }
         Err(error) => return Err(format!("observe MV mutation guard: {error}")),
     };
-    if let Some(observation) = observation {
-        if observation.marker().kind() != "materialized-view" {
-            return Err(format!(
-                "table {}.{}.{} has unsupported managed kind `{}`",
-                target.catalog,
-                target.namespace,
-                target.table,
-                observation.marker().kind()
-            ));
-        }
+    if view.management.is_some()
+        || view.slots.keys().any(|slot| slot.owner == "novarocks.mv")
+        || view.versions.values().any(|v| v.owner() == "novarocks.mv")
+    {
+        readiness
+            .candidate_reader()
+            .observe_current(&documents, request)?;
         return Err(format!(
             "table {}.{}.{} is a materialized view; {}",
             target.catalog,
@@ -193,6 +172,7 @@ pub fn reject_if_iceberg_mv_table_with_planning_lease_and_context(
             mutation.guidance()
         ));
     }
+
     Ok(())
 }
 

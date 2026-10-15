@@ -37,7 +37,7 @@ use novarocks_mv_application::product::{
 use novarocks_mv_application::publication::{
     MvRefreshPublicationFinalizationFacts, MvRefreshPublicationIntent,
 };
-use novarocks_mv_application::service::MvProductService;
+use novarocks_mv_application::service::MvKeyedProductService;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{
     ConnectorControlRegistry, ConnectorInstanceId, ConnectorProviderBindingKey,
@@ -55,7 +55,7 @@ pub(super) struct FrontendMvRefreshDependencies {
 }
 
 pub(super) fn execute(
-    product: &MvProductService,
+    product: &MvKeyedProductService,
     dependencies: &FrontendMvRefreshDependencies,
     refresh: PreparedMvRefresh,
     context: ConnectorRequestContext,
@@ -365,53 +365,15 @@ fn bind_publication_documents(
         .pending_publication_declaration()
         .map_err(|error| invalid(error.to_string()))?;
     let documents = admitted
-        .publication_document_set(
-            intent.publication_id(),
-            novarocks_mv_application::persistence::publication_facts::MvPublicationResult {
-                kind: publication_kind(intent),
-                logical_result_rows,
-            },
-        )
+        .publication_document_set(intent.publication_id(), logical_result_rows)
         .map_err(invalid)?;
-    let document_lease = planning
-        .derive_document_storage_lease()
-        .map_err(|error| unavailable(error.to_string()))?;
-    let prepared = document_lease
-        .prepare_documents(
-            novarocks_spi::connector::document_storage::ConnectorPrepareDocumentsRequest::try_new(
-                declaration.admission().clone(),
-                documents,
-                context.clone(),
-            )
-            .map_err(|error| invalid(error.to_string()))?,
-        )
-        .map_err(|error| invalid(error.to_string()))?;
-    let publication =
-        novarocks_spi::connector::document_storage::ConnectorDocumentPublicationIntent::try_new(
-            &declaration,
-            prepared,
-        )
-        .map_err(|error| invalid(error.to_string()))?;
+    let publication = novarocks_spi::connector::KeyedPublicationIntent {
+        declaration,
+        documents,
+    };
     session
-        .bind_application_document_publication(publication)
-        .map_err(|error| invalid(error.to_string()))
-}
-
-/// What kind of publication P records. A partition replacement is a
-/// repartition whichever technique carried its rows.
-fn publication_kind(
-    intent: &MvRefreshPublicationIntent,
-) -> novarocks_mv_application::persistence::codec::PublicationKind {
-    use novarocks_mv_application::persistence::codec::PublicationKind;
-    use novarocks_mv_application::publication::MvRefreshPublicationTechnique;
-    if intent.partition_spec_replacement().is_some() {
-        return PublicationKind::Repartition;
-    }
-    match intent.technique() {
-        MvRefreshPublicationTechnique::Full => PublicationKind::FullRefresh,
-        MvRefreshPublicationTechnique::Incremental => PublicationKind::IncrementalRefresh,
-        MvRefreshPublicationTechnique::MetadataOnly => PublicationKind::MetadataOnlyRefresh,
-    }
+        .bind_keyed_document_publication(publication)
+        .map_err(|e| invalid(e.to_string()))
 }
 
 /// The one commit authority of one MV data write.

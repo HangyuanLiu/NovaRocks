@@ -11,9 +11,10 @@
 
 use novarocks_mv_application::activity::CanonicalMvTarget;
 use novarocks_mv_application::readiness::{
-    MvCandidateReader as ProductCandidateReader, MvCurrentProjectionRequest,
-    MvCurrentProjectionSource, MvDropReadiness, MvProjectionDeleteGuard, MvProjectionError,
-    MvProjectionInstallOutcome, MvReadOnlyCurrentProjectionSource, MvReadinessService,
+    MvCurrentProjectionRequest, MvKeyedCandidateReader as ProductCandidateReader,
+    MvKeyedCurrentProjectionSource, MvKeyedDropReadiness, MvKeyedProjectionDeleteGuard,
+    MvKeyedProjectionInstallOutcome, MvKeyedReadOnlyCurrentProjectionSource,
+    MvKeyedReadinessService, MvProjectionError,
 };
 #[cfg(feature = "test-controls")]
 use std::sync::Arc;
@@ -23,8 +24,9 @@ use crate::mv::activity::canonical_mv_target;
 use crate::mv::domain::storage_observation::MvLakePackageObservation;
 use novarocks_mv_application::dependency::MvDependencyObjectIdentity;
 use novarocks_mv_application::persistence::dependency::StoredMvDependency;
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
-use novarocks_mv_application::repository::{LoadedMvProjection, MvRepositoryError};
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
+use novarocks_mv_application::repository::MvRepositoryError;
+use novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 /// The synchronous face of an asynchronous MV projection store.
@@ -41,14 +43,15 @@ use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 /// domain contract. It is a single place to delete once those work lines lift
 /// the surrounding boundaries.
 pub struct MvReadinessPort {
-    service: MvReadinessService,
+    service: MvKeyedReadinessService,
+    management: std::sync::Arc<novarocks_mv_application::management::ManagementEntrance>,
     handle: tokio::runtime::Handle,
     #[cfg(feature = "test-controls")]
     controls: Option<Arc<crate::mv::test_controls::MvTestControls>>,
 }
 
 pub(crate) struct MvLocalProjectionInventory {
-    inventory: novarocks_mv_application::readiness::MvBoundedProjectionInventory,
+    inventory: novarocks_mv_application::readiness::MvBoundedKeyedProjectionInventory,
     handle: tokio::runtime::Handle,
 }
 
@@ -67,14 +70,18 @@ impl MvLocalProjectionInventory {
         }
     }
 
-    pub(crate) fn next_ready(&mut self) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
+    pub(crate) fn next_ready(
+        &mut self,
+    ) -> Result<Option<LoadedKeyedMvProjection>, MvRepositoryError> {
         Self::block_on(&self.handle, self.inventory.next_ready())
     }
 
     pub(crate) fn next_listable(
         &mut self,
-    ) -> Result<Option<novarocks_mv_application::readiness::ListedMvProjection>, MvRepositoryError>
-    {
+    ) -> Result<
+        Option<novarocks_mv_application::readiness::ListedKeyedMvProjection>,
+        MvRepositoryError,
+    > {
         Self::block_on(&self.handle, self.inventory.next_listable())
     }
 }
@@ -104,9 +111,18 @@ fn local_inventory_bound() -> novarocks_mv_application::repository::MvProjection
 /// and DDL consumers, not whether a retained candidate can be independently
 /// proven against its exact publication.
 #[derive(Clone)]
-pub(crate) struct MvCandidateReader {
-    reader: ProductCandidateReader,
-    handle: tokio::runtime::Handle,
+pub(crate) enum MvCandidateReader {
+    Keyed {
+        reader: ProductCandidateReader,
+        service: MvKeyedReadinessService,
+        management: std::sync::Arc<novarocks_mv_application::management::ManagementEntrance>,
+        handle: tokio::runtime::Handle,
+    },
+    #[cfg(test)]
+    LegacyHeld {
+        reader: novarocks_mv_application::readiness::MvCandidateReader,
+        handle: tokio::runtime::Handle,
+    },
 }
 
 impl MvReadinessPort {
@@ -114,11 +130,13 @@ impl MvReadinessPort {
     /// product readiness service. This adapter cannot create an independent
     /// repository/runtime state pair.
     pub(crate) fn from_product(
-        service: MvReadinessService,
+        service: MvKeyedReadinessService,
         handle: tokio::runtime::Handle,
+        management: std::sync::Arc<novarocks_mv_application::management::ManagementEntrance>,
     ) -> Self {
         Self {
             service,
+            management,
             handle,
             #[cfg(feature = "test-controls")]
             controls: None,
@@ -155,7 +173,12 @@ impl MvReadinessPort {
     }
 
     pub(crate) fn candidate_reader(&self) -> MvCandidateReader {
-        MvCandidateReader::new(self.service.candidate_reader(), self.handle.clone())
+        MvCandidateReader::Keyed {
+            reader: self.service.candidate_reader(),
+            service: self.service.clone(),
+            management: self.management.clone(),
+            handle: self.handle.clone(),
+        }
     }
 
     /// Drives one durable MV operation from a synchronous caller. Confined to
@@ -184,11 +207,11 @@ impl MvReadinessPort {
         &self,
         operation_id: Uuid,
         request: MvCurrentProjectionRequest,
-        source: &dyn MvCurrentProjectionSource,
-    ) -> Result<MvProjectionInstallOutcome, MvProjectionError> {
+        source: &dyn MvKeyedCurrentProjectionSource,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
         self.block_on(
             self.service
-                .observe_current_and_install(operation_id, request, source),
+                .observe_and_install(operation_id, request, source),
         )
     }
 
@@ -196,12 +219,13 @@ impl MvReadinessPort {
         &self,
         operation_id: Uuid,
         request: MvCurrentProjectionRequest,
-        source: &dyn MvReadOnlyCurrentProjectionSource,
-    ) -> Result<MvProjectionInstallOutcome, MvProjectionError> {
+        source: &dyn MvKeyedReadOnlyCurrentProjectionSource,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
         self.block_on(self.service.observe_current_read_only_and_install(
             operation_id,
             request,
             source,
+            "read-only lake observation requires management readmission".to_string(),
         ))
     }
 
@@ -235,7 +259,7 @@ impl MvReadinessPort {
     }
 
     /// Whether plain SQL may read one MV target's storage. See
-    /// [`novarocks_mv_application::readiness::MvReadinessService::query_admission`].
+    /// [`novarocks_mv_application::readiness::MvKeyedReadinessService::query_admission`].
     pub(crate) fn query_admission(
         &self,
         target: &novarocks_sql::planning::mv::SqlMvTarget,
@@ -251,7 +275,7 @@ impl MvReadinessPort {
     pub(crate) fn load_ready(
         &self,
         target: &MvTarget,
-    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
+    ) -> Result<Option<LoadedKeyedMvProjection>, MvRepositoryError> {
         self.block_on(
             self.service
                 .load_ready_settled(&canonical_mv_target(target)),
@@ -277,7 +301,7 @@ impl MvReadinessPort {
     /// candidates instead of reviving a retained StateStore projection.
     pub(crate) fn list_ready_projections(
         &self,
-    ) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
+    ) -> Result<Vec<LoadedKeyedMvProjection>, MvRepositoryError> {
         self.block_on(self.service.list_ready_projections())
     }
 
@@ -286,7 +310,7 @@ impl MvReadinessPort {
     /// lake package.
     pub(crate) fn list_ready_dependencies_by_downstream(
         &self,
-        projection: &LoadedMvProjection,
+        projection: &LoadedKeyedMvProjection,
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
         self.block_on(
             self.service
@@ -296,7 +320,7 @@ impl MvReadinessPort {
 
     pub(crate) fn list_local_dependencies_by_downstream(
         &self,
-        projection: &LoadedMvProjection,
+        projection: &LoadedKeyedMvProjection,
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
         use novarocks_mv_application::repository::MvDependencyReadBound;
         let bound = MvDependencyReadBound {
@@ -327,7 +351,7 @@ impl MvReadinessPort {
     pub(crate) fn reserve_projection_delete(
         &self,
         target: &MvTarget,
-    ) -> Result<MvProjectionDeleteGuard, MvProjectionError> {
+    ) -> Result<MvKeyedProjectionDeleteGuard, MvProjectionError> {
         self.block_on(
             self.service
                 .reserve_projection_delete(canonical_mv_target(target)),
@@ -339,7 +363,7 @@ impl MvReadinessPort {
         &self,
         target: &MvTarget,
         if_exists: bool,
-    ) -> Result<MvDropReadiness, MvProjectionError> {
+    ) -> Result<MvKeyedDropReadiness, MvProjectionError> {
         self.block_on(
             self.service
                 .prepare_drop(&canonical_mv_target(target), if_exists),
@@ -350,8 +374,8 @@ impl MvReadinessPort {
     pub(crate) fn delete_after_provider_drop(
         &self,
         operation_id: Uuid,
-        guard: MvProjectionDeleteGuard,
-    ) -> Result<MvProjectionInstallOutcome, String> {
+        guard: MvKeyedProjectionDeleteGuard,
+    ) -> Result<MvKeyedProjectionInstallOutcome, String> {
         self.block_on(self.service.delete_after_provider_drop(operation_id, guard))
             .map_err(|error| error.to_string())
     }
@@ -371,7 +395,7 @@ impl MvReadinessPort {
     #[cfg(feature = "test-controls")]
     pub(crate) fn wipe_accelerator_for_test(
         &self,
-        product: &novarocks_mv_application::service::MvProductService,
+        product: &novarocks_mv_application::service::MvKeyedProductService,
         operation_id: Uuid,
         claim: &mut novarocks_failpoint::scope::ActionClaim,
     ) -> Result<(), String> {
@@ -393,29 +417,128 @@ impl MvReadinessPort {
 }
 
 impl MvCandidateReader {
-    /// Construct the read-only query candidate inventory from its durable
-    /// discovery dependency. This intentionally accepts neither process
-    /// readiness nor any refresh executor capability.
-    pub(crate) fn new(reader: ProductCandidateReader, handle: tokio::runtime::Handle) -> Self {
-        Self { reader, handle }
+    #[cfg(test)]
+    pub(crate) fn new(
+        reader: novarocks_mv_application::readiness::MvCandidateReader,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self::LegacyHeld { reader, handle }
     }
-
-    /// Enumerate retained candidate definitions without exposing a loaded
-    /// projection's CAS version to query discovery. Every member remains
-    /// optional until its exact lake publication and every frozen input/output
-    /// revision are verified.
+    fn block_on<T>(&self, future: impl std::future::Future<Output = T>) -> T {
+        let handle = match self {
+            Self::Keyed { handle, .. } => handle,
+            #[cfg(test)]
+            Self::LegacyHeld { handle, .. } => handle,
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => tokio::task::block_in_place(|| handle.block_on(future)),
+            Err(_) => handle.block_on(future),
+        }
+    }
     pub(crate) fn list_candidate_definitions(
         &self,
-    ) -> Result<Vec<StoredMvProjection>, MvRepositoryError> {
-        match tokio::runtime::Handle::try_current() {
-            Ok(_) => tokio::task::block_in_place(|| {
-                self.handle
-                    .block_on(self.reader.list_candidate_definitions())
-            }),
-            Err(_) => self
-                .handle
-                .block_on(self.reader.list_candidate_definitions()),
+    ) -> Result<Vec<StoredKeyedMvProjection>, MvRepositoryError> {
+        match self {
+            Self::Keyed { reader, .. } => self.block_on(reader.list_candidate_definitions()),
+            #[cfg(test)]
+            Self::LegacyHeld { reader, .. } => {
+                let legacy = self.block_on(reader.list_candidate_definitions())?;
+                if !legacy.is_empty() {
+                    return Err(MvRepositoryError::new(
+                        novarocks_mv_application::repository::MvRepositoryErrorKind::Corruption,
+                        "legacy held-port fixture unexpectedly returned facts",
+                    ));
+                }
+                Ok(Vec::new())
+            }
         }
+    }
+    pub(crate) fn observe_current(
+        &self,
+        lease: &novarocks_spi::connector::document_storage::ConnectorDocumentStorageLease,
+        request: novarocks_spi::connector::document_storage::KeyedDocumentObservationRequest,
+    ) -> Result<
+        novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+        String,
+    > {
+        let Self::Keyed {
+            service,
+            management,
+            ..
+        } = self
+        else {
+            return Err("held-port inventory does not observe lake documents".into());
+        };
+        let (mut observed,convergence)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management(lease,request.clone(),Default::default(),management).map_err(|e|e.to_string())?;
+        if observed.deployment_owner != *management.owner()
+            || observed.process_incarnation != *management.incarnation()
+        {
+            management
+                .close_on_keyed_current_management_mismatch(lease, request.clone())
+                .map_err(|e| e.to_string())?;
+            struct ReadOnly(novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments);
+            #[async_trait::async_trait]
+            impl MvKeyedReadOnlyCurrentProjectionSource for ReadOnly {
+                async fn observe_current_keyed_read_only(&self,_:MvCurrentProjectionRequest)->Result<novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,MvProjectionError>{
+                    Ok(self.0.clone())
+                }
+            }
+            let target = CanonicalMvTarget::from_parts(
+                Some(request.target.instance_id.as_str()),
+                &request.target.namespace,
+                &request.target.table,
+            );
+            let projection_request = MvCurrentProjectionRequest::try_new(
+                request.catalog_handle,
+                target,
+                request.context,
+                Default::default(),
+            )
+            .map_err(|e| e.to_string())?;
+            self.block_on(service.observe_current_read_only_and_install(
+                Uuid::now_v7(),
+                projection_request,
+                &ReadOnly(observed.clone()),
+                "fresh MV management slot names another writer".into(),
+            ))
+            .map_err(|e| e.to_string())?;
+            return Ok(observed);
+        }
+        if convergence.reinstall_current_projection {
+            let (fresh, admission, _) = management
+                .observe_keyed_admission(lease, request.clone(), Default::default())
+                .map_err(|e| e.to_string())?;
+            observed = fresh;
+            struct Source{observed:novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,admission:std::sync::Mutex<Option<novarocks_mv_application::management::MvCurrentManagementAdmission>>}
+            #[async_trait::async_trait]
+            impl MvKeyedCurrentProjectionSource for Source {
+                async fn observe_current_keyed(&self,_:MvCurrentProjectionRequest)->Result<(novarocks_mv_application::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,novarocks_mv_application::management::MvCurrentManagementAdmission),MvProjectionError>{
+                    Ok((self.observed.clone(), self.admission.lock().map_err(|_|MvProjectionError::new(novarocks_mv_application::readiness::MvProjectionErrorKind::SourceConflict,"slot projection admission lock poisoned"))?.take().ok_or_else(||MvProjectionError::new(novarocks_mv_application::readiness::MvProjectionErrorKind::SourceConflict,"slot projection admission already consumed"))?))
+                }
+            }
+            let target = CanonicalMvTarget::from_parts(
+                Some(request.target.instance_id.as_str()),
+                &request.target.namespace,
+                &request.target.table,
+            );
+            let projection_request = MvCurrentProjectionRequest::try_new(
+                request.catalog_handle,
+                target,
+                request.context,
+                Default::default(),
+            )
+            .map_err(|e| e.to_string())?;
+            self.block_on(service.observe_and_install(
+                Uuid::now_v7(),
+                projection_request,
+                &Source {
+                    observed: observed.clone(),
+                    admission: std::sync::Mutex::new(Some(admission)),
+                },
+            ))
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(observed)
     }
 }
 
@@ -438,34 +561,34 @@ mod controlled_wipe_tests {
         product::MvTarget,
         repository::MvRepository,
         scheduler::MvSchedulerConfig,
-        service::MvProductService,
+        service::MvKeyedProductService,
         test_repository::InMemoryMvRepository,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    async fn product_and_port() -> (MvProductService, MvReadinessPort, Arc<InMemoryMvRepository>) {
-        let repository = Arc::new(InMemoryMvRepository::default());
-        repository
-            .create_projection(
+    async fn product_and_port() -> (
+        MvKeyedProductService,
+        MvReadinessPort,
+        Arc<novarocks_mv_application::state_store_repository::StateStoreMvRepository>,
+    ) {
+        let (product, repository) = crate::mv::domain::test_admission::keyed_product().await;
+        let service = product.keyed_readiness_service().unwrap();
+        service
+            .seed_projection(
                 Uuid::now_v7(),
-                novarocks_mv_application::persistence::test_support::sample_projection(
+                crate::mv::domain::test_admission::sample_keyed_projection(
                     MvTarget::from_parts(Some("ice"), "sales", "orders"),
                     Some(7),
-                )
-                .into(),
+                ),
             )
             .await
             .unwrap();
-        let product = MvProductService::new_with_readiness_runtime(
-            MvSchedulerConfig::default(),
-            repository.clone(),
-            Arc::<ProcessRuntime<MvTarget, novarocks_spi::connector::LakePublicationId>>::default(),
-        );
         let port = MvReadinessPort::from_product(
-            product.readiness_service().unwrap(),
+            service,
             tokio::runtime::Handle::current(),
+            product.management_entrance().unwrap(),
         );
         (product, port, repository)
     }
@@ -507,7 +630,13 @@ mod controlled_wipe_tests {
             .unwrap();
         assert!(refresh_exited.load(Ordering::Acquire));
         assert!(maintenance_exited.load(Ordering::Acquire));
-        assert!(repository.list_projections().await.unwrap().is_empty());
+        assert!(
+            repository
+                .list_keyed_projections()
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(matches!(
             product.request_activity(
                 canonical_mv_target(&novarocks_sql::planning::mv::SqlMvTarget {
@@ -529,7 +658,7 @@ mod controlled_wipe_tests {
             .claim_call("ice", "sales", "orders", "wipe")
             .unwrap();
         let (product, port, repository) = product_and_port().await;
-        let before = repository.list_projections().await.unwrap();
+        let before = repository.list_keyed_projections().await.unwrap();
         let (refresh_stop_tx, _refresh_stop_rx) = mpsc::channel();
         let (maintenance_stop_tx, _maintenance_stop_rx) = mpsc::channel();
         let (wakeup_tx, _wakeup_rx) = mpsc::sync_channel(1);
@@ -555,7 +684,7 @@ mod controlled_wipe_tests {
             .await
             .unwrap();
         assert!(result.unwrap_err().contains("shared shutdown deadline"));
-        assert_eq!(repository.list_projections().await.unwrap(), before);
+        assert_eq!(repository.list_keyed_projections().await.unwrap(), before);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -566,7 +695,7 @@ mod controlled_wipe_tests {
             .claim_call("ice", "sales", "orders", "wipe")
             .unwrap();
         let (product, port, repository) = product_and_port().await;
-        let before = repository.list_projections().await.unwrap();
+        let before = repository.list_keyed_projections().await.unwrap();
         let (refresh_stop_tx, _refresh_stop_rx) = mpsc::channel();
         let (maintenance_stop_tx, _maintenance_stop_rx) = mpsc::channel();
         let (wakeup_tx, _wakeup_rx) = mpsc::sync_channel(1);
@@ -590,6 +719,6 @@ mod controlled_wipe_tests {
             .await
             .unwrap();
         assert!(result.unwrap_err().contains("panicked"));
-        assert_eq!(repository.list_projections().await.unwrap(), before);
+        assert_eq!(repository.list_keyed_projections().await.unwrap(), before);
     }
 }

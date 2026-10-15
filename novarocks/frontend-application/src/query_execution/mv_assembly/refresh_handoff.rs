@@ -149,7 +149,8 @@ mod tests {
     use super::*;
 
     fn attempt() -> MvRefreshAttemptIdentity {
-        novarocks_mv_application::service::MvProductService::default().reserve_refresh_attempt()
+        novarocks_mv_application::service::MvKeyedProductService::default()
+            .reserve_refresh_attempt()
     }
 
     #[test]

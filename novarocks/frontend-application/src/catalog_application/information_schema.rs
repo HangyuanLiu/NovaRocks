@@ -21,7 +21,7 @@ use arrow::array::ArrayRef;
 #[cfg(test)]
 use arrow::array::BooleanArray;
 use arrow::datatypes::DataType;
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_parser::{ast, printer};
 
 use crate::mv::domain::readiness::MvReadinessPort;
@@ -164,7 +164,7 @@ fn materialized_view_rows(
     Ok(rows)
 }
 
-fn materialized_view_row(projection: &StoredMvProjection) -> MaterializedViewInfoRow {
+fn materialized_view_row(projection: &StoredKeyedMvProjection) -> MaterializedViewInfoRow {
     let target = projection.facts.target();
     MaterializedViewInfoRow {
         table_schema: target.namespace().to_string(),
@@ -407,16 +407,16 @@ fn normalize_column_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use novarocks_mv_application::product::MvTarget;
 
-    fn projection(snapshot_id: Option<i64>, paused: bool) -> StoredMvProjection {
+    fn projection(snapshot_id: Option<i64>, paused: bool) -> StoredKeyedMvProjection {
         let mut fixture = ProjectionFixture::new(
             MvTarget::from_parts(Some("lake_alias"), "analytics", "orders_mv"),
             snapshot_id,
         );
         fixture.configuration.paused = paused;
-        StoredMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 42,
             facts: fixture.build().expect("valid document projection"),
         }

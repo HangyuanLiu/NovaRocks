@@ -108,12 +108,9 @@ fn ordered_previous_sources(
     use novarocks_mv_application::persistence::projection::MvPublicationState;
 
     match rewrite.mv_definition.facts.publication() {
-        MvPublicationState::NeverPublished if rewrite.previous.is_empty() => Ok(Vec::new()),
-        MvPublicationState::NeverPublished => {
-            Err("never-published MV first-refresh artifact has source history".to_string())
-        }
-        MvPublicationState::Published(published) => published
-            .document()
+        None if rewrite.previous.is_empty() => Ok(Vec::new()),
+        None => Err("never-published MV first-refresh artifact has source history".to_string()),
+        Some(published) => published
             .inputs
             .iter()
             .map(|input| {
@@ -134,7 +131,7 @@ fn ordered_previous_sources(
 }
 
 fn sql_snapshot_pin(
-    projection: &novarocks_mv_application::persistence::projection::StoredMvProjection,
+    projection: &novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
     sources: &[crate::mv::domain::rewrite::context::MvRewriteSourceSnapshot],
 ) -> Result<SqlMvSnapshotPin, String> {
     let occurrences = &projection.facts.definition().relation_occurrences;
@@ -576,17 +573,16 @@ fn parse_query_from_sql(sql: &str) -> Result<novarocks_parser::ast::Query, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mv::domain::test_admission::KeyedProjectionFixture as ProjectionFixture;
     use bytes::Bytes;
-    use novarocks_mv_application::persistence::{
-        projection::StoredMvProjection, test_support::ProjectionFixture,
-    };
+    use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
     use novarocks_mv_application::product::MvTarget;
     use novarocks_spi::connector::{
         ConnectorExactSemanticRevision, ConnectorProviderId, ConnectorTableObjectId,
     };
 
-    fn projection() -> StoredMvProjection {
-        StoredMvProjection {
+    fn projection() -> StoredKeyedMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 17,
             facts: ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), None)
                 .build()

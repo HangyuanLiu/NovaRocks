@@ -1073,6 +1073,7 @@ pub(crate) fn prepare_update_mutation(
     crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
         state.connector_control().as_ref(),
         state.mv_storage_observation().as_ref(),
+        state.mv_readiness().as_ref(),
         &target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Update,
     )?;
@@ -1223,6 +1224,7 @@ pub(crate) fn prepare_merge_mutation(
     crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
         state.connector_control().as_ref(),
         state.mv_storage_observation().as_ref(),
+        state.mv_readiness().as_ref(),
         &target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Merge,
     )?;
@@ -5050,6 +5052,7 @@ mod tests {
             std::sync::Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
             Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
+            crate::mv::domain::test_admission::test_readiness(),
             crate::query_execution::compiler::test_query_execution_service(),
         )
     }
@@ -6728,6 +6731,7 @@ mod tests {
                         crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
                     ),
                     Arc::new(spi::UnavailableMvStorageObservationPort),
+                    crate::mv::domain::test_admission::test_readiness(),
                     crate::query_execution::compiler::test_query_execution_service(),
                 );
                 let execution = QueryExecutionContext::new(

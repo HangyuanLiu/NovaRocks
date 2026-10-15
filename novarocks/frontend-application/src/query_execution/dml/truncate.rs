@@ -255,6 +255,7 @@ impl TruncateEngine for DmlExecutionKernel {
         crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
             self.connector_control().as_ref(),
             self.mv_storage_observation().as_ref(),
+            self.mv_readiness().as_ref(),
             &target,
             crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Truncate,
         )

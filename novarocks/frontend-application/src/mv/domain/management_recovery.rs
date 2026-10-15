@@ -34,7 +34,7 @@ use novarocks_mv_application::management::{
     ManagedMvTarget, ManagementContinuation, ManagementEntrance, ManagementTimestamp,
     UnsettledEffect,
 };
-use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_spi::connector::CatalogHandle;
 
 /// Close management on one target this process rediscovered from the lake.
@@ -45,7 +45,7 @@ use novarocks_spi::connector::CatalogHandle;
 pub(crate) fn close_recovered_target_management(
     entrance: &ManagementEntrance,
     catalog: CatalogHandle,
-    projection: &StoredMvProjection,
+    projection: &StoredKeyedMvProjection,
 ) -> Result<bool, String> {
     let source = projection.facts.source_revision();
     if source.deployment_owner != *entrance.owner() {
@@ -110,16 +110,16 @@ fn recovery_barrier(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mv::domain::test_admission::sample_keyed_projection as sample_projection;
     use novarocks_mv_application::management::{
         DeploymentOwner, MvManagementPhase, ProcessIncarnation,
     };
-    use novarocks_mv_application::persistence::test_support::sample_projection;
     use novarocks_mv_application::product::MvTarget;
     use novarocks_spi::connector::{CatalogVersion, ConnectorInstanceId};
 
     /// The fixture records `test-deployment` / `test-process` as the writer.
-    fn projection() -> StoredMvProjection {
-        StoredMvProjection {
+    fn projection() -> StoredKeyedMvProjection {
+        StoredKeyedMvProjection {
             mv_id: 1,
             facts: sample_projection(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(1)),
         }
@@ -139,7 +139,9 @@ mod tests {
         )
     }
 
-    fn table(projection: &StoredMvProjection) -> novarocks_spi::connector::ConnectorTableIdentity {
+    fn table(
+        projection: &StoredKeyedMvProjection,
+    ) -> novarocks_spi::connector::ConnectorTableIdentity {
         projection.facts.source_revision().target.clone()
     }
 

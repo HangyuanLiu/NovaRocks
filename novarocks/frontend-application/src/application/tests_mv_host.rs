@@ -93,7 +93,7 @@ async fn configured_state_store_transfers_mv_repository_to_role_product_construc
     let repository = host
         .take_mv_repository_for_role_product_construction()
         .expect("configured host transfers the MV repository once");
-    assert!(repository.list_projections().await.is_ok());
+    assert!(repository.list_keyed_projections().await.is_ok());
     assert!(
         host.take_mv_repository_for_role_product_construction()
             .is_err(),
@@ -110,7 +110,7 @@ async fn configured_state_store_transfers_mv_repository_to_role_product_construc
     let repository = reopened
         .take_mv_repository_for_role_product_construction()
         .expect("reopened host transfers the MV repository once");
-    assert!(repository.list_projections().await.is_ok());
+    assert!(repository.list_keyed_projections().await.is_ok());
     drop(repository);
     reopened.shutdown().await.expect("reopened host shutdown");
 }

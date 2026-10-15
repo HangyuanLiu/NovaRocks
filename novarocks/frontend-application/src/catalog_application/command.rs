@@ -323,6 +323,7 @@ fn execute_alter_iceberg_properties(
     crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
         executor.connector_control.as_ref(),
         executor.mv_storage_observation.as_ref(),
+        executor.mv_readiness.as_ref(),
         &target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::AlterTable,
     )?;
@@ -388,6 +389,7 @@ fn execute_alter_iceberg_schema(
     crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
         executor.connector_control.as_ref(),
         executor.mv_storage_observation.as_ref(),
+        executor.mv_readiness.as_ref(),
         &target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::AlterTable,
     )?;
@@ -513,6 +515,7 @@ fn execute_alter_partition_spec(
     crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
         executor.connector_control.as_ref(),
         executor.mv_storage_observation.as_ref(),
+        executor.mv_readiness.as_ref(),
         &target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::AlterTable,
     )?;
