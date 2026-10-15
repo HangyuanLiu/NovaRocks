@@ -828,3 +828,210 @@ fn json_object_actual_original_date_error_and_raw_panic_frontier_are_preserved()
         }
     }
 }
+
+// The admitted creator port exercises the actual catalogue attachment and both
+// checked owner siblings. This is operation-request evidence, not GLOBAL grant.
+#[test]
+fn json_object_checked_creator_keeps_original_owner_and_primary_refusals() {
+    use crate::{
+        CheckedCallPreparationFailure, FunctionBindingCreationFailure, PreparedPureKernel,
+        PureCallPreparation,
+    };
+    use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
+    use std::cell::Cell;
+    let catalog = crate::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
+    let arguments = [DataType::Utf8, DataType::Int64].map(|ty| FunctionArgument::Value {
+        value_type: FunctionValueType::new(ty, true),
+        constant: None,
+    });
+    let request = FunctionBindingRequest {
+        arguments: &arguments,
+        logical_argument_count: 2,
+        expected_result_type: None,
+    };
+    let control = crate::binding_test_control();
+    let bound = catalog
+        .resolve_bound_user("json_object", FunctionKind::Scalar, request, control)
+        .unwrap();
+    let selected = Arc::new(bound.selected);
+    let context = ExpressionEffectContext {
+        use_id: ExpressionUseId::new(41),
+        domain: EvaluationDomainId::new(7),
+        demand: EvaluationDemand::Value,
+    };
+    let uses = [
+        Some(ExpressionUseId::new(42)),
+        Some(ExpressionUseId::new(43)),
+    ];
+    let parameters = SemanticParameters::try_new([]).unwrap();
+    let input = || CallEffectInput {
+        function_id: &bound.function_id,
+        kind: FunctionKind::Scalar,
+        selected: &selected,
+        request,
+        argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
+        context,
+        parameters: &parameters,
+        environment: &[],
+        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+        proof_scope: CallProofScope::Domain(context.domain),
+    };
+    let options = || PureCallPreparation::Scalar {
+        arguments: ScopedExpressionEffects::pure_value(context),
+    };
+    let policy = crate::ConstantPolicy {
+        max_rows: 16,
+        max_array_nodes: 128,
+        max_logical_elements: 1024,
+        max_retained_buffer_bytes: 1 << 20,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 16,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 20,
+        max_library_validation_bytes: 1 << 20,
+    };
+    let original = catalog
+        .prepare_fresh_selected(input(), selected.clone(), options(), control)
+        .unwrap();
+    let frozen = original.prepared().call_contract().effects();
+    let used = Cell::new(0usize);
+    let requests = Cell::new(0usize);
+    let primary = Arc::new(());
+    let charge = |bytes: usize| {
+        requests.set(requests.get() + 1);
+        let next = used
+            .get()
+            .checked_add(bytes)
+            .filter(|bytes| *bytes <= 65_536)
+            .ok_or_else(|| primary.clone())?;
+        used.set(next);
+        Ok::<_, Arc<()>>(())
+    };
+    let mut exact = |layout: Layout| charge(layout.size());
+    let mut opaque = |bytes| charge(bytes);
+    let mut creation =
+        ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
+    let checked = catalog
+        .prepare_selected_checked_with_creator_in(
+            input(),
+            selected.clone(),
+            Some(frozen),
+            options(),
+            &policy,
+            &mut creation,
+            control,
+        )
+        .unwrap();
+    assert!(
+        requests.get() > 0,
+        "the exact fixed resolver used its supplied creator"
+    );
+    assert_eq!(checked.prepared().call_contract().effects(), frozen);
+    assert_eq!(
+        checked.prepared().call_contract().selected(),
+        selected.as_ref()
+    );
+    let PreparedPureKernel::ScalarInvocation(kernel) = checked.prepared() else {
+        panic!("the original whole-invocation ABI is retained");
+    };
+    let host = Arc::new(Host::default());
+    let mut instance = InvocationScalarEvaluationInstance::instantiate_with_allocator(
+        kernel.clone(),
+        Some(host.clone()),
+    )
+    .unwrap();
+    let key: ArrayRef = Arc::new(StringArray::from(vec!["v"]));
+    let value: ArrayRef = Arc::new(arrow_array::Int64Array::from(vec![7]));
+    let arguments = [
+        EvaluatedArgument::Column(&key),
+        EvaluatedArgument::Column(&value),
+    ];
+    let output = instance
+        .evaluate(
+            Selection::all(1),
+            &arguments,
+            ScalarInvocationActivation::Activated,
+            &Control::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        output
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "{\"v\": 7}"
+    );
+    drop(output);
+    drop(instance);
+    empty(&host);
+
+    let calls = Cell::new(0usize);
+    let mut refuse = |_: Layout| {
+        calls.set(calls.get() + 1);
+        Err::<(), _>(primary.clone())
+    };
+    let mut no_later_opaque =
+        |_| -> Result<(), Arc<()>> { panic!("callback after primary creator refusal") };
+    let mut creation = ValueSchemaCreation::new(
+        ValueTypeStorageLifetime::pure(),
+        &mut refuse,
+        &mut no_later_opaque,
+    );
+    let error = catalog
+        .prepare_selected_checked_with_creator_in(
+            input(),
+            selected.clone(),
+            Some(frozen),
+            options(),
+            &policy,
+            &mut creation,
+            control,
+        )
+        .err()
+        .expect("actual creator refusal precedes checked preparation");
+    let CheckedCallPreparationFailure::Binding(FunctionBindingCreationFailure::Creator(cause)) =
+        error
+    else {
+        panic!("the original typed creator cause must survive");
+    };
+    assert!(Arc::ptr_eq(&cause, &primary));
+    assert_eq!(calls.get(), 1);
+
+    struct Stop;
+    impl PureCompileControl for Stop {
+        fn checkpoint(
+            &self,
+            _: CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Err(novarocks_type_contract::CompileControlError::DeadlineExceeded)
+        }
+    }
+    let mut exact = |_: Layout| -> Result<(), Arc<()>> {
+        panic!("creator after original compile control refusal")
+    };
+    let mut opaque = |_| -> Result<(), Arc<()>> {
+        panic!("opaque request after original compile control refusal")
+    };
+    let mut creation =
+        ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
+    assert!(matches!(
+        catalog.prepare_selected_checked_with_creator_in(
+            input(),
+            selected.clone(),
+            Some(frozen),
+            options(),
+            &policy,
+            &mut creation,
+            &Stop,
+        ),
+        Err(CheckedCallPreparationFailure::Preparation(
+            crate::CheckedOwnerFailure::Original(crate::FunctionSpecializationFailure::Control(
+                novarocks_type_contract::CompileControlError::DeadlineExceeded
+            ))
+        ))
+    ));
+}

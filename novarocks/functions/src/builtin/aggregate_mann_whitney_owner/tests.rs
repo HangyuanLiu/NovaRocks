@@ -292,3 +292,225 @@ fn mann_whitney_owner_each_actual_compile_frontier_preserves_primary_cause() {
         }
     }
 }
+
+// The real staged catalogue entry must retain the original aggregate binding
+// and all phase/state facts, rather than use its unconverted-owner default.
+#[test]
+fn mann_whitney_checked_creator_preserves_four_phases_and_original_control() {
+    use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
+    use std::{alloc::Layout, cell::Cell};
+    let fixture = Fixture::new(&[DataType::Float64, DataType::Boolean]);
+    let policy = ConstantPolicy {
+        max_rows: 16,
+        max_array_nodes: 128,
+        max_logical_elements: 1024,
+        max_retained_buffer_bytes: 1 << 20,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 16,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 20,
+        max_library_validation_bytes: 1 << 20,
+    };
+    for phase in [
+        AggregateKernelPhase::Single,
+        AggregateKernelPhase::Partial,
+        AggregateKernelPhase::Intermediate,
+        AggregateKernelPhase::Final,
+    ] {
+        let context = fixture.context();
+        let state_type = fixture
+            .selected
+            .aggregate
+            .as_ref()
+            .unwrap()
+            .intermediate_type
+            .clone();
+        let argument_uses = if phase.consumes_logical_arguments() {
+            CallArgumentUses::SelectedChannels(&fixture.uses)
+        } else {
+            CallArgumentUses::AggregateMerge {
+                phase,
+                state_context: ExpressionEffectContext {
+                    use_id: ExpressionUseId::new(71),
+                    domain: EvaluationDomainId::new(73),
+                    demand: EvaluationDemand::Value,
+                },
+                state_input_type: &state_type,
+            }
+        };
+        let input = || CallEffectInput {
+            function_id: &fixture.id,
+            kind: FunctionKind::Aggregate,
+            selected: &fixture.selected,
+            request: FunctionBindingRequest {
+                arguments: &fixture.arguments,
+                logical_argument_count: fixture.arguments.len(),
+                expected_result_type: None,
+            },
+            argument_uses,
+            context,
+            parameters: &fixture.params,
+            environment: &[],
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+            proof_scope: CallProofScope::Domain(context.domain),
+        };
+        let options = || PureCallPreparation::Aggregate {
+            arguments: ScopedExpressionEffects::pure_value(context),
+            options: AggregatePreparationOptions {
+                phase,
+                distinct: false,
+                order_keys: Arc::from([]),
+                state_interpretation: None,
+                state_input_type: (!phase.consumes_logical_arguments())
+                    .then_some(state_type.clone()),
+            },
+        };
+        let original = fixture
+            .prepare(
+                phase,
+                false,
+                CallProofScope::Domain(context.domain),
+                &Control::default(),
+            )
+            .unwrap();
+        let frozen = original.prepared().call_contract().effects();
+        let used = Cell::new(0usize);
+        let charge = |bytes| {
+            let next = used
+                .get()
+                .checked_add(bytes)
+                .filter(|bytes| *bytes <= 65_536)
+                .ok_or(())?;
+            used.set(next);
+            Ok::<_, ()>(())
+        };
+        let mut exact = |layout: Layout| charge(layout.size());
+        let mut opaque = |bytes| charge(bytes);
+        let mut creation =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
+        let checked = fixture
+            .catalogue
+            .prepare_selected_checked_with_creator_in(
+                input(),
+                fixture.selected.clone(),
+                Some(frozen),
+                options(),
+                &policy,
+                &mut creation,
+                &Control::default(),
+            )
+            .unwrap();
+        let PreparedPureKernel::Aggregate(handle) = checked.prepared() else {
+            panic!("original aggregate ABI")
+        };
+        assert_eq!(handle.contract().phase(), phase);
+        assert_eq!(handle.contract().intermediate_type(), &state_type);
+        assert_eq!(handle.contract().call().effects(), frozen);
+        assert_eq!(
+            handle.contract().call().selected(),
+            fixture.selected.as_ref()
+        );
+        assert_eq!(
+            handle.memory_policy(),
+            AggregateStateMemoryPolicy::AllocationTracked
+        );
+        let stop = Control {
+            calls: Mutex::new(0),
+            refusal: Some((0, CompileControlError::Cancelled)),
+        };
+        let error = fixture
+            .catalogue
+            .prepare_selected_checked_with_creator_in(
+                input(),
+                fixture.selected.clone(),
+                Some(frozen),
+                options(),
+                &policy,
+                &mut creation,
+                &stop,
+            )
+            .err()
+            .expect("the original control must refuse checked preparation");
+        assert!(matches!(
+            error,
+            CheckedCallPreparationFailure::Preparation(CheckedOwnerFailure::Original(
+                FunctionSpecializationFailure::Control(CompileControlError::Cancelled)
+            ))
+        ));
+        assert_eq!(*stop.calls.lock().unwrap(), 1);
+    }
+}
+
+#[test]
+fn mann_whitney_borrowed_primitive_checks_preserve_exact_types_and_control_prefixes() {
+    let profiles = [
+        FunctionValueType::new(DataType::Utf8, true),
+        FunctionValueType::new(DataType::Utf8, false),
+        FunctionValueType::new(DataType::LargeUtf8, true),
+        FunctionValueType::new(DataType::Binary, true),
+        FunctionValueType::new(DataType::LargeBinary, true),
+        FunctionValueType::try_with_logical_type(
+            DataType::Utf8,
+            true,
+            novarocks_type_contract::ValueLogicalType::Json,
+        )
+        .unwrap(),
+        FunctionValueType::try_with_logical_type(
+            DataType::Binary,
+            true,
+            novarocks_type_contract::ValueLogicalType::Bitmap,
+        )
+        .unwrap(),
+    ];
+    for carrier in [DataType::Utf8, DataType::Binary] {
+        let original = FunctionValueType::new(carrier.clone(), true);
+        for actual in &profiles {
+            let mut original_calls = 0;
+            let expected = original
+                .exactly_equals_observed::<KernelFailure>(actual, || {
+                    original_calls += 1;
+                    Ok(())
+                })
+                .unwrap();
+            let mut borrowed_calls = 0;
+            assert_eq!(
+                original_nullable_type_matches::<KernelFailure>(actual, &carrier, || {
+                    borrowed_calls += 1;
+                    Ok(())
+                })
+                .unwrap(),
+                expected
+            );
+            assert_eq!(borrowed_calls, original_calls);
+            for stop in 0..original_calls {
+                let mut original_at = 0;
+                let original_error = original
+                    .exactly_equals_observed::<KernelFailure>(actual, || {
+                        let at = original_at;
+                        original_at += 1;
+                        if at == stop {
+                            Err(KernelFailure::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .unwrap_err();
+                let mut borrowed_at = 0;
+                let borrowed_error =
+                    original_nullable_type_matches::<KernelFailure>(actual, &carrier, || {
+                        let at = borrowed_at;
+                        borrowed_at += 1;
+                        if at == stop {
+                            Err(KernelFailure::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .unwrap_err();
+                assert_eq!(borrowed_error, original_error);
+                assert_eq!(borrowed_at, original_at);
+            }
+        }
+    }
+}

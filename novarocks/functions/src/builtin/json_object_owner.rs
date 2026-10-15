@@ -80,7 +80,7 @@ pub(super) fn definition(
 }
 
 struct JsonObjectOwner {
-    resolver: BuiltinScalarResolver,
+    resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
@@ -117,7 +117,7 @@ impl JsonObjectOwner {
             })
             .collect();
         Ok(Self {
-            resolver,
+            resolver: Arc::new(resolver),
             declaration,
             implementations,
         })
@@ -169,6 +169,10 @@ impl FunctionBindingResolver for JsonObjectOwner {
 }
 
 impl PureFunctionMetadataOwner for JsonObjectOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -217,6 +221,59 @@ impl FunctionEffectOwner for JsonObjectOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
+        self.refine_core(input, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_core(input, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
+    }
+}
+
+impl PureInvocationScalarImplementation for JsonObjectOwner {
+    fn prepare_invocation_scalar(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedInvocationScalarKernel>, KernelFailure> {
+        self.prepare_core(input, contract, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+
+    fn prepare_invocation_scalar_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedInvocationScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>>
+    {
+        self.prepare_core(input, contract, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
+    }
+}
+
+impl JsonObjectOwner {
+    fn refine_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(FunctionEffectOwnerError::Control)?;
         work.step().map_err(FunctionEffectOwnerError::Control)?;
@@ -235,11 +292,10 @@ impl FunctionEffectOwner for JsonObjectOwner {
             .into());
         }
         work.flush().map_err(FunctionEffectOwnerError::Control)?;
-        self.validate_selected(input.selected, input.request, control)
-            .map_err(|error| match error {
-                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
-                other => FunctionEffectOwnerError::Owner(other),
-            })?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+            other => FunctionEffectOwnerError::Owner(other),
+        })?;
         self.admit_selected_profile_observed(
             input.selected,
             input.request.logical_argument_count,
@@ -253,14 +309,13 @@ impl FunctionEffectOwner for JsonObjectOwner {
         work.finish().map_err(FunctionEffectOwnerError::Control)?;
         Ok(result)
     }
-}
 
-impl PureInvocationScalarImplementation for JsonObjectOwner {
-    fn prepare_invocation_scalar(
+    fn prepare_core(
         &self,
         input: CallEffectInput<'_>,
         contract: Arc<ScalarCallContract>,
         control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
     ) -> Result<Arc<dyn PreparedInvocationScalarKernel>, KernelFailure> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
             .map_err(compile_failure)?;
@@ -279,11 +334,10 @@ impl PureInvocationScalarImplementation for JsonObjectOwner {
             ));
         }
         work.flush().map_err(compile_failure)?;
-        self.validate_selected(input.selected, input.request, control)
-            .map_err(|error| match error {
-                FunctionBindingError::Control(error) => compile_failure(error),
-                _ => invalid("json_object preparation has a stale selected binding"),
-            })?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => compile_failure(error),
+            _ => invalid("json_object preparation has a stale selected binding"),
+        })?;
         super::json_object_selected::validate_profile(&contract, || {
             work.step().map_err(compile_failure)
         })?;

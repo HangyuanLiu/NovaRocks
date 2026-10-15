@@ -633,6 +633,12 @@ fn analytic_actual_private_host_and_original_builder_capture_separate_occurrence
         let mut journal = ProjectMetadataJournal::default();
         let compiled = compile(&bytes, &binding, &tracker, &loan, &mut journal);
         let node = compiled.program().graph().root();
+        let original_label = Arc::clone(
+            &compiled.program().graph().nodes()[node.index()]
+                .output_layout()
+                .schema()
+                .fields()[1],
+        );
         let mut functions = ExecutionFunctionSetBuilder::new();
         functions
             .catalog_builder_mut()
@@ -696,6 +702,10 @@ fn analytic_actual_private_host_and_original_builder_capture_separate_occurrence
                 occurrence.journal.body.settlement
             );
             settled(&occurrence.journal, false);
+            assert!(Arc::ptr_eq(
+                occurrence.schema.slots()[1].field_ref(),
+                &original_label,
+            ));
             assert_eq!(
                 occurrence.schema.arrow_schema_ref().fields()[1].name(),
                 &"r".repeat(label_bytes)
@@ -708,7 +718,10 @@ fn analytic_actual_private_host_and_original_builder_capture_separate_occurrence
         if label_bytes == 512 {
             let a = token(output.occurrences[0].schema.slots()[1].field_ref().name());
             let b = token(output.occurrences[1].schema.slots()[1].field_ref().name());
-            assert_ne!(a, b, "distinct real funded constructor invocations");
+            assert_eq!(
+                a, b,
+                "distinct runtime schemas retain the original funded label"
+            );
             assert_eq!(
                 global_store().snapshot_ref(a).unwrap().origin,
                 binding.account().id().get()

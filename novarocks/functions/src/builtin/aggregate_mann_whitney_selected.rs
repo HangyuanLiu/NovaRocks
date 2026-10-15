@@ -626,6 +626,27 @@ impl PreparedAggregateKernel for MannKernel {
     }
 }
 
+/// Match the original two primitive declarations without constructing an
+/// expected semantic/layout tree outside the caller's creation scope. Keep the
+/// original semantic header and the shared Arrow equality observation order.
+pub(super) fn original_nullable_type_matches<E: From<novarocks_type_contract::ValueTypeError>>(
+    value: &FunctionValueType,
+    expected: &DataType,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    observe()?;
+    if !value.nullable()
+        || !matches!(
+            (expected, value.value_type().kind()),
+            (DataType::Utf8, novarocks_type_contract::ValueKind::String)
+                | (DataType::Binary, novarocks_type_contract::ValueKind::Binary)
+        )
+    {
+        return Ok(false);
+    }
+    novarocks_type_contract::arrow_data_types_exact_observed(expected, value.data_type(), observe)
+}
+
 pub(super) fn validate_contract(
     contract: &AggregateCallContract,
     work: &mut CompileCheckpoints<'_>,
@@ -668,13 +689,13 @@ pub(super) fn validate_contract(
     let FunctionResultType::Scalar(output) = &selected.result_type else {
         return Err(invalid("Mann-Whitney requires its exact scalar result"));
     };
-    if !FunctionValueType::new(DataType::Utf8, true)
-        .exactly_equals_observed::<KernelFailure>(output, || work.step().map_err(compile_failure))?
-        || !FunctionValueType::new(DataType::Binary, true)
-            .exactly_equals_observed::<KernelFailure>(contract.intermediate_type(), || {
-                work.step().map_err(compile_failure)
-            })?
-    {
+    if !original_nullable_type_matches(output, &DataType::Utf8, || {
+        work.step().map_err(compile_failure)
+    })? || !original_nullable_type_matches(
+        contract.intermediate_type(),
+        &DataType::Binary,
+        || work.step().map_err(compile_failure),
+    )? {
         return Err(invalid(
             "Mann-Whitney result or state differs from its full type",
         ));
