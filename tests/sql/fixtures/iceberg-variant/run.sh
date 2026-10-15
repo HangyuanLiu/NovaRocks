@@ -22,7 +22,7 @@ while [[ $# -gt 0 ]]; do
     *) echo "usage: $0 --mode MODE --namespace NAME --table NAME --output FRESH_DIR" >&2; exit 2 ;;
   esac
 done
-case "$mode" in unshredded|shredded|bounds|nested|uuid|write-target|observe|unchanged) ;; *) echo "Invalid fixture mode: $mode" >&2;exit 2 ;; esac
+case "$mode" in unshredded|shredded|bounds|nested|uuid|write-target|empty-int|empty-bigint|empty-region|observe|unchanged) ;; *) echo "Invalid fixture mode: $mode" >&2;exit 2 ;; esac
 [[ "$namespace" =~ ^[a-zA-Z0-9_]+$ && "$table" =~ ^[a-zA-Z0-9_]+$ && -n "$output" ]] || { echo 'Invalid fixture arguments' >&2;exit 2; }
 printf 'IRU9_ARTIFACT_DIR=%s\n' "$output"
 mkdir -p "$output"

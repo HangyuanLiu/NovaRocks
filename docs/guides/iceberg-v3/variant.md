@@ -25,9 +25,11 @@ Iceberg `variant` 是逻辑类型。NovaRocks 读取其他引擎写出的顶层 
 | --- | --- |
 | 顶层 Variant 读取与表达式求值 | 支持；受下文 manifest 统计限制 |
 | STRUCT / LIST / MAP 中嵌套 Variant | 不支持；投影该基础列时报错，只选其他列仍可读 |
-| CREATE / ALTER ADD 顶层 Variant 列 | 仅 format-version 3；不支持 Variant default |
+| CREATE / ALTER ADD Variant 列 | 任意层级、默认 / v2 / v3 均拒绝；含 IF NOT EXISTS |
 | INSERT / OVERWRITE / UPDATE / MERGE / OPTIMIZE 数据重写 | 目标表任意层级含 Variant 时拒绝，包括只插入的 MERGE |
 | CTAS / MV 暂存建表 | 列定义含 Variant 时在 namespace 探测与暂存请求之前拒绝 |
+| CREATE TABLE LIKE | 保留源声明类型；目标含 Variant 时拒绝，不探测或创建目标 |
+| 已有表的普通 schema 修改 | 普通 ADD、rename / comment / drop / reorder 等保留；已有 Variant 同类型 MODIFY 沿原 no-op 规则 |
 | ADD FILES | 目标表含 Variant 时拒绝 |
 | DELETE | v3 使用 deletion vector；不因表内存在普通 Variant 列而拒绝 |
 | TRUNCATE | 不写出 Variant 数据文件，沿原有元数据操作路径执行 |
@@ -57,6 +59,8 @@ hint: this table has had Variant columns, and NovaRocks cannot read Variant colu
 提示只表示可能相关。权限、网络与文件损坏错误也可能带此提示；原错误类别、重试资格与清理事实保持不变。删除 Variant 列不抹去历史 schema，也不保证旧 manifest 已可读。不忽略统计、不跳过失败的 manifest。
 
 ## 写入限制与恢复条件
+
+新 Variant 列由外部引擎创建，NovaRocks 读取这些外部表。CREATE 与 ALTER ADD 的新列定义在 Provider 纯准入阶段递归拒绝，早于目标 metadata 读取或创建副作用；ALTER 保留同一代 planning / mutation lease，准入成功后才执行原 MV 与 DROP 依赖保护。仅检查本次新增定义，已有表含 Variant 不会阻止普通 metadata 修改、DELETE、合法等值键的 equality delete 或 TRUNCATE。CAST、parse_json 与读取类型词汇保持可用。
 
 NovaRocks 当前不写出 Variant Parquet 数据文件。SDK 写出类型仍不支持 Variant，执行载体不能代替 Parquet `LogicalType::Variant`、extension 与统计语义。写入在 provider 准入处返回 `Unsupported`，拒绝时不产生数据文件、暂存请求或提交。
 

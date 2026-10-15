@@ -56,7 +56,7 @@ Iceberg schema 同时拥有 schema ID、嵌套 field ID、逻辑类型、require
 2. **适配集合封闭。** 顶层 Int8/Int16 到 Int32；Binary 到 LargeBinary；相同单位、整数值不变的 UTC timezone 标签；Int32 字符串字典展开；按目标重建 STRUCT/LIST/MAP 字段。LargeUtf8 字符串转 Utf8 检查 offset 范围。其他类型差异、嵌套可空性差异和 required 顶层 NULL 明确拒绝；不静默截断、转 NULL 或降级。展开与重建留在原 writer 资源归属内。
 3. **数据写出准入与删除分离。** 目标任意层级含 Variant 或 uuid 的普通数据写出在副作用之前返回 Unsupported。UPDATE、MERGE 在只插入快捷分支之前判定。DV/position DELETE、TRUNCATE、位置删除重写与不含非法等值键的 equality delete 保留；ADD FILES 只拒绝 Variant，允许 uuid。
 4. **Variant 的逻辑判定。** 执行值格式继续由共享 types 层拥有；Connector 拥有 Iceberg Type::Variant、Parquet group 与执行值之间的转换。顶层读取支持 unshredded 与 shredded；普通同形 STRUCT 不合并。嵌套 Variant 投影拒绝；未投影列不阻止其他列读取。
-5. **DDL 与统计诚实。** 顶层 Variant 仅允许 v3，嵌套 Variant 与 shredding 属性拒绝；CTAS/MV 的 Variant 与属性拒绝早于 namespace 请求。Variant manifest bounds 尚不可读；历史 schema 出现 Variant 时，在 manifest 加载错误后附加可能相关的提示，保留类别、重试、清理与绑定事实，不吞统计、不跳 manifest。
+5. **新定义准入与统计诚实。** CREATE / ALTER ADD 在默认、v2、v3 均递归拒绝新增 Variant 列，含 IF NOT EXISTS；CREATE LIKE 保留源类型后拒绝目标定义，CTAS/MV 的 Variant 与 shredding 属性拒绝早于 namespace 请求。规则由 Provider 纯准入拥有；FE schema ALTER 先通过同一代 mutation lease 准入，再通过对应 planning lease 执行原 MV / DROP 依赖保护，并保留同一 operation id 执行与协调。已有表的普通 ADD、rename、comment、drop、reorder 和 Variant 同类型 MODIFY 沿原规则处理，DELETE / 合法普通键 equality delete / TRUNCATE 边界保留。Variant manifest bounds 尚不可读；历史 schema 出现 Variant 时，在 manifest 加载错误后附加可能相关的提示，保留类别、重试、清理与绑定事实，不吞统计、不跳 manifest。
 
 本条部分替代 ADR-0174 的 core U8 保留项及 Variant 读取暂缓条款，其余 vendor 来源与退出规则不变。ADR-0055 的 Provider 策略所有权继续有效；其裁决 5、妥协 3 保留 Variant 写入载体分歧的临时做法退出，改为提前拒绝未支持的写出。消费 [ADR-0176](ADR-0176-recursive-execution-types-and-independent-storage-ownership.md) 的执行类型与独立存储所有权；共享 Variant 值格式的归属保持 [ADR-0040](ADR-0040-sql-compiler-dependency-inversion.md) 的边界。
 

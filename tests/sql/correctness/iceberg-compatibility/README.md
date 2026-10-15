@@ -52,9 +52,26 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 The `java_variant_*` cases use the pinned Java API fixture in
 `tests/sql/fixtures/iceberg-variant/` to read unshredded/shredded Variant,
 exercise the manifest-statistics hint, isolate nested projection, and check
-Variant write refusal and DV deletion. `java_uuid_write_rejected` checks UUID
-write/equality-key refusal while retaining supported deletion.
+Variant write refusal and DV deletion. `java_variant_write_rejected` also checks
+default/v3 CTAS, LIKE, new top-level/nested Variant definitions and ordinary-to-
+Variant type evolution refusals. Its existing external table remains usable for
+ordinary ADD/rename/comment/drop/property changes and same-type Variant MODIFY;
+the final Java snapshot/data-file check permits those metadata changes while
+refusing accidental data publication. `java_variant_dv_delete` retains its exact
+post-DV row oracle and continues through ordinary-id equality deletion and
+TRUNCATE. Existing Variant tables are not made wholly read-only.
+`java_uuid_write_rejected` checks UUID write/equality-key refusal while retaining
+supported deletion; the Variant creation policy does not alter UUID operations.
 `java_timestamptz_write_adaptation` writes to a Java-authored target under a
 non-UTC session timezone and exercises the same target in equality deletion.
 The exhaustive independent footer and Spark type matrices are waived for this
 IRU-9 execution; these cases do not claim that validation.
+
+The same fixture's `empty-int`, `empty-bigint`, and `empty-region` modes supply
+the three `iceberg-dml/variant_*` cases and `optimizer/variant_path_pushdown`.
+Those cases bind an explicit REST catalog locally; they do not switch their
+ordinary suite backend from Hadoop. Empty tables keep exact original field
+nullability and have no data files or snapshot, including for the row-lineage
+and region-partition targets. Pure Variant function SQL and both pushdown
+oracles remain unchanged; existing function or empty-snapshot failures remain
+visible instead of being accepted as fixture setup failures.

@@ -116,36 +116,44 @@ fn unwritable_error(kind: &str, table: &str, path: &str) -> ConnectorError {
     )
 }
 
-/// Staged CTAS and MV creation must reject before allocating a location or
-/// querying the catalog; no target metadata exists at that boundary yet.
+/// New column definitions are decidable before any target metadata is read.
 pub(crate) fn deny_variant_column_definitions(
     columns: &[novarocks_spi::connector::ConnectorColumnDefinition],
     table: &str,
 ) -> Result<(), ConnectorError> {
-    fn visit(
-        data_type: &novarocks_spi::connector::ConnectorDataType,
-        path: &str,
-        table: &str,
-    ) -> Result<(), ConnectorError> {
-        use novarocks_spi::connector::ConnectorDataType;
-        match data_type {
-            ConnectorDataType::Variant => return Err(unwritable_error("Variant", table, path)),
-            ConnectorDataType::Array(element) => visit(element, &format!("{path}.element"), table)?,
-            ConnectorDataType::Map(key, value) => {
-                visit(key, &format!("{path}.key"), table)?;
-                visit(value, &format!("{path}.value"), table)?;
-            }
-            ConnectorDataType::Struct(fields) => {
-                for field in fields {
-                    visit(&field.data_type, &format!("{path}.{}", field.name), table)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
     for column in columns {
-        visit(&column.data_type, &column.name, table)?;
+        deny_variant_column_definition(&column.data_type, &column.name, table)?;
+    }
+    Ok(())
+}
+
+/// Check only the new type, with the caller's complete parent/column path.
+/// Existing Variant columns do not prevent unrelated metadata changes.
+pub(crate) fn deny_variant_column_definition(
+    data_type: &novarocks_spi::connector::ConnectorDataType,
+    path: &str,
+    table: &str,
+) -> Result<(), ConnectorError> {
+    use novarocks_spi::connector::ConnectorDataType;
+    match data_type {
+        ConnectorDataType::Variant => return Err(unwritable_error("Variant", table, path)),
+        ConnectorDataType::Array(element) => {
+            deny_variant_column_definition(element, &format!("{path}.element"), table)?
+        }
+        ConnectorDataType::Map(key, value) => {
+            deny_variant_column_definition(key, &format!("{path}.key"), table)?;
+            deny_variant_column_definition(value, &format!("{path}.value"), table)?;
+        }
+        ConnectorDataType::Struct(fields) => {
+            for field in fields {
+                deny_variant_column_definition(
+                    &field.data_type,
+                    &format!("{path}.{}", field.name),
+                    table,
+                )?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }

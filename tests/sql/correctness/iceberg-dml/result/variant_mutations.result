@@ -1,3 +1,13 @@
--- query 7
+-- query 2
+0
+IRU9_EMPTY_BIGINT_OK rows=0 snapshot=absent id=optional-long row-lineage=true
+IRU9_FIXTURE_COMPLETE
+
+-- query 8
 remaining_rows
 0
+
+-- query 12
+0
+IRU9_EMPTY_REGION_OK rows=0 snapshot=absent id=optional-long partition=identity(region)
+IRU9_FIXTURE_COMPLETE

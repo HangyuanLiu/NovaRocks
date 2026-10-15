@@ -23,16 +23,36 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_variant_get FORCE;
-CREATE TABLE ${case_db}.t_variant_get (
-  id INT,
-  v VARIANT
-)
-TBLPROPERTIES (
-  "format-version" = "3"
+CREATE EXTERNAL CATALOG `iru9_variant_get_${uuid0}`
+PROPERTIES (
+    "type"="iceberg",
+    "iceberg.catalog.type"="rest",
+    "uri"="${iceberg_rest_uri}",
+    "warehouse"="${iceberg_rest_warehouse}",
+    "credential.object-store-metadata.consumer-role" = "frontend",
+    "credential.object-store-metadata.mode" = "static",
+    "credential.object-store-metadata.name" = "${iceberg_object_store_credential_name}",
+    "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
+    "credential.object-store-data.consumer-role" = "backend",
+    "credential.object-store-data.mode" = "static",
+    "credential.object-store-data.name" = "${iceberg_object_store_credential_name}",
+    "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
+    "aws.s3.endpoint"="${oss_endpoint}",
+    "aws.s3.region"="us-east-1",
+    "aws.s3.enable_path_style_access"="true"
 );
 
 -- query 2
+-- @result_contains=IRU9_EMPTY_INT_OK
+shell: set -eu
+receipt_parent="${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/experiments/iceberg-variant"
+mkdir -p "$receipt_parent"
+receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode empty-int --namespace iru9_${uuid0} --table t_variant_get --output "$receipt_dir" >"$receipt_dir/run.log"
+cat "$receipt_dir/run.log" >&2
+grep -E '^IRU9_(EMPTY_INT_OK|FIXTURE_COMPLETE)' "$receipt_dir/run.log"
+
+-- query 3
 -- typed extraction; missing path / SQL NULL / unconvertible-cast
 -- rows are NULL; numeric narrowing (1.5) truncates per Spark CAST semantics
 -- (IV3-6 cast-semantics decision 2026-06-11).
@@ -46,7 +66,7 @@ WITH source_values AS (
 )
 SELECT id, try_variant_get(v, '$.a', 'bigint') FROM source_values ORDER BY id;
 
--- query 3
+-- query 4
 -- strict extraction; row 4 truncates (1.5 -> 1), not an error.
 WITH source_values AS (
   SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
@@ -58,7 +78,7 @@ WITH source_values AS (
 )
 SELECT id, variant_get(v, '$.a', 'bigint') FROM source_values WHERE id <= 4 ORDER BY id;
 
--- query 4
+-- query 5
 -- strict extraction over a genuinely unconvertible row must fail.
 -- @expect_error=cast
 WITH source_values AS (
@@ -71,7 +91,7 @@ WITH source_values AS (
 )
 SELECT variant_get(v, '$.a', 'bigint') FROM source_values WHERE id = 6;
 
--- query 5
+-- query 6
 -- WHERE usage through the PR-4 pushdown target shape.
 WITH source_values AS (
   SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
@@ -83,10 +103,10 @@ WITH source_values AS (
 )
 SELECT id FROM source_values WHERE try_variant_get(v, '$.a', 'bigint') = 99 ORDER BY id;
 
--- query 6
+-- query 7
 SET disable_optimizer_rules = 'VariantPathPushdown';
 
--- query 7
+-- query 8
 -- Same result with the rewrite disabled.
 WITH source_values AS (
   SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
@@ -98,10 +118,10 @@ WITH source_values AS (
 )
 SELECT id FROM source_values WHERE try_variant_get(v, '$.a', 'bigint') = 99 ORDER BY id;
 
--- query 8
+-- query 9
 SET disable_optimizer_rules = '';
 
--- query 9
+-- query 10
 -- 2-arg form returns variant; display via variant_typeof.
 WITH source_values AS (
   SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
@@ -113,7 +133,7 @@ WITH source_values AS (
 )
 SELECT id, variant_typeof(variant_get(v, '$.a')) FROM source_values WHERE id <= 2 ORDER BY id;
 
--- query 10
+-- query 11
 -- try_ predicate usage across missing-path / NULL rows.
 WITH source_values AS (
   SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
@@ -125,7 +145,7 @@ WITH source_values AS (
 )
 SELECT id FROM source_values WHERE try_variant_get(v, '$.a', 'bigint') > 5 ORDER BY id;
 
--- query 11
+-- query 12
 -- string extraction.
 WITH source_values AS (
   SELECT 1 AS id, parse_json('{"a":1,"b":"x"}') AS v
@@ -137,23 +157,24 @@ WITH source_values AS (
 )
 SELECT id, variant_get(v, '$.b', 'string') FROM source_values WHERE id <= 3 ORDER BY id;
 
--- query 12
+-- query 13
 -- @skip_result_check=true
 -- @explain_contains=variant columns:
 -- @explain_contains=try_variant_get(v, '$.a', 'bigint')
-SELECT id FROM ${case_db}.t_variant_get WHERE try_variant_get(v, '$.a', 'bigint') = 99;
-
--- query 13
-SET disable_optimizer_rules = 'VariantPathPushdown';
+SELECT id FROM iru9_variant_get_${uuid0}.iru9_${uuid0}.t_variant_get WHERE try_variant_get(v, '$.a', 'bigint') = 99;
 
 -- query 14
--- @skip_result_check=true
--- @explain_not_contains=variant columns:
-SELECT id FROM ${case_db}.t_variant_get WHERE try_variant_get(v, '$.a', 'bigint') = 99;
+SET disable_optimizer_rules = 'VariantPathPushdown';
 
 -- query 15
-SET disable_optimizer_rules = '';
+-- @skip_result_check=true
+-- @explain_not_contains=variant columns:
+SELECT id FROM iru9_variant_get_${uuid0}.iru9_${uuid0}.t_variant_get WHERE try_variant_get(v, '$.a', 'bigint') = 99;
 
 -- query 16
+SET disable_optimizer_rules = '';
+
+-- query 17
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_variant_get FORCE;
+DROP TABLE iru9_variant_get_${uuid0}.iru9_${uuid0}.t_variant_get FORCE;
+DROP CATALOG iru9_variant_get_${uuid0};

@@ -104,7 +104,7 @@ CREATE TABLE t (
 
 ### ❌ Variant（写）
 
-见 [variant.md](variant.md)。含 Variant 列的数据写出与 ADD FILES 在 Provider 准入时拒绝；DV DELETE、TRUNCATE 与非 Variant 等值键的 equality delete 保留原有路径。
+见 [variant.md](variant.md)。CREATE / ALTER ADD 在所有 format-version 拒绝任意层级的新 Variant 列，CREATE LIKE / CTAS / MV 目标同样拒绝。含 Variant 列的数据写出与 ADD FILES 在 Provider 准入时拒绝；已有表的普通 metadata 修改、DV DELETE、TRUNCATE 与非 Variant 等值键的 equality delete 保留原有路径。
 
 ### ❌ Geometry / Geography（V3 空间类型）
 

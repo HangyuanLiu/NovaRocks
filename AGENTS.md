@@ -354,6 +354,8 @@ Execution, and do not recreate a Backend facade around it.
   Iceberg 写出类型边界见 [ADR-0178](docs/adr/ADR-0178-iceberg-write-type-boundary-and-variant-layering.md)：
   `commit/write_stack/` 冻结完整目标 schema，`commit/frozen_write.rs` 投影 SDK writer schema，
   `commit/write_adaptation.rs` 适配执行输入；Variant/uuid 数据写出准入与逻辑 Variant 读取分别属于 Provider。
+  CREATE / ALTER ADD 在所有格式版本递归拒绝新 Variant 列；已有表的 DELETE、合法普通键 equality delete、
+  TRUNCATE 与普通 metadata 修改保留原边界。schema ALTER 先在同一代 lease 做 Provider 纯准入，再执行原 MV / DROP 保护。
 
   Iceberg 提交契约见 [ADR-0171](docs/adr/ADR-0171-commit-operation-model.md)。修改前先读：
   - `novarocks/connector/iceberg/src/commit/model/**`：不可变意图、逻辑条目与物理对象身份、继承字段、冻结请求及发布/清理结果。

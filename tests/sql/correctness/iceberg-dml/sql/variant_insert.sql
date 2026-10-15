@@ -19,20 +19,45 @@
 -- Variant writes fail before staging; scalar expressions retain their value domains.
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_v3_variant FORCE;
-CREATE TABLE ${case_db}.t_v3_variant (id INT, v VARIANT)
-TBLPROPERTIES ("format-version" = "3");
+CREATE EXTERNAL CATALOG `iru9_variant_insert_${uuid0}`
+PROPERTIES (
+    "type"="iceberg",
+    "iceberg.catalog.type"="rest",
+    "uri"="${iceberg_rest_uri}",
+    "warehouse"="${iceberg_rest_warehouse}",
+    "credential.object-store-metadata.consumer-role" = "frontend",
+    "credential.object-store-metadata.mode" = "static",
+    "credential.object-store-metadata.name" = "${iceberg_object_store_credential_name}",
+    "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
+    "credential.object-store-data.consumer-role" = "backend",
+    "credential.object-store-data.mode" = "static",
+    "credential.object-store-data.name" = "${iceberg_object_store_credential_name}",
+    "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
+    "aws.s3.endpoint"="${oss_endpoint}",
+    "aws.s3.region"="us-east-1",
+    "aws.s3.enable_path_style_access"="true"
+);
 
 -- query 2
+-- @result_contains=IRU9_EMPTY_INT_OK
+shell: set -eu
+receipt_parent="${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/experiments/iceberg-variant"
+mkdir -p "$receipt_parent"
+receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode empty-int --namespace iru9_${uuid0} --table t_v3_variant --output "$receipt_dir" >"$receipt_dir/run.log"
+cat "$receipt_dir/run.log" >&2
+grep -E '^IRU9_(EMPTY_INT_OK|FIXTURE_COMPLETE)' "$receipt_dir/run.log"
+
+-- query 3
 -- @expect_error_tier=drift
 -- @expect_error=Iceberg Variant writes are not supported
-INSERT INTO ${case_db}.t_v3_variant VALUES
+INSERT INTO iru9_variant_insert_${uuid0}.iru9_${uuid0}.t_v3_variant VALUES
   (1, parse_json('{"a":1,"b":"x"}')),
   (2, parse_json('[10,20,30]')),
   (3, parse_json('null')),
   (4, NULL);
 
--- query 3
+-- query 4
 SELECT variant_typeof(parse_json('{"a":1}')) AS object_kind,
        variant_typeof(parse_json('[10,20,30]')) AS array_kind,
        variant_typeof(parse_json('null')) AS variant_null_kind,
@@ -40,12 +65,13 @@ SELECT variant_typeof(parse_json('{"a":1}')) AS object_kind,
        parse_json('null') IS NULL AS variant_is_sql_null,
        CAST(NULL AS VARIANT) IS NULL AS sql_is_null;
 
--- query 4
+-- query 5
 SELECT get_json_string(parse_json('{"a":1,"b":"x"}'), '$.b') AS b;
 
--- query 5
-SELECT COUNT(*) AS remaining_rows FROM ${case_db}.t_v3_variant;
-
 -- query 6
+SELECT COUNT(*) AS remaining_rows FROM iru9_variant_insert_${uuid0}.iru9_${uuid0}.t_v3_variant;
+
+-- query 7
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_v3_variant FORCE;
+DROP TABLE iru9_variant_insert_${uuid0}.iru9_${uuid0}.t_v3_variant FORCE;
+DROP CATALOG iru9_variant_insert_${uuid0};

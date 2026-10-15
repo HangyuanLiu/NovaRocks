@@ -37,9 +37,10 @@ object VariantFixture {
     spark.sql(s"CREATE NAMESPACE IF NOT EXISTS ice_rest.$ns")
   }
   def load(): Table = Spark3Util.loadIcebergCatalog(spark,"ice_rest").loadTable(TableIdentifier.of(namespace,tableName))
-  def create(schema: Schema): Table = Spark3Util.loadIcebergCatalog(spark,"ice_rest").createTable(
-    TableIdentifier.of(namespace,tableName),schema,PartitionSpec.unpartitioned(),
-    Map("format-version"->"3","write.metadata.metrics.default"->"full").asJava)
+  def create(schema: Schema, spec: PartitionSpec = PartitionSpec.unpartitioned(), properties: Map[String,String] = Map.empty): Table =
+    Spark3Util.loadIcebergCatalog(spark,"ice_rest").createTable(
+      TableIdentifier.of(namespace,tableName),schema,spec,
+      (Map("format-version"->"3","write.metadata.metrics.default"->"full") ++ properties).asJava)
   def row(schema: Schema, values: Seq[Any]): Record = {
     val record = GenericRecord.create(schema)
     values.zipWithIndex.foreach{case (value,index) => record.set(index,value.asInstanceOf[AnyRef])};record
@@ -99,12 +100,29 @@ object VariantFixture {
   }
   def physicalData(t: Table): String = t.io().asInstanceOf[org.apache.iceberg.io.SupportsPrefixOperations]
     .listPrefix(t.location()+"/data/").asScala.map(_.location()).toVector.sorted.mkString("|")
+  def snapshot(t: Table): String = Option(t.currentSnapshot()).map(_.snapshotId().toString).getOrElse("absent")
   def remember(t: Table): Unit = {
-    t.updateProperties().set("iru9.fixture.snapshot",t.currentSnapshot().snapshotId().toString)
+    t.updateProperties().set("iru9.fixture.snapshot",snapshot(t))
       .set("iru9.fixture.data-files",physicalData(t)).commit()
   }
+  // These targets replace NovaRocks-authored empty tables. Appending even an
+  // empty file would change their missing-statistics and no-snapshot behavior.
+  def empty(schema: Schema, spec: PartitionSpec = PartitionSpec.unpartitioned(), properties: Map[String,String] = Map.empty): Unit = {
+    val t=create(schema,spec,properties)
+    t.refresh()
+    require(t.schema().asStruct() == schema.asStruct(),"empty fixture changed field IDs, types or nullability")
+    def fields(s: PartitionSpec) = s.fields().asScala.map(f => (f.sourceId(),f.name(),f.transform().toString)).toVector
+    require(fields(t.spec()) == fields(spec),"empty fixture changed partition fields")
+    properties.foreach { case (key,value) => require(t.properties().get(key) == value,"empty fixture lost property "+key) }
+    require(t.currentSnapshot() == null && !t.snapshots().iterator().hasNext(),"empty fixture must have no snapshot")
+    require(physicalData(t).isEmpty,"empty fixture must have no physical data files")
+    remember(t)
+    val persisted=load()
+    require(persisted.asInstanceOf[HasTableOperations].operations().current().formatVersion() == 3,"empty fixture must retain format-version 3")
+    require(persisted.currentSnapshot() == null && !persisted.snapshots().iterator().hasNext(),"remembering an empty fixture created a snapshot")
+  }
   def unchanged(): Unit = {
-    val t=load();require(t.currentSnapshot().snapshotId().toString == t.properties().get("iru9.fixture.snapshot"),"rejected write changed snapshot")
+    val t=load();require(snapshot(t) == t.properties().get("iru9.fixture.snapshot"),"rejected write changed snapshot")
     require(physicalData(t)==t.properties().get("iru9.fixture.data-files"),"rejected write created physical data files")
     println("IRU9_UNCHANGED_OK")
   }

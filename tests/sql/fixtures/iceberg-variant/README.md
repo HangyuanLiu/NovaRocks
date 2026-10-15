@@ -16,7 +16,10 @@ the Variant physical-type specification, not from NovaRocks output.
 
 The Iceberg connector owns this fixture and its maintenance. Consumers are the
 `java_variant_*`, `java_uuid_write_rejected`, and
-`java_timestamptz_write_adaptation` cases in `iceberg-compatibility`.
+`java_timestamptz_write_adaptation` cases in `iceberg-compatibility`, the three
+`iceberg-dml/variant_*` cases, and `optimizer/variant_path_pushdown`. Run the
+affected native cases when changing the corresponding fixture mode; the full
+independent type matrix is a separate validation boundary described below.
 
 ```bash
 # Resolve the generated immutable fixture publication once before invoking consumers.
@@ -36,6 +39,39 @@ create one new table. `observe` prints sorted IDs through `IcebergGenerics`.
 mode supplies an explicit `VariantShreddingFunction`; its manifest omits Variant
 bounds. The bounds mode retains and asserts real Java writer Variant bounds,
 so the NovaRocks hint test cannot pass accidentally on a bounds-free file.
+
+The three empty modes replace the former NovaRocks Variant CREATE setup, which
+is now unsupported even for format-v3 tables:
+
+| Mode | Exact input schema and properties | Consumers |
+|---|---|---|
+| `empty-int` | optional `id: int`, optional `v: variant`; unpartitioned | `variant_get`, `variant_insert`, `variant_path_pushdown` |
+| `empty-bigint` | optional `id: long`, optional `v: variant`; unpartitioned, `write.row-lineage=true` | `variant_mutations` |
+| `empty-region` | optional `id: long`, optional `region: string`, optional `v: variant`; `identity(region)` partition | `variant_mutations` |
+
+Java creates these tables without any append, including an empty-file append.
+The fixture checks the published schema's field IDs/types/nullability, partition
+fields, explicit properties, format version, empty physical `data/` listing, and
+absence of both a current snapshot and snapshot history. Saving the no-change
+receipt changes only properties and is checked again to preserve no snapshot.
+The fixed shell result markers report these asserted facts; they are not derived
+from NovaRocks output. This preserves the original missing-statistics EXPLAIN
+oracle and the existing empty-snapshot DML boundary rather than seeding data to
+make them pass. `unchanged` also understands the explicit `absent` snapshot fact.
+
+Each migrated case creates its own explicit REST catalog alias with the same
+generated endpoint, warehouse and credential binding as this Java fixture. The
+suite's shared init and ordinary Hadoop catalog remain unchanged; in particular,
+`variant_mutations` keeps its ordinary MERGE source in the original catalog and
+uses full REST names only for its Java-authored Variant targets.
+
+The optimizer case retains its deterministic `${case_db}` namespace and original
+table name so every cell of the full EXPLAIN golden remains meaningful. Its REST
+alias is unique, and the case owns that namespace/table at the original case
+isolation granularity under the global SQL-runner mutex. Java creation fails if
+a previous failed table still exists: there is no reuse, drop-existing fallback,
+or golden normalization. Resolve and retain that failed attempt before explicitly
+cleaning its owned table and rerunning. Other migrated cases use fresh UUID names.
 
 Each run requires a fresh output directory. SQL consumers allocate it under the
 existing XDG state experiment root; `IRU9_ARTIFACT_DIR` in the native shell output

@@ -384,21 +384,12 @@ fn execute_alter_iceberg_schema(
         current_catalog,
         current_database,
     )?;
-    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
-        executor.connector_control.as_ref(),
-        executor.mv_storage_observation.as_ref(),
-        &target,
-        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::AlterTable,
-    )?;
-    if let crate::catalog_application::statement::IcebergSchemaChange::DropColumn { path } =
-        &statement.change
-    {
-        crate::mv::domain::iceberg_guard::reject_drop_column_mv_dependencies_with_readiness(
-            executor.mv_readiness.as_ref(),
-            &target,
-            path,
-        )?;
-    }
+    let dropped_path = match &statement.change {
+        crate::catalog_application::statement::IcebergSchemaChange::DropColumn { path } => {
+            Some(path.clone())
+        }
+        _ => None,
+    };
     let instance_id =
         ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
     let change = match statement.change {
@@ -472,7 +463,7 @@ fn execute_alter_iceberg_schema(
             comment: Arc::from(comment),
         },
     };
-    crate::connector::mutation::execute_catalog_mutation(
+    execute_admitted_alter_schema(
         executor.connector_control.as_ref(),
         &instance_id,
         novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterSchema {
@@ -484,9 +475,55 @@ fn execute_alter_iceberg_schema(
             changes: vec![change],
         },
         connector_context.clone(),
+        |planning| {
+            crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context(
+                executor.mv_storage_observation.as_ref(),
+                planning,
+                &target,
+                crate::mv::domain::iceberg_guard::IcebergMvUserMutation::AlterTable,
+                connector_context.clone(),
+            )?;
+            if let Some(path) = &dropped_path {
+                crate::mv::domain::iceberg_guard::reject_drop_column_mv_dependencies_with_readiness(
+                    executor.mv_readiness.as_ref(),
+                    &target,
+                    path,
+                )?;
+            }
+            Ok(())
+        },
     )?;
     crate::catalog_application::resolver::invalidate_iceberg_caches(executor, &target)?;
     Ok(StatementResult::Ok)
+}
+
+/// Admit the complete schema mutation before any metadata-dependent guard.
+/// Both guards and publication retain the same control generation even if the
+/// catalog's current generation changes while the statement is in progress.
+fn execute_admitted_alter_schema(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    instance_id: &ConnectorInstanceId,
+    operation: novarocks_spi::connector::ConnectorCatalogMutationOperation,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    guard: impl FnOnce(&novarocks_spi::connector::ConnectorControlPlanningLease) -> Result<(), String>,
+) -> Result<crate::connector::mutation::CompletedCatalogMutation, String> {
+    let planning = controls
+        .acquire_current(instance_id)
+        .map_err(|error| error.to_string())?;
+    let mutation = planning
+        .derive_mutation_lease()
+        .map_err(|error| error.to_string())?;
+    let operation_id = novarocks_spi::connector::ConnectorMutationOperationId::new();
+    mutation
+        .admit_operation(operation_id, operation.clone(), context.clone())
+        .map_err(|error| error.to_string())?;
+    guard(&planning)?;
+    crate::connector::mutation::execute_catalog_mutation_with_lease(
+        &mutation,
+        operation_id,
+        operation,
+        context,
+    )
 }
 
 fn execute_alter_partition_spec(
@@ -674,6 +711,385 @@ mod tests {
     use novarocks_parser::ast::Statement;
 
     use super::{CatalogCommandExecutor, lower_semantic_create_catalog};
+
+    use bytes::Bytes;
+    use novarocks_spi::connector as spi;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    // These correctness tests exercise the FE sequencing boundary through real
+    // SPI leases. Metadata and mutation calls record their own observations;
+    // the guard is a metadata consumer, without duplicating MV policy here.
+    struct SchemaAlterGeneration {
+        descriptor: spi::ConnectorInstanceDescriptor,
+        marker: u8,
+        calls: Arc<Mutex<Vec<(u8, &'static str)>>>,
+        operation_ids: Mutex<Vec<spi::ConnectorMutationOperationId>>,
+        admission_error: Option<spi::ConnectorErrorKind>,
+        guard_error: bool,
+    }
+
+    impl spi::ConnectorMetadata for SchemaAlterGeneration {
+        fn instance_id(&self) -> &spi::ConnectorInstanceId {
+            &self.descriptor.instance_id
+        }
+        fn namespace_exists(
+            &self,
+            _: spi::ConnectorNamespaceRequest,
+        ) -> Result<bool, spi::ConnectorError> {
+            panic!("unexpected namespace read")
+        }
+        fn table_exists(
+            &self,
+            request: spi::ConnectorTableRequest,
+        ) -> Result<bool, spi::ConnectorError> {
+            assert_eq!(request.table.instance_id, self.descriptor.instance_id);
+            self.calls
+                .lock()
+                .unwrap()
+                .push((self.marker, "metadata guard"));
+            if self.guard_error {
+                Err(spi::ConnectorError::new(
+                    spi::ConnectorErrorKind::PermissionDenied,
+                    "metadata guard refused",
+                ))
+            } else {
+                Ok(true)
+            }
+        }
+        fn list_tables(
+            &self,
+            _: spi::ConnectorListTablesRequest,
+        ) -> Result<Vec<spi::ConnectorTableIdentity>, spi::ConnectorError> {
+            panic!("unexpected table listing")
+        }
+        fn load_table(
+            &self,
+            _: spi::ConnectorTableRequest,
+            _: &mut spi::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            spi::ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<spi::ConnectorError>,
+        > {
+            panic!("unexpected table load")
+        }
+    }
+    impl spi::ConnectorScanPlanning for SchemaAlterGeneration {
+        fn instance_id(&self) -> &spi::ConnectorInstanceId {
+            &self.descriptor.instance_id
+        }
+        fn begin_scan(
+            &self,
+            _: &spi::ConnectorTableHandle,
+            _: spi::ConnectorBeginScanRequest,
+        ) -> Result<spi::ConnectorScan, spi::ConnectorError> {
+            panic!("unexpected scan")
+        }
+        fn plan_splits(
+            &self,
+            _: &spi::ConnectorScanHandle,
+            _: spi::ConnectorSplitPlanningRequest,
+        ) -> Result<spi::ConnectorSplitPlanningResult, spi::ConnectorError> {
+            panic!("unexpected split planning")
+        }
+    }
+    impl spi::ConnectorExecutionDistribution for SchemaAlterGeneration {
+        fn declaration(
+            &self,
+            _: &spi::ConnectorRequestContext,
+        ) -> Result<spi::ConnectorProviderBinding, spi::ConnectorError> {
+            panic!("unexpected distribution")
+        }
+    }
+    impl spi::ConnectorCatalogMutation for SchemaAlterGeneration {
+        fn descriptor(&self) -> &spi::ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+        fn incarnation(&self) -> spi::ProviderBindingEpoch {
+            spi::ProviderBindingEpoch::from_bytes([self.marker; 16])
+        }
+        fn admit(
+            &self,
+            request: &spi::ConnectorCatalogMutationRequest,
+        ) -> Result<(), spi::ConnectorError> {
+            self.calls.lock().unwrap().push((self.marker, "admit"));
+            self.operation_ids
+                .lock()
+                .unwrap()
+                .push(request.operation_id);
+            assert_eq!(request.target.incarnation, self.incarnation());
+            assert!(matches!(
+                request.operation,
+                spi::ConnectorCatalogMutationOperation::AlterSchema { .. }
+            ));
+            match self.admission_error {
+                Some(kind) => Err(spi::ConnectorError::new(
+                    kind,
+                    "original provider admission",
+                )),
+                None => Ok(()),
+            }
+        }
+        fn execute(
+            &self,
+            request: spi::ConnectorCatalogMutationRequest,
+        ) -> Result<
+            spi::ExternalMutationOutcome<spi::ConnectorCatalogMutationReceipt>,
+            spi::ConnectorError,
+        > {
+            self.calls.lock().unwrap().push((self.marker, "execute"));
+            self.operation_ids
+                .lock()
+                .unwrap()
+                .push(request.operation_id);
+            assert_eq!(request.target.incarnation, self.incarnation());
+            Ok(spi::ExternalMutationOutcome::CommitUnknown {
+                failure: spi::ConnectorMutationFailure::new(
+                    spi::ConnectorMutationFailureKind::Unavailable,
+                    "response lost",
+                ),
+                evidence: spi::ExternalMutationEvidence::try_new(
+                    1,
+                    self.descriptor.clone(),
+                    self.incarnation(),
+                    request.operation_id,
+                    request.operation.kind(),
+                    Bytes::from_static(b"schema-alter"),
+                )?,
+            })
+        }
+        fn reconcile(
+            &self,
+            request: spi::ConnectorCatalogMutationReconcileRequest,
+        ) -> Result<
+            spi::ExternalMutationOutcome<spi::ConnectorCatalogMutationReceipt>,
+            spi::ConnectorError,
+        > {
+            self.calls.lock().unwrap().push((self.marker, "reconcile"));
+            self.operation_ids
+                .lock()
+                .unwrap()
+                .push(request.evidence.operation_id());
+            Ok(spi::ExternalMutationOutcome::KnownCommitted {
+                effect: spi::ExternalMutationEffect::Applied,
+                receipt: spi::ConnectorCatalogMutationReceipt::try_new(
+                    self.descriptor.clone(),
+                    self.incarnation(),
+                    request.evidence.operation_id(),
+                    request.evidence.operation_kind(),
+                    None,
+                )?,
+                finalization: spi::ExternalMutationFinalization::Complete,
+            })
+        }
+    }
+
+    struct SwitchingSchemaAlterResolver {
+        bindings: Vec<Arc<spi::ConnectorControlBinding>>,
+        acquired: AtomicUsize,
+    }
+    impl spi::ConnectorControlResolver for SwitchingSchemaAlterResolver {
+        fn observe_current_binding(
+            &self,
+            _: &spi::ConnectorInstanceId,
+        ) -> Result<spi::ConnectorProviderBindingKey, spi::ConnectorError> {
+            panic!("must retain a planning lease")
+        }
+        fn observe_current_control_runtime(
+            &self,
+            _: &spi::ConnectorInstanceId,
+        ) -> Result<spi::ConnectorControlRuntimeId, spi::ConnectorError> {
+            panic!("must retain a planning lease")
+        }
+        fn acquire_current(
+            &self,
+            _: &spi::ConnectorInstanceId,
+        ) -> Result<spi::ConnectorControlPlanningLease, spi::ConnectorError> {
+            let index = self.acquired.fetch_add(1, Ordering::AcqRel);
+            Ok(spi::ConnectorControlPlanningLease::new(
+                self.bindings[index.min(1)].clone(),
+                || {},
+            ))
+        }
+    }
+
+    fn schema_alter_fixture(
+        admission_error: Option<spi::ConnectorErrorKind>,
+        guard_error: bool,
+    ) -> (
+        SwitchingSchemaAlterResolver,
+        Arc<SchemaAlterGeneration>,
+        spi::ConnectorCatalogMutationOperation,
+        spi::ConnectorRequestContext,
+    ) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut bindings = Vec::new();
+        let mut first = None;
+        for marker in [1, 2] {
+            let capability = Arc::new(SchemaAlterGeneration {
+                descriptor: spi::ConnectorInstanceDescriptor {
+                    provider_id: spi::ConnectorProviderId::parse("iceberg").unwrap(),
+                    instance_id: spi::ConnectorInstanceId::parse("catalog").unwrap(),
+                },
+                marker,
+                calls: calls.clone(),
+                operation_ids: Mutex::new(Vec::new()),
+                admission_error,
+                guard_error,
+            });
+            bindings.push(Arc::new(
+                spi::ConnectorControlBinding::try_new(
+                    capability.descriptor.clone(),
+                    spi::ProviderBindingEpoch::from_bytes([marker; 16]),
+                    capability.clone(),
+                    capability.clone(),
+                    capability.clone(),
+                    Some(capability.clone()),
+                )
+                .unwrap(),
+            ));
+            if marker == 1 {
+                first = Some(capability);
+            }
+        }
+        let operation = spi::ConnectorCatalogMutationOperation::AlterSchema {
+            table: spi::ConnectorTableIdentity {
+                instance_id: spi::ConnectorInstanceId::parse("catalog").unwrap(),
+                namespace: "db".into(),
+                table: "t".into(),
+            },
+            changes: vec![spi::ConnectorSchemaChange::AddColumn {
+                parent: spi::ConnectorColumnPath {
+                    segments: Vec::new(),
+                },
+                column: spi::ConnectorColumnDefinition {
+                    name: "payload".into(),
+                    data_type: spi::ConnectorDataType::Variant,
+                    nullable: true,
+                    aggregation: None,
+                    default: None,
+                },
+                position: spi::ConnectorColumnPosition::Default,
+            }],
+        };
+        let context = crate::connector::connector_request_context(
+            None,
+            spi::ConnectorStopOwner::new().view(),
+        )
+        .unwrap();
+        (
+            SwitchingSchemaAlterResolver {
+                bindings,
+                acquired: AtomicUsize::new(0),
+            },
+            first.unwrap(),
+            operation,
+            context,
+        )
+    }
+
+    fn schema_alter_metadata_guard(
+        planning: &spi::ConnectorControlPlanningLease,
+        operation: &spi::ConnectorCatalogMutationOperation,
+        context: &spi::ConnectorRequestContext,
+    ) -> Result<(), String> {
+        let spi::ConnectorCatalogMutationOperation::AlterSchema { table, .. } = operation else {
+            panic!("expected schema mutation")
+        };
+        planning
+            .binding()
+            .metadata()
+            .table_exists(spi::ConnectorTableRequest {
+                table: table.clone(),
+                resolution: spi::ConnectorTableResolution::StrictBaseTable,
+                context: context.clone(),
+            })
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn schema_alter_admission_refusal_precedes_metadata_guards_and_dispatch() {
+        for kind in [
+            spi::ConnectorErrorKind::Unsupported,
+            spi::ConnectorErrorKind::Cancelled,
+            spi::ConnectorErrorKind::DeadlineExceeded,
+            spi::ConnectorErrorKind::ResourceExhausted,
+            spi::ConnectorErrorKind::InvalidRequest,
+        ] {
+            let (controls, capability, operation, context) =
+                schema_alter_fixture(Some(kind), false);
+            let error = super::execute_admitted_alter_schema(
+                &controls,
+                &capability.descriptor.instance_id,
+                operation.clone(),
+                context.clone(),
+                |planning| schema_alter_metadata_guard(planning, &operation, &context),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                spi::ConnectorError::new(kind, "original provider admission").to_string()
+            );
+            assert_eq!(controls.acquired.load(Ordering::Acquire), 1);
+            assert_eq!(*capability.calls.lock().unwrap(), [(1, "admit")]);
+            assert_eq!(capability.operation_ids.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn schema_alter_retains_one_generation_and_operation_through_guard_and_reconcile() {
+        let (controls, capability, operation, context) = schema_alter_fixture(None, false);
+        let result = super::execute_admitted_alter_schema(
+            &controls,
+            &capability.descriptor.instance_id,
+            operation.clone(),
+            context.clone(),
+            |planning| schema_alter_metadata_guard(planning, &operation, &context),
+        )
+        .unwrap();
+        assert_eq!(result.effect, spi::ExternalMutationEffect::Applied);
+        assert_eq!(controls.acquired.load(Ordering::Acquire), 1);
+        assert_eq!(
+            *capability.calls.lock().unwrap(),
+            [
+                (1, "admit"),
+                (1, "metadata guard"),
+                (1, "execute"),
+                (1, "reconcile")
+            ]
+        );
+        let ids = capability.operation_ids.lock().unwrap();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|id| *id == result.receipt.operation_id()));
+    }
+
+    #[test]
+    fn schema_alter_metadata_guard_refusal_prevents_execution() {
+        let (controls, capability, operation, context) = schema_alter_fixture(None, true);
+        let error = super::execute_admitted_alter_schema(
+            &controls,
+            &capability.descriptor.instance_id,
+            operation.clone(),
+            context.clone(),
+            |planning| schema_alter_metadata_guard(planning, &operation, &context),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            spi::ConnectorError::new(
+                spi::ConnectorErrorKind::PermissionDenied,
+                "metadata guard refused"
+            )
+            .to_string()
+        );
+        assert_eq!(controls.acquired.load(Ordering::Acquire), 1);
+        assert_eq!(
+            *capability.calls.lock().unwrap(),
+            [(1, "admit"), (1, "metadata guard")]
+        );
+        assert_eq!(capability.operation_ids.lock().unwrap().len(), 1);
+    }
 
     #[test]
     fn create_like_columns_preserve_variant_binary_and_nested_declarations() {

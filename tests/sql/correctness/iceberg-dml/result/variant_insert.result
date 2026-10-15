@@ -1,11 +1,16 @@
--- query 3
+-- query 2
+0
+IRU9_EMPTY_INT_OK rows=0 snapshot=absent id=optional-int v=optional-variant
+IRU9_FIXTURE_COMPLETE
+
+-- query 4
 object_kind	array_kind	variant_null_kind	sql_null_kind	variant_is_sql_null	sql_is_null
 Object	Array	Null	NULL	0	1
 
--- query 4
+-- query 5
 b
 x
 
--- query 5
+-- query 6
 remaining_rows
 0

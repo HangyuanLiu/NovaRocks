@@ -25,39 +25,6 @@ use crate::iceberg::spec::{
     ListType, Literal, MapType, NestedField, PrimitiveLiteral, PrimitiveType, StructType, Type,
 };
 
-/// Check only the new definition, so unrelated changes on externally authored
-/// tables do not accidentally reject existing nested Variant fields.
-pub(crate) fn validate_variant_definition(
-    data_type: &ConnectorDataType,
-    path: &str,
-    nested: bool,
-) -> Result<bool, String> {
-    match data_type {
-        ConnectorDataType::Variant if nested => Err(format!(
-            "Iceberg Variant cannot be nested inside STRUCT, LIST or MAP: column {path}"
-        )),
-        ConnectorDataType::Variant => Ok(true),
-        ConnectorDataType::Array(element) => {
-            validate_variant_definition(element, &format!("{path}.element"), true)
-        }
-        ConnectorDataType::Map(key, value) => {
-            validate_variant_definition(key, &format!("{path}.key"), true)?;
-            validate_variant_definition(value, &format!("{path}.value"), true)
-        }
-        ConnectorDataType::Struct(fields) => {
-            for field in fields {
-                validate_variant_definition(
-                    &field.data_type,
-                    &format!("{path}.{}", field.name),
-                    true,
-                )?;
-            }
-            Ok(false)
-        }
-        _ => Ok(false),
-    }
-}
-
 pub(crate) fn schema_fields(
     columns: &[ConnectorColumnDefinition],
 ) -> Result<Vec<Arc<NestedField>>, String> {
