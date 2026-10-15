@@ -22,6 +22,9 @@
 //! Arrow arrays and cannot make a fragment-local row or scan decision.
 // Design: ADR-0043 (docs/adr/ADR-0043-runtime-filter-artifact-query-and-evaluator-boundary.md)
 
+mod controlled;
+pub(crate) use controlled::{ControlledRowOutcome, evaluate_rows_controlled};
+
 use arrow::array::{Array, ArrayData, ArrayRef, BooleanArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_spi::connector::ConnectorScalarValue;
@@ -180,19 +183,33 @@ impl RuntimeFilterRowOutcome {
     /// fail-open outcome cannot fabricate profile deltas for a version it did
     /// not evaluate.
     pub fn effect(&self) -> Option<RuntimeFilterRowEffect> {
+        match self.effect_observed(|| Ok::<(), std::convert::Infallible>(())) {
+            Ok(effect) => effect,
+            Err(impossible) => match impossible {},
+        }
+    }
+    fn effect_observed<E>(
+        &self,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<Option<RuntimeFilterRowEffect>, E> {
         let RuntimeFilterRowEvaluation::Evaluated {
             mask,
             logical_version,
         } = &self.evaluation
         else {
-            return None;
+            return Ok(None);
         };
-        Some(RuntimeFilterRowEffect {
+        let mut output_rows = 0;
+        for matched in mask.values().iter() {
+            observe()?;
+            output_rows += u64::from(matched);
+        }
+        Ok(Some(RuntimeFilterRowEffect {
             binding_id: self.binding_id,
             logical_version: *logical_version,
             input_rows: mask.len() as u64,
-            output_rows: mask.values().iter().filter(|matched| *matched).count() as u64,
-        })
+            output_rows,
+        }))
     }
 }
 
@@ -235,100 +252,245 @@ pub fn evaluate_rows(
     artifact: &dyn RuntimeFilterArtifactQuery,
     input: &ArrayRef,
 ) -> Result<RuntimeFilterRowOutcome, RuntimeFilterContractViolation> {
+    evaluate_rows_with(
+        &mut LegacyRowQueryPolicy,
+        binding_id,
+        logical_version,
+        artifact,
+        input,
+    )
+}
+
+// The inner verdict is the original advisory artifact result; the outer
+// error is the policy's fatal cause. Neither shell parses error messages.
+trait RowQueryPolicy {
+    type Error: From<RuntimeFilterContractViolation>;
+    fn before_row(&mut self) -> Result<(), Self::Error>;
+    fn matches_null(
+        &mut self,
+        artifact: &dyn RuntimeFilterArtifactQuery,
+    ) -> Result<Result<bool, RuntimeFilterArtifactQueryError>, Self::Error>;
+    fn non_null_value_may_match(
+        &mut self,
+        artifact: &dyn RuntimeFilterArtifactQuery,
+        value: RuntimeFilterScalarRef<'_>,
+    ) -> Result<Result<bool, RuntimeFilterArtifactQueryError>, Self::Error>;
+}
+struct LegacyRowQueryPolicy;
+impl RowQueryPolicy for LegacyRowQueryPolicy {
+    type Error = RuntimeFilterContractViolation;
+    fn before_row(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn matches_null(
+        &mut self,
+        artifact: &dyn RuntimeFilterArtifactQuery,
+    ) -> Result<Result<bool, RuntimeFilterArtifactQueryError>, Self::Error> {
+        Ok(artifact.matches_null())
+    }
+    fn non_null_value_may_match(
+        &mut self,
+        artifact: &dyn RuntimeFilterArtifactQuery,
+        value: RuntimeFilterScalarRef<'_>,
+    ) -> Result<Result<bool, RuntimeFilterArtifactQueryError>, Self::Error> {
+        Ok(artifact.non_null_value_may_match(value))
+    }
+}
+
+fn evaluate_rows_with<P: RowQueryPolicy>(
+    policy: &mut P,
+    binding_id: RuntimeFilterBindingId,
+    logical_version: LogicalVersion,
+    artifact: &dyn RuntimeFilterArtifactQuery,
+    input: &ArrayRef,
+) -> Result<RuntimeFilterRowOutcome, P::Error> {
     if input.data_type() != artifact.data_type() {
         return Err(violation(
             "runtime-filter row input type differs from the immutable artifact type",
-        ));
+        )
+        .into());
     }
 
     let data = input.to_data();
     let evaluation = match input.data_type() {
-        DataType::Boolean => evaluate_data(artifact, input, &data, logical_version, |data, row| {
-            Ok(RuntimeFilterScalarRef::Boolean(boolean_value(data, row)?))
-        }),
-        DataType::Int8 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
-            Ok(RuntimeFilterScalarRef::Int8(i8::from_ne_bytes(
-                fixed_value::<1>(data, row)?,
-            )))
-        }),
-        DataType::Int16 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
-            Ok(RuntimeFilterScalarRef::Int16(i16::from_ne_bytes(
-                fixed_value::<2>(data, row)?,
-            )))
-        }),
-        DataType::Int32 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
-            Ok(RuntimeFilterScalarRef::Int32(i32::from_ne_bytes(
-                fixed_value::<4>(data, row)?,
-            )))
-        }),
-        DataType::Int64 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
-            Ok(RuntimeFilterScalarRef::Int64(i64::from_ne_bytes(
-                fixed_value::<8>(data, row)?,
-            )))
-        }),
+        DataType::Boolean => evaluate_data(
+            policy,
+            artifact,
+            input,
+            &data,
+            logical_version,
+            |data, row| Ok(RuntimeFilterScalarRef::Boolean(boolean_value(data, row)?)),
+        ),
+        DataType::Int8 => evaluate_data(
+            policy,
+            artifact,
+            input,
+            &data,
+            logical_version,
+            |data, row| {
+                Ok(RuntimeFilterScalarRef::Int8(i8::from_ne_bytes(
+                    fixed_value::<1>(data, row)?,
+                )))
+            },
+        ),
+        DataType::Int16 => evaluate_data(
+            policy,
+            artifact,
+            input,
+            &data,
+            logical_version,
+            |data, row| {
+                Ok(RuntimeFilterScalarRef::Int16(i16::from_ne_bytes(
+                    fixed_value::<2>(data, row)?,
+                )))
+            },
+        ),
+        DataType::Int32 => evaluate_data(
+            policy,
+            artifact,
+            input,
+            &data,
+            logical_version,
+            |data, row| {
+                Ok(RuntimeFilterScalarRef::Int32(i32::from_ne_bytes(
+                    fixed_value::<4>(data, row)?,
+                )))
+            },
+        ),
+        DataType::Int64 => evaluate_data(
+            policy,
+            artifact,
+            input,
+            &data,
+            logical_version,
+            |data, row| {
+                Ok(RuntimeFilterScalarRef::Int64(i64::from_ne_bytes(
+                    fixed_value::<8>(data, row)?,
+                )))
+            },
+        ),
         DataType::FixedSizeBinary(width)
             if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
         {
-            evaluate_data(artifact, input, &data, logical_version, |data, row| {
-                let value =
-                    novarocks_types::largeint::i128_from_be_bytes(&fixed_value::<16>(data, row)?)
-                        .map_err(|_| violation("invalid FixedSizeBinary(16) LargeInt value"))?;
-                Ok(RuntimeFilterScalarRef::LargeInt(value))
-            })
+            evaluate_data(
+                policy,
+                artifact,
+                input,
+                &data,
+                logical_version,
+                |data, row| {
+                    let value = novarocks_types::largeint::i128_from_be_bytes(&fixed_value::<16>(
+                        data, row,
+                    )?)
+                    .map_err(|_| violation("invalid FixedSizeBinary(16) LargeInt value"))?;
+                    Ok(RuntimeFilterScalarRef::LargeInt(value))
+                },
+            )
         }
-        DataType::Float32 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
-            Ok(RuntimeFilterScalarRef::Float32(f32::from_ne_bytes(
-                fixed_value::<4>(data, row)?,
-            )))
-        }),
-        DataType::Float64 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
-            Ok(RuntimeFilterScalarRef::Float64(f64::from_ne_bytes(
-                fixed_value::<8>(data, row)?,
-            )))
-        }),
-        DataType::Utf8 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
-            Ok(RuntimeFilterScalarRef::Utf8(utf8_value(data, row)?))
-        }),
-        DataType::Date32 => evaluate_data(artifact, input, &data, logical_version, |data, row| {
-            Ok(RuntimeFilterScalarRef::Date32(i32::from_ne_bytes(
-                fixed_value::<4>(data, row)?,
-            )))
-        }),
-        DataType::Timestamp(TimeUnit::Second, _) => {
-            evaluate_data(artifact, input, &data, logical_version, |data, row| {
+        DataType::Float32 => evaluate_data(
+            policy,
+            artifact,
+            input,
+            &data,
+            logical_version,
+            |data, row| {
+                Ok(RuntimeFilterScalarRef::Float32(f32::from_ne_bytes(
+                    fixed_value::<4>(data, row)?,
+                )))
+            },
+        ),
+        DataType::Float64 => evaluate_data(
+            policy,
+            artifact,
+            input,
+            &data,
+            logical_version,
+            |data, row| {
+                Ok(RuntimeFilterScalarRef::Float64(f64::from_ne_bytes(
+                    fixed_value::<8>(data, row)?,
+                )))
+            },
+        ),
+        DataType::Utf8 => evaluate_data(
+            policy,
+            artifact,
+            input,
+            &data,
+            logical_version,
+            |data, row| Ok(RuntimeFilterScalarRef::Utf8(utf8_value(data, row)?)),
+        ),
+        DataType::Date32 => evaluate_data(
+            policy,
+            artifact,
+            input,
+            &data,
+            logical_version,
+            |data, row| {
+                Ok(RuntimeFilterScalarRef::Date32(i32::from_ne_bytes(
+                    fixed_value::<4>(data, row)?,
+                )))
+            },
+        ),
+        DataType::Timestamp(TimeUnit::Second, _) => evaluate_data(
+            policy,
+            artifact,
+            input,
+            &data,
+            logical_version,
+            |data, row| {
                 Ok(RuntimeFilterScalarRef::TimestampSecond(i64::from_ne_bytes(
                     fixed_value::<8>(data, row)?,
                 )))
-            })
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            evaluate_data(artifact, input, &data, logical_version, |data, row| {
+            },
+        ),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => evaluate_data(
+            policy,
+            artifact,
+            input,
+            &data,
+            logical_version,
+            |data, row| {
                 Ok(RuntimeFilterScalarRef::TimestampMillisecond(
                     i64::from_ne_bytes(fixed_value::<8>(data, row)?),
                 ))
-            })
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            evaluate_data(artifact, input, &data, logical_version, |data, row| {
+            },
+        ),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => evaluate_data(
+            policy,
+            artifact,
+            input,
+            &data,
+            logical_version,
+            |data, row| {
                 Ok(RuntimeFilterScalarRef::TimestampMicrosecond(
                     i64::from_ne_bytes(fixed_value::<8>(data, row)?),
                 ))
-            })
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            evaluate_data(artifact, input, &data, logical_version, |data, row| {
+            },
+        ),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => evaluate_data(
+            policy,
+            artifact,
+            input,
+            &data,
+            logical_version,
+            |data, row| {
                 Ok(RuntimeFilterScalarRef::TimestampNanosecond(
                     i64::from_ne_bytes(fixed_value::<8>(data, row)?),
                 ))
-            })
-        }
-        DataType::Decimal128(_, _) => {
-            evaluate_data(artifact, input, &data, logical_version, |data, row| {
+            },
+        ),
+        DataType::Decimal128(_, _) => evaluate_data(
+            policy,
+            artifact,
+            input,
+            &data,
+            logical_version,
+            |data, row| {
                 Ok(RuntimeFilterScalarRef::Decimal128(i128::from_ne_bytes(
                     fixed_value::<16>(data, row)?,
                 )))
-            })
-        }
+            },
+        ),
         _ => Ok(RuntimeFilterRowEvaluation::NotEvaluated {
             reason: RuntimeFilterRowNotEvaluatedReason::DataTypeUnsupported,
             observed_version: logical_version,
@@ -341,7 +503,8 @@ pub fn evaluate_rows(
     })
 }
 
-fn evaluate_data(
+fn evaluate_data<P: RowQueryPolicy>(
+    policy: &mut P,
     artifact: &dyn RuntimeFilterArtifactQuery,
     input: &ArrayRef,
     data: &ArrayData,
@@ -350,11 +513,11 @@ fn evaluate_data(
         &ArrayData,
         usize,
     ) -> Result<RuntimeFilterScalarRef<'_>, RuntimeFilterContractViolation>,
-) -> Result<RuntimeFilterRowEvaluation, RuntimeFilterContractViolation> {
+) -> Result<RuntimeFilterRowEvaluation, P::Error> {
     if data.data_type() != input.data_type() || data.len() != input.len() {
         return Err(violation(
             "runtime-filter Arrow array physical data differs from its declared input type or length",
-        ));
+        ).into());
     }
     let mut mask = Vec::new();
     if mask.try_reserve_exact(data.len()).is_err() {
@@ -364,10 +527,11 @@ fn evaluate_data(
         });
     }
     for index in 0..data.len() {
+        policy.before_row()?;
         let result = if row_is_null(data, index)? {
-            artifact.matches_null()
+            policy.matches_null(artifact)?
         } else {
-            artifact.non_null_value_may_match(scalar(data, index)?)
+            policy.non_null_value_may_match(artifact, scalar(data, index)?)?
         };
         match result {
             Ok(matched) => mask.push(matched),
@@ -386,7 +550,8 @@ fn evaluate_data(
             Err(RuntimeFilterArtifactQueryError::ContractViolation) => {
                 return Err(violation(
                     "runtime-filter artifact query rejected its immutable artifact",
-                ));
+                )
+                .into());
             }
         }
     }

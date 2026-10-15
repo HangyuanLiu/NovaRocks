@@ -2730,6 +2730,14 @@ fn runtime_scalar_memory_actual_scan_driver_bind_funds_original_shift_key() {
             Some(Arc::new(consumers)),
         );
         let mut operator = factory.create(1, 0);
+        // Direct fixtures install the same creator and tracker as the real
+        // pipeline, before asserting the query-memory admission verdict.
+        let tracker = state.mem_tracker().expect("actual Task tracker");
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        operator.set_construction_factory(super::aggregate_fixture::runtime_construction_factory(
+            tracker,
+            state.error_state(),
+        ));
         operator.prepare().unwrap();
         operator.bind_runtime_state(&state).unwrap();
         let result = operator.as_processor_mut().unwrap().pull_chunk(&state);
