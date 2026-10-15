@@ -40,8 +40,8 @@ use novarocks_spi::connector::{
     ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
-use crate::catalog::CatalogTableName;
 use crate::catalog::admission::{CatalogAdmissionRequest, CatalogOperation, connector_unsupported};
+use crate::catalog::{CatalogTableName, SnapshotLoading};
 use crate::commit::snapshot_lifecycle_helpers::expire_snapshots::{
     ExpireParams, run_expire_snapshots_once_with_marker,
 };
@@ -164,7 +164,12 @@ impl IcebergMetadataMaintenanceAdapter {
             .invalidate_table_cache(&namespace, &table_name);
         let loaded = self
             .runtime
-            .load_table_for_request(&namespace, &table_name, &request.context)
+            .observe_table_for_request_with_snapshots(
+                &namespace,
+                &table_name,
+                &request.context,
+                maintenance_snapshot_loading(request.operation().kind()),
+            )
             .map_err(|error| unavailable(format!("load Iceberg table for maintenance: {error}")))?;
         let table = loaded.into_table();
         let metadata = table.metadata();
@@ -277,7 +282,7 @@ impl IcebergMetadataMaintenanceAdapter {
             .invalidate_table_cache(&payload.namespace, &payload.table);
         let loaded = self
             .runtime
-            .load_table_for_request(&payload.namespace, &payload.table, context)
+            .observe_table_for_request(&payload.namespace, &payload.table, context)
             .map_err(|error| {
                 unavailable(format!("load Iceberg table for marker lookup: {error}"))
             })?;
@@ -338,7 +343,12 @@ impl IcebergMetadataMaintenanceAdapter {
         let catalog = self.runtime.novarocks_catalog().vendored_client();
         let loaded = self
             .runtime
-            .load_table_for_request(&payload.namespace, &payload.table, context)
+            .observe_table_for_request_with_snapshots(
+                &payload.namespace,
+                &payload.table,
+                context,
+                maintenance_snapshot_loading(plan.operation_kind()),
+            )
             .map_err(|error| ExecFailure::KnownUncommitted(unavailable(error.to_string())))?;
         validate_frozen_state(&loaded.table, plan, payload)
             .map_err(ExecFailure::KnownUncommitted)?;
@@ -409,7 +419,12 @@ impl IcebergMetadataMaintenanceAdapter {
             .invalidate_table_cache(&payload.namespace, &payload.table);
         let committed = self
             .runtime
-            .load_table_for_request(&payload.namespace, &payload.table, context)
+            .observe_table_for_request_with_snapshots(
+                &payload.namespace,
+                &payload.table,
+                context,
+                maintenance_snapshot_loading(plan.operation_kind()),
+            )
             .map_err(|error| {
                 ExecFailure::Unknown(unavailable(format!(
                     "reload committed Iceberg table: {error}"
@@ -627,6 +642,17 @@ impl IcebergMetadataMaintenanceAdapter {
                 "Iceberg metadata maintenance receipt",
             )?,
         )
+    }
+}
+
+/// Manifest rewriting needs only the current ref's manifests and document
+/// closure. Snapshot expiry and historical marker adjudication still need All;
+/// lookup_marker deliberately keeps its independent full-history observation.
+fn maintenance_snapshot_loading(operation_kind: &str) -> SnapshotLoading {
+    if operation_kind == novarocks_spi::connector::REWRITE_METADATA_LAYOUT_KIND {
+        SnapshotLoading::Refs
+    } else {
+        SnapshotLoading::All
     }
 }
 
@@ -1141,6 +1167,96 @@ mod tests {
             assert_eq!(payload.as_object().expect("receipt object").len(), 2);
             assert!(payload.get("snapshot_id").is_some());
             inventory_without_private_artifacts(&root);
+        }
+    }
+
+    #[test]
+    fn rewrite_plan_and_commit_use_refs_while_expiry_and_marker_adjudication_use_all() {
+        for expire in [false, true] {
+            let (executor, _warehouse, original, key) = adapter();
+            let loads = Arc::new(Mutex::new(Vec::new()));
+            let owner = crate::catalog::admission_test_support::all_admitted_with_snapshot_trace(
+                Arc::clone(original.runtime.novarocks_catalog()),
+                Arc::clone(&loads),
+            );
+            let runtime = Arc::new(IcebergMetadataContext::with_catalog_for_test(
+                original.runtime.control_state().clone(),
+                original.runtime.resources().clone(),
+                owner,
+            ));
+            let adapter = IcebergMetadataMaintenanceAdapter::new(key.clone(), runtime)
+                .expect("traced maintenance adapter");
+            let table = create_local_table(&executor, &adapter);
+            append_local_file(&executor, &adapter, table.identifier(), "first");
+            append_local_file(&executor, &adapter, table.identifier(), "second");
+            // A preceding read in this same request scope may have frozen the
+            // old metadata. Generation-cache invalidation does not clear that
+            // attempt cache; every maintenance effect observation must bypass it.
+            let execution_context = context();
+            let cached_before = adapter
+                .runtime
+                .load_table_for_request("maintenance_test", "t", &execution_context)
+                .expect("cache the pre-maintenance observation");
+            assert_eq!(cached_before.table.metadata().snapshots().count(), 2);
+            let previous_head = cached_before.table.metadata().current_snapshot_id();
+            loads.lock().expect("load trace").clear();
+
+            let expected = if expire {
+                SnapshotLoading::All
+            } else {
+                SnapshotLoading::Refs
+            };
+            let plan = adapter
+                .plan_maintenance(local_planning_request(&key, expire))
+                .expect("maintenance plan");
+            assert_eq!(*loads.lock().expect("plan loads"), vec![expected]);
+            let outcome = adapter
+                .execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, execution_context)
+                        .expect("execute request"),
+                )
+                .expect("maintenance execution");
+            let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome else {
+                panic!("real maintenance must commit")
+            };
+            if expire {
+                assert_eq!(receipt.summary().affected_versions, 1);
+            } else {
+                assert_eq!(receipt.summary().rewritten_items, 2);
+                assert_eq!(receipt.summary().added_items, 1);
+            }
+            assert_eq!(
+                *loads.lock().expect("execution loads"),
+                vec![expected, SnapshotLoading::All, expected, expected],
+                "historical marker adjudication must retain All independently of the current-ref rewrite base",
+            );
+            let catalog = adapter.runtime.novarocks_catalog().vendored_client();
+            let committed = executor
+                .block_on(catalog.load_table(table.identifier()))
+                .expect("independently observe committed metadata");
+            let receipt_payload: IcebergMetadataMaintenanceReceiptV1 =
+                decode_canonical_json(receipt.provider_payload(), "maintenance receipt")
+                    .expect("receipt payload");
+            assert_eq!(
+                receipt_payload.snapshot_id,
+                committed.metadata().current_snapshot_id(),
+                "the receipt must describe the postcommit observation",
+            );
+            if expire {
+                assert_eq!(committed.metadata().snapshots().count(), 1);
+                assert_eq!(committed.metadata().current_snapshot_id(), previous_head);
+            } else {
+                assert_eq!(committed.metadata().snapshots().count(), 3);
+                assert_ne!(committed.metadata().current_snapshot_id(), previous_head);
+                assert_eq!(
+                    committed
+                        .metadata()
+                        .current_snapshot()
+                        .unwrap()
+                        .parent_snapshot_id(),
+                    previous_head,
+                );
+            }
         }
     }
 

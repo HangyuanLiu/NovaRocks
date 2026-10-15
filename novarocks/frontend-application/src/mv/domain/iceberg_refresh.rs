@@ -1833,7 +1833,7 @@ pub fn reobserve_configured_iceberg_mv_with_ports(
         .catalog_handle()
         .map_err(|error| error.to_string())?
         .clone();
-    crate::mv::domain::staged_create::install_configured_current_projection(
+    crate::mv::domain::staged_create::install_admitted_current_projection(
         ports.management_entrance()?.as_ref(),
         ports.readiness().as_ref(),
         ports.connector_control(),

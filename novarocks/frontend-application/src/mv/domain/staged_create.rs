@@ -442,7 +442,7 @@ pub(crate) fn install_created_current_projection(
     operation_id: uuid::Uuid,
     context: ConnectorRequestContext,
 ) -> Result<(), String> {
-    install_committed_current_projection(
+    install_current_projection(
         entrance,
         readiness,
         connector_control,
@@ -468,7 +468,7 @@ pub(crate) fn install_configured_current_projection(
     operation_id: uuid::Uuid,
     context: ConnectorRequestContext,
 ) -> Result<(), String> {
-    install_committed_current_projection(
+    install_current_projection(
         entrance,
         readiness,
         connector_control,
@@ -479,6 +479,31 @@ pub(crate) fn install_configured_current_projection(
         MvConvergence::CommittedEffect,
         context,
         "configured",
+    )
+}
+
+/// Refresh an already admitted target from a fresh provider observation.
+/// This does not claim a local committed effect or reopen a closed entrance.
+pub(crate) fn install_admitted_current_projection(
+    entrance: &ManagementEntrance,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    catalog: CatalogHandle,
+    target: novarocks_mv_application::product::MvTarget,
+    operation_id: uuid::Uuid,
+    context: ConnectorRequestContext,
+) -> Result<(), String> {
+    install_current_projection(
+        entrance,
+        readiness,
+        connector_control,
+        catalog,
+        target,
+        operation_id,
+        None,
+        MvConvergence::AdmittedCurrent,
+        context,
+        "observed",
     )
 }
 
@@ -497,7 +522,7 @@ pub(crate) fn install_published_current_projection(
     published: PublishedOutput,
     context: ConnectorRequestContext,
 ) -> Result<(), String> {
-    install_committed_current_projection(
+    install_current_projection(
         entrance,
         readiness,
         connector_control,
@@ -529,7 +554,7 @@ pub(crate) fn readmit_declared_target(
     permits: Vec<novarocks_mv_application::management::ReadmissionPermit>,
     context: ConnectorRequestContext,
 ) -> Result<(), String> {
-    install_committed_current_projection(
+    install_current_projection(
         entrance,
         readiness,
         connector_control,
@@ -558,7 +583,7 @@ pub(crate) struct PublishedOutput {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn install_committed_current_projection(
+fn install_current_projection(
     entrance: &ManagementEntrance,
     readiness: &crate::mv::domain::readiness::MvReadinessPort,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
@@ -577,7 +602,7 @@ fn install_committed_current_projection(
         novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
     )
     .map_err(|error| format!("prepare the {effect} MV Current observation: {error}"))?;
-    let source = CommittedTargetCurrentSource {
+    let source = ManagedTargetCurrentSource {
         entrance,
         connector_control,
         published,
@@ -589,13 +614,13 @@ fn install_committed_current_projection(
         .map_err(|error| format!("install the {effect} MV Current projection: {error}"))
 }
 
-/// Observes a target this statement just committed to and converges management
-/// onto it.
+/// Observe one target through the same management entrance, using the
+/// convergence requirement appropriate to its current admission state.
 ///
 /// The same sealed observation both mints the management admission and
 /// supplies the documents, so readiness can never be installed from one read
 /// and admitted by another.
-struct CommittedTargetCurrentSource<'a> {
+struct ManagedTargetCurrentSource<'a> {
     entrance: &'a ManagementEntrance,
     connector_control: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
     /// The output this observation must read back, absent when the effect
@@ -607,6 +632,9 @@ struct CommittedTargetCurrentSource<'a> {
 /// Why management is being reopened, which decides how the entrance is asked.
 #[derive(Clone, Debug)]
 enum MvConvergence {
+    /// A manageable target remains admitted after a configuration observation
+    /// or resolved slot change; its live admission is renewed from Current.
+    AdmittedCurrent,
     /// An effect this process committed must be re-observed before management
     /// reopens.
     CommittedEffect,
@@ -635,7 +663,7 @@ pub(crate) fn keyed_request(
     }
 }
 
-impl CommittedTargetCurrentSource<'_> {
+impl ManagedTargetCurrentSource<'_> {
     fn register_incarnation(
         &self,
         state: &mut novarocks_mv_application::management::ManagementObservationState,
@@ -700,7 +728,7 @@ impl CommittedTargetCurrentSource<'_> {
 
 #[async_trait::async_trait]
 impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
-    for CommittedTargetCurrentSource<'_>
+    for ManagedTargetCurrentSource<'_>
 {
     async fn observe_current_keyed(
         &self,
@@ -765,6 +793,13 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             request.context().clone(),
         );
         let mut state = match &self.convergence {
+            MvConvergence::AdmittedCurrent => {
+                let (observed, admission, _) = self
+                    .entrance
+                    .observe_keyed_admission(&documents, observation, request.decode_budget())
+                    .map_err(|e| conflict(format!("observe admitted MV Current: {e}")))?;
+                return Ok((observed, admission));
+            }
             MvConvergence::CommittedEffect => self.entrance.begin_committed_convergence(
                 &table,
                 novarocks_mv_application::management::ManagementContinuation::SameOwner {
@@ -1248,3 +1283,7 @@ pub(crate) fn admit_mv_publication(
         repartitioned: false,
     })
 }
+
+#[cfg(test)]
+#[path = "staged_create/admitted_current_tests.rs"]
+mod admitted_current_tests;

@@ -176,6 +176,12 @@ pub(crate) fn try_execute_document_expiry(
     call: &CallStatement,
     _current_database: &str,
     context: &ConnectorRequestContext,
+    on_reconciled_current: &dyn Fn(
+        CatalogHandle,
+        novarocks_mv_application::product::MvTarget,
+        Uuid,
+        ConnectorRequestContext,
+    ) -> Result<(), String>,
     on_committed: &dyn Fn(
         CatalogHandle,
         novarocks_mv_application::product::MvTarget,
@@ -254,7 +260,7 @@ pub(crate) fn try_execute_document_expiry(
         }
     };
     if convergence.reinstall_current_projection {
-        on_committed(
+        on_reconciled_current(
             catalog.clone(),
             target.clone(),
             Uuid::now_v7(),
@@ -289,7 +295,7 @@ pub(crate) fn try_execute_document_expiry(
         full = documents
             .observe_full_keyed_documents(request(admitted_context.clone().after_external_effect()))
             .map_err(|e| e.to_string())?;
-        on_committed(
+        on_reconciled_current(
             catalog.clone(),
             target.clone(),
             Uuid::now_v7(),

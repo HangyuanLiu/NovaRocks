@@ -222,6 +222,17 @@ impl MvCommandExecutor {
             current_database,
             connector_context,
             &|catalog, target, operation_id, context| {
+                crate::mv::domain::staged_create::install_admitted_current_projection(
+                    self.ports.management_entrance()?.as_ref(),
+                    self.ports.readiness().as_ref(),
+                    self.ports.connector_control(),
+                    catalog,
+                    target,
+                    operation_id,
+                    context,
+                )
+            },
+            &|catalog, target, operation_id, context| {
                 crate::mv::domain::staged_create::install_configured_current_projection(
                     self.ports.management_entrance()?.as_ref(),
                     self.ports.readiness().as_ref(),

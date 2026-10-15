@@ -32,7 +32,7 @@
 //! * ADDED + EXISTING entries become EXISTING in the merged manifest
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::iceberg::io::FileIO;
 use crate::iceberg::spec::{
@@ -40,61 +40,14 @@ use crate::iceberg::spec::{
     ManifestListWriter, ManifestStatus, ManifestWriterBuilder, Operation, SnapshotReference,
     SnapshotRetention, Summary,
 };
-use crate::iceberg::{Catalog, TableIdent, TableRequirement, TableUpdate};
+use crate::iceberg::{Catalog, TableRequirement, TableUpdate};
 
-use crate::commit::commit_with_retry;
 use crate::commit::existing_commit::existing_table_commit;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RewriteManifestsOutcome {
     pub rewritten_manifests_count: i32,
     pub added_manifests_count: i32,
-}
-
-/// Top-level entry called from `engine::iceberg_maintenance`.
-/// Loads the table, groups manifests, merges, and commits.
-///
-/// Noop cases (returns Ok immediately):
-/// 1. Table has no current snapshot (empty table).
-/// 2. Manifest list has ≤ 1 entry.
-/// 3. All (partition_spec_id, content) groups have exactly 1 manifest.
-pub async fn run_rewrite_manifests(
-    catalog: Arc<dyn Catalog>,
-    table_ident: TableIdent,
-) -> Result<RewriteManifestsOutcome, String> {
-    run_rewrite_manifests_with_marker(catalog, table_ident, None).await
-}
-
-/// Executes the legacy retry wrapper while attaching a provider-owned operation
-/// marker to the replace snapshot. The metadata-maintenance adapter supplies a
-/// marker and will later use the typed frozen-plan entrypoint; keeping this
-/// narrow helper makes marker placement testable independently.
-pub async fn run_rewrite_manifests_with_marker(
-    catalog: Arc<dyn Catalog>,
-    table_ident: TableIdent,
-    marker: Option<String>,
-) -> Result<RewriteManifestsOutcome, String> {
-    let outcome: Arc<Mutex<Option<RewriteManifestsOutcome>>> = Arc::new(Mutex::new(None));
-    let outcome_out = outcome.clone();
-    commit_with_retry(|_attempt| {
-        let catalog = catalog.clone();
-        let table_ident = table_ident.clone();
-        let outcome_out = outcome_out.clone();
-        let marker = marker.clone();
-        async move {
-            let next = run_rewrite_manifests_one_attempt(catalog, table_ident, marker).await?;
-            *outcome_out
-                .lock()
-                .expect("rewrite manifests outcome mutex poisoned") = Some(next);
-            Ok(())
-        }
-    })
-    .await?;
-    outcome
-        .lock()
-        .expect("rewrite manifests outcome mutex poisoned")
-        .clone()
-        .ok_or_else(|| "rewrite_manifests finished without an outcome".to_string())
 }
 
 /// Runs one frozen-plan attempt without the legacy OCC retry loop.
@@ -164,16 +117,6 @@ async fn write_manifest_list(
         .close()
         .await
         .map_err(|error| format!("close manifest-list output: {error}"))
-}
-
-async fn run_rewrite_manifests_one_attempt(
-    catalog: Arc<dyn Catalog>,
-    table_ident: TableIdent,
-    marker: Option<String>,
-) -> Result<RewriteManifestsOutcome, crate::iceberg::Error> {
-    let table = catalog.load_table(&table_ident).await?;
-    let file_io = table.file_io().clone();
-    run_rewrite_manifests_with_table(catalog, table, file_io, marker).await
 }
 
 /// Run one manifest rewrite from a caller-bound table and FileIO. The catalog
@@ -683,9 +626,14 @@ mod existing_table_commit_tests {
         fixture.append("second").await;
         let loaded = fixture.load().await;
 
-        let outcome = run_rewrite_manifests(fixture.catalog.clone(), fixture.ident.clone())
-            .await
-            .expect("rewrite manifests");
+        let outcome = run_rewrite_manifests_once_with_marker(
+            fixture.catalog.clone(),
+            loaded.clone(),
+            loaded.file_io().clone(),
+            None,
+        )
+        .await
+        .expect("rewrite manifests");
 
         assert_eq!(outcome.rewritten_manifests_count, 2);
         assert_eq!(
