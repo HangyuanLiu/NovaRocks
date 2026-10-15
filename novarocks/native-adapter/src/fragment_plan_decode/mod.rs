@@ -567,6 +567,65 @@ fn attach_producers(
     }
 }
 
+/// A planner RF endpoint is a materialized slot read, not a second invocation
+/// of the expression that supplied that slot. Its complete type references are
+/// fragment-local roots and need not have the same numeric binding ID.
+fn runtime_filter_materialized_key_matches(
+    key: &novarocks_proto_models::expr::Expr,
+    endpoint: &novarocks_proto_models::expr::Expr,
+    path: FieldPath,
+    decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
+) -> Result<bool, NativeFragmentDecodeError> {
+    use novarocks_proto_models::expr::expr::Kind;
+    let (Some(Kind::ColumnRef(key_column)), Some(Kind::ColumnRef(endpoint_column))) =
+        (key.kind.as_ref(), endpoint.kind.as_ref())
+    else {
+        // Preserve the pre-existing exact comparison for every other shape.
+        // In particular, invocation definition IDs are never erased here.
+        return Ok(key == endpoint);
+    };
+    if key_column != endpoint_column
+        || key.nullable != endpoint.nullable
+        || (endpoint.original_definition_id.is_some()
+            && key.original_definition_id != endpoint.original_definition_id)
+    {
+        return Ok(false);
+    }
+    let key_reference = key.r#type.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("type"),
+            "runtime-filter key requires a complete type reference",
+        )
+    })?;
+    let endpoint_reference = endpoint.r#type.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("type"),
+            "runtime-filter endpoint requires a complete type reference",
+        )
+    })?;
+    let key_type = decoder
+        .value_type(key_reference, path.clone().field("type"))?
+        .ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone().field("type"),
+                "runtime-filter key complete binding is absent",
+            )
+        })?;
+    let endpoint_type = decoder
+        .value_type(endpoint_reference, path.clone().field("type"))?
+        .ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.field("type"),
+                "runtime-filter endpoint complete binding is absent",
+            )
+        })?;
+    decoder.bindings_match(
+        key_type.typed_binding(),
+        endpoint_type.typed_binding(),
+        false,
+    )
+}
+
 fn attach_hash_join_producers(
     wire_node: &plan::DistributedNode,
     wire_join: &plan::HashJoinNode,
@@ -666,7 +725,12 @@ fn attach_hash_join_producers(
                 ),
             )
         })?;
-        if raw_build != binding.expression {
+        if !runtime_filter_materialized_key_matches(
+            raw_build,
+            binding.expression,
+            raw_build_path.clone(),
+            type_decoder,
+        )? {
             return Err(NativeFragmentDecodeError::inconsistent(
                 raw_build_path.clone(),
                 format!(
@@ -829,7 +893,12 @@ fn attach_hash_aggregate_producers(
                     ),
                 )
             })?;
-        if raw_group_key != binding.expression {
+        if !runtime_filter_materialized_key_matches(
+            raw_group_key,
+            binding.expression,
+            group_key_path.clone(),
+            type_decoder,
+        )? {
             return Err(NativeFragmentDecodeError::inconsistent(
                 group_key_path.clone(),
                 format!(
@@ -2149,6 +2218,201 @@ mod tests {
             }
             AssertNumRowsMode::PerKeyAtMostOne { .. } => panic!("expected global assert"),
         }
+    }
+
+    fn with_materialized_key_types<R>(
+        values: &[novarocks_type_contract::FunctionValueType],
+        operation: impl FnOnce(&mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>) -> R,
+    ) -> R {
+        use novarocks_plan_codec::execution_type_table::{
+            ExecutionTypeRoot, ExecutionTypeTableBuilder, ExecutionTypeTableLimits,
+        };
+        use novarocks_type_contract::{
+            CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+        };
+        struct Control;
+        impl PureCompileControl for Control {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                assert!(units <= 256);
+                Ok(())
+            }
+        }
+        let roots = values
+            .iter()
+            .enumerate()
+            .map(|(id, value)| ExecutionTypeRoot {
+                id: id as u32,
+                value,
+            })
+            .collect::<Vec<_>>();
+        let mut work = CompileCheckpoints::try_new(&Control, CompilePhase::Encode).unwrap();
+        let table = ExecutionTypeTableBuilder::new(&roots)
+            .encode_observed::<std::convert::Infallible>(
+                ExecutionTypeTableLimits::for_validated_root_count(roots.len()).unwrap(),
+                &mut |_| Ok(()),
+                &mut work,
+            )
+            .unwrap()
+            .into_wire();
+        work.finish().unwrap();
+        let fragment = plan::PlanFragment {
+            execution_types: Some(table),
+            ..Default::default()
+        };
+        let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+            "RF materialized key fixture",
+        );
+        tracker.install_limit_once(1 << 20).unwrap();
+        let creation = crate::native_type_construction::NativeTypeConstruction::try_with_control(
+            tracker.clone(),
+            &Control,
+        )
+        .unwrap();
+        let mut resources =
+            crate::fragment_type_decode::NativeDecodeResources::try_new(&creation).unwrap();
+        let types =
+            crate::fragment_type_decode::decode_fragment_type_owner(&fragment, &mut resources)
+                .unwrap();
+        let result = operation(
+            &mut crate::fragment_type_decode::NativeTypeDecoder::Strong {
+                types: &types.execution,
+                original_requests: None,
+                resources: &mut resources,
+            },
+        );
+        resources.finish().unwrap();
+        drop(types);
+        drop(creation);
+        assert_eq!(tracker.current(), 0);
+        result
+    }
+    fn materialized_key(reference: u32, definition: Option<u32>) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(common::TypeDesc {
+                value_binding_id: Some(reference),
+            }),
+            nullable: true,
+            original_definition_id: definition,
+            kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
+                column_id: 7,
+                qualifier: None,
+                column: None,
+            })),
+        }
+    }
+    #[test]
+    fn runtime_filter_materialized_key_accepts_equal_independent_type_roots_and_synthetic_read() {
+        let first = novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true);
+        let second = novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true);
+        with_materialized_key_types(&[first, second], |decoder| {
+            let key = materialized_key(0, Some(19));
+            let endpoint = materialized_key(1, None);
+            assert_ne!(
+                key, endpoint,
+                "wire IDs and source-definition markers are distinct"
+            );
+            assert!(
+                super::runtime_filter_materialized_key_matches(
+                    &key,
+                    &endpoint,
+                    FieldPath::root("key"),
+                    decoder
+                )
+                .unwrap()
+            );
+        });
+    }
+    #[test]
+    fn runtime_filter_materialized_key_rejects_full_domain_layout_null_and_slot_drift() {
+        use novarocks_type_contract::{FunctionValueType as V, ValueLogicalType};
+        let nested_json = V::try_from_typed_binding(
+            novarocks_types::execution_value_type_from_declaration(
+                &novarocks_types::schema::SqlType::Array(Box::new(
+                    novarocks_types::schema::SqlType::Json,
+                )),
+                &DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    false,
+                ))),
+                true,
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let values = [
+            V::new(DataType::Utf8, true),
+            V::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json).unwrap(),
+            V::new(DataType::LargeUtf8, true),
+            V::new(DataType::Utf8, false),
+            V::new(
+                DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    false,
+                ))),
+                true,
+            ),
+            V::new(
+                DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    true,
+                ))),
+                true,
+            ),
+            nested_json,
+        ];
+        with_materialized_key_types(&values, |decoder| {
+            for (left, right) in [(0, 1), (0, 2), (0, 3), (4, 5), (4, 6)] {
+                assert!(
+                    !super::runtime_filter_materialized_key_matches(
+                        &materialized_key(left, Some(19)),
+                        &materialized_key(right, None),
+                        FieldPath::root("key"),
+                        decoder
+                    )
+                    .unwrap()
+                );
+            }
+            let key = materialized_key(0, Some(19));
+            let mut endpoint = materialized_key(0, None);
+            let Some(expr::expr::Kind::ColumnRef(column)) = endpoint.kind.as_mut() else {
+                unreachable!()
+            };
+            column.column_id = 8;
+            assert!(
+                !super::runtime_filter_materialized_key_matches(
+                    &key,
+                    &endpoint,
+                    FieldPath::root("key"),
+                    decoder
+                )
+                .unwrap()
+            );
+            endpoint = materialized_key(0, Some(20));
+            assert!(
+                !super::runtime_filter_materialized_key_matches(
+                    &key,
+                    &endpoint,
+                    FieldPath::root("key"),
+                    decoder
+                )
+                .unwrap()
+            );
+            endpoint = materialized_key(0, None);
+            endpoint.nullable = false;
+            assert!(
+                !super::runtime_filter_materialized_key_matches(
+                    &key,
+                    &endpoint,
+                    FieldPath::root("key"),
+                    decoder
+                )
+                .unwrap()
+            );
+        });
     }
 
     #[test]
