@@ -89,6 +89,14 @@ impl NovaRocksCatalog for AdmittedCatalog {
     fn evidence_policy(&self) -> crate::catalog::publication::CatalogEvidencePolicy {
         self.inner.evidence_policy()
     }
+    fn freeze_create_publication(
+        &self,
+        request: crate::catalog::catalog_request::CatalogCreatePublicationRequest,
+    ) -> crate::catalog::publication_dispatch::PreparationResult<
+        crate::catalog::catalog_request::FrozenCatalogPublication,
+    > {
+        self.inner.freeze_create_publication(request)
+    }
     async fn prepare_catalog_publication(
         &self,
         request: crate::catalog::catalog_request::FrozenCatalogPublication,

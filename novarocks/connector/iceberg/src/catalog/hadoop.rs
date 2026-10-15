@@ -130,6 +130,60 @@ fn map_bounded_read_error(error: &crate::iceberg::Error) -> ConnectorError {
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksHadoopCatalog {
+    fn freeze_create_publication(
+        &self,
+        request: super::catalog_request::CatalogCreatePublicationRequest,
+    ) -> super::publication_dispatch::PreparationResult<
+        super::catalog_request::FrozenCatalogPublication,
+    > {
+        let target = CatalogTableName::new(
+            Arc::clone(&request.namespace.namespace),
+            request.creation.name.clone(),
+        );
+        self.admit_operation(
+            &CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
+            &target.into(),
+        )
+        .map_err(|reason| {
+            super::publication_dispatch::PreparationFailure(
+                novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                    reason.message(),
+                ),
+            )
+        })?;
+        let namespace = super::delegate::namespace_ident(&request.namespace)?;
+        let attempt = self
+            .client
+            .prepare_create_attempt(
+                &namespace,
+                request.creation,
+                uuid::Uuid::from_bytes(request.operation_id)
+                    .simple()
+                    .to_string(),
+            )
+            .map_err(|failure| {
+                super::publication_dispatch::PreparationFailure(
+                    novarocks_spi::connector::ConnectorMutationFailure::new(
+                        match failure.kind {
+                            crate::hadoop_catalog::HadoopCreateFailureKind::Invalid => novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
+                            crate::hadoop_catalog::HadoopCreateFailureKind::Unsupported => novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                            crate::hadoop_catalog::HadoopCreateFailureKind::Uncommitted
+                            | crate::hadoop_catalog::HadoopCreateFailureKind::Unknown => novarocks_spi::connector::ConnectorMutationFailureKind::Internal,
+                        },
+                        failure.message,
+                    ),
+                )
+            })?;
+        Ok(
+            super::catalog_request::FrozenCatalogPublication::hadoop_create(
+                attempt,
+                request.operation_id,
+                request.no_op_if_exists,
+            )?,
+        )
+    }
+
     async fn prepare_catalog_publication(
         &self,
         request: super::catalog_request::FrozenCatalogPublication,

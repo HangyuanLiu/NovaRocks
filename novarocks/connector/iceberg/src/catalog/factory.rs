@@ -542,6 +542,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hadoop_create_freezer_retains_one_exact_document_without_io() {
+        use crate::catalog::catalog_request::CatalogCreatePublicationRequest;
+        use crate::commit::publication_descriptor::{AttributionPlan, PublicationDescriptor};
+        use sha2::Digest;
+        let warehouse = tempfile::tempdir().unwrap();
+        let owner = adopted(&hadoop_configuration(warehouse.path()))
+            .await
+            .unwrap();
+        let operation_id = [23; 16];
+        let frozen = owner
+            .freeze_create_publication(CatalogCreatePublicationRequest {
+                operation_id,
+                namespace: CatalogNamespaceName::new("db"),
+                creation: creation("t"),
+                no_op_if_exists: true,
+            })
+            .unwrap();
+        let facts = frozen
+            .conditional_create_facts()
+            .expect("Hadoop exact identity");
+        let metadata: serde_json::Value = serde_json::from_slice(frozen.request_bytes()).unwrap();
+        assert_eq!(metadata["table-uuid"], facts.table_uuid.as_ref());
+        assert_eq!(
+            facts.operation_id.as_ref(),
+            uuid::Uuid::from_bytes(operation_id).simple().to_string()
+        );
+        let digest: String = sha2::Sha256::digest(frozen.request_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(facts.metadata_digest.as_ref(), digest);
+        assert!(
+            matches!(frozen.attribution(), AttributionPlan::ExactMetadata { table_uuid, location, digest }
+            if table_uuid.to_string() == facts.table_uuid.as_ref() && location == facts.metadata_location.as_ref() && digest == facts.metadata_digest.as_ref())
+        );
+        let scope: serde_json::Value = serde_json::from_str(&frozen.targets()[0]).unwrap();
+        assert_eq!(scope["table-create-no-op"], true);
+        let descriptor = PublicationDescriptor::catalog(
+            operation_id,
+            frozen.targets(),
+            frozen.request_bytes().to_vec(),
+            frozen.attribution().clone(),
+        )
+        .unwrap();
+        frozen.validate_descriptor(&descriptor).unwrap();
+        assert_eq!(std::fs::read_dir(warehouse.path()).unwrap().count(), 0);
+        let (attempt, no_op) = frozen.into_hadoop_create().unwrap();
+        assert!(no_op);
+        attempt.validate_frozen_identity(operation_id).unwrap();
+        let mut foreign_operation = operation_id;
+        foreign_operation[0] ^= 1;
+        assert!(attempt.validate_frozen_identity(foreign_operation).is_err());
+        assert_eq!(
+            attempt.facts().metadata_location,
+            facts.metadata_location.as_ref()
+        );
+        assert_eq!(attempt.metadata_bytes(), descriptor.request.as_slice());
+        assert_eq!(std::fs::read_dir(warehouse.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn hadoop_create_freezer_preserves_trailing_slash_protocol_location() {
+        use crate::catalog::catalog_request::CatalogCreatePublicationRequest;
+        let warehouse = tempfile::tempdir().unwrap();
+        let owner = adopted(&hadoop_configuration(warehouse.path()))
+            .await
+            .unwrap();
+        let mut request = creation("t");
+        let location = format!("{}/explicit/", warehouse.path().display());
+        request.location = Some(location.clone());
+        let frozen = owner
+            .freeze_create_publication(CatalogCreatePublicationRequest {
+                operation_id: [25; 16],
+                namespace: CatalogNamespaceName::new("db"),
+                creation: request,
+                no_op_if_exists: false,
+            })
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(frozen.request_bytes()).unwrap();
+        assert_eq!(metadata["location"], location.trim_end_matches('/'));
+        let (attempt, _) = frozen.into_hadoop_create().unwrap();
+        attempt.validate_frozen_identity([25; 16]).unwrap();
+        assert_eq!(
+            attempt.facts().metadata_location,
+            format!(
+                "{}/metadata/v1.metadata.json",
+                location.trim_end_matches('/')
+            )
+        );
+        assert_eq!(std::fs::read_dir(warehouse.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn rest_create_freezer_binds_policy_without_session_io_or_hadoop_facts() {
+        use crate::catalog::catalog_request::CatalogCreatePublicationRequest;
+        use crate::commit::publication_descriptor::PublicationDescriptor;
+        let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        endpoint.set_nonblocking(true).unwrap();
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[
+                ("iceberg.catalog.type".into(), "rest".into()),
+                (
+                    "uri".into(),
+                    format!("http://{}", endpoint.local_addr().unwrap()),
+                ),
+                ("warehouse".into(), "s3://warehouse".into()),
+            ],
+        )
+        .unwrap();
+        let owner = adopted(&configuration).await.unwrap();
+        let freeze = |conditional| {
+            owner
+                .freeze_create_publication(CatalogCreatePublicationRequest {
+                    operation_id: [24; 16],
+                    namespace: CatalogNamespaceName::new("db"),
+                    creation: creation("t"),
+                    no_op_if_exists: conditional,
+                })
+                .unwrap()
+        };
+        let strict = freeze(false);
+        let conditional = freeze(true);
+        assert!(strict.conditional_create_facts().is_none());
+        assert_eq!(strict.request_bytes(), conditional.request_bytes());
+        let descriptor = PublicationDescriptor::catalog(
+            [24; 16],
+            strict.targets(),
+            strict.request_bytes().to_vec(),
+            strict.attribution().clone(),
+        )
+        .unwrap();
+        strict.validate_descriptor(&descriptor).unwrap();
+        assert!(conditional.validate_descriptor(&descriptor).is_err());
+        let request: serde_json::Value = serde_json::from_slice(strict.request_bytes()).unwrap();
+        assert_eq!(request["name"], "t");
+        assert!(request.get("no-op-if-exists").is_none());
+        assert_eq!(
+            endpoint.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
     async fn anchor_is_pure_admitted_no_op_without_namespace_or_pointer_registration() {
         let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         endpoint.set_nonblocking(true).unwrap();

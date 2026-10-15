@@ -79,6 +79,20 @@ impl NovaRocksHiveCatalog {
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksHiveCatalog {
+    fn freeze_create_publication(
+        &self,
+        _request: super::catalog_request::CatalogCreatePublicationRequest,
+    ) -> super::publication_dispatch::PreparationResult<
+        super::catalog_request::FrozenCatalogPublication,
+    > {
+        Err(super::publication_dispatch::PreparationFailure(
+            novarocks_spi::connector::ConnectorMutationFailure::new(
+                novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                "Hive Iceberg catalog is a read-only compatibility entry",
+            ),
+        ))
+    }
+
     fn bind_publication_generation(
         &self,
         generation: novarocks_spi::connector::ProviderBindingEpoch,

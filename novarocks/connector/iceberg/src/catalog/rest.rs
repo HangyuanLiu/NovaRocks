@@ -233,6 +233,38 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         })
     }
 
+    fn freeze_create_publication(
+        &self,
+        request: super::catalog_request::CatalogCreatePublicationRequest,
+    ) -> super::publication_dispatch::PreparationResult<
+        super::catalog_request::FrozenCatalogPublication,
+    > {
+        let target = CatalogTableName::new(
+            Arc::clone(&request.namespace.namespace),
+            request.creation.name.clone(),
+        );
+        self.admit_operation(
+            &CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
+            &target.into(),
+        )
+        .map_err(|reason| {
+            super::publication_dispatch::PreparationFailure(
+                novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                    reason.message(),
+                ),
+            )
+        })?;
+        Ok(
+            super::catalog_request::CatalogPublicationRequest::CreateTable {
+                namespace: request.namespace,
+                creation: request.creation,
+                no_op_if_exists: request.no_op_if_exists,
+            }
+            .freeze(request.operation_id)?,
+        )
+    }
+
     async fn prepare_catalog_publication(
         &self,
         request: super::catalog_request::FrozenCatalogPublication,
@@ -248,6 +280,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         preparation.check_active()?;
         self.endpoints.publication_generation.require(generation)?;
         request.validate_descriptor(&descriptor)?;
+        let (route, expectation) = request.rest_protocol()?;
         self.admit_operation(&request.operation, &request.target)
             .map_err(|reason| {
                 super::publication_dispatch::PreparationFailure(
@@ -311,11 +344,11 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         }
         let prepared = crate::rest_protocol::mutation::prepared::PreparedRestMutation::prepare(
             Arc::clone(&self.endpoints),
-            request.route,
+            route,
             &descriptor,
             generation,
             &preparation,
-            request.expectation,
+            expectation,
             request.stage_create,
             request
                 .stage_create

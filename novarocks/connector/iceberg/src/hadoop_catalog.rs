@@ -110,6 +110,26 @@ impl HadoopCreateAttempt {
     pub(crate) fn facts(&self) -> &HadoopCreateAttemptFacts {
         &self.facts
     }
+    pub(crate) fn identifier(&self) -> &TableIdent {
+        &self.ident
+    }
+    pub(crate) fn metadata_bytes(&self) -> &[u8] {
+        &self.metadata_bytes
+    }
+    pub(crate) fn validate_frozen_identity(&self, operation_id: [u8; 16]) -> Result<()> {
+        if self.facts.operation_id != uuid::Uuid::from_bytes(operation_id).simple().to_string()
+            || self.facts.table_uuid != self.metadata.uuid().to_string()
+            || self.facts.metadata_location
+                != HadoopFileSystemCatalog::metadata_path(&self.table_location, 1)
+            || self.facts.metadata_digest != hex_digest(&self.metadata_bytes)
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Frozen Hadoop create identity differs from its exact metadata request",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]

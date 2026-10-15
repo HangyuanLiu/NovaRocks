@@ -27,6 +27,14 @@ use crate::rest_protocol::mutation::prepared::MutationRoute;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Local definition facts; freezing this request cannot acquire live I/O.
+pub(crate) struct CatalogCreatePublicationRequest {
+    pub(crate) operation_id: [u8; 16],
+    pub(crate) namespace: CatalogNamespaceName,
+    pub(crate) creation: TableCreation,
+    pub(crate) no_op_if_exists: bool,
+}
+
 pub(crate) enum CatalogPublicationRequest {
     CreateNamespace {
         namespace: CatalogNamespaceName,
@@ -40,6 +48,7 @@ pub(crate) enum CatalogPublicationRequest {
     CreateTable {
         namespace: CatalogNamespaceName,
         creation: TableCreation,
+        no_op_if_exists: bool,
     },
     StageCreate {
         namespace: CatalogNamespaceName,
@@ -72,16 +81,24 @@ impl CatalogResponseDocument {
     }
 }
 
+enum FrozenCatalogPayload {
+    CatalogJson {
+        route: MutationRoute,
+        expectation: AttributionExpectation,
+        request: Vec<u8>,
+    },
+    HadoopCreate(Box<crate::hadoop_catalog::HadoopCreateAttempt>),
+}
+
 pub(crate) struct FrozenCatalogPublication {
     operation_id: [u8; 16],
     pub(super) operation: CatalogOperation,
     pub(super) target: CatalogAdmissionTarget,
-    pub(super) route: MutationRoute,
-    pub(super) expectation: AttributionExpectation,
+    payload: FrozenCatalogPayload,
     pub(super) stage_create: bool,
     namespace_no_op: Option<bool>,
     pub(super) namespace_has_properties: bool,
-    request: Vec<u8>,
+    table_create_no_op: Option<bool>,
     attribution: AttributionPlan,
 }
 impl FrozenCatalogPublication {
@@ -97,17 +114,90 @@ impl FrozenCatalogPublication {
                 "kind": "table", "namespace": table.namespace.as_ref(), "name": table.name.as_ref(),
             }),
         };
-        vec![
-            serde_json::json!({
-                "catalog-request-scope-version": 1,
-                "operation": self.operation.name(), "target": target,
-                "namespace-no-op": self.namespace_no_op,
-            })
-            .to_string(),
-        ]
+        let mut scope = serde_json::json!({
+            "catalog-request-scope-version": 1,
+            "operation": self.operation.name(), "target": target,
+            "namespace-no-op": self.namespace_no_op,
+        });
+        if let Some(no_op) = self.table_create_no_op {
+            scope["table-create-no-op"] = no_op.into();
+        }
+        vec![scope.to_string()]
     }
     pub(crate) fn request_bytes(&self) -> &[u8] {
-        &self.request
+        match &self.payload {
+            FrozenCatalogPayload::CatalogJson { request, .. } => request,
+            FrozenCatalogPayload::HadoopCreate(attempt) => attempt.metadata_bytes(),
+        }
+    }
+    pub(super) fn rest_protocol(
+        &self,
+    ) -> super::publication_dispatch::PreparationResult<(MutationRoute, AttributionExpectation)>
+    {
+        match &self.payload {
+            FrozenCatalogPayload::CatalogJson {
+                route, expectation, ..
+            } => Ok((route.clone(), expectation.clone())),
+            FrozenCatalogPayload::HadoopCreate(_) => {
+                Err(novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                    "Hadoop metadata-object publication cannot use the REST request mechanism",
+                )
+                .into())
+            }
+        }
+    }
+    pub(crate) fn conditional_create_facts(&self) -> Option<super::ConditionalCreateFacts> {
+        let FrozenCatalogPayload::HadoopCreate(attempt) = &self.payload else {
+            return None;
+        };
+        let facts = attempt.facts();
+        Some(super::ConditionalCreateFacts {
+            operation_id: Arc::from(facts.operation_id.as_str()),
+            table_uuid: Arc::from(facts.table_uuid.as_str()),
+            metadata_location: Arc::from(facts.metadata_location.as_str()),
+            metadata_digest: Arc::from(facts.metadata_digest.as_str()),
+        })
+    }
+    pub(crate) fn hadoop_create(
+        attempt: crate::hadoop_catalog::HadoopCreateAttempt,
+        operation_id: [u8; 16],
+        no_op_if_exists: bool,
+    ) -> Result<Self> {
+        attempt.validate_frozen_identity(operation_id)?;
+        let target = CatalogTableName::from_identifier(attempt.identifier());
+        let facts = attempt.facts();
+        let attribution = AttributionPlan::ExactMetadata {
+            table_uuid: uuid::Uuid::parse_str(&facts.table_uuid).map_err(|error| {
+                Error::new(ErrorKind::DataInvalid, "Invalid frozen Hadoop table UUID")
+                    .with_source(error)
+            })?,
+            location: facts.metadata_location.clone(),
+            digest: facts.metadata_digest.clone(),
+        };
+        Ok(Self {
+            operation_id,
+            operation: CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
+            target: target.into(),
+            payload: FrozenCatalogPayload::HadoopCreate(Box::new(attempt)),
+            stage_create: false,
+            namespace_no_op: None,
+            namespace_has_properties: false,
+            table_create_no_op: Some(no_op_if_exists),
+            attribution,
+        })
+    }
+    pub(super) fn into_hadoop_create(
+        self,
+    ) -> super::publication_dispatch::PreparationResult<(
+        crate::hadoop_catalog::HadoopCreateAttempt,
+        bool,
+    )> {
+        match (self.payload, self.table_create_no_op, self.operation, self.stage_create) {
+            (FrozenCatalogPayload::HadoopCreate(attempt), Some(no_op), CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable), false) => Ok((*attempt, no_op)),
+            _ => Err(novarocks_spi::connector::ConnectorError::new(novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "Conditional Hadoop publication requires its exact frozen metadata request and policy").into()),
+        }
     }
     pub(crate) fn attribution(&self) -> &AttributionPlan {
         &self.attribution
@@ -154,7 +244,7 @@ impl FrozenCatalogPublication {
         descriptor.validate_catalog(
             self.operation_id,
             self.targets(),
-            self.request.clone(),
+            self.request_bytes().to_vec(),
             self.attribution.clone(),
         )
     }
@@ -166,6 +256,7 @@ impl CatalogPublicationRequest {
         use crate::rest_protocol::wire::{CreateNamespaceRequest, CreateTableRequest};
         let mut attribution = AttributionPlan::ObserveOnly;
         let mut stage_create = false;
+        let mut table_create_no_op = None;
         let mut namespace_no_op = None;
         let mut namespace_has_properties = false;
         let (operation, target, route, expectation, request) = match self {
@@ -208,7 +299,11 @@ impl CatalogPublicationRequest {
                     Self::CreateTable {
                         namespace,
                         creation,
-                    } => (namespace, creation),
+                        no_op_if_exists,
+                    } => {
+                        table_create_no_op = Some(no_op_if_exists);
+                        (namespace, creation)
+                    }
                     Self::StageCreate {
                         namespace,
                         creation,
@@ -316,12 +411,15 @@ impl CatalogPublicationRequest {
             operation_id,
             operation,
             target,
-            route,
-            expectation,
+            payload: FrozenCatalogPayload::CatalogJson {
+                route,
+                expectation,
+                request,
+            },
             stage_create,
             namespace_no_op,
             namespace_has_properties,
-            request,
+            table_create_no_op,
             attribution,
         })
     }

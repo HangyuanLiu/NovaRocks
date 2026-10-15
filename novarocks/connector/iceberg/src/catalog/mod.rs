@@ -462,6 +462,26 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         preparation: novarocks_spi::connector::ConnectorRequestContext,
     ) -> publication_dispatch::PreparationResult<publication_dispatch::PreparedPublication>;
 
+    /// Freeze one ordinary create using the admitted owner's exact mechanism.
+    /// This synchronous boundary builds immutable facts only.
+    #[cfg(not(test))]
+    fn freeze_create_publication(
+        &self,
+        request: catalog_request::CatalogCreatePublicationRequest,
+    ) -> publication_dispatch::PreparationResult<catalog_request::FrozenCatalogPublication>;
+    #[cfg(test)]
+    fn freeze_create_publication(
+        &self,
+        _request: catalog_request::CatalogCreatePublicationRequest,
+    ) -> publication_dispatch::PreparationResult<catalog_request::FrozenCatalogPublication> {
+        Err(publication_dispatch::PreparationFailure(
+            novarocks_spi::connector::ConnectorMutationFailure::new(
+                novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                "Catalog has no local create freezer",
+            ),
+        ))
+    }
+
     /// Artifactless requests use the same journal executor as frozen commits.
     /// Catalogs without this mechanism refuse before external side effects.
     async fn prepare_catalog_publication(
