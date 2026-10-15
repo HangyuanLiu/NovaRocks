@@ -104,7 +104,7 @@ ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_
 
 -- query 15
 -- Default-format CTAS refuses the same logical Variant as explicit-v3 query9.
--- @expect_error=Iceberg Variant writes are not supported yet: table iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_default_ctas_rejected_${uuid0}, column v
+-- @expect_error=Iceberg Variant writes are not supported yet: table nr_compat_${suite_uuid0}.java_variant_default_ctas_rejected_${uuid0}, column v
 CREATE TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_default_ctas_rejected_${uuid0} AS SELECT id,v FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_rejected_${uuid0};
 
 -- query 16
