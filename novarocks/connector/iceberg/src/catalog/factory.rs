@@ -542,6 +542,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn anchor_is_pure_admitted_no_op_without_namespace_or_pointer_registration() {
+        let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        endpoint.set_nonblocking(true).unwrap();
+        for kind in ["hadoop", "rest", "hive"] {
+            let warehouse = tempfile::tempdir().unwrap();
+            let configuration = crate::catalog_config::parse_catalog_configuration(
+                "ice",
+                &[
+                    ("iceberg.catalog.type".into(), kind.into()),
+                    (
+                        "iceberg.catalog.warehouse".into(),
+                        warehouse.path().display().to_string(),
+                    ),
+                    (
+                        "iceberg.catalog.uri".into(),
+                        format!("http://{}", endpoint.local_addr().unwrap()),
+                    ),
+                    (
+                        "hive.metastore.uris".into(),
+                        format!("thrift://{}", endpoint.local_addr().unwrap()),
+                    ),
+                ],
+            )
+            .unwrap();
+            let owner = adopted(&configuration).await.unwrap();
+            let name = CatalogTableName::new("absent_namespace", "absent_table");
+            let outcome = owner
+                .anchor_written_metadata(name.clone(), Arc::from("s3://never-read/metadata.json"))
+                .await;
+            match (kind, outcome) {
+                ("hive", CatalogOutcome::Unsupported(_)) => (),
+                (
+                    "hadoop" | "rest",
+                    CatalogOutcome::KnownCommitted {
+                        effect: novarocks_spi::connector::ExternalMutationEffect::NoOp,
+                        receipt,
+                        ..
+                    },
+                ) => assert_eq!(receipt, name),
+                (_, other) => panic!("Unexpected {kind} anchor: {other:?}"),
+            }
+            assert_eq!(
+                std::fs::read_dir(warehouse.path()).unwrap().count(),
+                0,
+                "Anchor must not create a namespace or metadata pointer"
+            );
+            assert_eq!(
+                endpoint.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "Anchor must not reach catalog services"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn hms_direct_mutations_and_constructors_refuse_before_metastore_io() {
         let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         endpoint.set_nonblocking(true).unwrap();

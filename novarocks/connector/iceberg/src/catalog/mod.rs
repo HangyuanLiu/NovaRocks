@@ -48,11 +48,10 @@
 //! covers the operations the provider actually performs, and grows only when a
 //! real caller appears.
 //!
-//! There is no `register_table` either. Every catalog could forward one, but
-//! nothing called it: production anchors an already-written metadata file
-//! through `anchor_written_metadata`, which is the operation the provider
-//! actually performs. A trait method whose only content is a forward to a
-//! primitive no caller wants is a second way to do one thing.
+//! There is no `register_table`: every supported write protocol already
+//! publishes its own metadata pointer. The retained `anchor_written_metadata`
+//! call performs pure admission and returns NoOp; it cannot create namespaces
+//! or register another pointer after a write has committed.
 
 pub(crate) mod admission;
 #[cfg(test)]
@@ -812,16 +811,9 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     /// owner's job and may only proceed on `KnownCommitted`; see ADR-0118.
     async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt>;
 
-    /// Make a write's freshly published metadata reachable through this
-    /// catalog.
-    ///
-    /// Catalogs that track metadata locations themselves have nothing to do and
-    /// answer with a no-op. A filesystem catalog, whose entry *is* the metadata
-    /// pointer, has to anchor it.
-    ///
-    /// This exists so the write path stops asking "is this a remote catalog?".
-    /// That question was answered outside the factory, by a helper that also
-    /// swallowed the errors from the namespace it created along the way.
+    /// Admit an already committed write without another external mutation.
+    /// Supported write protocols publish their own pointer. Unsupported
+    /// catalogs still refuse; this boundary grants no registration authority.
     async fn anchor_written_metadata(
         &self,
         table: CatalogTableName,

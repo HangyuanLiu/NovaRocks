@@ -589,7 +589,7 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
     async fn anchor_written_metadata(
         &self,
         table: CatalogTableName,
-        metadata_location: Arc<str>,
+        _metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName> {
         if let Err(reason) = self.admit_operation(
             &CatalogOperation::AnchorWrittenMetadata,
@@ -597,36 +597,12 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         ) {
             return CatalogOutcome::Unsupported(reason);
         }
-        // The namespace has to exist before the table can be anchored under it.
-        // The previous helper created it with `let _ =`, so a namespace that
-        // failed to appear surfaced later as a confusing registration failure
-        // instead of the thing that actually went wrong.
-        let namespace = CatalogNamespaceName::new(Arc::clone(&table.namespace));
-        match self.delegate.namespace_exists(&namespace).await {
-            Ok(true) => {}
-            Ok(false) => {
-                let created = self.delegate.create_namespace(namespace).await;
-                if !matches!(created, CatalogOutcome::KnownCommitted { .. }) {
-                    return match created {
-                        CatalogOutcome::KnownCommitted { .. } => unreachable!(),
-                        CatalogOutcome::Unsupported(reason) => CatalogOutcome::Unsupported(reason),
-                        CatalogOutcome::KnownUncommitted { failure } => {
-                            CatalogOutcome::KnownUncommitted { failure }
-                        }
-                        CatalogOutcome::CommitUnknown { failure, evidence } => {
-                            CatalogOutcome::CommitUnknown { failure, evidence }
-                        }
-                    };
-                }
-            }
-            Err(error) => {
-                return CatalogOutcome::uncommitted(
-                    novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
-                    error.to_string(),
-                );
-            }
-        }
-        self.delegate.register_table(table, metadata_location).await
+        // Both the conditional create and retained update protocol publish
+        // their own metadata pointer. Admission must not register it again.
+        CatalogOutcome::committed(
+            table,
+            novarocks_spi::connector::ExternalMutationEffect::NoOp,
+        )
     }
 
     /// Prepare the conditional metadata write that makes this table exist.
