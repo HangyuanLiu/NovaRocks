@@ -1563,22 +1563,34 @@ mod tests {
     }
 
     #[test]
-    fn application_managed_marker_denies_ordinary_dml_but_allows_refresh() {
+    fn keyed_management_slot_denies_ordinary_dml_but_allows_refresh() {
         let owner = owner();
-        let metadata = metadata_with_properties(HashMap::from([
-            (
-                crate::document_storage::observation::MANAGED_KIND_PROPERTY.to_string(),
-                "mv".to_string(),
-            ),
-            (
-                crate::document_storage::observation::MANAGED_OWNER_PROPERTY.to_string(),
-                "deployment".to_string(),
-            ),
-            (
-                crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY.to_string(),
-                "writer".to_string(),
-            ),
-        ]));
+        let slot =
+            novarocks_spi::connector::ConnectorSlotName::try_new("novarocks.storage", "management")
+                .unwrap();
+        let mut content = Vec::new();
+        for value in ["materialized-view", "deployment", "writer"] {
+            content.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            content.extend_from_slice(value.as_bytes());
+        }
+        let documents = novarocks_spi::connector::KeyedCreate {
+            slots: std::collections::BTreeMap::from([(
+                slot,
+                novarocks_spi::connector::ConnectorSlotValue {
+                    format: novarocks_spi::connector::ConnectorDocumentFormat::try_new(
+                        "novarocks.mv",
+                        "management",
+                        1,
+                    )
+                    .unwrap(),
+                    content: bytes::Bytes::from(content),
+                },
+            )]),
+            ..Default::default()
+        };
+        let metadata = metadata_with_properties(
+            crate::document_storage::keyed::write::create_properties(&documents).unwrap(),
+        );
         let payload = table_payload(Some(table_info(&metadata)));
 
         let denied = expect_denied(
@@ -1608,7 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_application_managed_marker_fails_closed() {
+    fn legacy_managed_marker_refuses_all_writes() {
         let owner = owner();
         let metadata = metadata_with_properties(HashMap::from([(
             crate::document_storage::observation::MANAGED_OWNER_PROPERTY.to_string(),
@@ -1627,7 +1639,20 @@ mod tests {
             )
             .expect("partial managed marker outcome"),
         );
-        assert_eq!(denied.kind(), ConnectorErrorKind::CorruptData);
+        assert_eq!(denied.kind(), ConnectorErrorKind::Unsupported);
+        assert!(denied.message().contains("only DROP TABLE is supported"));
+        let denied = expect_denied(
+            prepare_write(
+                data_request(
+                    &owner,
+                    &payload,
+                    ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+                ),
+                &owner,
+            )
+            .unwrap(),
+        );
+        assert_eq!(denied.kind(), ConnectorErrorKind::Unsupported);
     }
 
     #[test]

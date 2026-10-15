@@ -3710,9 +3710,12 @@ mod tests {
         // Build an opaque, valid document intent using the explicit publication
         // test owner. No preparation is performed through the HMS generation.
         let (_document_executor, _document_warehouse, document_provider) = document_provider();
-        let document_table = managed_table(&document_provider);
-        let document_request =
-            application_document_update_fixture(&document_provider, &document_table).request;
+        let document_table = guarded_table(&document_provider);
+        let document_request = keyed_channel_request(
+            &document_provider,
+            &document_table,
+            keyed_configuration_change(),
+        );
         let operation_id = document_request.operation_id;
 
         let executor = tokio::runtime::Runtime::new().expect("runtime");
@@ -4551,123 +4554,102 @@ mod tests {
     }
 
     #[test]
-    fn application_document_execute_dispatches_one_set_properties_without_advancing_snapshot() {
+    fn keyed_marker_execute_preserves_current_records_and_other_properties() {
+        use novarocks_spi::connector::{
+            ConnectorMarkerKey, ConnectorMarkerValue, KeyedMarkerWrite, KeyedMutation,
+        };
         let (_executor, _warehouse, provider) = document_provider();
-        let table = managed_table(&provider);
+        let table = guarded_table(&provider);
+        provider
+            .execute(keyed_channel_request(
+                &provider,
+                &table,
+                keyed_configuration_change(),
+            ))
+            .unwrap();
+        let loaded = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        let runtime = Arc::clone(provider.runtime());
+        let physical = loaded.table.clone();
+        provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move {
+                crate::commit::run::append_snapshot_for_test(
+                    runtime,
+                    physical,
+                    vec![],
+                    "main".into(),
+                    BTreeMap::from([(
+                        "novarocks.doc.v2.record.novarocks.test~publication".into(),
+                        "2.-.a2VlcA".into(),
+                    )]),
+                )
+                .await
+            })
+            .unwrap()
+            .unwrap();
+        provider
+            .runtime()
+            .control_state()
+            .invalidate_table_cache(&table.namespace, &table.table);
         let before = provider
             .runtime()
             .load_table(&table.namespace, &table.table)
-            .expect("load before update");
-        let before_snapshot = before.table.metadata().current_snapshot_id();
-        let before_snapshot_properties = before
-            .table
-            .metadata()
-            .current_snapshot()
-            .expect("managed table current snapshot")
-            .summary()
-            .additional_properties
-            .clone();
-        let before_manifest = crate::document_storage::codec::decode_document_manifest(
-            before.table.metadata().properties()
-                [crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY]
-                .as_bytes(),
-        )
-        .expect("decode initial document manifest");
-        assert!(
-            before_snapshot.is_some(),
-            "fixture must have a real snapshot"
-        );
-        let before_metadata_files = metadata_file_count(before.table.metadata().location());
-        let update = application_document_update_fixture(&provider, &table);
-
-        let outcome = provider
-            .execute(update.request)
-            .expect("execute application-document update");
+            .unwrap();
+        let files_before = metadata_file_count(before.table.metadata().location());
+        let marker = KeyedMutation::Markers(KeyedMarkerWrite {
+            markers: BTreeMap::from([(
+                ConnectorMarkerKey {
+                    owner: "novarocks.mv".into(),
+                    name: "pending".into(),
+                    binding: "attempt-7".into(),
+                },
+                ConnectorMarkerValue {
+                    format: ConnectorDocumentFormat::try_new("novarocks.mv", "pending", 1).unwrap(),
+                    content: Bytes::from_static(b"intent"),
+                },
+            )]),
+        });
         assert!(matches!(
-            outcome,
+            provider
+                .execute(keyed_channel_request(&provider, &table, marker))
+                .unwrap(),
             ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::Applied,
                 finalization: ExternalMutationFinalization::Complete,
                 ..
             }
         ));
-
         let after = provider
             .runtime()
             .load_table(&table.namespace, &table.table)
-            .expect("reload after update");
-        assert_eq!(
-            after.table.metadata().current_snapshot_id(),
-            before_snapshot
-        );
+            .unwrap();
         assert_eq!(
             metadata_file_count(after.table.metadata().location()),
-            before_metadata_files + 1,
-            "one execute must publish exactly one metadata version"
+            files_before + 1
         );
         assert_eq!(
-            after
-                .table
-                .metadata()
-                .current_snapshot()
-                .expect("managed table current snapshot after update")
-                .summary()
-                .additional_properties,
-            before_snapshot_properties,
-            "a table-metadata document update must not rewrite snapshot-attached P"
+            before.table.metadata().current_snapshot(),
+            after.table.metadata().current_snapshot()
         );
+        let additions: Vec<_> = after
+            .table
+            .metadata()
+            .properties()
+            .iter()
+            .filter(|(key, value)| before.table.metadata().properties().get(*key) != Some(*value))
+            .collect();
+        assert_eq!(additions.len(), 1);
         assert_eq!(
-            after
-                .table
-                .metadata()
-                .properties()
-                .get(crate::document_storage::publication::DOCUMENT_UPDATE_OPERATION_PROPERTY),
-            Some(&update.operation_marker)
+            additions[0].0,
+            "novarocks.doc.v2.mark.novarocks.mv~pending~attempt-7"
         );
-        let after_manifest_property = &after.table.metadata().properties()
-            [crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY];
-        assert_eq!(
-            crate::document_storage::publication::manifest_digest(after_manifest_property),
-            update.manifest_digest,
-            "reconciliation evidence must cover the final merged manifest"
-        );
-        assert_ne!(
-            update.manifest_digest, update.prepared_only_digest,
-            "reconciliation evidence must not cover only the C replacement"
-        );
-        let after_manifest = crate::document_storage::codec::decode_document_manifest(
-            after_manifest_property.as_bytes(),
-        )
-        .expect("decode updated document manifest");
-        assert_eq!(after_manifest.documents.len(), 3);
-        for unchanged_name in ["definition", "interpretation"] {
-            assert_eq!(
-                after_manifest
-                    .documents
-                    .iter()
-                    .find(|document| document.name == unchanged_name),
-                before_manifest
-                    .documents
-                    .iter()
-                    .find(|document| document.name == unchanged_name),
-                "C-only update changed the {unchanged_name} envelope"
-            );
+        for (key, value) in before.table.metadata().properties() {
+            assert_eq!(after.table.metadata().properties().get(key), Some(value));
         }
-        let before_configuration = before_manifest
-            .documents
-            .iter()
-            .find(|document| document.name == "configuration")
-            .expect("initial configuration envelope");
-        let after_configuration = after_manifest
-            .documents
-            .iter()
-            .find(|document| document.name == "configuration")
-            .expect("updated configuration envelope");
-        assert_ne!(after_configuration.revision, before_configuration.revision);
-        assert!(matches!(
-            after_configuration.attachment,
-            crate::document_storage::envelope::IcebergDocumentAttachmentV1::TableMetadata
-        ));
     }
 
     fn application_document_evidence(
@@ -4695,65 +4677,85 @@ mod tests {
     }
 
     #[test]
-    fn application_document_reconcile_is_exact_positive_and_mismatch_stays_unknown() {
+    fn keyed_marker_reconcile_checks_every_exact_value_and_mismatch_stays_unknown() {
+        use novarocks_spi::connector::{
+            ConnectorMarkerKey, ConnectorMarkerValue, KeyedMarkerWrite, KeyedMutation,
+        };
         let (_executor, _warehouse, provider) = document_provider();
-        let table = managed_table(&provider);
-        let update = application_document_update_fixture(&provider, &table);
-        let exact = application_document_evidence(
-            &provider,
-            &update,
-            update.operation_marker.clone(),
-            update.manifest_digest,
-        );
+        let table = guarded_table(&provider);
+        let markers = KeyedMarkerWrite {
+            markers: (1..=2)
+                .map(|index| {
+                    (
+                        ConnectorMarkerKey {
+                            owner: "novarocks.mv".into(),
+                            name: "pending".into(),
+                            binding: format!("attempt-{index}"),
+                        },
+                        ConnectorMarkerValue {
+                            format: ConnectorDocumentFormat::try_new("novarocks.mv", "pending", 1)
+                                .unwrap(),
+                            content: Bytes::from_static(b"intent"),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let request =
+            keyed_channel_request(&provider, &table, KeyedMutation::Markers(markers.clone()));
+        let loaded = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .unwrap();
+        let properties: BTreeMap<_, _> = crate::document_storage::keyed::write::marker_properties(
+            loaded.table.metadata(),
+            &markers,
+        )
+        .unwrap()
+        .into_iter()
+        .collect();
+        let make = |properties| {
+            evidence(
+                &provider,
+                request.operation_id,
+                "keyed-documents",
+                IcebergMutationEvidenceTarget::KeyedMarkers {
+                    namespace: table.namespace.to_string(),
+                    table: table.table.to_string(),
+                    table_uuid: loaded.table.metadata().uuid().to_string(),
+                    operation_id: request.operation_id.to_bytes(),
+                    properties,
+                },
+            )
+            .unwrap()
+        };
+        provider.execute(request.clone()).unwrap();
         assert!(matches!(
             provider
-                .execute(update.request.clone())
-                .expect("execute update"),
+                .reconcile(ConnectorCatalogMutationReconcileRequest {
+                    evidence: make(properties.clone()),
+                    context: context()
+                })
+                .unwrap(),
             ExternalMutationOutcome::KnownCommitted { .. }
         ));
-
-        let reconciled = provider
-            .reconcile(ConnectorCatalogMutationReconcileRequest {
-                evidence: exact,
-                context: context(),
-            })
-            .expect("reconcile exact application-document update");
-        assert!(matches!(
-            reconciled,
-            ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::Applied,
-                finalization: ExternalMutationFinalization::Complete,
-                ..
-            }
-        ));
-
-        let mismatches = [
-            application_document_evidence(
-                &provider,
-                &update,
-                "foreign-operation".to_string(),
-                update.manifest_digest,
-            ),
-            application_document_evidence(
-                &provider,
-                &update,
-                update.operation_marker.clone(),
-                [0xA5; 32],
-            ),
-        ];
-        for mismatched in mismatches {
-            let expected_operation = mismatched.operation_id();
-            let reconciled = provider
-                .reconcile(ConnectorCatalogMutationReconcileRequest {
-                    evidence: mismatched,
-                    context: context(),
-                })
-                .expect("reconcile mismatched application-document evidence");
-            assert!(matches!(
-                reconciled,
-                ExternalMutationOutcome::CommitUnknown { evidence, .. }
-                    if evidence.operation_id() == expected_operation
-            ));
+        for (key, _) in &markers.markers {
+            let mut mismatch = properties.clone();
+            mismatch.insert(
+                crate::document_storage::keyed::keys::marker_key(key),
+                crate::document_storage::keyed::envelope::encode_marker(
+                    key,
+                    &ConnectorMarkerValue {
+                        format: ConnectorDocumentFormat::try_new("novarocks.mv", "pending", 1)
+                            .unwrap(),
+                        content: Bytes::from_static(b"different"),
+                    },
+                )
+                .unwrap(),
+            );
+            assert!(
+                matches!(provider.reconcile(ConnectorCatalogMutationReconcileRequest {evidence:make(mismatch),context:context()}).unwrap(),ExternalMutationOutcome::CommitUnknown {evidence,..} if evidence.operation_id()==request.operation_id)
+            );
         }
     }
 
