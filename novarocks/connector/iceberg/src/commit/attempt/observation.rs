@@ -67,10 +67,35 @@ pub(crate) struct ProtocolObservation {
     pub status_code: Option<u16>,
     pub header_names: Vec<String>,
 }
+/// Both valid receipt projections are built before dispatch. The recorded
+/// effect selects facts; receipt projection never decides publication.
+#[derive(Clone)]
+pub(crate) struct PublicationReceipts<R> {
+    applied: R,
+    no_op: R,
+}
+impl<R: Clone> PublicationReceipts<R> {
+    pub(crate) fn same(receipt: R) -> Self {
+        Self {
+            applied: receipt.clone(),
+            no_op: receipt,
+        }
+    }
+    pub(crate) fn for_effects(applied: R, no_op: R) -> Self {
+        Self { applied, no_op }
+    }
+    fn for_effect(&self, effect: novarocks_spi::connector::ExternalMutationEffect) -> R {
+        match effect {
+            novarocks_spi::connector::ExternalMutationEffect::Applied => self.applied.clone(),
+            novarocks_spi::connector::ExternalMutationEffect::NoOp => self.no_op.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Checked<R> {
     evidence: ExternalMutationEvidence,
-    receipt: R,
+    receipts: PublicationReceipts<R>,
     retained: Vec<ObjectIdentity>,
     descriptor: PublicationDescriptor,
     attempt: Option<AttemptToken>,
@@ -249,7 +274,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             .collect();
         self.prepare(Checked {
             evidence,
-            receipt,
+            receipts: PublicationReceipts::same(receipt),
             retained,
             descriptor: PublicationDescriptor::frozen(request)?,
             attempt: Some(request.artifacts().attempt()),
@@ -266,9 +291,27 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
         attribution: AttributionPlan,
         preparation: ConnectorRequestContext,
     ) -> Result<JournalEntryRef> {
+        self.prepare_catalog_with_receipts(
+            evidence,
+            PublicationReceipts::same(receipt),
+            targets,
+            request,
+            attribution,
+            preparation,
+        )
+    }
+    pub(crate) fn prepare_catalog_with_receipts(
+        &self,
+        evidence: ExternalMutationEvidence,
+        receipts: PublicationReceipts<R>,
+        targets: Vec<String>,
+        request: Vec<u8>,
+        attribution: AttributionPlan,
+        preparation: ConnectorRequestContext,
+    ) -> Result<JournalEntryRef> {
         self.prepare(Checked {
             evidence,
-            receipt,
+            receipts,
             retained: Vec::new(),
             descriptor: PublicationDescriptor::catalog(
                 self.operation.to_bytes(),
@@ -644,7 +687,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             Phase::Committed(proof, checked, finalization) => {
                 ExternalMutationOutcome::KnownCommitted {
                     effect: proof.effect,
-                    receipt: checked.receipt,
+                    receipt: checked.receipts.for_effect(proof.effect),
                     finalization,
                 }
             }
@@ -691,7 +734,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
                 };
                 ExternalMutationOutcome::KnownCommitted {
                     effect: proof.effect,
-                    receipt: checked.receipt,
+                    receipt: checked.receipts.for_effect(proof.effect),
                     finalization: merge_finalization(finalization, report.cleanup.finalization()),
                 }
             }
@@ -699,7 +742,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
                 Phase::Committed(proof, checked, finalization) => {
                     ExternalMutationOutcome::KnownCommitted {
                         effect: proof.effect,
-                        receipt: checked.receipt,
+                        receipt: checked.receipts.for_effect(proof.effect),
                         finalization,
                     }
                 }
@@ -769,7 +812,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
                 };
                 ExternalMutationOutcome::KnownCommitted {
                     effect: proof.effect,
-                    receipt: checked.receipt,
+                    receipt: checked.receipts.for_effect(proof.effect),
                     finalization: merge_finalization(
                         owner_finalization,
                         merge_finalization(
@@ -821,7 +864,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             Phase::Committed(proof, checked, finalization) => {
                 ExternalMutationOutcome::KnownCommitted {
                     effect: proof.effect,
-                    receipt: checked.receipt,
+                    receipt: checked.receipts.for_effect(proof.effect),
                     finalization: merge_finalization(
                         finalization,
                         merge_finalization(
@@ -1882,6 +1925,122 @@ mod tests {
         ));
         assert!(journal.descriptor().unwrap().first_dispatch_ms.is_none());
     }
+    #[tokio::test]
+    async fn catalog_receipt_seeds_follow_recorded_effect_and_survive_late_bridge_failure() {
+        use novarocks_spi::connector::ExternalMutationEffect;
+        for effect in [
+            ExternalMutationEffect::Applied,
+            ExternalMutationEffect::NoOp,
+        ] {
+            let (template, preparation) = catalog_journal();
+            let checked = template.current_checked().unwrap();
+            let journal = PublicationJournal::new(template.operation);
+            let entry = journal
+                .prepare_catalog_with_receipts(
+                    checked.evidence,
+                    PublicationReceipts::for_effects(
+                        "attempt UUID/digest".to_string(),
+                        "no attempted metadata published".to_string(),
+                    ),
+                    vec!["db.t".into()],
+                    b"frozen conditional create".to_vec(),
+                    AttributionPlan::ObserveOnly,
+                    preparation.clone(),
+                )
+                .unwrap();
+            let issued = journal
+                .claim_dispatch()
+                .unwrap()
+                .begin_dispatch(&preparation, &MemoryDispatchBarrier)
+                .await
+                .unwrap();
+            assert_eq!(issued, entry);
+            let mut proof = CommitProof::applied(None);
+            proof.effect = effect;
+            journal.conclude_entry(entry, DispatchEvidence::Applied { proof });
+            let expected = if effect == ExternalMutationEffect::Applied {
+                "attempt UUID/digest"
+            } else {
+                "no attempted metadata published"
+            };
+            assert!(
+                matches!(journal.catalog_entry_outcome(entry), ExternalMutationOutcome::KnownCommitted { effect: actual, receipt, .. } if actual == effect && receipt == expected)
+            );
+            assert!(
+                matches!(journal.catalog_bridge_failure("late bridge failure".into()), ExternalMutationOutcome::KnownCommitted { effect: actual, receipt, finalization: ExternalMutationFinalization::Failed(_) } if actual == effect && receipt == expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_unknown_never_selects_no_op_receipt_and_positive_proof_selects_applied_facts()
+    {
+        let (template, preparation) = catalog_journal();
+        let checked = template.current_checked().unwrap();
+        let journal = PublicationJournal::new(template.operation);
+        let uuid = Uuid::from_u128(1);
+        let location = "s3://warehouse/db/t/metadata/v1.metadata.json".to_string();
+        let digest = "a".repeat(64);
+        let entry = journal
+            .prepare_catalog_with_receipts(
+                checked.evidence,
+                PublicationReceipts::for_effects(
+                    "attempt UUID/digest".to_string(),
+                    "no attempted metadata published".to_string(),
+                ),
+                vec!["db.t".into()],
+                b"frozen conditional create".to_vec(),
+                AttributionPlan::ExactMetadata {
+                    table_uuid: uuid,
+                    location: location.clone(),
+                    digest: digest.clone(),
+                },
+                preparation.clone(),
+            )
+            .unwrap();
+        journal
+            .claim_dispatch()
+            .unwrap()
+            .begin_dispatch(&preparation, &MemoryDispatchBarrier)
+            .await
+            .unwrap();
+        journal.conclude_entry(
+            entry,
+            DispatchEvidence::Unknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "lost response",
+                ),
+                observation: ProtocolObservation {
+                    adapter: "hadoop",
+                    stage: "conditional-create",
+                    ..Default::default()
+                },
+            },
+        );
+        assert!(matches!(
+            journal.catalog_entry_outcome(entry),
+            ExternalMutationOutcome::CommitUnknown { .. }
+        ));
+        assert!(matches!(
+            journal.catalog_bridge_failure("later failure".into()),
+            ExternalMutationOutcome::CommitUnknown { .. }
+        ));
+        journal
+            .append_positive_proof(
+                entry.0,
+                PositiveAttributionObservation::ExactMetadata {
+                    table_uuid: uuid,
+                    location,
+                    digest,
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(journal.catalog_entry_outcome(entry), ExternalMutationOutcome::KnownCommitted { effect: novarocks_spi::connector::ExternalMutationEffect::Applied, receipt, .. } if receipt == "attempt UUID/digest")
+        );
+    }
+
     #[tokio::test]
     async fn delayed_finalization_is_bound_to_its_entry_after_next_request_is_prepared() {
         let (journal, preparation) = catalog_journal();
