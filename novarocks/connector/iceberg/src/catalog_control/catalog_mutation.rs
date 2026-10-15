@@ -6050,8 +6050,8 @@ mod tests {
         assert!(error.table_object_binding_failure().is_none());
         match provider.execute(request).expect("typed known refusal") {
             ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
-                assert_eq!(failure.kind(), failure_kind(kind));
-                assert_eq!(failure.to_string(), error.to_string());
+                assert_eq!(failure.kind(), failure_kind(error.kind()));
+                assert_eq!(failure.message(), error.to_string());
                 assert!(matches!(cleanup, ExternalMutationFinalization::Complete));
             }
             _ => panic!("definition refusal must be known uncommitted"),
