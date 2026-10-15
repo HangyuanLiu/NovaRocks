@@ -44,7 +44,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(test)]
 use novarocks_fs::FileError;
-use novarocks_fs::{ConditionalCreateOutcome, FileCancellation, FileErrorKind};
+#[cfg(test)]
+use novarocks_fs::FileErrorKind;
+use novarocks_fs::{ConditionalCreateOutcome, FileCancellation};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
@@ -63,12 +65,14 @@ pub(crate) struct HadoopCreateAttemptFacts {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) enum HadoopCreateDisposition {
     Created,
     Existing,
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct HadoopCreateResult {
     pub(crate) disposition: HadoopCreateDisposition,
     /// Kept for the fault tests, which assert the published attempt's identity
@@ -931,6 +935,7 @@ impl HadoopFileSystemCatalog {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn create_table_fenced(
         &self,
         namespace: &NamespaceIdent,
@@ -941,6 +946,7 @@ impl HadoopFileSystemCatalog {
         self.publish_create_attempt(attempt).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn publish_create_attempt(
         &self,
         attempt: HadoopCreateAttempt,
@@ -1068,6 +1074,7 @@ impl HadoopFileSystemCatalog {
         })
     }
 
+    #[cfg(test)]
     async fn classify_existing_v1(
         &self,
         attempt: &HadoopCreateAttempt,
@@ -1251,12 +1258,22 @@ impl Catalog for HadoopFileSystemCatalog {
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> Result<Namespace> {
-        let marker = self.namespace_marker_location(namespace);
-        self.file_io
-            .new_output(&marker)?
-            .write(Vec::new().into())
-            .await?;
-        Ok(Namespace::with_properties(namespace.clone(), properties))
+        #[cfg(not(test))]
+        {
+            Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::FeatureUnsupported,
+                "Catalog mutation must use its prepared publication journal",
+            ))
+        }
+        #[cfg(test)]
+        {
+            let marker = self.namespace_marker_location(namespace);
+            self.file_io
+                .new_output(&marker)?
+                .write(Vec::new().into())
+                .await?;
+            Ok(Namespace::with_properties(namespace.clone(), properties))
+        }
     }
 
     async fn get_namespace(&self, namespace: &NamespaceIdent) -> Result<Namespace> {
@@ -1290,13 +1307,33 @@ impl Catalog for HadoopFileSystemCatalog {
         _namespace: &NamespaceIdent,
         _properties: HashMap<String, String>,
     ) -> Result<()> {
-        Ok(())
+        #[cfg(not(test))]
+        {
+            Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Catalog mutation must use its prepared publication journal",
+            ))
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
     }
 
     async fn drop_namespace(&self, namespace: &NamespaceIdent) -> Result<()> {
-        self.file_io
-            .delete(self.namespace_marker_location(namespace))
-            .await
+        #[cfg(not(test))]
+        {
+            Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::FeatureUnsupported,
+                "Catalog mutation must use its prepared publication journal",
+            ))
+        }
+        #[cfg(test)]
+        {
+            self.file_io
+                .delete(self.namespace_marker_location(namespace))
+                .await
+        }
     }
 
     async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
@@ -1312,25 +1349,35 @@ impl Catalog for HadoopFileSystemCatalog {
         namespace: &NamespaceIdent,
         creation: TableCreation,
     ) -> Result<Table> {
-        let result = self
-            .create_table_fenced(namespace, creation, uuid::Uuid::now_v7().to_string())
-            .await
-            .map_err(|failure| {
-                let kind = match failure.kind {
-                    HadoopCreateFailureKind::Invalid => ErrorKind::DataInvalid,
-                    HadoopCreateFailureKind::Unsupported => ErrorKind::FeatureUnsupported,
-                    HadoopCreateFailureKind::Uncommitted => ErrorKind::Unexpected,
-                    HadoopCreateFailureKind::Unknown => ErrorKind::Unexpected,
-                };
-                Error::new(kind, failure.message)
-            })?;
-        if result.disposition == HadoopCreateDisposition::Existing {
-            return Err(Error::new(
-                ErrorKind::TableAlreadyExists,
-                format!("table already exists: {}", result.table.identifier()),
-            ));
+        #[cfg(not(test))]
+        {
+            Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::FeatureUnsupported,
+                "Catalog mutation must use its prepared publication journal",
+            ))
         }
-        Ok(result.table)
+        #[cfg(test)]
+        {
+            let result = self
+                .create_table_fenced(namespace, creation, uuid::Uuid::now_v7().to_string())
+                .await
+                .map_err(|failure| {
+                    let kind = match failure.kind {
+                        HadoopCreateFailureKind::Invalid => ErrorKind::DataInvalid,
+                        HadoopCreateFailureKind::Unsupported => ErrorKind::FeatureUnsupported,
+                        HadoopCreateFailureKind::Uncommitted => ErrorKind::Unexpected,
+                        HadoopCreateFailureKind::Unknown => ErrorKind::Unexpected,
+                    };
+                    Error::new(kind, failure.message)
+                })?;
+            if result.disposition == HadoopCreateDisposition::Existing {
+                return Err(Error::new(
+                    ErrorKind::TableAlreadyExists,
+                    format!("table already exists: {}", result.table.identifier()),
+                ));
+            }
+            Ok(result.table)
+        }
     }
 
     /// Load a table through the filesystem-owned catalog pointer.
@@ -1368,19 +1415,29 @@ impl Catalog for HadoopFileSystemCatalog {
     /// hint self-repairs on the next read: the drop simply did not commit, and
     /// retrying is safe. Removing `v1.metadata.json` is the commit point.
     async fn drop_table(&self, table: &TableIdent) -> Result<()> {
-        let key = Self::table_key(table);
-        self.tables.lock().await.remove(&key);
+        #[cfg(not(test))]
+        {
+            Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::FeatureUnsupported,
+                "Catalog mutation must use its prepared publication journal",
+            ))
+        }
+        #[cfg(test)]
+        {
+            let key = Self::table_key(table);
+            self.tables.lock().await.remove(&key);
 
-        let table_location = self.table_location(table);
-        let hint = Self::version_hint_path(&table_location);
-        if self.file_io.exists(&hint).await? {
-            self.file_io.delete(&hint).await?;
+            let table_location = self.table_location(table);
+            let hint = Self::version_hint_path(&table_location);
+            if self.file_io.exists(&hint).await? {
+                self.file_io.delete(&hint).await?;
+            }
+            let canonical = Self::metadata_path(&table_location, 1);
+            if self.file_io.exists(&canonical).await? {
+                self.file_io.delete(&canonical).await?;
+            }
+            Ok(())
         }
-        let canonical = Self::metadata_path(&table_location, 1);
-        if self.file_io.exists(&canonical).await? {
-            self.file_io.delete(&canonical).await?;
-        }
-        Ok(())
     }
 
     async fn purge_table(&self, _table: &TableIdent) -> Result<()> {
@@ -1402,34 +1459,54 @@ impl Catalog for HadoopFileSystemCatalog {
     }
 
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> Result<()> {
-        let src_key = Self::table_key(src);
-        let dest_key = Self::table_key(dest);
-        let mut guard = self.tables.lock().await;
-        if let Some(loc) = guard.remove(&src_key) {
-            guard.insert(dest_key, loc);
+        #[cfg(not(test))]
+        {
+            Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::FeatureUnsupported,
+                "Catalog mutation must use its prepared publication journal",
+            ))
         }
-        Ok(())
+        #[cfg(test)]
+        {
+            let src_key = Self::table_key(src);
+            let dest_key = Self::table_key(dest);
+            let mut guard = self.tables.lock().await;
+            if let Some(loc) = guard.remove(&src_key) {
+                guard.insert(dest_key, loc);
+            }
+            Ok(())
+        }
     }
 
     /// Register an existing table that already has metadata written at
     /// `metadata_location`.
     async fn register_table(&self, table: &TableIdent, metadata_location: String) -> Result<Table> {
-        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location)
-            .await
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("read metadata from {}: {}", metadata_location, e),
-                )
-            })?;
+        #[cfg(not(test))]
+        {
+            Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::FeatureUnsupported,
+                "Catalog mutation must use its prepared publication journal",
+            ))
+        }
+        #[cfg(test)]
+        {
+            let metadata = TableMetadata::read_from(&self.file_io, &metadata_location)
+                .await
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("read metadata from {}: {}", metadata_location, e),
+                    )
+                })?;
 
-        let key = Self::table_key(table);
-        self.tables
-            .lock()
-            .await
-            .insert(key, metadata_location.clone());
+            let key = Self::table_key(table);
+            self.tables
+                .lock()
+                .await
+                .insert(key, metadata_location.clone());
 
-        self.build_table(table.clone(), metadata, metadata_location)
+            self.build_table(table.clone(), metadata, metadata_location)
+        }
     }
 
     /// Apply a table commit (requirements + updates) and write a new versioned

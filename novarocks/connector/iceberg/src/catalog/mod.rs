@@ -197,6 +197,7 @@ impl CatalogCreateIntent {
 /// The other three arms are terminal, and `Unsupported` among them is the only
 /// one that promises nothing was attempted.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) enum CatalogTransactionStart {
     Ready(Box<transaction::Transaction>),
     /// Refused before any external side effect. Safe to report to the user as
@@ -215,6 +216,8 @@ pub(crate) enum CatalogTransactionStart {
         evidence: error::CatalogCommitEvidence,
     },
 }
+
+#[cfg(test)]
 
 impl CatalogTransactionStart {
     /// True when admission failed and left the caller owning everything it
@@ -249,6 +252,7 @@ pub(crate) struct CatalogDropTableReceipt {
 
 /// Inputs for a conditional create.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct ConditionalCreateRequest {
     pub(crate) namespace: CatalogNamespaceName,
     pub(crate) creation: crate::iceberg::TableCreation,
@@ -262,6 +266,7 @@ pub(crate) struct ConditionalCreateRequest {
 /// Opaque above this module: the concrete attempt state belongs to whichever
 /// implementation prepared it.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct ConditionalCreateAttempt {
     pub(crate) target: CatalogTableName,
     pub(crate) facts: ConditionalCreateFacts,
@@ -269,9 +274,12 @@ pub(crate) struct ConditionalCreateAttempt {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 enum ConditionalCreateAttemptState {
     Hadoop(Box<crate::hadoop_catalog::HadoopCreateAttempt>),
 }
+
+#[cfg(test)]
 
 impl ConditionalCreateAttempt {
     pub(crate) fn hadoop(
@@ -307,6 +315,7 @@ pub(crate) struct ConditionalCreateFacts {
 // Produced only by `publish_conditional_create`; see the note there.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub(crate) struct ConditionalCreateReceipt {
     pub(crate) facts: ConditionalCreateFacts,
     pub(crate) already_existed: bool,
@@ -349,6 +358,7 @@ pub(crate) enum ConditionalCreateVerdict {
 /// collapsing it: `Conflict` is a definite server rejection, `KnownUncommitted`
 /// proves the request never went out, and `CommitUnknown` means it may have.
 /// Flattening these is how a lost response becomes a duplicate publication.
+#[cfg(test)]
 pub(crate) enum StagedCreateStart {
     Staged {
         /// The table response must not select a FileIO before a vended
@@ -390,6 +400,7 @@ pub(crate) struct StagedPublicationExpectation {
 
 /// What committing a staged create produced.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) enum StagedCommitResult {
     /// The receipt: this publication's snapshot and the table UUID.
     Committed(transaction::CommitProof),
@@ -566,6 +577,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     ///
     /// Every catalog shares the vendored `update_table` mechanism; the REST
     /// owner replaces it with its evidence-producing commit (L12).
+    #[cfg(test)]
     fn commit_dispatch(
         &self,
         ident: crate::iceberg::TableIdent,
@@ -815,10 +827,14 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         ))
     }
 
+    #[cfg(test)]
+
     async fn create_namespace(
         &self,
         namespace: CatalogNamespaceName,
     ) -> CatalogOutcome<CatalogNamespaceName>;
+
+    #[cfg(test)]
 
     async fn drop_namespace(
         &self,
@@ -829,6 +845,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     ///
     /// This removes catalog visibility only. Object deletion is the filesystem
     /// owner's job and may only proceed on `KnownCommitted`; see ADR-0118.
+    #[cfg(test)]
     async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt>;
 
     /// Admit an already committed write without another external mutation.
@@ -846,6 +863,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     // No production caller yet: this is the update-commit half of the
     // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
     #[allow(dead_code)]
+    #[cfg(test)]
     async fn new_transaction(
         &self,
         request: transaction::TransactionRequest,
@@ -857,6 +875,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     /// committed, which is what makes a CTAS absent-or-complete. A catalog with
     /// no such protocol answers `Unsupported`, and never by creating a visible
     /// empty table to fill in afterwards.
+    #[cfg(test)]
     async fn stage_create_table(
         &self,
         namespace: CatalogNamespaceName,
@@ -865,6 +884,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
 
     /// Publish a staged create with exactly one assert-create request,
     /// attributed against `expectation` before any evidence is reported.
+    #[cfg(test)]
     async fn commit_staged_table(
         &self,
         commit: crate::iceberg::TableCommit,
@@ -880,6 +900,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     /// how a catalog kind used to escape the factory.
     ///
     /// Preparing is local: it builds metadata and sends nothing.
+    #[cfg(test)]
     async fn prepare_conditional_create(
         &self,
         request: ConditionalCreateRequest,
@@ -889,6 +910,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     // Reached only by tests, which is the only way the lost-response path can
     // be exercised at all: production publishes through `ConditionalCreateDispatch`.
     #[allow(dead_code)]
+    #[cfg(test)]
     async fn publish_conditional_create(
         &self,
         attempt: ConditionalCreateAttempt,
@@ -931,6 +953,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     ///
     /// The request carries [`CatalogCreateIntent`], and implementations may
     /// accept one intent while refusing another on the same catalog.
+    #[cfg(test)]
     async fn new_create_table_transaction(
         &self,
         request: transaction::CreateTableTransactionRequest,
@@ -940,6 +963,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     // No production caller yet: this is the update-commit half of the
     // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
     #[allow(dead_code)]
+    #[cfg(test)]
     async fn new_create_or_replace_table_transaction(
         &self,
         request: transaction::CreateTableTransactionRequest,
@@ -965,6 +989,7 @@ pub(crate) mod transaction;
 /// executes.
 // No production caller yet: see the note on `new_transaction`.
 #[allow(dead_code)]
+#[cfg(test)]
 fn start_update_table_transaction(
     owner: &(impl NovaRocksCatalog + ?Sized),
     request: transaction::TransactionRequest,
@@ -1001,6 +1026,7 @@ fn start_update_table_transaction(
 }
 
 /// Begin a publication that creates a table through one catalog request.
+#[cfg(test)]
 fn start_create_table_transaction(
     delegate: &delegate::CatalogDelegate,
     request: transaction::CreateTableTransactionRequest,

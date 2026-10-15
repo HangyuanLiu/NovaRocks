@@ -24,14 +24,21 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 
+#[cfg(test)]
+use super::CatalogDropTableReceipt;
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::delegate::CatalogDelegate;
 use super::error::{CatalogOutcome, CatalogUnsupported};
+#[cfg(test)]
 use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use super::{
-    CatalogCreateIntent, CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName,
-    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
-    ConditionalCreateReceipt, ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog,
+    CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, ConditionalCreateEvidence,
+    ConditionalCreateVerdict, NovaRocksCatalog,
+};
+#[cfg(test)]
+use super::{
+    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateReceipt,
+    ConditionalCreateRequest,
 };
 
 /// A Hive Metastore Iceberg catalog.
@@ -309,6 +316,8 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         Err(super::views_unsupported("load_view"))
     }
 
+    #[cfg(test)]
+
     async fn create_namespace(
         &self,
         _namespace: CatalogNamespaceName,
@@ -318,6 +327,8 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         )
     }
 
+    #[cfg(test)]
+
     async fn drop_namespace(
         &self,
         _namespace: CatalogNamespaceName,
@@ -326,6 +337,8 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
             self.refuse_operation(CatalogOperation::DropNamespace, _namespace),
         )
     }
+
+    #[cfg(test)]
 
     async fn drop_table(
         &self,
@@ -344,6 +357,8 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         )
     }
 
+    #[cfg(test)]
+
     async fn stage_create_table(
         &self,
         _namespace: CatalogNamespaceName,
@@ -355,6 +370,8 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         ))
     }
 
+    #[cfg(test)]
+
     async fn commit_staged_table(
         &self,
         _commit: crate::iceberg::TableCommit,
@@ -365,6 +382,8 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
             CatalogTableName::from_identifier(_commit.identifier()),
         ))
     }
+
+    #[cfg(test)]
 
     async fn prepare_conditional_create(
         &self,
@@ -378,6 +397,8 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
             ),
         ))
     }
+
+    #[cfg(test)]
 
     async fn publish_conditional_create(
         &self,
@@ -401,11 +422,15 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         ))
     }
 
+    #[cfg(test)]
+
     async fn new_transaction(&self, _request: TransactionRequest) -> CatalogTransactionStart {
         CatalogTransactionStart::Unsupported(
             self.refuse_operation(CatalogOperation::Append, _request.target),
         )
     }
+
+    #[cfg(test)]
 
     async fn new_create_table_transaction(
         &self,
@@ -416,6 +441,8 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
             request.target,
         ))
     }
+
+    #[cfg(test)]
 
     async fn new_create_or_replace_table_transaction(
         &self,

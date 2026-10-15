@@ -19,41 +19,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The unified provider-private transaction.
-//!
-//! Design: ADR-0118 (docs/adr/ADR-0118-iceberg-provider-private-catalog-owner.md)
-//!
-//! All three constructors on [`super::NovaRocksCatalog`] return this one type.
-//! It exists because the vendored `iceberg::Transaction::commit` cannot express
-//! what the publication contract requires: it returns a plain error and retries
-//! on `Error::retryable()`, so a caller cannot tell a rejected request from a
-//! lost response, and a lost response gets resent.
-//!
-//! This type answers that question instead, and enforces three rules the
-//! previous per-family state machines each restated in their own way:
-//!
-//! 1. **One dispatch.** [`Transaction::commit`] performs exactly one external
-//!    request. It never loops, never reloads-and-resends, and never delegates
-//!    to a layer that would.
-//! 2. **Unknown closes mutation authority.** Once a request may have landed,
-//!    `commit` and `abort` both refuse. The only remaining move is
-//!    [`Transaction::adjudicate`], which is read-only.
-//! 3. **Abort is pre-dispatch only.** Cleanup after a possible dispatch is how
-//!    committed data gets deleted, so the type refuses rather than trusting
-//!    each caller to remember.
+//! Immutable publication proof vocabulary shared by the prepared adapters and
+//! the sole publication journal. The former transaction lifecycle below is
+//! retained only as an independent test oracle; normal builds cannot use it.
 
 use std::sync::Arc;
 
+#[cfg(test)]
 use async_trait::async_trait;
+#[cfg(test)]
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ExternalMutationEffect,
 };
 
+#[cfg(test)]
 use super::error::{
     CatalogCommitEvidence, CatalogOutcome, proves_uncommitted, uncommitted_failure_kind,
 };
+#[cfg(test)]
 use super::{CatalogCreateIntent, CatalogTableName};
+use novarocks_spi::connector::ExternalMutationEffect;
 
 /// The exact identity a publication attempt is bound to.
 ///
@@ -70,10 +55,13 @@ use super::{CatalogCreateIntent, CatalogTableName};
 /// bytes plus the label naming which authority minted it. One identity per
 /// frontier is preserved; inventing one is not.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct TransactionIdentity {
     pub(crate) authority: &'static str,
     pub(crate) bytes: [u8; 16],
 }
+
+#[cfg(test)]
 
 impl TransactionIdentity {
     pub(crate) fn new(authority: &'static str, bytes: [u8; 16]) -> Self {
@@ -122,8 +110,8 @@ pub(crate) struct CommitProof {
     /// Metadata file the target now resolves to, when the operation publishes
     /// one directly.
     pub(crate) metadata_location: Option<Arc<str>>,
-    /// Digest of that metadata, read back after publication rather than taken
-    /// from what was sent -- which is what makes it authoritative.
+    /// Digest of the exact metadata bytes acknowledged by the storage request
+    /// or positively read back. This fact does not itself decide the effect.
     pub(crate) metadata_digest: Option<Arc<str>>,
     pub(crate) metadata_predecessor: MetadataPredecessorObservation,
     /// Whether the catalog state changed or the request was already satisfied.
@@ -202,6 +190,7 @@ impl CommitProof {
 /// The transaction advances on this directly (L12): nothing above the
 /// mechanism infers a definite rejection from an error type.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) enum CommitDispatchResult {
     /// The publication is present.
     Applied(CommitProof),
@@ -211,6 +200,8 @@ pub(crate) enum CommitDispatchResult {
     /// The request may have taken effect.
     Unknown { message: String },
 }
+
+#[cfg(test)]
 
 impl CommitDispatchResult {
     /// Classify a vendored catalog result with the shared judgment, which reads
@@ -238,6 +229,7 @@ impl CommitDispatchResult {
 /// commit, a Hadoop conditional metadata publication, or a plain
 /// `update_table`. The transaction owns the contract; this owns the mechanism.
 #[async_trait]
+#[cfg(test)]
 pub(crate) trait CatalogCommitDispatch: std::fmt::Debug + Send + Sync {
     /// Issue **exactly one** external request.
     ///
@@ -264,6 +256,7 @@ pub(crate) trait CatalogCommitDispatch: std::fmt::Debug + Send + Sync {
 /// What the transaction is publishing. Kept private to the catalog module so
 /// callers above see one lifecycle rather than four.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) enum TransactionShape {
     Existing,
     Create(CatalogCreateIntent),
@@ -272,6 +265,7 @@ pub(crate) enum TransactionShape {
 
 /// Where the single frontier currently stands.
 #[derive(Debug)]
+#[cfg(test)]
 enum TransactionState {
     /// Admitted. Nothing external has been attempted yet.
     Admitted,
@@ -285,6 +279,7 @@ enum TransactionState {
 
 /// Inputs for a transaction against an existing table.
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub(crate) struct TransactionRequest {
     pub(crate) operation: super::admission::CatalogOperation,
     pub(crate) identity: TransactionIdentity,
@@ -304,6 +299,7 @@ pub(crate) struct TransactionRequest {
 /// Not `Clone`: the vendored `TableCreation` is not cloneable, and a creation
 /// request is consumed by exactly one attempt anyway.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct CreateTableTransactionRequest {
     pub(crate) identity: TransactionIdentity,
     pub(crate) target: CatalogTableName,
@@ -324,6 +320,7 @@ pub(crate) struct CreateTableTransactionRequest {
 /// operation, and a caller should read what it needs without asking which kind
 /// of catalog admitted it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct AdmissionFacts {
     pub(crate) table_uuid: Option<Arc<str>>,
     pub(crate) metadata_location: Option<Arc<str>>,
@@ -332,6 +329,7 @@ pub(crate) struct AdmissionFacts {
 
 /// One publication frontier, from admission to a terminal outcome.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct Transaction {
     identity: TransactionIdentity,
     target: CatalogTableName,
@@ -342,6 +340,8 @@ pub(crate) struct Transaction {
     admission: AdmissionFacts,
     state: TransactionState,
 }
+
+#[cfg(test)]
 
 impl Transaction {
     pub(crate) fn new(

@@ -30,12 +30,18 @@ use super::admission::{
 };
 use super::delegate::CatalogDelegate;
 use super::error::{CatalogOutcome, CatalogUnsupported};
+#[cfg(test)]
 use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use super::{
-    CatalogCreateIntent, CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName,
-    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
-    ConditionalCreateFacts, ConditionalCreateReceipt, ConditionalCreateRequest,
+    CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, ConditionalCreateEvidence,
     ConditionalCreateVerdict, NovaRocksCatalog,
+};
+#[cfg(test)]
+use super::{CatalogDropTableReceipt, ConditionalCreateFacts};
+#[cfg(test)]
+use super::{
+    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateReceipt,
+    ConditionalCreateRequest,
 };
 
 /// A Hadoop filesystem Iceberg catalog.
@@ -630,6 +636,8 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         Err(super::views_unsupported("load_view"))
     }
 
+    #[cfg(test)]
+
     async fn create_namespace(
         &self,
         namespace: CatalogNamespaceName,
@@ -643,6 +651,8 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         self.delegate.create_namespace(namespace).await
     }
 
+    #[cfg(test)]
+
     async fn drop_namespace(
         &self,
         namespace: CatalogNamespaceName,
@@ -654,6 +664,8 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         }
         self.delegate.drop_namespace(namespace).await
     }
+
+    #[cfg(test)]
 
     async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt> {
         if let Err(reason) =
@@ -687,6 +699,7 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
     ///
     /// Local only: it builds metadata and sends nothing, which is what lets the
     /// caller freeze publication evidence before the attempt is dispatched.
+    #[cfg(test)]
     async fn stage_create_table(
         &self,
         _namespace: CatalogNamespaceName,
@@ -697,6 +710,8 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         ))
     }
 
+    #[cfg(test)]
+
     async fn commit_staged_table(
         &self,
         _commit: crate::iceberg::TableCommit,
@@ -706,6 +721,8 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
             "Hadoop Iceberg catalog has no staged-create protocol",
         ))
     }
+
+    #[cfg(test)]
 
     async fn prepare_conditional_create(
         &self,
@@ -749,6 +766,8 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
             Err(failure) => map_prepare_failure(&failure),
         }
     }
+
+    #[cfg(test)]
 
     async fn publish_conditional_create(
         &self,
@@ -822,6 +841,8 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         })
     }
 
+    #[cfg(test)]
+
     async fn new_transaction(&self, request: TransactionRequest) -> CatalogTransactionStart {
         if let Err(reason) =
             self.admit_operation(&request.operation, &request.target.clone().into())
@@ -830,6 +851,8 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         }
         super::start_update_table_transaction(self, request)
     }
+
+    #[cfg(test)]
 
     async fn new_create_table_transaction(
         &self,
@@ -910,6 +933,8 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         }
     }
 
+    #[cfg(test)]
+
     async fn new_create_or_replace_table_transaction(
         &self,
         _request: CreateTableTransactionRequest,
@@ -919,6 +944,8 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         ))
     }
 }
+
+#[cfg(test)]
 
 fn facts_from_hadoop(
     facts: &crate::hadoop_catalog::HadoopCreateAttemptFacts,
@@ -932,6 +959,7 @@ fn facts_from_hadoop(
 }
 
 /// Preparing sends nothing, so its failures are all proven uncommitted.
+#[cfg(test)]
 fn map_prepare_failure<T>(
     failure: &crate::hadoop_catalog::HadoopCreateFailure,
 ) -> CatalogOutcome<T> {
@@ -952,6 +980,7 @@ fn map_prepare_failure<T>(
 
 // Used by `publish_conditional_create`, which only tests reach.
 #[allow(dead_code)]
+#[cfg(test)]
 fn map_publish_failure<T>(
     failure: &crate::hadoop_catalog::HadoopCreateFailure,
     facts: &ConditionalCreateFacts,
@@ -972,6 +1001,8 @@ fn map_publish_failure<T>(
         ),
     }
 }
+
+#[cfg(test)]
 
 fn message(failure: &crate::hadoop_catalog::HadoopCreateFailure) -> String {
     match failure.facts.as_ref() {

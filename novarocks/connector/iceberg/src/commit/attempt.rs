@@ -62,6 +62,8 @@ pub(crate) trait Publisher: Send + Sync {
 pub(crate) type RecoveryPreflight =
     std::sync::Arc<dyn Fn(&FrozenRequest, &IcebergCommitOperation) -> Result<()> + Send + Sync>;
 
+#[cfg(test)]
+
 pub(crate) struct TransitionalPublisher {
     pub catalog_operation: crate::catalog::admission::CatalogOperation,
     pub catalog: std::sync::Arc<dyn crate::catalog::NovaRocksCatalog>,
@@ -72,6 +74,7 @@ pub(crate) struct TransitionalPublisher {
 }
 
 #[async_trait]
+#[cfg(test)]
 impl Publisher for TransitionalPublisher {
     async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
         attempt.check_active()?;
@@ -136,6 +139,7 @@ impl Publisher for TransitionalPublisher {
 
 /// Eager writes retain the catalog-owner transaction frontier. The request is
 /// complete before admission and is borrowed only by the single dispatch.
+#[cfg(test)]
 pub(crate) struct OwnerPublisher {
     pub target: TransitionalPublisher,
     pub operation: super::model::OperationToken,
@@ -143,6 +147,7 @@ pub(crate) struct OwnerPublisher {
 }
 
 #[async_trait]
+#[cfg(test)]
 impl Publisher for OwnerPublisher {
     async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
         self.target.load_target(attempt).await

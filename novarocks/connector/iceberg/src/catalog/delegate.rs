@@ -27,14 +27,17 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorListingBound, ConnectorListingCollector,
-    ConnectorMutationFailureKind, ExternalMutationEffect,
 };
 use novarocks_types::naming::normalize_identifier;
 
 use crate::iceberg::{Catalog, NamespaceIdent, TableIdent};
 
+#[cfg(test)]
+use super::CatalogDropTableReceipt;
 use super::error::{CatalogCommitEvidence, CatalogOutcome, map_read_error};
-use super::{CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName};
+use super::{CatalogNamespaceName, CatalogTableName};
+#[cfg(test)]
+use novarocks_spi::connector::{ConnectorMutationFailureKind, ExternalMutationEffect};
 
 fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
@@ -226,6 +229,7 @@ impl CatalogDelegate {
 
     // ---- Direct mutations ----------------------------------------------
 
+    #[cfg(test)]
     pub(super) async fn create_namespace(
         &self,
         namespace: CatalogNamespaceName,
@@ -251,6 +255,7 @@ impl CatalogDelegate {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn drop_namespace(
         &self,
         namespace: CatalogNamespaceName,
@@ -279,6 +284,7 @@ impl CatalogDelegate {
     /// never on a path prefix. A table that cannot be loaded still gets
     /// dropped; the receipt simply carries no cleanup facts, which correctly
     /// leaves nothing eligible for deletion.
+    #[cfg(test)]
     pub(super) async fn drop_table(
         &self,
         table: CatalogTableName,
@@ -314,6 +320,7 @@ impl CatalogDelegate {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn register_table(
         &self,
         table: CatalogTableName,
@@ -341,6 +348,7 @@ impl CatalogDelegate {
         }
     }
 
+    #[cfg(test)]
     fn classify<T>(
         &self,
         error: &crate::iceberg::Error,

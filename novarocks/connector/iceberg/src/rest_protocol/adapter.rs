@@ -270,14 +270,24 @@ impl Catalog for RestTransitionalAdapter {
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> Result<Namespace> {
-        let outcome = self
-            .endpoints
-            .create_namespace(namespace, properties.clone())
-            .await;
-        if !matches!(outcome.evidence, RestEvidence::Applied { .. }) {
-            return Err(failed(outcome, Conflict409::NamespaceExists));
+        #[cfg(not(test))]
+        {
+            Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::FeatureUnsupported,
+                "Catalog mutation must use its prepared publication journal",
+            ))
         }
-        Ok(Namespace::with_properties(namespace.clone(), properties))
+        #[cfg(test)]
+        {
+            let outcome = self
+                .endpoints
+                .create_namespace(namespace, properties.clone())
+                .await;
+            if !matches!(outcome.evidence, RestEvidence::Applied { .. }) {
+                return Err(failed(outcome, Conflict409::NamespaceExists));
+            }
+            Ok(Namespace::with_properties(namespace.clone(), properties))
+        }
     }
 
     async fn get_namespace(&self, namespace: &NamespaceIdent) -> Result<Namespace> {
@@ -303,10 +313,20 @@ impl Catalog for RestTransitionalAdapter {
     }
 
     async fn drop_namespace(&self, namespace: &NamespaceIdent) -> Result<()> {
-        let outcome = self.endpoints.drop_namespace(namespace).await;
-        match outcome.evidence {
-            RestEvidence::Applied { .. } => Ok(()),
-            _ => Err(failed(outcome, Conflict409::None)),
+        #[cfg(not(test))]
+        {
+            Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::FeatureUnsupported,
+                "Catalog mutation must use its prepared publication journal",
+            ))
+        }
+        #[cfg(test)]
+        {
+            let outcome = self.endpoints.drop_namespace(namespace).await;
+            match outcome.evidence {
+                RestEvidence::Applied { .. } => Ok(()),
+                _ => Err(failed(outcome, Conflict409::None)),
+            }
         }
     }
 
@@ -323,27 +343,37 @@ impl Catalog for RestTransitionalAdapter {
         namespace: &NamespaceIdent,
         creation: TableCreation,
     ) -> Result<Table> {
-        let ident = TableIdent::new(namespace.clone(), creation.name.clone());
-        let request = CreateTableRequest {
-            name: creation.name,
-            location: creation.location,
-            schema: creation.schema,
-            partition_spec: creation.partition_spec,
-            write_order: creation.sort_order,
-            stage_create: None,
-            properties: creation.properties,
-        };
-        let outcome = self.endpoints.create_table(namespace, request).await;
-        if !matches!(outcome.evidence, RestEvidence::Applied { .. }) {
-            return Err(failed(outcome, Conflict409::TableExists));
+        #[cfg(not(test))]
+        {
+            Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::FeatureUnsupported,
+                "Catalog mutation must use its prepared publication journal",
+            ))
         }
-        let (response, evidence) = decode::<LoadTableResult>(outcome)?;
-        self.materialize(
-            ident,
-            response.metadata_location,
-            response.metadata,
-            evidence,
-        )
+        #[cfg(test)]
+        {
+            let ident = TableIdent::new(namespace.clone(), creation.name.clone());
+            let request = CreateTableRequest {
+                name: creation.name,
+                location: creation.location,
+                schema: creation.schema,
+                partition_spec: creation.partition_spec,
+                write_order: creation.sort_order,
+                stage_create: None,
+                properties: creation.properties,
+            };
+            let outcome = self.endpoints.create_table(namespace, request).await;
+            if !matches!(outcome.evidence, RestEvidence::Applied { .. }) {
+                return Err(failed(outcome, Conflict409::TableExists));
+            }
+            let (response, evidence) = decode::<LoadTableResult>(outcome)?;
+            self.materialize(
+                ident,
+                response.metadata_location,
+                response.metadata,
+                evidence,
+            )
+        }
     }
 
     async fn load_table(&self, table: &TableIdent) -> Result<Table> {
@@ -362,10 +392,20 @@ impl Catalog for RestTransitionalAdapter {
     }
 
     async fn drop_table(&self, table: &TableIdent) -> Result<()> {
-        let outcome = self.endpoints.drop_table(table).await;
-        match outcome.evidence {
-            RestEvidence::Applied { .. } => Ok(()),
-            _ => Err(failed(outcome, Conflict409::None)),
+        #[cfg(not(test))]
+        {
+            Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::FeatureUnsupported,
+                "Catalog mutation must use its prepared publication journal",
+            ))
+        }
+        #[cfg(test)]
+        {
+            let outcome = self.endpoints.drop_table(table).await;
+            match outcome.evidence {
+                RestEvidence::Applied { .. } => Ok(()),
+                _ => Err(failed(outcome, Conflict409::None)),
+            }
         }
     }
 

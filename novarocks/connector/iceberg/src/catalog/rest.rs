@@ -27,24 +27,32 @@ use novarocks_spi::connector::{
     ConnectorListingCollector,
 };
 
+#[cfg(test)]
+use super::CatalogDropTableReceipt;
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::delegate::CatalogDelegate;
 use super::error::CatalogOutcome;
+#[cfg(test)]
 use super::transaction::{CatalogCommitDispatch, CommitDispatchResult, CommitProof};
+#[cfg(test)]
 use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use super::{
-    CatalogCreateIntent, CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName,
-    CatalogTablePage, CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
-    ConditionalCreateReceipt, ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog,
+    CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, CatalogTablePage,
+    ConditionalCreateEvidence, ConditionalCreateVerdict, NovaRocksCatalog,
+};
+#[cfg(test)]
+use super::{
+    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateReceipt,
+    ConditionalCreateRequest,
 };
 use crate::catalog_runtime::RestAccessDelegationMode;
 use crate::loaded_table::{IcebergAccessDelegation, IcebergLoadedTable, parse_rest_delegation};
 use crate::rest_protocol::adapter::RestTransitionalAdapter;
 use crate::rest_protocol::boundary::sanitize_upstream_error;
 use crate::rest_protocol::endpoints::RestEndpoints;
-use crate::rest_protocol::evidence::{
-    AttributionExpectation, ExpectedSnapshot, NotDispatchedCause, RestEvidence, StageVerdict,
-};
+use crate::rest_protocol::evidence::{AttributionExpectation, ExpectedSnapshot};
+#[cfg(test)]
+use crate::rest_protocol::evidence::{NotDispatchedCause, RestEvidence, StageVerdict};
 
 /// A REST Iceberg catalog.
 ///
@@ -544,6 +552,8 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         self.adapter.clone()
     }
 
+    #[cfg(test)]
+
     fn commit_dispatch(
         &self,
         ident: crate::iceberg::TableIdent,
@@ -1005,6 +1015,8 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         Ok(loaded)
     }
 
+    #[cfg(test)]
+
     async fn create_namespace(
         &self,
         namespace: CatalogNamespaceName,
@@ -1018,6 +1030,8 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         self.delegate.create_namespace(namespace).await
     }
 
+    #[cfg(test)]
+
     async fn drop_namespace(
         &self,
         namespace: CatalogNamespaceName,
@@ -1029,6 +1043,8 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         }
         self.delegate.drop_namespace(namespace).await
     }
+
+    #[cfg(test)]
 
     async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt> {
         if let Err(reason) =
@@ -1057,6 +1073,8 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             novarocks_spi::connector::ExternalMutationEffect::NoOp,
         )
     }
+
+    #[cfg(test)]
 
     async fn stage_create_table(
         &self,
@@ -1155,6 +1173,8 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             access_delegation: staged.1,
         }
     }
+
+    #[cfg(test)]
 
     async fn commit_staged_table(
         &self,
@@ -1257,6 +1277,8 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         view_outcome(outcome.evidence, view)
     }
 
+    #[cfg(test)]
+
     async fn prepare_conditional_create(
         &self,
         _request: ConditionalCreateRequest,
@@ -1265,6 +1287,8 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             "REST Iceberg catalog publishes a create through the catalog, not through a conditional metadata write",
         )
     }
+
+    #[cfg(test)]
 
     async fn publish_conditional_create(
         &self,
@@ -1285,6 +1309,8 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         ))
     }
 
+    #[cfg(test)]
+
     async fn new_transaction(&self, request: TransactionRequest) -> CatalogTransactionStart {
         if let Err(reason) =
             self.admit_operation(&request.operation, &request.target.clone().into())
@@ -1293,6 +1319,8 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         }
         super::start_update_table_transaction(self, request)
     }
+
+    #[cfg(test)]
 
     async fn new_create_table_transaction(
         &self,
@@ -1335,6 +1363,8 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             }
         }
     }
+
+    #[cfg(test)]
 
     async fn new_create_or_replace_table_transaction(
         &self,
@@ -1387,6 +1417,7 @@ fn view_outcome(
 /// The REST owner's evidence-producing publication of a frozen request (L12):
 /// one NovaRocks commit, confirmed from the minimal view only.
 #[derive(Debug)]
+#[cfg(test)]
 struct RestCommitDispatch {
     endpoints: Arc<RestEndpoints>,
     ident: crate::iceberg::TableIdent,
@@ -1395,6 +1426,7 @@ struct RestCommitDispatch {
 }
 
 #[async_trait]
+#[cfg(test)]
 impl CatalogCommitDispatch for RestCommitDispatch {
     async fn dispatch_once(
         &self,
@@ -1511,6 +1543,7 @@ impl CatalogCommitDispatch for RestCommitDispatch {
 /// the creation itself. That difference is this implementation's to know, which
 /// is why it used to be a catalog-kind comparison at the call site and is not
 /// any more.
+#[cfg(test)]
 fn with_explicit_format_version(
     creation: crate::iceberg::TableCreation,
 ) -> crate::iceberg::TableCreation {

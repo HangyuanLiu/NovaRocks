@@ -1056,6 +1056,7 @@ impl RestEvidence {
     }
 
     /// Map a stage-create evidence to its saga branch (L19).
+    #[cfg(test)]
     pub(crate) fn into_stage_verdict(self) -> StageVerdict {
         match split(self) {
             Split::Applied(receipt) => StageVerdict::Staged { receipt },
@@ -1068,6 +1069,7 @@ impl RestEvidence {
     }
 
     /// Map a CTAS final-commit evidence to its publication branch.
+    #[cfg(test)]
     pub(crate) fn into_ctas_commit_verdict(self) -> CtasCommitVerdict {
         match split(self) {
             Split::Applied(receipt) => CtasCommitVerdict::Committed { receipt },
@@ -1109,6 +1111,7 @@ fn split(evidence: RestEvidence) -> Split {
 /// attributable success is staged, everything else -- 400 and 404 included --
 /// is unknown.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) enum StageVerdict {
     Staged {
         receipt: RestReceipt,
@@ -1123,6 +1126,7 @@ pub(crate) enum StageVerdict {
 
 /// The publication branch of the CTAS final commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) enum CtasCommitVerdict {
     Committed {
         receipt: RestReceipt,

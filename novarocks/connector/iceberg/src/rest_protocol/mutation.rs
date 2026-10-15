@@ -207,6 +207,7 @@ impl RestEndpoints {
     }
 
     /// Create a table immediately (static access only).
+    #[cfg(test)]
     pub(crate) async fn create_table(
         &self,
         namespace: &NamespaceIdent,
@@ -225,6 +226,7 @@ impl RestEndpoints {
 
     /// Stage a create (`stage-create: true`), asking for vended credentials in
     /// both access modes, as today (L23).
+    #[cfg(test)]
     pub(crate) async fn stage_create(
         &self,
         namespace: &NamespaceIdent,
@@ -242,6 +244,7 @@ impl RestEndpoints {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn create_namespace(
         &self,
         namespace: &NamespaceIdent,
@@ -262,6 +265,7 @@ impl RestEndpoints {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn drop_namespace(&self, namespace: &NamespaceIdent) -> MutationOutcome {
         self.mutate::<()>(
             Method::DELETE,
@@ -275,6 +279,7 @@ impl RestEndpoints {
     }
 
     /// Drop a table. `purgeRequested` is never sent.
+    #[cfg(test)]
     pub(crate) async fn drop_table(&self, table: &TableIdent) -> MutationOutcome {
         self.mutate::<()>(
             Method::DELETE,

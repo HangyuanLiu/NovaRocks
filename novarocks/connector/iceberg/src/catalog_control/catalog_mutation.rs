@@ -43,10 +43,7 @@ use crate::catalog::admission::{
     CatalogAdmissionRequest, CatalogAdmissionTarget, CatalogOperation, connector_unsupported,
 };
 use crate::catalog::error::CatalogOutcome;
-use crate::catalog::transaction::{TransactionIdentity, TransactionRequest};
-use crate::catalog::{
-    CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, CatalogTransactionStart,
-};
+use crate::catalog::{CatalogCreateIntent, CatalogNamespaceName, CatalogTableName};
 use crate::commit::{RefActionOutcome, execute_ref_action, lower_ref_action};
 use crate::iceberg::spec::{
     FormatVersion, NestedField, Operation, PrimitiveType, Schema, Snapshot, SnapshotReference,

@@ -512,6 +512,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
     }
 
     /// The adapter has returned. No await, cancellation or fallible receipt I/O.
+    #[cfg(test)]
     pub(crate) fn conclude_dispatch(&self, evidence: DispatchEvidence) {
         self.conclude_entry(
             self.current_entry()
@@ -519,6 +520,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             evidence,
         );
     }
+    #[cfg(test)]
     fn conclude_outcome_entry(
         &self,
         entry_ref: JournalEntryRef,
@@ -549,6 +551,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
         }
     }
     // Removed when all adapters use DispatchEvidence directly in T3.
+    #[cfg(test)]
     pub(crate) fn conclude(&self, outcome: &CatalogOutcome<CommitProof>) {
         let evidence = match outcome {
             CatalogOutcome::KnownCommitted { receipt, .. } => DispatchEvidence::Applied {
@@ -751,6 +754,7 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
             },
         }
     }
+    #[cfg(test)]
     pub(crate) fn observe(&self, inner: Arc<dyn Publisher>) -> impl Publisher + use<R> {
         ObservedPublisher {
             inner,
@@ -1070,11 +1074,13 @@ fn merge_finalization(
     }
 }
 
+#[cfg(test)]
 struct ObservedPublisher<R> {
     inner: Arc<dyn Publisher>,
     journal: PublicationJournal<R>,
 }
 #[async_trait]
+#[cfg(test)]
 impl<R: Clone + Send + Sync> Publisher for ObservedPublisher<R> {
     async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
         self.inner.load_target(attempt).await

@@ -19,14 +19,20 @@
 //!
 //! Design: ADR-0118 (docs/adr/ADR-0118-iceberg-provider-private-catalog-owner.md)
 
+#[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(test)]
 use async_trait::async_trait;
+#[cfg(test)]
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
+#[cfg(test)]
 use crate::commit::model::FrozenRequest;
+#[cfg(test)]
 use crate::iceberg::{Catalog, TableIdent};
 
+#[cfg(test)]
 use super::transaction::{CatalogCommitDispatch, CommitDispatchResult, CommitProof};
 
 /// Publishes to an existing table with exactly one `update_table`.
@@ -44,6 +50,7 @@ use super::transaction::{CatalogCommitDispatch, CommitDispatchResult, CommitProo
 // No production caller yet: this is the update-commit half of the lifecycle,
 // wired when `commit/**` migrates off `vendored_client`.
 #[allow(dead_code)]
+#[cfg(test)]
 pub(super) struct UpdateTableDispatch {
     client: Arc<dyn Catalog>,
     ident: TableIdent,
@@ -58,6 +65,7 @@ pub(super) struct UpdateTableDispatch {
 }
 
 #[allow(dead_code)]
+#[cfg(test)]
 impl UpdateTableDispatch {
     pub(super) fn new(
         client: Arc<dyn Catalog>,
@@ -73,6 +81,8 @@ impl UpdateTableDispatch {
         }
     }
 }
+
+#[cfg(test)]
 
 impl UpdateTableDispatch {
     async fn dispatch_inner(
@@ -102,6 +112,7 @@ impl UpdateTableDispatch {
 }
 
 #[async_trait]
+#[cfg(test)]
 impl CatalogCommitDispatch for UpdateTableDispatch {
     async fn dispatch_once(&self, staged: Option<&FrozenRequest>) -> CommitDispatchResult {
         CommitDispatchResult::from_catalog_result(self.dispatch_inner(staged).await)
@@ -185,12 +196,15 @@ pub(crate) fn committed_snapshot_id(
 /// The Hadoop implementation does not use this: its linearization point is a
 /// conditional metadata write in storage (ADR-0077), not a catalog call.
 #[derive(Debug)]
+#[cfg(test)]
 pub(super) struct CreateTableDispatch {
     client: Arc<dyn Catalog>,
     namespace: crate::iceberg::NamespaceIdent,
     creation: std::sync::Mutex<Option<crate::iceberg::TableCreation>>,
     ident: TableIdent,
 }
+
+#[cfg(test)]
 
 impl CreateTableDispatch {
     pub(super) fn new(
@@ -207,6 +221,8 @@ impl CreateTableDispatch {
         }
     }
 }
+
+#[cfg(test)]
 
 impl CreateTableDispatch {
     async fn dispatch_inner(
@@ -243,6 +259,7 @@ impl CreateTableDispatch {
 }
 
 #[async_trait]
+#[cfg(test)]
 impl CatalogCommitDispatch for CreateTableDispatch {
     async fn dispatch_once(&self, staged: Option<&FrozenRequest>) -> CommitDispatchResult {
         CommitDispatchResult::from_catalog_result(self.dispatch_inner(staged).await)
@@ -282,6 +299,7 @@ impl CatalogCommitDispatch for CreateTableDispatch {
 /// The attempt is consumed on first dispatch, so a second commit cannot resend
 /// it even if the transaction's own guard were bypassed.
 #[derive(Debug)]
+#[cfg(test)]
 pub(super) struct ConditionalCreateDispatch {
     /// The filesystem client that owns the conditional-create primitive. It
     /// stays inside this module, which is the whole point of the boundary.
@@ -289,6 +307,8 @@ pub(super) struct ConditionalCreateDispatch {
     attempt: std::sync::Mutex<Option<crate::hadoop_catalog::HadoopCreateAttempt>>,
     evidence: super::ConditionalCreateEvidence,
 }
+
+#[cfg(test)]
 
 impl ConditionalCreateDispatch {
     pub(super) fn new(
@@ -303,6 +323,8 @@ impl ConditionalCreateDispatch {
         }
     }
 }
+
+#[cfg(test)]
 
 impl ConditionalCreateDispatch {
     async fn dispatch_inner(
@@ -380,6 +402,7 @@ impl ConditionalCreateDispatch {
 }
 
 #[async_trait]
+#[cfg(test)]
 impl CatalogCommitDispatch for ConditionalCreateDispatch {
     async fn dispatch_once(&self, staged: Option<&FrozenRequest>) -> CommitDispatchResult {
         CommitDispatchResult::from_catalog_result(self.dispatch_inner(staged).await)

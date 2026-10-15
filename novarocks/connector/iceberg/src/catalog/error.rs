@@ -169,6 +169,7 @@ pub(crate) enum CatalogOutcome<T> {
 /// [`CatalogOutcome::into_known_committed`], so an unknown or uncommitted
 /// outcome simply cannot produce the value that object deletion requires.
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) struct KnownCommitted(());
 
 impl<T> CatalogOutcome<T> {
@@ -209,6 +210,7 @@ impl<T> CatalogOutcome<T> {
     /// Returns `None` for every other arm, which is the point: `CommitUnknown`
     /// must leak rather than delete, and `Unsupported` / `KnownUncommitted`
     /// have nothing published to clean up after.
+    #[cfg(test)]
     pub(crate) fn into_known_committed(
         self,
     ) -> Option<(T, ExternalMutationEffect, KnownCommitted)> {
@@ -295,6 +297,7 @@ pub(crate) fn read_error_kind(kind: crate::iceberg::ErrorKind) -> ConnectorError
 /// vendored client would resend, which is a different question from whether the
 /// request already took effect, and acting on it here is exactly the behavior
 /// this owner exists to prevent.
+#[cfg(test)]
 pub(crate) fn proves_uncommitted(error: &crate::iceberg::Error) -> bool {
     use crate::iceberg::ErrorKind;
     // A REST failure carries its typed evidence; only the evidence decides
@@ -345,6 +348,7 @@ pub(crate) fn uncommitted_failure_kind(
 
 /// Whether REST evidence proves nothing was applied: never dispatched, or
 /// rejected with a status the server raises before publishing (D13).
+#[cfg(test)]
 fn evidence_proves_uncommitted(evidence: &crate::rest_protocol::evidence::RestEvidence) -> bool {
     matches!(
         evidence,
@@ -358,6 +362,7 @@ fn evidence_proves_uncommitted(evidence: &crate::rest_protocol::evidence::RestEv
 ///
 /// The `Unsupported` arm is unreachable from here by construction: once a
 /// request may have left the process, refusing it is no longer an option.
+#[cfg(test)]
 pub(crate) fn classify_dispatched_error<T>(
     error: &crate::iceberg::Error,
     evidence: impl FnOnce() -> CatalogCommitEvidence,
@@ -379,6 +384,7 @@ pub(crate) fn classify_dispatched_error<T>(
 /// request was dispatched. Treat it exactly like a lost response.
 // No production caller yet: the wired bridge sites classify inline.
 #[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn classify_bridge_failure<T>(
     message: &str,
     evidence: CatalogCommitEvidence,

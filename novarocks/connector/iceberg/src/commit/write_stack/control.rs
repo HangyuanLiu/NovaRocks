@@ -68,9 +68,9 @@ use novarocks_spi::connector::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::catalog::CatalogTransactionStart;
 use crate::catalog::error::CatalogOutcome;
-use crate::catalog::transaction::{TransactionIdentity, TransactionRequest};
+#[cfg(test)]
+use crate::catalog::transaction::TransactionIdentity;
 use crate::commit::write_stack::domain::{
     IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment, IcebergCommitHandle,
     IcebergContentRange, IcebergDataBranchRecipe, IcebergDocumentPublicationFacts,
@@ -296,6 +296,7 @@ pub(crate) fn validate_context(context: &ConnectorRequestContext) -> Result<(), 
     Ok(())
 }
 
+#[cfg(test)]
 async fn commit_eager_frontier(
     frontier: &mut crate::catalog::transaction::Transaction,
     context: &ConnectorRequestContext,
