@@ -216,6 +216,12 @@ impl RestRequest {
         }
     }
 
+    /// Retains the exact bytes whose fingerprint the publication journal froze.
+    pub(crate) fn with_encoded_json_body(mut self, bytes: Vec<u8>) -> Self {
+        self.body = Some(bytes);
+        self
+    }
+
     /// Attaches a JSON body; serialization failure means not written.
     pub(crate) fn with_json_body<T: serde::Serialize + ?Sized>(
         mut self,

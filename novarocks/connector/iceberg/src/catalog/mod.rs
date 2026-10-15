@@ -66,8 +66,9 @@ pub(crate) mod hive;
 #[cfg(feature = "mem-1-m07-hms-listing-observe")]
 pub(crate) mod hms_listing_observer;
 pub(crate) mod listing_admission;
-pub(crate) mod rest;
 pub(crate) mod publication;
+pub(crate) mod publication_dispatch;
+pub(crate) mod rest;
 pub(crate) mod table_coordination;
 pub(crate) mod view_request;
 

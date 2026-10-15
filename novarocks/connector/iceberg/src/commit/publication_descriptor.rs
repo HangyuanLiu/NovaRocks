@@ -137,16 +137,51 @@ impl AttributionPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum RecoveryPrincipalScope {
+    Anonymous,
+    CatalogGeneration { generation: [u8; 16] },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecoveryBinding {
-    pub generation: String,
+    pub generation: [u8; 16],
     pub method: String,
     pub endpoint: String,
     pub warehouse: Option<String>,
     pub query: Vec<(String, String)>,
-    pub principal_scope: String,
+    pub principal_scope: RecoveryPrincipalScope,
     pub deduplication_domain: String,
     pub lifetime: Option<std::time::Duration>,
+}
+
+impl RecoveryBinding {
+    pub(crate) fn validate_generation(&self, generation: [u8; 16]) -> Result<()> {
+        let url = reqwest::Url::parse(&self.endpoint)
+            .map_err(|_| Error::new(ErrorKind::DataInvalid, "Invalid REST recovery endpoint"))?;
+        let query: Vec<_> = url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        if self.generation != generation
+            || matches!(&self.principal_scope, RecoveryPrincipalScope::CatalogGeneration { generation: principal } if *principal != generation)
+            || !matches!(self.method.as_str(), "POST" | "DELETE")
+            || !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+            || self.deduplication_domain.is_empty()
+            || query != self.query
+            || self.lifetime.is_some_and(|duration| duration.is_zero())
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "REST recovery binding differs from its exact generation or request scope",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,6 +329,9 @@ impl PublicationDescriptor {
                 "Invalid frozen publication descriptor",
             ));
         }
+        if let Some(binding) = &self.binding {
+            binding.validate_generation(binding.generation)?;
+        }
         Ok(())
     }
 }
@@ -335,12 +373,14 @@ mod tests {
         )
         .unwrap();
         descriptor.binding = Some(RecoveryBinding {
-            generation: "generation-1".into(),
+            generation: [2; 16],
             method: "POST".into(),
             endpoint: "https://catalog.example/v1/namespaces".into(),
             warehouse: None,
             query: vec![],
-            principal_scope: "generation-bound".into(),
+            principal_scope: RecoveryPrincipalScope::CatalogGeneration {
+                generation: [2; 16],
+            },
             deduplication_domain: "catalog.example".into(),
             lifetime: Some(std::time::Duration::from_nanos(1)),
         });

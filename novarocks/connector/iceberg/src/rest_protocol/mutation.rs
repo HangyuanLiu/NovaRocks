@@ -24,6 +24,8 @@
 //! writes) keeps the complete success document; owner commits decode only the
 //! minimal view, chunk by chunk.
 
+pub(crate) mod prepared;
+
 use std::collections::HashMap;
 
 use reqwest::Method;
@@ -35,7 +37,6 @@ use uuid::Uuid;
 use crate::catalog::view_request::{ValidatedViewReplace, ViewCreate, ViewSchema};
 use crate::iceberg::spec::Schema;
 use crate::iceberg::{NamespaceIdent, TableCommit, TableIdent};
-use crate::rest_protocol::wire::{CommitTableRequest, CreateNamespaceRequest, CreateTableRequest};
 use crate::rest_protocol::binding::SessionBinding;
 use crate::rest_protocol::endpoints::{RestEndpoints, VENDED_CREDENTIALS};
 use crate::rest_protocol::evidence::{
@@ -47,6 +48,7 @@ use crate::rest_protocol::json::{JsonScanner, ScanError, ViewSink, scan_complete
 use crate::rest_protocol::minimal_view::{
     MutationView, NamespaceSink, TableResponseSink, ViewMutationSink,
 };
+use crate::rest_protocol::wire::{CommitTableRequest, CreateNamespaceRequest, CreateTableRequest};
 
 // Design: ADR-0176 (docs/adr/ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md)
 // NovaRocks owns the view wire vocabulary: the upstream REST crate has no
@@ -1229,8 +1231,7 @@ mod scratch_probe {
             &expect,
         );
         println!("evidence: {evidence:?}");
-        let decoded =
-            serde_json::from_slice::<crate::rest_protocol::wire::LoadTableResult>(&bytes);
+        let decoded = serde_json::from_slice::<crate::rest_protocol::wire::LoadTableResult>(&bytes);
         println!("decode ok: {}", decoded.is_ok());
     }
 }

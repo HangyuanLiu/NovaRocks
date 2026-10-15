@@ -264,6 +264,7 @@ impl fmt::Debug for PropertyValue {
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct TableResponseView {
     pub(crate) metadata_location: LocationField,
+    pub(crate) metadata_predecessor: crate::catalog::transaction::MetadataPredecessorObservation,
     pub(crate) table_uuid: Option<String>,
     /// `Some` exactly when the request named a snapshot.
     pub(crate) snapshot: Option<SnapshotCheck>,
@@ -299,6 +300,10 @@ pub(crate) enum TableNode {
     TargetRefSnapshotId,
     Properties,
     Property(usize),
+    MetadataLog,
+    MetadataLogEntry,
+    MetadataLogFile,
+    MetadataLogTimestamp,
 }
 
 /// Sink for the table-response view.
@@ -319,6 +324,14 @@ pub(crate) struct TableResponseSink {
     snapshot_present: bool,
     ref_snapshot_id: Option<i64>,
     properties: Vec<PropertyValue>,
+    seen_metadata_log: bool,
+    metadata_log_invalid: bool,
+    log_entry_valid: bool,
+    seen_log_file: bool,
+    seen_log_timestamp: bool,
+    log_file: Option<String>,
+    log_timestamp: Option<i64>,
+    metadata_predecessor: crate::catalog::transaction::MetadataPredecessorObservation,
 }
 
 impl TableResponseSink {
@@ -341,6 +354,14 @@ impl TableResponseSink {
             snapshot_present: false,
             ref_snapshot_id: None,
             properties: vec![PropertyValue::Absent; keys],
+            seen_metadata_log: false,
+            metadata_log_invalid: false,
+            log_entry_valid: false,
+            seen_log_file: false,
+            seen_log_timestamp: false,
+            log_file: None,
+            log_timestamp: None,
+            metadata_predecessor: Default::default(),
         }
     }
 }
@@ -389,6 +410,33 @@ impl ViewSink for TableResponseSink {
                 expect_kind(kind, &[Number], "metadata.refs.<target>.snapshot-id")?;
                 return Ok(INTEGER_TEXT_LIMIT);
             }
+            TableNode::MetadataLog => {
+                if kind != Array {
+                    self.metadata_log_invalid = true;
+                }
+            }
+            TableNode::MetadataLogEntry => {
+                self.log_entry_valid = kind == Object;
+                if !self.log_entry_valid {
+                    self.metadata_log_invalid = true;
+                }
+                self.log_file = None;
+                self.log_timestamp = None;
+                self.seen_log_file = false;
+                self.seen_log_timestamp = false;
+            }
+            TableNode::MetadataLogFile => {
+                if kind == String {
+                    return Ok(METADATA_LOCATION_LIMIT);
+                }
+                self.log_entry_valid = false;
+            }
+            TableNode::MetadataLogTimestamp => {
+                if kind == Number {
+                    return Ok(INTEGER_TEXT_LIMIT);
+                }
+                self.log_entry_valid = false;
+            }
             TableNode::Properties => expect_kind(kind, &[Object, Null], "metadata.properties")?,
             TableNode::Property(_) => {
                 expect_kind(kind, &[String], "metadata.properties")?;
@@ -416,6 +464,27 @@ impl ViewSink for TableResponseSink {
             (TableNode::Metadata, "table-uuid") => {
                 first(&mut self.seen_uuid, "metadata.table-uuid")?;
                 Some(TableNode::TableUuid)
+            }
+            (TableNode::Metadata, "metadata-log") => {
+                if self.seen_metadata_log {
+                    self.metadata_log_invalid = true;
+                }
+                self.seen_metadata_log = true;
+                Some(TableNode::MetadataLog)
+            }
+            (TableNode::MetadataLogEntry, "metadata-file") => {
+                if self.seen_log_file {
+                    self.log_entry_valid = false;
+                }
+                self.seen_log_file = true;
+                Some(TableNode::MetadataLogFile)
+            }
+            (TableNode::MetadataLogEntry, "timestamp-ms") => {
+                if self.seen_log_timestamp {
+                    self.log_entry_valid = false;
+                }
+                self.seen_log_timestamp = true;
+                Some(TableNode::MetadataLogTimestamp)
             }
             (TableNode::Metadata, "snapshots") if self.request.snapshot.is_some() => {
                 first(&mut self.seen_snapshots, "metadata.snapshots")?;
@@ -468,6 +537,7 @@ impl ViewSink for TableResponseSink {
     fn element(&mut self, array: TableNode, _index: u64) -> Result<Option<TableNode>, ScanError> {
         Ok(match array {
             TableNode::Snapshots => Some(TableNode::Snapshot),
+            TableNode::MetadataLog => Some(TableNode::MetadataLogEntry),
             _ => None,
         })
     }
@@ -482,6 +552,19 @@ impl ViewSink for TableResponseSink {
             }
             TableNode::TableUuid => {
                 self.table_uuid = retained_string(value, "metadata.table-uuid")?;
+            }
+            TableNode::MetadataLogFile => match value {
+                Scalar::Str(text) if !text.is_empty() => self.log_file = Some(text.to_owned()),
+                _ => self.log_entry_valid = false,
+            },
+            TableNode::MetadataLogTimestamp => {
+                self.log_timestamp =
+                    retained_integer(value, "metadata.metadata-log[].timestamp-ms")
+                        .ok()
+                        .flatten();
+                if self.log_timestamp.is_none() {
+                    self.log_entry_valid = false;
+                }
             }
             TableNode::SnapshotId => {
                 let id = retained_integer(value, "metadata.snapshots[].snapshot-id")?;
@@ -506,7 +589,23 @@ impl ViewSink for TableResponseSink {
         Ok(())
     }
 
-    fn close(&mut self, _node: TableNode) -> Result<(), ScanError> {
+    fn close(&mut self, node: TableNode) -> Result<(), ScanError> {
+        if node == TableNode::MetadataLogEntry {
+            use crate::catalog::transaction::MetadataPredecessorObservation;
+            self.metadata_predecessor = match (
+                self.log_entry_valid,
+                self.log_file.take(),
+                self.log_timestamp.take(),
+            ) {
+                (true, Some(location), Some(timestamp_ms)) => {
+                    MetadataPredecessorObservation::Candidate {
+                        location,
+                        timestamp_ms,
+                    }
+                }
+                _ => MetadataPredecessorObservation::Unusable,
+            };
+        }
         Ok(())
     }
 
@@ -527,6 +626,11 @@ impl ViewSink for TableResponseSink {
             .collect();
         Ok(TableResponseView {
             metadata_location: self.metadata_location,
+            metadata_predecessor: if self.metadata_log_invalid {
+                crate::catalog::transaction::MetadataPredecessorObservation::Unusable
+            } else {
+                self.metadata_predecessor
+            },
             table_uuid: self.table_uuid,
             snapshot,
             target_ref,
@@ -1859,5 +1963,92 @@ mod tests {
             Err(ScanError::DuplicateField("metadata.table-uuid"))
         );
         assert_split_invariant(BackendAcquisitionSink::new, document.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod metadata_log_tests {
+    use super::*;
+    use crate::catalog::transaction::MetadataPredecessorObservation;
+    use crate::rest_protocol::evidence::{
+        AttributionExpectation, BodyRead, DispatchStage, RestEvidence, classify,
+    };
+    use crate::rest_protocol::json::scan_complete;
+
+    fn view(metadata_log: Option<serde_json::Value>) -> TableResponseView {
+        let mut response = serde_json::json!({"metadata-location":"s3://warehouse/metadata/response.json", "metadata":{"table-uuid":uuid::Uuid::nil()}});
+        if let Some(log) = metadata_log {
+            response["metadata"]["metadata-log"] = log;
+        }
+        scan_complete(
+            TableResponseSink::new(TableViewRequest::default()),
+            &serde_json::to_vec(&response).unwrap(),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn response_log_retains_only_its_last_predecessor_as_a_non_authoritative_clue() {
+        let view = view(Some(serde_json::json!([
+            {"timestamp-ms":1,"metadata-file":"s3://warehouse/metadata/planning-base.json"},
+            {"timestamp-ms":2,"metadata-file":"s3://warehouse/metadata/actual-predecessor.json"}
+        ])));
+        assert_eq!(
+            view.metadata_predecessor,
+            MetadataPredecessorObservation::Candidate {
+                location: "s3://warehouse/metadata/actual-predecessor.json".into(),
+                timestamp_ms: 2,
+            }
+        );
+        let expect = AttributionExpectation::table_commit(uuid::Uuid::nil(), None).unwrap();
+        let evidence = classify(
+            &DispatchStage::Status {
+                code: 200,
+                header_names: vec![],
+            },
+            BodyRead::Complete(MutationView::Table(view)),
+            &expect,
+        );
+        let RestEvidence::Applied { receipt } = evidence else {
+            panic!("valid table success must remain Applied")
+        };
+        assert!(matches!(
+            receipt.metadata_predecessor,
+            MetadataPredecessorObservation::Candidate {
+                timestamp_ms: 2,
+                ..
+            }
+        ));
+        assert!(!format!("{:?}", receipt.metadata_predecessor).contains("actual-predecessor"));
+    }
+    #[test]
+    fn missing_or_unusable_diagnostics_cannot_downgrade_decisive_table_evidence() {
+        assert_eq!(
+            view(None).metadata_predecessor,
+            MetadataPredecessorObservation::NotReported
+        );
+        for log in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!([{"metadata-file":"valid", "timestamp-ms":"wrong-type"}]),
+            serde_json::json!([{"metadata-file":"x".repeat(METADATA_LOCATION_LIMIT+1), "timestamp-ms":1}]),
+        ] {
+            let view = view(Some(log));
+            assert_eq!(
+                view.metadata_predecessor,
+                MetadataPredecessorObservation::Unusable
+            );
+            let expect = AttributionExpectation::table_commit(uuid::Uuid::nil(), None).unwrap();
+            assert!(matches!(
+                classify(
+                    &DispatchStage::Status {
+                        code: 200,
+                        header_names: vec![]
+                    },
+                    BodyRead::Complete(MutationView::Table(view)),
+                    &expect
+                ),
+                RestEvidence::Applied { .. }
+            ));
+        }
     }
 }

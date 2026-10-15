@@ -518,6 +518,7 @@ pub(crate) struct RestReceipt {
     /// Diagnosis and IRU-6a only: in a refreshed response it may belong to a
     /// later version.
     pub(crate) metadata_location: Option<String>,
+    pub(crate) metadata_predecessor: crate::catalog::transaction::MetadataPredecessorObservation,
     pub(crate) ref_relation: RefRelation,
 }
 
@@ -528,6 +529,7 @@ impl RestReceipt {
             snapshot_id: None,
             uuid: None,
             metadata_location: None,
+            metadata_predecessor: Default::default(),
             ref_relation: RefRelation::NotTracked,
         }
     }
@@ -811,6 +813,7 @@ fn attribute_table(
         snapshot_id: expect.snapshot.as_ref().map(ExpectedSnapshot::snapshot_id),
         uuid: Some(uuid),
         metadata_location: view.metadata_location.non_empty().map(str::to_owned),
+        metadata_predecessor: view.metadata_predecessor.clone(),
         ref_relation: relation,
     })
 }

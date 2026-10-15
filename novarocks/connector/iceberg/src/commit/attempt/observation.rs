@@ -17,6 +17,8 @@
 
 //! One journal owns each request's dispatch fact, evidence and finalization.
 
+mod dispatch;
+
 use super::{Publisher, Report};
 use crate::catalog::error::CatalogOutcome;
 use crate::catalog::transaction::CommitProof;
@@ -772,14 +774,6 @@ impl<R> DispatchClaim<R> {
             matches!(entry.phase, EntryPhase::Claimed),
             "Dispatch claim lost its entry"
         );
-        entry.checked.descriptor.first_dispatch_ms = Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock is after Unix epoch")
-                .as_millis()
-                .try_into()
-                .expect("timestamp fits i64"),
-        );
         entry.phase = EntryPhase::Dispatching;
         self.completed = true;
         Ok(JournalEntryRef(self.key))
@@ -920,6 +914,7 @@ impl<R: Clone + Send + Sync> Publisher for ObservedPublisher<R> {
                 );
             }
         };
+        self.journal.mark_dispatch_start(entry_ref);
         let outcome = self.inner.dispatch_once(request).await;
         self.journal.conclude_outcome_entry(entry_ref, &outcome);
         outcome
@@ -1419,7 +1414,7 @@ mod tests {
         assert!(path.exists());
         assert_eq!(fixture.operation.recovery_artifacts(), before);
     }
-    fn catalog_journal() -> (PublicationJournal<String>, ConnectorRequestContext) {
+    pub(super) fn catalog_journal() -> (PublicationJournal<String>, ConnectorRequestContext) {
         catalog_journal_with_attribution(AttributionPlan::ObserveOnly)
     }
     fn catalog_journal_with_attribution(
@@ -1500,7 +1495,7 @@ mod tests {
             .begin_dispatch(&preparation, &MemoryDispatchBarrier)
             .await
             .unwrap();
-        assert!(journal.descriptor().unwrap().first_dispatch_ms.is_some());
+        assert!(journal.descriptor().unwrap().first_dispatch_ms.is_none());
         journal.conclude(&CatalogOutcome::committed(
             CommitProof::applied(None),
             ExternalMutationEffect::Applied,

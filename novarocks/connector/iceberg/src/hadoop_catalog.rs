@@ -25,6 +25,8 @@
 /// - `update_table` manually applies requirements/updates instead of delegating
 ///   to `TableCommit::apply()`, which calls `MetadataLocation::from_str()` and
 ///   only accepts the `{version}-{uuid}.metadata.json` format.
+mod publication;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -125,6 +127,7 @@ enum HadoopCatalogTestFault {
     BeforeConditionalRequest,
     AfterConditionalResponseLoss,
     BeforeHintWrite,
+    AfterMetadataWriteEvidenceExpiry,
     AfterHintWriteResponseLoss,
     AuthoritativeV1Read,
 }
@@ -589,6 +592,84 @@ impl HadoopFileSystemCatalog {
             .build()
     }
 
+    // The optional grant only bounds starting the existing protocol's steps.
+    // Catalog FileIO, hint recovery and numbering remain unchanged until IRU-6c.
+    fn check_publication_budget(
+        budget: Option<crate::catalog::publication::EvidenceContext>,
+    ) -> Result<()> {
+        if budget.is_some_and(|budget| budget.expired()) {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                "Hadoop publication evidence deadline elapsed",
+            )
+            .with_source(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::DeadlineExceeded,
+                "Hadoop publication evidence deadline elapsed",
+            )));
+        }
+        Ok(())
+    }
+
+    async fn table_cache_with_budget(
+        &self,
+        budget: Option<crate::catalog::publication::EvidenceContext>,
+    ) -> Result<tokio::sync::MutexGuard<'_, HashMap<String, String>>> {
+        let guard = match budget {
+            Some(budget) => tokio::time::timeout_at(budget.deadline().into(), self.tables.lock())
+                .await
+                .map_err(|_| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Hadoop publication cache wait deadline elapsed",
+                    )
+                    .with_source(
+                        novarocks_spi::connector::ConnectorError::new(
+                            novarocks_spi::connector::ConnectorErrorKind::DeadlineExceeded,
+                            "Hadoop publication cache wait deadline elapsed",
+                        ),
+                    )
+                })?,
+            None => self.tables.lock().await,
+        };
+        Self::check_publication_budget(budget)?;
+        Ok(guard)
+    }
+
+    async fn load_existing_table_with_budget(
+        &self,
+        table: &TableIdent,
+        budget: Option<crate::catalog::publication::EvidenceContext>,
+    ) -> Result<Table> {
+        Self::check_publication_budget(budget)?;
+        let key = Self::table_key(table);
+        let metadata_location = match self
+            .try_cache_existing_table_with_budget(table, budget)
+            .await?
+        {
+            Some(location) => location,
+            None => {
+                self.table_cache_with_budget(budget).await?.remove(&key);
+                return Err(Error::new(
+                    ErrorKind::TableNotFound,
+                    format!("table not found: {}", key),
+                ));
+            }
+        };
+
+        Self::check_publication_budget(budget)?;
+        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location)
+            .await
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("read metadata from {}: {}", metadata_location, e),
+                )
+            })?;
+
+        Self::check_publication_budget(budget)?;
+        self.build_table(table.clone(), metadata, metadata_location)
+    }
+
     /// Use one request-bound FileIO for every read needed to resolve the
     /// catalog pointer and metadata. The generation's FileIO remains reusable
     /// by later requests and by mutation recovery.
@@ -706,13 +787,24 @@ impl HadoopFileSystemCatalog {
     /// filesystem probe also populates the cache, making subsequent calls
     /// cache-hit fast.
     async fn try_cache_existing_table(&self, table: &TableIdent) -> Result<Option<String>> {
+        self.try_cache_existing_table_with_budget(table, None).await
+    }
+
+    async fn try_cache_existing_table_with_budget(
+        &self,
+        table: &TableIdent,
+        budget: Option<crate::catalog::publication::EvidenceContext>,
+    ) -> Result<Option<String>> {
+        Self::check_publication_budget(budget)?;
         let table_location = self.table_location(table);
         let version = self.read_version_hint(&table_location).await;
+        Self::check_publication_budget(budget)?;
         let metadata_location = if version == 0 {
             let v1 = Self::metadata_path(&table_location, 1);
             if !self.file_io.exists(&v1).await? {
                 return Ok(None);
             }
+            Self::check_publication_budget(budget)?;
             TableMetadata::read_from(&self.file_io, &v1)
                 .await
                 .map_err(|error| {
@@ -721,6 +813,7 @@ impl HadoopFileSystemCatalog {
                         format!("read canonical Hadoop table metadata {v1}: {error}"),
                     )
                 })?;
+            Self::check_publication_budget(budget)?;
             if let Err(error) = self.write_version_hint(&table_location, 1).await {
                 tracing::warn!(
                     "failed to repair Hadoop catalog version hint from canonical v1 metadata: {error}"
@@ -728,6 +821,7 @@ impl HadoopFileSystemCatalog {
             }
             v1
         } else {
+            Self::check_publication_budget(budget)?;
             let hinted = Self::metadata_path(&table_location, version);
             if !self.file_io.exists(&hinted).await? {
                 return Err(Error::new(
@@ -735,6 +829,7 @@ impl HadoopFileSystemCatalog {
                     format!("Hadoop catalog version hint points to missing metadata: {hinted}"),
                 ));
             }
+            Self::check_publication_budget(budget)?;
             TableMetadata::read_from(&self.file_io, &hinted)
                 .await
                 .map_err(|error| {
@@ -746,9 +841,8 @@ impl HadoopFileSystemCatalog {
             hinted
         };
         let key = Self::table_key(table);
-        self.tables
-            .lock()
-            .await
+        self.table_cache_with_budget(budget)
+            .await?
             .insert(key, metadata_location.clone());
         Ok(Some(metadata_location))
     }
@@ -1219,28 +1313,7 @@ impl Catalog for HadoopFileSystemCatalog {
     /// location without first resolving `version-hint.text` would make this
     /// client observe a stale table identity.
     async fn load_table(&self, table: &TableIdent) -> Result<Table> {
-        let key = Self::table_key(table);
-        let metadata_location = match self.try_cache_existing_table(table).await? {
-            Some(location) => location,
-            None => {
-                self.tables.lock().await.remove(&key);
-                return Err(Error::new(
-                    ErrorKind::TableNotFound,
-                    format!("table not found: {}", key),
-                ));
-            }
-        };
-
-        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location)
-            .await
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("read metadata from {}: {}", metadata_location, e),
-                )
-            })?;
-
-        self.build_table(table.clone(), metadata, metadata_location)
+        self.load_existing_table_with_budget(table, None).await
     }
 
     /// Drop the table from the catalog.
@@ -1422,7 +1495,7 @@ mod tests {
         )
     }
 
-    fn test_catalog(location: &str) -> HadoopFileSystemCatalog {
+    pub(super) fn test_catalog(location: &str) -> HadoopFileSystemCatalog {
         let binding = local_test_binding();
         let file_io = crate::fs_io::build_file_io_for_location(location, binding.clone());
         HadoopFileSystemCatalog::new_with_binding(
@@ -1836,7 +1909,7 @@ mod tests {
             .expect("catalog generation remains usable");
     }
 
-    fn test_creation(name: &str) -> TableCreation {
+    pub(super) fn test_creation(name: &str) -> TableCreation {
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::required(
                 1,

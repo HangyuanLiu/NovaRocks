@@ -331,6 +331,10 @@ impl RestAuthOwner {
         })
     }
 
+    pub(crate) fn is_anonymous(&self) -> bool {
+        matches!(self.credential, Credential::Anonymous)
+    }
+
     pub(crate) fn http(&self) -> &RestHttpClient {
         &self.http
     }

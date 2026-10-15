@@ -1010,7 +1010,9 @@ impl CatalogCommitDispatch for RestCommitDispatch {
         let message = evidence.message();
         match evidence {
             RestEvidence::Applied { receipt } => {
-                let proof = CommitProof::applied(receipt.snapshot_id);
+                let mut proof = CommitProof::applied(receipt.snapshot_id);
+                proof.metadata_location = receipt.metadata_location.as_deref().map(Arc::from);
+                proof.metadata_predecessor = receipt.metadata_predecessor;
                 CommitDispatchResult::Applied(match receipt.uuid {
                     Some(uuid) => proof.with_table_uuid(uuid.to_string()),
                     None => proof,

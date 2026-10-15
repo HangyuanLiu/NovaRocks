@@ -100,7 +100,20 @@ impl TransactionIdentity {
 ///
 /// There is deliberately no `Default`: the effect is the one field a proof can
 /// never be vague about, so every proof states it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A response clue for locating the real committed predecessor. It never
+/// grants deletion authority; reclamation validates the metadata chain itself.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub(crate) enum MetadataPredecessorObservation {
+    #[default]
+    NotReported,
+    Candidate {
+        location: String,
+        timestamp_ms: i64,
+    },
+    Unusable,
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct CommitProof {
     /// Snapshot the publication landed on, when the operation produces one.
     pub(crate) snapshot_id: Option<i64>,
@@ -112,8 +125,37 @@ pub(crate) struct CommitProof {
     /// Digest of that metadata, read back after publication rather than taken
     /// from what was sent -- which is what makes it authoritative.
     pub(crate) metadata_digest: Option<Arc<str>>,
+    pub(crate) metadata_predecessor: MetadataPredecessorObservation,
     /// Whether the catalog state changed or the request was already satisfied.
     pub(crate) effect: ExternalMutationEffect,
+}
+
+impl std::fmt::Debug for MetadataPredecessorObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotReported => f.write_str("NotReported"),
+            Self::Candidate { timestamp_ms, .. } => f
+                .debug_struct("Candidate")
+                .field("timestamp_ms", timestamp_ms)
+                .finish_non_exhaustive(),
+            Self::Unusable => f.write_str("Unusable"),
+        }
+    }
+}
+impl std::fmt::Debug for CommitProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommitProof")
+            .field("snapshot_id", &self.snapshot_id)
+            .field("table_uuid", &self.table_uuid)
+            .field(
+                "metadata_location_present",
+                &self.metadata_location.is_some(),
+            )
+            .field("metadata_digest_present", &self.metadata_digest.is_some())
+            .field("metadata_predecessor", &self.metadata_predecessor)
+            .field("effect", &self.effect)
+            .finish()
+    }
 }
 
 impl CommitProof {
@@ -123,6 +165,7 @@ impl CommitProof {
             table_uuid: None,
             metadata_location: None,
             metadata_digest: None,
+            metadata_predecessor: MetadataPredecessorObservation::NotReported,
             effect,
         }
     }
