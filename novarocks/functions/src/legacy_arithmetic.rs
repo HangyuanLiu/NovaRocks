@@ -766,18 +766,7 @@ pub fn eval_add_arrays(
     )? {
         return Ok(arr);
     }
-    let result = eval_numeric_binop_arrays(
-        lhs,
-        rhs,
-        |x, y| {
-            let result = add(x, y)?;
-            Ok(Arc::new(result))
-        },
-        |x, y| {
-            let result = add(x, y)?;
-            Ok(Arc::new(result))
-        },
-    )?;
+    let result = eval_numeric_binop_arrays(lhs, rhs, |x, y| add(x, y), |x, y| add(x, y))?;
     cast_numeric_output(result, &output_type)
 }
 
@@ -801,18 +790,7 @@ pub fn eval_sub_arrays(
     )? {
         return Ok(arr);
     }
-    let result = eval_numeric_binop_arrays(
-        lhs,
-        rhs,
-        |x, y| {
-            let result = sub(x, y)?;
-            Ok(Arc::new(result))
-        },
-        |x, y| {
-            let result = sub(x, y)?;
-            Ok(Arc::new(result))
-        },
-    )?;
+    let result = eval_numeric_binop_arrays(lhs, rhs, |x, y| sub(x, y), |x, y| sub(x, y))?;
     cast_numeric_output(result, &output_type)
 }
 
@@ -836,18 +814,7 @@ pub fn eval_mul_arrays(
     )? {
         return Ok(arr);
     }
-    let result = eval_numeric_binop_arrays(
-        lhs,
-        rhs,
-        |x, y| {
-            let result = mul(x, y)?;
-            Ok(Arc::new(result))
-        },
-        |x, y| {
-            let result = mul(x, y)?;
-            Ok(Arc::new(result))
-        },
-    )?;
+    let result = eval_numeric_binop_arrays(lhs, rhs, |x, y| mul(x, y), |x, y| mul(x, y))?;
     cast_numeric_output(result, &output_type)
 }
 
@@ -883,32 +850,10 @@ pub fn eval_div_arrays(
             arrow_cast::cast(&lhs, &DataType::Float64).map_err(|e| format!("div cast lhs: {e}"))?;
         let rhs_f =
             arrow_cast::cast(&rhs, &DataType::Float64).map_err(|e| format!("div cast rhs: {e}"))?;
-        let result = eval_numeric_binop_arrays(
-            lhs_f,
-            rhs_f,
-            |x, y| {
-                let result = div(x, y)?;
-                Ok(Arc::new(result))
-            },
-            |x, y| {
-                let result = div(x, y)?;
-                Ok(Arc::new(result))
-            },
-        )?;
+        let result = eval_numeric_binop_arrays(lhs_f, rhs_f, |x, y| div(x, y), |x, y| div(x, y))?;
         return Ok(result);
     }
-    let result = eval_numeric_binop_arrays(
-        lhs,
-        rhs,
-        |x, y| {
-            let result = div(x, y)?;
-            Ok(Arc::new(result))
-        },
-        |x, y| {
-            let result = div(x, y)?;
-            Ok(Arc::new(result))
-        },
-    )?;
+    let result = eval_numeric_binop_arrays(lhs, rhs, |x, y| div(x, y), |x, y| div(x, y))?;
     cast_numeric_output(result, &output_type)
 }
 
@@ -1017,17 +962,6 @@ pub fn eval_mod_arrays(
     )? {
         return Ok(arr);
     }
-    let result = eval_numeric_binop_arrays(
-        lhs,
-        rhs,
-        |x, y| {
-            let result = rem(x, y)?;
-            Ok(Arc::new(result))
-        },
-        |x, y| {
-            let result = rem(x, y)?;
-            Ok(Arc::new(result))
-        },
-    )?;
+    let result = eval_numeric_binop_arrays(lhs, rhs, |x, y| rem(x, y), |x, y| rem(x, y))?;
     cast_numeric_output(result, &output_type)
 }

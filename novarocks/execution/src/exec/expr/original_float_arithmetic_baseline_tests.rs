@@ -235,6 +235,94 @@ fn original_float_arithmetic_same_arrow_author_complete_carrier_axes() {
         }
     }
 }
+
+#[test]
+fn original_arithmetic_outputs_enter_root_without_rebuilding_the_carrier() {
+    use crate::exec::chunk::{RootArrayStorageLimits, borrowed_root_array_storage};
+
+    // Exercise the actual arena output before any Chunk retag or ArrayData
+    // reconstruction can conceal a separate outer ArrayRef owner.
+    for floating in [false, true] {
+        let left: ArrayRef = if floating {
+            Arc::new(Float64Array::from(vec![
+                Some(7.0),
+                None,
+                Some(9.0),
+                Some(-7.0),
+            ]))
+        } else {
+            Arc::new(Int64Array::from(vec![Some(7), None, Some(9), Some(-7)]))
+        };
+        let right: ArrayRef = if floating {
+            Arc::new(Float64Array::from(vec![
+                Some(2.0),
+                Some(3.0),
+                None,
+                Some(2.0),
+            ]))
+        } else {
+            Arc::new(Int64Array::from(vec![Some(2), Some(3), None, Some(2)]))
+        };
+        for (op, expected) in [
+            (ArithmeticOperator::Add, [Some(9.0), None, None, Some(-5.0)]),
+            (
+                ArithmeticOperator::Subtract,
+                [Some(5.0), None, None, Some(-9.0)],
+            ),
+            (
+                ArithmeticOperator::Multiply,
+                [Some(14.0), None, None, Some(-14.0)],
+            ),
+            (
+                ArithmeticOperator::Divide,
+                [Some(3.5), None, None, Some(-3.5)],
+            ),
+            (
+                ArithmeticOperator::Modulo,
+                [Some(1.0), None, None, Some(-1.0)],
+            ),
+        ] {
+            let actual = legacy(
+                op,
+                left.clone(),
+                right.clone(),
+                DecimalOverflowPolicy::OutputNull,
+                false,
+            )
+            .unwrap();
+            borrowed_root_array_storage(
+                actual.as_ref(),
+                RootArrayStorageLimits {
+                    bytes: 4096,
+                    nodes: 8,
+                    depth: 1,
+                },
+            )
+            .expect("the original arithmetic output is an exact root carrier");
+            let float_output = floating || op == ArithmeticOperator::Divide;
+            assert_eq!(
+                actual.data_type(),
+                if float_output {
+                    &DataType::Float64
+                } else {
+                    &DataType::Int64
+                }
+            );
+            assert_eq!(actual.len(), expected.len());
+            if float_output {
+                let actual = actual.as_any().downcast_ref::<Float64Array>().unwrap();
+                assert_eq!(actual.iter().collect::<Vec<_>>(), expected);
+            } else {
+                let actual = actual.as_any().downcast_ref::<Int64Array>().unwrap();
+                assert_eq!(
+                    actual.iter().collect::<Vec<_>>(),
+                    expected.map(|value| value.map(|value| value as i64))
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn original_float_arithmetic_rhs_zero_width_and_ieee_remain_distinct() {
     let left = Arc::new(Float64Array::from(vec![
