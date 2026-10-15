@@ -42,21 +42,42 @@ UPDATE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_rejec
 MERGE INTO iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_rejected_${uuid0} t USING (SELECT 1 AS id) s ON t.id=s.id WHEN NOT MATCHED THEN INSERT (id,v) VALUES (s.id,NULL);
 
 -- query 5
--- @expect_error=Iceberg Variant writes are not supported
+-- REST admits OPTIMIZE as a detached job. Submission success is followed by
+-- the provider's schema refusal in the job's terminal presentation.
+-- @skip_result_check=true
 ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_rejected_${uuid0} OPTIMIZE;
 
 -- query 6
+-- Poll the read-only job presentation; wait_alter_optimize only accepts
+-- FINISHED and cannot validate this intended provider refusal.
+-- @retry_count=60
+-- @retry_interval_ms=500
+-- @result_contains=FAILED
+-- @result_contains=Iceberg Variant writes are not supported
+-- @skip_result_check=true
+SHOW ALTER TABLE OPTIMIZE FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}
+WHERE TableName = 'java_variant_rejected_${uuid0}';
+
+-- query 7
 -- @expect_error=Iceberg Variant writes are not supported
 ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_rejected_${uuid0} ADD FILES FROM 's3://warehouse/iru9-does-not-exist-${uuid0}';
 
--- query 7
+-- query 8
 -- The ordinary id column has no Variant semantics. REST staging admission
 -- must still reject this property before probing or staging the target.
 -- @expect_error=write.parquet.variant-shredding.
 CREATE TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_shredding_ctas_rejected_${uuid0}
 TBLPROPERTIES ('write.parquet.variant-shredding.payload' = 'a:int') AS SELECT 1 AS id;
 
--- query 8
+-- query 9
+-- REST staged creation must refuse the actual logical Variant result type
+-- obtained from the external Java table before staging a new target.
+-- @expect_error=Iceberg Variant writes are not supported
+CREATE TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_ctas_rejected_${uuid0}
+TBLPROPERTIES ('format-version' = '3') AS
+SELECT id,v FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_rejected_${uuid0};
+
+-- query 10
 -- @result_contains=IRU9_UNCHANGED_OK
 shell: set -eu
 receipt_parent="${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/experiments/iceberg-variant"
@@ -64,6 +85,6 @@ mkdir -p "$receipt_parent"
 receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode unchanged --namespace nr_compat_${suite_uuid0} --table java_variant_rejected_${uuid0} --output "$receipt_dir"
 
--- query 9
+-- query 11
 -- @skip_result_check=true
 DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_rejected_${uuid0} FORCE;

@@ -47,42 +47,37 @@ ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id,v) VALUES (s.id,NULL);
 INSERT OVERWRITE ${case_db}.t_v3_variant_mut VALUES (20,parse_json('{"a":20}'));
 
 -- query 6
--- @expect_error=Iceberg Variant writes are not supported
-CREATE TABLE ${case_db}.t_v3_variant_ctas TBLPROPERTIES ("format-version"="3")
-AS SELECT CAST(1 AS BIGINT) AS id, parse_json('{"a":1}') AS v;
-
--- query 7
 -- @skip_result_check=true
 DELETE FROM ${case_db}.t_v3_variant_mut WHERE id = 2;
 TRUNCATE TABLE ${case_db}.t_v3_variant_mut;
 
--- query 8
+-- query 7
 SELECT COUNT(*) AS remaining_rows FROM ${case_db}.t_v3_variant_mut;
 
--- query 9
+-- query 8
 -- @expect_error=equality-delete keys
 ALTER TABLE ${case_db}.t_v3_variant_mut ADD EQUALITY DELETE (v) VALUES (NULL);
 
--- query 10
+-- query 9
 -- @expect_error=variant columns cannot appear in the partition spec
 CREATE TABLE ${case_db}.t_v3_variant_partition_bad (id BIGINT,v VARIANT)
 PARTITION BY identity(v) TBLPROPERTIES ("format-version"="3");
 
--- query 11
+-- query 10
 -- @expect_error=variant columns cannot appear in the partition spec
 ALTER TABLE ${case_db}.t_v3_variant_mut ADD PARTITION COLUMN v;
 
--- query 12
+-- query 11
 -- @skip_result_check=true
 CREATE TABLE ${case_db}.t_v3_variant_part_mut (id BIGINT,region VARCHAR,v VARIANT)
 PARTITION BY identity(region) TBLPROPERTIES ("format-version"="3");
 
--- query 13
+-- query 12
 -- @expect_error=Iceberg Variant writes are not supported
 INSERT OVERWRITE PARTITIONS ${case_db}.t_v3_variant_part_mut
 VALUES (4,'us',parse_json('{"a":4}'));
 
--- query 14
+-- query 13
 -- @skip_result_check=true
 DROP TABLE ${case_db}.t_v3_variant_mut FORCE;
 DROP TABLE ${case_db}.s_v3_variant_mut FORCE;

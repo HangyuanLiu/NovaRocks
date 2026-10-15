@@ -3201,7 +3201,7 @@ fn sign_input_shape(
 /// the manifest, and a reader applies the delete by id. Resolving them here,
 /// against the same metadata the session froze, is what makes a renamed or
 /// absent column a refusal instead of a delete that matches nothing.
-fn equality_delete_recipe(
+pub(crate) fn equality_delete_recipe(
     metadata: &TableMetadata,
     fields: &[ConnectorWriteFieldBinding],
 ) -> Result<crate::commit::write_stack::domain::IcebergEqualityDeleteRecipe, ConnectorError> {

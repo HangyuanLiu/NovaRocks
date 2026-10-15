@@ -114,6 +114,16 @@ pub(crate) fn prepare_write(
     }
 
     let input = bind_write_input(&request, owner, &metadata)?;
+    if let ConnectorWriteInputShape::EqualityDelete { equality_fields } = &input {
+        // Reuse session admission's exact logical-key projection. The same
+        // FixedSizeBinary carrier may represent uuid or ordinary fixed data;
+        // neither the application nor the carrier can decide this policy.
+        if let Err(error) =
+            crate::commit::write_stack::control::equality_delete_recipe(&metadata, equality_fields)
+        {
+            return Ok(ConnectorWritePreparationOutcome::Denied(error));
+        }
+    }
     let target_snapshot_id = write_target_snapshot_id(&metadata, request.target_ref.as_str())?;
     let table_uuid = table.table_uuid.as_deref().ok_or_else(|| {
         ConnectorError::new(
@@ -1308,6 +1318,61 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![provider_field("id", DataType::Int64, false, 1)]
         );
+    }
+
+    #[test]
+    fn equality_preparation_checks_selected_logical_keys_not_shared_fixed_carriers_or_whole_table()
+    {
+        let owner = owner();
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "uuid_key", Type::Primitive(PrimitiveType::Uuid)).into(),
+                NestedField::optional(3, "raw_key", Type::Primitive(PrimitiveType::Fixed(16)))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "file:///tmp/equality-logical-types".into(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let payload = table_payload(Some(table_info(&metadata)));
+        for (name, carrier, nullable, denied) in [
+            ("uuid_key", DataType::FixedSizeBinary(16), true, true),
+            ("raw_key", DataType::FixedSizeBinary(16), true, false),
+            ("id", DataType::Int64, false, false),
+        ] {
+            let mut request = equality_delete_request(&owner, &payload);
+            request.input = ConnectorWriteInputRequest::EqualityDelete {
+                equality_fields: vec![ConnectorWriteFieldRequest::new(Field::new(
+                    name, carrier, nullable,
+                ))],
+            };
+            let outcome = prepare_write(request, &owner).unwrap();
+            if denied {
+                let error = expect_denied(outcome);
+                assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+                assert!(error.message().contains("uuid"));
+            } else {
+                let preparation = expect_prepared(outcome);
+                let ConnectorWriteInputShape::EqualityDelete { equality_fields } =
+                    preparation.input()
+                else {
+                    panic!("equality input")
+                };
+                assert_eq!(equality_fields.len(), 1);
+                assert_eq!(equality_fields[0].field().name(), name);
+            }
+        }
     }
 
     /// The relocated gates must stay invisible to every other row-delta write.
