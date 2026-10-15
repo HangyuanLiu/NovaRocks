@@ -380,31 +380,24 @@ fn prepare_compiled_fragment_in(
                 error,
             )
         })?;
-        // Receiver schemas are created by the same BE tracker/control policy
-        // as operator schemas. The registry retains each independent schema,
-        // while this temporary factory exits with preparation.
-        let construction_error = |cause: crate::exec::pipeline::operator::ConstructionFailure| {
-            FragmentLaunchError::from_failure(
-                FragmentLaunchStage::Register,
-                FragmentLaunchErrorKind::ResourceUnavailable,
-                cause.into(),
-            )
-        };
-        let receiver_creation = if program.exchange_inputs().is_empty() {
-            None
-        } else {
-            let tracker = runtime_state.mem_tracker().ok_or_else(|| {
-                construction_error(
-                    crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
-                )
-            })?;
-            let profile = crate::exec::pipeline::pipeline::representation_construction_profile()
-                .map_err(crate::exec::pipeline::operator::ConstructionFailure::from)
-                .map_err(construction_error)?;
-            Some(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-                profile, tracker, runtime_state.error_state(),
-            ).map_err(construction_error)?)
-        };
+        // Both receiver lifetimes use the same tracker, model and creation
+        // author. Native explicitly retains its stop owner through retirement.
+        let (receiver_creation, receiver_construction_stop) =
+            if program.exchange_inputs().is_empty() {
+                (None, None)
+            } else {
+                let (factory, stop) =
+                    context
+                        .receiver_construction(&runtime_state)
+                        .map_err(|cause| {
+                            FragmentLaunchError::from_failure(
+                                FragmentLaunchStage::Register,
+                                FragmentLaunchErrorKind::ResourceUnavailable,
+                                cause.into(),
+                            )
+                        })?;
+                (Some(factory), stop)
+            };
         let receivers = materialize_compiled_exchange_receivers(
             program,
             finst_id,
@@ -421,7 +414,7 @@ fn prepare_compiled_fragment_in(
             };
             FragmentLaunchError::from_failure(FragmentLaunchStage::Register, kind, cause.into())
         })?;
-        resources.acquire_compiled_exchange(receivers.registrations)?;
+        resources.acquire_compiled_exchange(receivers.registrations, receiver_construction_stop)?;
         context.fail_if_injected(PrepareFailurePoint::AfterExchange)?;
 
         let result_sink = match program.graph().sink() {

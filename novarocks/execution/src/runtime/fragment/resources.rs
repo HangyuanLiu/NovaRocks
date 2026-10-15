@@ -17,6 +17,8 @@
 
 use std::sync::Arc;
 
+use crate::exec::pipeline::operator::input_construction::ReceiverInputConstructionStopOwner;
+
 use crate::exec::fragment::program::{FragmentProgram, FragmentSinkKind};
 use crate::runtime::exchange::ExchangeColumnBinding;
 use crate::runtime::fragment::error::{
@@ -218,6 +220,7 @@ pub(crate) struct ExchangeRegistration {
     keys: Vec<ExchangeReceiverKey>,
     active: bool,
     cleanup_should_fail: bool,
+    construction_stop: Option<ReceiverInputConstructionStopOwner>,
 }
 
 impl ExchangeRegistration {
@@ -229,6 +232,7 @@ impl ExchangeRegistration {
         creation_factory: Option<
             Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
         >,
+        construction_stop: Option<ReceiverInputConstructionStopOwner>,
     ) -> Result<Option<Self>, FragmentLaunchError> {
         if program.exchange_inputs().is_empty() {
             return Ok(None);
@@ -238,6 +242,7 @@ impl ExchangeRegistration {
             keys: Vec::with_capacity(program.exchange_inputs().len()),
             active: true,
             cleanup_should_fail,
+            construction_stop,
         };
         for (node_id, contract) in program.exchange_inputs() {
             let assignment = instance
@@ -276,6 +281,7 @@ impl ExchangeRegistration {
         port: Arc<dyn ExchangeReceiverPort>,
         registrations: Vec<ExchangeReceiverRegistration>,
         cleanup_should_fail: bool,
+        construction_stop: Option<ReceiverInputConstructionStopOwner>,
     ) -> Result<Option<Self>, FragmentLaunchError> {
         if registrations.is_empty() {
             return Ok(None);
@@ -285,6 +291,7 @@ impl ExchangeRegistration {
             keys: Vec::with_capacity(registrations.len()),
             active: true,
             cleanup_should_fail,
+            construction_stop,
         };
         for entry in registrations {
             let key = entry.key;
@@ -298,6 +305,7 @@ impl ExchangeRegistration {
     }
 
     fn rollback(&mut self) -> Result<(), String> {
+        self.stop_construction(novarocks_functions::KernelFailure::Cancelled.into());
         if self.active {
             for key in self.keys.drain(..).rev() {
                 self.port.cancel(key);
@@ -312,6 +320,7 @@ impl ExchangeRegistration {
     }
 
     fn finish_success(&mut self) {
+        self.stop_construction(novarocks_functions::KernelFailure::Cancelled.into());
         if self.active {
             for key in self.keys.drain(..).rev() {
                 self.port.remove(key);
@@ -322,6 +331,7 @@ impl ExchangeRegistration {
     }
 
     fn finish_cancelled(&mut self) {
+        self.stop_construction(novarocks_functions::KernelFailure::Cancelled.into());
         if self.active {
             for key in self.keys.drain(..).rev() {
                 self.port.cancel(key);
@@ -330,11 +340,67 @@ impl ExchangeRegistration {
         }
         self.cleanup_should_fail = false;
     }
+
+    fn stop_construction(&self, cause: super::ExecutionFailure) {
+        if let Some(stop) = &self.construction_stop {
+            stop.stop(cause);
+        }
+    }
 }
 
 impl Drop for ExchangeRegistration {
     fn drop(&mut self) {
         let _ = self.rollback();
+    }
+}
+
+/// The original receiver registration, moved to its application's retirement gate.
+///
+/// Dropping an uncompleted or rolled-back task cancels its original receivers.
+/// A raw successful terminal fact selects the original success removal instead.
+/// This capability is deliberately not cloneable.
+pub struct ExchangeReceiverRetirement {
+    registration: ExchangeRegistration,
+    disposition: ExchangeRetirementDisposition,
+}
+
+#[derive(Clone, Copy)]
+enum ExchangeRetirementDisposition {
+    Cancel,
+    Remove,
+}
+
+impl ExchangeReceiverRetirement {
+    /// Record the kernel's fact before publishing task convergence. This does
+    /// not remove or cancel a receiver; the application's gate still owns that.
+    pub fn record_terminal(&mut self, fact: &super::FragmentTerminalFact) {
+        self.disposition = match fact.outcome() {
+            super::FragmentOutcome::Succeeded => ExchangeRetirementDisposition::Remove,
+            super::FragmentOutcome::Failed(error) => {
+                self.stop_construction(error.cause().clone());
+                ExchangeRetirementDisposition::Cancel
+            }
+            super::FragmentOutcome::Cancelled { .. } => ExchangeRetirementDisposition::Cancel,
+        };
+    }
+
+    /// Stop construction on a real failure or abort without retiring ingress.
+    pub fn stop_construction(&self, cause: super::ExecutionFailure) {
+        self.registration.stop_construction(cause);
+    }
+
+    /// Retire synchronously while the caller holds its original inbound gate.
+    pub fn retire(self) {
+        drop(self);
+    }
+}
+
+impl Drop for ExchangeReceiverRetirement {
+    fn drop(&mut self) {
+        match self.disposition {
+            ExchangeRetirementDisposition::Remove => self.registration.finish_success(),
+            ExchangeRetirementDisposition::Cancel => self.registration.finish_cancelled(),
+        }
     }
 }
 
@@ -482,6 +548,7 @@ impl FragmentResources {
         creation_factory: Option<
             Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
         >,
+        construction_stop: Option<ReceiverInputConstructionStopOwner>,
     ) -> Result<(), FragmentLaunchError> {
         self.exchange = ExchangeRegistration::acquire(
             Arc::clone(&self.exchange_receiver_port),
@@ -489,6 +556,7 @@ impl FragmentResources {
             instance,
             self.cleanup_faults.should_fail(ResourceKind::Exchange),
             creation_factory,
+            construction_stop,
         )?;
         Ok(())
     }
@@ -496,13 +564,24 @@ impl FragmentResources {
     pub(crate) fn acquire_compiled_exchange(
         &mut self,
         registrations: Vec<ExchangeReceiverRegistration>,
+        construction_stop: Option<ReceiverInputConstructionStopOwner>,
     ) -> Result<(), FragmentLaunchError> {
         self.exchange = ExchangeRegistration::acquire_registrations(
             Arc::clone(&self.exchange_receiver_port),
             registrations,
             self.cleanup_faults.should_fail(ResourceKind::Exchange),
+            construction_stop,
         )?;
         Ok(())
+    }
+
+    pub(crate) fn take_exchange_retirement(&mut self) -> Option<ExchangeReceiverRetirement> {
+        self.exchange
+            .take()
+            .map(|registration| ExchangeReceiverRetirement {
+                registration,
+                disposition: ExchangeRetirementDisposition::Cancel,
+            })
     }
 
     pub(crate) fn rollback(&mut self) -> Vec<String> {
@@ -588,4 +667,242 @@ fn registration_error(detail: impl Into<String>) -> FragmentLaunchError {
         FragmentLaunchErrorKind::DuplicateRegistration,
         detail,
     )
+}
+
+#[cfg(test)]
+mod receiver_construction_tests {
+    use super::*;
+    use crate::exec::chunk::{ChunkSchemaRef, typed_fixture};
+    use crate::exec::pipeline::operator::input_construction::{
+        try_receiver_input_construction_factory, try_runtime_input_construction_factory,
+    };
+    use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionFactory};
+    use crate::runtime::execution_runtime::test_execution_runtime;
+    use crate::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort;
+    use crate::runtime::fragment::{
+        ExecutionFailure, FragmentCancelReason, FragmentExecutionError, FragmentExecutionErrorKind,
+        FragmentOutcome, FragmentTerminalFact,
+    };
+    use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeErrorState};
+    use novarocks_types::QueryId;
+
+    fn typed_schema(factory: &dyn InputConstructionFactory) -> ChunkSchemaRef {
+        let declaration =
+            typed_fixture::layout(Arc::new(arrow::datatypes::Schema::empty()), &[], &[]);
+        factory.create_compiled_chunk_schema(&declaration).unwrap()
+    }
+
+    fn entry(
+        key: ExchangeReceiverKey,
+        schema: &ChunkSchemaRef,
+        factory: &Arc<dyn InputConstructionFactory>,
+    ) -> ExchangeReceiverRegistration {
+        ExchangeReceiverRegistration {
+            key,
+            expected_senders: 1,
+            expected_chunk_schema: schema.clone(),
+            column_binding: ExchangeColumnBinding::Positional,
+            creation_factory: factory.clone(),
+        }
+    }
+
+    // A duplicate is the real registry's supported refusal, not a fabricated
+    // register failure. Protect prefix rollback and original primary/secondary
+    // diagnostics using exact typed creators and independent existing keys.
+    // This owner-local fixture needs no service, controller or timing gate.
+    #[test]
+    fn receiver_construction_registration_duplicate_rolls_back_only_its_successful_prefix() {
+        for has_prefix in [false, true] {
+            let runtime = test_execution_runtime();
+            let port: Arc<dyn ExchangeReceiverPort> =
+                Arc::new(ExecutionRuntimeExchangeReceiverPort::new(runtime));
+            let existing_tracker = MemTracker::new_root("existing receiver declarations");
+            existing_tracker.install_limit_once(1024 * 1024).unwrap();
+            let existing_factory = try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                existing_tracker.clone(),
+                Arc::new(RuntimeErrorState::default()),
+            )
+            .unwrap();
+            let existing_schema = typed_schema(existing_factory.as_ref());
+            let instance = UniqueId::new(85_100, i64::from(has_prefix));
+            let prefix = ExchangeReceiverKey {
+                fragment_instance_id: instance,
+                node_id: 1,
+            };
+            let conflict = ExchangeReceiverKey {
+                fragment_instance_id: instance,
+                node_id: 2,
+            };
+            let sibling = ExchangeReceiverKey {
+                fragment_instance_id: instance,
+                node_id: 3,
+            };
+            port.register(entry(conflict, &existing_schema, &existing_factory))
+                .unwrap();
+            port.register(entry(sibling, &existing_schema, &existing_factory))
+                .unwrap();
+            let before_conflict = port.snapshot(conflict).unwrap();
+            let before_sibling = port.snapshot(sibling).unwrap();
+
+            let tracker = MemTracker::new_root("candidate receiver declarations");
+            tracker.install_limit_once(1024 * 1024).unwrap();
+            let (factory, stop) = try_receiver_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                tracker.clone(),
+                Arc::new(RuntimeErrorState::default()),
+            )
+            .unwrap();
+            let schema = typed_schema(factory.as_ref());
+            let mut registrations = Vec::new();
+            if has_prefix {
+                registrations.push(entry(prefix, &schema, &factory));
+            }
+            registrations.push(entry(conflict, &schema, &factory));
+            let result = ExchangeRegistration::acquire_registrations(
+                port.clone(),
+                registrations,
+                has_prefix,
+                Some(stop),
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("the original registry must refuse its already registered key"),
+            };
+            assert_eq!(error.stage(), FragmentLaunchStage::Register);
+            assert_eq!(error.kind(), FragmentLaunchErrorKind::DuplicateRegistration);
+            assert_eq!(
+                error.detail(),
+                format!(
+                    "exchange receiver already registered: finst={} node_id=2",
+                    instance.to_uuid_string(),
+                )
+            );
+            if has_prefix {
+                assert_eq!(
+                    error.cleanup_diagnostics(),
+                    &["injected exchange registration cleanup failure"]
+                );
+                assert!(port.snapshot(prefix).is_none());
+                let refused = match port.receiver_handle(prefix, 1) {
+                    Err(error) => error,
+                    Ok(_) => panic!("the cancelled prefix cannot acquire a receiver handle"),
+                };
+                assert_eq!(refused, "exchange canceled");
+            } else {
+                assert!(error.cleanup_diagnostics().is_empty());
+            }
+            for (key, before) in [(conflict, before_conflict), (sibling, before_sibling)] {
+                let after = port
+                    .snapshot(key)
+                    .expect("a preexisting receiver must survive another owner's rollback");
+                assert_eq!(after.expected_senders, before.expected_senders);
+                assert_eq!(after.finished_senders, before.finished_senders);
+                assert_eq!(after.queued_chunks, before.queued_chunks);
+                assert_eq!(after.queued_rows, before.queued_rows);
+                assert_eq!(after.canceled, before.canceled);
+                assert!(!after.canceled);
+                assert!(port.receiver_handle(key, 1).is_ok());
+            }
+            let cancelled: ExecutionFailure = novarocks_functions::KernelFailure::Cancelled.into();
+            assert_eq!(
+                factory.observe_input_work(0).unwrap_err(),
+                ConstructionFailure::Caller(Box::new(cancelled))
+            );
+            drop(schema);
+            drop(factory);
+            assert_eq!(
+                tracker.current(),
+                0,
+                "the refused owner's actual creator aliases have exited"
+            );
+            port.remove(conflict);
+            port.remove(sibling);
+            drop(existing_schema);
+            drop(existing_factory);
+            assert_eq!(existing_tracker.current(), 0);
+        }
+    }
+
+    // Raw cancellation includes normal Quiesce and cannot end DATA creation;
+    // an originating failure must carry its exact typed cause immediately.
+    // The real registration remains installed until the original guard retires.
+    #[test]
+    fn receiver_construction_retirement_preserves_raw_cancel_and_original_failed_cause() {
+        for failed in [false, true] {
+            let runtime = test_execution_runtime();
+            let port: Arc<dyn ExchangeReceiverPort> =
+                Arc::new(ExecutionRuntimeExchangeReceiverPort::new(runtime));
+            let tracker = MemTracker::new_root("receiver terminal control");
+            tracker.install_limit_once(1024 * 1024).unwrap();
+            let (factory, stop) = try_receiver_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                tracker.clone(),
+                Arc::new(RuntimeErrorState::default()),
+            )
+            .unwrap();
+            let schema = typed_schema(factory.as_ref());
+            let instance = UniqueId::new(85_101, i64::from(failed));
+            let key = ExchangeReceiverKey {
+                fragment_instance_id: instance,
+                node_id: 1,
+            };
+            let registration = ExchangeRegistration::acquire_registrations(
+                port.clone(),
+                vec![entry(key, &schema, &factory)],
+                false,
+                Some(stop),
+            )
+            .unwrap()
+            .unwrap();
+            let mut retirement = ExchangeReceiverRetirement {
+                registration,
+                disposition: ExchangeRetirementDisposition::Cancel,
+            };
+            let original: ExecutionFailure =
+                novarocks_functions::KernelFailure::DeadlineExceeded.into();
+            let outcome = if failed {
+                FragmentOutcome::Failed(FragmentExecutionError::from_failure(
+                    FragmentExecutionErrorKind::Pipeline,
+                    original.clone(),
+                ))
+            } else {
+                FragmentOutcome::Cancelled {
+                    reason: FragmentCancelReason::new("normal quiesce"),
+                }
+            };
+            retirement.record_terminal(&FragmentTerminalFact::new(
+                QueryId::new(85_100, 1),
+                instance,
+                outcome,
+                None,
+            ));
+            if failed {
+                assert_eq!(
+                    factory.observe_input_work(1).unwrap_err(),
+                    ConstructionFailure::Caller(Box::new(original.clone()))
+                );
+            } else {
+                factory.observe_input_work(1).unwrap();
+            }
+            assert!(
+                port.snapshot(key).is_some(),
+                "a terminal fact alone cannot delete ingress"
+            );
+            retirement.retire();
+            assert!(port.snapshot(key).is_none());
+            let stopped = if failed {
+                original
+            } else {
+                novarocks_functions::KernelFailure::Cancelled.into()
+            };
+            assert_eq!(
+                factory.observe_input_work(1).unwrap_err(),
+                ConstructionFailure::Caller(Box::new(stopped))
+            );
+            drop(schema);
+            drop(factory);
+            assert_eq!(tracker.current(), 0);
+        }
+    }
 }

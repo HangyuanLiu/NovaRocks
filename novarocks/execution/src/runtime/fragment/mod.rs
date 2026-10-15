@@ -24,6 +24,7 @@ pub use handle::{
     prepare_compiled_fragment_with_metadata_host, prepare_fragment,
 };
 pub use instance::*;
+pub use resources::ExchangeReceiverRetirement;
 pub use submission::FragmentSubmission;
 
 pub use execution_failure::{
