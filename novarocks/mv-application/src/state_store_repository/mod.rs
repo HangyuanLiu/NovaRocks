@@ -18,6 +18,7 @@
 pub mod catalog;
 pub mod codec;
 pub mod key;
+pub mod keyed;
 mod operation;
 
 #[cfg(test)]
@@ -1160,8 +1161,21 @@ async fn delete_indexes_for_projection(
     mv_id: i64,
     page_size: usize,
 ) -> Result<(), StateStoreError> {
-    let target_key = target_key(&definition_target(definition).map_err(invalid_state_store)?)
-        .map_err(invalid_state_store)?;
+    delete_indexes_for_target(
+        transaction,
+        &definition_target(definition).map_err(invalid_state_store)?,
+        mv_id,
+        page_size,
+    )
+    .await
+}
+async fn delete_indexes_for_target(
+    transaction: &mut dyn WriteTransaction,
+    target: &MvTarget,
+    mv_id: i64,
+    page_size: usize,
+) -> Result<(), StateStoreError> {
+    let target_key = target_key(target).map_err(invalid_state_store)?;
     let target = transaction
         .get(&target_key)
         .await?

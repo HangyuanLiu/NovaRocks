@@ -31,8 +31,8 @@ use crate::persistence::identity::{
     ComputationIdentity, DocumentRevision, FieldIdentity, ObjectIdentity,
 };
 
-pub const DEFAULT_MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
-pub const DEFAULT_MAX_DOCUMENT_SET_BYTES: usize = 32 * 1024 * 1024;
+pub const DEFAULT_MAX_DOCUMENT_BYTES: usize = 64 * 1024;
+pub const DEFAULT_MAX_DOCUMENT_SET_BYTES: usize = 256 * 1024;
 pub const DEFAULT_MAX_DECODE_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_DOCUMENT_ITEMS: usize = 4096;
 pub const DEFAULT_MAX_STRUCTURE_DEPTH: usize = 64;

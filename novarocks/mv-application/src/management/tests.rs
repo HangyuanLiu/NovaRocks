@@ -2871,3 +2871,86 @@ fn one_bounded_path_does_not_bound_an_effect_that_spans_two() {
         ReadmissionMode::OperatorDeclarationOnly
     );
 }
+
+#[test]
+fn slot_change_unknown_remains_manageable_until_a_terminal_conclusion() {
+    use novarocks_spi::connector::{
+        CommitConclusion, CommitProof, ConnectorSlotName, UnknownCommitEvidence,
+        UnknownCommitIdentity,
+    };
+    for conclusion in [
+        CommitConclusion::StillUnknown,
+        CommitConclusion::Committed(CommitProof::SlotWriter),
+        CommitConclusion::NotCommitted(CommitProof::NegativeProof),
+        CommitConclusion::InvalidatedUndetermined,
+    ] {
+        let target = target("mv-slot", b"object-slot");
+        let observation = ready_observation_state(target.clone(), "deployment-a", "inc-a");
+        let dependencies =
+            ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
+        let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
+        entrance
+            .install_observed_target(&observation, dependencies.clone())
+            .unwrap();
+        let request = || {
+            ManagementRequest::try_new(
+                target.catalog().clone(),
+                target.table().clone(),
+                Some(target.object_id().clone()),
+                ConnectorDocumentManagementOperation::SingleTargetUpdate,
+                Some(dependencies.clone()),
+                EffectScope::CATALOG_COMMIT,
+            )
+            .unwrap()
+        };
+        let mut lease = entrance.acquire(request(), || false).unwrap();
+        lease
+            .mark_dispatched(EffectResponsibility::new(
+                EffectIdentity::from_bytes([31; 16]),
+                target.clone(),
+                incarnation("inc-a"),
+                EffectScope::CATALOG_COMMIT,
+                ManagementTimestamp::from_unix_millis(1_000),
+            ))
+            .unwrap();
+        let evidence = UnknownCommitEvidence {
+            asserted_parent: Some(17),
+            preselected_snapshot: 18,
+            identity: UnknownCommitIdentity::SlotWriter {
+                slot: ConnectorSlotName::try_new("novarocks.mv", "configuration").unwrap(),
+            },
+        };
+        lease.record_slot_change_unknown(evidence.clone()).unwrap();
+        assert_eq!(entrance.pending_slot_changes(target.table()), 1);
+        assert!(entrance.unsettled_effects(target.table()).is_empty());
+        assert_eq!(
+            entrance.management_phase(target.table()),
+            MvManagementPhase::Manageable
+        );
+        drop(entrance.acquire(request(), || false).unwrap());
+        let result = entrance
+            .resolve_slot_changes(target.table(), target.object_id(), |actual| {
+                assert_eq!(actual, evidence);
+                Ok(conclusion.clone())
+            })
+            .unwrap();
+        if conclusion == CommitConclusion::StillUnknown {
+            assert_eq!(entrance.pending_slot_changes(target.table()), 1);
+            assert_eq!(entrance.latest_slot_change_conclusion(target.table()), None);
+        } else {
+            assert_eq!(entrance.pending_slot_changes(target.table()), 0);
+            assert_eq!(
+                entrance.latest_slot_change_conclusion(target.table()),
+                Some(conclusion.clone())
+            );
+        }
+        assert_eq!(
+            result.reinstall_current_projection,
+            matches!(conclusion, CommitConclusion::Committed(_))
+        );
+        assert_eq!(
+            entrance.management_phase(target.table()),
+            MvManagementPhase::Manageable
+        );
+    }
+}

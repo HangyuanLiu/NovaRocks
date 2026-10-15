@@ -126,6 +126,12 @@ struct StoredMvProjectionAvro {
     output_version: Option<ProviderVersionAvro>,
     storage_rows: Option<i64>,
     source_revision: MvAcceleratorSourceRevisionAvro,
+    #[serde(default)]
+    binding: Option<serde_bytes::ByteBuf>,
+    #[serde(default)]
+    current_data_files: Option<i64>,
+    #[serde(default)]
+    current_delete_files: Option<i64>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -306,6 +312,9 @@ impl TryFrom<&StoredMvProjection> for StoredMvProjectionAvro {
             storage_rows,
             metadata_version: facts.metadata_version().into(),
             source_revision: facts.source_revision().into(),
+            binding: None,
+            current_data_files: None,
+            current_delete_files: None,
         })
     }
 }
@@ -323,6 +332,9 @@ impl StoredMvProjectionAvro {
         budget: PersistenceDecodeBudget,
     ) -> Result<StoredMvProjection, String> {
         let value = self;
+        if value.binding.is_some() {
+            return Err("keyed MV projection requires the keyed repository API".into());
+        }
         if value.mv_id <= 0 {
             return Err("MV projection ID must be positive".into());
         }
@@ -420,12 +432,12 @@ pub fn decode_projection_with_budget(
     let mut documents = budget;
     let decoded: DecodedMvRecord<StoredMvProjectionAvro> =
         decode_record_checked(key, value, |kind, schema_id, payload| {
-            if kind != MvRecordKind::Projection || schema_id != 3 {
+            if kind != MvRecordKind::Projection || !matches!(schema_id, 3 | 4) {
                 return Err(
                     "bounded MV projection decode requires the registered V3 schema".into(),
                 );
             }
-            documents = preflight::projection_v3(payload, budget)?;
+            documents = preflight::projection(payload, budget, schema_id == 4)?;
             Ok(())
         })?;
     Ok(DecodedMvRecord {
@@ -494,10 +506,10 @@ where
 {
     decode_record_checked(key, value, |kind, schema_id, payload| {
         if kind == MvRecordKind::Projection {
-            if schema_id != 3 {
-                return Err("MV projection preflight requires the registered V3 schema".into());
+            if !matches!(schema_id, 3 | 4) {
+                return Err("MV projection preflight requires a registered schema".into());
             }
-            preflight::projection_v3(payload, PersistenceDecodeBudget::default())?;
+            preflight::projection(payload, PersistenceDecodeBudget::default(), schema_id == 4)?;
         }
         Ok(())
     })
@@ -604,3 +616,158 @@ where
 #[cfg(test)]
 #[path = "codec_tests.rs"]
 mod codec_tests;
+
+/// Keyed projections share the Accelerator root, schema catalog and indexes.
+/// Their binding field discriminates the representation; old APIs reject them.
+pub fn encode_keyed_projection(
+    operation_id: Uuid,
+    projection: &crate::persistence::keyed_documents::StoredKeyedMvProjection,
+) -> Result<Value, String> {
+    let facts = &projection.facts;
+    let to_long =
+        |n: u64| i64::try_from(n).map_err(|_| "file total exceeds Accelerator long".to_string());
+    let dto = StoredMvProjectionAvro {
+        mv_id: projection.mv_id,
+        definition: serde_bytes::ByteBuf::from(facts.versions.definition.content().to_vec()),
+        interpretation: serde_bytes::ByteBuf::from(
+            facts.versions.interpretation.content().to_vec(),
+        ),
+        configuration: serde_bytes::ByteBuf::from(
+            encode_configuration(&facts.configuration)
+                .map_err(|e| e.to_string())?
+                .into_bytes(),
+        ),
+        binding: Some(serde_bytes::ByteBuf::from(
+            facts.versions.binding.content().to_vec(),
+        )),
+        publication: facts
+            .publication
+            .as_ref()
+            .map(|p| {
+                crate::persistence::codec::keyed::encode_publication_payload(
+                    p,
+                    &facts.definition,
+                    &facts.versions.binding_document,
+                )
+                .map(serde_bytes::ByteBuf::from)
+            })
+            .transpose()
+            .map_err(|e| e.to_string())?,
+        output_version: facts
+            .publication
+            .as_ref()
+            .map(|_| ProviderVersionAvro::from(&facts.metadata_version)),
+        metadata_version: ProviderVersionAvro::from(&facts.metadata_version),
+        storage_rows: None,
+        source_revision: (&facts.source).into(),
+        current_data_files: facts.file_totals.data_files.map(to_long).transpose()?,
+        current_delete_files: facts.file_totals.delete_files.map(to_long).transpose()?,
+    };
+    encode_record(MvRecordKind::Projection, operation_id, &dto)
+}
+pub fn decode_keyed_projection(
+    key: &Key,
+    value: &Value,
+    budget: PersistenceDecodeBudget,
+) -> Result<DecodedMvRecord<crate::persistence::keyed_documents::StoredKeyedMvProjection>, String> {
+    use crate::persistence::{codec::keyed::*, keyed_documents::*};
+    use novarocks_spi::connector::{ConnectorSnapshotRecord, SnapshotFileTotals};
+    let mut documents = budget;
+    let decoded: DecodedMvRecord<StoredMvProjectionAvro> =
+        decode_record_checked(key, value, |kind, schema, payload| {
+            if kind != MvRecordKind::Projection || schema != 4 {
+                return Err("legacy MV projection cannot be read through the keyed API".into());
+            }
+            documents = preflight::projection(payload, budget, true)?;
+            Ok(())
+        })?;
+    let d = decoded.value;
+    if d.mv_id <= 0 {
+        return Err("MV projection ID must be positive".into());
+    }
+    let binding = d
+        .binding
+        .ok_or("legacy MV projection cannot be read through the keyed API")?;
+    let definition = decode_definition(&d.definition, documents).map_err(|e| e.to_string())?;
+    let interpretation =
+        decode_keyed_interpretation(&d.interpretation, documents).map_err(|e| e.to_string())?;
+    let binding = decode_binding(&binding, documents).map_err(|e| e.to_string())?;
+    let versions =
+        build_keyed_versions(&definition, &interpretation, binding).map_err(|e| e.to_string())?;
+    let source: MvAcceleratorSourceRevision = d.source_revision.try_into()?;
+    let metadata_version: ConnectorCommittedVersion = d.metadata_version.try_into()?;
+    let configuration =
+        decode_configuration(&d.configuration, documents).map_err(|e| e.to_string())?;
+    let publication = d
+        .publication
+        .as_ref()
+        .map(|bytes| {
+            decode_publication_payload(
+                bytes,
+                &definition,
+                versions.definition_revision(),
+                versions.interpretation_revision(),
+                &versions.binding_document,
+            )
+        })
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let record_revision = d.publication.as_ref().map(|bytes| {
+        crate::persistence::identity::DocumentRevision::from_canonical_bytes(
+            &snapshot_record_frame(&ConnectorSnapshotRecord {
+                owner: MV_DOCUMENT_OWNER.into(),
+                name: "publication".into(),
+                binding: Some(versions.binding.identity()),
+                payload: Bytes::from(bytes.to_vec()),
+            }),
+        )
+    });
+    let output = d
+        .output_version
+        .map(ConnectorCommittedVersion::try_from)
+        .transpose()?;
+    if source.definition_revision != versions.definition_revision()
+        || source.interpretation_revision != versions.interpretation_revision()
+        || source.configuration_revision
+            != encode_configuration(&configuration)
+                .map_err(|e| e.to_string())?
+                .revision()
+        || source.publication_revision != record_revision
+        || source.metadata_version
+            != MvAcceleratorCommittedVersionRevision::from_committed(&metadata_version)
+        || source.publication_output_version
+            != output
+                .as_ref()
+                .map(MvAcceleratorCommittedVersionRevision::from_committed)
+        || publication.is_some() != output.is_some()
+        || output.as_ref().is_some_and(|o| o != &metadata_version)
+        || interpretation.target.object_id.as_bytes() != source.target_object_id.as_bytes().as_ref()
+    {
+        return Err("keyed MV cache source revision does not match exact document facts".into());
+    }
+    let to_unsigned =
+        |n: i64| u64::try_from(n).map_err(|_| "negative cached file total".to_string());
+    let facts = MvKeyedDocumentProjection {
+        source,
+        metadata_version,
+        definition,
+        interpretation,
+        configuration,
+        versions,
+        publication,
+        file_totals: SnapshotFileTotals {
+            data_files: d.current_data_files.map(to_unsigned).transpose()?,
+            delete_files: d.current_delete_files.map(to_unsigned).transpose()?,
+        },
+    };
+    if facts.publication.is_none() && !facts.never_published() {
+        return Err("keyed MV cache lacks publication without an empty-file witness".into());
+    }
+    Ok(DecodedMvRecord {
+        operation_id: decoded.operation_id,
+        value: StoredKeyedMvProjection {
+            mv_id: d.mv_id,
+            facts,
+        },
+    })
+}

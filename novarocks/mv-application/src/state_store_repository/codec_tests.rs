@@ -182,7 +182,14 @@ fn schema_catalog_contains_exactly_four_current_accelerator_subjects() {
     for subject in catalog.subjects() {
         assert!(catalog.entry(subject, 1).is_err());
         assert!(catalog.entry(subject, 2).is_err());
-        assert_eq!(catalog.latest(subject).unwrap().id(), 3);
+        assert_eq!(
+            catalog.latest(subject).unwrap().id(),
+            if subject == "mv.accelerator_projection" {
+                4
+            } else {
+                3
+            }
+        );
     }
     assert!(catalog.entry("mv.definition", 4).is_err());
     assert!(catalog.entry("mv.refresh", 5).is_err());

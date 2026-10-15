@@ -196,11 +196,21 @@ impl MvProjectionInventoryBuilder {
         &mut self,
         projection: &StoredMvProjection,
     ) -> Result<(), MvRepositoryError> {
+        self.push_facts(
+            projection.mv_id,
+            projection.facts.target(),
+            &projection.facts.source_revision().target_object_id,
+        )
+    }
+    pub(crate) fn push_facts(
+        &mut self,
+        mv_id: i64,
+        target: &MvTarget,
+        object: &novarocks_spi::connector::ConnectorTableObjectId,
+    ) -> Result<(), MvRepositoryError> {
         if self.entries.len() >= self.bound.entries {
             return Err(Self::refusal("MV inventory exceeds its entry bound"));
         }
-        let target = projection.facts.target();
-        let object = &projection.facts.source_revision().target_object_id;
         if [
             target.catalog().unwrap_or_default(),
             target.namespace(),
@@ -261,7 +271,7 @@ impl MvProjectionInventoryBuilder {
             MvRepositoryError::new(MvRepositoryErrorKind::Corruption, error.to_string())
         })?;
         self.entries.push(MvProjectionInventoryEntry {
-            mv_id: projection.mv_id,
+            mv_id,
             target: target.clone(),
             object_id,
         });

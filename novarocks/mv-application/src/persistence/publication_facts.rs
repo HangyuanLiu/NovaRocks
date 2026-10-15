@@ -286,3 +286,26 @@ mod tests {
         assert_eq!(publication.statistics.logical_result_rows, Some(0));
     }
 }
+
+/// Freeze only the facts carried by layout 1; removed legacy fields do not
+/// acquire replacement defaults in the keyed publication model.
+pub fn freeze_keyed_publication_document(
+    source: &MvAcceleratorSourceRevision,
+    publication_id: LakePublicationId,
+    inputs: &MvPublicationInputs,
+    logical_result_rows: Option<u64>,
+    prepared_at_ms: u64,
+) -> Result<crate::persistence::codec::keyed::KeyedPublicationDocument, String> {
+    if prepared_at_ms > i64::MAX as u64 {
+        return Err("publication frozen timestamp exceeds i64".into());
+    }
+    Ok(crate::persistence::codec::keyed::KeyedPublicationDocument {
+        publication_prepared_at_ms: prepared_at_ms,
+        publication_id: PublicationIdentity::try_new(publication_id.to_bytes().to_vec())
+            .map_err(|e| e.to_string())?,
+        definition_revision: source.definition_revision,
+        interpretation_revision: source.interpretation_revision,
+        inputs: inputs.inputs.clone(),
+        logical_result_rows,
+    })
+}

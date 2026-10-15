@@ -174,6 +174,46 @@ pub struct PendingCreateIntentObservation {
 }
 
 impl PendingCreateIntentObservation {
+    pub fn complete_keyed(
+        self,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<
+        (
+            FreshCreateIntentObservation,
+            novarocks_spi::connector::KeyedDocumentView,
+        ),
+        ManagementObservationError,
+    > {
+        if request.catalog_handle != *self.intent.catalog()
+            || request.target != *self.intent.table()
+        {
+            return Err(ManagementObservationError::EffectTargetMismatch);
+        }
+        let catalog = request.catalog_handle.clone();
+        let view = lease
+            .observe_keyed_documents(request)
+            .map_err(|_| ManagementObservationError::UnsealedObservation)?;
+        let slot = view
+            .slots
+            .get(
+                &crate::persistence::keyed_documents::management_slot_name()
+                    .map_err(|_| ManagementObservationError::InvalidProvenance)?,
+            )
+            .ok_or(ManagementObservationError::InvalidProvenance)?;
+        crate::persistence::keyed_documents::decode_management_slot(&slot.value)
+            .map_err(|_| ManagementObservationError::InvalidProvenance)?;
+        let target = ManagedMvTarget::try_new(catalog, view.table.clone(), view.object_id.clone())?;
+        let target = self.intent.bind_target(target)?;
+        Ok((
+            FreshCreateIntentObservation {
+                intent: self.intent,
+                target,
+            },
+            view,
+        ))
+    }
+
     pub(super) const fn for_intent(intent: CreateIntent) -> Self {
         Self { intent }
     }
@@ -218,6 +258,48 @@ impl FreshCreateIntentObservation {
 }
 
 impl PendingManagementObservation {
+    /// Obtain the fresh observation through the retained lease itself; raw
+    /// decoded keyed views cannot mint a management admission capability.
+    pub fn complete_keyed(
+        self,
+        lease: &novarocks_spi::connector::ConnectorDocumentStorageLease,
+        request: novarocks_spi::connector::KeyedDocumentObservationRequest,
+    ) -> Result<
+        (
+            FreshManagementObservation,
+            novarocks_spi::connector::KeyedDocumentView,
+        ),
+        ManagementObservationError,
+    > {
+        if request.catalog_handle != *self.target.catalog()
+            || request.target != *self.target.table()
+            || request.object_id != *self.target.object_id()
+        {
+            return Err(ManagementObservationError::EffectTargetMismatch);
+        }
+        let view = lease
+            .observe_keyed_documents(request)
+            .map_err(|_| ManagementObservationError::UnsealedObservation)?;
+        let slot = view
+            .slots
+            .get(
+                &crate::persistence::keyed_documents::management_slot_name()
+                    .map_err(|_| ManagementObservationError::InvalidProvenance)?,
+            )
+            .ok_or(ManagementObservationError::InvalidProvenance)?;
+        let (owner, incarnation) =
+            crate::persistence::keyed_documents::decode_management_slot(&slot.value)
+                .map_err(|_| ManagementObservationError::InvalidProvenance)?;
+        let fresh = FreshManagementObservation {
+            request_id: self.request_id,
+            target: self.target,
+            owner,
+            incarnation,
+            metadata_version: view.metadata_version.clone(),
+        };
+        Ok((fresh, view))
+    }
+
     pub fn complete(
         self,
         observation: &ConnectorDocumentManagementObservation,

@@ -18,6 +18,7 @@
 //! Canonical, bounded conversion between runtime values and private generated
 //! persistence DTOs. No function in this module performs I/O.
 
+pub mod keyed;
 mod model;
 mod wire;
 

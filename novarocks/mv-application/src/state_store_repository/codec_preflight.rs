@@ -22,9 +22,10 @@
 use crate::persistence::codec::preflight_current_document_set;
 use crate::persistence::validation::PersistenceDecodeBudget;
 
-pub(super) fn projection_v3(
+pub(super) fn projection(
     payload: &[u8],
     budget: PersistenceDecodeBudget,
+    version_four: bool,
 ) -> Result<PersistenceDecodeBudget, String> {
     let mut input = Datum { remaining: payload };
     input.long()?; // mv_id
@@ -48,6 +49,14 @@ pub(super) fn projection_v3(
     input.string()?;
     input.string()?;
     input.string()?;
+    let binding = if version_four {
+        let binding = input.optional(Datum::bytes)?;
+        input.optional(Datum::long)?;
+        input.optional(Datum::long)?;
+        binding
+    } else {
+        None
+    };
     if !input.remaining.is_empty() {
         return Err("MV Accelerator Avro payload has trailing bytes".into());
     }
@@ -68,6 +77,39 @@ pub(super) fn projection_v3(
         max_working_set_bytes: available,
         ..budget
     };
+    if let Some(binding) = binding {
+        for content in [definition, interpretation, configuration, binding] {
+            if content.len() > documents.max_document_bytes {
+                return Err("keyed MV cache document exceeds decode bound".into());
+            }
+        }
+        if publication.is_some_and(|p| p.len() > 4096) {
+            return Err("keyed MV publication exceeds record bound".into());
+        }
+        if [
+            definition.len(),
+            interpretation.len(),
+            configuration.len(),
+            binding.len(),
+            publication.map_or(0, |p| p.len()),
+        ]
+        .into_iter()
+        .sum::<usize>()
+            > crate::persistence::validation::DEFAULT_MAX_DOCUMENT_SET_BYTES
+        {
+            return Err("keyed MV document set exceeds decode bound".into());
+        }
+        crate::persistence::codec::keyed::preflight_keyed_document_set(
+            definition,
+            interpretation,
+            binding,
+            configuration,
+            publication,
+            documents,
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(documents);
+    }
     preflight_current_document_set(
         definition,
         interpretation,

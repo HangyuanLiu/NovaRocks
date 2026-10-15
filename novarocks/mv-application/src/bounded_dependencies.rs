@@ -157,11 +157,21 @@ pub(crate) fn validate_canonical(
     projection: &StoredMvProjection,
     dependencies: &[StoredMvDependency],
 ) -> Result<(), MvRepositoryError> {
-    let definition = projection.facts.definition();
+    validate_canonical_parts(
+        projection.mv_id,
+        projection.facts.definition(),
+        dependencies,
+    )
+}
+pub(crate) fn validate_canonical_parts(
+    mv_id: i64,
+    definition: &crate::persistence::codec::DefinitionDocument,
+    dependencies: &[StoredMvDependency],
+) -> Result<(), MvRepositoryError> {
     let occurrences = &definition.relation_occurrences;
     if dependencies.len() != occurrences.len()
         || dependencies.iter().any(|dependency| {
-            dependency.downstream_mv_id != projection.mv_id
+            dependency.downstream_mv_id != mv_id
                 || dependency.created_at_ms != definition.created_at_ms
                 || dependency.upstream.object_type != MvDependencyObjectType::Unclassified
                 || dependency.upstream.storage_engine != MvDependencyStorageEngine::Unclassified

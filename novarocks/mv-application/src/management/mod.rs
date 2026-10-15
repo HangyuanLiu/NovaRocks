@@ -33,7 +33,7 @@ mod startup_isolation;
 pub use admission::{
     AutomaticMaintenanceEffect, ManagementAdmissionError, ManagementDependencySet,
     ManagementEntrance, ManagementEntranceLease, ManagementEntranceTicket, ManagementRequest,
-    MvCurrentManagementAdmission, MvManagementPhase,
+    MvCurrentManagementAdmission, MvManagementPhase, SlotChangeConvergence,
 };
 pub use audit::{
     MAX_MANAGEMENT_AUDIT_FIELD_BYTES, ManagementAuditAction, ManagementAuditOutcome,

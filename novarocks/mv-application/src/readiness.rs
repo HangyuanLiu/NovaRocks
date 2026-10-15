@@ -188,6 +188,12 @@ impl From<MvDocumentError> for MvProjectionError {
     fn from(error: MvDocumentError) -> Self {
         use novarocks_spi::connector::ConnectorErrorKind as K;
         let kind = match &error {
+            MvDocumentError::KeyedStorage(
+                novarocks_spi::connector::KeyedDocumentReadError::LegacyFormat { .. },
+            ) => MvProjectionErrorKind::Unsupported,
+            MvDocumentError::KeyedStorage(
+                novarocks_spi::connector::KeyedDocumentReadError::Invalid(error),
+            ) => return Self::from(MvDocumentError::Connector(error.clone())),
             MvDocumentError::Connector(error) => match error.kind() {
                 K::Unsupported => MvProjectionErrorKind::Unsupported,
                 K::Cancelled => MvProjectionErrorKind::Cancelled,
@@ -1104,3 +1110,913 @@ mod tests;
 /// otherwise hold the reader forever: after it, the reader answers exactly as
 /// it did before this wait existed.
 const OBSERVATION_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Additive keyed adapter during the document-format migration. It shares the
+/// exact Accelerator repository and process runtime with the legacy adapter.
+#[derive(Clone)]
+pub struct MvKeyedReadinessService {
+    repository: Arc<crate::state_store_repository::StateStoreMvRepository>,
+    runtime: Arc<ProcessRuntime<MvTarget, LakePublicationId>>,
+}
+#[async_trait::async_trait]
+pub trait MvKeyedCurrentProjectionSource: Send + Sync {
+    async fn observe_current_keyed(
+        &self,
+        request: MvCurrentProjectionRequest,
+    ) -> Result<
+        (
+            crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+            MvCurrentManagementAdmission,
+        ),
+        MvProjectionError,
+    >;
+}
+#[derive(Debug)]
+pub enum MvKeyedProjectionInstallOutcome {
+    AlreadyProjectedElsewhere(MvTarget),
+    AlreadyAbsent,
+    Removed,
+    Installed(crate::state_store_repository::keyed::LoadedKeyedMvProjection),
+    Unchanged(crate::state_store_repository::keyed::LoadedKeyedMvProjection),
+    Superseded,
+}
+impl MvKeyedReadinessService {
+    pub fn new(
+        repository: Arc<crate::state_store_repository::StateStoreMvRepository>,
+        runtime: Arc<ProcessRuntime<MvTarget, LakePublicationId>>,
+    ) -> Self {
+        Self {
+            repository,
+            runtime,
+        }
+    }
+    /// Reserve order before invoking the provider. A slower earlier read can
+    /// never overwrite a later observation or an explicit invalidation.
+    pub async fn observe_and_install(
+        &self,
+        operation_id: Uuid,
+        request: MvCurrentProjectionRequest,
+        source: &dyn MvKeyedCurrentProjectionSource,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
+        let target = request.target().clone();
+        let budget = request.decode_budget();
+        let order = self.runtime.projection_order(target.clone());
+        let (generation, expected) = {
+            let mut cell = order.lock().await;
+            let generation = cell.advance()?;
+            cell.installed = None;
+            cell.pending = Some(generation);
+            self.runtime.set_unavailable(
+                target.clone(),
+                "fresh keyed Current observation pending".into(),
+            );
+            let expected = self
+                .repository
+                .find_keyed_by_target(&target, budget)
+                .await?;
+            (generation, expected)
+        };
+        let observed = source.observe_current_keyed(request.clone()).await;
+        let mut cell = order.lock().await;
+        if cell.generation != generation {
+            return Ok(MvKeyedProjectionInstallOutcome::Superseded);
+        }
+        cell.settle(generation);
+        let current = self
+            .repository
+            .find_keyed_by_target(&target, budget)
+            .await?;
+        if current.as_ref().map(|v| &v.version) != expected.as_ref().map(|v| &v.version) {
+            return Ok(MvKeyedProjectionInstallOutcome::Superseded);
+        }
+        let (observed, admission) = match observed {
+            Ok(value) => value,
+            Err(error) => {
+                self.runtime.set_unavailable(target, error.to_string());
+                return Err(error);
+            }
+        };
+        check_context(request.context())?;
+        if !admission.matches_keyed(&observed)
+            || observed.view.table.instance_id.as_str() != target.catalog().unwrap_or("")
+            || observed.view.table.namespace.as_ref() != target.namespace()
+            || observed.view.table.table.as_ref() != target.name()
+        {
+            return Err(MvProjectionError::new(
+                MvProjectionErrorKind::SourceConflict,
+                "keyed projection lacks admission for this exact observation",
+            ));
+        }
+        let facts =
+            crate::persistence::keyed_documents::MvKeyedDocumentProjection::try_from_current(
+                observed,
+            )
+            .map_err(|e| MvProjectionError::new(MvProjectionErrorKind::CorruptDocument, e))?;
+        let unchanged = expected
+            .as_ref()
+            .is_some_and(|old| old.projection.facts.source_revision() == facts.source_revision());
+        if expected.is_none() {
+            if let Some(existing) = self
+                .repository
+                .find_keyed_by_target_object(&facts.source_revision().target_object_id)
+                .await?
+            {
+                let other = existing.projection.facts.target();
+                self.runtime.set_unavailable(
+                    target,
+                    "target object is already projected through another catalog".into(),
+                );
+                return Ok(MvKeyedProjectionInstallOutcome::AlreadyProjectedElsewhere(
+                    other,
+                ));
+            }
+        }
+        let loaded = if unchanged {
+            expected.expect("unchanged requires an expected root")
+        } else {
+            self.repository
+                .install_keyed_projection(operation_id, facts, expected)
+                .await?
+        };
+        if !admission.is_open() {
+            self.runtime.set_unavailable(
+                target,
+                "management admission closed during keyed installation".into(),
+            );
+            return Err(MvProjectionError::new(
+                MvProjectionErrorKind::SourceConflict,
+                "management admission closed during keyed installation",
+            ));
+        }
+        cell.installed = Some(loaded.version.clone());
+        self.runtime.set_ready(target);
+        Ok(if unchanged {
+            MvKeyedProjectionInstallOutcome::Unchanged(loaded)
+        } else {
+            MvKeyedProjectionInstallOutcome::Installed(loaded)
+        })
+    }
+    pub async fn load_ready(
+        &self,
+        target: &MvTarget,
+    ) -> Result<
+        Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
+        MvRepositoryError,
+    > {
+        let order = self.runtime.projection_order(target.clone());
+        let cell = order.lock().await;
+        let Some(loaded) = self
+            .repository
+            .find_keyed_by_target(target, PersistenceDecodeBudget::default())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !matches!(self.runtime.readiness(target), TargetReadiness::Ready)
+            || cell.installed.as_ref() != Some(&loaded.version)
+        {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Unavailable,
+                "keyed MV target requires a successful fresh Current observation",
+            ));
+        }
+        Ok(Some(loaded))
+    }
+}
+
+#[derive(Clone)]
+pub struct MvKeyedCandidateReader {
+    repository: Arc<crate::state_store_repository::StateStoreMvRepository>,
+}
+impl MvKeyedCandidateReader {
+    pub async fn list_candidate_definitions(
+        &self,
+    ) -> Result<Vec<crate::persistence::keyed_documents::StoredKeyedMvProjection>, MvRepositoryError>
+    {
+        Ok(self
+            .repository
+            .list_keyed_projections()
+            .await?
+            .into_iter()
+            .map(|v| v.projection)
+            .collect())
+    }
+}
+pub struct MvBoundedKeyedProjectionInventory {
+    service: MvKeyedReadinessService,
+    entries: std::vec::IntoIter<MvProjectionInventoryEntry>,
+    bound: MvProjectionInventoryBound,
+}
+pub struct ListedKeyedMvProjection {
+    pub loaded: crate::state_store_repository::keyed::LoadedKeyedMvProjection,
+    pub manageability: MvListedManageability,
+}
+impl MvBoundedKeyedProjectionInventory {
+    pub fn order_by_namespace_and_name(&mut self) {
+        self.entries.as_mut_slice().sort_by(|a, b| {
+            a.target
+                .namespace()
+                .cmp(b.target.namespace())
+                .then(a.target.name().cmp(b.target.name()))
+        });
+    }
+    pub async fn next_ready(
+        &mut self,
+    ) -> Result<
+        Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
+        MvRepositoryError,
+    > {
+        for entry in self.entries.by_ref() {
+            let order = self.service.runtime.projection_order(entry.target.clone());
+            let cell = order.lock().await;
+            let Some(loaded) = self
+                .service
+                .repository
+                .find_keyed_by_target_bounded(&entry.target, self.bound)
+                .await?
+            else {
+                continue;
+            };
+            if matches!(
+                self.service.runtime.readiness(&entry.target),
+                TargetReadiness::Ready
+            ) && cell.installed.as_ref() == Some(&loaded.version)
+            {
+                return Ok(Some(loaded));
+            }
+        }
+        Ok(None)
+    }
+    pub async fn next_listable(
+        &mut self,
+    ) -> Result<Option<ListedKeyedMvProjection>, MvRepositoryError> {
+        for entry in self.entries.by_ref() {
+            let mut bound = self.bound;
+            let state = self
+                .service
+                .runtime
+                .with_readiness(&entry.target, |state| {
+                    let bytes = match state {
+                        TargetReadiness::ReadOnly(r) | TargetReadiness::Unavailable(r) => r.len(),
+                        _ => 0,
+                    };
+                    bound.decode.max_working_set_bytes = bound
+                        .decode
+                        .max_working_set_bytes
+                        .checked_sub(bytes)
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| {
+                            MvRepositoryError::new(
+                                MvRepositoryErrorKind::InvalidRequest,
+                                "keyed readiness reason exceeds decode budget",
+                            )
+                        })?;
+                    Ok::<_, MvRepositoryError>(match state {
+                        TargetReadiness::Ready => Some(MvListedManageability::Manageable),
+                        TargetReadiness::ReadOnly(r) => {
+                            Some(MvListedManageability::ReadOnly(r.clone()))
+                        }
+                        TargetReadiness::Unavailable(r) => {
+                            Some(MvListedManageability::Unavailable(r.clone()))
+                        }
+                        TargetReadiness::Unobserved => None,
+                    })
+                })?;
+            let Some(manageability) = state else {
+                continue;
+            };
+            let order = self.service.runtime.projection_order(entry.target.clone());
+            let cell = order.lock().await;
+            let Some(loaded) = self
+                .service
+                .repository
+                .find_keyed_by_target_bounded(&entry.target, bound)
+                .await?
+            else {
+                continue;
+            };
+            if manageability == MvListedManageability::Manageable
+                && cell.installed.as_ref() != Some(&loaded.version)
+            {
+                continue;
+            }
+            return Ok(Some(ListedKeyedMvProjection {
+                loaded,
+                manageability,
+            }));
+        }
+        Ok(None)
+    }
+}
+pub struct MvKeyedProjectionDeleteGuard {
+    target: MvTarget,
+    generation: u64,
+    expected: Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
+    order: Arc<tokio::sync::Mutex<ProjectionOrder>>,
+}
+impl MvKeyedProjectionDeleteGuard {
+    pub fn has_projection(&self) -> bool {
+        self.expected.is_some()
+    }
+    pub fn expected_target_object_id(
+        &self,
+    ) -> Option<&novarocks_spi::connector::ConnectorTableObjectId> {
+        self.expected
+            .as_ref()
+            .map(|e| &e.projection.facts.source_revision().target_object_id)
+    }
+}
+pub enum MvKeyedDropReadiness {
+    ReadyToDrop(MvKeyedProjectionDeleteGuard),
+    AlreadyAbsent,
+}
+#[async_trait::async_trait]
+pub trait MvKeyedReadOnlyCurrentProjectionSource: Send + Sync {
+    async fn observe_current_keyed_read_only(
+        &self,
+        request: MvCurrentProjectionRequest,
+    ) -> Result<
+        crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
+        MvProjectionError,
+    >;
+}
+impl MvKeyedReadinessService {
+    /// Control-only operations reuse the existing runtime/repository pair.
+    pub fn controls(&self) -> MvReadinessService {
+        MvReadinessService::new(self.repository.clone(), self.runtime.clone())
+    }
+    pub fn candidate_reader(&self) -> MvKeyedCandidateReader {
+        MvKeyedCandidateReader {
+            repository: self.repository.clone(),
+        }
+    }
+    pub async fn invalidate_current(
+        &self,
+        target: MvTarget,
+        reason: String,
+    ) -> Result<(), MvProjectionError> {
+        self.controls().invalidate_current(target, reason).await
+    }
+    pub fn begin_publication(
+        &self,
+        target: MvTarget,
+        id: LakePublicationId,
+    ) -> Result<MvRuntimePublicationLease, MvRepositoryError> {
+        self.controls().begin_publication(target, id)
+    }
+    #[cfg(any(test, feature = "test-controls"))]
+    pub fn ensure_no_active_publications(&self) -> Result<(), MvRepositoryError> {
+        self.controls().ensure_no_active_publications()
+    }
+    #[cfg(any(test, feature = "test-controls"))]
+    pub async fn wipe_accelerator(&self, id: Uuid) -> Result<(), MvProjectionError> {
+        self.controls().wipe_accelerator(id).await
+    }
+    pub async fn query_admission(
+        &self,
+        target: &MvTarget,
+    ) -> Result<MvQueryAdmission, MvRepositoryError> {
+        if self
+            .repository
+            .find_keyed_by_target(target, PersistenceDecodeBudget::default())
+            .await?
+            .is_none()
+        {
+            return Ok(MvQueryAdmission::NotAnMv);
+        }
+        Ok(match self.runtime.readiness(target) {
+            TargetReadiness::Ready | TargetReadiness::ReadOnly(_) => MvQueryAdmission::Admitted,
+            TargetReadiness::Unavailable(r) => MvQueryAdmission::Quarantined(r),
+            TargetReadiness::Unobserved => MvQueryAdmission::Quarantined(
+                "MV target has not been observed in this process".into(),
+            ),
+        })
+    }
+    pub async fn load_ready_settled(
+        &self,
+        target: &MvTarget,
+    ) -> Result<
+        Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
+        MvRepositoryError,
+    > {
+        let order = self.runtime.projection_order(target.clone());
+        let deadline = tokio::time::Instant::now() + OBSERVATION_SETTLE_WAIT;
+        loop {
+            let cell = order.lock().await;
+            if cell.pending.is_none() {
+                break;
+            }
+            let settled = Arc::clone(&cell.settled);
+            let notified = settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            drop(cell);
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                break;
+            }
+        }
+        self.load_ready(target).await
+    }
+    pub async fn bounded_projection_inventory(
+        &self,
+        bound: MvProjectionInventoryBound,
+    ) -> Result<MvBoundedKeyedProjectionInventory, MvRepositoryError> {
+        Ok(MvBoundedKeyedProjectionInventory {
+            service: self.clone(),
+            entries: self
+                .repository
+                .list_keyed_projection_inventory(bound)
+                .await?
+                .into_iter(),
+            bound,
+        })
+    }
+    pub async fn list_ready_projections(
+        &self,
+    ) -> Result<Vec<crate::state_store_repository::keyed::LoadedKeyedMvProjection>, MvRepositoryError>
+    {
+        let mut values = Vec::new();
+        for loaded in self.repository.list_keyed_projections().await? {
+            match self.load_ready(&loaded.projection.facts.target()).await {
+                Ok(Some(v)) => values.push(v),
+                Ok(None) => {}
+                Err(e) if e.kind() == MvRepositoryErrorKind::Unavailable => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(values)
+    }
+    pub async fn list_ready_dependencies_by_downstream_bounded(
+        &self,
+        loaded: &crate::state_store_repository::keyed::LoadedKeyedMvProjection,
+        bound: crate::repository::MvDependencyReadBound,
+    ) -> Result<Vec<crate::persistence::dependency::StoredMvDependency>, MvRepositoryError> {
+        let target = loaded.projection.facts.target();
+        let order = self.runtime.projection_order(target.clone());
+        let cell = order.lock().await;
+        if !matches!(self.runtime.readiness(&target), TargetReadiness::Ready)
+            || cell.installed.as_ref() != Some(&loaded.version)
+        {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Unavailable,
+                "keyed dependency root is not ready",
+            ));
+        }
+        self.repository
+            .list_keyed_dependencies_by_downstream_bounded(loaded, bound)
+            .await
+    }
+    pub async fn ensure_no_ready_downstream_dependencies(
+        &self,
+        upstream: &MvDependencyObjectIdentity,
+    ) -> Result<(), MvRepositoryError> {
+        for loaded in self.list_ready_projections().await? {
+            for r in &loaded.projection.facts.definition().relation_occurrences {
+                if r.catalog_at_binding == upstream.catalog_instance.as_str()
+                    && crate::persistence::exact_revision::persisted_object_names(
+                        &r.object_id,
+                        &upstream.object_id,
+                    )
+                    .map_err(|e| {
+                        MvRepositoryError::new(MvRepositoryErrorKind::Corruption, e.to_string())
+                    })?
+                {
+                    return Err(MvRepositoryError::new(
+                        MvRepositoryErrorKind::Conflict,
+                        "exact object has downstream materialized views",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    pub async fn reserve_projection_delete(
+        &self,
+        target: MvTarget,
+    ) -> Result<MvKeyedProjectionDeleteGuard, MvProjectionError> {
+        let order = self.runtime.projection_order(target.clone());
+        let mut cell = order.lock().await;
+        let generation = cell.advance()?;
+        cell.installed = None;
+        cell.pending = Some(generation);
+        self.runtime
+            .set_unavailable(target.clone(), "MV deletion pending".into());
+        let expected = match self
+            .repository
+            .find_keyed_by_target(&target, PersistenceDecodeBudget::default())
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                cell.settle(generation);
+                return Err(e.into());
+            }
+        };
+        drop(cell);
+        Ok(MvKeyedProjectionDeleteGuard {
+            target,
+            generation,
+            expected,
+            order,
+        })
+    }
+    pub async fn delete_after_provider_drop(
+        &self,
+        operation: Uuid,
+        guard: MvKeyedProjectionDeleteGuard,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
+        let mut cell = guard.order.lock().await;
+        if cell.generation != guard.generation {
+            return Ok(MvKeyedProjectionInstallOutcome::Superseded);
+        }
+        cell.settle(guard.generation);
+        let current = self
+            .repository
+            .find_keyed_by_target(&guard.target, PersistenceDecodeBudget::default())
+            .await?;
+        if current.as_ref().map(|v| &v.version) != guard.expected.as_ref().map(|v| &v.version) {
+            return Ok(MvKeyedProjectionInstallOutcome::Superseded);
+        }
+        let Some(expected) = guard.expected else {
+            return Ok(MvKeyedProjectionInstallOutcome::AlreadyAbsent);
+        };
+        let removed = self
+            .repository
+            .delete_keyed_projection(operation, expected)
+            .await?;
+        cell.installed = None;
+        self.runtime
+            .set_unavailable(guard.target, "MV target was removed".into());
+        Ok(if removed {
+            MvKeyedProjectionInstallOutcome::Removed
+        } else {
+            MvKeyedProjectionInstallOutcome::AlreadyAbsent
+        })
+    }
+    pub async fn prepare_drop(
+        &self,
+        target: &MvTarget,
+        if_exists: bool,
+    ) -> Result<MvKeyedDropReadiness, MvProjectionError> {
+        let Some(loaded) = self.load_ready(target).await? else {
+            return if if_exists {
+                Ok(MvKeyedDropReadiness::AlreadyAbsent)
+            } else {
+                Err(MvProjectionError::new(
+                    MvProjectionErrorKind::SourceConflict,
+                    "materialized view does not exist",
+                ))
+            };
+        };
+        self.ensure_no_ready_downstream_dependencies(&MvDependencyObjectIdentity::new(
+            loaded
+                .projection
+                .facts
+                .source_revision()
+                .target
+                .instance_id
+                .as_str(),
+            loaded
+                .projection
+                .facts
+                .source_revision()
+                .target_object_id
+                .clone(),
+        ))
+        .await?;
+        Ok(MvKeyedDropReadiness::ReadyToDrop(
+            self.reserve_projection_delete(target.clone()).await?,
+        ))
+    }
+    pub async fn observe_current_read_only_and_install(
+        &self,
+        operation_id: Uuid,
+        request: MvCurrentProjectionRequest,
+        source: &dyn MvKeyedReadOnlyCurrentProjectionSource,
+        reason: String,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
+        let target = request.target().clone();
+        let order = self.runtime.projection_order(target.clone());
+        let (generation, expected, managed, installed) = {
+            let mut cell = order.lock().await;
+            let generation = cell.advance()?;
+            let managed = matches!(self.runtime.readiness(&target), TargetReadiness::Ready);
+            let installed = cell.installed.take();
+            cell.pending = Some(generation);
+            self.runtime.set_unavailable(
+                target.clone(),
+                "fresh keyed read-only observation pending".into(),
+            );
+            let expected = self
+                .repository
+                .find_keyed_by_target(&target, request.decode_budget())
+                .await?;
+            (generation, expected, managed, installed)
+        };
+        let observed = source
+            .observe_current_keyed_read_only(request.clone())
+            .await;
+        let mut cell = order.lock().await;
+        if cell.generation != generation {
+            return Ok(MvKeyedProjectionInstallOutcome::Superseded);
+        }
+        cell.settle(generation);
+        let current = self
+            .repository
+            .find_keyed_by_target(&target, request.decode_budget())
+            .await?;
+        if current.as_ref().map(|v| &v.version) != expected.as_ref().map(|v| &v.version) {
+            return Ok(MvKeyedProjectionInstallOutcome::Superseded);
+        }
+        let observed = observed?;
+        check_context(request.context())?;
+        let facts =
+            crate::persistence::keyed_documents::MvKeyedDocumentProjection::try_from_current(
+                observed,
+            )
+            .map_err(|e| MvProjectionError::new(MvProjectionErrorKind::CorruptDocument, e))?;
+        if facts.target() != target {
+            return Err(MvProjectionError::new(
+                MvProjectionErrorKind::SourceConflict,
+                "keyed read-only observation target changed",
+            ));
+        }
+        let unchanged = expected
+            .as_ref()
+            .is_some_and(|v| v.projection.facts.source_revision() == facts.source_revision());
+        if expected.is_none() {
+            if let Some(existing) = self
+                .repository
+                .find_keyed_by_target_object(&facts.source_revision().target_object_id)
+                .await?
+            {
+                self.runtime.set_unavailable(
+                    target,
+                    "target object is already projected through another catalog".into(),
+                );
+                return Ok(MvKeyedProjectionInstallOutcome::AlreadyProjectedElsewhere(
+                    existing.projection.facts.target(),
+                ));
+            }
+        }
+        let loaded = if unchanged {
+            expected.expect("unchanged requires a root")
+        } else {
+            self.repository
+                .install_keyed_projection(operation_id, facts, expected)
+                .await?
+        };
+        if managed && unchanged && installed.as_ref() == Some(&loaded.version) {
+            cell.installed = Some(loaded.version.clone());
+            self.runtime.set_ready(target);
+        } else {
+            cell.installed = None;
+            self.runtime.set_read_only(target, reason);
+        }
+        Ok(if unchanged {
+            MvKeyedProjectionInstallOutcome::Unchanged(loaded)
+        } else {
+            MvKeyedProjectionInstallOutcome::Installed(loaded)
+        })
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn seed_projection(
+        &self,
+        operation: Uuid,
+        facts: crate::persistence::keyed_documents::MvKeyedDocumentProjection,
+    ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
+        let target = facts.target();
+        let order = self.runtime.projection_order(target.clone());
+        let mut cell = order.lock().await;
+        cell.advance()?;
+        cell.supersede();
+        let expected = self
+            .repository
+            .find_keyed_by_target(&target, PersistenceDecodeBudget::default())
+            .await?;
+        let loaded = self
+            .repository
+            .install_keyed_projection(operation, facts, expected)
+            .await?;
+        cell.installed = Some(loaded.version.clone());
+        self.runtime.set_ready(target);
+        Ok(MvKeyedProjectionInstallOutcome::Installed(loaded))
+    }
+}
+
+#[cfg(test)]
+mod keyed_tests {
+    use super::*;
+    use crate::persistence::keyed_documents::*;
+    use crate::repository::MvDependencyReadBound;
+    struct Source(MvKeyedObservedCurrentDocuments);
+    #[async_trait::async_trait]
+    impl MvKeyedCurrentProjectionSource for Source {
+        async fn observe_current_keyed(
+            &self,
+            _: MvCurrentProjectionRequest,
+        ) -> Result<
+            (
+                MvKeyedObservedCurrentDocuments,
+                MvCurrentManagementAdmission,
+            ),
+            MvProjectionError,
+        > {
+            Ok((
+                self.0.clone(),
+                MvCurrentManagementAdmission::for_test_keyed(&self.0),
+            ))
+        }
+    }
+    #[async_trait::async_trait]
+    impl MvKeyedReadOnlyCurrentProjectionSource for Source {
+        async fn observe_current_keyed_read_only(
+            &self,
+            _: MvCurrentProjectionRequest,
+        ) -> Result<MvKeyedObservedCurrentDocuments, MvProjectionError> {
+            Ok(self.0.clone())
+        }
+    }
+    async fn service() -> MvKeyedReadinessService {
+        let store = Arc::new(
+            novarocks_state_store_testkit::testing::InMemoryStateStore::new(format!(
+                "keyed-readiness-{}",
+                Uuid::now_v7()
+            )),
+        );
+        let repository = crate::state_store_repository::StateStoreMvRepository::open(
+            store,
+            novarocks_state_store_runtime::StateStoreRunPolicy::default(),
+        )
+        .await
+        .unwrap();
+        MvKeyedReadinessService::new(repository, Arc::new(ProcessRuntime::default()))
+    }
+    fn input(published: bool) -> (MvCurrentProjectionRequest, Source) {
+        let (catalog, view) = keyed_view_fixture(Some(17), published);
+        let decoded = decode_current_keyed_documents(
+            view,
+            catalog.clone(),
+            PersistenceDecodeBudget::default(),
+        )
+        .unwrap();
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            stop.view(),
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        (
+            MvCurrentProjectionRequest::try_new(
+                catalog,
+                MvTarget::from_parts(Some("ice"), "sales", "mv"),
+                context,
+                PersistenceDecodeBudget::default(),
+            )
+            .unwrap(),
+            Source(decoded),
+        )
+    }
+    #[tokio::test]
+    async fn keyed_ready_inventory_candidate_read_only_and_delete_share_one_root() {
+        let service = service().await;
+        let (request, source) = input(true);
+        let target = request.target().clone();
+        assert!(matches!(
+            service
+                .observe_and_install(Uuid::now_v7(), request.clone(), &source)
+                .await
+                .unwrap(),
+            MvKeyedProjectionInstallOutcome::Installed(_)
+        ));
+        let loaded = service.load_ready_settled(&target).await.unwrap().unwrap();
+        assert_eq!(loaded.projection.facts.publication_snapshot(), Some(17));
+        assert!(matches!(
+            service.query_admission(&target).await.unwrap(),
+            MvQueryAdmission::Admitted
+        ));
+        assert_eq!(
+            service
+                .candidate_reader()
+                .list_candidate_definitions()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let bound = MvProjectionInventoryBound {
+            entries: 4,
+            snapshot_bytes: 64 * 1024,
+            raw_page_bytes: 1024 * 1024,
+            single_name_bytes: 1024,
+            continuation_token_bytes: 4096,
+            decode: PersistenceDecodeBudget::default(),
+        };
+        let mut inventory = service.bounded_projection_inventory(bound).await.unwrap();
+        assert!(inventory.next_ready().await.unwrap().is_some());
+        assert!(inventory.next_ready().await.unwrap().is_none());
+        let dependencies = service
+            .list_ready_dependencies_by_downstream_bounded(
+                &loaded,
+                MvDependencyReadBound {
+                    inventory: bound,
+                    entries: 8,
+                    collection_bytes: 64 * 1024,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(dependencies.len(), 2);
+        assert_eq!(
+            service
+                .list_ready_dependencies_by_downstream(&loaded)
+                .await
+                .unwrap(),
+            dependencies
+        );
+        assert!(matches!(
+            service
+                .observe_current_read_only_and_install(
+                    Uuid::now_v7(),
+                    request,
+                    &source,
+                    "foreign".into()
+                )
+                .await
+                .unwrap(),
+            MvKeyedProjectionInstallOutcome::Unchanged(_)
+        ));
+        assert!(service.load_ready(&target).await.unwrap().is_some());
+        let guard = service
+            .reserve_projection_delete(target.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .delete_after_provider_drop(Uuid::now_v7(), guard)
+                .await
+                .unwrap(),
+            MvKeyedProjectionInstallOutcome::Removed
+        ));
+        assert!(service.load_ready(&target).await.unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn keyed_control_adapter_observes_the_same_active_publication() {
+        let service = service().await;
+        let (request, source) = input(false);
+        let target = request.target().clone();
+        service
+            .observe_and_install(Uuid::now_v7(), request, &source)
+            .await
+            .unwrap();
+        let hold = service
+            .begin_publication(
+                target,
+                LakePublicationId::try_from_uuid(Uuid::now_v7()).unwrap(),
+            )
+            .unwrap();
+        assert!(service.ensure_no_active_publications().is_err());
+        assert!(service.controls().ensure_no_active_publications().is_err());
+        drop(hold);
+        assert!(service.controls().ensure_no_active_publications().is_ok());
+    }
+    #[tokio::test]
+    async fn keyed_scheduler_consumes_only_actual_compact_publication_facts() {
+        use crate::scheduler::{MvRefreshScheduler, MvSchedulerConfig};
+        let (_, source) = input(true);
+        let facts = MvKeyedDocumentProjection::try_from_current(source.0).unwrap();
+        let due = facts.publication().unwrap().publication_prepared_at_ms
+            + facts.configuration().refresh_interval_ms.unwrap();
+        let mut scheduler = MvRefreshScheduler::<StoredKeyedMvProjection>::for_projection(
+            MvSchedulerConfig::new(true, 1000, 1, 10, 40),
+        );
+        scheduler.observe_projection(StoredKeyedMvProjection { mv_id: 7, facts }, due as i64);
+        let ready = scheduler.take_ready();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].projection().mv_id, 7);
+    }
+}
+
+impl MvKeyedReadinessService {
+    pub async fn list_ready_dependencies_by_downstream(
+        &self,
+        loaded: &crate::state_store_repository::keyed::LoadedKeyedMvProjection,
+    ) -> Result<Vec<crate::persistence::dependency::StoredMvDependency>, MvRepositoryError> {
+        let target = loaded.projection.facts.target();
+        let order = self.runtime.projection_order(target.clone());
+        let cell = order.lock().await;
+        if !matches!(self.runtime.readiness(&target), TargetReadiness::Ready)
+            || cell.installed.as_ref() != Some(&loaded.version)
+        {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Unavailable,
+                "keyed dependency root is not ready",
+            ));
+        }
+        self.repository
+            .list_keyed_dependencies_by_downstream(loaded)
+            .await
+    }
+}

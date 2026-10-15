@@ -43,23 +43,29 @@ use crate::scheduler::{MvRefreshScheduler, MvSchedulerConfig};
 /// The one process-local MV owner for activity admission and background-worker
 /// lifecycle. Hosts may inject effect callbacks, but cannot own a parallel
 /// gate, shutdown state, or worker supervisor.
-pub struct MvProductService {
+pub type MvProductService =
+    MvProductServiceCore<crate::persistence::projection::StoredMvProjection>;
+pub type MvKeyedProductService =
+    MvProductServiceCore<crate::persistence::keyed_documents::StoredKeyedMvProjection>;
+
+pub struct MvProductServiceCore<P: crate::scheduler::MvSchedulerProjection> {
     activity_gate: MvActivityGate,
     background: MvBackgroundRuntimeOwner,
     scheduler_config: MvSchedulerConfig,
-    scheduler: Mutex<MvRefreshScheduler>,
+    scheduler: Mutex<MvRefreshScheduler<P>>,
     readiness: Option<MvReadinessService>,
+    keyed_readiness: Option<crate::readiness::MvKeyedReadinessService>,
     management: Option<Arc<crate::management::ManagementEntrance>>,
     continuation: Option<Arc<crate::management::ManagementContinuationService>>,
 }
 
-impl Default for MvProductService {
+impl<P: crate::scheduler::MvSchedulerProjection> Default for MvProductServiceCore<P> {
     fn default() -> Self {
         Self::new(MvSchedulerConfig::default())
     }
 }
 
-impl MvProductService {
+impl<P: crate::scheduler::MvSchedulerProjection> MvProductServiceCore<P> {
     /// Construct the one product owner for this process' MV scheduler state.
     /// The host may use the tick interval to arrange a wakeup, but the queue,
     /// source revisions, retry ledger and terminal transitions remain here.
@@ -67,9 +73,10 @@ impl MvProductService {
         Self {
             activity_gate: MvActivityGate::default(),
             background: MvBackgroundRuntimeOwner::default(),
-            scheduler: Mutex::new(MvRefreshScheduler::new(scheduler_config.clone())),
+            scheduler: Mutex::new(MvRefreshScheduler::for_projection(scheduler_config.clone())),
             scheduler_config,
             readiness: None,
+            keyed_readiness: None,
             management: None,
             continuation: None,
         }
@@ -175,7 +182,7 @@ impl MvProductService {
     /// retain scheduler state outside this process product owner.
     pub fn with_refresh_scheduler<T>(
         &self,
-        operation: impl FnOnce(&mut MvRefreshScheduler) -> T,
+        operation: impl FnOnce(&mut MvRefreshScheduler<P>) -> T,
     ) -> T {
         let mut scheduler = self
             .scheduler
@@ -1094,5 +1101,25 @@ mod tests {
 
         assert!(matches!(result, MvProductResult::Acknowledged));
         assert_eq!(effects.events(), ["prepare_drop"]);
+    }
+}
+
+impl MvProductServiceCore<crate::persistence::keyed_documents::StoredKeyedMvProjection> {
+    pub fn new_with_keyed_management_continuation(
+        config: MvSchedulerConfig,
+        repository: Arc<crate::state_store_repository::StateStoreMvRepository>,
+        runtime: Arc<ProcessRuntime<MvTarget, novarocks_spi::connector::LakePublicationId>>,
+        management: Arc<crate::management::ManagementEntrance>,
+        policy: crate::management::RemoteEffectPolicy,
+    ) -> Self {
+        let keyed =
+            crate::readiness::MvKeyedReadinessService::new(repository.clone(), runtime.clone());
+        let mut service =
+            Self::new_with_management_continuation(config, repository, runtime, management, policy);
+        service.keyed_readiness = Some(keyed);
+        service
+    }
+    pub fn keyed_readiness_service(&self) -> Option<crate::readiness::MvKeyedReadinessService> {
+        self.keyed_readiness.clone()
     }
 }

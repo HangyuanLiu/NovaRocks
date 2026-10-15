@@ -156,6 +156,7 @@ impl MvObservedCurrentDocuments {
 
 #[derive(Debug)]
 pub enum MvDocumentError {
+    KeyedStorage(novarocks_spi::connector::KeyedDocumentReadError),
     Codec(PersistenceCodecError),
     Contract(String),
     Connector(novarocks_spi::connector::ConnectorError),
@@ -165,6 +166,9 @@ pub enum MvDocumentError {
 impl std::fmt::Display for MvDocumentError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::KeyedStorage(error) => {
+                write!(formatter, "MV keyed document storage failed: {error}")
+            }
             Self::Codec(error) => write!(formatter, "MV document codec failed: {error}"),
             Self::Contract(message) => write!(formatter, "invalid MV document contract: {message}"),
             Self::Connector(error) => {
@@ -176,6 +180,12 @@ impl std::fmt::Display for MvDocumentError {
 }
 
 impl std::error::Error for MvDocumentError {}
+
+impl From<novarocks_spi::connector::KeyedDocumentReadError> for MvDocumentError {
+    fn from(error: novarocks_spi::connector::KeyedDocumentReadError) -> Self {
+        Self::KeyedStorage(error)
+    }
+}
 
 impl From<PersistenceCodecError> for MvDocumentError {
     fn from(value: PersistenceCodecError) -> Self {
@@ -740,7 +750,7 @@ fn decode_document_slice(
     })
 }
 
-fn validate_create_target(
+pub(crate) fn validate_create_target(
     interpretation: &InterpretationDocument,
     target: &ConnectorPreparedCreateDocumentTarget,
 ) -> Result<(), MvDocumentError> {

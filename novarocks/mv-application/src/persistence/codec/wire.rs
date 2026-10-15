@@ -64,6 +64,8 @@ pub(super) enum Schema {
     PublicationOutput,
     PublicationStatistics,
     ConfigurationDocument,
+    BindingDocument,
+    DataVersionFormat,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,6 +295,9 @@ const PUBLICATION_OUTPUT: &[Field] = &[bytes(1), boolean(2)];
 const PUBLICATION_STATISTICS: &[Field] = &[scalar(1), scalar(2)];
 const CONFIGURATION: &[Field] = &[scalar(1), scalar(2), boolean(3), scalar(4), scalar(5)];
 
+const BINDING: &[Field] = &[scalar(1), repeated_message(2, Schema::DataVersionFormat)];
+const DATA_VERSION_FORMAT: &[Field] = &[bytes(1), bytes(2), scalar(3), scalar(4)];
+
 impl Schema {
     fn fields(self) -> &'static [Field] {
         match self {
@@ -319,6 +324,8 @@ impl Schema {
             Self::PublicationOutput => PUBLICATION_OUTPUT,
             Self::PublicationStatistics => PUBLICATION_STATISTICS,
             Self::ConfigurationDocument => CONFIGURATION,
+            Self::BindingDocument => BINDING,
+            Self::DataVersionFormat => DATA_VERSION_FORMAT,
         }
     }
 }
