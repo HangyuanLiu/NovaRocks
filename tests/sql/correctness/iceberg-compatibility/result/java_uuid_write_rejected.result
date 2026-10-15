@@ -1,0 +1,8 @@
+-- query 2
+id	key_is_null
+1	0
+2	1
+
+-- query 8
+remaining_rows
+0

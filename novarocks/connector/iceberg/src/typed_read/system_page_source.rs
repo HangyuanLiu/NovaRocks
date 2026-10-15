@@ -2820,7 +2820,17 @@ impl IcebergSystemTableProvider {
         let max_page_rows = self.max_page_rows;
         let load = async move {
             let mut reader = FrozenMetadataReader::new(&binding, &context);
-            let manifest = reader.load_manifest(&relation.manifest).await?;
+            let manifest = reader
+                .load_manifest(&relation.manifest)
+                .await
+                .map_err(|error| {
+                    error.map_message(|message| {
+                        crate::manifest::with_variant_statistics_hint_for_history(
+                            message,
+                            relation.table_has_variant_history,
+                        )
+                    })
+                })?;
             let bytes_read = reader.bytes_read;
             relation.into_page_source(&manifest, max_page_rows, bytes_read)
         };
@@ -2890,6 +2900,7 @@ struct StreamRead {
 
 /// One `$files` split's frozen shape; deciding it reads nothing.
 struct FilesSplitRelation {
+    table_has_variant_history: bool,
     manifest: TrinoManifestFile,
     spec: PartitionSpec,
     schema: SchemaRef,
@@ -2913,6 +2924,7 @@ impl FilesSplitRelation {
         let schema = system_relation_schema(IcebergSystemTableType::Files, &table_schema, &specs)?;
         let projection = project_system_relation_columns(&schema, columns)?;
         Ok(Self {
+            table_has_variant_history: split.table_has_variant_history(),
             manifest: split.manifest().clone(),
             spec,
             schema,
@@ -3208,7 +3220,11 @@ async fn read_snapshot_file_rows(
     let mut rows = Vec::new();
     for manifest_file in &manifests.files {
         let spec = manifest_spec(metadata, manifest_file)?;
-        let manifest = reader.load_manifest(manifest_file).await?;
+        let manifest = reader.load_manifest(manifest_file).await.map_err(|error| {
+            error.map_message(|message| {
+                crate::manifest::with_variant_statistics_hint(message, metadata)
+            })
+        })?;
         budget.consume(1).await;
         rows.extend(manifest_rows(manifest_file, &manifest, &spec, status_rule)?);
     }
@@ -4304,6 +4320,7 @@ mod tests {
         let schema = warehouse.metadata.current_schema().as_ref().clone();
         let spec = identity_spec(&schema, 0, "region");
         let split = FilesTableSplit::try_new(FilesTableSplitParams {
+            table_has_variant_history: false,
             manifest: manifests[0].clone(),
             table_schema_json: serde_json::to_string(&schema).expect("schema json"),
             metadata_table_schema_json: r#"{"relation":"$files"}"#.to_string(),
@@ -4574,6 +4591,7 @@ mod tests {
         let schema = warehouse.metadata.current_schema().as_ref().clone();
         let spec = identity_spec(&schema, 0, "region");
         let split = FilesTableSplit::try_new(FilesTableSplitParams {
+            table_has_variant_history: false,
             manifest: manifests[0].clone(),
             table_schema_json: serde_json::to_string(&schema).expect("schema json"),
             metadata_table_schema_json: r#"{"relation":"$files"}"#.to_string(),
@@ -4589,6 +4607,182 @@ mod tests {
         let relation = system_relation_schema(IcebergSystemTableType::Files, &schema, &[spec])
             .expect("schema");
         (split, all_columns(&relation))
+    }
+
+    struct ManifestReadFailureSpawner {
+        handle: tokio::runtime::Handle,
+        kind: novarocks_fs::FileErrorKind,
+        message: &'static str,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FileTaskSpawner for ManifestReadFailureSpawner {
+        fn spawn(
+            &self,
+            _task: novarocks_fs::FileTaskFuture,
+        ) -> novarocks_fs::FileResult<novarocks_fs::FileTask> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(novarocks_fs::FileError::new(self.kind, self.message))
+        }
+
+        fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+            self.handle.spawn_blocking(job);
+        }
+    }
+
+    fn split_with_variant_history(split: &FilesTableSplit, history: bool) -> FilesTableSplit {
+        FilesTableSplit::try_new(FilesTableSplitParams {
+            table_has_variant_history: history,
+            manifest: split.manifest().clone(),
+            table_schema_json: split.table_schema_json().to_owned(),
+            metadata_table_schema_json: split.metadata_table_schema_json().to_owned(),
+            partition_spec_jsons: split.partition_spec_jsons().clone(),
+            partition_column_type_json: split.partition_column_type_json().map(str::to_owned),
+            bounds_column_type_json: split.bounds_column_type_json().map(str::to_owned),
+            encryption_key_id: None,
+        })
+        .expect("same manifest with a frozen history fact")
+    }
+
+    fn assert_manifest_stream_preserves_failure(
+        runtime: &tokio::runtime::Runtime,
+        binding: &IcebergReadBinding,
+        context: &FileReadContext,
+        split: &FilesTableSplit,
+        columns: &[IcebergColumnHandle],
+        original: &ConnectorError,
+    ) {
+        assert!(original.message().contains(split.manifest().path()));
+        assert!(!original.message().contains("hint:"));
+        for history in [false, true] {
+            let split = split_with_variant_history(split, history);
+            let budget = ConnectorPollBudget::new();
+            let stream = provider(binding, context)
+                .create_files_page_stream(&split, columns, &budget)
+                .expect("manifest page stream");
+            let mut stream = DrivenStream::new(runtime, stream, budget);
+            let actual = match stream.next_page() {
+                Err(error) => error,
+                Ok(_) => panic!("manifest failure must precede any page"),
+            };
+            assert!(stream.is_finished());
+            stream.close().expect("manifest read physically exited");
+
+            assert_eq!(actual.kind(), original.kind());
+            assert_eq!(
+                actual.retryable_before_progress(),
+                original.retryable_before_progress()
+            );
+            assert_eq!(
+                actual.table_object_binding_failure(),
+                original.table_object_binding_failure()
+            );
+            // Full equality also checks the private cleanup/binding facts.
+            // Only the diagnostic suffix may differ from the actual reader.
+            assert_eq!(
+                actual
+                    .clone()
+                    .map_message(|_| original.message().to_owned()),
+                *original
+            );
+            if history {
+                assert!(actual.message().starts_with(original.message()));
+                let suffix = &actual.message()[original.message().len()..];
+                assert!(suffix.contains("hint: this table has had Variant columns"));
+                assert!(suffix.contains("may be related"));
+                assert!(suffix.contains("docs/guides/iceberg-v3/variant.md"));
+            } else {
+                assert_eq!(actual, *original, "no Variant history adds no hint");
+            }
+        }
+    }
+
+    fn injected_manifest_read_preserves_failure(
+        kind: novarocks_fs::FileErrorKind,
+        message: &'static str,
+    ) {
+        let (runtime, binding, mut context) = runtime_and_binding();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
+        let (split, columns) = first_manifest_split(&runtime, &binding, &context, &warehouse);
+        assert!(
+            !files_pages(&runtime, &provider(&binding, &context), &split, &columns)
+                .expect("the real manifest is initially readable")
+                .is_empty()
+        );
+
+        // Install the failing dispatch only after all setup reads. Each
+        // remaining read is the exact local manifest named by this split.
+        let spawner = Arc::new(ManifestReadFailureSpawner {
+            handle: runtime.handle().clone(),
+            kind,
+            message,
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let operations =
+            route_reads_through(&mut context, spawner.clone(), runtime.handle().clone());
+        let original = runtime
+            .block_on(FrozenMetadataReader::new(&binding, &context).load_manifest(split.manifest()))
+            .expect_err("manifest read dispatch is injected to fail");
+        assert!(original.message().contains(message));
+        // The pre-existing metadata reader deliberately maps both storage
+        // permission and transient read failures to retryable Unavailable.
+        assert_eq!(original.kind(), ConnectorErrorKind::Unavailable);
+        assert!(original.retryable_before_progress());
+        assert_manifest_stream_preserves_failure(
+            &runtime, &binding, &context, &split, &columns, &original,
+        );
+        assert_eq!(
+            spawner.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the raw reader and both history branches must hit the injected read"
+        );
+        assert_eq!(operations.live_operations(), 0);
+    }
+
+    #[test]
+    fn files_manifest_permission_failure_preserves_facts_and_adds_only_history_hint() {
+        injected_manifest_read_preserves_failure(
+            novarocks_fs::FileErrorKind::Permission,
+            "injected permission denial reading the selected manifest",
+        );
+    }
+
+    #[test]
+    fn files_manifest_network_failure_preserves_facts_and_adds_only_history_hint() {
+        injected_manifest_read_preserves_failure(
+            novarocks_fs::FileErrorKind::Transient,
+            "injected connection reset reading the selected manifest",
+        );
+    }
+
+    #[test]
+    fn files_manifest_corrupt_avro_preserves_facts_and_adds_only_history_hint() {
+        let (runtime, binding, context) = runtime_and_binding();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
+        let (split, columns) = first_manifest_split(&runtime, &binding, &context, &warehouse);
+        assert!(
+            !files_pages(&runtime, &provider(&binding, &context), &split, &columns)
+                .expect("the real manifest is initially readable")
+                .is_empty()
+        );
+        let path = split.manifest().path().strip_prefix("file://").unwrap();
+        let length = std::fs::metadata(path).expect("manifest metadata").len();
+        // Keep the frozen file length valid so this reaches the real Avro
+        // parser rather than failing an unrelated short-read contract.
+        std::fs::write(path, vec![0; usize::try_from(length).unwrap()])
+            .expect("replace the actual manifest with corrupt Avro");
+        let original = runtime
+            .block_on(FrozenMetadataReader::new(&binding, &context).load_manifest(split.manifest()))
+            .expect_err("the real manifest bytes are corrupt");
+        assert_eq!(original.kind(), ConnectorErrorKind::CorruptData);
+        assert!(!original.retryable_before_progress());
+        assert!(original.message().contains("is invalid"));
+        assert_manifest_stream_preserves_failure(
+            &runtime, &binding, &context, &split, &columns, &original,
+        );
     }
 
     #[test]

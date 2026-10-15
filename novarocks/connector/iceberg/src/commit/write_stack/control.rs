@@ -1041,9 +1041,8 @@ fn unsigned_counts(
 
 /// Whether a field id is one of the row-lineage columns Iceberg reserves.
 ///
-/// These ids live outside the table schema on purpose: `annotate_schema_from_scan_model`
-/// stamps them onto the Arrow field directly so a lineage column can ride with
-/// the data without being a table column.
+/// These IDs live outside the table schema. The frozen writer projection adds
+/// their reserved definitions so lineage can ride beside ordinary data columns.
 const fn is_reserved_row_lineage_field(field_id: i32) -> bool {
     field_id == crate::row_lineage_synth::ICEBERG_RESERVED_FIELD_ID_ROW_ID
         || field_id
@@ -1070,6 +1069,9 @@ fn decode_bounds(
                     "Iceberg staged artifact bound names unknown field id {field_id}"
                 ))
             })?;
+            if matches!(field.field_type.as_ref(), crate::iceberg::spec::Type::Variant(_)) {
+                return Err(corrupt(format!("Iceberg Variant statistics for field id {field_id} are unsupported because Variant writes are unsupported")));
+            }
             let primitive = field.field_type.as_primitive_type().ok_or_else(|| {
                 corrupt(format!(
                     "Iceberg staged artifact bound field id {field_id} is not a primitive"
@@ -2468,7 +2470,11 @@ impl IcebergWriteSessionControl {
             // pure branch planner.
             equality: match &signed {
                 ConnectorWriteInputShape::EqualityDelete { equality_fields } => {
-                    Some(equality_delete_recipe(writer_metadata, equality_fields)?)
+                    Some(equality_delete_recipe(
+                        writer_metadata,
+                        equality_fields,
+                        &format!("{}.{}", self.key.instance_id.as_str(), request.table),
+                    )?)
                 }
                 _ => None,
             },
@@ -3199,9 +3205,10 @@ fn sign_input_shape(
 /// the manifest, and a reader applies the delete by id. Resolving them here,
 /// against the same metadata the session froze, is what makes a renamed or
 /// absent column a refusal instead of a delete that matches nothing.
-fn equality_delete_recipe(
+pub(crate) fn equality_delete_recipe(
     metadata: &TableMetadata,
     fields: &[ConnectorWriteFieldBinding],
+    target_fqn: &str,
 ) -> Result<crate::commit::write_stack::domain::IcebergEqualityDeleteRecipe, ConnectorError> {
     use crate::commit::write_stack::domain::{
         IcebergEqualityDeleteColumnFacts, IcebergEqualityDeleteRecipe,
@@ -3217,30 +3224,51 @@ fn equality_delete_recipe(
         ));
     }
     let schema = metadata.current_schema();
+    let mut projected = Vec::with_capacity(fields.len());
     let columns = fields
         .iter()
         .map(|binding| {
             let field = binding.field();
-            let iceberg_field = schema
+            let mut candidates = schema
                 .as_struct()
                 .fields()
                 .iter()
-                .find(|candidate| candidate.name.eq_ignore_ascii_case(field.name()))
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "Iceberg equality-delete field `{}` is absent from the frozen schema",
-                        field.name()
-                    ))
-                })?;
-            IcebergEqualityDeleteColumnFacts::try_new(
-                field.name().to_string(),
-                iceberg_field.id,
-                format!("{:?}", field.data_type()),
-                field.is_nullable(),
-            )
+                .filter(|candidate| candidate.name.eq_ignore_ascii_case(field.name()));
+            let iceberg_field = candidates.next().ok_or_else(|| {
+                invalid(format!(
+                    "Iceberg equality-delete field `{}` is absent from the frozen schema",
+                    field.name()
+                ))
+            })?;
+            if candidates.next().is_some() {
+                return Err(invalid(format!(
+                    "Iceberg equality-delete field `{}` is ambiguous in the frozen schema",
+                    field.name()
+                )));
+            }
+            crate::commit::frozen_write::validate_writer_type(&iceberg_field.field_type).map_err(
+                |message| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        format!(
+                            "{message}: table `{target_fqn}`, column `{}`",
+                            iceberg_field.name
+                        ),
+                    )
+                },
+            )?;
+            projected.push(iceberg_field.clone());
+            IcebergEqualityDeleteColumnFacts::try_new(field.name().to_string(), iceberg_field.id)
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
-    IcebergEqualityDeleteRecipe::try_new(columns)
+    let projection = crate::iceberg::spec::Schema::builder()
+        .with_schema_id(schema.schema_id())
+        .with_fields(projected)
+        .build()
+        .map_err(|error| invalid(format!("project Iceberg equality-delete schema: {error}")))?;
+    let field_schema_json = serde_json::to_string(&projection)
+        .map_err(|error| invalid(format!("freeze Iceberg equality-delete schema: {error}")))?;
+    IcebergEqualityDeleteRecipe::try_new(columns, field_schema_json)
 }
 
 /// Derive the data branch's partitioning and schema recipe from the frozen
@@ -3266,7 +3294,10 @@ fn data_branch_recipe(
         transforms.push(field.transform.to_string());
     }
     IcebergDataBranchRecipe::try_new(
-        Some(crate::schema_facts::iceberg_schema_def(schema)),
+        Some(
+            serde_json::to_string(schema.as_ref())
+                .map_err(|error| invalid(format!("freeze Iceberg target schema: {error}")))?,
+        ),
         sources,
         names,
         transforms,
@@ -4723,3 +4754,27 @@ mod terminal_finalization_tests {
 
 #[cfg(test)]
 mod shared_cow_admission_metadata_tests;
+
+#[cfg(test)]
+mod variant_statistics_tests {
+    use super::*;
+    #[test]
+    fn variant_bounds_explain_unsupported_writer_statistics() {
+        let schema:crate::iceberg::spec::Schema=serde_json::from_value(serde_json::json!({"type":"struct","schema-id":42,"fields":[{"id":1,"name":"v","required":false,"type":"variant"}]})).unwrap();
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "file:///tmp/variant-statistics".into(),
+            crate::iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let error = decode_bounds(&BTreeMap::from([(1, vec![0])]), &metadata).unwrap_err();
+        assert!(error.message().contains("Variant statistics"));
+        assert!(error.message().contains("Variant writes are unsupported"));
+    }
+}

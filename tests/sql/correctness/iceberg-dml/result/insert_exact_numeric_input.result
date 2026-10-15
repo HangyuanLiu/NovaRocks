@@ -60,14 +60,14 @@ id	d
 3	2.50
 
 -- query 15
-id	bytes_hex	variant_kind	text_value
-1	FF	Object	values-direct
-2	FF00	Object	values-cast
-3	FF	Object	select-direct
-4	FF00	Object	select-cast
-5	NULL	NULL	NULL
-6	FF	Object	values-varchar-cast
-7	FF00	Object	select-varchar-cast
+id	bytes_hex
+1	FF
+2	FF00
+3	FF
+4	FF00
+5	NULL
+6	FF
+7	FF00
 
 -- query 17
 a	b
@@ -80,3 +80,7 @@ d
 -- query 21
 d
 1.00
+
+-- query 23
+variant_kind	cast_text	varchar_text
+Object	values-cast	varchar-cast

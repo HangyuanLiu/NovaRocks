@@ -89,7 +89,34 @@ pub fn execute_catalog_mutation(
     operation: ConnectorCatalogMutationOperation,
     context: ConnectorRequestContext,
 ) -> Result<CompletedCatalogMutation, String> {
-    match resolve_catalog_mutation(resolver, instance_id, operation, context) {
+    present_catalog_mutation_result(resolve_catalog_mutation(
+        resolver,
+        instance_id,
+        operation,
+        context,
+    ))
+}
+
+/// Executes and presents a mutation through the exact lease retained during
+/// admission and metadata guards, including its one permitted reconciliation.
+pub(crate) fn execute_catalog_mutation_with_lease(
+    lease: &novarocks_spi::connector::ConnectorCatalogMutationLease,
+    operation_id: ConnectorMutationOperationId,
+    operation: ConnectorCatalogMutationOperation,
+    context: ConnectorRequestContext,
+) -> Result<CompletedCatalogMutation, String> {
+    present_catalog_mutation_result(resolve_catalog_mutation_with_lease(
+        lease,
+        operation_id,
+        operation,
+        context,
+    ))
+}
+
+fn present_catalog_mutation_result(
+    result: ResolvedCatalogMutation,
+) -> Result<CompletedCatalogMutation, String> {
+    match result {
         ResolvedCatalogMutation::KnownCommitted(completed) => {
             if let ExternalMutationFinalization::Failed(failure) = &completed.finalization {
                 Err(
@@ -426,6 +453,94 @@ mod tests {
             1024,
         )
         .expect("context")
+    }
+
+    #[test]
+    fn result_presentation_preserves_finalization_cleanup_unknown_and_contract_errors() {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: ConnectorInstanceId::parse("catalog").unwrap(),
+        };
+        let incarnation = ProviderBindingEpoch::from_bytes([1; 16]);
+        let operation_id = ConnectorMutationOperationId::new();
+        let operation = create_namespace_operation(descriptor.instance_id.clone());
+        let receipt = ConnectorCatalogMutationReceipt::try_new(
+            descriptor.clone(),
+            incarnation,
+            operation_id,
+            operation.kind(),
+            None,
+        )
+        .unwrap();
+        let failure = ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Unavailable,
+            "publication failed",
+        );
+        let cleanup_failure =
+            ConnectorMutationFailure::new(ConnectorMutationFailureKind::Internal, "cleanup failed");
+        let finalization = ExternalMutationFinalization::Failed(cleanup_failure.clone());
+        let committed = present_catalog_mutation_result(ResolvedCatalogMutation::KnownCommitted(
+            CompletedCatalogMutation {
+                effect: ExternalMutationEffect::Applied,
+                receipt,
+                finalization: finalization.clone(),
+            },
+        ))
+        .unwrap_err();
+        assert_eq!(
+            committed,
+            EngineError::commit_known_committed_finalize_failed(cleanup_failure.to_string())
+                .to_string()
+        );
+        let uncommitted =
+            present_catalog_mutation_result(ResolvedCatalogMutation::KnownUncommitted {
+                failure: failure.clone(),
+                cleanup: finalization,
+            })
+            .unwrap_err();
+        assert_eq!(
+            uncommitted,
+            EngineError::commit_known_uncommitted(format!(
+                "{failure}; artifact cleanup failed: {cleanup_failure}"
+            ))
+            .to_string()
+        );
+        let evidence = ExternalMutationEvidence::try_new(
+            1,
+            descriptor,
+            incarnation,
+            operation_id,
+            operation.kind(),
+            Bytes::from_static(b"unknown"),
+        )
+        .unwrap();
+        let unknown = present_catalog_mutation_result(ResolvedCatalogMutation::CommitUnknown {
+            failure: failure.clone(),
+            evidence,
+        })
+        .unwrap_err();
+        assert_eq!(
+            unknown,
+            EngineError::commit_unknown(failure.to_string()).to_string()
+        );
+        for dispatch in [
+            MutationDispatchState::ConfirmedNotDispatched,
+            MutationDispatchState::PossiblyDispatched,
+        ] {
+            let error = ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "original contract failure",
+            );
+            let expected = error.to_string();
+            assert_eq!(
+                present_catalog_mutation_result(ResolvedCatalogMutation::ContractFailure {
+                    error,
+                    dispatch
+                })
+                .unwrap_err(),
+                expected
+            );
+        }
     }
 
     #[test]

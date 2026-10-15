@@ -47,14 +47,14 @@ under the License.
 - ❌ 需要走 Glue / Nessie / JDBC catalog（仅 Hadoop / In-memory / REST 基础）
 - ❌ 需要写 Azure / GCS / 腾讯 COS / 华为 OBS（仅本地 / HDFS / S3 / OSS）
 - ❌ 需要 V1 表读 / V1→V2 / V2→V3 升级
-- ❌ 需要写 Iceberg variant / geometry / geography（variant 仅读）
+- ❌ 需要写 Iceberg Variant / uuid / geometry / geography 数据文件（Variant 顶层仅读，含 shredded；详见类型边界）
 - ❌ 需要 MV 自动 query rewrite（基表查询自动命中物化视图，仍在路线图上）
 
 ---
 
 ## 与 Spark / Trino 一起用
 
-NovaRocks 致力于和上游 Iceberg 生态互通，但目前**没有完整的 cross-engine fixture**（双向 read/write 测试矩阵在路线图上）。已知的语法 / 行为差异：
+跨引擎正确性用例位于 `tests/sql/correctness/iceberg-compatibility/`。顶层 Variant 外部写入读取、uuid 准入与普通数据写出分别覆盖；完整独立 footer / 跨引擎类型矩阵仍未完成，不能把部分用例或跳过项当成全矩阵通过。已知的语法 / 行为差异：
 
 | 主题 | NovaRocks | Spark / Trino |
 | --- | --- | --- |

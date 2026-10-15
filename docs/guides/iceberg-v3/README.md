@@ -60,7 +60,7 @@ under the License.
 
 - [Row Lineage（行级身份 `_row_id` / `_last_updated_sequence_number`）](row-lineage.md)
 - [Default Value（`initial-default` / `write-default`）](default-values.md)
-- [Variant 类型](variant.md) —— 读 ✅；INSERT 写 ✅（PR #87）；OVERWRITE / DELETE / UPDATE / MERGE 写仍 ❌
+- [Variant 类型](variant.md) —— 顶层读（含 shredded）支持；数据写出与 ADD FILES 拒绝；DV DELETE 等边界见文内
 - [Deletion Vector（V3 DV + V2 position-delete + equality-delete）](deletion-vectors.md)
 
 ### 查询与时间旅行

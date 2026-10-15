@@ -659,6 +659,7 @@ impl TrinoManifestFile {
 /// The exact facts one `$files` split carries.
 #[derive(Clone, Debug)]
 pub struct FilesTableSplitParams {
+    pub table_has_variant_history: bool,
     pub manifest: TrinoManifestFile,
     pub table_schema_json: String,
     /// The frozen `$files` output schema. It is not an Iceberg schema, so it is
@@ -685,6 +686,7 @@ pub struct FilesTableSplitParams {
 /// retry another manifest's work.
 #[derive(Clone, Debug)]
 pub struct FilesTableSplit {
+    table_has_variant_history: bool,
     manifest: TrinoManifestFile,
     table_schema_json: Arc<str>,
     metadata_table_schema_json: Arc<str>,
@@ -697,6 +699,7 @@ pub struct FilesTableSplit {
 impl FilesTableSplit {
     pub fn try_new(params: FilesTableSplitParams) -> Result<Self, ConnectorError> {
         let FilesTableSplitParams {
+            table_has_variant_history,
             manifest,
             table_schema_json,
             metadata_table_schema_json,
@@ -725,6 +728,7 @@ impl FilesTableSplit {
         }
 
         let mut split = Self {
+            table_has_variant_history,
             manifest,
             table_schema_json: Arc::from(table_schema_json.as_str()),
             metadata_table_schema_json: Arc::from(metadata_table_schema_json.as_str()),
@@ -755,6 +759,7 @@ impl FilesTableSplit {
             )));
         }
         let mut split = Self {
+            table_has_variant_history: self.table_has_variant_history,
             manifest,
             table_schema_json: Arc::clone(&self.table_schema_json),
             metadata_table_schema_json: Arc::clone(&self.metadata_table_schema_json),
@@ -769,6 +774,10 @@ impl FilesTableSplit {
 
     pub const fn manifest(&self) -> &TrinoManifestFile {
         &self.manifest
+    }
+
+    pub const fn table_has_variant_history(&self) -> bool {
+        self.table_has_variant_history
     }
 
     pub fn table_schema_json(&self) -> &str {
@@ -826,6 +835,7 @@ impl FilesTableSplit {
 
     pub fn to_proto(&self) -> dto::FilesTableSplit {
         dto::FilesTableSplit {
+            table_has_variant_history: self.table_has_variant_history,
             manifest: Some(self.manifest.to_proto()),
             table_schema_json: self.table_schema_json.to_string(),
             metadata_table_schema_json: self.metadata_table_schema_json.to_string(),
@@ -848,6 +858,7 @@ impl FilesTableSplit {
             .as_ref()
             .ok_or_else(|| invalid("iceberg $files split requires a manifest"))?;
         Self::try_new(FilesTableSplitParams {
+            table_has_variant_history: raw.table_has_variant_history,
             manifest: TrinoManifestFile::from_proto(manifest)?,
             table_schema_json: raw.table_schema_json.clone(),
             metadata_table_schema_json: raw.metadata_table_schema_json.clone(),
@@ -886,6 +897,7 @@ impl ConnectorSplit for FilesTableSplit {
 /// The exact facts one `$files` split source is built from.
 #[derive(Clone, Debug)]
 pub struct FilesTableSplitSourceParams {
+    pub table_has_variant_history: bool,
     pub reference: IcebergSystemTableReference,
     /// Every manifest of the pinned snapshot's manifest list, in list order.
     pub manifests: Vec<TrinoManifestFile>,
@@ -913,6 +925,7 @@ pub struct FilesTableSplitSource {
 impl FilesTableSplitSource {
     pub fn try_new(params: FilesTableSplitSourceParams) -> Result<Self, ConnectorError> {
         let FilesTableSplitSourceParams {
+            table_has_variant_history,
             reference,
             manifests,
             table_schema_json,
@@ -939,6 +952,7 @@ impl FilesTableSplitSource {
         let mut manifests = VecDeque::from(manifests);
         let template = match manifests.pop_front() {
             Some(manifest) => Some(FilesTableSplit::try_new(FilesTableSplitParams {
+                table_has_variant_history,
                 manifest,
                 table_schema_json,
                 metadata_table_schema_json,
@@ -1146,6 +1160,7 @@ mod tests {
             serde_json::to_string(&spec).expect("spec json"),
         );
         FilesTableSplitSourceParams {
+            table_has_variant_history: true,
             reference: reference(IcebergSystemTableType::Files),
             manifests,
             table_schema_json: serde_json::to_string(&schema).expect("schema json"),
@@ -1428,6 +1443,7 @@ mod tests {
         for split in drain(&mut source) {
             let decoded = FilesTableSplit::from_proto(&split.to_proto()).expect("decoded split");
             assert_eq!(decoded.manifest(), split.manifest());
+            assert!(decoded.table_has_variant_history());
             assert_eq!(decoded.table_schema_json(), split.table_schema_json());
             assert_eq!(
                 decoded.metadata_table_schema_json(),

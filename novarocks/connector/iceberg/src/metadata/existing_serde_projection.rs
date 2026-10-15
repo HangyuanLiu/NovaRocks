@@ -379,6 +379,7 @@ fn build_field<E>(
         Ok(())
     })?;
     Ok(IcebergSchemaFieldDef {
+        is_variant: matches!(field.field_type.as_ref(), Type::Variant(_)),
         field_id: field.id,
         name: exact_string(&field.name)?,
         // These two are serde-skipped and no production COW default reader
@@ -393,96 +394,3 @@ fn build_field<E>(
 #[cfg(test)]
 #[path = "projection_tests.rs"]
 mod tests;
-
-// Schema-only specialization of the SAME checked field codec. It does not
-// serialize the whole metadata, create a Literal clone, or construct a Value.
-pub(crate) struct SchemaOnlyPlan<'a> {
-    schema: &'a Schema,
-    graph_with_inline_root: u64,
-    maximum_field_temporary: u64,
-}
-impl<'a> SchemaOnlyPlan<'a> {
-    pub(crate) fn inspect<E>(
-        schema: &'a Schema,
-        scope: &dyn OriginalScope<E>,
-    ) -> Result<Self, Error<E>> {
-        let fields = schema.as_struct().fields();
-        let mut graph = add(
-            size_of::<IcebergSchemaDef>() as u64,
-            mul(
-                fields.len() as u64,
-                size_of::<IcebergSchemaFieldDef>() as u64,
-            )?,
-        )?;
-        let mut temporary = 0;
-        for field in fields {
-            inspect_field(field, scope, &mut graph, &mut temporary)?;
-        }
-        Ok(Self {
-            schema,
-            graph_with_inline_root: graph,
-            maximum_field_temporary: temporary,
-        })
-    }
-    pub(crate) fn retained_upper<E>(&self) -> Result<u64, Error<E>> {
-        use crate::commit::write_stack::domain::IcebergCowSchemaBacking;
-        // Arc allocation: two atomic usize counts, padded data, trailing pad.
-        // SchemaDef inline lives IN the backing; never charged twice.
-        let a = std::mem::align_of::<IcebergCowSchemaBacking>().max(std::mem::align_of::<usize>())
-            as u64;
-        let header = add(2 * size_of::<usize>() as u64, a - 1)? / a * a;
-        let layout = add(header, size_of::<IcebergCowSchemaBacking>() as u64)?;
-        let layout = add(layout, a - 1)? / a * a;
-        add(
-            layout,
-            self.graph_with_inline_root - size_of::<IcebergSchemaDef>() as u64,
-        )
-    }
-    pub(crate) fn authorize<E>(
-        self,
-        existing_and_other_new_upper: u64,
-        scope: &'a dyn OriginalScope<E>,
-    ) -> Result<CheckedSchemaOnly<'a, E>, Error<E>> {
-        let total = add(
-            add(existing_and_other_new_upper, self.retained_upper()?)?,
-            self.maximum_field_temporary,
-        )?;
-        scope.check_active().map_err(Error::Control)?;
-        scope.check_total(total).map_err(Error::Control)?;
-        Ok(CheckedSchemaOnly { plan: self, scope })
-    }
-}
-pub(crate) struct CheckedSchemaOnly<'a, E> {
-    plan: SchemaOnlyPlan<'a>,
-    scope: &'a dyn OriginalScope<E>,
-}
-impl<E> CheckedSchemaOnly<'_, E> {
-    pub(crate) fn build(
-        self,
-    ) -> Result<std::sync::Arc<crate::commit::write_stack::domain::IcebergCowSchemaBacking>, Error<E>>
-    {
-        self.scope.check_active().map_err(Error::Control)?;
-        let guard = self.scope.original_guard(); // Same holder BEFORE schema growth.
-        let fields = self.plan.schema.as_struct().fields();
-        let mut output = Vec::with_capacity(fields.len());
-        if output.capacity() != fields.len() {
-            return Err(Error::ShapeChanged);
-        }
-        for field in fields {
-            output.push(build_field(field, self.scope)?);
-        }
-        self.scope.check_active().map_err(Error::Control)?;
-        let backing = crate::commit::write_stack::domain::IcebergCowSchemaBacking::from_checked(
-            IcebergSchemaDef { fields: output },
-            guard,
-        );
-        if let Err(original) = self.scope.check_active() {
-            drop(backing);
-            return Err(Error::Control(original));
-        }
-        Ok(backing)
-    }
-}
-#[cfg(test)]
-#[path = "schema_only_tests.rs"]
-mod schema_only_tests;

@@ -131,6 +131,15 @@ impl IcebergDistributedRewriteControl {
             .map_err(unavailable)?
             .into_table();
         let metadata = table.metadata();
+        if matches!(
+            request.operation(),
+            ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
+        ) {
+            crate::commit::validation::deny_unwritable_data_files(
+                metadata.current_schema(),
+                &format!("{}.{}", target.namespace, target.table),
+            )?;
+        }
         let base_snapshot_id = metadata.current_snapshot_id();
         let table_for_files = table.clone();
         let read_control = request.context.clone();
@@ -2023,6 +2032,137 @@ mod tests {
                 novarocks_connector_contract::PureProviderCompileError::Control(actual)
                     if actual == cause
             ));
+        }
+    }
+
+    #[test]
+    fn data_rewrite_denies_variant_and_uuid_without_writing_plan_artifacts() {
+        use crate::iceberg::spec::{
+            FormatVersion, NestedField, PrimitiveType, Schema, Type, VariantType,
+        };
+        use novarocks_spi::connector::{
+            ConnectorInstanceId, ConnectorProviderId, ConnectorWriteOperationId,
+        };
+        fn files(
+            root: &std::path::Path,
+        ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+            fn walk(
+                path: &std::path::Path,
+                output: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+            ) {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        walk(&path, output);
+                    } else {
+                        output.insert(path.clone(), std::fs::read(&path).unwrap());
+                    }
+                }
+            }
+            let mut output = std::collections::BTreeMap::new();
+            walk(root, &mut output);
+            output
+        }
+        for data_type in [
+            Type::Variant(VariantType),
+            Type::Primitive(PrimitiveType::Uuid),
+        ] {
+            let (executor, warehouse, runtime, _listener) = admission_runtime("hadoop");
+            let catalog = runtime.novarocks_catalog().vendored_client();
+            executor.block_on(async {
+                let namespace = crate::iceberg::NamespaceIdent::new("db".to_owned());
+                catalog
+                    .create_namespace(&namespace, std::collections::HashMap::new())
+                    .await
+                    .unwrap();
+                catalog
+                    .create_table(
+                        &namespace,
+                        crate::iceberg::TableCreation::builder()
+                            .name("t".to_owned())
+                            .schema(
+                                Schema::builder()
+                                    .with_fields(vec![
+                                        NestedField::optional(1, "payload", data_type).into(),
+                                    ])
+                                    .build()
+                                    .unwrap(),
+                            )
+                            .format_version(FormatVersion::V3)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            });
+            let descriptor = ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+            };
+            let incarnation = ProviderBindingEpoch::from_bytes([8; 16]);
+            let provider = Arc::new(IcebergMetadata::new(
+                descriptor.clone(),
+                incarnation,
+                runtime.clone(),
+            ));
+            let adapter =
+                IcebergDistributedRewriteControl::new(descriptor, incarnation, runtime, provider)
+                    .unwrap();
+            let table = ConnectorTableHandle::try_new(adapter.key.instance_id.clone(), Bytes::from_static(br#"{"namespace":"db","table":"t","metadata_location":null,"table_info":null,"metadata_columns":[],"metadata_table_type":null,"prepared_files":[],"explicit_files":null}"#)).unwrap();
+            let mut context = admission_context("hadoop");
+            context = context
+                .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::Statement);
+            let request = ConnectorDistributedRewritePlanningRequest::try_new(
+                ConnectorWriteOperationId::new(),
+                adapter.key.clone(),
+                ConnectorDistributedRewriteOperation::RewriteDataFiles {
+                    table: table.clone(),
+                    rewrite_all: true,
+                },
+                context.clone(),
+            )
+            .unwrap();
+            let before = files(warehouse.path());
+            let mut layout = |_| Ok(());
+            let mut work = |_| Ok(());
+            let mut creation =
+                novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    &mut layout,
+                    &mut work,
+                );
+            let error = adapter.plan_rewrite(request, &mut creation).unwrap_err();
+            let novarocks_connector_contract::PureProviderCompileError::Provider(error) = error
+            else {
+                panic!("provider denial")
+            };
+            assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+            assert!(error.message().contains("column payload"), "{error}");
+            assert_eq!(
+                files(warehouse.path()),
+                before,
+                "refused data rewrite writes nothing"
+            );
+            // The same v3 table remains eligible for position-delete rewrite;
+            // its empty snapshot produces an empty, valid operation plan.
+            let request = ConnectorDistributedRewritePlanningRequest::try_new(
+                ConnectorWriteOperationId::new(),
+                adapter.key.clone(),
+                ConnectorDistributedRewriteOperation::RewritePositionDeletes {
+                    table,
+                    rewrite_all: true,
+                    min_input_files: None,
+                },
+                context,
+            )
+            .unwrap();
+            adapter
+                .plan_rewrite(request, &mut creation)
+                .expect("position-delete rewrite is not a data-file write");
+            assert_eq!(
+                files(warehouse.path()),
+                before,
+                "empty position rewrite writes nothing"
+            );
         }
     }
 

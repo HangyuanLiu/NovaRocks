@@ -235,8 +235,9 @@ fn field_rule(message: MessageKind, field: u32) -> Option<FieldRule> {
         (M::StorageRoute, 1) => Some(singular(F::Text)),
 
         (M::EqualityRecipe, 1) => Some(repeated(F::Message(M::EqualityColumn))),
-        (M::EqualityColumn, 1) | (M::EqualityColumn, 3) => Some(singular(F::Text)),
-        (M::EqualityColumn, 2) | (M::EqualityColumn, 4) => Some(singular(F::Varint)),
+        (M::EqualityRecipe, 2) => Some(singular(F::Text)),
+        (M::EqualityColumn, 1) => Some(singular(F::Text)),
+        (M::EqualityColumn, 2) => Some(singular(F::Varint)),
 
         (M::Partition, 1..=2) => Some(singular(F::Text)),
         (M::Partition, 3) => Some(singular(F::Varint)),
@@ -729,11 +730,11 @@ fn validate_data_recipe(
     context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<(), ConnectorCodecError> {
     let result = (|| {
-        if let Some(schema) = &recipe.input_schema_json {
+        if let Some(schema) = &recipe.target_schema_json {
             bounded_text(
                 schema,
                 MAX_SCHEMA_JSON_BYTES,
-                path.field("input_schema_json"),
+                path.field("target_schema_json"),
                 false,
             )?;
         }
@@ -797,6 +798,12 @@ fn validate_equality_recipe(
     context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<(), ConnectorCodecError> {
     let result = (|| {
+        bounded_text(
+            &recipe.field_schema_json,
+            MAX_SCHEMA_JSON_BYTES,
+            path.field("field_schema_json"),
+            false,
+        )?;
         bounded_count(
             recipe.columns.len(),
             MAX_EQUALITY_DELETE_COLUMNS,
@@ -815,12 +822,6 @@ fn validate_equality_recipe(
                 &column.name,
                 MAX_NAME_BYTES,
                 column_path.field("name"),
-                false,
-            )?;
-            bounded_text(
-                &column.data_type,
-                MAX_NAME_BYTES,
-                column_path.field("data_type"),
                 false,
             )?;
             nonnegative(i64::from(column.field_id), column_path.field("field_id"))?;
@@ -1662,12 +1663,11 @@ mod compile_control_tests {
                         IcebergEqualityDeleteColumnFacts::try_new(
                             format!("k{i}"),
                             i,
-                            "bigint".into(),
-                            true,
                         )
                         .unwrap()
                     })
                     .collect(),
+                serde_json::json!({"type":"struct","schema-id":1,"fields":(1..=321).map(|i| serde_json::json!({"id":i,"name":format!("k{i}"),"required":false,"type":"long"})).collect::<Vec<_>>()}).to_string(),
             )
             .unwrap(),
         )

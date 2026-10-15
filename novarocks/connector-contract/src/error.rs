@@ -92,6 +92,13 @@ impl ConnectorError {
         &self.message
     }
 
+    /// Extend a diagnostic without rebuilding its classification, retry or
+    /// cleanup facts. Context adds information, never a new failure verdict.
+    pub fn map_message(mut self, map: impl FnOnce(String) -> String) -> Self {
+        self.message = map(self.message);
+        self
+    }
+
     /// The typed current-table binding classification, when this error is one.
     pub const fn table_object_binding_failure(&self) -> Option<ConnectorTableObjectBindingFailure> {
         self.table_object_binding_failure
@@ -140,6 +147,39 @@ impl From<ConnectorIdentityError> for ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_context_preserves_every_error_fact() {
+        for error in [
+            ConnectorError::new(ConnectorErrorKind::Unavailable, "network")
+                .with_retryable_before_progress(),
+            ConnectorError::new(ConnectorErrorKind::CorruptData, "manifest"),
+            ConnectorError::new(ConnectorErrorKind::PermissionDenied, "denied"),
+            ConnectorError::table_object_binding(
+                ConnectorTableObjectBindingFailure::Replaced,
+                "rebound",
+            ),
+        ] {
+            let original = error.with_cleanup_context("owned cleanup");
+            let contextualized = original
+                .clone()
+                .map_message(|message| format!("{message}; context"));
+            assert_eq!(contextualized.kind, original.kind);
+            assert_eq!(
+                contextualized.retryable_before_progress,
+                original.retryable_before_progress
+            );
+            assert_eq!(contextualized.cleanup_context, original.cleanup_context);
+            assert_eq!(
+                contextualized.table_object_binding_failure,
+                original.table_object_binding_failure
+            );
+            assert_eq!(
+                contextualized.message,
+                format!("{}; context", original.message)
+            );
+        }
+    }
 
     #[test]
     fn ordinary_errors_keep_their_retryable_flag() {

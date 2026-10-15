@@ -159,6 +159,12 @@ pub(crate) fn prepare_rest_staged_table(
             reason.message().to_string(),
         ));
     }
+    crate::commit::validation::deny_variant_column_definitions(
+        columns,
+        &format!("{namespace_name}.{table_name}"),
+    )
+    .and_then(|()| super::catalog_mutation::reject_variant_shredding_properties(properties))
+    .map_err(|error| RestStagedPrepareFailure::Unsupported(error.message().to_owned()))?;
     let namespace_name = normalize_identifier(namespace_name)?;
     let table_name = normalize_identifier(table_name)?;
     let location = ctas_staging_location(
@@ -2105,6 +2111,82 @@ mod tests {
             IcebergMetadataResources::new(binding, handle),
         )
         .expect("control runtime")
+    }
+
+    #[test]
+    fn variant_columns_and_shredding_properties_refuse_ctas_before_any_request() {
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        use novarocks_spi::connector::{ConnectorDataType, ConnectorStructField};
+
+        let server = TestServer::start(Script::new());
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let handle = executor.handle().clone();
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[
+                ("iceberg.catalog.type".to_owned(), "rest".to_owned()),
+                ("uri".to_owned(), server.url()),
+                ("warehouse".to_owned(), "s3://warehouse".to_owned()),
+            ],
+        )
+        .unwrap();
+        let binding = IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
+        );
+        let runtime = IcebergMetadataContext::try_new(
+            IcebergCatalogControlState::new(configuration),
+            IcebergMetadataResources::new(binding, handle),
+        )
+        .unwrap();
+        let nested = ConnectorDataType::Struct(vec![ConnectorStructField {
+            name: Arc::from("leaf"),
+            data_type: ConnectorDataType::Array(Box::new(ConnectorDataType::Variant)),
+            nullable: true,
+        }]);
+        for (data_type, properties, diagnostic) in [
+            (ConnectorDataType::Variant, Vec::new(), "column payload"),
+            (nested, Vec::new(), "column payload.leaf.element"),
+            (
+                ConnectorDataType::Int,
+                vec![(
+                    Arc::from("write.parquet.variant-shredding.enabled"),
+                    Arc::from("true"),
+                )],
+                "write.parquet.variant-shredding.",
+            ),
+        ] {
+            let failure = match prepare_rest_staged_table(
+                &runtime,
+                None,
+                ConnectorMutationOperationId::new(),
+                novarocks_spi::connector::LakePublicationId::new_v7(),
+                "db",
+                "t",
+                &[ConnectorColumnDefinition {
+                    name: Arc::from("payload"),
+                    data_type,
+                    nullable: true,
+                    aggregation: None,
+                    default: None,
+                }],
+                &[],
+                &properties,
+            ) {
+                Err(failure) => failure,
+                Ok(_) => panic!("unsupported CTAS must be refused"),
+            };
+            assert!(
+                matches!(failure, RestStagedPrepareFailure::Unsupported(ref message) if message.contains(diagnostic)),
+                "{failure:?}"
+            );
+            assert!(
+                server.requests().is_empty(),
+                "admission must not contact namespace or stage-create endpoints"
+            );
+        }
     }
 
     /// A vended CTAS whose route an execution node could not follow is refused

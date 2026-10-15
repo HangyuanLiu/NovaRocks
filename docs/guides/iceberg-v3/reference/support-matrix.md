@@ -76,7 +76,7 @@ under the License.
 | date / time / timestamp（毫秒/微秒） | ✅ | |
 | timestamptz | ✅ | |
 | decimal | ✅ | 含写入 + 比较 + cast |
-| uuid | ✅ | 基础支持 |
+| uuid | 读 ✅ / 写 ❌ | SQL 无 UUID 类型关键字；不写出 UUID 数据或等值键，ADD FILES 与普通键删除不因 uuid 全表拒绝 |
 | timestamp_ns / timestamptz_ns（V3 纳秒） | ❌ | |
 | unknown（V3 placeholder） | ❌ | |
 
@@ -93,10 +93,10 @@ under the License.
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| variant（读） | 🚧 待恢复 | iceberg-rust 0.11 切换仅保证编译，无 Iceberg 读取功能承诺；见 [Variant](../variant.md) |
-| variant（INSERT 写） | ❌ 暂不可用 | 旧转换已退出，上游 writer 拒绝 Variant；等待正式物理布局接缝恢复 |
-| variant（OVERWRITE / DELETE / UPDATE / MERGE / equality-delete 写） | ❌ 暂不可用 | 当前不支持 Variant 数据路径 |
-| variant shredding（`typed_value` 子树） | 🚧 读待恢复 / ❌ 写 | 不声明 Iceberg 读能力；旧属性解析与写出转换已删除 |
+| variant（读） | ✅ 顶层 | 含 shredded；嵌套与 manifest bounds 限制见 [Variant](../variant.md) |
+| variant（INSERT / OVERWRITE / UPDATE / MERGE 数据写出） | ❌ | Provider 提前拒绝，含只插入 MERGE |
+| Variant 表 DELETE / TRUNCATE / equality delete | 有条件支持 | DV DELETE、元数据 truncate 与非 Variant 等值键；Variant 等值键拒绝 |
+| variant shredding（`typed_value` 子树） | 顶层读 ✅ / 写 ❌ | `write.parquet.variant-shredding.` 属性拒绝 |
 | variant default value（`initial-default` / `write-default`） | ❌ | |
 | variant 在 partition spec / sort order / equality_ids | ❌ | spec 禁止；NovaRocks reject |
 | variant predicate pushdown 到 parquet | ❌ | 当前在 BE 层 evaluate |

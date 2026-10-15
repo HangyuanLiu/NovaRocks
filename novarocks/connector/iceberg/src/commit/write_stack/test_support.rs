@@ -436,11 +436,9 @@ pub(crate) fn equality_delete_recipe() -> IcebergEqualityDeleteRecipe {
         IcebergEqualityDeleteColumnFacts::try_new(
             "k1".to_string(),
             1,
-            format!("{:?}", DataType::Int64),
-            true,
         )
         .expect("equality column"),
-    ])
+    ], serde_json::json!({"type":"struct","schema-id":1,"fields":[{"id":1,"name":"k1","required":false,"type":"long"}]}).to_string())
     .expect("equality recipe")
 }
 
@@ -452,7 +450,7 @@ pub(crate) fn data_branch_plan() -> IcebergDataBranchPlan {
             None,
         )
         .expect("output"),
-        recipe: IcebergDataBranchRecipe::try_new(None, Vec::new(), Vec::new(), Vec::new(), false)
+        recipe: IcebergDataBranchRecipe::try_new(Some(serde_json::json!({"type":"struct","schema-id":1,"fields":[{"id":1,"name":"k1","required":false,"type":"long"}]}).to_string()), Vec::new(), Vec::new(), Vec::new(), false)
             .expect("recipe"),
         input: data_input_shape(),
     }

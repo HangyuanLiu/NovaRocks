@@ -17,13 +17,10 @@
 
 -- Value-domain facts follow selected windows, identity CASTs and collection transforms.
 -- query 1
-CREATE TABLE ${case_db}.window_result_domains (id INT, v VARIANT)
-TBLPROPERTIES ("format-version" = "3");
+CREATE TABLE ${case_db}.window_result_domains (id INT);
 
 -- query 2
-INSERT INTO ${case_db}.window_result_domains VALUES
-  (1, CAST(parse_json('1') AS VARIANT)),
-  (2, CAST(parse_json('2') AS VARIANT));
+INSERT INTO ${case_db}.window_result_domains VALUES (1),(2);
 
 -- query 3
 -- @order_sensitive=true
@@ -34,8 +31,8 @@ SELECT id,
        variant_get(next_variant, '$', 'bigint') AS next_variant
 FROM (
   SELECT id,
-         first_value(CAST(v AS VARIANT)) OVER (ORDER BY id) AS first_variant,
-         lead(CAST(v AS VARIANT), 1, CAST(NULL AS VARIANT)) OVER (ORDER BY id) AS next_variant
+         first_value(CAST(parse_json(CAST(id AS VARCHAR)) AS VARIANT)) OVER (ORDER BY id) AS first_variant,
+         lead(CAST(parse_json(CAST(id AS VARCHAR)) AS VARIANT), 1, CAST(NULL AS VARIANT)) OVER (ORDER BY id) AS next_variant
   FROM ${case_db}.window_result_domains
 ) window_values ORDER BY id;
 

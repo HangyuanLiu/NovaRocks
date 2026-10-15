@@ -229,7 +229,12 @@ pub(crate) async fn read_metadata_table_rows_with_control(
         }
         let manifest = crate::manifest::load_manifest(&mf, file_io)
             .await
-            .map_err(|e| format!("load manifest {}: {e}", mf.manifest_path))?;
+            .map_err(|e| {
+                crate::manifest::with_variant_statistics_hint(
+                    format!("load manifest {}: {e}", mf.manifest_path),
+                    metadata,
+                )
+            })?;
         check_active()?;
         for entry in manifest.entries() {
             check_active()?;

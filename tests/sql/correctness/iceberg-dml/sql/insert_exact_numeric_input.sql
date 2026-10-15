@@ -127,27 +127,16 @@ SELECT id, d FROM ${case_db}.t_insert_exact_controls ORDER BY id;
 -- query 14
 -- @skip_result_check=true
 DROP TABLE IF EXISTS ${case_db}.t_insert_exact_bytes;
-CREATE TABLE ${case_db}.t_insert_exact_bytes (id INT, b VARBINARY, v VARIANT)
-TBLPROPERTIES ("format-version" = "3");
-INSERT INTO ${case_db}.t_insert_exact_bytes VALUES
-  (1, 'ÿ', parse_json('{"text":"values-direct"}')),
-  (2, X'FF00', CAST(parse_json('{"text":"values-cast"}') AS VARIANT));
-INSERT INTO ${case_db}.t_insert_exact_bytes
-SELECT 3, 'ÿ', parse_json('{"text":"select-direct"}');
-INSERT INTO ${case_db}.t_insert_exact_bytes
-SELECT 4, X'FF00', CAST(parse_json('{"text":"select-cast"}') AS VARIANT);
-INSERT INTO ${case_db}.t_insert_exact_bytes VALUES (5, NULL, NULL);
-INSERT INTO ${case_db}.t_insert_exact_bytes
-VALUES (6, X'FF', parse_json(CAST('{"text":"values-varchar-cast"}' AS VARCHAR)));
-INSERT INTO ${case_db}.t_insert_exact_bytes
-SELECT 7, X'FF00', parse_json(CAST('{"text":"select-varchar-cast"}' AS VARCHAR));
+CREATE TABLE ${case_db}.t_insert_exact_bytes (id INT, b VARBINARY);
+INSERT INTO ${case_db}.t_insert_exact_bytes VALUES (1,'ÿ'),(2,X'FF00');
+INSERT INTO ${case_db}.t_insert_exact_bytes SELECT 3,'ÿ';
+INSERT INTO ${case_db}.t_insert_exact_bytes SELECT 4,X'FF00';
+INSERT INTO ${case_db}.t_insert_exact_bytes VALUES (5,NULL),(6,X'FF');
+INSERT INTO ${case_db}.t_insert_exact_bytes SELECT 7,X'FF00';
 
 -- query 15
--- Logical VARIANT decoding checks that the stored bytes are canonical payloads.
--- LATIN1 U+00FF is one byte FF; a UTF8 rewrite would incorrectly write C3BF.
-SELECT id, hex(b) AS bytes_hex, variant_typeof(v) AS variant_kind,
-       get_json_string(v, '$.text') AS text_value
-FROM ${case_db}.t_insert_exact_bytes ORDER BY id;
+-- LATIN1 U+00FF is FF rather than UTF8 C3BF.
+SELECT id,hex(b) AS bytes_hex FROM ${case_db}.t_insert_exact_bytes ORDER BY id;
 
 -- query 16
 -- @skip_result_check=true
@@ -191,3 +180,8 @@ DROP TABLE ${case_db}.t_insert_exact_bytes;
 DROP TABLE ${case_db}.t_insert_exact_source_order;
 DROP TABLE ${case_db}.t_insert_exact_having;
 DROP TABLE ${case_db}.t_insert_exact_union_distinct;
+
+-- query 23
+SELECT variant_typeof(parse_json('{"text":"values-direct"}')) AS variant_kind,
+       get_json_string(CAST(parse_json('{"text":"values-cast"}') AS VARIANT),'$.text') AS cast_text,
+       get_json_string(parse_json(CAST('{"text":"varchar-cast"}' AS VARCHAR)),'$.text') AS varchar_text;

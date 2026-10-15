@@ -28,40 +28,54 @@ use std::sync::Arc;
 
 use crate::iceberg::io::FileIO;
 use crate::iceberg::spec::{DataContentType, DataFileFormat, Struct};
-use arrow::array::{Array, ArrayRef, Int8Array, Int16Array, Int32Builder};
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
-use super::frozen_write::scalar_integer_storage_schema;
 use super::types::WrittenFile;
+use super::write_adaptation::adapt_batch;
+use super::write_stack::equality_schema::EqualityDeleteFileTarget;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EqualityDeleteColumn {
-    pub name: String,
-    pub field_id: i32,
-    pub data_type: DataType,
-    pub nullable: bool,
-}
-
-pub async fn write_equality_delete_file(
+pub(crate) async fn write_equality_delete_file(
     file_io: &FileIO,
     staging_dir: &str,
     partition_spec_id: i32,
-    columns: Vec<EqualityDeleteColumn>,
+    target: EqualityDeleteFileTarget,
     batch: RecordBatch,
 ) -> Result<Option<WrittenFile>, String> {
     if batch.num_rows() == 0 {
         return Ok(None);
     }
-    let schema = equality_delete_schema(&columns)?;
-    // Validate the declared input before changing only its storage carrier.
-    let batch = rewrap_batch_with_equality_schema(batch, schema.clone())?;
-    let schema = scalar_integer_storage_schema(&schema);
-    let batch = equality_delete_storage_batch(batch, schema.clone())?;
+    let schema = target.arrow_schema;
+    if schema.fields().is_empty() {
+        return Err("equality-delete writer requires at least one equality column".to_string());
+    }
+    let equality_ids = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            field
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .ok_or_else(|| {
+                    format!(
+                        "equality-delete field `{}` has no Iceberg field ID",
+                        field.name()
+                    )
+                })?
+                .parse::<i32>()
+                .map_err(|error| {
+                    format!(
+                        "invalid equality-delete field ID for `{}`: {error}",
+                        field.name()
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let batch = adapt_batch(&batch, &schema)?;
     let path = format!(
         "{staging_dir}/equality-delete-{:08x}-{}.parquet",
         0,
@@ -88,104 +102,12 @@ pub async fn write_equality_delete_file(
         upper_bounds: HashMap::new(),
         key_metadata: None,
         referenced_data_file: None,
-        equality_ids: Some(columns.iter().map(|c| c.field_id).collect()),
+        equality_ids: Some(equality_ids),
         first_row_id: None,
         content_offset: None,
         content_size_in_bytes: None,
         cardinality: None,
     }))
-}
-
-fn equality_delete_schema(columns: &[EqualityDeleteColumn]) -> Result<ArrowSchemaRef, String> {
-    if columns.is_empty() {
-        return Err("equality-delete writer requires at least one equality column".to_string());
-    }
-    let fields = columns
-        .iter()
-        .map(|column| {
-            let mut metadata = HashMap::new();
-            metadata.insert(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                column.field_id.to_string(),
-            );
-            Field::new(&column.name, column.data_type.clone(), column.nullable)
-                .with_metadata(metadata)
-        })
-        .collect::<Vec<_>>();
-    Ok(Arc::new(ArrowSchema::new(fields)))
-}
-
-fn rewrap_batch_with_equality_schema(
-    batch: RecordBatch,
-    schema: ArrowSchemaRef,
-) -> Result<RecordBatch, String> {
-    if batch.num_columns() != schema.fields().len() {
-        return Err(format!(
-            "equality-delete batch column count mismatch: expected {}, got {}",
-            schema.fields().len(),
-            batch.num_columns()
-        ));
-    }
-    for (idx, field) in schema.fields().iter().enumerate() {
-        let actual = batch.column(idx).data_type();
-        if actual != field.data_type() {
-            return Err(format!(
-                "equality-delete column `{}` type mismatch: expected {:?}, got {:?}",
-                field.name(),
-                field.data_type(),
-                actual
-            ));
-        }
-    }
-    let columns = (0..batch.num_columns())
-        .map(|idx| Arc::clone(batch.column(idx)) as ArrayRef)
-        .collect::<Vec<_>>();
-    RecordBatch::try_new(schema, columns)
-        .map_err(|e| format!("equality-delete RecordBatch::try_new failed: {e}"))
-}
-
-/// Equality-delete keys retain their exact declared input signature. The only
-/// carrier change owned here is lossless signed I8/I16 to standard Iceberg INT.
-fn equality_delete_storage_batch(
-    batch: RecordBatch,
-    schema: ArrowSchemaRef,
-) -> Result<RecordBatch, String> {
-    let columns = batch
-        .columns()
-        .iter()
-        .zip(schema.fields())
-        .map(|(column, field)| match (column.data_type(), field.data_type()) {
-            (DataType::Int8, DataType::Int32) => {
-                let values = column
-                    .as_any()
-                    .downcast_ref::<Int8Array>()
-                    .ok_or_else(|| "equality-delete Int8 carrier downcast failed".to_string())?;
-                let mut builder = Int32Builder::with_capacity(values.len());
-                for value in values.iter() {
-                    builder.append_option(value.map(i32::from));
-                }
-                Ok(Arc::new(builder.finish()) as ArrayRef)
-            }
-            (DataType::Int16, DataType::Int32) => {
-                let values = column
-                    .as_any()
-                    .downcast_ref::<Int16Array>()
-                    .ok_or_else(|| "equality-delete Int16 carrier downcast failed".to_string())?;
-                let mut builder = Int32Builder::with_capacity(values.len());
-                for value in values.iter() {
-                    builder.append_option(value.map(i32::from));
-                }
-                Ok(Arc::new(builder.finish()) as ArrayRef)
-            }
-            (actual, target) if actual == target => Ok(Arc::clone(column)),
-            (actual, target) => Err(format!(
-                "unsupported equality-delete storage conversion for `{}`: {actual:?} to {target:?}",
-                field.name()
-            )),
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    RecordBatch::try_new(schema, columns)
-        .map_err(|error| format!("build equality-delete storage batch failed: {error}"))
 }
 
 fn encode_equality_delete_parquet(
@@ -237,26 +159,28 @@ mod tests {
 
     use super::*;
 
-    fn columns() -> Vec<EqualityDeleteColumn> {
-        vec![
-            EqualityDeleteColumn {
-                name: "id".to_string(),
-                field_id: 1,
-                data_type: DataType::Int32,
-                nullable: false,
-            },
-            EqualityDeleteColumn {
-                name: "category".to_string(),
-                field_id: 2,
-                data_type: DataType::Utf8,
-                nullable: true,
-            },
-        ]
+    use crate::iceberg::arrow::schema_to_arrow_schema;
+    use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use arrow::array::{ArrayRef, Int8Array};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+
+    fn target(fields: Vec<crate::iceberg::spec::NestedFieldRef>) -> EqualityDeleteFileTarget {
+        let schema = Schema::builder().with_fields(fields).build().unwrap();
+        EqualityDeleteFileTarget {
+            arrow_schema: Arc::new(schema_to_arrow_schema(&schema).unwrap()),
+        }
+    }
+
+    fn common_target() -> EqualityDeleteFileTarget {
+        target(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(2, "category", Type::Primitive(PrimitiveType::String)).into(),
+        ])
     }
 
     #[test]
     fn schema_has_iceberg_field_ids() {
-        let schema = equality_delete_schema(&columns()).expect("schema");
+        let schema = common_target().arrow_schema;
 
         assert_eq!(
             schema.field(0).metadata().get(PARQUET_FIELD_ID_META_KEY),
@@ -270,8 +194,7 @@ mod tests {
 
     #[test]
     fn encode_round_trips_values() {
-        let columns = columns();
-        let schema = equality_delete_schema(&columns).expect("schema");
+        let schema = common_target().arrow_schema;
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -321,26 +244,11 @@ mod tests {
         use parquet::basic::{LogicalType, Type as PhysicalType};
         let dir = tempfile::tempdir().unwrap();
         let location = format!("file://{}", dir.path().display());
-        let columns = vec![
-            EqualityDeleteColumn {
-                name: "tiny".to_string(),
-                field_id: 11,
-                data_type: DataType::Int8,
-                nullable: true,
-            },
-            EqualityDeleteColumn {
-                name: "small".to_string(),
-                field_id: 27,
-                data_type: DataType::Int16,
-                nullable: true,
-            },
-            EqualityDeleteColumn {
-                name: "raw".to_string(),
-                field_id: 99,
-                data_type: DataType::Binary,
-                nullable: true,
-            },
-        ];
+        let target = target(vec![
+            NestedField::optional(11, "tiny", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(27, "small", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(99, "raw", Type::Primitive(PrimitiveType::Binary)).into(),
+        ]);
         // Actual input is still the frozen SQL I8/I16 domain, not pre-cast I32.
         let input_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("tiny", DataType::Int8, true),
@@ -364,7 +272,7 @@ mod tests {
             &local_file_io(&location),
             &format!("{location}/data"),
             7,
-            columns,
+            target,
             batch,
         )
         .await
@@ -407,7 +315,10 @@ mod tests {
                 Some(&id.to_string())
             );
         }
-        assert_eq!(builder.schema().field(2).data_type(), &DataType::Binary);
+        assert_eq!(
+            builder.schema().field(2).data_type(),
+            &DataType::LargeBinary
+        );
         assert_eq!(
             builder
                 .schema()
@@ -443,7 +354,7 @@ mod tests {
         let raw = batches[0]
             .column(2)
             .as_any()
-            .downcast_ref::<BinaryArray>()
+            .downcast_ref::<arrow::array::LargeBinaryArray>()
             .unwrap();
         assert_eq!(raw.value(0), &[0xff, 0]);
         assert!(raw.is_null(1));
@@ -451,63 +362,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn equality_delete_public_writer_rejects_input_signature_before_storage_conversion() {
-        use arrow::array::{Int8Array, Int16Array};
+    async fn equality_delete_public_writer_rejects_unsupported_and_required_null_before_io() {
+        use arrow::array::Int64Array;
         let dir = tempfile::tempdir().unwrap();
         let location = format!("file://{}", dir.path().display());
         let io = local_file_io(&location);
-        let columns = vec![EqualityDeleteColumn {
-            name: "key".to_string(),
-            field_id: 11,
-            data_type: DataType::Int8,
-            nullable: true,
-        }];
-        for values in [
-            Arc::new(Int32Array::from(vec![127])) as ArrayRef,
-            Arc::new(Int16Array::from(vec![127])) as ArrayRef,
+        for (values, required, expected) in [
+            (
+                Arc::new(Int64Array::from(vec![127])) as ArrayRef,
+                false,
+                "unsupported Iceberg write adaptation",
+            ),
+            (
+                Arc::new(Int8Array::from(vec![None::<i8>])) as ArrayRef,
+                true,
+                "contains NULL",
+            ),
         ] {
-            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            let input = Arc::new(ArrowSchema::new(vec![Field::new(
                 "key",
                 values.data_type().clone(),
                 true,
             )]));
-            let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
+            let batch = RecordBatch::try_new(input, vec![values]).unwrap();
+            let field = if required {
+                NestedField::required(11, "key", Type::Primitive(PrimitiveType::Int))
+            } else {
+                NestedField::optional(11, "key", Type::Primitive(PrimitiveType::Int))
+            };
             let error = write_equality_delete_file(
                 &io,
                 &format!("{location}/data"),
                 7,
-                columns.clone(),
+                target(vec![field.into()]),
                 batch,
             )
             .await
             .err()
-            .expect("wider caller input must not bypass the frozen I8 declaration");
-            assert!(error.contains("type mismatch: expected Int8"), "{error}");
-            assert!(
-                !dir.path().join("data").exists(),
-                "rejected input must not publish an output"
-            );
+            .expect("reject before writing");
+            assert!(error.contains(expected), "{error}");
+            assert!(!dir.path().join("data").exists());
         }
-        let columns = vec![EqualityDeleteColumn {
-            name: "key".to_string(),
-            field_id: 11,
-            data_type: DataType::Int8,
-            nullable: false,
-        }];
+    }
+
+    #[tokio::test]
+    async fn equality_delete_sdk_target_preserves_timezone_and_dictionary_values() {
+        use arrow::array::{DictionaryArray, LargeStringArray, TimestampMicrosecondArray};
+        use arrow::datatypes::{Int32Type, TimeUnit};
+        use parquet::basic::LogicalType;
+        let dir = tempfile::tempdir().unwrap();
+        let location = format!("file://{}", dir.path().display());
+        let target = target(vec![
+            NestedField::optional(71, "ts", Type::Primitive(PrimitiveType::Timestamptz)).into(),
+            NestedField::optional(72, "s", Type::Primitive(PrimitiveType::String)).into(),
+        ]);
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![Some(1), None, Some(0)]),
+                Arc::new(LargeStringArray::from(vec!["alpha", "東京"])) as ArrayRef,
+            )
+            .unwrap(),
+        );
         let batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![Field::new(
-                "key",
-                DataType::Int8,
-                true,
-            )])),
-            vec![Arc::new(Int8Array::from(vec![None::<i8>]))],
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+                Field::new("s", dictionary.data_type().clone(), true),
+            ])),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(-1234567),
+                    None,
+                    Some(42),
+                ])),
+                dictionary,
+            ],
         )
         .unwrap();
-        let error = write_equality_delete_file(&io, &format!("{location}/data"), 7, columns, batch)
-            .await
-            .err()
-            .expect("NULL must not satisfy a required input field");
-        assert!(error.contains("RecordBatch::try_new failed"), "{error}");
-        assert!(!dir.path().join("data").exists());
+        let written = write_equality_delete_file(
+            &local_file_io(&location),
+            &format!("{location}/data"),
+            0,
+            target,
+            batch,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(written.equality_ids, Some(vec![71, 72]));
+        let reader = ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(written.path.strip_prefix("file://").unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            reader.parquet_schema().columns()[0].logical_type_ref(),
+            Some(LogicalType::Timestamp {
+                is_adjusted_to_u_t_c: true,
+                ..
+            })
+        ));
+        assert_eq!(
+            reader.parquet_schema().columns()[0]
+                .self_type()
+                .get_basic_info()
+                .id(),
+            71
+        );
+        let batches = reader
+            .build()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let timestamps = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(
+            timestamps.iter().collect::<Vec<_>>(),
+            vec![Some(-1234567), None, Some(42)]
+        );
+        let strings = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            strings.iter().collect::<Vec<_>>(),
+            vec![Some("東京"), None, Some("alpha")]
+        );
     }
 }

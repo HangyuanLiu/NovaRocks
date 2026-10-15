@@ -199,9 +199,7 @@ mod tests {
             )
             .unwrap(),
             IcebergDataBranchRecipe::try_new(
-                Some(crate::schema_facts::iceberg_schema_def(
-                    metadata.current_schema(),
-                )),
+                Some(serde_json::to_string(metadata.current_schema().as_ref()).unwrap()),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),

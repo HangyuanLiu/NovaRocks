@@ -303,6 +303,47 @@ fn validate_request(
             "Iceberg catalog mutation does not match this control generation",
         ));
     }
+    // New definitions need no table or format-version facts. Keep this before
+    // catalog admission and every read/dispatch, including IF NOT EXISTS.
+    match &request.operation {
+        ConnectorCatalogMutationOperation::CreateTable { table, columns, .. } => {
+            ensure_owner(provider, &table.instance_id)?;
+            crate::commit::validation::deny_variant_column_definitions(
+                columns,
+                &format!(
+                    "{}.{}.{}",
+                    table.instance_id.as_str(),
+                    table.namespace,
+                    table.table
+                ),
+            )?;
+        }
+        ConnectorCatalogMutationOperation::AlterSchema { table, changes } => {
+            ensure_owner(provider, &table.instance_id)?;
+            for change in changes {
+                if let ConnectorSchemaChange::AddColumn { parent, column, .. } = change {
+                    let path = parent
+                        .segments
+                        .iter()
+                        .map(AsRef::as_ref)
+                        .chain(std::iter::once(column.name.as_ref()))
+                        .collect::<Vec<&str>>()
+                        .join(".");
+                    crate::commit::validation::deny_variant_column_definition(
+                        &column.data_type,
+                        &path,
+                        &format!(
+                            "{}.{}.{}",
+                            table.instance_id.as_str(),
+                            table.namespace,
+                            table.table
+                        ),
+                    )?;
+                }
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -656,6 +697,9 @@ fn execute_create_table(
     policy: CreatePolicy,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
     ensure_owner(provider, &table.instance_id)?;
+    // Property support is decided before namespace or table probes. New
+    // definitions have already passed the provider's pure admission.
+    table_properties(columns, key, properties)?;
     // An existing target is settled here, before anything is dispatched.
     // `CreatePolicy` is the caller's statement about what an existing table
     // means -- `IF NOT EXISTS` makes it a no-op, a plain create makes it a
@@ -960,11 +1004,35 @@ fn map_mutation_failure(
     ConnectorError::new(kind, failure.to_string())
 }
 
+const VARIANT_SHREDDING_PROPERTY_PREFIX: &str = "write.parquet.variant-shredding.";
+
+pub(crate) fn reject_variant_shredding_properties(
+    input: &[(Arc<str>, Arc<str>)],
+) -> Result<(), ConnectorError> {
+    for (key, _) in input {
+        reject_variant_shredding_property(key)?;
+    }
+    Ok(())
+}
+
+fn reject_variant_shredding_property(key: &str) -> Result<(), ConnectorError> {
+    if key.starts_with(VARIANT_SHREDDING_PROPERTY_PREFIX) {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            format!(
+                "Iceberg table property prefix `{VARIANT_SHREDDING_PROPERTY_PREFIX}` is not supported"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn table_properties(
     columns: &[ConnectorColumnDefinition],
     key: Option<&ConnectorTableKey>,
     input: &[(Arc<str>, Arc<str>)],
 ) -> Result<(FormatVersion, BTreeMap<String, String>), ConnectorError> {
+    reject_variant_shredding_properties(input)?;
     let mut format_version = FormatVersion::V2;
     let mut properties = BTreeMap::new();
     for (key, value) in input {
@@ -1409,6 +1477,9 @@ fn property_updates(
     let mut sets = HashMap::new();
     let mut removals = Vec::new();
     for change in changes {
+        if let ConnectorPropertyChange::Set { key, .. } = change {
+            reject_variant_shredding_property(key)?;
+        }
         let key = match change {
             ConnectorPropertyChange::Set { key, .. }
             | ConnectorPropertyChange::Unset { key, .. } => key.as_ref(),
@@ -1605,6 +1676,13 @@ pub(crate) fn schema_change_commit(
         .with_identifier_field_ids(metadata.current_schema().identifier_field_ids())
         .build()
         .map_err(|error| invalid(format!("build evolved Iceberg schema: {error}")))?;
+    // Scalar integer domain validation above must precede this schema
+    // comparison. An unchanged MODIFY has no schema publication to dispatch.
+    if matches!(change, ConnectorSchemaChange::ModifyColumn { .. })
+        && &new_schema == metadata.current_schema().as_ref()
+    {
+        return Ok(None);
+    }
     let updates = scalar_integer_schema_updates(metadata, change, new_schema, integer_domains)?;
     let commit = crate::commit::existing_commit::existing_table_commit(
         ident,
@@ -5887,5 +5965,426 @@ mod tests {
             409,
         ));
         assert!(!commit_may_be_unknown(conflict.kind()));
+    }
+    /// The REST spy detects catalog requests; the existing refusing FileIO
+    /// owner makes either synchronous or spawned object access fail the test.
+    fn variant_definition_provider(endpoint: &str) -> (tokio::runtime::Runtime, IcebergMetadata) {
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[
+                ("iceberg.catalog.type".into(), "rest".into()),
+                ("uri".into(), endpoint.into()),
+                ("warehouse".into(), "s3://warehouse".into()),
+            ],
+        )
+        .expect("REST configuration");
+        let binding = IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(RefuseFileIo),
+            Arc::new(RefuseFileIo),
+        );
+        let runtime = IcebergMetadataContext::try_new(
+            IcebergCatalogControlState::new(configuration),
+            IcebergMetadataResources::new(binding, executor.handle().clone()),
+        )
+        .expect("lazy REST generation");
+        let provider = IcebergMetadata::new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+            },
+            ProviderBindingEpoch::from_bytes([6; 16]),
+            Arc::new(runtime),
+        );
+        (executor, provider)
+    }
+
+    fn definition_column(data_type: ConnectorDataType) -> ConnectorColumnDefinition {
+        ConnectorColumnDefinition {
+            name: "payload".into(),
+            data_type,
+            nullable: true,
+            aggregation: None,
+            default: None,
+        }
+    }
+
+    fn variant_definitions() -> Vec<(ConnectorDataType, &'static str)> {
+        vec![
+            (ConnectorDataType::Variant, "payload"),
+            (
+                ConnectorDataType::Array(Box::new(ConnectorDataType::Variant)),
+                "payload.element",
+            ),
+            (
+                ConnectorDataType::Map(
+                    Box::new(ConnectorDataType::Variant),
+                    Box::new(ConnectorDataType::String),
+                ),
+                "payload.key",
+            ),
+            (
+                ConnectorDataType::Map(
+                    Box::new(ConnectorDataType::String),
+                    Box::new(ConnectorDataType::Variant),
+                ),
+                "payload.value",
+            ),
+            (
+                ConnectorDataType::Struct(vec![novarocks_spi::connector::ConnectorStructField {
+                    name: "v".into(),
+                    data_type: ConnectorDataType::Array(Box::new(ConnectorDataType::Variant)),
+                    nullable: true,
+                }]),
+                "payload.v.element",
+            ),
+        ]
+    }
+
+    fn assert_definition_refused(
+        provider: &IcebergMetadata,
+        request: ConnectorCatalogMutationRequest,
+        kind: ConnectorErrorKind,
+        message: &str,
+    ) {
+        let error = ConnectorCatalogMutation::admit(provider, &request)
+            .expect_err("pure provider admission must refuse");
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.message(), message);
+        assert!(!error.retryable_before_progress());
+        assert!(error.table_object_binding_failure().is_none());
+        match provider.execute(request).expect("typed known refusal") {
+            ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
+                assert_eq!(failure.kind(), failure_kind(error.kind()));
+                assert_eq!(failure.message(), error.to_string());
+                assert!(matches!(cleanup, ExternalMutationFinalization::Complete));
+            }
+            _ => panic!("definition refusal must be known uncommitted"),
+        }
+    }
+
+    #[test]
+    fn variant_new_definitions_refuse_create_and_add_before_catalog_or_file_io() {
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        let server = TestServer::start(Script::new());
+        let (_executor, provider) = variant_definition_provider(&server.url());
+        for (data_type, path) in variant_definitions() {
+            for format in [None, Some("2"), Some("3")] {
+                for policy in [CreatePolicy::FailIfExists, CreatePolicy::NoOpIfExists] {
+                    let mut request =
+                        create_request(&provider, ConnectorMutationOperationId::new(), policy);
+                    let ConnectorCatalogMutationOperation::CreateTable {
+                        columns,
+                        properties,
+                        ..
+                    } = &mut request.operation
+                    else {
+                        unreachable!()
+                    };
+                    *columns = vec![definition_column(data_type.clone())];
+                    *properties = format
+                        .into_iter()
+                        .map(|version| ("format-version".into(), version.into()))
+                        .collect();
+                    assert_definition_refused(
+                        &provider,
+                        request,
+                        ConnectorErrorKind::Unsupported,
+                        &format!(
+                            "Iceberg Variant writes are not supported yet: table ice.atomic.events, column {path}"
+                        ),
+                    );
+                }
+            }
+            for parent in [vec![], vec![Arc::from("outer"), Arc::from("record")]] {
+                let path = if parent.is_empty() {
+                    path.to_owned()
+                } else {
+                    format!("outer.record.{path}")
+                };
+                let mut request = create_request(
+                    &provider,
+                    ConnectorMutationOperationId::new(),
+                    CreatePolicy::FailIfExists,
+                );
+                request.operation = ConnectorCatalogMutationOperation::AlterSchema {
+                    table: ConnectorTableIdentity {
+                        instance_id: provider.descriptor().instance_id.clone(),
+                        namespace: "atomic".into(),
+                        table: "events".into(),
+                    },
+                    changes: vec![ConnectorSchemaChange::AddColumn {
+                        parent: ConnectorColumnPath { segments: parent },
+                        column: definition_column(data_type.clone()),
+                        position: ConnectorColumnPosition::Default,
+                    }],
+                };
+                assert_definition_refused(
+                    &provider,
+                    request,
+                    ConnectorErrorKind::Unsupported,
+                    &format!(
+                        "Iceberg Variant writes are not supported yet: table ice.atomic.events, column {path}"
+                    ),
+                );
+            }
+            assert!(
+                server.requests().is_empty(),
+                "new definitions must not probe a target or namespace"
+            );
+        }
+    }
+
+    #[test]
+    fn variant_new_definition_admission_preserves_context_and_generation_failures() {
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        let server = TestServer::start(Script::new());
+        let (_executor, provider) = variant_definition_provider(&server.url());
+        let mut request = create_request(
+            &provider,
+            ConnectorMutationOperationId::new(),
+            CreatePolicy::FailIfExists,
+        );
+        let ConnectorCatalogMutationOperation::CreateTable { columns, .. } = &mut request.operation
+        else {
+            unreachable!()
+        };
+        *columns = vec![definition_column(ConnectorDataType::Variant)];
+        let stopped = novarocks_spi::connector::ConnectorStopOwner::new();
+        stopped.request_stop();
+        let mut cancelled = request.clone();
+        cancelled.context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            stopped.view(),
+            64 * 1024,
+            256 * 1024,
+        )
+        .unwrap();
+        assert_definition_refused(
+            &provider,
+            cancelled,
+            ConnectorErrorKind::Cancelled,
+            "connector request was cancelled",
+        );
+        let mut expired = request.clone();
+        expired.context = ConnectorRequestContext::try_new(
+            Instant::now() - Duration::from_secs(1),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            64 * 1024,
+            256 * 1024,
+        )
+        .unwrap();
+        assert_definition_refused(
+            &provider,
+            expired,
+            ConnectorErrorKind::DeadlineExceeded,
+            "connector request deadline elapsed",
+        );
+        let mut foreign_epoch = request.clone();
+        foreign_epoch.target.incarnation = ProviderBindingEpoch::from_bytes([7; 16]);
+        assert_definition_refused(
+            &provider,
+            foreign_epoch,
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg catalog mutation does not match this control generation",
+        );
+        let mut foreign_table = request.clone();
+        if let ConnectorCatalogMutationOperation::CreateTable { table, .. } =
+            &mut foreign_table.operation
+        {
+            table.instance_id = ConnectorInstanceId::parse("other").unwrap();
+        }
+        assert_definition_refused(
+            &provider,
+            foreign_table,
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg catalog mutation belongs to another connector instance",
+        );
+        request.target.instance_id = ConnectorInstanceId::parse("other").unwrap();
+        assert_definition_refused(
+            &provider,
+            request,
+            ConnectorErrorKind::InvalidRequest,
+            "Iceberg catalog mutation does not match this control generation",
+        );
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn variant_new_definition_guard_preserves_plain_types_and_existing_schema_changes() {
+        use crate::rest_protocol::test_server::{Script, TestServer};
+        let server = TestServer::start(Script::new());
+        let (_executor, provider) = variant_definition_provider(&server.url());
+        let plain = ConnectorDataType::Struct(vec![
+            novarocks_spi::connector::ConnectorStructField {
+                name: "metadata".into(),
+                data_type: ConnectorDataType::Binary,
+                nullable: true,
+            },
+            novarocks_spi::connector::ConnectorStructField {
+                name: "value".into(),
+                data_type: ConnectorDataType::Binary,
+                nullable: true,
+            },
+        ]);
+        for data_type in [
+            ConnectorDataType::Int,
+            ConnectorDataType::Binary,
+            plain.clone(),
+        ] {
+            let mut request = create_request(
+                &provider,
+                ConnectorMutationOperationId::new(),
+                CreatePolicy::FailIfExists,
+            );
+            let ConnectorCatalogMutationOperation::CreateTable { columns, .. } =
+                &mut request.operation
+            else {
+                unreachable!()
+            };
+            *columns = vec![definition_column(data_type)];
+            ConnectorCatalogMutation::admit(&provider, &request)
+                .expect("plain definitions are admitted without I/O");
+        }
+        let variant_type = Type::Variant(crate::iceberg::spec::VariantType);
+        let fields = vec![
+            Arc::new(NestedField::optional(1, "payload", variant_type.clone())),
+            Arc::new(
+                NestedField::required(2, "id", Type::Primitive(PrimitiveType::Int))
+                    .with_doc("existing identifier"),
+            ),
+        ];
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+            Schema::builder()
+                .with_fields(fields.clone())
+                .with_identifier_field_ids([2])
+                .build()
+                .unwrap(),
+            crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "memory://existing-variant-schema".to_string(),
+            FormatVersion::V3,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let ident = || TableIdent::from_strs(["atomic", "events"]).unwrap();
+        let path = || ConnectorColumnPath {
+            segments: vec!["payload".into()],
+        };
+        for change in [
+            ConnectorSchemaChange::AddColumn {
+                parent: ConnectorColumnPath { segments: vec![] },
+                column: definition_column(plain),
+                position: ConnectorColumnPosition::Default,
+            },
+            ConnectorSchemaChange::RenameColumn {
+                path: path(),
+                to: "renamed".into(),
+            },
+            ConnectorSchemaChange::DropColumn { path: path() },
+            ConnectorSchemaChange::SetColumnComment {
+                path: path(),
+                comment: "existing external Variant".into(),
+            },
+            ConnectorSchemaChange::SetColumnNullability {
+                path: path(),
+                nullable: true,
+            },
+            ConnectorSchemaChange::ReorderColumn {
+                path: path(),
+                position: ConnectorColumnPosition::Default,
+            },
+            ConnectorSchemaChange::ModifyColumn {
+                path: path(),
+                data_type: ConnectorDataType::Variant,
+            },
+        ] {
+            let mut request = create_request(
+                &provider,
+                ConnectorMutationOperationId::new(),
+                CreatePolicy::FailIfExists,
+            );
+            request.operation = ConnectorCatalogMutationOperation::AlterSchema {
+                table: ConnectorTableIdentity {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    namespace: "atomic".into(),
+                    table: "events".into(),
+                },
+                changes: vec![change.clone()],
+            };
+            // Use a distinct name for ordinary ADD so the actual schema-change
+            // owner tests the successful path rather than a duplicate-name error.
+            let change = match &mut request.operation {
+                ConnectorCatalogMutationOperation::AlterSchema { changes, .. } => {
+                    if let ConnectorSchemaChange::AddColumn { column, .. } = &mut changes[0] {
+                        column.name = "ordinary".into();
+                    }
+                    changes[0].clone()
+                }
+                _ => unreachable!(),
+            };
+            ConnectorCatalogMutation::admit(&provider, &request)
+                .expect("existing Variant does not make metadata read-only");
+            apply_schema_change(&fields, &change, &mut 3)
+                .expect("existing schema-change semantics remain legal");
+            let commit = schema_change_commit(ident(), &metadata, &change)
+                .expect("existing schema change reaches its commit owner");
+            assert_eq!(
+                commit.is_none(),
+                matches!(change, ConnectorSchemaChange::ModifyColumn { .. }),
+                "the unchanged MODIFY must not publish an identical schema"
+            );
+        }
+        let ordinary_modify = |data_type| ConnectorSchemaChange::ModifyColumn {
+            path: ConnectorColumnPath {
+                segments: vec!["id".into()],
+            },
+            data_type,
+        };
+        assert!(
+            schema_change_commit(ident(), &metadata, &ordinary_modify(ConnectorDataType::Int))
+                .unwrap()
+                .is_none(),
+            "ordinary same-type MODIFY is also a no-op"
+        );
+        assert!(
+            schema_change_commit(
+                ident(),
+                &metadata,
+                &ordinary_modify(ConnectorDataType::BigInt)
+            )
+            .unwrap()
+            .is_some(),
+            "a real widening must still publish a schema"
+        );
+        assert_eq!(
+            schema_change_commit(
+                ident(),
+                &metadata,
+                &ordinary_modify(ConnectorDataType::Variant)
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorErrorKind::Unsupported,
+            "MODIFY cannot introduce Variant"
+        );
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn shredding_properties_are_rejected_without_interpreting_values() {
+        let properties = vec![(
+            Arc::from("write.parquet.variant-shredding.payload"),
+            Arc::from("false"),
+        )];
+        let error = reject_variant_shredding_properties(&properties).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert!(table_properties(&[], None, &properties).is_err());
+        assert!(reject_variant_shredding_property("write.parquet.compression-codec").is_ok());
     }
 }

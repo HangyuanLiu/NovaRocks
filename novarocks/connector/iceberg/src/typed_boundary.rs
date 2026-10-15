@@ -1827,6 +1827,7 @@ impl IcebergTypedBoundary {
             );
         }
         let source = FilesTableSplitSource::try_new(FilesTableSplitSourceParams {
+            table_has_variant_history: crate::manifest::table_has_variant_history(&metadata),
             manifests: self.pinned_snapshot_manifests(reference)?,
             table_schema_json: serde_json::to_string(&table_schema).map_err(|error| {
                 corrupt(format!("iceberg table schema is not serializable: {error}"))

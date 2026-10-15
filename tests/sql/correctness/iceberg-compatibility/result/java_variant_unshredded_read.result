@@ -1,0 +1,30 @@
+-- query 2
+id	kind
+1	NULL
+2	Null
+3	Object
+4	Array
+5	Boolean(true)
+6	Boolean(false)
+7	Int8
+8	Int16
+9	Int32
+10	Int64
+11	Float
+12	Double
+13	Decimal4
+14	Decimal8
+15	Decimal16
+16	Date
+17	TimestampTz
+18	TimestampNtz
+19	Binary
+20	String
+21	TimeNtz
+22	TimestampTzNanos
+23	TimestampNtzNanos
+24	Uuid
+
+-- query 3
+id	nested_a
+3	7

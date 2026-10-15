@@ -34,6 +34,52 @@ use crate::scan_model::{
     IcebergDeleteFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue,
 };
 
+pub(crate) fn schema_contains_variant(schema: &crate::iceberg::spec::Schema) -> bool {
+    fn contains(data_type: &crate::iceberg::spec::Type) -> bool {
+        use crate::iceberg::spec::Type;
+        match data_type {
+            Type::Variant(_) => true,
+            Type::Struct(fields) => fields
+                .fields()
+                .iter()
+                .any(|field| contains(&field.field_type)),
+            Type::List(list) => contains(&list.element_field.field_type),
+            Type::Map(map) => {
+                contains(&map.key_field.field_type) || contains(&map.value_field.field_type)
+            }
+            Type::Primitive(_) => false,
+        }
+    }
+    schema
+        .as_struct()
+        .fields()
+        .iter()
+        .any(|field| contains(&field.field_type))
+}
+
+pub(crate) fn table_has_variant_history(metadata: &TableMetadata) -> bool {
+    metadata
+        .schemas_iter()
+        .any(|schema| schema_contains_variant(schema))
+}
+
+pub(crate) fn with_variant_statistics_hint(message: String, metadata: &TableMetadata) -> String {
+    with_variant_statistics_hint_for_history(message, table_has_variant_history(metadata))
+}
+
+pub(crate) fn with_variant_statistics_hint_for_history(
+    message: String,
+    has_variant_history: bool,
+) -> String {
+    if has_variant_history {
+        format!(
+            "{message}; hint: this table has had Variant columns, and NovaRocks cannot read Variant column statistics written by other engines yet, which may be related (docs/guides/iceberg-v3/variant.md)"
+        )
+    } else {
+        message
+    }
+}
+
 // Design: ADR-0174 (docs/adr/ADR-0174-vendored-iceberg-baseline-and-patch-policy.md)
 /// Read a pinned manifest list directly through its admitted FileIO.
 /// This preserves the existing unencrypted metadata read boundary.
@@ -247,7 +293,9 @@ pub(crate) async fn current_equality_delete_column_names_with_control(
         }
         let manifest = crate::manifest::load_manifest(&manifest_file, file_io)
             .await
-            .map_err(|error| format!("load manifest: {error}"))?;
+            .map_err(|error| {
+                with_variant_statistics_hint(format!("load manifest: {error}"), metadata)
+            })?;
         check_active()?;
         for entry in manifest.entries() {
             check_active()?;
@@ -727,6 +775,61 @@ mod tests {
         IcebergReadDeleteFile, IcebergReadDeleteFormat, IcebergReadDeleteKind,
     };
     use crate::scan_model::{IcebergDeleteFileContent, IcebergDeleteFileFormat};
+
+    #[test]
+    fn variant_manifest_hint_uses_all_historical_schemas_and_preserves_original_text() {
+        use crate::iceberg::spec::{
+            FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+            TableMetadataBuilder, Type, VariantType,
+        };
+        let variant_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "v", Type::Variant(VariantType)).into(),
+            ])
+            .build()
+            .unwrap();
+        let clean_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(2, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        let new = |schema| {
+            TableMetadataBuilder::new(
+                schema,
+                PartitionSpec::unpartition_spec().into_unbound(),
+                SortOrder::unsorted_order(),
+                "file:///warehouse/t".to_owned(),
+                FormatVersion::V3,
+                HashMap::new(),
+            )
+            .unwrap()
+        };
+        let never_variant = new(clean_schema.clone()).build().unwrap().metadata;
+        let old_variant = new(variant_schema)
+            .add_current_schema(clean_schema)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        assert!(!super::schema_contains_variant(
+            old_variant.current_schema()
+        ));
+        for original in [
+            "permission denied",
+            "network timeout",
+            "invalid Avro",
+            "Variant statistics",
+        ] {
+            assert_eq!(
+                super::with_variant_statistics_hint(original.to_owned(), &never_variant),
+                original
+            );
+            let hinted = super::with_variant_statistics_hint(original.to_owned(), &old_variant);
+            assert!(hinted.starts_with(original));
+            assert!(hinted.contains("has had Variant columns"));
+        }
+    }
 
     fn read_delete(
         file_format: IcebergReadDeleteFormat,

@@ -1,0 +1,72 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+
+-- @expect_error_tier=drift
+-- Variant definitions are refused independently of the target format version.
+-- The legacy case name is retained so the existing targeted selection stays valid.
+-- query 1
+-- @expect_error=Iceberg Variant writes are not supported
+CREATE TABLE ${case_db}.variant_default_v2 (id INT,v VARIANT);
+
+-- query 2
+-- @expect_error=Iceberg Variant writes are not supported
+CREATE TABLE ${case_db}.variant_explicit_v2 (id INT,v VARIANT) TBLPROPERTIES ("format-version"="2");
+
+-- query 3
+-- @expect_error=Iceberg Variant writes are not supported
+CREATE TABLE ${case_db}.variant_explicit_v3 (id INT,v VARIANT) TBLPROPERTIES ("format-version"="3");
+
+-- query 4
+-- @skip_result_check=true
+CREATE TABLE ${case_db}.variant_alter_v2 (id INT) TBLPROPERTIES ("format-version"="2");
+CREATE TABLE ${case_db}.variant_alter_v3 (id INT,s STRUCT<x INT>) TBLPROPERTIES ("format-version"="3");
+
+-- query 5
+-- IF NOT EXISTS cannot turn an unsupported new definition into a target probe.
+-- @expect_error=Iceberg Variant writes are not supported
+CREATE TABLE IF NOT EXISTS ${case_db}.variant_alter_v3 (id INT,v VARIANT) TBLPROPERTIES ("format-version"="3");
+
+-- query 6
+-- @expect_error=Iceberg Variant writes are not supported
+ALTER TABLE ${case_db}.variant_alter_v2 ADD COLUMN v VARIANT;
+
+-- query 7
+-- @expect_error=Iceberg Variant writes are not supported
+ALTER TABLE ${case_db}.variant_alter_v3 ADD COLUMN v VARIANT;
+
+-- query 8
+-- @expect_error=Iceberg Variant writes are not supported
+ALTER TABLE ${case_db}.variant_alter_v3 ADD COLUMN s.v VARIANT;
+
+-- query 9
+-- MODIFY retains the existing type-evolution rule instead of introducing Variant.
+-- @expect_error=unsupported Iceberg type evolution from int to variant
+ALTER TABLE ${case_db}.variant_alter_v3 MODIFY COLUMN id VARIANT;
+
+-- query 10
+-- The new-definition refusal precedes the old Variant partition-source check.
+-- @expect_error=Iceberg Variant writes are not supported yet: table iceberg_ddl_cat_${suite_uuid0}.${case_db}.variant_partition_rejected, column v
+CREATE TABLE ${case_db}.variant_partition_rejected (id INT,v VARIANT)
+PARTITION BY identity(v) TBLPROPERTIES ("format-version"="3");
+
+-- query 11
+-- Ordinary schema changes still work after the refusals.
+-- @skip_result_check=true
+ALTER TABLE ${case_db}.variant_alter_v2 ADD COLUMN extra INT;
+ALTER TABLE ${case_db}.variant_alter_v3 ADD COLUMN extra INT;
+DROP TABLE ${case_db}.variant_alter_v2;
+DROP TABLE ${case_db}.variant_alter_v3;
