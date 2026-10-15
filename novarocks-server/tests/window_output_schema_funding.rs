@@ -334,6 +334,7 @@ fn source(input_type: FunctionValueType, label_bytes: usize) -> Vec<u8> {
                 site: PhysicalCallSite::Expression(use_id),
                 context,
                 effects: token.call_contract().effects().clone(),
+                materialized_writer_input: None,
                 decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
             });
         }

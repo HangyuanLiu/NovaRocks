@@ -159,6 +159,7 @@ fn populated_n_consumer(f: &Fixture, tracker: Arc<MemTracker>) -> CompiledGroupe
     }
     let mut processor = factory.processor();
     processor.set_mem_tracker(tracker);
+    prepare_typed_fixture_operator(&mut processor);
     let state = RuntimeState::default();
     let mut saw_heap = false;
     for offset in (0..N_ROWS.len()).step_by(3) {
