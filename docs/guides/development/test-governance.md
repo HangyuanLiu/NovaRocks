@@ -107,6 +107,8 @@ Native build identity 的来源在薄 CLI build.rs 冻结并注入 Version，不
 
 日常开发只有一个 `dev` 主测试图。规范入口是 [dev-test.sh](../../../tools/ci/dev-test.sh)：`prepare <receipt>` 同次 `cargo build --workspace --tests --bins --profile dev --locked --target-dir "$PWD/target"`，从开始包含 dev-dependencies 和真实程序；`test [filter] -- [libtest options]` 保持 workspace package selection 并交给 Cargo 执行；`doc` 单独运行 doctest。clippy 的 `--all-targets` 是额外静态检查范围，不扩大行为测试到暂停项、bench 或 example。窄 `cargo test -p <owner>` 适合内循环，选包会改变依赖统一和必要链接，不能冒称完整规范图。
 
+标准 `dev` 的 workspace 与非 workspace package 均使用 `opt-level=1`，保留 debug assertions、增量编译、256 codegen units 和关闭 LTO；第一方使用 line tables，非 workspace 依赖不生成 debug symbols。`package."*"` 按 Cargo 的非 workspace 成员集合生效，包含其 host 单元，不能将它当作语义上的全部第三方分类。这个唯一默认组合由 G2a 的有界应用成本观察选择；成本观察不替代 native 正确性验收，原失败和未完成项单独保留。
+
 主缓存属于当前 worktree 的 `target/`。实际 `debug_assertions` 由共享 build helper 投影为 `novarocks_dev_controls`：标准 dev 编入控制能力，标准 release 排除；不再通过镜像 feature 或声明 profile 改变能力。`NOVAROCKS_BUILD_PROFILE` 不参与构建来源或能力判断。Server CLI 保留 `novarocks-server` 包名，SQL CLI 保留 `tests/sql/runner/Cargo.toml` 和 `novarocks-sql-test` 身份；库分别为 `novarocks-server-application` 与 `novarocks-sql-test-library`。System CLI 包是 `novarocks-system-test-cli`，库保留 `novarocks-system-test-runner`。Git 来源仅薄 CLI 冻结，库不监听来源。
 
 规范 helper 从 Cargo JSON 的真实 bin artifact 绑定 Server、SQL/System runner 和 error-manifest 的可执行路径与 SHA-256。最后一次相关 Cargo 后重新采集，并在消费前检查内容；缺路径、缺 required bin 或内容变化失败，不能回退旧程序。SQL 列举、执行和 error-manifest 检查直接使用已准备程序，不另起 `cargo run`。自报保存 stdout/stderr/实际退出；capabilities 据实际编译事实保留，`declared_profile=null` 与其它 unknown 不补造。自报不认证依赖最终 profile 或发布资格。

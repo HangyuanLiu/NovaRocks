@@ -170,7 +170,7 @@ novarocks-workload-control = { path = "novarocks/workload-control", version = "0
 
 # One development configuration for native tests, tools, and role binaries.
 [profile.dev]
-opt-level = 0
+opt-level = 1
 debug = "line-tables-only"
 incremental = true
 lto = false
@@ -178,6 +178,7 @@ codegen-units = 256
 debug-assertions = true
 
 [profile.dev.package."*"]
+opt-level = 1
 debug = false
 
 # Opt-in full symbols without changing the standard development control boundary.
