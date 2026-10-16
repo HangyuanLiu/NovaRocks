@@ -2113,6 +2113,9 @@ impl IcebergWriteSessionControl {
                 request.context.initiation(),
             ))
             .map_err(connector_unsupported)?;
+        if let ConnectorWriteSessionFlavor::DistributedRewrite { frozen, .. } = &request.flavor {
+            frozen.validate_owner(&self.key)?;
+        }
         // A staged target is the one target that cannot be looked up: the
         // catalog will not know it until the publication that owns it commits.
         // So its frozen facts arrive with the request, and this branch reads
@@ -2470,10 +2473,9 @@ impl IcebergWriteSessionControl {
             // A delete branch's frozen old-delete references are the one piece
             // of material that costs an external read, so it is taken only when
             // the request's own shape says a delete branch exists.
-            merge_targets: if session_freezes_old_deletes(&request.flavor, &signed) {
-                let snapshot_id = base_snapshot_id.ok_or_else(|| {
-                    invalid("Iceberg row-level write requires a frozen target snapshot")
-                })?;
+            merge_targets: if session_freezes_old_deletes(&request.flavor, &signed)
+                && let Some(snapshot_id) = base_snapshot_id
+            {
                 let table = table.as_ref().ok_or_else(|| {
                     invalid("Iceberg row-level write requires a loaded target table")
                 })?;
