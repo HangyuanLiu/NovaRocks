@@ -45,7 +45,7 @@ code-anchors:
 5. **正面核查只追加事实。** 只有与准确请求绑定的归属标记、版本、UUID、快照及必要内容匹配才可从 Unknown 追加 positive proof。旧状态、缺失、偶然相同的当前后置条件都保持 Unknown。证明与 owner 收尾事实在同一个 journal 锁内可见，核查不伪称未观察的 Hadoop cache/hint 安装已完成；原始 Unknown 仍保留。进程内证据保留原 journal owner，wire-only 证据不能重建一次新的派发机会。
 6. **跨 generation 的本地协调。** 同一 catalog scope 的表锁由真实 service/factory 注入，覆盖重叠 G1/G2 lease；不使用全局 registry。锁后读取当前权威 metadata，holder/waiter 到真实退出才回收。确定结案的 expiry 与本地 ref 修改串行；Unknown 释放锁后迟到 expiry 仍可能覆盖后来的 ref，本地锁不提供外部 CAS。
 7. **retention 与回收分开。** 候选使用完整 branch/tag 图、table/call/ref 的明确优先级及固定评价时间；main 永不过期。确定冲突允许政策内有界重准备，Unknown、UUID replacement、总预算耗尽停止。Applied 后先定位实际提交版本和前驱，独立审计丢失 refs；异常 ref 的文件保护且诊断明确。回收保护当前完整 snapshot roots，包括无 ref 的历史；Puffin 任一存活 blob 保护整路径。不可变路径缓存不做 HEAD；新根读取失败、长度矛盾或前驱不可用均停止删除。每次 DELETE 发出前 age≤T，排队或扫描过窗重新复核；失败不续期。
-8. **传输无关的结果。** 中立 SPI 区分 mutation effect、receipt/evidence 与 finalization；FE 只投影 Provider 事实，MySQL 只编码用户结果。native FE/BE 的角色及信任边界沿 ADR-0110；Provider 私有 catalog 所有权沿 ADR-0118；操作、物理对象、继承字段和清理模型沿 ADR-0171。
+8. **传输无关的结果。** 中立 SPI 区分 mutation effect、receipt/evidence 与 finalization；FE 只投影 Provider 事实，MySQL 只编码用户结果。lake publication 的 crash-only 结果、target OCC 与年龄窗 GC 沿 ADR-0110；Provider 私有 catalog 所有权沿 ADR-0118；操作、物理对象、继承字段和清理模型沿 ADR-0171。
 
 ## 考虑过的选项
 

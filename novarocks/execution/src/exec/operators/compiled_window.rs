@@ -1292,7 +1292,9 @@ fn validate_complete_output(
 
 impl Operator for CompiledWindowProcessor {
     #[cfg(any(test, feature = "test-support"))]
-    fn prepared_schema_for_test(&self) -> Option<ChunkSchemaRef> { self.output.clone() }
+    fn prepared_schema_for_test(&self) -> Option<ChunkSchemaRef> {
+        self.output.clone()
+    }
     fn compiled_schema_preparation_site(
         &self,
     ) -> Option<(

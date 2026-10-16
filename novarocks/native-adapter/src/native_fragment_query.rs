@@ -316,12 +316,20 @@ impl NativeFragmentQueryRuntime {
         exec_mem_limit: Option<i64>,
     ) -> Result<NativeQueryPreparationMemory, NativeFragmentAdmissionError> {
         let (query_mem_tracker, query_memory) = self.establish_query_resources(
-            execution_id, delivery_expire, query_expire, exec_mem_limit,
+            execution_id,
+            delivery_expire,
+            query_expire,
+            exec_mem_limit,
         )?;
-        let query_memory = query_memory.ok_or_else(|| NativeFragmentAdmissionError::Existing(
-            "native preparation requires the established query memory binding".into(),
-        ))?;
-        Ok(NativeQueryPreparationMemory { query_memory, query_mem_tracker })
+        let query_memory = query_memory.ok_or_else(|| {
+            NativeFragmentAdmissionError::Existing(
+                "native preparation requires the established query memory binding".into(),
+            )
+        })?;
+        Ok(NativeQueryPreparationMemory {
+            query_memory,
+            query_mem_tracker,
+        })
     }
 
     /// Consume the early binding rather than minting a second query account.
